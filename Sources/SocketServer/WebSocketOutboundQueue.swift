@@ -298,6 +298,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     private let lock = NSLock()
     private var queuedBytes = 0
     private var queuedFrames = 0
+    /// C8 `waitForRoom` callers (guarded by `lock`); wakes them on drain.
+    private var drainWaiters = 0
+    private let drainCondition = NSCondition()
     /// Bytes held in `pendingControlFrames` (subset of `queuedBytes`).
     private var queuedControlBytes = 0
     private var state: State = .open
@@ -388,6 +391,44 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     var isOpen: Bool {
         lock.lock(); defer { lock.unlock() }
         return state == .open
+    }
+
+    enum RoomWait: Equatable {
+        case room
+        case closed
+        case timedOut
+    }
+
+    /// C8: blocks until at most `limit` bytes are queued, the queue stops
+    /// being open, or `timeout` passes. Dequeues, degrade and close signal
+    /// it; it also rechecks every 100 ms for state changes nothing signals.
+    func waitForRoom(atMost limit: Int, timeout: TimeInterval) -> RoomWait {
+        let deadline = Date(timeIntervalSinceNow: max(0, timeout))
+        drainCondition.lock()
+        lock.lock(); drainWaiters += 1; lock.unlock()
+        defer {
+            lock.lock(); drainWaiters -= 1; lock.unlock()
+            drainCondition.unlock()
+        }
+        while true {
+            lock.lock()
+            let open = state == .open
+            let bytes = queuedBytes
+            lock.unlock()
+            if !open { return .closed }
+            if bytes <= limit { return .room }
+            let now = Date()
+            if now >= deadline { return .timedOut }
+            _ = drainCondition.wait(until: min(deadline, now.addingTimeInterval(0.1)))
+        }
+    }
+
+    /// Call after releasing `lock`, with `drainWaiters > 0` read under it.
+    private func signalDrainWaiters(_ waiting: Bool) {
+        guard waiting else { return }
+        drainCondition.lock()
+        drainCondition.broadcast()
+        drainCondition.unlock()
     }
 
     var queuedFrameCountForTests: Int {
@@ -601,7 +642,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             discardedBulkFrames: discardedBulk,
             needsBaselineRequired: freedFrames > 0
         )
+        let waiting = drainWaiters > 0
         lock.unlock()
+        signalDrainWaiters(waiting)
         return outcome
     }
 
@@ -940,7 +983,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     func close() {
         lock.lock()
         if state == .open || state == .terminalReserved { state = .closed }
+        let waiting = drainWaiters > 0
         lock.unlock()
+        signalDrainWaiters(waiting)
     }
 
     func drain() {
@@ -1065,7 +1110,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         if let drainStartedAt, byteCount > 0 {
             noteDrainLocked(bytes: byteCount, startedAt: drainStartedAt)
         }
+        let waiting = drainWaiters > 0
         lock.unlock()
+        signalDrainWaiters(waiting)
     }
 
     private func noteDrainLocked(bytes: Int, startedAt: TimeInterval) {

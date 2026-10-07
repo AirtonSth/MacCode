@@ -140,7 +140,7 @@ final class DurableReplayWebSocketTests: XCTestCase {
         let (server, port) = try startServer()
         defer { server.stop() }
         let scenario = evictedRingScenario()
-        let task = socket(port: port, since: scenario.cursor, durable: true)
+        let task = socket(port: port, since: scenario.cursor, durable: true, resumeEpoch: 42)
         defer { task.cancel(with: .goingAway, reason: nil) }
 
         let welcome = try await next(task)
@@ -203,7 +203,7 @@ final class DurableReplayWebSocketTests: XCTestCase {
         defer { server.stop() }
         let scenario = evictedRingScenario()
         log.prune(through: scenario.cursor)
-        let task = socket(port: port, since: scenario.cursor, durable: true)
+        let task = socket(port: port, since: scenario.cursor, durable: true, resumeEpoch: 42)
         defer { task.cancel(with: .goingAway, reason: nil) }
 
         let welcome = try await next(task)
@@ -222,7 +222,7 @@ final class DurableReplayWebSocketTests: XCTestCase {
         let text = String(repeating: "state ", count: 70)
         for index in 0..<700 { state("big-\(index) \(text)") }
         for _ in 0..<40 { delta("t-flood-budget", bytes: 64 * 1_024) }
-        let task = socket(port: port, since: cursor, durable: true)
+        let task = socket(port: port, since: cursor, durable: true, resumeEpoch: 42)
         defer { task.cancel(with: .goingAway, reason: nil) }
 
         let welcome = try await next(task)
@@ -269,20 +269,39 @@ final class DurableReplayWebSocketTests: XCTestCase {
         let scenario = evictedRingScenario()
         let dispatcher = JSONRPCDispatcher(router: FakeRouter())
         func call(_ params: [String: JSONValue]) async -> JSONRPCResponse {
-            await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "events.recent", params: params))
+            await dispatcher.dispatch(
+                JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "events.recent", params: params),
+                mutationContext: MutationRequestContext(
+                    ownerFingerprint: "owner", hostId: "durable-host", bootEpoch: 42
+                )
+            )
         }
+        let envelope: [String: JSONValue] = [
+            "durable": .bool(true), "resume_host_id": .string("durable-host"), "resume_boot_epoch": .number(42),
+        ]
 
         let legacy = await call(["since_seq": .number(Double(scenario.cursor))])
         XCTAssertEqual(legacy.result?.objectValue?["requires_baseline"]?.boolValue, true)
         XCTAssertNil(legacy.result?.objectValue?["stream_gaps"], "old response shape unchanged")
+
+        // A cursor whose boot nothing proves may come from a crashed boot:
+        // the log could have holes it cannot see, so only the ring serves it.
+        let unproven = await call(["since_seq": .number(Double(scenario.cursor)), "durable": .bool(true)])
+        XCTAssertEqual(unproven.result?.objectValue?["requires_baseline"]?.boolValue, true)
+        var otherBoot = envelope
+        otherBoot["resume_boot_epoch"] = .number(41)
+        let stale = await call(["since_seq": .number(Double(scenario.cursor))].merging(otherBoot) { $1 })
+        XCTAssertEqual(stale.result?.objectValue?["requires_baseline"]?.boolValue, true,
+                       "another boot without a clean record never replays")
+        XCTAssertEqual(stale.result?.objectValue?["events"]?.arrayValue?.count, 0)
 
         var since = scenario.cursor
         var markers: [String] = []
         var gapThreads = Set<String>()
         for _ in 0..<40 {
             let response = await call([
-                "since_seq": .number(Double(since)), "max_bytes": .number(300_000), "durable": .bool(true),
-            ])
+                "since_seq": .number(Double(since)), "max_bytes": .number(300_000),
+            ].merging(envelope) { $1 })
             let result = try XCTUnwrap(response.result?.objectValue)
             XCTAssertEqual(result["requires_baseline"]?.boolValue, false)
             for gap in result["stream_gaps"]?.arrayValue ?? [] {
@@ -298,5 +317,52 @@ final class DurableReplayWebSocketTests: XCTestCase {
 
         let bad = await call(["since_seq": .number(0), "durable": .string("yes")])
         XCTAssertEqual(bad.error?.code, -32602)
+        let badEpoch = await call(["since_seq": .number(0), "durable": .bool(true), "resume_boot_epoch": .string("42")])
+        XCTAssertEqual(badEpoch.error?.code, -32602)
+    }
+
+    func test_durableSocket_withoutResumeEnvelope_belowTheRing_getsBaselineRequired() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        let scenario = evictedRingScenario()
+        // No X-RC2-Resume-* headers: the cursor could be from a boot that
+        // crashed before persisting its tail, so the log cannot vouch for it.
+        let task = socket(port: port, since: scenario.cursor, durable: true)
+        defer { task.cancel(with: .goingAway, reason: nil) }
+
+        let welcome = try await next(task)
+        XCTAssertEqual((welcome["replayFromSequence"] as? NSNumber)?.int64Value,
+                       (welcome["currentSequence"] as? NSNumber)?.int64Value)
+        let first = try await frames(task) { _ in true }
+        XCTAssertEqual(first.first?["type"] as? String, "baselineRequired")
+        XCTAssertEqual(log.pageReads, 0, "no event-log read for an unproven cursor")
+    }
+
+    func test_cellularSocket_getsGapsOnlyForThreadsItsFilterCarries() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        let scenario = evictedRingScenario()
+        var request = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
+        request.setValue("\(scenario.cursor)", forHTTPHeaderField: "X-RC2-Since-Seq")
+        request.setValue("v1", forHTTPHeaderField: "X-RC2-Durable-Replay")
+        request.setValue("durable-host", forHTTPHeaderField: "X-RC2-Resume-Host-Id")
+        request.setValue("42", forHTTPHeaderField: "X-RC2-Resume-Boot-Epoch")
+        request.setValue("cellular-safe", forHTTPHeaderField: "X-RC2-WS-Filter")
+        request.setValue(scenario.gapThread, forHTTPHeaderField: "X-RC2-WS-Interest-Threads")
+        let task = URLSession(configuration: .ephemeral).webSocketTask(with: request)
+        task.maximumMessageSize = 4 * 1_024 * 1_024
+        task.resume()
+        defer { task.cancel(with: .goingAway, reason: nil) }
+
+        let welcome = try await next(task)
+        XCTAssertEqual((welcome["replayFromSequence"] as? NSNumber)?.int64Value, scenario.cursor)
+        var gapThreads: [String] = []
+        let backlog = try await frames(task) { frame in
+            if frame["type"] as? String == "streamGap" { gapThreads.append(frame["threadId"] as? String ?? "") }
+            return frame["type"] as? String == "replayComplete"
+        }
+        XCTAssertEqual(gapThreads, [scenario.gapThread],
+                       "the flood thread is outside the interest set: its deltas never reach this phone, so no refetch")
+        XCTAssertEqual(backlog.compactMap(marker), ["m1", "m2", "m3"])
     }
 }

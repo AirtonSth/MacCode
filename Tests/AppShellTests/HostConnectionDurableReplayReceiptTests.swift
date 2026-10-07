@@ -43,6 +43,7 @@ final class HostConnectionDurableReplayReceiptTests: XCTestCase {
         let path: String
         let replayedEvents: Int
         let streamGaps: Int
+        var welcomeMs: Double = 0
     }
 
     override func setUpWithError() throws {
@@ -131,6 +132,189 @@ final class HostConnectionDurableReplayReceiptTests: XCTestCase {
         try await runCell(name: "resume_after_5_min_gap_legacy_client", seconds: 300, durable: false)
     }
 
+    /// A client with no state (first pairing, cleared cache) connects with
+    /// since=0. The host must answer with a baseline without reading the
+    /// event log first; the log holds the 5000-row retention cap here.
+    @MainActor
+    func test_receipt_freshConnect_durable() async throws {
+        try await runFreshConnect(name: "fresh_connect_since_0", durable: true)
+    }
+
+    @MainActor
+    func test_receipt_freshConnect_legacyClient() async throws {
+        try await runFreshConnect(name: "fresh_connect_since_0_legacy_client", durable: false)
+    }
+
+    @MainActor
+    private func runFreshConnect(name: String, durable: Bool) async throws {
+        let seqAtWiring = EventBus.shared.currentSeq
+        let fixture = try makeFixture()
+        defer { fixture.server.stop() }
+        Self.seedStateRows(5_000, workspace: fixture.workspace)
+        fixture.context.flushEventPersistence()
+        var samples: [Sample] = []
+        for index in 0..<(Self.warmups + Self.samples) {
+            let sample = try await Self.resume(fixture, cursor: 0, durable: durable, envelope: false)
+            if index >= Self.warmups { samples.append(sample) }
+        }
+        Self.report(name, samples.map(\.timeToLiveMs), extra: [
+            "header_sent": durable,
+            "bus_seq_at_wiring": seqAtWiring,
+            "event_log_rows": try Self.eventLogRows(fixture),
+            "paths": samples.map(\.path),
+            "bytes_p50": samples.map(\.bytes).sorted()[samples.count / 2],
+            "welcome_ms": samples.map { ($0.welcomeMs * 1000).rounded() / 1000 },
+            "welcome_p50_ms": Self.percentile(samples.map(\.welcomeMs), 0.5),
+            "welcome_p95_ms": Self.percentile(samples.map(\.welcomeMs), 0.95),
+        ])
+    }
+
+    /// A clean quit, then a new boot epoch: the client resumes with the old
+    /// epoch's cursor after a 5 minute gap that straddles the restart.
+    @MainActor
+    func test_receipt_cleanRestartResume_5MinuteGap_durable() async throws {
+        let first = try makeFixture()
+        var server = first.server
+        var epoch: UInt64 = 1
+        defer { server.stop() }
+        var samples: [Sample] = []
+        for index in 0..<(Self.warmups + Self.samples) {
+            let cursor = EventBus.shared.currentSeq
+            Self.simulateGap(seconds: 300, workspace: first.workspace, round: index)
+            first.context.flushEventPersistence()
+            server.stop()
+            XCTAssertTrue(DurableReplayResumeRecord.write(
+                eventBus: .shared, settings: first.context.settingsRepo, bootEpoch: epoch
+            ), "a clean quit must leave a resume record")
+            XCTAssertTrue(DurableReplayResumeRecord.restore(
+                eventBus: .shared, settings: first.context.settingsRepo, bootEpoch: epoch + 1
+            ))
+            let restarted = try Self.startServer(first.context, bootEpoch: epoch + 1)
+            server = restarted.server
+            let fixture = Fixture(context: first.context, server: restarted.server, token: first.token,
+                                  port: restarted.port, workspace: first.workspace)
+            let sample = try await Self.resume(fixture, cursor: cursor, durable: true, envelopeEpoch: epoch)
+            epoch += 1
+            if index >= Self.warmups { samples.append(sample) }
+        }
+        EventBus.shared.clearPreviousBootReplayForTesting()
+        Self.report("clean_restart_resume_after_5_min_gap", samples.map(\.timeToLiveMs), extra: [
+            "header_sent": true,
+            "paths": samples.map(\.path),
+            "bytes": samples.map(\.bytes),
+            "bytes_p50": samples.map(\.bytes).sorted()[samples.count / 2],
+            "replayed_events": samples.map(\.replayedEvents),
+            "stream_gaps": samples.map(\.streamGaps),
+            "welcome_p50_ms": Self.percentile(samples.map(\.welcomeMs), 0.5),
+        ])
+    }
+
+    /// The pre-welcome budget estimate, old SQL vs the bounded, anchored SQL,
+    /// on the same file-backed log (5000 rows, the retention cap), for the
+    /// cursors that reach it: fresh (0), pruned (below the oldest row),
+    /// 1 h old and 5 min old.
+    @MainActor
+    func test_receipt_budgetEstimateSQL_oldVersusBounded() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.server.stop() }
+        Self.seedStateRows(5_200, workspace: fixture.workspace)
+        fixture.context.flushEventPersistence()
+        let db = fixture.context.readDB
+        func scalar(_ sql: String) throws -> Int64 {
+            let st = try db.prepare(sql)
+            _ = try st.step()
+            return st.columnInt64(0)
+        }
+        let oldest = try scalar("SELECT MIN(seq) FROM events;")
+        let newest = try scalar("SELECT MAX(seq) FROM events;")
+        let rowLimit = DurableReplayContract.maximumReplayBytes / 200 + 1
+        func oldEstimate(_ after: Int64) throws {
+            let st = try db.prepare("""
+                SELECT COUNT(*),
+                       COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB)) + LENGTH(CAST(kind AS BLOB))), 0)
+                FROM events WHERE seq > ? AND seq <= ?;
+            """)
+            try st.bind(1, after); try st.bind(2, newest)
+            _ = try st.step()
+        }
+        func newEstimate(_ after: Int64) throws {
+            let anchor = try db.prepare("SELECT 1 FROM events WHERE seq <= ? LIMIT 1;")
+            try anchor.bind(1, after)
+            guard try anchor.step() else { return }
+            let st = try db.prepare("""
+                SELECT COUNT(*),
+                       COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB)) + LENGTH(CAST(kind AS BLOB))), 0)
+                FROM (
+                    SELECT payload_json, kind FROM events
+                    WHERE seq > ? AND seq <= ?
+                    ORDER BY seq ASC LIMIT ?
+                );
+            """)
+            try st.bind(1, after); try st.bind(2, newest); try st.bind(3, Int64(rowLimit))
+            _ = try st.step()
+        }
+        let cursors: [(String, Int64)] = [
+            ("fresh_since_0", 0),
+            ("pruned_below_oldest", max(0, oldest - 1)),
+            ("1_h_1800_rows", newest - 1_800),
+            ("5_min_150_rows", newest - 150),
+        ]
+        for (label, cursor) in cursors {
+            for (variant, run) in [("old_unbounded", oldEstimate), ("new_bounded_anchored", newEstimate)] {
+                var timings: [Double] = []
+                for index in 0..<(Self.warmups + Self.samples) {
+                    let t0 = DispatchTime.now()
+                    try run(cursor)
+                    if index >= Self.warmups { timings.append(Self.ms(since: t0)) }
+                }
+                Self.report("budget_estimate_\(label)_\(variant)", timings, extra: [
+                    "event_log_rows": newest - oldest + 1, "row_limit": rowLimit,
+                ])
+            }
+        }
+    }
+
+    /// Persisted state rows, the kinds that dominate the live event log.
+    private static func seedStateRows(_ count: Int, workspace: String) {
+        let text = String(repeating: "The change is in place and the tests pass. ", count: 8)
+        for index in 0..<count {
+            EventBus.shared.publish(kind: .agentItemCompleted, payload: .object([
+                "thread_id": .string("receipt-seed-\(index % 40)"), "item_id": .string("seed-\(index)"),
+                "kind": .string("assistant_message"), "text": .string(text),
+            ]))
+        }
+    }
+
+    @MainActor
+    private static func eventLogRows(_ fixture: Fixture) throws -> Int64 {
+        let st = try fixture.context.readDB.prepare("SELECT COUNT(*) FROM events;")
+        _ = try st.step()
+        return st.columnInt64(0)
+    }
+
+    @MainActor
+    private static func startServer(_ context: AppContext, bootEpoch: UInt64) throws -> (server: DirectHTTPServer, port: UInt16) {
+        let auth = LocalAuthAdapter(repo: DeviceTrustRepository(db: context.db))
+        var lastError: Error?
+        for _ in 0..<20 {
+            let port = UInt16.random(in: 33000...44000)
+            let server = DirectHTTPServer(
+                port: port, loopbackOnly: true,
+                dispatcher: JSONRPCDispatcher(router: context.router),
+                auth: auth, serverId: "receipt-host", bootEpoch: bootEpoch
+            )
+            do { try server.start(); return (server, port) } catch { lastError = error }
+        }
+        throw lastError ?? NSError(domain: "receipt", code: 1)
+    }
+
+    private static func percentile(_ values: [Double], _ p: Double) -> Double {
+        let sorted = values.sorted()
+        guard !sorted.isEmpty else { return 0 }
+        let index = min(sorted.count - 1, Int((p * Double(sorted.count - 1)).rounded()))
+        return (sorted[index] * 1000).rounded() / 1000
+    }
+
     @MainActor
     private func runCell(name: String, seconds: Int, durable: Bool) async throws {
         let fixture = try makeFixture()
@@ -151,6 +335,7 @@ final class HostConnectionDurableReplayReceiptTests: XCTestCase {
             "bytes_p50": samples.map(\.bytes).sorted()[samples.count / 2],
             "replayed_events": samples.map(\.replayedEvents),
             "stream_gaps": samples.map(\.streamGaps),
+            "welcome_p50_ms": Self.percentile(samples.map(\.welcomeMs), 0.5),
         ])
     }
 
@@ -209,12 +394,20 @@ final class HostConnectionDurableReplayReceiptTests: XCTestCase {
         var bytes = 0
     }
 
-    private static func resume(_ fixture: Fixture, cursor: Int64, durable: Bool) async throws -> Sample {
+    private static func resume(
+        _ fixture: Fixture,
+        cursor: Int64,
+        durable: Bool,
+        envelope: Bool = true,
+        envelopeEpoch: UInt64 = 1
+    ) async throws -> Sample {
         var request = URLRequest(url: URL(string: "ws://127.0.0.1:\(fixture.port)/v1/ws")!)
         request.setValue("Bearer \(fixture.token)", forHTTPHeaderField: "Authorization")
         request.setValue("\(cursor)", forHTTPHeaderField: "X-RC2-Since-Seq")
-        request.setValue("receipt-host", forHTTPHeaderField: "X-RC2-Resume-Host-Id")
-        request.setValue("1", forHTTPHeaderField: "X-RC2-Resume-Boot-Epoch")
+        if envelope {
+            request.setValue("receipt-host", forHTTPHeaderField: "X-RC2-Resume-Host-Id")
+            request.setValue("\(envelopeEpoch)", forHTTPHeaderField: "X-RC2-Resume-Boot-Epoch")
+        }
         if durable { request.setValue("v1", forHTTPHeaderField: "X-RC2-Durable-Replay") }
         let session = URLSession(configuration: .ephemeral)
         defer { session.invalidateAndCancel() }
@@ -236,6 +429,7 @@ final class HostConnectionDurableReplayReceiptTests: XCTestCase {
             return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
         }
         let welcome = try await next()
+        let welcomeMs = ms(since: t0)
         let replayFrom = (welcome["replayFromSequence"] as? NSNumber)?.int64Value
         if replayFrom == cursor {
             var events = 0
@@ -247,11 +441,12 @@ final class HostConnectionDurableReplayReceiptTests: XCTestCase {
                 case "streamGap": gaps += 1
                 case "replayComplete":
                     return Sample(timeToLiveMs: ms(since: t0), bytes: bytes, path: "durable_replay",
-                                  replayedEvents: events, streamGaps: gaps)
+                                  replayedEvents: events, streamGaps: gaps, welcomeMs: welcomeMs)
                 case "baselineRequired":
                     let snapshotBytes = try await snapshot(fixture)
                     return Sample(timeToLiveMs: ms(since: t0), bytes: bytes + snapshotBytes,
-                                  path: "durable_then_baseline", replayedEvents: events, streamGaps: gaps)
+                                  path: "durable_then_baseline", replayedEvents: events, streamGaps: gaps,
+                                  welcomeMs: welcomeMs)
                 default: continue
                 }
             }
@@ -262,7 +457,7 @@ final class HostConnectionDurableReplayReceiptTests: XCTestCase {
         }
         let snapshotBytes = try await snapshot(fixture)
         return Sample(timeToLiveMs: ms(since: t0), bytes: bytes + snapshotBytes, path: "baseline_snapshot",
-                      replayedEvents: 0, streamGaps: 0)
+                      replayedEvents: 0, streamGaps: 0, welcomeMs: welcomeMs)
     }
 
     private static func snapshot(_ fixture: Fixture) async throws -> Int {

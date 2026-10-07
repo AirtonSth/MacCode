@@ -175,18 +175,33 @@ public final class EventLogRepository {
         return ReplayPage(rows: rows, anchored: anchored)
     }
 
-    /// Rows in `(after, through]` and their kind + payload bytes, for the
-    /// durable-replay budget.
-    public func estimateReplay(after: Int64, through: Int64) throws -> (rows: Int, bytes: Int) {
+    /// The oldest rows in `(after, through]` (at most `rowLimit`) and their
+    /// kind + payload bytes, for the durable-replay budget. `anchored` is
+    /// false when no row at or below `after` is left (retention may have
+    /// pruned past it); the sum is then skipped. Both reads are bounded: an
+    /// index seek and at most `rowLimit` rows, whatever the range.
+    public func estimateReplay(
+        after: Int64,
+        through: Int64,
+        rowLimit: Int
+    ) throws -> (rows: Int, bytes: Int, anchored: Bool) {
+        let anchor = try db.prepare("SELECT 1 FROM events WHERE seq <= ? LIMIT 1;")
+        try anchor.bind(1, after)
+        guard try anchor.step() else { return (0, 0, false) }
         let st = try db.prepare("""
             SELECT COUNT(*),
                    COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB)) + LENGTH(CAST(kind AS BLOB))), 0)
-            FROM events WHERE seq > ? AND seq <= ?;
+            FROM (
+                SELECT payload_json, kind FROM events
+                WHERE seq > ? AND seq <= ?
+                ORDER BY seq ASC LIMIT ?
+            );
         """)
         try st.bind(1, after)
         try st.bind(2, through)
-        guard try st.step() else { return (0, 0) }
-        return (Int(st.columnInt64(0)), Int(st.columnInt64(1)))
+        try st.bind(3, Int64(max(0, rowLimit)))
+        guard try st.step() else { return (0, 0, true) }
+        return (Int(st.columnInt64(0)), Int(st.columnInt64(1)), true)
     }
 
     /// Parses `created_at` (written by `appendBatch`) back to a Date.

@@ -11,14 +11,19 @@ final class FakeDurableEventLog: @unchecked Sendable {
     private var unacknowledged: [Int64] = []
     var acknowledgeImmediately = true
     private(set) var pageReads = 0
+    private(set) var estimateReads = 0
+    private(set) var lastEstimateRowLimit: Int?
 
     func wire(_ bus: EventBus) {
         bus.durableReplaySource = EventBus.DurableReplaySource(page: { [self] after, through, limit in
             page(after: after, through: through, limit: limit)
-        }, estimate: { [self] after, through in
+        }, estimate: { [self] after, through, rowLimit in
             lock.lock(); defer { lock.unlock() }
-            let range = rows.filter { $0.seq > after && $0.seq <= through }
-            return (range.count, range.reduce(0) { $0 + EventBus.retainedJSONByteCount($1) })
+            estimateReads += 1
+            lastEstimateRowLimit = rowLimit
+            guard rows.contains(where: { $0.seq <= after }) else { return (0, 0, false) }
+            let range = rows.filter { $0.seq > after && $0.seq <= through }.prefix(rowLimit)
+            return (range.count, range.reduce(0) { $0 + EventBus.retainedJSONByteCount($1) }, true)
         })
         bus.persister = { [weak bus, self] event in
             guard !EventBus.liveOnlyStreamEventKinds.contains(event.kind) else { return }
@@ -282,7 +287,101 @@ final class DurableReplayEventBusTests: XCTestCase {
         XCTAssertEqual(received, [lastDropped + 1], "live delivery resumes after the dropped range")
     }
 
+    func test_goLive_overflowHandlerThatPublishesToTheBus_doesNotDeadlock_andKeepsOrder() {
+        let bus = EventBus()
+        let subscription = bus.subscribeDurableReplay(since: bus.currentSeq)
+        defer { bus.unsubscribe(subscription.id) }
+        let big = String(repeating: "x", count: 1_100_000)
+        for _ in 0..<4 { delta(bus, thread: "t-big", text: big) }
+        let through = bus.currentSeq
+        let lock = NSLock()
+        var received: [Int64] = []
+        var outcome: DurableReplaySubscription.GoLiveOutcome?
+        let done = expectation(description: "goLive returns")
+        // HTTPServer's overflow handler can publish (pressure diagnostics);
+        // that publish waits on the delivery queue, which delivers to this
+        // very subscription. Holding its lock across the handler deadlocked.
+        DispatchQueue.global().async {
+            let result = subscription.goLive(deliver: { item in
+                lock.lock(); received.append(item.sequence); lock.unlock()
+            }, onOverflow: { _ in
+                self.state(bus, "published-from-overflow")
+                self.state(bus, "second")
+            })
+            lock.lock(); outcome = result; lock.unlock()
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+        state(bus, "live")
+        lock.lock(); defer { lock.unlock() }
+        XCTAssertEqual(outcome, .overflowed(lastSequence: through))
+        XCTAssertEqual(received, [through + 1, through + 2, through + 3],
+                       "events after the dropped range arrive once, in order, buffered then live")
+    }
+
     // MARK: - Driver
+
+    func test_driver_sendsGapsOnlyForStreamsTheSubscriberFilterCarries() {
+        let (bus, _, cursor) = evictedScenario()
+        delta(bus, thread: "t-other")
+        for index in 18...30 { state(bus, "s\(index)") }   // evicts t-other's delta
+        let cellular = bus.subscribeDurableReplay(
+            since: cursor, filter: .cellularSafe(interestThreadIds: ["t-lost"])
+        )
+        let threadsOnly = bus.subscribeDurableReplay(since: cursor, filter: .agentThreadAndQueue)
+        let full = bus.subscribeDurableReplay(since: cursor)
+        defer { [cellular, threadsOnly, full].forEach { bus.unsubscribe($0.id) } }
+        let allLost: Set<EventBus.StreamGap.Stream> = [.thread("t-lost"), .thread("t-in-ring"), .thread("t-other")]
+        XCTAssertEqual(Set(full.plan.streamGaps.map(\.stream)), allLost)
+
+        func gaps(_ subscription: DurableReplaySubscription) -> [EventBus.StreamGap.Stream] {
+            var sent: [EventBus.StreamGap.Stream] = []
+            let driver = DurableReplayDriver(
+                sliceBytes: 1 << 20,
+                firstPage: nil,
+                readPage: { bus.readDurableReplayPage(after: $0, through: $1, maxBytes: $2) },
+                deliverEvent: { _ in },
+                deliverFiltered: { _ in },
+                advanceWatermark: { _ in },
+                isOpen: { true },
+                waitForRoom: { _, _ in .ready },
+                sendGap: { sent.append($0.stream); return true },
+                requireBaseline: { _ in XCTFail("no baseline expected") }
+            )
+            guard case .completed(_, let count) = driver.run(subscription: subscription) else {
+                XCTFail("expected completion"); return sent
+            }
+            XCTAssertEqual(count, sent.count)
+            return sent
+        }
+        XCTAssertEqual(gaps(cellular), [.thread("t-lost")],
+                       "t-other's deltas never reach this phone; a gap would only cost it a refetch")
+        XCTAssertEqual(gaps(threadsOnly), [], "a socket that never carries deltas has nothing to refetch")
+        XCTAssertEqual(Set(gaps(full)), allLost)
+    }
+
+    func test_driver_socketThatStopsDraining_getsBaselineAtHead_insteadOfWaitingForever() {
+        let (bus, _, cursor) = evictedScenario()
+        let subscription = bus.subscribeDurableReplay(since: cursor)
+        defer { bus.unsubscribe(subscription.id) }
+        var baselineAt: Int64?
+        var timeouts: [TimeInterval] = []
+        let driver = DurableReplayDriver(
+            sliceBytes: 1,
+            firstPage: nil,
+            readPage: { bus.readDurableReplayPage(after: $0, through: $1, maxBytes: $2) },
+            deliverEvent: { _ in },
+            deliverFiltered: { _ in },
+            advanceWatermark: { _ in },
+            isOpen: { true },
+            waitForRoom: { _, timeout in timeouts.append(timeout); return .stalled },
+            sendGap: { _ in XCTFail("no gap after a baseline"); return true },
+            requireBaseline: { baselineAt = $0 }
+        )
+        XCTAssertEqual(driver.run(subscription: subscription), .baselineRequired)
+        XCTAssertEqual(baselineAt, 17)
+        XCTAssertEqual(timeouts, [DurableReplayDriver.defaultStallTimeout], "one bounded wait, no polling loop")
+    }
 
     func test_driver_skipsLiveOnlyHoles_thenAdvancesToHead_thenSendsGaps() {
         let (bus, _, cursor) = evictedScenario()
@@ -296,8 +395,8 @@ final class DurableReplayEventBusTests: XCTestCase {
             deliverEvent: { log.append("event \($0.seq)") },
             deliverFiltered: { log.append("filtered \($0)") },
             advanceWatermark: { log.append("advance \($0)") },
-            queuedBytes: { 0 },
             isOpen: { true },
+            waitForRoom: { _, _ in .ready },
             sendGap: { log.append("gap \($0.throughSequence)"); return true },
             requireBaseline: { log.append("baseline \($0)") }
         )
@@ -329,11 +428,13 @@ final class DurableReplayEventBusTests: XCTestCase {
             },
             deliverFiltered: { _ in },
             advanceWatermark: { _ in },
-            queuedBytes: { queued },
             isOpen: { true },
+            waitForRoom: { limit, _ in
+                if queued > limit { waits += 1; queued = 0 }
+                return .ready
+            },
             sendGap: { _ in true },
-            requireBaseline: { _ in XCTFail("no baseline expected") },
-            waitSlice: { waits += 1; queued = 0 }
+            requireBaseline: { _ in XCTFail("no baseline expected") }
         )
         XCTAssertEqual(driver.run(subscription: subscription), .completed(eventsReplayed: 13, gapsSent: 1))
         XCTAssertEqual(deliveredWhileFull, 0, "no slice is queued until the previous one drained")
@@ -355,8 +456,8 @@ final class DurableReplayEventBusTests: XCTestCase {
             deliverEvent: { _ in },
             deliverFiltered: { _ in },
             advanceWatermark: { _ in },
-            queuedBytes: { 0 },
             isOpen: { true },
+            waitForRoom: { _, _ in .ready },
             sendGap: { _ in gaps += 1; return true },
             requireBaseline: { baselineAt = $0 }
         )
@@ -377,8 +478,8 @@ final class DurableReplayEventBusTests: XCTestCase {
             deliverEvent: { _ in delivered += 1 },
             deliverFiltered: { _ in },
             advanceWatermark: { _ in },
-            queuedBytes: { 0 },
             isOpen: { delivered < 2 },
+            waitForRoom: { _, _ in delivered < 2 ? .ready : .closed },
             sendGap: { _ in XCTFail("closed socket gets no gap"); return true },
             requireBaseline: { _ in XCTFail("closed socket gets no baseline") }
         )
@@ -392,21 +493,60 @@ final class DurableReplayEventBusTests: XCTestCase {
         let previous = EventBus.PreviousBootReplay(
             bootEpoch: 6, highWater: 500, lostStreams: [:], minimumCursor: 0
         )
-        func accept(_ since: Int64, epoch: Int64?, host: String? = "h", record: EventBus.PreviousBootReplay?) -> (Int64, Bool) {
+        func accept(_ since: Int64, epoch: Int64?, host: String? = "h", record: EventBus.PreviousBootReplay?) -> (Int64, Bool, Bool) {
             let result = DurableReplayContract.acceptedResume(
                 requestedSinceSequence: since, requestedResumeHost: host,
                 requestedResumeBootEpoch: epoch, serverId: "h", bootEpoch: 7,
                 currentSequence: 600, previousBoot: record
             )
-            return (result.since, result.previousBoot)
+            return (result.since, result.previousBoot, result.eventLog)
         }
-        XCTAssertTrue(accept(400, epoch: 6, record: previous) == (400, true))
-        XCTAssertTrue(accept(400, epoch: 6, record: nil) == (0, false), "no record: baseline as before")
-        XCTAssertTrue(accept(501, epoch: 6, record: previous) == (0, false), "past what that boot published")
-        XCTAssertTrue(accept(400, epoch: 5, record: previous) == (0, false), "older epochs never resume")
-        XCTAssertTrue(accept(400, epoch: 6, host: "other", record: previous) == (0, false))
-        XCTAssertTrue(accept(550, epoch: 7, record: previous) == (550, false), "same boot works as before")
-        XCTAssertTrue(accept(550, epoch: nil, host: nil, record: previous) == (550, false), "legacy envelope-less cursor")
+        XCTAssertTrue(accept(400, epoch: 6, record: previous) == (400, true, true))
+        XCTAssertTrue(accept(400, epoch: 6, record: nil) == (0, false, false), "no record: baseline as before")
+        XCTAssertTrue(accept(501, epoch: 6, record: previous) == (0, false, false), "past what that boot published")
+        XCTAssertTrue(accept(400, epoch: 5, record: previous) == (0, false, false), "older epochs never resume")
+        XCTAssertTrue(accept(400, epoch: 6, host: "other", record: previous) == (0, false, false))
+        XCTAssertTrue(accept(550, epoch: 7, record: previous) == (550, false, true), "same boot works as before")
+        XCTAssertTrue(accept(550, epoch: nil, host: nil, record: previous) == (550, false, false),
+                      "legacy envelope-less cursor: same cursor, but its boot is unproven, so ring or baseline only")
+    }
+
+    func test_unprovenCursor_belowTheRing_getsBaseline_withoutReadingTheLog() {
+        let (bus, log, cursor) = evictedScenario()
+        XCTAssertEqual(bus.durableReplayPlan(since: cursor, allowEventLog: false).outcome, .baselineRequired,
+                       "a cursor from a crashed boot could sit on log holes and lost deltas no ledger has")
+        let ringPlan = bus.durableReplayPlan(since: 12, allowEventLog: false)
+        XCTAssertEqual(ringPlan.outcome, .replay, "the ring still serves it, as before C8")
+        XCTAssertEqual(ringPlan.durableThrough, 12)
+        XCTAssertEqual(log.pageReads, 0)
+        XCTAssertEqual(log.estimateReads, 0)
+    }
+
+    func test_freshConnect_sinceZero_getsBaseline_withoutAnyLogRead() {
+        let (bus, log, _) = evictedScenario()
+        let plan = bus.durableReplayPlan(since: 0)
+        XCTAssertEqual(plan.outcome, .baselineRequired, "a client with no state needs the snapshot anyway")
+        XCTAssertFalse(bus.durableReplayExceedsBudget(plan, maxBytes: 0), "no estimate for a baseline plan")
+        XCTAssertEqual(log.pageReads, 0)
+        XCTAssertEqual(log.estimateReads, 0)
+    }
+
+    func test_budgetEstimate_isBounded_andAnUnanchoredCursorExceedsIt() throws {
+        let (bus, log, cursor) = evictedScenario()
+        let plan = bus.durableReplayPlan(since: cursor)
+        let full = try XCTUnwrap(bus.estimatedDurableReplayBytes(plan))
+        let bounded = try XCTUnwrap(bus.estimatedDurableReplayBytes(plan, rowLimit: 1))
+        XCTAssertLessThan(bounded, full, "the estimate stops reading at the row limit")
+        // Every frame costs at least the overhead, so a 1,000-byte budget
+        // never needs more than 1000 / 200 + 1 rows to know it is exceeded.
+        _ = bus.durableReplayExceedsBudget(plan, maxBytes: 1_000)
+        XCTAssertEqual(log.lastEstimateRowLimit, 6)
+        _ = bus.durableReplayExceedsBudget(plan, maxBytes: DurableReplayContract.maximumReplayBytes)
+        XCTAssertEqual(log.lastEstimateRowLimit, DurableReplayContract.maximumReplayBytes / 200 + 1)
+
+        log.prune(through: cursor)
+        XCTAssertNil(bus.estimatedDurableReplayBytes(plan), "retention passed the cursor")
+        XCTAssertTrue(bus.durableReplayExceedsBudget(plan, maxBytes: .max), "baseline before any page read")
     }
 
     func test_streamGapFrame_roundTripsStrictly_andRejectsAmbiguousStream() throws {

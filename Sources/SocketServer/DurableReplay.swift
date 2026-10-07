@@ -42,6 +42,12 @@ public enum DurableReplayContract {
     /// legacy envelope-less) cursor works as before. A previous-boot cursor
     /// is kept only when that boot left a clean resume record and the cursor
     /// is not past what it published.
+    ///
+    /// `eventLog` is true only when the envelope proves which boot the cursor
+    /// came from (this boot, or the clean previous one). An envelope-less
+    /// cursor may come from a boot that crashed: its unpersisted events are
+    /// holes in the log and its lost deltas are in no ledger, so it gets the
+    /// ring or a baseline, as before C8.
     static func acceptedResume(
         requestedSinceSequence: Int64,
         requestedResumeHost: String?,
@@ -50,7 +56,7 @@ public enum DurableReplayContract {
         bootEpoch: Int64,
         currentSequence: Int64,
         previousBoot: EventBus.PreviousBootReplay?
-    ) -> (since: Int64, previousBoot: Bool) {
+    ) -> (since: Int64, previousBoot: Bool, eventLog: Bool) {
         let sameBoot = DirectHTTPServer.acceptedResumeSequence(
             requestedSinceSequence: requestedSinceSequence,
             requestedResumeHost: requestedResumeHost,
@@ -60,18 +66,19 @@ public enum DurableReplayContract {
             currentSequence: currentSequence
         )
         let hasEnvelope = requestedResumeHost != nil || requestedResumeBootEpoch != nil
+        guard hasEnvelope else { return (sameBoot, false, false) }
         let matchesCurrentBoot = requestedResumeHost == serverId
             && requestedResumeBootEpoch == bootEpoch
-        guard hasEnvelope, !matchesCurrentBoot else { return (sameBoot, false) }
+        if matchesCurrentBoot { return (sameBoot, false, true) }
         guard let previousBoot,
               requestedResumeHost == serverId,
               let epoch = requestedResumeBootEpoch,
               epoch >= 0, UInt64(epoch) == previousBoot.bootEpoch,
               requestedSinceSequence > 0,
               requestedSinceSequence <= previousBoot.highWater else {
-            return (0, false)
+            return (0, false, false)
         }
-        return (requestedSinceSequence, true)
+        return (requestedSinceSequence, true, true)
     }
 }
 
@@ -170,32 +177,47 @@ public final class DurableReplaySubscription: @unchecked Sendable {
 
     /// Maps a replayed event through this subscriber's current filter.
     public func map(_ event: EventBus.Event) -> EventBus.Event? {
-        bus?.mapForSubscriber(id, event) ?? EventStreamFilter.full.map(event)
+        // A nil from the subscriber's filter is a drop, not a missing bus:
+        // `bus?.map(...) ?? full` would resend every event the filter dropped.
+        guard let bus else { return EventStreamFilter.full.map(event) }
+        return bus.mapForSubscriber(id, event)
+    }
+
+    /// True when this subscriber's current filter carries the stream's
+    /// live-only events, so its gap means something to the client.
+    public func admits(_ gap: EventBus.StreamGap) -> Bool {
+        map(gap.representativeEvent) != nil
     }
 
     /// Delivers the buffered live events, then switches to direct delivery.
     /// On overflow, `onOverflow` runs before any later live event is
     /// delivered, with the newest dropped seq.
+    ///
+    /// No closure runs under `lock`: `receive` takes it on the EventBus
+    /// delivery queue, and `onOverflow` / `deliver` can publish to the bus
+    /// (pressure diagnostics), which waits on that queue.
     @discardableResult
     public func goLive(
         deliver: @escaping (Item) -> Void,
         onOverflow: (Int64) -> Void
     ) -> GoLiveOutcome {
+        var overflowedAt: Int64?
         while true {
             lock.lock()
             if let through = overflowedThrough {
+                // Events received from here on are all after `through`; they
+                // buffer and drain below once the overflow is reported.
                 overflowedThrough = nil
-                onOverflow(through)
-                self.deliver = deliver
-                isLive = true
                 lock.unlock()
-                return .overflowed(lastSequence: through)
+                onOverflow(through)
+                overflowedAt = through
+                continue
             }
             if buffered.isEmpty {
                 self.deliver = deliver
                 isLive = true
                 lock.unlock()
-                return .live
+                return overflowedAt.map { .overflowed(lastSequence: $0) } ?? .live
             }
             let items = buffered
             buffered.removeAll()
@@ -216,8 +238,18 @@ public final class DurableReplaySubscription: @unchecked Sendable {
 /// Streams a durable plan to one socket off the delivery queue: event-log
 /// pages, then the ring backlog, then stream gaps, then live delivery. Each
 /// slice waits until the outbound queue is back under `sliceBytes`, so a
-/// long backlog never fills the queue or sheds frames.
+/// long backlog never fills the queue or sheds frames. A socket that does
+/// not drain a slice within `stallTimeout` gets a baseline instead.
 struct DurableReplayDriver {
+    enum Room: Equatable {
+        case ready
+        case closed
+        case stalled
+    }
+
+    /// A slice the socket cannot drain in this long ends the replay.
+    static let defaultStallTimeout: TimeInterval = 10
+
     var sliceBytes: Int
     /// First event-log page, read before the welcome (proves the log still
     /// reaches the cursor).
@@ -229,13 +261,15 @@ struct DurableReplayDriver {
     var deliverFiltered: (Int64) -> Void
     /// Flushes coalesced frames and moves the gap watermark past `seq`.
     var advanceWatermark: (_ seq: Int64) -> Void
-    var queuedBytes: () -> Int
     var isOpen: () -> Bool
+    /// Blocks until at most `limit` bytes are queued (signalled by the
+    /// outbound queue, not polled), the socket closes, or `timeout` passes.
+    var waitForRoom: (_ limit: Int, _ timeout: TimeInterval) -> Room
+    var stallTimeout: TimeInterval = DurableReplayDriver.defaultStallTimeout
     /// Enqueues one stream gap; false when it could not be queued.
     var sendGap: (EventBus.StreamGap) -> Bool
     /// Falls back to a baseline from `head` (log pruned mid-replay, overflow).
     var requireBaseline: (_ head: Int64) -> Void
-    var waitSlice: () -> Void = { usleep(2_000) }
 
     enum Outcome: Equatable {
         case completed(eventsReplayed: Int, gapsSent: Int)
@@ -250,16 +284,8 @@ struct DurableReplayDriver {
         var replayed = 0
         var budgetUsed = 0
 
-        func waitForRoom() -> Bool {
-            budgetUsed = 0
-            while isOpen() {
-                if queuedBytes() <= sliceBytes { return true }
-                waitSlice()
-            }
-            return false
-        }
-        func emit(_ event: EventBus.Event) -> Bool {
-            if event.seq <= expectedNext - 1 { return true }
+        func emit(_ event: EventBus.Event) -> Room {
+            if event.seq <= expectedNext - 1 { return .ready }
             if event.seq > expectedNext {
                 // Live-only seqs are not in the event log: skip over them.
                 advanceWatermark(event.seq - 1)
@@ -272,8 +298,16 @@ struct DurableReplayDriver {
             }
             expectedNext = event.seq + 1
             replayed += 1
-            if budgetUsed >= sliceBytes { return waitForRoom() }
-            return isOpen()
+            if budgetUsed >= sliceBytes {
+                budgetUsed = 0
+                return waitForRoom(sliceBytes, stallTimeout)
+            }
+            return isOpen() ? .ready : .closed
+        }
+        func stop(_ room: Room) -> Outcome {
+            guard room == .stalled else { return .closed }
+            requireBaseline(plan.head)
+            return .baselineRequired
         }
 
         if plan.durableThrough > plan.since {
@@ -287,7 +321,8 @@ struct DurableReplayDriver {
                 }
                 page = nil
                 for event in current.events {
-                    guard emit(event) else { return .closed }
+                    let room = emit(event)
+                    guard room == .ready else { return stop(room) }
                 }
                 guard current.coveredThrough > after else {
                     requireBaseline(plan.head)
@@ -297,13 +332,18 @@ struct DurableReplayDriver {
             }
         }
         for event in plan.ringBacklog {
-            guard emit(event) else { return .closed }
+            let room = emit(event)
+            guard room == .ready else { return stop(room) }
         }
         // Trailing live-only seqs up to the head were lost or filtered.
         advanceWatermark(plan.head)
         var gaps = 0
         for gap in plan.streamGaps {
             guard isOpen() else { return .closed }
+            // A stream this socket's filter never carries (a thread outside a
+            // cellular interest set, a kind outside its prefixes) has nothing
+            // for the client to refetch.
+            guard subscription.admits(gap) else { continue }
             guard sendGap(gap) else {
                 requireBaseline(plan.head)
                 return .baselineRequired

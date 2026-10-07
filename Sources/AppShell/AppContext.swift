@@ -2710,8 +2710,8 @@ public final class AppContext {
                 return EventBus.Event(seq: row.seq, kind: row.kind, payload: payload, ts: ts)
             }
             return EventBus.DurableReplaySourcePage(events: events, anchored: page.anchored)
-        }, estimate: { after, through in
-            try replayLog.estimateReplay(after: after, through: through)
+        }, estimate: { after, through, rowLimit in
+            try replayLog.estimateReplay(after: after, through: through, rowLimit: rowLimit)
         })
         let writeBatch: ([EventBus.Event]) -> Void = { [weak self, weak eventBus] batch in
             defer { pending.finishBatch() }

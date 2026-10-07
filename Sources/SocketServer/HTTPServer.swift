@@ -2702,8 +2702,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             )
             let wsSinceSeq: Int64
             var durablePreviousBoot = false
+            var durableEventLog = false
             if durableReplayRequested {
-                (wsSinceSeq, durablePreviousBoot) = DurableReplayContract.acceptedResume(
+                (wsSinceSeq, durablePreviousBoot, durableEventLog) = DurableReplayContract.acceptedResume(
                     requestedSinceSequence: requestedSinceSequence,
                     requestedResumeHost: requestedResumeHost,
                     requestedResumeBootEpoch: requestedResumeBootEpoch,
@@ -2728,6 +2729,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 ? EventBus.shared.subscribeDurableReplay(
                     since: wsSinceSeq,
                     previousBoot: durablePreviousBoot,
+                    allowEventLog: durableEventLog,
                     filter: wsFilter
                 )
                 : nil
@@ -3165,8 +3167,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         batcher.flush()
                         sequenceWatermark.reanchorForExpiredReplay(sequence: sequence)
                     },
-                    queuedBytes: { outbound.queuedByteCount },
                     isOpen: { outbound.isOpen },
+                    waitForRoom: { limit, timeout in
+                        switch outbound.waitForRoom(atMost: limit, timeout: timeout) {
+                        case .room: return .ready
+                        case .closed: return .closed
+                        case .timedOut: return .stalled
+                        }
+                    },
                     sendGap: { gap in
                         guard let data = DurableReplayContract.streamGapData(
                             connectionId: connectionId,

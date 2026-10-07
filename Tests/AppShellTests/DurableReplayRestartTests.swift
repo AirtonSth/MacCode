@@ -88,7 +88,7 @@ final class DurableReplayRestartTests: XCTestCase {
             currentSequence: bus.currentSeq,
             previousBoot: bus.previousBootReplay
         )
-        XCTAssertTrue(accepted == (old.cursor, true))
+        XCTAssertTrue(accepted == (old.cursor, true, true))
 
         state(bus, "new-boot")
         context.flushEventPersistence(eventBus: bus)
@@ -127,7 +127,23 @@ final class DurableReplayRestartTests: XCTestCase {
             currentSequence: bus.currentSeq,
             previousBoot: bus.previousBootReplay
         )
-        XCTAssertTrue(accepted == (0, false), "a crash may have lost events: baseline")
+        XCTAssertTrue(accepted == (0, false, false), "a crash may have lost events: baseline")
+
+        // The same cursor without the envelope: its boot is unproven, so the
+        // log (whose crashed-boot deltas no ledger remembers) must not serve it.
+        let legacy = DurableReplayContract.acceptedResume(
+            requestedSinceSequence: old.cursor,
+            requestedResumeHost: nil,
+            requestedResumeBootEpoch: nil,
+            serverId: "host",
+            bootEpoch: Int64(context.liveActivityHostIdentity.bootEpoch),
+            currentSequence: bus.currentSeq,
+            previousBoot: bus.previousBootReplay
+        )
+        XCTAssertTrue(legacy == (old.cursor, false, false))
+        let plan = bus.durableReplayPlan(since: legacy.since, allowEventLog: legacy.eventLog)
+        XCTAssertEqual(plan.outcome, .baselineRequired,
+                       "t-a and t-b lost deltas in the crashed boot; a log replay would never report them")
     }
 
     func test_eventAfterTheRecord_invalidatesIt_butDiagnosticsDoNot() throws {
@@ -159,5 +175,28 @@ final class DurableReplayRestartTests: XCTestCase {
         ), "the log is not complete yet")
         gate.signal()
         context.flushEventPersistence(eventBus: bus)
+    }
+
+    /// The budget estimate runs before the welcome, so it must stay cheap
+    /// for any cursor: it stops at `rowLimit` rows and skips the byte sum
+    /// once retention has passed the cursor.
+    func test_sqliteEstimate_isBoundedByRowLimit_andReportsAPrunedCursor() throws {
+        let (context, bus) = try boot()
+        state(bus, "anchor")
+        let cursor = bus.currentSeq
+        for index in 0..<20 { state(bus, "row-\(index)") }
+        context.flushEventPersistence(eventBus: bus)
+        let log = EventLogRepository(db: context.readDB)
+
+        let all = try log.estimateReplay(after: cursor, through: bus.currentSeq, rowLimit: .max)
+        XCTAssertEqual(all.rows, 20)
+        XCTAssertTrue(all.anchored)
+        let bounded = try log.estimateReplay(after: cursor, through: bus.currentSeq, rowLimit: 3)
+        XCTAssertEqual(bounded.rows, 3)
+        XCTAssertLessThan(bounded.bytes, all.bytes)
+
+        let beforeRetention = try log.estimateReplay(after: 0, through: bus.currentSeq, rowLimit: .max)
+        XCTAssertFalse(beforeRetention.anchored, "no row at or below the cursor: it may have been pruned")
+        XCTAssertEqual(beforeRetention.rows, 0, "no byte sum for a cursor the log cannot serve")
     }
 }

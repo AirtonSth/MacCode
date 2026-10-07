@@ -873,6 +873,19 @@ public final class EventBus: @unchecked Sendable {
         public let sinceSequence: Int64
         /// Newest lost (or, once a stream has a gap, skipped) event of this stream.
         public let throughSequence: Int64
+
+        /// A stand-in for the lost events, so a subscriber filter can decide
+        /// whether this socket would have carried them.
+        var representativeEvent: Event {
+            switch stream {
+            case .thread(let id):
+                return Event(seq: throughSequence, kind: RemoteCodeEventKind.agentItemDelta.rawValue,
+                             payload: .object(["thread_id": .string(id)]), ts: 0)
+            case .surface(let id):
+                return Event(seq: throughSequence, kind: RemoteCodeEventKind.surfaceOutput.rawValue,
+                             payload: .object(["surface_id": .string(id)]), ts: 0)
+            }
+        }
     }
 
     /// One page from the durable event log: durable events with seq in
@@ -892,12 +905,14 @@ public final class EventBus: @unchecked Sendable {
     public struct DurableReplaySource: Sendable {
         /// `(after, through, limit)`: one page of durable events.
         public var page: @Sendable (Int64, Int64, Int) throws -> DurableReplaySourcePage
-        /// `(after, through)`: stored rows and their kind + payload bytes.
-        public var estimate: @Sendable (Int64, Int64) throws -> (rows: Int, bytes: Int)
+        /// `(after, through, rowLimit)`: the oldest stored rows in the range
+        /// (at most `rowLimit`) and their kind + payload bytes; `anchored` as
+        /// for a page (false: retention may have pruned past `after`).
+        public var estimate: @Sendable (Int64, Int64, Int) throws -> (rows: Int, bytes: Int, anchored: Bool)
 
         public init(
             page: @escaping @Sendable (Int64, Int64, Int) throws -> DurableReplaySourcePage,
-            estimate: @escaping @Sendable (Int64, Int64) throws -> (rows: Int, bytes: Int)
+            estimate: @escaping @Sendable (Int64, Int64, Int) throws -> (rows: Int, bytes: Int, anchored: Bool)
         ) {
             self.page = page
             self.estimate = estimate
@@ -1069,13 +1084,22 @@ public final class EventBus: @unchecked Sendable {
 #endif
 
     /// Plans a durable replay from `since`. `previousBoot` marks a cursor
-    /// accepted from the previous boot epoch.
-    public func durableReplayPlan(since: Int64, previousBoot: Bool = false) -> DurableReplayPlan {
+    /// accepted from the previous boot epoch. `allowEventLog` is false for a
+    /// cursor whose boot is unproven: only the ring may serve it.
+    public func durableReplayPlan(
+        since: Int64,
+        previousBoot: Bool = false,
+        allowEventLog: Bool = true
+    ) -> DurableReplayPlan {
         lock.lock(); defer { lock.unlock() }
-        return durableReplayPlanLocked(since: since, previousBoot: previousBoot)
+        return durableReplayPlanLocked(since: since, previousBoot: previousBoot, allowEventLog: allowEventLog)
     }
 
-    private func durableReplayPlanLocked(since: Int64, previousBoot: Bool) -> DurableReplayPlan {
+    private func durableReplayPlanLocked(
+        since: Int64,
+        previousBoot: Bool,
+        allowEventLog: Bool
+    ) -> DurableReplayPlan {
         let metadata = snapshotMetadataLocked()
         let head = lastSeq
         func plan(
@@ -1115,7 +1139,10 @@ public final class EventBus: @unchecked Sendable {
         if since >= ringCoverageFloor {
             durableThrough = since
         } else {
-            guard durableReplaySourceStorage != nil,
+            // since == 0 is a client with no state: it needs the baseline
+            // whatever the log holds, so no log read is spent on it.
+            guard allowEventLog, since > 0,
+                  durableReplaySourceStorage != nil,
                   since >= durableHoleFloor,
                   persistedThroughLocked() >= ringCoverageFloor else {
                 return plan(.baselineRequired)
@@ -1184,12 +1211,15 @@ public final class EventBus: @unchecked Sendable {
     }
 
     /// Estimated wire bytes of the event-log part of `plan` plus its ring
-    /// backlog. Nil when the plan needs no event log (the ring alone covers
-    /// the cursor, as for any client) or the estimate cannot be read.
-    public func estimatedDurableReplayBytes(_ plan: DurableReplayPlan) -> Int? {
+    /// backlog, counting at most `rowLimit` log rows. Nil when the plan
+    /// needs no event log (the ring alone covers the cursor, as for any
+    /// client), the estimate cannot be read, or the log no longer reaches
+    /// the cursor.
+    public func estimatedDurableReplayBytes(_ plan: DurableReplayPlan, rowLimit: Int = .max) -> Int? {
         guard plan.outcome == .replay, plan.durableThrough > plan.since,
               let source = durableReplaySource,
-              let stored = try? source.estimate(plan.since, plan.durableThrough) else { return nil }
+              let stored = try? source.estimate(plan.since, plan.durableThrough, rowLimit),
+              stored.anchored else { return nil }
         let ring = plan.ringBacklog.reduce(0) {
             $0 + Self.retainedJSONByteCount($1) + Self.replayFrameOverheadBytes
         }
@@ -1198,10 +1228,13 @@ public final class EventBus: @unchecked Sendable {
 
     /// True when the plan replays from the event log and that replay is
     /// estimated to cost more than `maxBytes` (or cannot be estimated): a
-    /// baseline is then the cheaper honest answer.
+    /// baseline is then the cheaper honest answer. Every row costs at least
+    /// `replayFrameOverheadBytes`, so the estimate stops reading one row past
+    /// the most the budget can hold.
     public func durableReplayExceedsBudget(_ plan: DurableReplayPlan, maxBytes: Int) -> Bool {
         guard plan.outcome == .replay, plan.durableThrough > plan.since else { return false }
-        guard let estimate = estimatedDurableReplayBytes(plan) else { return true }
+        let rowLimit = max(0, maxBytes) / Self.replayFrameOverheadBytes + 1
+        guard let estimate = estimatedDurableReplayBytes(plan, rowLimit: rowLimit) else { return true }
         return estimate > maxBytes
     }
 
@@ -1211,9 +1244,11 @@ public final class EventBus: @unchecked Sendable {
     public func durableRecentEvents(
         since: Int64,
         maxBytes: Int?,
+        previousBoot: Bool = false,
+        allowEventLog: Bool = true,
         replayBudgetBytes: Int = DurableReplayContract.maximumReplayBytes
     ) -> (result: RecentEventsResult, streamGaps: [StreamGap]) {
-        let plan = durableReplayPlan(since: since)
+        let plan = durableReplayPlan(since: since, previousBoot: previousBoot, allowEventLog: allowEventLog)
         let budget = (maxBytes ?? 0) > 0 ? maxBytes! : Int.max
         switch plan.outcome {
         case .live:
@@ -1261,11 +1296,16 @@ public final class EventBus: @unchecked Sendable {
     public func subscribeDurableReplay(
         since: Int64,
         previousBoot: Bool = false,
+        allowEventLog: Bool = true,
         filter: EventStreamFilter = .full
     ) -> DurableReplaySubscription {
         let register = { [self] () -> DurableReplaySubscription in
             lock.lock()
-            let plan = durableReplayPlanLocked(since: since, previousBoot: previousBoot)
+            let plan = durableReplayPlanLocked(
+                since: since,
+                previousBoot: previousBoot,
+                allowEventLog: allowEventLog
+            )
             let id = UUID()
             let subscription = DurableReplaySubscription(id: id, plan: plan, bus: self)
             subscribers[id] = Subscriber(

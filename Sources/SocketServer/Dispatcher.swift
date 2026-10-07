@@ -2585,9 +2585,54 @@ public final class JSONRPCDispatcher {
                 let result: EventBus.RecentEventsResult
                 var streamGaps: [EventBus.StreamGap] = []
                 if durable {
+                    // Only a cursor whose boot `resume_host_id` +
+                    // `resume_boot_epoch` prove (this boot, or the clean
+                    // previous one) may replay the event log; without them
+                    // the ring serves it or the caller needs a baseline.
+                    let resumeHost: String?
+                    switch params["resume_host_id"] {
+                    case nil: resumeHost = nil
+                    case .string(let value)?: resumeHost = value
+                    default: throw JSONRPCError.invalidParams
+                    }
+                    let resumeEpoch: Int64?
+                    switch params["resume_boot_epoch"] {
+                    case nil: resumeEpoch = nil
+                    case let value?:
+                        guard let epoch = value.intValue else { throw JSONRPCError.invalidParams }
+                        resumeEpoch = Int64(epoch)
+                    }
+                    let identity = eventIdentity.map { ($0.hostId, Int64($0.bootEpoch)) }
                     // The event-log read uses the read-only connection, off main.
                     (result, streamGaps) = await Task.detached(priority: .userInitiated) {
-                        EventBus.shared.durableRecentEvents(since: sinceSeq, maxBytes: maxBytes)
+                        let bus = EventBus.shared
+                        guard resumeHost != nil || resumeEpoch != nil, let identity else {
+                            return bus.durableRecentEvents(
+                                since: sinceSeq, maxBytes: maxBytes, allowEventLog: false
+                            )
+                        }
+                        let accepted = DurableReplayContract.acceptedResume(
+                            requestedSinceSequence: sinceSeq,
+                            requestedResumeHost: resumeHost,
+                            requestedResumeBootEpoch: resumeEpoch,
+                            serverId: identity.0,
+                            bootEpoch: identity.1,
+                            currentSequence: bus.currentSeq,
+                            previousBoot: bus.previousBootReplay
+                        )
+                        guard accepted.eventLog else {
+                            // A cursor from another host or an unrecoverable
+                            // boot: nothing after it can be trusted.
+                            let head = bus.currentSeq
+                            return (EventBus.RecentEventsResult(
+                                lastSeq: head, events: [], truncated: true, requiresBaseline: true
+                            ), [])
+                        }
+                        return bus.durableRecentEvents(
+                            since: accepted.since,
+                            maxBytes: maxBytes,
+                            previousBoot: accepted.previousBoot
+                        )
                     }.value
                 } else {
                     result = EventBus.shared.recentEvents(since: sinceSeq, maxBytes: maxBytes)
