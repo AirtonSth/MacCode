@@ -143,33 +143,35 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         readOffMainActorCountForTesting = 0
     }
 
-    private let db: SQLiteDB
+    /// WAL reader. Every gateway method is a pure read, so paired-device
+    /// list/page reads never wait on the writer connection's operation gate.
+    private let readDB: SQLiteDB
     private let queue: DispatchQueue
     // PERF: listPendingCallbacks allocated JSONDecoder per off-MainActor poll.
     // Gateway work is serial on `queue`, so one instance decoder is safe and
     // avoids per-call codec construction while decode behavior is unchanged.
     private let pendingCallbackDecoder = JSONDecoder()
 
-    public init(db: SQLiteDB) {
-        self.db = db
+    public init(db: SQLiteDB, readDB: SQLiteDB? = nil) {
+        self.readDB = readDB ?? db
         self.queue = DispatchQueue(label: Self.queueLabel, qos: .userInitiated)
     }
 
     public func listThreads(workspaceId: WorkspaceID?) async throws -> [AgentThread] {
         try await execute {
-            try AgentThreadRepository(db: self.db).list(workspaceId: workspaceId)
+            try AgentThreadRepository(db: self.readDB).list(workspaceId: workspaceId)
         }
     }
 
     public func threadIdsWithMessages() async throws -> Set<AgentThreadID> {
         try await execute {
-            try AgentMessageRepository(db: self.db).threadIdsWithMessages()
+            try AgentMessageRepository(db: self.readDB).threadIdsWithMessages()
         }
     }
 
     public func listMessages(threadId: AgentThreadID, limit: Int) async throws -> [AgentMessage] {
         try await execute {
-            try AgentMessageRepository(db: self.db).listRecent(
+            try AgentMessageRepository(db: self.readDB).listRecent(
                 threadId: threadId,
                 limit: max(0, min(limit, 500))
             )
@@ -183,7 +185,7 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         after: AgentMessageCursor?
     ) async throws -> AgentMessagePage {
         try await execute {
-            try AgentMessageRepository(db: self.db).listPage(
+            try AgentMessageRepository(db: self.readDB).listPage(
                 threadId: threadId,
                 limit: max(0, min(limit, 500)),
                 before: before,
@@ -201,7 +203,7 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         contentLimit: Int
     ) async throws -> AgentMessageBodyBudgetResult {
         try await execute {
-            try AgentMessageRepository(db: self.db).listPageWithinBodyBudget(
+            try AgentMessageRepository(db: self.readDB).listPageWithinBodyBudget(
                 threadId: threadId,
                 limit: max(1, min(limit, 500)),
                 before: before,
@@ -217,14 +219,14 @@ public final class AgentAppReadGateway: @unchecked Sendable {
 
     public func listQueuedMessages(threadId: AgentThreadID) async throws -> [AgentQueuedMessage] {
         try await execute {
-            try AgentQueuedMessageRepository(db: self.db).list(threadId: threadId)
+            try AgentQueuedMessageRepository(db: self.readDB).list(threadId: threadId)
         }
     }
 
     public func listPendingCallbacks(threadId: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot {
         try await execute {
             PendingCallbackSnapshotMapper.snapshot(
-                from: try ProviderPendingCallbackRepository(db: self.db).listVisible(threadId: threadId),
+                from: try ProviderPendingCallbackRepository(db: self.readDB).listVisible(threadId: threadId),
                 decoder: self.pendingCallbackDecoder
             )
         }
@@ -246,10 +248,10 @@ public final class AgentAppReadGateway: @unchecked Sendable {
                 }
                 do {
                     // The queue keeps the work off MainActor; performSync also
-                    // takes SQLiteDB's operation gate for the complete
-                    // statement/decode sequence so this gateway cannot race
-                    // existing readers or writers on the shared handle.
-                    let result = try self.db.performSync { _ in try work() }
+                    // takes the read connection's operation gate for the complete
+                    // statement/decode sequence and resets its statements after,
+                    // so no WAL read snapshot outlives the call.
+                    let result = try self.readDB.performSync { _ in try work() }
                     continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
@@ -501,7 +503,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         self.sshPasswordStore = sshPasswordStore
         self.sshCommandRunner = sshCommandRunner
         self.botSecretStore = secretStore
-        self.agentAppReadGateway = AgentAppReadGateway(db: context.db)
+        self.agentAppReadGateway = AgentAppReadGateway(db: context.db, readDB: context.readDB)
         installBotHostObservers()
     }
 

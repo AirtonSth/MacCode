@@ -1744,6 +1744,46 @@ final class HTTPServerTests: XCTestCase {
         )
     }
 
+    /// WHY (C3): /v1/rpc resolved its bearer twice per request — once for the
+    /// owner fingerprint, once for the RPC principal. One resolution supplies
+    /// both, on loopback (no gate) as well as through the gate.
+    @MainActor
+    func test_rpcWithBearer_verifiesTheBearerOncePerRequest() async throws {
+        let auth = StubAuth()
+        var started: DirectHTTPServer?
+        var port: UInt16 = 0
+        for _ in 0..<10 where started == nil {
+            port = UInt16.random(in: 33000...44000)
+            let server = DirectHTTPServer(
+                port: port,
+                loopbackOnly: true,
+                dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+                auth: auth,
+                serverId: "rpc-single-verify",
+                bootEpoch: 1
+            )
+            if (try? server.start()) != nil { started = server }
+        }
+        let server = try XCTUnwrap(started)
+        defer { server.stop() }
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/rpc")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer good-token", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(#"{"jsonrpc":"2.0","id":1,"method":"system.ping","params":{}}"#.utf8)
+        let (_, response) = try await URLSession.shared.data(for: request)
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(auth.verificationCount, 1,
+                       "one /v1/rpc request must resolve its bearer exactly once")
+        XCTAssertEqual(server.requestPhaseMetrics.snapshot().auth.count, 1,
+                       "/v1/health request_phases.auth_ms times the single resolution")
+        XCTAssertNotNil(DirectHTTPServer.requestPhaseMetricsJSON(
+            server.requestPhaseMetrics.snapshot()
+        )["auth_ms"])
+    }
+
     @MainActor
     func test_authenticatedCapabilities_acceptsRepeatedAuthorizationSpaces_extractsExactToken() throws {
         // WHY: Authorization: Bearer followed by one or more spaces then

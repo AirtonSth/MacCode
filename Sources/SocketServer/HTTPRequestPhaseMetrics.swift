@@ -21,6 +21,8 @@ public struct HTTPRequestPhaseLaneSnapshot: Sendable, Equatable {
 /// Used by `/v1/health` so operators can see whether pressure is in admit,
 /// snapshot read, encode, or write — without exposing request content.
 public struct HTTPRequestPhaseMetricsSnapshot: Sendable, Equatable {
+    /// Bearer → principal resolution in the HTTP auth gate.
+    public var auth: HTTPRequestPhaseLaneSnapshot = .zero
     public let admit: HTTPRequestPhaseLaneSnapshot
     public let snapshotRead: HTTPRequestPhaseLaneSnapshot
     public let snapshotEncode: HTTPRequestPhaseLaneSnapshot
@@ -47,6 +49,7 @@ public struct HTTPRequestPhaseMetricsSnapshot: Sendable, Equatable {
 /// Secret-free phase metrics for DirectHTTPServer request handling.
 public final class HTTPRequestPhaseMetrics: @unchecked Sendable {
     public enum Phase: String, Sendable {
+        case auth
         case admit
         case snapshotRead
         case snapshotEncode
@@ -75,6 +78,7 @@ public final class HTTPRequestPhaseMetrics: @unchecked Sendable {
     }
 
     private struct Storage {
+        var auth = Latency()
         var admit = Latency()
         var snapshotRead = Latency()
         var snapshotEncode = Latency()
@@ -95,6 +99,7 @@ public final class HTTPRequestPhaseMetrics: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         switch phase {
+        case .auth: storage.auth.record(latencyMilliseconds)
         case .admit: storage.admit.record(latencyMilliseconds)
         case .snapshotRead: storage.snapshotRead.record(latencyMilliseconds)
         case .snapshotEncode: storage.snapshotEncode.record(latencyMilliseconds)
@@ -136,6 +141,7 @@ public final class HTTPRequestPhaseMetrics: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return HTTPRequestPhaseMetricsSnapshot(
+            auth: storage.auth.snapshot,
             admit: storage.admit.snapshot,
             snapshotRead: storage.snapshotRead.snapshot,
             snapshotEncode: storage.snapshotEncode.snapshot,

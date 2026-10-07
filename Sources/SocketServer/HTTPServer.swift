@@ -2468,6 +2468,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             && path == "/v1/rpc"
             && headers["x-remotecode-attachment-upload"] == "1"
         var requestBearerVerified = false
+        var requestBearerAttempted = false
         var requestRPCPrincipal: DirectRPCPrincipal?
         let largeBodyAuthorized: Bool
         if requestedAttachmentUpload,
@@ -2484,6 +2485,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 requestRPCPrincipal = principal
                 largeBodyAuthorized = true
                 requestBearerVerified = true
+                requestBearerAttempted = true
             } else {
                 largeBodyAuthorized = false
             }
@@ -2570,19 +2572,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // receive terminal output, agent messages, and file-edit contents.
             // Loopback-only mode stays open, matching the HTTP gate (loopback is
             // trusted) and preserving the loopbackOnly: true test harness.
+            var verifiedWebSocketOwner: String?
             if Self.wsUpgradeRequiresToken(
                 loopbackOnly: bindLoopbackOnly,
                 hasAuthProvider: auth != nil,
                 remoteAuthenticated: remoteAuthenticated
             ),
                let auth = auth {
-                guard let token = presentedBearerToken, auth.verify(token: token) else {
+                guard let token = presentedBearerToken,
+                      let owner = auth.authorizedOwnerFingerprint(token: token) else {
                     send(fd: fd, status: 401, contentType: "text/plain",
                          body: Self.unauthorizedBody,
                          additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
                 }
+                verifiedWebSocketOwner = owner
             }
-            let webSocketOwnerFingerprint = presentedBearerToken.flatMap { token in
+            // The gate's owner is reused so the upgrade verifies its bearer once.
+            let webSocketOwnerFingerprint = verifiedWebSocketOwner ?? presentedBearerToken.flatMap { token in
                 auth?.authorizedOwnerFingerprint(token: token)
             } ?? Self.connectionOwnerFingerprint(
                 token: presentedBearerToken
@@ -3178,15 +3184,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let authenticated: Bool
             if requestBearerVerified {
                 authenticated = true
-            } else if path == "/v1/rpc",
-                      let token = presentedBearerToken,
-                      let principal = auth.authorizedRPCPrincipal(token: token) {
-                requestRPCPrincipal = principal
-                requestBearerVerified = true
-                authenticated = true
-            } else if let token = presentedBearerToken, auth.verify(token: token) {
-                requestBearerVerified = true
-                authenticated = true
+            } else if let token = presentedBearerToken {
+                // One resolution per request: the principal carries the owner
+                // fingerprint reused below, so the bearer is never verified twice.
+                requestBearerAttempted = true
+                let authStarted = DispatchTime.now().uptimeNanoseconds
+                requestRPCPrincipal = auth.authorizedRPCPrincipal(token: token)
+                requestPhaseMetrics.record(
+                    .auth,
+                    latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: authStarted)
+                )
+                requestBearerVerified = requestRPCPrincipal != nil
+                authenticated = requestBearerVerified
             } else {
                 authenticated = false
             }
@@ -3213,18 +3222,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let requestOwnerFingerprint = Self.connectionOwnerFingerprint(
             token: presentedBearerToken
         )
-        if let token = presentedBearerToken,
-           let owner = auth?.authorizedOwnerFingerprint(token: token) {
-            activeHTTPOwnerConnections.bind(fd, ownerFingerprint: owner)
-        }
         // A valid bearer on a trusted loopback connection still carries its
         // persisted scopes. Tokenless/invalid-token loopback remains the
-        // existing trusted-local full-access path.
-        if path == "/v1/rpc",
-           requestRPCPrincipal == nil,
+        // existing trusted-local full-access path. Resolve at most once.
+        if requestRPCPrincipal == nil,
+           !requestBearerAttempted,
            let auth,
            let token = presentedBearerToken {
+            requestBearerAttempted = true
+            let authStarted = DispatchTime.now().uptimeNanoseconds
             requestRPCPrincipal = auth.authorizedRPCPrincipal(token: token)
+            requestPhaseMetrics.record(
+                .auth,
+                latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: authStarted)
+            )
+        }
+        if let owner = requestRPCPrincipal?.ownerFingerprint {
+            activeHTTPOwnerConnections.bind(fd, ownerFingerprint: owner)
         }
         let effectiveRPCPrincipal = requestRPCPrincipal
             ?? DirectRPCPrincipal(
@@ -3734,6 +3748,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             ]
         }
         return [
+            "auth_ms": lane(metrics.auth),
             "admit_ms": lane(metrics.admit),
             "snapshot_read_ms": lane(metrics.snapshotRead),
             "snapshot_encode_ms": lane(metrics.snapshotEncode),

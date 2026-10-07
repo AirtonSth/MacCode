@@ -4506,7 +4506,17 @@ public final class AgentRunRepository: @unchecked Sendable {
     private let committedProviderEventLock = NSLock()
     private var knownProviderEventIdsByThread: [String: Set<String>] = [:]
     private static let committedProviderEventCacheLimit = 128
-    public init(db: SQLiteDB) { self.db = db }
+    /// WAL reader for paired-device stream reads (`agent.thread.read` v1), so
+    /// they do not wait on the writer's operation gate. Defaults to `db`.
+    private let readDB: SQLiteDB
+    public init(db: SQLiteDB) {
+        self.db = db
+        self.readDB = db
+    }
+    public init(db: SQLiteDB, readDB: SQLiteDB) {
+        self.db = db
+        self.readDB = readDB
+    }
 #if DEBUG
     /// Exact pre-screening path retained only for same-process A/B receipts.
     var useLegacyDurableHostMetadataDecodingForBenchmark = false
@@ -6598,10 +6608,18 @@ public final class AgentRunRepository: @unchecked Sendable {
         threadId: AgentThreadID,
         limit: Int
     ) throws -> [StreamEventRowMeta] {
+        try latestStreamEventMetadata(threadId: threadId, limit: limit, on: db)
+    }
+
+    private func latestStreamEventMetadata(
+        threadId: AgentThreadID,
+        limit: Int,
+        on connection: SQLiteDB
+    ) throws -> [StreamEventRowMeta] {
         let safeLimit = max(0, limit)
         guard safeLimit > 0 else { return [] }
         // Project LENGTH(blob) + last ~240 characters only. Never SELECT full payload_json.
-        let st = try db.prepare("""
+        let st = try connection.prepare("""
             SELECT id, seq, presentation_bytes, trailer_suffix
             FROM (
                 SELECT id, seq, started_at, ordering_id,
@@ -6641,8 +6659,21 @@ public final class AgentRunRepository: @unchecked Sendable {
         remainingByteBudget: Int64? = nil
     ) throws -> [AssistantEvent] {
         guard !ids.isEmpty else { return [] }
+        return try decodeStreamEventPayloads(
+            try streamEventPayloads(ids, strictDecoding: strictDecoding, on: db),
+            strictDecoding: strictDecoding,
+            remainingByteBudget: remainingByteBudget
+        )
+    }
+
+    private func streamEventPayloads(
+        _ ids: [Int64],
+        strictDecoding: Bool,
+        on connection: SQLiteDB
+    ) throws -> [(eventId: Int64, data: Data)] {
+        guard !ids.isEmpty else { return [] }
         let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
-        let st = try db.prepare("""
+        let st = try connection.prepare("""
             SELECT id, payload_json
             FROM agent_replay_stream_events
             WHERE id IN (\(placeholders))
@@ -6663,11 +6694,7 @@ public final class AgentRunRepository: @unchecked Sendable {
             }
             payloads.append((eventId, data))
         }
-        return try decodeStreamEventPayloads(
-            payloads,
-            strictDecoding: strictDecoding,
-            remainingByteBudget: remainingByteBudget
-        )
+        return payloads
     }
 
     private func decodeStreamEventPayloads(
@@ -6735,10 +6762,16 @@ public final class AgentRunRepository: @unchecked Sendable {
         let safeEventLimit = max(1, eventLimit)
         let safeMaxBytes = max(1, maxPayloadBytes)
         // +1 probe for honest has_more without materializing full history.
-        let meta = try listLatestStreamEventMetadata(
-            threadId: threadId,
-            limit: safeEventLimit + 1
-        )
+        // Row reads use the WAL reader and release it before decode: rehydrating
+        // an oversized row touches the writer, and the reader is never held
+        // while waiting for it.
+        let meta = try readDB.performSync { reader in
+            try latestStreamEventMetadata(
+                threadId: threadId,
+                limit: safeEventLimit + 1,
+                on: reader
+            )
+        }
         guard !meta.isEmpty else {
             return BoundedStreamEventSelection(
                 events: [],
@@ -6781,8 +6814,11 @@ public final class AgentRunRepository: @unchecked Sendable {
         let droppedFromInspected = selected.count < meta.count
         let hasMoreOlder = droppedFromInspected
 
-        let events = try listStreamEventsByIds(
-            selectedIds,
+        let payloads = try readDB.performSync { reader in
+            try streamEventPayloads(selectedIds, strictDecoding: strictDecoding, on: reader)
+        }
+        let events = try decodeStreamEventPayloads(
+            payloads,
             strictDecoding: strictDecoding,
             remainingByteBudget: safeMaxBytes
         )
