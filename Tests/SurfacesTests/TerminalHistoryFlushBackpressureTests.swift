@@ -86,6 +86,78 @@ final class TerminalHistoryFlushBackpressureTests: XCTestCase {
         )
     }
 
+    func test_flushBarrierWaitsForBytesParkedBehindInFlightWrite() throws {
+        // WHY: close and quit treat a resolved history barrier as "every byte
+        // accepted before it is durable". With one SQLite write in flight, the
+        // newest bytes park in pending/deferred and drain one chunk per write.
+        // A barrier queued behind only the in-flight write resolved true while
+        // the newest terminal output (up to the 4 MiB backlog) was unwritten,
+        // so quitting right after it lost the tail of the scrollback.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "RC2HistoryBarrierDrain-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let database = try SQLiteDB(path: directory.appendingPathComponent("history.sqlite").path)
+        try Schema.migrate(database)
+        let repository = TerminalOutputRepository(db: database)
+        let surfaceID = UUID().uuidString
+        let coordinator = TerminalHistoryCoordinator(
+            repository: repository,
+            surfaceID: surfaceID,
+            workspaceID: UUID().uuidString
+        )
+        coordinator.prepare(restored: false)
+        try waitForPreparation(coordinator)
+
+        let enteredPersist = DispatchSemaphore(value: 0)
+        let releasePersist = DispatchSemaphore(value: 0)
+        let firstPersistHold = FirstPersistHold()
+        coordinator.beforePersistForTesting = {
+            guard firstPersistHold.claim() else { return }
+            enteredPersist.signal()
+            releasePersist.wait()
+        }
+
+        coordinator.enqueue(Data(repeating: 0x41, count: chunkBytes))
+        XCTAssertEqual(enteredPersist.wait(timeout: .now() + 5), .success)
+        let tailMarker = Data("NEWEST_TAIL_BEFORE_BARRIER".utf8)
+        var parked = Data(repeating: 0x42, count: chunkBytes * 2)
+        parked.append(tailMarker)
+        coordinator.enqueue(parked)
+        XCTAssertGreaterThan(
+            coordinator.deferredReadyBytesForTesting,
+            0,
+            "the fixture must park bytes behind the in-flight write"
+        )
+        let expectedBytes = chunkBytes + parked.count
+
+        let barrier = coordinator.flushBarrier()
+        releasePersist.signal()
+        // Parked bytes drain on the main actor, which this test is holding.
+        XCTAssertFalse(
+            barrier.waitForGroups(until: .now() + 0.3),
+            "the barrier must not resolve while accepted bytes are still parked"
+        )
+        XCTAssertEqual(try repository.totalBytes(surfaceID: surfaceID), chunkBytes)
+
+        let deadline = Date().addingTimeInterval(5)
+        while !barrier.waitForGroups(until: .now()), Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.005))
+        }
+        XCTAssertTrue(barrier.wait(until: .now()), "a drained barrier must report success")
+        XCTAssertEqual(
+            try repository.totalBytes(surfaceID: surfaceID),
+            expectedBytes,
+            "every byte accepted before the barrier must be durable when it resolves"
+        )
+        let persisted = try repository.readWindow(surfaceID: surfaceID).chunks
+            .reduce(into: Data()) { $0.append($1.data) }
+        XCTAssertTrue(persisted.suffix(tailMarker.count) == tailMarker)
+    }
+
     private func waitForPreparation(
         _ coordinator: TerminalHistoryCoordinator,
         timeout: TimeInterval = 5
