@@ -3670,24 +3670,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         principal: effectiveRPCPrincipal
                     )
                 }
-                let watchdog = Task {
-                    while !Task.isCancelled {
-                        if !registry.isActive(fd) || !Self.isRPCPeerConnected(fd: fd) {
-                            ownerRegistry.unbind(fd)
-                            registry.close(fd)
-                            work.cancel()
-                            return
-                        }
-                        do {
-                            try await Task.sleep(nanoseconds: 5_000_000)
-                        } catch {
-                            return
-                        }
-                    }
+                // C9: the kernel wakes the watchdog on FIN/RST/shutdown instead
+                // of a 5 ms MSG_PEEK poll per in-flight RPC.
+                let watchdog = RPCPeerDisconnectWatchdog(fd: fd, isOwned: { registry.isActive(fd) }) {
+                    ownerRegistry.unbind(fd)
+                    registry.close(fd)
+                    work.cancel()
                 }
                 let respData = await work.value
-                watchdog.cancel()
-                _ = await watchdog.result
+                await watchdog.stop()
                 guard registry.isActive(fd) else {
                     self.requestPhaseMetrics.recordCancelled()
                     ownerRegistry.unbind(fd)
@@ -4005,18 +3996,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "snapshot_joined_total": metrics.joinedTotal,
             "write_aborted_total": metrics.writeAbortedTotal,
         ]
-    }
-
-    /// Non-consuming peer probe for the handed-off RPC socket. Registry state
-    /// alone cannot observe a remote FIN while no request reader owns the fd.
-    nonisolated static func isRPCPeerConnected(fd: Int32) -> Bool {
-        var byte: UInt8 = 0
-        let result = withUnsafeMutableBytes(of: &byte) { buffer in
-            Darwin.recv(fd, buffer.baseAddress, 1, MSG_PEEK | MSG_DONTWAIT)
-        }
-        if result > 0 { return true }
-        if result == 0 { return false }
-        return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
     }
 
     /// QA-003: pure async request/response seam — decode → dispatch →

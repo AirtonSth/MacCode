@@ -1,0 +1,1093 @@
+# C9 A/B instrumentation (NOT shipped). Apply on top of the commit before C9, plus
+# Sources/SocketServer/RPCPeerDisconnectWatchdog.swift from the C9 commit, to rerun
+# the interleaved A/B receipts in c9-transport.md.
+diff --git a/Sources/SocketServer/HTTPServer.swift b/Sources/SocketServer/HTTPServer.swift
+index b71f1734f..64d3f1bfe 100644
+--- a/Sources/SocketServer/HTTPServer.swift
++++ b/Sources/SocketServer/HTTPServer.swift
+@@ -1877,6 +1877,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
+                 continue
+             }
+             disableSIGPIPE(fd: fd)
++            if C9TransportTuning.noDelay { Self.enableNoDelay(fd) }
+             switch registry.register(fd, generation: acceptanceGeneration) {
+             case .accepted:
+                 break
+@@ -1910,6 +1911,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
+         }
+     }
+ 
++    static func enableNoDelay(_ fd: Int32) {
++        var yes: Int32 = 1
++        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
++    }
++
+     private func disableSIGPIPE(fd: Int32) {
+         var yes: Int32 = 1
+         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
+@@ -2683,10 +2689,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
+                 &wsReceiveTimeout,
+                 socklen_t(MemoryLayout<timeval>.size)
+             )
+-            let frameWriter = WebSocketConnectionWriter { [weak self] opcode, data in
+-                guard let self else { return false }
+-                return self.sendWSFrame(fd: fd, opcode: opcode, data: data)
+-            }
++            let frameWriter = WebSocketConnectionWriter(
++                writeFrame: { [weak self] opcode, data in
++                    guard let self else { return false }
++                    return self.sendWSFrame(fd: fd, opcode: opcode, data: data)
++                },
++                writeFrames: { [weak self] frames in
++                    guard let self else { return false }
++                    return self.sendWSFrames(fd: fd, frames: frames)
++                }
++            )
+             let connectionId = UUID().uuidString
+             let eventSnapshot = EventBus.shared.snapshotMetadata()
+             let requestedSinceSequence = headers["x-rc2-since-seq"]
+@@ -2828,6 +2840,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
+                         compressed: wsCompressionEnabled
+                     )
+                 },
++                applicationBatchWriter: { [weak self] payloads in
++                    guard let self else { return false }
++                    return frameWriter.send(frames: payloads.map {
++                        self.wsEventFrame(data: $0, compressed: wsCompressionEnabled)
++                    })
++                },
+                 controlWriter: { opcode, data in
+                     frameWriter.send(opcode: opcode, data: data)
+                 },
+@@ -3670,24 +3688,35 @@ public final class DirectHTTPServer: @unchecked Sendable {
+                         principal: effectiveRPCPrincipal
+                     )
+                 }
+-                let watchdog = Task {
+-                    while !Task.isCancelled {
+-                        if !registry.isActive(fd) || !Self.isRPCPeerConnected(fd: fd) {
+-                            ownerRegistry.unbind(fd)
+-                            registry.close(fd)
+-                            work.cancel()
+-                            return
+-                        }
+-                        do {
+-                            try await Task.sleep(nanoseconds: 5_000_000)
+-                        } catch {
+-                            return
++                let respData: Data
++                if C9TransportTuning.sourceWatchdog {
++                    let watchdog = RPCPeerDisconnectWatchdog(fd: fd, isOwned: { registry.isActive(fd) }) {
++                        ownerRegistry.unbind(fd)
++                        registry.close(fd)
++                        work.cancel()
++                    }
++                    respData = await work.value
++                    await watchdog.stop()
++                } else {
++                    let watchdog = Task {
++                        while !Task.isCancelled {
++                            if !registry.isActive(fd) || !Self.isRPCPeerConnected(fd: fd) {
++                                ownerRegistry.unbind(fd)
++                                registry.close(fd)
++                                work.cancel()
++                                return
++                            }
++                            do {
++                                try await Task.sleep(nanoseconds: 5_000_000)
++                            } catch {
++                                return
++                            }
+                         }
+                     }
++                    respData = await work.value
++                    watchdog.cancel()
++                    _ = await watchdog.result
+                 }
+-                let respData = await work.value
+-                watchdog.cancel()
+-                _ = await watchdog.result
+                 guard registry.isActive(fd) else {
+                     self.requestPhaseMetrics.recordCancelled()
+                     ownerRegistry.unbind(fd)
+@@ -4137,6 +4166,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
+                     return rpcErrorData(.invalidRequest, id: NSNull())
+                 }
+             }
++            if C9TransportTuning.parallelBatch {
++                return rpcJSONData(await dispatchReadOnlyBatchConcurrently(
++                    batch,
++                    principal: principal,
++                    wireTransport: wireTransport
++                ))
++            }
+             var responses: [[String: Any]] = []
+             responses.reserveCapacity(batch.count)
+             for item in batch {
+@@ -4205,6 +4241,39 @@ public final class DirectHTTPServer: @unchecked Sendable {
+         ))
+     }
+ 
++    /// JSON values cross the task group as one opaque box; each item's value
++    /// is only touched by the child that owns it and then by the reassembly.
++    private struct UncheckedRPCValue: @unchecked Sendable {
++        let value: Any
++    }
++
++    /// Read-only batch items run concurrently (validated read-only above), and
++    /// the responses keep the request order.
++    private func dispatchReadOnlyBatchConcurrently(
++        _ batch: [Any],
++        principal: DirectRPCPrincipal,
++        wireTransport: AgentCheckpointListContract.WireTransport
++    ) async -> [[String: Any]] {
++        await withTaskGroup(of: (Int, UncheckedRPCValue).self) { group in
++            for (index, item) in batch.enumerated() {
++                let boxed = UncheckedRPCValue(value: item)
++                group.addTask {
++                    let response = await self.dispatchStrictRPCItem(
++                        boxed.value,
++                        principal: principal,
++                        wireTransport: wireTransport
++                    )
++                    return (index, UncheckedRPCValue(value: response))
++                }
++            }
++            var ordered = [[String: Any]?](repeating: nil, count: batch.count)
++            for await (index, response) in group {
++                ordered[index] = response.value as? [String: Any]
++            }
++            return ordered.map { $0 ?? rpcErrorObject(.internalError, id: NSNull()) }
++        }
++    }
++
+     private func dispatchStrictRPCItem(
+         _ value: Any,
+         principal: DirectRPCPrincipal,
+@@ -5865,6 +5934,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
+         // instead of concatenating into one Data — avoids a full-body copy
+         // per response, which doubled transient memory for large payloads
+         // (agent.message.list / git.diff).
++        if C9TransportTuning.writev {
++            return Self.writeAll(fd: fd, head: Data(head.utf8), body: responseBody)
++        }
+         guard writeAll(fd: fd, data: Data(head.utf8)) else { return false }
+         if !responseBody.isEmpty {
+             return writeAll(fd: fd, data: responseBody)
+@@ -6048,12 +6120,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
+         data: Data,
+         compressed: Bool
+     ) -> Bool {
++        let frame = wsEventFrame(data: data, compressed: compressed)
++        return writer.send(opcode: frame.opcode, data: frame.data)
++    }
++
++    /// Opcode and payload for one application event: a binary envelope when
++    /// compression is negotiated and actually smaller, otherwise text.
++    private func wsEventFrame(data: Data, compressed: Bool) -> (opcode: UInt8, data: Data) {
+         if compressed,
+            let envelope = try? PayloadCodec.encodeWebSocketEnvelope(data),
+            envelope.count < data.count {
+-            return writer.send(opcode: 0x2, data: envelope)
++            return (0x2, envelope)
+         }
+-        return writer.send(opcode: 0x1, data: data)
++        return (0x1, data)
+     }
+ 
+     private func sendWSText(writer: WebSocketConnectionWriter, data: Data) {
+@@ -6061,8 +6140,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
+     }
+ 
+     private func sendWSFrame(fd: Int32, opcode: UInt8, data: Data) -> Bool {
+-        // server frames are unmasked
+         var frame = Data()
++        Self.appendWSFrame(opcode: opcode, data: data, to: &frame)
++        return writeAll(fd: fd, data: frame)
++    }
++
++    /// Several complete frames in one buffer and one `writeAll`.
++    private func sendWSFrames(fd: Int32, frames: [(opcode: UInt8, data: Data)]) -> Bool {
++        var buffer = Data()
++        buffer.reserveCapacity(frames.reduce(0) { $0 + $1.data.count + 10 })
++        for frame in frames {
++            Self.appendWSFrame(opcode: frame.opcode, data: frame.data, to: &buffer)
++        }
++        return writeAll(fd: fd, data: buffer)
++    }
++
++    static func appendWSFrame(opcode: UInt8, data: Data, to frame: inout Data) {
++        // server frames are unmasked
+         frame.append(0x80 | opcode)
+         let len = data.count
+         if len <= 125 {
+@@ -6077,7 +6171,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
+             }
+         }
+         frame.append(data)
+-        return writeAll(fd: fd, data: frame)
+     }
+ 
+     private func wsServeLoop(
+@@ -6471,6 +6564,73 @@ public final class DirectHTTPServer: @unchecked Sendable {
+         }
+     }
+ 
++    /// `writeAll` for a response head and body: one `writev` per kernel
++    /// acceptance instead of two writes, with no concatenation copy. Same
++    /// non-blocking progress rules as `writeAll(fd:data:)`.
++    @discardableResult
++    static func writeAll(
++        fd: Int32,
++        head: Data,
++        body: Data,
++        progressIdleTimeout: TimeInterval = writeProgressIdleTimeout,
++        now: () -> TimeInterval = { Date().timeIntervalSinceReferenceDate },
++        writevFn: (Int32, UnsafePointer<iovec>, Int32) -> Int = { Darwin.writev($0, $1, $2) },
++        waitWritable: (Int32, TimeInterval) -> Bool = { fd, timeout in
++            waitForWritable(fd: fd, timeout: timeout)
++        }
++    ) -> Bool {
++        let total = head.count + body.count
++        guard total > 0 else { return true }
++        _ = enableNonBlocking(fd)
++        return head.withUnsafeBytes { headBytes in
++            body.withUnsafeBytes { bodyBytes in
++                var offset = 0
++                var lastProgressAt = now()
++                while offset < total {
++                    var vectors: [iovec] = []
++                    vectors.reserveCapacity(2)
++                    if offset < head.count, let base = headBytes.baseAddress {
++                        vectors.append(iovec(
++                            iov_base: UnsafeMutableRawPointer(mutating: base.advanced(by: offset)),
++                            iov_len: head.count - offset
++                        ))
++                    }
++                    let bodyOffset = max(0, offset - head.count)
++                    if bodyOffset < body.count, let base = bodyBytes.baseAddress {
++                        vectors.append(iovec(
++                            iov_base: UnsafeMutableRawPointer(mutating: base.advanced(by: bodyOffset)),
++                            iov_len: body.count - bodyOffset
++                        ))
++                    }
++                    let n = vectors.withUnsafeBufferPointer { buffer in
++                        writevFn(fd, buffer.baseAddress!, Int32(buffer.count))
++                    }
++                    if n > 0 {
++                        offset += n
++                        lastProgressAt = now()
++                        continue
++                    }
++                    if n < 0 {
++                        let err = errno
++                        if err == EINTR { continue }
++                        if err == EAGAIN || err == EWOULDBLOCK {
++                            let remaining = progressIdleTimeout - (now() - lastProgressAt)
++                            if remaining <= 0 { return false }
++                            if !waitWritable(fd, remaining),
++                               now() - lastProgressAt >= progressIdleTimeout {
++                                return false
++                            }
++                            continue
++                        }
++                        return false
++                    }
++                    return false
++                }
++                return true
++            }
++        }
++    }
++
+     static func jsonValueToAny(_ v: JSONValue) -> Any {
+         switch v {
+         case .null: return NSNull()
+diff --git a/Sources/SocketServer/TailcatLoopbackListener.swift b/Sources/SocketServer/TailcatLoopbackListener.swift
+index 1a73ebff0..03a015c4a 100644
+--- a/Sources/SocketServer/TailcatLoopbackListener.swift
++++ b/Sources/SocketServer/TailcatLoopbackListener.swift
+@@ -136,6 +136,7 @@ public final class TailcatLoopbackListener: TailcatLoopbackListening, @unchecked
+                 &noSIGPIPE,
+                 socklen_t(MemoryLayout<Int32>.size)
+             )
++            if C9TransportTuning.noDelay { DirectHTTPServer.enableNoDelay(accepted) }
+             guard case .accepted = preambleSockets.register(accepted, generation: generation) else {
+                 continue
+             }
+diff --git a/Sources/SocketServer/WebSocketOutboundQueue.swift b/Sources/SocketServer/WebSocketOutboundQueue.swift
+index 5292aa385..89658b08c 100644
+--- a/Sources/SocketServer/WebSocketOutboundQueue.swift
++++ b/Sources/SocketServer/WebSocketOutboundQueue.swift
+@@ -9,9 +9,14 @@ import Darwin
+ final class WebSocketConnectionWriter: @unchecked Sendable {
+     private let lock = NSLock()
+     private let writeFrame: @Sendable (UInt8, Data) -> Bool
++    private let writeFrames: (@Sendable ([(opcode: UInt8, data: Data)]) -> Bool)?
+ 
+-    init(writeFrame: @escaping @Sendable (UInt8, Data) -> Bool) {
++    init(
++        writeFrame: @escaping @Sendable (UInt8, Data) -> Bool,
++        writeFrames: (@Sendable ([(opcode: UInt8, data: Data)]) -> Bool)? = nil
++    ) {
+         self.writeFrame = writeFrame
++        self.writeFrames = writeFrames
+     }
+ 
+     func send(opcode: UInt8, data: Data) -> Bool {
+@@ -19,6 +24,16 @@ final class WebSocketConnectionWriter: @unchecked Sendable {
+         defer { lock.unlock() }
+         return writeFrame(opcode, data)
+     }
++
++    /// Writes several complete frames back to back under one lock hold, in
++    /// one socket write when the transport supports it.
++    func send(frames: [(opcode: UInt8, data: Data)]) -> Bool {
++        lock.lock()
++        defer { lock.unlock() }
++        if let writeFrames { return writeFrames(frames) }
++        for frame in frames where !writeFrame(frame.opcode, frame.data) { return false }
++        return true
++    }
+ }
+ 
+ /// FIFO storage with O(1) head advancement and occasional amortized compaction.
+@@ -51,6 +66,10 @@ struct WebSocketFrameFIFO<Element> {
+         storage.append(element)
+     }
+ 
++    var first: Element? {
++        headIndex < storage.count ? storage[headIndex] : nil
++    }
++
+     mutating func popFirst() -> Element? {
+         guard headIndex < storage.count,
+               let element = storage[headIndex] else {
+@@ -314,6 +333,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
+     private var pendingApplicationFrames = WebSocketFrameFIFO<QueuedApplicationFrame>()
+     private var pendingControlFrames = WebSocketFrameFIFO<(opcode: UInt8, data: Data)>()
+     private let applicationWriter: @Sendable (Data) -> Bool
++    /// Optional gathered writer: several encoded application payloads in one
++    /// socket write. When nil, frames drain one write each.
++    private let applicationBatchWriter: (@Sendable ([Data]) -> Bool)?
+     private let knownEventEncoder: @Sendable (KnownConnectionEventFrame) -> Data?
+     private let controlWriter: @Sendable (UInt8, Data) -> Bool
+     private let writeFailureClosingData: Data
+@@ -336,6 +358,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
+         maxQueuedBytes: Int = 1024 * 1024,
+         maxQueuedFrames: Int = 4_096,
+         applicationWriter: @escaping @Sendable (Data) -> Bool,
++        applicationBatchWriter: (@Sendable ([Data]) -> Bool)? = nil,
+         knownEventEncoder: @escaping @Sendable (KnownConnectionEventFrame) -> Data? = {
+             try? $0.encoded()
+         },
+@@ -352,6 +375,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
+         self.configuredMaxQueuedBytes = max(1, maxQueuedBytes)
+         self.maxQueuedFrames = max(1, maxQueuedFrames)
+         self.applicationWriter = applicationWriter
++        self.applicationBatchWriter = applicationBatchWriter
+         self.knownEventEncoder = knownEventEncoder
+         self.controlWriter = controlWriter
+         self.writeFailureClosingData = writeFailureClosingData
+@@ -1030,7 +1054,11 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
+         case .control(let opcode, let data):
+             writeControl(opcode: opcode, data: data)
+         case .application(let frame, _):
+-            writeApplication(frame.frame)
++            if C9TransportTuning.wsGather, let applicationBatchWriter {
++                writeApplicationGathered(first: frame.frame, writer: applicationBatchWriter)
++            } else {
++                writeApplication(frame.frame)
++            }
+         case nil:
+             return
+         }
+@@ -1073,6 +1101,88 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
+         if !succeeded { terminateImmediatelyAfterWriteFailure() }
+     }
+ 
++    /// Upper bound for one gathered write. Frames past it wait for the next
++    /// drain token, so a large frame is never copied into a gather buffer.
++    static let gatheredWriteMaxBytes = 64 * 1_024
++
++    /// Takes the frames that later drain tokens would pick next, in the same
++    /// order (priority lane, then the sequenced FIFO), and writes them in one
++    /// socket write. Stops at a queued control frame so pong/close keep their
++    /// precedence, and at `gatheredWriteMaxBytes`.
++    private func writeApplicationGathered(
++        first: ApplicationFrame,
++        writer: @Sendable ([Data]) -> Bool
++    ) {
++        var frames = [first]
++        var gatheredBytes = first.byteCount
++        var waits: [(ApplicationPriority, Double)] = []
++        lock.lock()
++        while pendingControlFrames.first == nil {
++            let fromPriorityLane: Bool
++            let candidate: QueuedApplicationFrame
++            if let next = pendingPriorityApplicationFrames.first {
++                fromPriorityLane = true
++                candidate = next
++            } else if let next = pendingApplicationFrames.first {
++                fromPriorityLane = false
++                candidate = next
++            } else {
++                break
++            }
++            guard gatheredBytes + candidate.frame.byteCount <= Self.gatheredWriteMaxBytes else { break }
++            if fromPriorityLane {
++                _ = pendingPriorityApplicationFrames.popFirst()
++            } else {
++                _ = pendingApplicationFrames.popFirst()
++            }
++            waits.append((candidate.priority, recordApplicationQueueWaitLocked(candidate)))
++            frames.append(candidate.frame)
++            gatheredBytes += candidate.frame.byteCount
++        }
++        lock.unlock()
++        for (priority, wait) in waits { onApplicationQueueWaitRecorded(priority, wait) }
++
++        let byteCounts = frames.map(\.byteCount)
++        guard shouldWriteQueuedItem() else {
++            removeQueuedItems(byteCounts: byteCounts, drainStartedAt: nil)
++            return
++        }
++        var encoded: [Data] = []
++        encoded.reserveCapacity(frames.count)
++        for frame in frames {
++            guard let data = frame.encoded(knownEventEncoder: knownEventEncoder) else { break }
++            encoded.append(data)
++        }
++        let writeStartedAt = now()
++        let succeeded = encoded.isEmpty || writer(encoded)
++        removeQueuedItems(
++            byteCounts: Array(byteCounts.prefix(encoded.count)),
++            drainStartedAt: succeeded ? writeStartedAt : nil
++        )
++        if encoded.count < frames.count {
++            // Same as the single-frame path: an unencodable frame ends the
++            // connection after everything before it was written.
++            removeQueuedItems(byteCounts: Array(byteCounts.dropFirst(encoded.count)), drainStartedAt: nil)
++            terminateImmediatelyAfterWriteFailure()
++            return
++        }
++        if !succeeded { terminateImmediatelyAfterWriteFailure() }
++    }
++
++    private func removeQueuedItems(byteCounts: [Int], drainStartedAt: TimeInterval?) {
++        guard !byteCounts.isEmpty else { return }
++        lock.lock()
++        let total = byteCounts.reduce(0, +)
++        queuedBytes = max(0, queuedBytes - total)
++        queuedFrames = max(0, queuedFrames - byteCounts.count)
++        if let drainStartedAt, total > 0 {
++            noteDrainLocked(bytes: total, startedAt: drainStartedAt)
++        }
++        let waiting = drainWaiters > 0
++        lock.unlock()
++        signalDrainWaiters(waiting)
++    }
++
+     private func writeControl(opcode: UInt8, data: Data) {
+         guard shouldWriteQueuedItem() else {
+             removeQueuedItem(byteCount: data.count, isControl: true)
+diff --git a/Tests/AppShellTests/HostConnectionTransportReceiptTests.swift b/Tests/AppShellTests/HostConnectionTransportReceiptTests.swift
+new file mode 100644
+index 0000000..7ff792a
+--- /dev/null
++++ b/Tests/AppShellTests/HostConnectionTransportReceiptTests.swift
+@@ -0,0 +1,576 @@
++import Darwin
++import XCTest
++@testable import AppShell
++@testable import CoreModel
++@testable import SocketServer
++@testable import Persistence
++
++/// C9 perf receipts (host connection: socket options, response writes, WS
++/// drain, read-only batches, in-flight RPC watchdog).
++///
++/// Opt-in measurement, not a pass/fail gate: run with
++/// `RC_HOST_CONN_RECEIPTS=1 scripts/isolated-sandbox.sh test --filter HostConnectionTransportReceiptTests`.
++/// A file-backed AppContext, the production AppCommandRouter and
++/// JSONRPCDispatcher, and a real DirectHTTPServer over loopback TCP with a
++/// paired bearer. The client is URLSession (the iOS transport). Each scenario
++/// discards warm-up samples and prints one `RECEIPT {json}` line.
++final class HostConnectionTransportReceiptTests: XCTestCase {
++    private static let eventsPerThread = 128
++
++    private struct Fixture {
++        let context: AppContext
++        let server: DirectHTTPServer
++        let token: String
++        let port: UInt16
++        let threads: [AgentThreadID]
++    }
++
++    override func setUpWithError() throws {
++        guard ProcessInfo.processInfo.environment["RC_HOST_CONN_RECEIPTS"] == "1" else {
++            throw XCTSkip("set RC_HOST_CONN_RECEIPTS=1 to record host-connection receipts")
++        }
++    }
++
++    @MainActor
++    private func makeFixture() throws -> Fixture {
++        let dir = NSTemporaryDirectory() + "RC2HostConnC9Receipt-" + UUID().uuidString
++        let context = try AppContext(channel: .debug, appSupportOverride: dir)
++        let router = AppCommandRouter(context: context)
++        context.router = router
++        let repo = DeviceTrustRepository(db: context.db)
++        let code = try repo.createPairingCode()
++        let paired = try XCTUnwrap(repo.redeemPairingCode(code.code, deviceName: "Receipt iPhone"))
++        let auth = LocalAuthAdapter(repo: DeviceTrustRepository(db: context.db))
++        // 150 threads; the newest four carry a full v1 stream window and a
++        // 100-message transcript (what a connect burst reads).
++        var threads: [AgentThreadID] = []
++        for index in 0..<150 {
++            var thread = AgentThread(title: "receipt thread \(index)", provider: .codex, model: "gpt-5")
++            thread.updatedAt = Date(timeIntervalSince1970: 1_800_000_000 + TimeInterval(index))
++            try context.threadRepo.upsert(thread)
++            if index >= 146 { threads.append(thread.id) }
++        }
++        for thread in threads {
++            let run = AgentRun(
++                threadId: thread,
++                provider: .codex,
++                model: "gpt-5",
++                status: .completed,
++                startedAt: Date(timeIntervalSince1970: 1_800_000_000)
++            )
++            try context.runRepo.upsert(run)
++            for seq in 1...Self.eventsPerThread {
++                let turn = "turn-\(seq)-" + String(repeating: "x", count: 640)
++                try context.runRepo.appendStreamEvent(
++                    runId: run.id,
++                    seq: seq,
++                    kind: "turnStarted",
++                    payloadJSON: #"{"turnStarted":{"turnId":"\#(turn)"}}"#
++                )
++            }
++            for index in 0..<100 {
++                try context.messageRepo.append(AgentMessage(
++                    threadId: thread,
++                    role: index.isMultiple(of: 2) ? .user : .assistant,
++                    content: String(repeating: "receipt message \(index) body. ", count: 40),
++                    createdAt: Date(timeIntervalSince1970: 1_800_000_000 + TimeInterval(index))
++                ))
++            }
++        }
++        var lastError: Error?
++        for _ in 0..<20 {
++            let port = UInt16.random(in: 33000...44000)
++            let server = DirectHTTPServer(
++                port: port,
++                loopbackOnly: true,
++                dispatcher: JSONRPCDispatcher(router: router),
++                auth: auth,
++                serverId: "receipt-host",
++                bootEpoch: 1
++            )
++            do {
++                try server.start()
++                return Fixture(context: context, server: server, token: paired.token, port: port, threads: threads)
++            } catch {
++                lastError = error
++            }
++        }
++        throw lastError ?? NSError(domain: "receipt", code: 1)
++    }
++
++    /// TEMPORARY A/B switch set (see `C9TransportTuning`). Every scenario
++    /// interleaves variants sample by sample so machine load hits all alike.
++    private struct Variant {
++        let name: String
++        var noDelay = false
++        var writev = false
++        var parallelBatch = false
++        var sourceWatchdog = false
++        var wsGather = false
++
++        func apply() {
++            C9TransportTuning.noDelay = noDelay
++            C9TransportTuning.writev = writev
++            C9TransportTuning.parallelBatch = parallelBatch
++            C9TransportTuning.sourceWatchdog = sourceWatchdog
++            C9TransportTuning.wsGather = wsGather
++        }
++    }
++
++    override func tearDown() {
++        Variant(name: "reset").apply()
++        super.tearDown()
++    }
++
++    private static let httpVariants = [
++        Variant(name: "base"),
++        Variant(name: "nodelay", noDelay: true),
++        Variant(name: "writev", writev: true),
++        Variant(name: "nodelay_writev", noDelay: true, writev: true),
++        Variant(name: "dispatch_source_watchdog", sourceWatchdog: true),
++    ]
++
++    // MARK: - HTTP request/response (NODELAY, writev)
++
++    /// Small response on a reused keep-alive connection, one connection per
++    /// variant (NODELAY is set at accept).
++    @MainActor
++    func test_receipt_rpcPing_keepAlive() async throws {
++        try await httpReceipt(name: "rpc_system_ping_keepalive", method: "system.ping", samples: 60, warmups: 10)
++    }
++
++    /// Larger response body (50 messages).
++    @MainActor
++    func test_receipt_rpcMessagePage_keepAlive() async throws {
++        try await httpReceipt(
++            name: "rpc_agent_message_page_50_keepalive",
++            method: "agent.message.list",
++            params: { ["thread_id": $0.threads[0].value.uuidString, "limit": 50, "pagination": true] },
++            samples: 30,
++            warmups: 5
++        )
++    }
++
++    @MainActor
++    private func httpReceipt(
++        name: String,
++        method: String,
++        params: (Fixture) -> [String: Any] = { _ in [:] },
++        samples: Int,
++        warmups: Int
++    ) async throws {
++        let fixture = try makeFixture()
++        defer { fixture.server.stop() }
++        let body = params(fixture)
++        let sessions = Self.httpVariants.map { _ in URLSession(configuration: .ephemeral) }
++        defer { sessions.forEach { $0.invalidateAndCancel() } }
++        var results = Array(repeating: [Double](), count: Self.httpVariants.count)
++        for round in 0..<(warmups + samples) {
++            for (index, variant) in Self.httpVariants.enumerated() {
++                variant.apply()
++                let latency = try await Self.rpc(fixture, method: method, params: body, session: sessions[index])
++                if round >= warmups { results[index].append(latency) }
++            }
++        }
++        for (index, variant) in Self.httpVariants.enumerated() {
++            Self.report("\(name)__\(variant.name)", results[index])
++        }
++    }
++
++    // MARK: - Read-only top-level batch
++
++    private static let batchVariants = [
++        Variant(name: "sequential"),
++        Variant(name: "taskgroup", parallelBatch: true),
++    ]
++
++    /// The connect burst shape: four `agent.thread.read` v1 tails in one batch.
++    @MainActor
++    func test_receipt_readOnlyBatch_threadReadV1x4() async throws {
++        let fixture = try makeFixture()
++        defer { fixture.server.stop() }
++        let batch: [[String: Any]] = fixture.threads.enumerated().map { index, thread in
++            [
++                "jsonrpc": "2.0", "id": index + 1, "method": "agent.thread.read",
++                "params": [
++                    "thread_id": thread.value.uuidString,
++                    "response_version": 1,
++                    "include_event_watermark": true,
++                ] as [String: Any],
++            ]
++        }
++        try await batchReceipt(name: "batch_agent_thread_read_v1_x4", fixture: fixture, batch: batch)
++    }
++
++    /// Mixed main-actor reads: thread list + three message pages.
++    @MainActor
++    func test_receipt_readOnlyBatch_listAndPages() async throws {
++        let fixture = try makeFixture()
++        defer { fixture.server.stop() }
++        var batch: [[String: Any]] = [["jsonrpc": "2.0", "id": 1, "method": "agent.thread.list"]]
++        for (index, thread) in fixture.threads.prefix(3).enumerated() {
++            batch.append([
++                "jsonrpc": "2.0", "id": index + 2, "method": "agent.message.list",
++                "params": ["thread_id": thread.value.uuidString, "limit": 50, "pagination": true] as [String: Any],
++            ])
++        }
++        try await batchReceipt(name: "batch_thread_list_plus_message_pages_x3", fixture: fixture, batch: batch)
++    }
++
++    @MainActor
++    private func batchReceipt(name: String, fixture: Fixture, batch: [[String: Any]]) async throws {
++        var results = Array(repeating: [Double](), count: Self.batchVariants.count)
++        for round in 0..<(3 + 15) {
++            for (index, variant) in Self.batchVariants.enumerated() {
++                variant.apply()
++                let latency = try await Self.rpcBatch(fixture, batch)
++                if round >= 3 { results[index].append(latency) }
++            }
++        }
++        for (index, variant) in Self.batchVariants.enumerated() {
++            Self.report("\(name)__\(variant.name)", results[index])
++        }
++    }
++
++    // MARK: - In-flight RPC watchdog
++
++    private static let watchdogVariants = [
++        Variant(name: "poll_5ms"),
++        Variant(name: "dispatch_source", sourceWatchdog: true),
++    ]
++
++    /// Eight RPCs wait on a busy main actor for one second (a long synchronous
++    /// main-thread stretch). Records process CPU and context switches spent
++    /// while they wait; the main thread itself is asleep.
++    @MainActor
++    func test_receipt_inflightRPCs_whileMainBlocked() async throws {
++        let fixture = try makeFixture()
++        defer { fixture.server.stop() }
++        for _ in 0..<3 { _ = try await Self.rpc(fixture, method: "system.ping") }
++        var cpu = Array(repeating: [Double](), count: Self.watchdogVariants.count)
++        var switches = Array(repeating: [Double](), count: Self.watchdogVariants.count)
++        for round in 0..<(2 + 7) {
++            for (index, variant) in Self.watchdogVariants.enumerated() {
++                variant.apply()
++                let tasks = (0..<8).map { _ in
++                    Task.detached { try await Self.rpc(fixture, method: "system.ping") }
++                }
++                Thread.sleep(forTimeInterval: 0.1)
++                let r0 = Self.usage()
++                Thread.sleep(forTimeInterval: 1.0)
++                let r1 = Self.usage()
++                for task in tasks { _ = try await task.value }
++                if round >= 2 {
++                    cpu[index].append(r1.cpuMs - r0.cpuMs)
++                    switches[index].append(r1.switches - r0.switches)
++                }
++            }
++        }
++        for (index, variant) in Self.watchdogVariants.enumerated() {
++            Self.report("inflight_rpc_x8_main_blocked_1s_process_cpu_ms__\(variant.name)", cpu[index])
++            Self.report("inflight_rpc_x8_main_blocked_1s_context_switches__\(variant.name)", switches[index])
++        }
++    }
++
++    /// A peer that drops mid-RPC must still cancel the work and release the
++    /// socket under both watchdogs. Measures drop → socket released.
++    @MainActor
++    func test_receipt_peerDropMidRPC_releaseLatency() async throws {
++        let fixture = try makeFixture()
++        defer { fixture.server.stop() }
++        var results = Array(repeating: [Double](), count: Self.watchdogVariants.count)
++        let body = try JSONSerialization.data(withJSONObject: [
++            "jsonrpc": "2.0", "id": 1, "method": "system.ping", "params": [:] as [String: Any],
++        ])
++        for round in 0..<(2 + 7) {
++            for (index, variant) in Self.watchdogVariants.enumerated() {
++                variant.apply()
++                let baseline = fixture.server.acceptedSocketCountForTests
++                let fd = try Self.rawConnect(port: fixture.port)
++                let request = "POST /v1/rpc HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer \(fixture.token)\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\n\r\n"
++                var bytes = Data(request.utf8)
++                bytes.append(body)
++                // Main is blocked for the whole sample, so the RPC is in flight
++                // when the peer drops.
++                _ = bytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
++                Thread.sleep(forTimeInterval: 0.05)
++                let t0 = DispatchTime.now()
++                Darwin.close(fd)
++                var released: Double = -1
++                while Self.ms(since: t0) < 500 {
++                    if fixture.server.acceptedSocketCountForTests <= baseline {
++                        released = Self.ms(since: t0)
++                        break
++                    }
++                    usleep(100)
++                }
++                XCTAssertGreaterThanOrEqual(released, 0, "\(variant.name): socket never released")
++                if round >= 2 { results[index].append(released) }
++                // Let the blocked RPC drain before the next sample.
++                await Task.yield()
++                try await Task.sleep(nanoseconds: 20_000_000)
++            }
++        }
++        for (index, variant) in Self.watchdogVariants.enumerated() {
++            Self.report("peer_drop_mid_rpc_release_ms__\(variant.name)", results[index])
++        }
++    }
++
++    // MARK: - WebSocket delivery
++
++    private static let wsVariants = [
++        Variant(name: "base"),
++        Variant(name: "nodelay", noDelay: true),
++        Variant(name: "gather", wsGather: true),
++        Variant(name: "nodelay_gather", noDelay: true, wsGather: true),
++    ]
++
++    /// One event every 2 ms (a streaming turn). Publish → client receive.
++    @MainActor
++    func test_receipt_wsSpacedEventLatency() async throws {
++        let fixture = try makeFixture()
++        defer { fixture.server.stop() }
++        var roundP50 = Array(repeating: [Double](), count: Self.wsVariants.count)
++        var roundP95 = Array(repeating: [Double](), count: Self.wsVariants.count)
++        var pooled = Array(repeating: [Double](), count: Self.wsVariants.count)
++        var round = 0
++        for pass in 0..<6 {
++            for (index, variant) in Self.wsVariants.enumerated() {
++                variant.apply()
++                let ws = try await Self.openWS(fixture)
++                defer { ws.session.invalidateAndCancel() }
++                let latencies = try await Self.publishAndCollect(ws, count: 200, spacingMicros: 2_000, round: round)
++                round += 1
++                ws.task.cancel(with: .goingAway, reason: nil)
++                if pass >= 1 {
++                    let sorted = latencies.sorted()
++                    roundP50[index].append(Self.percentile(sorted, 0.5))
++                    roundP95[index].append(Self.percentile(sorted, 0.95))
++                    pooled[index].append(contentsOf: latencies)
++                }
++            }
++        }
++        for (index, variant) in Self.wsVariants.enumerated() {
++            Self.report("ws_spaced_2ms_x200_event_latency_pooled__\(variant.name)", pooled[index], includeSamples: false)
++            Self.report("ws_spaced_2ms_x200_round_p50__\(variant.name)", roundP50[index])
++            Self.report("ws_spaced_2ms_x200_round_p95__\(variant.name)", roundP95[index])
++        }
++    }
++
++    /// 150 events published back to back (a flushed coalesce window or a
++    /// replay slice, about 75 KB; small enough that the outbound budget does
++    /// not shed). Time from the first publish to the last receive, and the
++    /// process CPU spent (host and in-process client together).
++    @MainActor
++    func test_receipt_wsBurstThroughput() async throws {
++        let fixture = try makeFixture()
++        defer { fixture.server.stop() }
++        var elapsed = Array(repeating: [Double](), count: Self.wsVariants.count)
++        var cpu = Array(repeating: [Double](), count: Self.wsVariants.count)
++        var round = 1_000
++        for pass in 0..<12 {
++            for (index, variant) in Self.wsVariants.enumerated() {
++                variant.apply()
++                let ws = try await Self.openWS(fixture)
++                defer { ws.session.invalidateAndCancel() }
++                try await Task.sleep(nanoseconds: 20_000_000)
++                let r0 = Self.usage()
++                let t0 = DispatchTime.now()
++                let got = try await Self.publishAndCollect(ws, count: 150, spacingMicros: 0, round: round)
++                let ms = Self.ms(since: t0)
++                let r1 = Self.usage()
++                round += 1
++                ws.task.cancel(with: .goingAway, reason: nil)
++                if pass >= 2, got.count == 150 {
++                    elapsed[index].append(ms)
++                    cpu[index].append(r1.cpuMs - r0.cpuMs)
++                }
++            }
++        }
++        for (index, variant) in Self.wsVariants.enumerated() {
++            Self.report("ws_burst_150_events_time_to_last_ms__\(variant.name)", elapsed[index])
++            Self.report("ws_burst_150_events_process_cpu_ms__\(variant.name)", cpu[index])
++        }
++    }
++
++    // MARK: - Helpers
++
++    private struct WS {
++        let session: URLSession
++        let task: URLSessionWebSocketTask
++    }
++
++    private static func openWS(_ fixture: Fixture) async throws -> WS {
++        var request = URLRequest(url: URL(string: "ws://127.0.0.1:\(fixture.port)/v1/ws")!)
++        request.setValue("Bearer \(fixture.token)", forHTTPHeaderField: "Authorization")
++        let session = URLSession(configuration: .ephemeral)
++        let task = session.webSocketTask(with: request)
++        task.maximumMessageSize = 8 * 1_024 * 1_024
++        task.resume()
++        // Welcome frame first.
++        _ = try await task.receive()
++        return WS(session: session, task: task)
++    }
++
++    private final class Published: @unchecked Sendable {
++        private let lock = NSLock()
++        private var stamps: [Int: UInt64] = [:]
++        func set(_ index: Int, _ ns: UInt64) { lock.lock(); stamps[index] = ns; lock.unlock() }
++        func get(_ index: Int) -> UInt64? { lock.lock(); defer { lock.unlock() }; return stamps[index] }
++    }
++
++    /// Publishes `count` state events on a background thread and returns the
++    /// per-event publish→receive latency in milliseconds.
++    private static func publishAndCollect(
++        _ ws: WS,
++        count: Int,
++        spacingMicros: UInt32,
++        round: Int
++    ) async throws -> [Double] {
++        let marker = "c9r\(round)-"
++        let stamps = Published()
++        let filler = String(repeating: "The change is in place and the tests pass. ", count: 4)
++        Thread.detachNewThread {
++            for index in 0..<count {
++                let now = DispatchTime.now().uptimeNanoseconds
++                stamps.set(index, now)
++                EventBus.shared.publish(kind: .agentItemCompleted, payload: .object([
++                    "thread_id": .string("c9-receipt"),
++                    "item_id": .string("\(marker)\(index)"),
++                    "kind": .string("assistant_message"),
++                    "text": .string(filler),
++                ]))
++                if spacingMicros > 0 { usleep(spacingMicros) }
++            }
++        }
++        // A stream that never delivers must fail the scenario, not hang the run.
++        let deadline = Task {
++            try await Task.sleep(nanoseconds: 5_000_000_000)
++            ws.task.cancel(with: .goingAway, reason: nil)
++        }
++        defer { deadline.cancel() }
++        var latencies: [Double] = []
++        latencies.reserveCapacity(count)
++        var seen = 0
++        var otherFrames: [String] = []
++        while seen < count {
++            guard let message = try? await ws.task.receive() else {
++                FileHandle.standardError.write(Data(
++                    "INCOMPLETE round=\(round) seen=\(seen)/\(count) other_frames=\(otherFrames.suffix(5))\n".utf8
++                ))
++                break
++            }
++            let received = DispatchTime.now().uptimeNanoseconds
++            let text: String
++            switch message {
++            case .data(let value): text = String(decoding: value, as: UTF8.self)
++            case .string(let value): text = value
++            @unknown default: text = ""
++            }
++            // A connect-time `baselineRequired` (no cursor, replayTruncated)
++            // is advisory here: the stream keeps delivering, and only event
++            // latency is measured. Skip it rather than counting it.
++            if !text.contains(marker) { otherFrames.append(String(text.prefix(160))) }
++            if text.contains("\"type\":\"baselineRequired\"") { continue }
++            var search = text[...]
++            while let range = search.range(of: marker) {
++                let digits = search[range.upperBound...].prefix { $0.isNumber }
++                if let index = Int(digits), let sent = stamps.get(index) {
++                    latencies.append(Double(received &- sent) / 1_000_000)
++                    seen += 1
++                }
++                search = search[range.upperBound...]
++            }
++        }
++        return latencies
++    }
++
++    private static func usage() -> (cpuMs: Double, switches: Double) {
++        var r = rusage()
++        getrusage(RUSAGE_SELF, &r)
++        let user = Double(r.ru_utime.tv_sec) * 1_000 + Double(r.ru_utime.tv_usec) / 1_000
++        let system = Double(r.ru_stime.tv_sec) * 1_000 + Double(r.ru_stime.tv_usec) / 1_000
++        return (user + system, Double(r.ru_nvcsw + r.ru_nivcsw))
++    }
++
++    private static func ms(since start: DispatchTime) -> Double {
++        Double(DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000
++    }
++
++    private static func rawConnect(port: UInt16) throws -> Int32 {
++        let fd = socket(AF_INET, SOCK_STREAM, 0)
++        var address = sockaddr_in()
++        address.sin_family = sa_family_t(AF_INET)
++        address.sin_port = port.bigEndian
++        address.sin_addr.s_addr = inet_addr("127.0.0.1")
++        let result = withUnsafePointer(to: &address) {
++            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
++                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
++            }
++        }
++        guard result == 0 else { throw NSError(domain: "receipt", code: Int(errno)) }
++        return fd
++    }
++
++    private static func rpc(
++        _ fixture: Fixture,
++        method: String,
++        params: [String: Any] = [:],
++        session: URLSession = .shared
++    ) async throws -> Double {
++        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(fixture.port)/v1/rpc")!)
++        request.httpMethod = "POST"
++        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
++        request.setValue("Bearer \(fixture.token)", forHTTPHeaderField: "Authorization")
++        request.httpBody = try JSONSerialization.data(withJSONObject: [
++            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
++        ])
++        let t0 = DispatchTime.now()
++        let (data, response) = try await session.data(for: request)
++        let latency = ms(since: t0)
++        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
++        let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
++        XCTAssertNil(object?["error"], "\(method) failed: \(String(decoding: data, as: UTF8.self).prefix(300))")
++        return latency
++    }
++
++    private static func rpcBatch(_ fixture: Fixture, _ batch: [[String: Any]]) async throws -> Double {
++        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(fixture.port)/v1/rpc")!)
++        request.httpMethod = "POST"
++        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
++        request.setValue("Bearer \(fixture.token)", forHTTPHeaderField: "Authorization")
++        request.httpBody = try JSONSerialization.data(withJSONObject: batch)
++        let t0 = DispatchTime.now()
++        let (data, response) = try await URLSession.shared.data(for: request)
++        let latency = ms(since: t0)
++        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
++        let items = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [[String: Any]])
++        XCTAssertEqual(items.count, batch.count)
++        for (index, item) in items.enumerated() {
++            XCTAssertEqual((item["id"] as? NSNumber)?.intValue, (batch[index]["id"] as? Int), "batch order")
++            XCTAssertNil(item["error"], "batch item failed: \(item)")
++        }
++        return latency
++    }
++
++    private static func percentile(_ sorted: [Double], _ p: Double) -> Double {
++        guard !sorted.isEmpty else { return 0 }
++        let index = min(sorted.count - 1, Int((p * Double(sorted.count - 1)).rounded()))
++        return sorted[index]
++    }
++
++    private static func report(_ name: String, _ samples: [Double], includeSamples: Bool = true) {
++        let sorted = samples.sorted()
++        var payload: [String: Any] = [
++            "scenario": name,
++            "n": samples.count,
++            "p50_ms": (percentile(sorted, 0.5) * 1000).rounded() / 1000,
++            "p95_ms": (percentile(sorted, 0.95) * 1000).rounded() / 1000,
++            "max_ms": ((sorted.last ?? 0) * 1000).rounded() / 1000,
++        ]
++        if includeSamples { payload["samples_ms"] = samples.map { ($0 * 1000).rounded() / 1000 } }
++        let data = (try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])) ?? Data()
++        // Unbuffered: a killed run must not lose receipts already taken.
++        FileHandle.standardError.write(Data("RECEIPT \(String(decoding: data, as: UTF8.self))\n".utf8))
++    }
++}
+diff --git a/Sources/SocketServer/C9TransportTuning.swift b/Sources/SocketServer/C9TransportTuning.swift
+new file mode 100644
+index 0000000..17a4ad1
+--- /dev/null
++++ b/Sources/SocketServer/C9TransportTuning.swift
+@@ -0,0 +1,12 @@
++import Foundation
++
++/// TEMPORARY C9 measurement switches. Lets the receipt harness interleave the
++/// old and new transport paths sample by sample in one process. Removed before
++/// commit; only the paths with a winning receipt remain.
++enum C9TransportTuning {
++    nonisolated(unsafe) static var noDelay = false
++    nonisolated(unsafe) static var writev = false
++    nonisolated(unsafe) static var parallelBatch = false
++    nonisolated(unsafe) static var sourceWatchdog = false
++    nonisolated(unsafe) static var wsGather = false
++}
