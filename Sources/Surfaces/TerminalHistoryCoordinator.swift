@@ -483,10 +483,10 @@ private final class TerminalHistoryQueueState: @unchecked Sendable {
     private var retryDeadline = Date.distantFuture
     private var retriesCancelled = false
 
-    func beginFlushIfPermitted() -> Bool {
+    func beginFlushIfPermitted(bypassingInFlightCap: Bool = false) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        guard TerminalHistoryFlushBackpressure.shouldEnqueueWrite(
+        guard bypassingInFlightCap || TerminalHistoryFlushBackpressure.shouldEnqueueWrite(
             inFlightCount: inFlightFlushCount
         ) else { return false }
         inFlightFlushCount += 1
@@ -1492,7 +1492,11 @@ final class TerminalHistoryCoordinator {
         }
         let failureGeneration = queueState.currentFailureGeneration()
         if case .ready = preparationState {
-            flushReadyPending()
+            if finalizing {
+                handParkedBytesToWriterQueueForFinalization()
+            } else {
+                flushReadyPending()
+            }
             schedulePendingRetentionCheckIfNeeded()
             scheduleBarrier(
                 state,
@@ -1503,6 +1507,24 @@ final class TerminalHistoryCoordinator {
             deferredBarrier = (state, failureGeneration)
         }
         return state.surfaceBarrier()
+    }
+
+    /// Quit waits for the finalizing barrier synchronously on the main thread,
+    /// while parked bytes normally drain through a main-queue hop after each
+    /// finished write. Queue every parked chunk on the serial writer now so the
+    /// barrier lands behind them without the main thread. Writes stay serial,
+    /// and the backlog is bounded because finalizing already stopped accepting.
+    private func handParkedBytesToWriterQueueForFinalization() {
+        while true {
+            flushReadyPending(bypassingInFlightCap: true)
+            guard pendingData.isEmpty, !deferredReadyData.isEmpty else { break }
+            let take = min(Self.maxChunkBytes, deferredReadyData.count)
+            pendingData = Data(deferredReadyData.prefix(take))
+            deferredReadyData.removeFirst(take)
+        }
+        if pendingData.isEmpty, deferredReadyData.isEmpty {
+            releaseDrainBarriers()
+        }
     }
 
     func readPersistedWindow(
@@ -1537,13 +1559,15 @@ final class TerminalHistoryCoordinator {
         return try await operation.value(timeout: timeout)
     }
 
-    private func flushReadyPending() {
+    private func flushReadyPending(bypassingInFlightCap: Bool = false) {
         guard let repository,
               case .ready = preparationState,
               let chunkIndex = nextChunkIndex,
               let writerGeneration,
               !pendingData.isEmpty else { return }
-        guard queueState.beginFlushIfPermitted() else { return }
+        guard queueState.beginFlushIfPermitted(
+            bypassingInFlightCap: bypassingInFlightCap
+        ) else { return }
 
         let data = pendingData
         pendingData = Data()
