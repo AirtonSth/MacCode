@@ -1233,7 +1233,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 164)
+        XCTAssertEqual(canonical.count, 167)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -1340,6 +1340,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             "workspace.create", "window.create", "agent.thread.create",
             "agent.provider.update", "notification.create",
             "bot.create", "bot.scheduler.tick", "bot.self_config",
+            "distill.accounts.cancel",
         ]
         var covered: Set<String> = []
         var probeCount = 0

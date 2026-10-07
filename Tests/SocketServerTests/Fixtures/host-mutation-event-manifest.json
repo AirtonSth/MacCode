@@ -106,6 +106,9 @@
     {"method": "agent.attachment.upload", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.attachment.uploaded"], "readbackMethods": ["fs.workspace.list"]},
     {"method": "agent.attachment.import", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.attachment.uploaded"], "readbackMethods": ["agent.message.list"]},
     {"method": "agent.provider.update", "family": "agent-execution", "risk": "destructive", "eventKinds": ["agent.provider.updated"], "readbackMethods": ["agent.state.current"]},
+    {"method": "distill.accounts.login", "family": "agent-execution", "risk": "lowMutation", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
+    {"method": "distill.accounts.logout", "family": "agent-execution", "risk": "destructive", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
+    {"method": "distill.accounts.cancel", "family": "agent-execution", "risk": "lowMutation", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
 
     {"method": "fs.workspace.create_file", "family": "files", "risk": "lowMutation", "eventKinds": ["fs.workspace.changed"], "readbackMethods": ["fs.workspace.list", "fs.workspace.read"]},
     {"method": "fs.workspace.delete", "family": "files", "risk": "destructive", "eventKinds": ["fs.workspace.changed"], "readbackMethods": ["fs.workspace.list"]},

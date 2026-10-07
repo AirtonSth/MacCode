@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import Persistence
 import CoreModel
+import AgentRuntime
 
 public enum HostMutationContract {
     public static let transportParamKeys: Set<String> = [
@@ -511,11 +512,13 @@ public enum HostMutationContract {
         case "settings.set": return [.string("key"), .string("value")]
         case "project.run_script": return [.uuid("workspace_id"), .string("name")]
         case "private.push_token.update": return [.pushTokenContract]
+        case "distill.accounts.login", "distill.accounts.logout": return [.stringEnum("provider", distillAccountProviders)]
         default: return []
         }
     }
 
     private static let directions: Set<String> = ["right", "down", "left", "up"]
+    private static let distillAccountProviders = Set(DistillAccountProvider.allCases.map(\.rawValue))
 
     private static func isSurfaceType(_ value: String) -> Bool {
         let lower = value.lowercased()
