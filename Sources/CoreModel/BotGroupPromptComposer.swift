@@ -68,6 +68,7 @@ public enum BotGroupPromptComposer {
         }
         sections.append(
             "Reply to the group as \(me.name). To hand the floor to another participant, @mention them."
+                + " " + participantsAnswerOnTheirTurnsLine
         )
         sections.append(BotPeerTranscript.languageInstruction)
 
@@ -82,6 +83,12 @@ public enum BotGroupPromptComposer {
             omittedCount: omitted
         )
     }
+
+    /// A participant asked through `bot_ask_peer` starts a second, hidden
+    /// run outside the room; a supervised turn then waits on an approval
+    /// nobody sees. The room already gives every participant its own turn.
+    static let participantsAnswerOnTheirTurnsLine =
+        "The other participants answer in this group on their own turns: never use bot_ask_peer to ask them, and do not answer for them."
 
     public static func omissionLine(_ count: Int) -> String {
         count == 1

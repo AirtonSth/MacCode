@@ -63,6 +63,18 @@ final class BotGroupPromptComposerTests: XCTestCase {
         XCTAssertTrue(result.prompt.hasSuffix(BotPeerTranscript.languageInstruction))
     }
 
+    func test_prompt_tellsTheBotNotToConsultParticipantsThroughThePeerTool() {
+        // WHY: in the sandbox E2E a VM bot read "@tgmac and @tgvm" and called
+        // bot_ask_peer for the other participant. That hidden consult asked
+        // for approval on a member thread nobody sees, and the group turn
+        // hung until Stop. Participants already get their own turn.
+        let result = compose(me: beta, [message(.user, "@alpha and @beta: hi", at: 0)])
+        XCTAssertTrue(result.prompt.contains(
+            "@mention them. The other participants answer in this group on their own turns: never use bot_ask_peer to ask them"
+        ))
+        XCTAssertTrue(result.prompt.hasSuffix(BotPeerTranscript.languageInstruction))
+    }
+
     func test_onlyMessagesAfterWatermark_areIncluded() {
         let old = message(.user, "OLD QUESTION", at: 0)
         let seen = message(.user, "SEEN QUESTION", at: 1)
