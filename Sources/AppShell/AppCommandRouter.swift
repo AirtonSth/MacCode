@@ -3205,6 +3205,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             mutation: false,
             method: "bot.peer.ask"
         )
+        // A peer's agent runs on the Mac. A caller inside its bot's Linux VM
+        // reaches the Mac only through the user-approved Mac-execution request,
+        // never through a peer.
+        if try ctx.threadRepo.guestPlacement(of: callerThread)?.runsInGuest == true {
+            throw JSONRPCError(
+                code: -32052,
+                message: "bot_ask_peer is not available inside the bot's Linux VM: the other Bot would run on the Mac. Ask the user to run this conversation on the Mac, or use bot_request_mac_execution."
+            )
+        }
         guard let normalizedHandle = BotHandle.normalize(handle),
               let peer = try ctx.botStore.list().first(where: { $0.handle == normalizedHandle }) else {
             throw JSONRPCError(code: -32044, message: "RemoteCode Bot @\(handle) was not found.")
