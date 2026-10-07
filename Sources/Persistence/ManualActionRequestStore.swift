@@ -77,6 +77,41 @@ public final class ManualActionRequestStore: @unchecked Sendable {
         try resolve(id: id, state: .expired)
     }
 
+    /// The Mac card and the paired-device RPC both go through this: the store write picks the
+    /// single winner and only the winner takes the bot's computer. nil for unknown, taken or closed ids.
+    @discardableResult
+    public func take(id: UUID, control: BotComputerControl) throws -> ManualActionRequest? {
+        guard let taken = try take(id: id) else { return nil }
+        control.take(taken.botID)
+        return taken
+    }
+
+    /// Continue or decline for the Mac card and the paired-device RPC: only the winner hands control
+    /// back and closes the bot's in-memory request. nil for unknown or already closed ids.
+    @discardableResult
+    public func resolve(
+        id: UUID,
+        state: ManualActionState,
+        note: String?,
+        control: BotComputerControl
+    ) throws -> ManualActionRequest? {
+        guard let resolved = try resolve(id: id, state: state, note: note) else { return nil }
+        control.release(resolved.botID)
+        control.dismiss(resolved.id, as: state, note: note)
+        return resolved
+    }
+
+    /// Every thread's open or taken request (the newest when several), read once.
+    public func openByThread() -> [AgentThreadID: ManualActionRequest] {
+        lock.withLock {
+            var open: [AgentThreadID: ManualActionRequest] = [:]
+            for request in load() where request.state.isOpen {
+                if let threadID = request.threadID { open[threadID] = request }
+            }
+            return open
+        }
+    }
+
     public func closeAll(botID: BotID) throws {
         try lock.withLock {
             var items = load()

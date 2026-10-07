@@ -1319,6 +1319,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Always present while PlanNotesProjectionV1 is compiled in this
             // target (v1 get + digest-CAS save). Single helper with system.capabilities.
             "plan_notes": PlanNotesProjectionV1.CapabilityAdvertisement.foundationObject,
+            // agent.manual_action.list/resolve, agent.manual_action.updated and
+            // pending_manual_action on thread payloads.
+            "manual_actions_v1": true,
         ]
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject

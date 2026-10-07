@@ -58,6 +58,7 @@ public enum HostMutationContract {
     agent.run.stop
     agent.request.respond
     agent.user_input.respond
+    agent.manual_action.resolve
     agent.plan.implement
     agent.plan.save
     agent.plan.notes.save
@@ -450,6 +451,7 @@ public enum HostMutationContract {
         case "agent.message.queue.reorder": return [.uuid("thread_id"), .anyUUID(["queued_message_id", "id"]), .int("position")]
         case "agent.request.respond": return [.uuid("thread_id"), .string("request_id"), .stringEnum("decision", ["approve", "approve_for_session", "approveForSession", "decline", "cancel"])]
         case "agent.user_input.respond": return [.uuid("thread_id"), .string("request_id"), .string("text")]
+        case "agent.manual_action.resolve": return [.uuid("thread_id"), .uuid("manual_action_id"), .stringEnum("action", ["take", "continue", "decline"])]
         case "agent.plan.implement", "agent.plan.save": return [.uuid("thread_id"), .string("plan_id")]
         case "agent.plan.notes.save": return [.uuid("thread_id"), .string("notes")]
         case "agent.checkpoint.revert": return [.uuid("thread_id"), .firstPresentInt(["turn_count", "checkpoint_turn_count"])]

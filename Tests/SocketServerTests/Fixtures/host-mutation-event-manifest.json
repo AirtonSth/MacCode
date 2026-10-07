@@ -95,6 +95,7 @@
     {"method": "agent.run.continue", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.run.continue_requested"], "readbackMethods": ["agent.message.list", "agent.state.current"]},
     {"method": "agent.run.stop", "family": "agent-execution", "risk": "destructive", "eventKinds": ["agent.run.stop_requested"], "readbackMethods": ["agent.message.list", "agent.state.current"]},
     {"method": "agent.request.respond", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.request.resolved"], "readbackMethods": ["agent.pending_callbacks.list", "agent.thread.read"]},
+    {"method": "agent.manual_action.resolve", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.manual_action.updated"], "readbackMethods": ["agent.manual_action.list", "agent.thread.list"]},
     {"method": "agent.user_input.respond", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.user_input.resolved"], "readbackMethods": ["agent.pending_callbacks.list"]},
     {"method": "agent.plan.implement", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.plan.implemented"], "readbackMethods": ["agent.message.list", "agent.thread.list"]},
     {"method": "agent.plan.save", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.plan.saved"], "readbackMethods": ["fs.workspace.read"]},

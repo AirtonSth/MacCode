@@ -10,6 +10,9 @@ public enum RemoteCodeEventKind: String, Codable, CaseIterable, Sendable {
     case agentItemDelta = "agent.item.delta"
     case agentItemProgress = "agent.item.progress"
     case agentItemStarted = "agent.item.started"
+    /// A bot's manual-action request opened, was taken or was resolved
+    /// (`AgentManualActionUpdatedEvent`).
+    case agentManualActionUpdated = "agent.manual_action.updated"
     case agentMessageAccepted = "agent.message.accepted"
     case agentMessageAppended = "agent.message.appended"
     case agentMessageQueueCancelled = "agent.message.queue.cancelled"

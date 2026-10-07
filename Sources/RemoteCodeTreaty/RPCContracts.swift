@@ -38,6 +38,12 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case botGroupRevisionConflict
         /// `bot.team.*` / `bot.group.*`: this host cannot run groups right now.
         case botGroupRuntimeUnavailable
+        /// `agent.manual_action.resolve`: the request is not one of this thread's.
+        case manualActionNotFound
+        /// `agent.manual_action.resolve`: another resolve won; `data.state` is the current state.
+        case manualActionStateConflict
+        /// `agent.manual_action.resolve` `take` on a thread that runs on the Mac.
+        case manualActionTakeUnavailable
         case unknown(Int)
     }
 
@@ -59,6 +65,14 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
             case .string("not_found"): return .botGroupNotFound
             case .string("revision_conflict"): return .botGroupRevisionConflict
             case .string("runtime_unavailable"): return .botGroupRuntimeUnavailable
+            default: break
+            }
+        }
+        if case .object(let data)? = data, data["domain"] == .string("manual_action") {
+            switch data["kind"] {
+            case .string("not_found"): return .manualActionNotFound
+            case .string("state_conflict"): return .manualActionStateConflict
+            case .string("take_unavailable"): return .manualActionTakeUnavailable
             default: break
             }
         }

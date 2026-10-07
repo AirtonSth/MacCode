@@ -354,9 +354,22 @@ public protocol CommandRouting: AnyObject {
     func filesEditSave(sessionID: String) throws -> JSONValue
     func filesEditDiscard(sessionID: String) throws -> JSONValue
     func filesEditClose(sessionID: String) throws -> JSONValue
+    // manual actions: a bot paused for the user (login, captcha, 2FA, payment, confirm)
+    /// The thread's requests, oldest first. A taken request whose control was lost reads as open.
+    func listManualActions(thread: AgentThreadID) throws -> [ManualActionSnapshot]
+    /// Each thread's open or taken request, for `pending_manual_action` in thread payloads.
+    func pendingManualActions(for threads: [AgentThread]) -> [AgentThreadID: ManualActionSnapshot]
+    /// Single-winner transition shared with the Mac card; refusals are `DefiniteMutationRejection`.
+    func resolveManualAction(thread: AgentThreadID, id: UUID, resolution: ManualActionResolution, note: String?) async throws -> ManualActionResolveOutcome
 }
 
 public extension CommandRouting {
+    func listManualActions(thread: AgentThreadID) throws -> [ManualActionSnapshot] { [] }
+    func pendingManualActions(for threads: [AgentThread]) -> [AgentThreadID: ManualActionSnapshot] { [:] }
+    func resolveManualAction(thread: AgentThreadID, id: UUID, resolution: ManualActionResolution, note: String?) async throws -> ManualActionResolveOutcome {
+        throw JSONRPCError.notSupported("agent.manual_action.resolve")
+    }
+
     func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
         try sshTransferUpload(surface: surface, localPath: localPath, remotePath: remotePath)
     }
@@ -937,6 +950,9 @@ public final class JSONRPCDispatcher {
         "agent.run.stop",
         "agent.request.respond",
         "agent.user_input.respond",
+        // Not canonical-immediate: the router publishes agent.manual_action.updated
+        // inside the call, and the ledger captures it into the receipt.
+        "agent.manual_action.resolve",
         "agent.plan.implement",
         "agent.plan.save",
         "agent.plan.notes.save",
@@ -2442,7 +2458,9 @@ public final class JSONRPCDispatcher {
                     // this target. Same helper as DirectHTTPServer.capabilitiesPayload
                     // so authorities cannot drift on the old-host negotiation gate.
                     "plan_notes": PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue,
-                    "checkpoint_list": AgentCheckpointListCapabilityV1.jsonValue
+                    "checkpoint_list": AgentCheckpointListCapabilityV1.jsonValue,
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "manual_actions_v1": .bool(true)
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {
@@ -3231,7 +3249,11 @@ public final class JSONRPCDispatcher {
                 let threads = try await router.listAgentThreadsOffMain(workspace: wid)
                 // PERF-007: one batch query for all threads instead of N per-thread queries.
                 let lockedThreads = (try? await router.threadIdsWithMessagesOffMain()) ?? []
-                return .init(id: id, result: .array(threads.map { encodeThread($0, lockedThreads: lockedThreads) }))
+                // One store read for every thread's pending_manual_action.
+                let manualActions = router.pendingManualActions(for: threads)
+                return .init(id: id, result: .array(threads.map {
+                    encodeThread($0, lockedThreads: lockedThreads, pendingManualActions: manualActions)
+                }))
             case "agent.thread.create", "host.agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let title = params["title"]?.stringValue ?? "New thread"
@@ -3778,6 +3800,46 @@ public final class JSONRPCDispatcher {
             case "agent.pending_callbacks.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: encode(try await router.listAgentPendingCallbacksOffMain(thread: tid)))
+            case "agent.manual_action.list":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                let actions = try router.listManualActions(thread: tid)
+                return .init(id: id, result: .object([
+                    "thread_id": .string(tid.value.uuidString),
+                    "manual_actions": .array(actions.map(ManualActionWire.row)),
+                    "pending_manual_action": ManualActionWire.pendingRow(actions.last { $0.request.state.isOpen }),
+                ]))
+            case "agent.manual_action.resolve":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let actionID = params["manual_action_id"]?.stringValue.flatMap(UUID.init),
+                      let resolution = params["action"]?.stringValue.flatMap(ManualActionResolution.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let outcome = try await router.resolveManualAction(
+                    thread: tid, id: actionID, resolution: resolution, note: params["note"]?.stringValue
+                )
+                let followUp: JSONValue
+                switch outcome.followUp {
+                case nil:
+                    followUp = .null
+                case .sent(let sent)?:
+                    var object = messageSendResultPayload(sent).objectValue ?? [:]
+                    object["delivered"] = .bool(true)
+                    followUp = .object(object)
+                case .failed(let message)?:
+                    followUp = .object(["delivered": .bool(false), "error": .string(message)])
+                }
+                let result: JSONValue = .object([
+                    "thread_id": .string(tid.value.uuidString),
+                    "manual_action": ManualActionWire.row(outcome.manualAction),
+                    "pending_manual_action": ManualActionWire.pendingRow(outcome.pending),
+                    "follow_up": followUp,
+                ])
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.read":
                 // response_version absent → exact legacy shapes (array or watermark object).
                 // response_version present → integral 1 only; validate before repository work.
@@ -4761,7 +4823,7 @@ public final class JSONRPCDispatcher {
         "workspace.list", "workspace.current",
         "surface.health", "surface.read_text", "surface.read_history",
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
-        "agent.message.list", "agent.message.get", "agent.pending_callbacks.list",
+        "agent.message.list", "agent.message.get", "agent.pending_callbacks.list", "agent.manual_action.list",
         // Legacy agent.checkpoint.list remains batch-admitted. Explicit
         // response_version 1 is rejected by preflightTransport before execution.
         "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
@@ -5009,12 +5071,17 @@ public final class JSONRPCDispatcher {
         object["provider_locked"] = .bool(locked)
         appendRouting(thread.effectiveRoutingConfiguration, to: &object)
         appendActiveRun(to: &object, thread: thread.id)
+        object["pending_manual_action"] = ManualActionWire.pendingRow(router.pendingManualActions(for: [thread])[thread.id])
         return .object(object)
     }
 
     /// Batch overload used by agent.thread.list (PERF-007): caller pre-fetches
     /// the locked set once; no additional query is issued per thread.
-    private func encodeThread(_ thread: AgentThread, lockedThreads: Set<AgentThreadID>) -> JSONValue {
+    private func encodeThread(
+        _ thread: AgentThread,
+        lockedThreads: Set<AgentThreadID>,
+        pendingManualActions: [AgentThreadID: ManualActionSnapshot]
+    ) -> JSONValue {
         guard case .object(var object) = encode(thread) else { return .null }
         let display = AgentThreadTitle.display(thread.title)
         object["displayTitle"] = .string(display)
@@ -5034,6 +5101,7 @@ public final class JSONRPCDispatcher {
         object["provider_locked"] = .bool(locked)
         appendRouting(thread.effectiveRoutingConfiguration, to: &object)
         appendActiveRun(to: &object, thread: thread.id)
+        object["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualActions[thread.id])
         return .object(object)
     }
 
@@ -5477,6 +5545,7 @@ public final class JSONRPCDispatcher {
         payload["pinned"] = .bool(thread.pinned)
         payload["sort_order"] = .number(Double(thread.sortOrder))
         appendRouting(thread.effectiveRoutingConfiguration, to: &payload)
+        payload["pending_manual_action"] = ManualActionWire.pendingRow(router.pendingManualActions(for: [thread])[thread.id])
         return .object(payload)
     }
 

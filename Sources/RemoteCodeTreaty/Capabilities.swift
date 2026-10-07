@@ -35,21 +35,36 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         public let providers: [String]
         public let supportsStreamEvents: Bool
         public let supportsResume: Bool
+        /// `agent.manual_action.list` / `agent.manual_action.resolve`,
+        /// `agent.manual_action.updated` and `pending_manual_action` on thread
+        /// payloads (see ManualActionContracts.swift). False for older hosts.
+        public let manualActionsV1: Bool
 
         public init(
             providers: [String],
             supportsStreamEvents: Bool,
-            supportsResume: Bool
+            supportsResume: Bool,
+            manualActionsV1: Bool = false
         ) {
             self.providers = providers
             self.supportsStreamEvents = supportsStreamEvents
             self.supportsResume = supportsResume
+            self.manualActionsV1 = manualActionsV1
         }
 
         private enum CodingKeys: String, CodingKey {
             case providers
             case supportsStreamEvents = "supports_stream_events"
             case supportsResume = "supports_resume"
+            case manualActionsV1 = "manual_actions_v1"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            providers = try container.decode([String].self, forKey: .providers)
+            supportsStreamEvents = try container.decode(Bool.self, forKey: .supportsStreamEvents)
+            supportsResume = try container.decode(Bool.self, forKey: .supportsResume)
+            manualActionsV1 = try container.decodeIfPresent(Bool.self, forKey: .manualActionsV1) ?? false
         }
     }
 

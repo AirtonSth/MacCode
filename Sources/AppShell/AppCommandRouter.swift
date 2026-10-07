@@ -525,6 +525,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest else { return }
             Task { @MainActor [weak self] in self?.handleManualActionRequested(request) }
         })
+        // Synchronous on the poster's thread: an agent.manual_action.resolve call posts on the
+        // main actor, so its event is published inside the call and lands in the receipt.
+        botHostObservers.append(center.addObserver(forName: .manualActionStateChanged, object: nil, queue: nil) { [weak self] note in
+            guard let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest,
+                  let threadID = request.threadID else { return }
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.publishManualActionUpdated(thread: threadID, requestID: request.id) }
+            } else {
+                Task { @MainActor [weak self] in self?.publishManualActionUpdated(thread: threadID, requestID: request.id) }
+            }
+        })
         botHostObservers.append(center.addObserver(forName: .botMacExecutionRequested, object: nil, queue: nil) { [weak self] note in
             guard let info = note.userInfo,
                   let threadID = info[BotHostNotificationKey.threadID] as? AgentThreadID else { return }
@@ -548,11 +559,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func handleManualActionRequested(_ request: ManualActionRequest) {
         guard let threadID = request.threadID else { return }
-        // A late main-actor hop must not overwrite a request the user already resolved.
-        guard !manualActionStore.all(threadID: threadID).contains(where: { $0.id == request.id }) else { return }
-        do { try manualActionStore.upsert(request) } catch {
-            NSLog("RemoteCode: manual action request could not be saved: \(error)")
+        // A late main-actor hop must not overwrite or re-announce a request the user already
+        // resolved. A Mac card that saved it first (its observer can run before this hop)
+        // still gets its event and push here, once.
+        if let existing = manualActionStore.all(threadID: threadID).first(where: { $0.id == request.id }) {
+            guard existing.state.isOpen else { return }
+        } else {
+            do { try manualActionStore.upsert(request) } catch {
+                NSLog("RemoteCode: manual action request could not be saved: \(error)")
+            }
         }
+        publishManualActionUpdated(thread: threadID, requestID: request.id)
         guard let ctx = context else { return }
         // The pausing turn may already have ended; a fresh run id still passes the nested-worker check.
         let runID = (try? ctx.runRepo.latestActive(for: threadID))?.id ?? AgentRunID()
@@ -636,6 +653,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         payload["sort_order"] = .number(Double(thread.sortOrder))
         appendAgentRouting(thread.effectiveRoutingConfiguration, to: &payload)
         appendAgentActiveRun(to: &payload, thread: thread.id)
+        payload["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualActions(for: [thread])[thread.id])
         return .object(payload)
     }
 
