@@ -308,6 +308,8 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     var agentUserInputResponses: [(AgentThreadID, String, String)] = []
     var respondAgentUserInputCallCount = 0
     var readAgentEvents: [AssistantEvent] = []
+    /// nil keeps the protocol default (replayed error rows left as stored).
+    var replayedRunErrorFieldsStub: ((String, Bool) -> [String: JSONValue])?
     var readAgentThreadMirrorSnapshotCallCount = 0
     /// Captures the last `eventRowLimit` argument. `nil` means unbounded legacy.
     var lastMirrorSnapshotEventRowLimit: Int?
@@ -655,6 +657,9 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     }
     func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent] {
         readAgentEvents
+    }
+    func replayedRunErrorFields(message: String, recoverable: Bool) -> [String: JSONValue] {
+        replayedRunErrorFieldsStub?(message, recoverable) ?? [:]
     }
     func readAgentThreadMirrorSnapshot(
         thread: AgentThreadID,

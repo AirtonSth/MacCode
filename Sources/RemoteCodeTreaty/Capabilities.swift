@@ -45,19 +45,28 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         /// `agent.mac_execution.requested` (see ThreadActorContracts.swift).
         /// False for older hosts.
         public let threadActorV1: Bool
+        /// `recovery_action` (`sign_in` | `retry` | `start_fresh` |
+        /// `new_session` | null) is present on every `agent.run.error` and
+        /// `agent.run.failed` event and on every replayed `error` row of
+        /// `agent.thread.read`; `message` there is display text. Render the
+        /// action as given (null = no action). False for older hosts: fall back
+        /// to a generic Retry.
+        public let runRecoveryActionV1: Bool
 
         public init(
             providers: [String],
             supportsStreamEvents: Bool,
             supportsResume: Bool,
             manualActionsV1: Bool = false,
-            threadActorV1: Bool = false
+            threadActorV1: Bool = false,
+            runRecoveryActionV1: Bool = false
         ) {
             self.providers = providers
             self.supportsStreamEvents = supportsStreamEvents
             self.supportsResume = supportsResume
             self.manualActionsV1 = manualActionsV1
             self.threadActorV1 = threadActorV1
+            self.runRecoveryActionV1 = runRecoveryActionV1
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -66,6 +75,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             case supportsResume = "supports_resume"
             case manualActionsV1 = "manual_actions_v1"
             case threadActorV1 = "thread_actor_v1"
+            case runRecoveryActionV1 = "run_recovery_action_v1"
         }
 
         public init(from decoder: Decoder) throws {
@@ -75,6 +85,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             supportsResume = try container.decode(Bool.self, forKey: .supportsResume)
             manualActionsV1 = try container.decodeIfPresent(Bool.self, forKey: .manualActionsV1) ?? false
             threadActorV1 = try container.decodeIfPresent(Bool.self, forKey: .threadActorV1) ?? false
+            runRecoveryActionV1 = try container.decodeIfPresent(Bool.self, forKey: .runRecoveryActionV1) ?? false
         }
     }
 

@@ -326,13 +326,19 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     public static let freshSessionMarkerPrefix = "[fresh-session:"
 
     private static let freshSessionMarkerRegex = try! NSRegularExpression(
-        pattern: "\\[fresh-session:[^\\]]*\\]\\s*"
+        pattern: "\\[fresh-session:[^\\]]*\\]\\s*",
+        options: [.caseInsensitive]
     )
+
+    /// Case-insensitive, like the classifier (which lowercases the message).
+    public static func hasFreshSessionMarker(_ message: String) -> Bool {
+        message.range(of: freshSessionMarkerPrefix, options: .caseInsensitive) != nil
+    }
 
     /// Error text for people: the fresh-session marker is a machine tag, so it
     /// is removed. Classify on the raw message, never on this text.
     public static func displayText(_ message: String) -> String {
-        guard message.contains(freshSessionMarkerPrefix) else { return message }
+        guard hasFreshSessionMarker(message) else { return message }
         let range = NSRange(message.startIndex..<message.endIndex, in: message)
         return freshSessionMarkerRegex.stringByReplacingMatches(
             in: message, options: [], range: range, withTemplate: ""
@@ -351,7 +357,7 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
         switch action {
         case .signIn: return "sign_in"
         case .startFresh: return "start_fresh"
-        case .retry: return message.contains(freshSessionMarkerPrefix) ? "new_session" : "retry"
+        case .retry: return hasFreshSessionMarker(message) ? "new_session" : "retry"
         }
     }
 }
@@ -9969,7 +9975,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // history the model rejected, so Retry re-runs the prompt in a new
         // provider session on the SAME thread (a bot desk keeps its linked
         // conversation). Start fresh would orphan the desk link instead.
-        if normalized.contains("[fresh-session:") {
+        if AgentErrorRecoveryAction.hasFreshSessionMarker(message) {
             return .retry
         }
         let resumeInvalidMarkers = [
@@ -16718,7 +16724,7 @@ public struct AgentAppView: View {
                                         .foregroundColor(DS.Palette.textSecondary)
                                         .lineLimit(1)
                                         .truncationMode(.tail)
-                                    if let detail = activity.detail, !detail.isEmpty {
+                                    if let detail = Self.workLogDetailText(activity), !detail.isEmpty {
                                         Text(detail)
                                             .font(DS.Font.monoSmall)
                                             .foregroundColor(DS.Palette.textTertiary)
@@ -16737,6 +16743,13 @@ public struct AgentAppView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityIdentifier("agent.workLog")
         }
+    }
+
+    /// The work log shows an error's text without the fresh-session machine
+    /// marker, like the composer error row; the stored detail stays raw.
+    nonisolated static func workLogDetailText(_ activity: AssistantWorkActivity) -> String? {
+        guard activity.kind == .error, let detail = activity.detail else { return activity.detail }
+        return AgentErrorRecoveryAction.displayText(detail)
     }
 
     private func workActivityIcon(_ activity: AssistantWorkActivity) -> String {

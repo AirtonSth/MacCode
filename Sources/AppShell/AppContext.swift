@@ -1430,6 +1430,8 @@ public final class AppContext {
         // paths only emit .threadStarted, so onRunStarted becomes the single
         // source for new runs.
         let runStartedDeduplicator = AgentRunStartedDeduplicator()
+        // agent.run.error's action wins for its run (see AgentRunErrorWire).
+        let runErrorActions = AgentRunErrorActionLedger()
         coordinator.onRunStarted = { [weak self] tid, runId in
             guard runStartedDeduplicator.insert(threadID: tid, runID: runId) else { return }
             EventBus.shared.publish(kind: .agentRunStarted,
@@ -1697,13 +1699,15 @@ public final class AppContext {
                 // clients can show the reason and a Retry affordance instead
                 // of a bare FAIL badge.
                 var errorPayload = agentRunPayload(threadId: tid, runId: runId).objectValue ?? [:]
-                errorPayload.merge(AgentRunErrorWire.fields(message: message, recoverable: recoverable)) { $1 }
-                errorPayload["recoverable"] = .bool(recoverable)
+                let errorFields = AgentRunErrorWire.errorEventFields(message: message, recoverable: recoverable)
+                errorPayload.merge(errorFields) { $1 }
+                runErrorActions.record(runId: runId, action: errorFields["recovery_action"] ?? .null)
                 EventBus.shared.publish(kind: .agentRunError, payload: .object(errorPayload))
             }
         }
         coordinator.onRunFinished = { [weak self] tid, rid, status in
             let nextWaiting = BotVMRunRegistry.shared.releaseAndNextWaiter(runID: rid)
+            let streamErrorAction = runErrorActions.take(runId: rid)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let nextWaiting {
@@ -1713,9 +1717,14 @@ public final class AppContext {
                     ? .agentRunCompleted
                     : .agentRunFailed
                 var failedPayload = agentRunPayload(threadId: tid, runId: rid, status: status)
-                if status == .failed, let msg = try? self.runRepo.errorMessage(of: rid), !msg.isEmpty {
+                if kind == .agentRunFailed {
+                    let storedMessage = status == .failed ? (try? self.runRepo.errorMessage(of: rid)) ?? nil : nil
                     var obj = failedPayload.objectValue ?? [:]
-                    obj.merge(AgentRunErrorWire.fields(message: msg, recoverable: false)) { $1 }
+                    obj.merge(AgentRunErrorWire.failedEventFields(
+                        status: status,
+                        storedMessage: storedMessage,
+                        streamErrorAction: streamErrorAction
+                    )) { $1 }
                     failedPayload = .object(obj)
                 }
                 EventBus.shared.publish(kind: kind, payload: kind == .agentRunFailed ? failedPayload : agentRunPayload(threadId: tid, runId: rid, status: status))

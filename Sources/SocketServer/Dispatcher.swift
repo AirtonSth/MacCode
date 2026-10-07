@@ -372,6 +372,10 @@ public protocol CommandRouting: AnyObject {
     func setAgentThreadActor(thread: AgentThreadID, actor: RunActor, executionTarget: ExecutionTarget?) async throws -> AgentThread
     /// Single-winner answer to the bot's Mac-execution request, shared with the Mac banner.
     func resolveMacExecutionRemote(thread: AgentThreadID, approve: Bool) async throws -> MacExecutionResolveOutcome
+    /// `message` (display text) and `recovery_action` for a replayed `.error`
+    /// event (host capability `agent.run_recovery_action_v1`), from the same
+    /// classifier as the live `agent.run.error` event. Empty leaves the row as stored.
+    func replayedRunErrorFields(message: String, recoverable: Bool) -> [String: JSONValue]
 }
 
 public extension CommandRouting {
@@ -389,6 +393,7 @@ public extension CommandRouting {
     func resolveMacExecutionRemote(thread: AgentThreadID, approve: Bool) async throws -> MacExecutionResolveOutcome {
         throw JSONRPCError.notSupported("agent.mac_execution.resolve")
     }
+    func replayedRunErrorFields(message: String, recoverable: Bool) -> [String: JSONValue] { [:] }
 
     func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
         try sshTransferUpload(surface: surface, localPath: localPath, remotePath: remotePath)
@@ -2486,7 +2491,9 @@ public final class JSONRPCDispatcher {
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
                     "manual_actions_v1": .bool(true),
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
-                    "thread_actor_v1": .bool(true)
+                    "thread_actor_v1": .bool(true),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "run_recovery_action_v1": .bool(true)
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {
@@ -3915,7 +3922,7 @@ public final class JSONRPCDispatcher {
                         eventRowLimit: caps.eventLimit,
                         maxPayloadBytes: Int64(caps.maxBytes)
                     )
-                    let encodedEvents = snapshot.events.map { encode($0) }
+                    let encodedEvents = snapshot.events.map { decorateReplayedRunError(encode($0)) }
                     let blocked = snapshot.blockedEvent.map {
                         AgentThreadReadV1.BlockedEvent(
                             id: $0.id,
@@ -3957,14 +3964,14 @@ public final class JSONRPCDispatcher {
                     let events = eventLimit.map { Array(snapshot.events.suffix($0)) }
                         ?? snapshot.events
                     var payload: [String: JSONValue] = [
-                        "events": encode(events),
+                        "events": decorateReplayedRunErrors(encode(events)),
                         "event_watermark": .number(Double(snapshot.eventWatermark)),
                         "events_truncated": .bool(events.count < snapshot.events.count)
                     ]
                     appendActiveDelegation(to: &payload, thread: tid)
                     return .init(id: id, result: .object(payload))
                 }
-                return .init(id: id, result: encode(try await router.readAgentThreadEvents(thread: tid)))
+                return .init(id: id, result: decorateReplayedRunErrors(encode(try await router.readAgentThreadEvents(thread: tid))))
             case "agent.thread.rollback":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let turnId = params["turn_id"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -5072,6 +5079,25 @@ public final class JSONRPCDispatcher {
             return .null
         }
         return result
+    }
+
+    /// agent.thread.read: a replayed `{"error": {message, recoverable}}` row gets
+    /// the live event's display `message` and `recovery_action`, so a cold
+    /// open or reconnect shows the same action as `agent.run.error`.
+    func decorateReplayedRunError(_ event: JSONValue) -> JSONValue {
+        guard case .object(let outer) = event, outer.count == 1,
+              case .object(var error)? = outer["error"],
+              let message = error["message"]?.stringValue,
+              let recoverable = error["recoverable"]?.boolValue else { return event }
+        let fields = router.replayedRunErrorFields(message: message, recoverable: recoverable)
+        guard !fields.isEmpty else { return event }
+        error.merge(fields) { $1 }
+        return .object(["error": .object(error)])
+    }
+
+    func decorateReplayedRunErrors(_ events: JSONValue) -> JSONValue {
+        guard case .array(let rows) = events else { return events }
+        return .array(rows.map(decorateReplayedRunError))
     }
 
     /// Full JSON-RPC response UTF-8 size (keys, separators, escaping, id).

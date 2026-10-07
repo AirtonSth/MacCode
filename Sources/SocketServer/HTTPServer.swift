@@ -1326,6 +1326,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // on thread payloads, agent.thread.actor.set, agent.mac_execution.resolve
             // and agent.mac_execution.requested.
             "thread_actor_v1": true,
+            // recovery_action (+ display message) on agent.run.error,
+            // agent.run.failed and replayed agent.thread.read error rows.
+            "run_recovery_action_v1": true,
         ]
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject

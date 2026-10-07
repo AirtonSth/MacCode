@@ -43,6 +43,24 @@ final class AgentErrorRecoveryWireTests: XCTestCase {
         )
     }
 
+    func test_markerCasing_neverChangesTheActionOrLeaksTheTag() {
+        // WHY: the classifier lowercases, so a differently cased marker is still
+        // a fresh-session failure; the wire and display must agree with it.
+        let upper = "[FRESH-SESSION:incompatible-history] rejected"
+        XCTAssertEqual(AgentErrorRecoveryAction.pairedWireValue(message: upper, recoverable: false), "new_session")
+        XCTAssertEqual(AgentErrorRecoveryAction.displayText(upper), "rejected")
+    }
+
+    func test_workLogErrorDetail_hidesTheMarker_otherKindsUnchanged() {
+        // WHY: the work log is the second place the Mac shows the error text.
+        let error = AssistantWorkActivity(id: "e", kind: .error, title: "Agent error", detail: freshSessionError, createdAtMs: 0)
+        let shown = AgentAppView.workLogDetailText(error)
+        XCTAssertEqual(shown, AgentErrorRecoveryAction.displayText(freshSessionError))
+        XCTAssertFalse(shown?.contains("[fresh-session:") ?? true)
+        let tool = AssistantWorkActivity(id: "t", kind: .tool, title: "Ran", detail: "[fresh-session:x] literal", createdAtMs: 0)
+        XCTAssertEqual(AgentAppView.workLogDetailText(tool), "[fresh-session:x] literal", "only error rows are rewritten")
+    }
+
     func test_freshSessionNoticeRow_isLabelledNewSessionNotCompacted() {
         // WHY: Distill's replacement-session notice rides as .contextCompaction for
         // decoder compatibility; calling it "Compacted" tells the user the wrong thing.
