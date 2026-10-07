@@ -779,8 +779,11 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     weak var router: AppCommandRouter?
 
     private var handoffs: [UUID: PersistedBotPeerHandoff] = [:]
-    /// Open only while `reconcilePeerHandoffs` runs; see `publishThreadChrome`.
+    /// Open while `reconcilePeerHandoffs` runs, or from init until
+    /// `publishRestoredThreadChrome()` when the event log is not wired yet;
+    /// see `publishThreadChrome`.
     private var deferredThreadChrome: [AgentThreadID: AgentThreadChromeWrite]?
+    private let eventBus: EventBus
     private var activeConsultationClaims: Set<UUID> = []
     /// Telemetry receipt id per delegated peer run, so finalization targets the
     /// exact bot row even when routing admission wrote a second receipt under
@@ -848,7 +851,9 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         settingsRepo: SettingsRepository,
         coordinator: AgentRunCoordinator,
         appSupportDirectory: URL,
-        orchestrationRuntime: AgentOrchestrationRuntime? = nil
+        orchestrationRuntime: AgentOrchestrationRuntime? = nil,
+        eventBus: EventBus = .shared,
+        holdsThreadChromeUntilEventLogReady: Bool = false
     ) {
         self.botStore = botStore
         self.threadRepo = threadRepo
@@ -860,9 +865,23 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         self.coordinator = coordinator
         self.orchestrationRuntime = orchestrationRuntime
         self.appSupportDirectory = appSupportDirectory
+        self.eventBus = eventBus
+        // At app launch this init runs before the event log is wired: an
+        // event published now gets a seq the log reload discards, is never
+        // persisted, and reaches no client. Keep the restore batch open until
+        // the host says the bus is ready.
+        if holdsThreadChromeUntilEventLogReady { deferredThreadChrome = [:] }
         coordinator.addObserver(self)
         observePeerQueueLifecycle()
         reconcilePeerHandoffs()
+    }
+
+    /// Publishes the chrome held since init (restore reconcile plus anything
+    /// projected before the event log was ready), once per thread. Call after
+    /// the event log is wired and reloaded. Later calls do nothing.
+    func publishRestoredThreadChrome() {
+        guard deferredThreadChrome != nil else { return }
+        flushDeferredThreadChrome()
     }
 
     deinit {
@@ -2143,8 +2162,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     }
 
     /// Status/unread chrome for a projected peer message. Returns the committed
-    /// write, or nil when nothing changed (no terminal status and the thread is
-    /// selected or already unread).
+    /// write, or nil when nothing changed (the row is gone, or no terminal
+    /// status and the thread is selected or already unread).
     static func writeAgentAppProjectionChrome(
         threadRepo: AgentThreadRepository,
         threadID: AgentThreadID,
@@ -2153,6 +2172,9 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         at date: Date = Date()
     ) throws -> AgentThreadChromeWrite? {
         if let terminalStatus {
+            // The status UPDATEs match zero rows on a missing thread without
+            // throwing; never describe that as a commit.
+            guard try threadRepo.status(of: threadID) != nil else { return nil }
             if markUnread {
                 try threadRepo.updateStatus(id: threadID, status: terminalStatus, hasUnread: true, at: date)
                 return AgentThreadChromeWrite(
@@ -2172,7 +2194,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     /// projects many handoffs emits one event per thread after its last write.
     private func publishThreadChrome(_ write: AgentThreadChromeWrite) {
         guard deferredThreadChrome != nil else {
-            write.publish()
+            write.publish(on: eventBus)
             return
         }
         deferredThreadChrome?[write.threadID, default: write].merge(write)
@@ -2182,7 +2204,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         let writes = deferredThreadChrome ?? [:]
         deferredThreadChrome = nil
         for threadID in writes.keys.sorted(by: { $0.value.uuidString < $1.value.uuidString }) {
-            writes[threadID]?.publish()
+            writes[threadID]?.publish(on: eventBus)
         }
     }
 
