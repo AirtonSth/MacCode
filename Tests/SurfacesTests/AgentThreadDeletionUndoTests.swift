@@ -188,9 +188,11 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
     }
 
     func test_deleteAndUndoIncludesTerminalForkIntentWithoutRetainingDeletedTranscript() async throws {
-        // WHY: a completed fork intent contains a copy of the source transcript.
-        // Deleting that source must remove the copy too, while the existing
-        // short undo window must still restore the exact relational graph.
+        // WHY: a fork intent that reached local_committed has already copied the
+        // transcript into the child thread, so it releases its source_messages_json
+        // copy (it holds `[]`). Deleting the source must remove the intent row too,
+        // and the short undo window must restore that exact committed row without
+        // resurrecting the deleted transcript into it.
         let vm = try makeVM()
         vm.createThread(title: "fork source")
         let sourceId = try XCTUnwrap(vm.selectedThreadId)
@@ -232,7 +234,8 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
         XCTAssertTrue(vm.undoLastThreadDeletion())
         let restored = try XCTUnwrap(vm.threadRepo.getForkIntent(childThreadId: child.id))
         XCTAssertEqual(restored.state, .localCommitted)
-        XCTAssertEqual(restored.sourceMessages.map(\.content), ["private source transcript"])
+        XCTAssertEqual(restored.sourceMessages.map(\.content), [],
+                       "a committed intent holds no transcript copy, before or after undo")
     }
 
     func test_deleteFailsClosedWhileForkRecoveryNeedsSourceTranscript() async throws {

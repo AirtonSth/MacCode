@@ -680,7 +680,10 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         )
 
         let font = NSFont.systemFont(ofSize: 13)
-        let prompt = String(repeating: "paste a very long user prompt ", count: 80)
+        // Keep the prompt on one line inside the 10,000 pt measuring container:
+        // a wrapped prompt only grows its last line, so `prompt + "!"` could
+        // share the first line's width and hide a real collision behind equal sizes.
+        let prompt = String(repeating: "paste a very long user prompt ", count: 30)
         IntrinsicHeightTextView.idealSizeComputeCountForTesting = 0
         let first = IntrinsicHeightTextView.idealSize(string: prompt, font: font)
         let second = IntrinsicHeightTextView.idealSize(string: prompt, font: font)
@@ -689,6 +692,8 @@ final class AgentLinkedInlineTextTests: XCTestCase {
             IntrinsicHeightTextView.idealSizeComputeCountForTesting, 1,
             "fingerprint keys must still hit for the same long prompt"
         )
+        XCTAssertLessThan(first.height, font.boundingRectForFont.height * 2,
+                          "fixture prompt must measure on a single line")
         let other = IntrinsicHeightTextView.idealSize(string: prompt + "!", font: font)
         XCTAssertEqual(IntrinsicHeightTextView.idealSizeComputeCountForTesting, 2)
         XCTAssertNotEqual(other, first, "a different prompt must measure independently")
