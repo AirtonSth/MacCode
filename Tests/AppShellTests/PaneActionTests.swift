@@ -634,7 +634,14 @@ final class PaneActionTests: XCTestCase {
         try ctx.apply(.addSurface(workspaceID, paneID: nil, descriptor: descriptor))
         let controller = MainWindowController(context: ctx, router: router)
         router.windowController = controller
+        // PF-13: refreshBusyStates skips panes whose window is not visible, so the
+        // in-place spinner contract is about an on-screen window. Show it (no input).
+        controller.window.animationBehavior = .none
+        controller.window.orderFront(nil)
+        defer { controller.window.orderOut(nil) }
         drainMainQueue()
+        XCTAssertTrue(controller.window.isVisible,
+                      "the busy refresh contract below applies to a visible main window")
         let paneRoot = {
             controller.window.contentView?.layoutSubtreeIfNeeded()
             return self.allSubviews(of: controller.window.contentView ?? NSView()).first { $0 is PaneRootView }
