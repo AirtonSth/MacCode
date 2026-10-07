@@ -231,9 +231,12 @@ final class AgentForkAtomicityTests: XCTestCase {
     }
 
     func test_productionAdaptersDeclareForkUnsafeAndCoordinatorNeverLaunchesThem() async throws {
+        // The Claude CLI adapter implements a keyed, compensatable fork on purpose
+        // (b602b3490); that contract is pinned by
+        // ClaudeStreamingCLIAdapterInterruptTests.test_cliForkThread_isKeyedIdempotentAndCompensatable.
+        // Only the adapters whose provider protocol exposes no keyed fork belong here.
         let adapters: [AgentProviderAdapter] = [
             CodexAppServerAdapter(binaryNameOverride: "/definitely/missing/codex"),
-            ClaudeStreamingCLIAdapter(binaryNameOverride: "/definitely/missing/claude"),
             GrokACPAdapter(binaryNameOverride: "/definitely/missing/grok")
         ]
 

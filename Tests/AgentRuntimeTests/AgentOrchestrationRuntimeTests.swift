@@ -220,8 +220,8 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
                 eligible: AgentProvider.allCases,
                 preferred: .claude
             ),
-            [.claude, .codex, .grok],
-            "Auto must try the Source picker host before allCases order (codex-first)."
+            [.claude, .codex, .grok, .distill],
+            "Auto must try the Source picker host before allCases order (codex-first), keeping every other case including .distill."
         )
         XCTAssertEqual(
             AgentOrchestrationRuntime.orderedEligibleProviders(
