@@ -805,8 +805,20 @@ public final class AppContext {
         coordinator.onAssistantEvent = { ev, tid, runId in
             let t = tid.value.uuidString.lowercased()
             switch ev {
-            case .threadStarted:
-                guard runStartedDeduplicator.insert(threadID: tid, runID: runId) else { break }
+            case .threadStarted(let eventThreadId, let providerThreadId):
+                guard runStartedDeduplicator.insert(threadID: tid, runID: runId) else {
+                    // agent.run.started went out before the coordinator committed
+                    // this provider cursor; mirror the cursor write itself, but only
+                    // when it actually landed.
+                    let cursor = providerThreadId ?? eventThreadId
+                    if (try? self.threadRepo.providerThreadId(of: tid)) == cursor,
+                       let updatedAt = try? self.threadRepo.updatedAt(of: tid) {
+                        AgentThreadChromeWrite(
+                            threadID: tid, providerThreadID: cursor, updatedAt: updatedAt
+                        ).publish()
+                    }
+                    break
+                }
                 EventBus.shared.publish(kind: .agentRunStarted, payload: agentRunPayload(threadId: tid, runId: runId))
             case .turnStarted(let turnId):
                 EventBus.shared.publish(kind: .agentTurnStarted,

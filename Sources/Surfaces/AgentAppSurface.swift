@@ -297,6 +297,42 @@ public enum AgentThreadLifecycleEvent {
     case deleted([AgentThreadID])
 }
 
+/// One committed narrow `agent_threads` chrome write (status, unread or the
+/// provider cursor, plus `updated_at`) that publishes no `agent.*` state
+/// event of its own. The host mirrors it as one partial `agent.thread.updated`
+/// so connected clients and the `agentThreads` snapshot revision see the
+/// commit. A nil field means the write left that column alone.
+public struct AgentThreadChromeWrite: Equatable, Sendable {
+    public var threadID: AgentThreadID
+    public var status: AgentRunStatus?
+    public var hasUnread: Bool?
+    public var providerThreadID: String?
+    public var updatedAt: Date
+
+    public init(
+        threadID: AgentThreadID,
+        status: AgentRunStatus? = nil,
+        hasUnread: Bool? = nil,
+        providerThreadID: String? = nil,
+        updatedAt: Date
+    ) {
+        self.threadID = threadID
+        self.status = status
+        self.hasUnread = hasUnread
+        self.providerThreadID = providerThreadID
+        self.updatedAt = updatedAt
+    }
+
+    /// Folds a later write to the same thread into this one, so a loop that
+    /// commits several writes can publish once with the final row values.
+    public mutating func merge(_ later: AgentThreadChromeWrite) {
+        status = later.status ?? status
+        hasUnread = later.hasUnread ?? hasUnread
+        providerThreadID = later.providerThreadID ?? providerThreadID
+        updatedAt = later.updatedAt
+    }
+}
+
 public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     case signIn
     case retry
@@ -537,6 +573,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// repo write + reloadThreads) so the host can mirror them to remote
     /// clients. Wired by AppCommandRouter like onThreadConfigPersisted.
     public var onThreadLifecycle: ((AgentThreadLifecycleEvent) -> Void)?
+    /// Fired after this VM commits a status/unread-only `agent_threads` write
+    /// that no `agent.*` state event covers, so the host can mirror it.
+    public var onThreadChromeWritten: ((AgentThreadChromeWrite) -> Void)?
     /// Post-commit process-global retirement for automatic cap victims. The
     /// boolean is true only when AgentRunCoordinator's native fork producer
     /// already retired its coordinator state and the host only needs queue state.
@@ -8303,11 +8342,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         guard selectedThreadId == threadId else {
             do {
-                guard let wrote = try threadRepo.markUnreadUpdatingActivity(of: threadId) else {
+                let unreadAt = Date()
+                guard let wrote = try threadRepo.markUnreadUpdatingActivity(of: threadId, at: unreadAt) else {
                     statusMessage = "The bot reply thread is no longer available."
                     return nil
                 }
                 if wrote {
+                    onThreadChromeWritten?(AgentThreadChromeWrite(
+                        threadID: threadId, hasUnread: true, updatedAt: unreadAt
+                    ))
                     scheduleReloadThreads(delayMilliseconds: 0)
                 }
             } catch {
@@ -8788,6 +8831,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 hasUnread: paintedUnread,
                 at: pendingAt
             )
+            onThreadChromeWritten?(AgentThreadChromeWrite(
+                threadID: tid, status: .pending, hasUnread: paintedUnread, updatedAt: pendingAt
+            ))
             if let index = threads.firstIndex(where: { $0.id == tid }) {
                 threads[index].status = .pending
                 threads[index].updatedAt = pendingAt
@@ -8815,12 +8861,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 if let current = try? threadRepo.status(of: tid), current == .pending {
                     let failedAt = Date()
                     let paintedUnread = threads.first(where: { $0.id == tid })?.hasUnread ?? false
-                    try? threadRepo.updateStatus(
+                    if (try? threadRepo.updateStatus(
                         id: tid,
                         status: .failed,
                         hasUnread: paintedUnread,
                         at: failedAt
-                    )
+                    )) != nil {
+                        onThreadChromeWritten?(AgentThreadChromeWrite(
+                            threadID: tid, status: .failed, hasUnread: paintedUnread, updatedAt: failedAt
+                        ))
+                    }
                     if let index = threads.firstIndex(where: { $0.id == tid }) {
                         threads[index].status = .failed
                         threads[index].updatedAt = failedAt
@@ -8840,7 +8890,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         do {
             if let transformFailure {
-                try? threadRepo.updateStatus(id: tid, status: .failed, hasUnread: false, at: Date())
+                let failedAt = Date()
+                if (try? threadRepo.updateStatus(id: tid, status: .failed, hasUnread: false, at: failedAt)) != nil {
+                    onThreadChromeWritten?(AgentThreadChromeWrite(
+                        threadID: tid, status: .failed, hasUnread: false, updatedAt: failedAt
+                    ))
+                }
                 throw transformFailure
             }
             let runId = try await coordinator.startRun(

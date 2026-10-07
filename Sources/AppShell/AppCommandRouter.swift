@@ -1109,6 +1109,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         agent.viewModel.onThreadLifecycle = { [weak self] event in
                             self?.publishAgentThreadLifecycle(event)
                         }
+                        agent.viewModel.onThreadChromeWritten = { write in
+                            write.publish()
+                        }
                         agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
                             ctx?.retireDeletedAgentThreads(
                                 ids,
@@ -9004,6 +9007,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 agent.viewModel.onThreadLifecycle = { [weak self] event in
                     self?.publishAgentThreadLifecycle(event)
+                }
+                agent.viewModel.onThreadChromeWritten = { write in
+                    write.publish()
                 }
                 agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
                     ctx?.retireDeletedAgentThreads(

@@ -779,6 +779,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     weak var router: AppCommandRouter?
 
     private var handoffs: [UUID: PersistedBotPeerHandoff] = [:]
+    /// Open only while `reconcilePeerHandoffs` runs; see `publishThreadChrome`.
+    private var deferredThreadChrome: [AgentThreadID: AgentThreadChromeWrite]?
     private var activeConsultationClaims: Set<UUID> = []
     /// Telemetry receipt id per delegated peer run, so finalization targets the
     /// exact bot row even when routing admission wrote a second receipt under
@@ -2121,21 +2123,13 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                   stored.role == .assistant,
                   stored.content == content else { return false }
             let markUnread = router?.agentAppThreadIsSelected(threadID) != true
-            if let terminalStatus {
-                if markUnread {
-                    try threadRepo.updateStatus(
-                        id: threadID,
-                        status: terminalStatus,
-                        hasUnread: true
-                    )
-                } else {
-                    try threadRepo.updateStatusPreservingUnread(
-                        id: threadID,
-                        status: terminalStatus
-                    )
-                }
-            } else if markUnread {
-                _ = try threadRepo.markUnreadUpdatingActivity(of: threadID)
+            if let write = try Self.writeAgentAppProjectionChrome(
+                threadRepo: threadRepo,
+                threadID: threadID,
+                terminalStatus: terminalStatus,
+                markUnread: markUnread
+            ) {
+                publishThreadChrome(write)
             }
             router?.projectAgentAppPeerMessage(
                 threadID: threadID,
@@ -2145,6 +2139,50 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             return true
         } catch {
             return false
+        }
+    }
+
+    /// Status/unread chrome for a projected peer message. Returns the committed
+    /// write, or nil when nothing changed (no terminal status and the thread is
+    /// selected or already unread).
+    static func writeAgentAppProjectionChrome(
+        threadRepo: AgentThreadRepository,
+        threadID: AgentThreadID,
+        terminalStatus: AgentRunStatus?,
+        markUnread: Bool,
+        at date: Date = Date()
+    ) throws -> AgentThreadChromeWrite? {
+        if let terminalStatus {
+            if markUnread {
+                try threadRepo.updateStatus(id: threadID, status: terminalStatus, hasUnread: true, at: date)
+                return AgentThreadChromeWrite(
+                    threadID: threadID, status: terminalStatus, hasUnread: true, updatedAt: date
+                )
+            }
+            try threadRepo.updateStatusPreservingUnread(id: threadID, status: terminalStatus, at: date)
+            return AgentThreadChromeWrite(threadID: threadID, status: terminalStatus, updatedAt: date)
+        }
+        guard markUnread, try threadRepo.markUnreadUpdatingActivity(of: threadID, at: date) == true else {
+            return nil
+        }
+        return AgentThreadChromeWrite(threadID: threadID, hasUnread: true, updatedAt: date)
+    }
+
+    /// Publishes now, or folds into the open restore batch so a reconcile that
+    /// projects many handoffs emits one event per thread after its last write.
+    private func publishThreadChrome(_ write: AgentThreadChromeWrite) {
+        guard deferredThreadChrome != nil else {
+            write.publish()
+            return
+        }
+        deferredThreadChrome?[write.threadID, default: write].merge(write)
+    }
+
+    private func flushDeferredThreadChrome() {
+        let writes = deferredThreadChrome ?? [:]
+        deferredThreadChrome = nil
+        for threadID in writes.keys.sorted(by: { $0.value.uuidString < $1.value.uuidString }) {
+            writes[threadID]?.publish()
         }
     }
 
@@ -2321,6 +2359,11 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
 
     private func reconcilePeerHandoffs() {
         refreshStorageProjection()
+        let ownsChromeBatch = deferredThreadChrome == nil
+        if ownsChromeBatch { deferredThreadChrome = [:] }
+        defer {
+            if ownsChromeBatch { flushDeferredThreadChrome() }
+        }
         for activityID in handoffs.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
             guard let handoff = handoffs[activityID] else { continue }
             if let conversationID = handoff.originConversationID,
