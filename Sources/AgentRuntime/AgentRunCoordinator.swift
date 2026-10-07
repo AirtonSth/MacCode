@@ -2538,7 +2538,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// keeps the durable session status (a failed, cancelled or interrupted row).
     ///
     /// The capped pass targets threads that finished seconds ago, so the release
-    /// also waits out a finish still in flight (pending, deferred or finishing
+    /// also waits out a finish still in flight (pending or finishing
     /// terminal, the ghost-reconcile barrier) and any in-memory ownership, then
     /// holds the thread's start gate across `stopSession`: a start cannot begin
     /// on the session being stopped. A start that loses that race fails like any
@@ -2548,7 +2548,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let streamOwner = pendingStreamRunIds[threadId]
         let terminalBarrierPending = streamOwner.map {
             pendingTerminalEvents[$0] != nil
-                || deferredProviderTerminalEvents[$0] != nil
                 || finishingRuns.contains($0)
         } ?? false
         // A surface that reserved a start is about to send on this session.
