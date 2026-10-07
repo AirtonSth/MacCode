@@ -660,6 +660,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
     }
 
     func test_runtimeModeSwitchRestartsStreamingProcessWithResumeCursor() async throws {
+        try skipUnlessLegacyClaudeIsSelectable()
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-runtime-switch-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
@@ -982,6 +983,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
     }
 
     func test_agentSDKBridgeAdapterUsesOneBridgeAndNativeRuntimeSwitchControls() async throws {
+        try skipUnlessLegacyClaudeIsSelectable()
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-sdk-bridge-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)

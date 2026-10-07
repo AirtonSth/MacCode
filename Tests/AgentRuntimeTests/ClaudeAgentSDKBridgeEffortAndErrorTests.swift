@@ -737,6 +737,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
     }
 
     func test_closedStdinInvalidatesEveryMutableBridgeControlBoundary() async throws {
+        try skipUnlessLegacyClaudeIsSelectable()
         guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
         let boundaries = ["turn", "model", "permission", "user_input", "cancel_input"]
 
