@@ -337,6 +337,8 @@ public struct AgentAppEmbedding {
     /// never runs a provider). Returns the rows it wrote to the pinned thread,
     /// painted at once; a thrown error keeps the prompt and shows its text.
     public let sendInterceptor: AgentAppSendInterceptor?
+    /// Composer placeholder for an intercepted surface (it names no provider).
+    public let composerPlaceholder: String?
 
     public init(
         pinnedThreadId: AgentThreadID,
@@ -344,7 +346,8 @@ public struct AgentAppEmbedding {
         promptTransform: (@MainActor (_ text: String, _ threadId: AgentThreadID, _ runId: AgentRunID) async throws -> String)? = nil,
         onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)? = nil,
         onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)? = nil,
-        sendInterceptor: AgentAppSendInterceptor? = nil
+        sendInterceptor: AgentAppSendInterceptor? = nil,
+        composerPlaceholder: String? = nil
     ) {
         self.pinnedThreadId = pinnedThreadId
         self.executionCwd = executionCwd
@@ -352,6 +355,7 @@ public struct AgentAppEmbedding {
         self.onRunStarted = onRunStarted
         self.onRunFinished = onRunFinished
         self.sendInterceptor = sendInterceptor
+        self.composerPlaceholder = composerPlaceholder
     }
 }
 
@@ -5046,6 +5050,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// `!selectedThreadRunIsStartingOrRunning` guard keeps the neutral copy during
     /// the brief window a resume run is starting.
     public var composerPlaceholder: String {
+        if let placeholder = embedding?.composerPlaceholder { return placeholder }
         let defaultPlaceholder = "Ask \(provider.rawValue.capitalized) for changes…"
         guard !selectedThreadRunIsStartingOrRunning,
               let reason = incompleteTurnReason else { return defaultPlaceholder }
@@ -6509,6 +6514,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         prompt = summary
         persistComposerDraft(for: newId)
         return newId
+    }
+
+    /// Shown when Retry, Continue or a re-run is asked of a surface whose
+    /// sends are intercepted (a bot group room or a member's private thread).
+    public static let interceptedRunRefusal = "Bots in a group answer from the group. Write in the group."
+
+    /// True when sends are intercepted: nothing may start a provider run here.
+    private func refuseInterceptedRun() -> Bool {
+        guard embedding?.sendInterceptor != nil else { return false }
+        statusMessage = Self.interceptedRunRefusal
+        return true
     }
 
     private func refuseLegacyProviderThreadRun() -> Bool {
@@ -9128,7 +9144,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     ) async -> AgentRunID? {
         botVMClaimRefusal = nil
         // A surface whose sends are intercepted (a bot group room) never runs a provider.
-        guard embedding?.sendInterceptor == nil else { return nil }
+        guard !refuseInterceptedRun() else { return nil }
         guard !refuseLegacyProviderThreadRun() else { return nil }
         guard !refuseUnavailableBotThreadRun() else { return nil }
         let baseRouting = queuedRoutingSnapshot?.configuration
@@ -9717,6 +9733,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// UX-MAC_AGENT-009: re-send the last prompt after a recoverable error
     /// without forcing the user to retype it.
     public func retryLastPrompt() async {
+        if refuseInterceptedRun() { return }
         if refuseLegacyProviderThreadRun() { return }
         let failedMessage = selectedThreadId.flatMap { threadId in
             try? messageRepo.listRecent(
@@ -13051,7 +13068,11 @@ public struct AgentAppView: View {
     @State private var customModelDraft = ""
     /// Composer Simple (attach/model/send) vs Power (full toolbar).
     /// Always full chrome — no Simple/Power collapse toggle on macOS.
-    private var composerChromeMode: AgentComposerChromeMode { .power }
+    /// A surface whose sends are intercepted (a bot group room) only relays:
+    /// its provider, model and run chrome would change nothing.
+    private var composerChromeMode: AgentComposerChromeMode {
+        vm.embedding?.sendInterceptor != nil ? .relay : .power
+    }
 
     public init(vm: AgentAppViewModel, accountPanel: AnyView? = nil, layout: AgentAppViewLayout = .standard) {
         self.vm = vm
@@ -18999,7 +19020,7 @@ public struct AgentAppView: View {
                 && AgentComposerChromePresentation.shows(.sendStop, mode: composerChromeMode),
             runActive: vm.selectedThreadIsStoppableBusy,
             isStopping: vm.isStopping,
-            attachEnabled: vm.selectedProviderCanRun && !(vm.selectedProviderSnapshot.map {
+            attachEnabled: composerChromeMode != .relay && vm.selectedProviderCanRun && !(vm.selectedProviderSnapshot.map {
                 !$0.effectiveCapabilities.supportsAttachments
             } ?? false),
             onSend: { Task { await vm.send() } },
@@ -19026,7 +19047,9 @@ public struct AgentAppView: View {
             runStatusCaption: vm.selectedThreadIsStoppableBusy
                 ? (vm.selectedThreadIsPreparingRun ? "Preparing" : "Running")
                 : nil,
-            onFileDrop: { vm.insertDroppedFilePaths($0) }
+            onFileDrop: { vm.insertDroppedFilePaths($0) },
+            attachUnavailableReason: composerChromeMode == .relay
+                ? AgentComposerChromePresentation.relayAttachUnavailable : nil
         )
     }
 

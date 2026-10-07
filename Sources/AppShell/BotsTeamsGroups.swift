@@ -67,7 +67,8 @@ public final class BotTeamsGroupsController: ObservableObject {
 
     @Published private(set) var teams: [BotTeam] = []
     @Published private(set) var membersByTeam: [BotTeamID: [BotID]] = [:]
-    /// Visible (not hidden) groups, pinned first then most recent.
+    /// Every group (hidden ones too: the sidebar shows them under Show
+    /// hidden), pinned first then most recent.
     @Published private(set) var groups: [BotGroupConversation] = []
     /// Active participants per group, in participant order.
     @Published private(set) var participantsByGroup: [BotGroupID: [BotGroupParticipant]] = [:]
@@ -79,14 +80,23 @@ public final class BotTeamsGroupsController: ObservableObject {
         let target: ExecutionTarget?
     }
     @Published private(set) var memberThreads: [BotGroupID: [BotID: MemberThread]] = [:]
+    /// Failed or interrupted turns of the selected group's last round that
+    /// an active participant can retry.
+    @Published private(set) var retryableTurns: [BotGroupID: [BotGroupTurn]] = [:]
     @Published private(set) var selectedGroupID: BotGroupID?
+    /// The open group (hidden or not), published with the selection.
+    @Published private(set) var selectedGroup: BotGroupConversation?
     @Published var collapsedTeamIDs: Set<BotTeamID> = [] {
         didSet { persistCollapsedTeams() }
     }
     @Published var isInspectorVisible = true {
         didSet { UserDefaults.standard.set(isInspectorVisible, forKey: Self.inspectorDefaultsKey) }
     }
+    /// Presented by the sidebar roster (or the Bots window root).
     @Published var sheet: Sheet?
+    /// Presented by the group room itself (the inspector's Edit…), which is
+    /// on screen whenever the inspector is, sidebar collapsed or not.
+    @Published var roomSheet: Sheet?
     @Published var pendingDelete: PendingDelete?
     /// The selected group's room, mounted as an embedded Agent App.
     @Published private(set) var roomVM: AgentAppViewModel?
@@ -98,6 +108,7 @@ public final class BotTeamsGroupsController: ObservableObject {
     static let collapsedTeamsDefaultsKey = "bots.collapsedTeamIDs"
     static let inspectorDefaultsKey = "bots.groupInspector"
     static let privateThreadReadOnlyMessage = "This is the bot's private thread. Write in the group."
+    static let roomPlaceholder = "Message the group. @mention a bot to choose who answers…"
 
     private let context: AppContext
     private let routerProvider: () -> AppCommandRouter?
@@ -127,7 +138,18 @@ public final class BotTeamsGroupsController: ObservableObject {
         if defaults.object(forKey: Self.inspectorDefaultsKey) != nil {
             isInspectorVisible = defaults.bool(forKey: Self.inspectorDefaultsKey)
         }
-        reload()
+        // The restored group's identity only (one row) so the room can mount
+        // on this turn; the lists load off the main actor.
+        if let id = selectedGroupID {
+            selectedGroup = (try? context.botStore.group(id: id)) ?? nil
+            if selectedGroup == nil {
+                selectedGroupID = nil
+                defaults.removeObject(forKey: Self.selectedGroupDefaultsKey)
+            } else {
+                loadParticipantsIfMissing(id)
+            }
+        }
+        scheduleReload()
         let subscription = EventBus.shared.subscribeFromCurrent(
             filter: .kindPrefixes(["bot.team.updated", "bot.group.updated"])
         ) { [weak self] _ in
@@ -143,10 +165,6 @@ public final class BotTeamsGroupsController: ObservableObject {
 
     private var service: BotTeamGroupService { context.botTeamGroupService }
     private var botStore: BotStore { context.botStore }
-
-    var selectedGroup: BotGroupConversation? {
-        selectedGroupID.flatMap { id in groups.first { $0.id == id } }
-    }
 
     func participants(of groupID: BotGroupID) -> [BotGroupParticipant] {
         participantsByGroup[groupID] ?? []
@@ -165,10 +183,15 @@ public final class BotTeamsGroupsController: ObservableObject {
         let groups: [BotGroupConversation]
         let participants: [BotGroupID: [BotGroupParticipant]]
         let memberThreads: [BotGroupID: [BotID: MemberThread]]
+        let retryable: [BotGroupID: [BotGroupTurn]]
     }
 
-    private nonisolated static func read(_ store: BotStore, threads: AgentThreadRepository) throws -> Snapshot {
-        let groups = try store.listGroups()
+    private nonisolated static func read(
+        _ store: BotStore,
+        threads: AgentThreadRepository,
+        selectedGroupID: BotGroupID?
+    ) throws -> Snapshot {
+        let groups = try store.listGroups(includeHidden: true)
         var participants: [BotGroupID: [BotGroupParticipant]] = [:]
         var memberThreads: [BotGroupID: [BotID: MemberThread]] = [:]
         for group in groups {
@@ -183,23 +206,45 @@ public final class BotTeamsGroupsController: ObservableObject {
                 )
             }
         }
+        var retryable: [BotGroupID: [BotGroupTurn]] = [:]
+        if let selectedGroupID, groups.contains(where: { $0.id == selectedGroupID }) {
+            retryable[selectedGroupID] = try retryableTurns(
+                store, groupID: selectedGroupID, active: Set((participants[selectedGroupID] ?? []).map(\.botID))
+            )
+        }
         return Snapshot(
             teams: try store.listTeams(),
             members: try store.listTeamMembers(),
             groups: groups,
             participants: participants,
-            memberThreads: memberThreads
+            memberThreads: memberThreads,
+            retryable: retryable
         )
     }
 
-    /// Synchronous read (small tables): used at launch and right after a
-    /// local edit so the sidebar shows it on the same turn.
+    /// The last round's failed or interrupted turns of bots still in the
+    /// group (two reads, never the group's whole history).
+    nonisolated static func retryableTurns(
+        _ store: BotStore,
+        groupID: BotGroupID,
+        active: Set<BotID>
+    ) throws -> [BotGroupTurn] {
+        guard let last = try store.latestGroupTurn(groupID: groupID, states: BotGroupTurn.State.allCases) else {
+            return []
+        }
+        return try store.listGroupTurns(groupID: groupID, roundID: last.roundID).filter {
+            ($0.state == .failed || $0.state == .interrupted) && active.contains($0.botID)
+        }
+    }
+
+    /// Synchronous read (small tables) right after a local edit, so the
+    /// sidebar shows it on the same turn. Launch uses `scheduleReload`.
     func reload() {
         reloadGeneration &+= 1
         reloadTask?.cancel()
         reloadTask = nil
         do {
-            apply(try Self.read(botStore, threads: context.threadRepo))
+            apply(try Self.read(botStore, threads: context.threadRepo, selectedGroupID: selectedGroupID))
         } catch {
             onError?(Self.message(for: error))
         }
@@ -213,9 +258,10 @@ public final class BotTeamsGroupsController: ObservableObject {
         reloadTask?.cancel()
         let store = botStore
         let threads = context.threadRepo
+        let selected = selectedGroupID
         reloadTask = Task { @MainActor [weak self] in
             let result = await Task.detached(priority: .userInitiated) {
-                Result { try Self.read(store, threads: threads) }
+                Result { try Self.read(store, threads: threads, selectedGroupID: selected) }
             }.value
             guard let self, !Task.isCancelled, generation == self.reloadGeneration else { return }
             self.reloadTask = nil
@@ -237,9 +283,13 @@ public final class BotTeamsGroupsController: ObservableObject {
         if groups != snapshot.groups { groups = snapshot.groups }
         if participantsByGroup != snapshot.participants { participantsByGroup = snapshot.participants }
         if memberThreads != snapshot.memberThreads { memberThreads = snapshot.memberThreads }
-        guard let selectedGroupID, !snapshot.groups.contains(where: { $0.id == selectedGroupID }) else { return }
-        // A hidden group is still a group: only a deleted one closes the room.
-        if (try? botStore.group(id: selectedGroupID)) ?? nil == nil {
+        if retryableTurns != snapshot.retryable { retryableTurns = snapshot.retryable }
+        guard let selectedGroupID else { return }
+        if let group = snapshot.groups.first(where: { $0.id == selectedGroupID }) {
+            // Hidden or not, the open group keeps its room.
+            if selectedGroup != group { selectedGroup = group }
+            if isRoomVisible { syncRoom() }
+        } else if (try? botStore.group(id: selectedGroupID)) ?? nil == nil {
             selectGroup(nil)
             onSelectedGroupVanished?()
         }
@@ -254,6 +304,10 @@ public final class BotTeamsGroupsController: ObservableObject {
             selectedGroupID = id
             closePrivateThread()
         }
+        if selectedGroup?.id != id {
+            selectedGroup = id.flatMap { id in groups.first { $0.id == id } ?? ((try? botStore.group(id: id)) ?? nil) }
+        }
+        if let id { loadParticipantsIfMissing(id) }
         if let id {
             UserDefaults.standard.set(id.value.uuidString.lowercased(), forKey: Self.selectedGroupDefaultsKey)
         } else {
@@ -268,6 +322,15 @@ public final class BotTeamsGroupsController: ObservableObject {
         }
     }
 
+    /// The open group's participants are part of its identity (header,
+    /// mentions, lead): one read when the list pass has not landed yet.
+    private func loadParticipantsIfMissing(_ id: BotGroupID) {
+        guard participantsByGroup[id] == nil,
+              let participants = try? botStore.listGroupParticipants(groupID: id) else { return }
+        participantsByGroup[id] = participants
+        participantsRevision &+= 1
+    }
+
     /// The Bots screen changed: the room exists only while the group screen shows.
     func setRoomVisible(_ visible: Bool) {
         guard isRoomVisible != visible else { return }
@@ -277,9 +340,12 @@ public final class BotTeamsGroupsController: ObservableObject {
 
     private func syncRoom() {
         guard isRoomVisible, let group = selectedGroup, let router = routerProvider() else {
+            service.setViewing(nil, by: self)
             tearDownRoom()
             return
         }
+        // A reply in the room on screen is read as it lands (no dot).
+        service.setViewing(group.id, by: self)
         if roomThreadID == group.roomThreadID, roomVM != nil { return }
         tearDownRoom()
         let groupID = group.id
@@ -288,7 +354,8 @@ public final class BotTeamsGroupsController: ObservableObject {
             sendInterceptor: { [weak self] text, attachments, _ in
                 guard let self else { throw BotStoreError.notFound }
                 return try self.sendToGroup(groupID, text: text, attachments: attachments)
-            }
+            },
+            composerPlaceholder: Self.roomPlaceholder
         )
         let vm = makeEmbeddedVM(threadID: group.roomThreadID, embedding: embedding, router: router)
         vm.mentionableBotsProvider = { [weak self] in
@@ -321,6 +388,8 @@ public final class BotTeamsGroupsController: ObservableObject {
             submitKey: UUID().uuidString.lowercased(),
             attachments: attachments
         )
+        guard receipt.roomMessages.isEmpty else { return receipt.roomMessages }
+        // A replayed send: its rows are already written, read them back.
         let ids = [receipt.userMessageID] + receipt.turns.map(\.roomMessageID)
         return ids.compactMap { (try? context.messageRepo.get(id: $0)) ?? nil }
     }
@@ -338,7 +407,8 @@ public final class BotTeamsGroupsController: ObservableObject {
             pinnedThreadId: threadID,
             sendInterceptor: { _, _, _ in
                 throw BotGroupOrchestrator.SendError.rejected(Self.privateThreadReadOnlyMessage)
-            }
+            },
+            composerPlaceholder: Self.privateThreadReadOnlyMessage
         )
         privateThreadVM = makeEmbeddedVM(threadID: threadID, embedding: embedding, router: router)
         privateThreadBotID = botID
@@ -542,6 +612,26 @@ public final class BotTeamsGroupsController: ObservableObject {
         updateSelected(groupID) { $0.pinned = pinned }
     }
 
+    /// Like a hidden bot: off the sidebar unless Show hidden is on. An open
+    /// hidden group keeps its room.
+    func setHidden(_ hidden: Bool, groupID: BotGroupID) {
+        updateSelected(groupID) { $0.hidden = hidden }
+    }
+
+    /// Retries the last round's failed or interrupted turns, in order. The
+    /// first refusal stops the rest and is shown.
+    func retryFailedTurns(groupID: BotGroupID) {
+        for turn in retryableTurns[groupID] ?? [] {
+            do {
+                try service.retryTurn(groupID: groupID, turnID: turn.id)
+            } catch {
+                onError?(Self.message(for: error))
+                break
+            }
+        }
+        reload()
+    }
+
     private func updateSelected(_ groupID: BotGroupID, _ mutate: @escaping (inout BotGroupConversation) -> Void) {
         do {
             guard let group = try botStore.group(id: groupID) else { throw BotStoreError.notFound }
@@ -585,6 +675,21 @@ extension BotsViewModel {
 }
 
 // MARK: - Sidebar
+
+/// "New Team…" and "New Group…" (the My Bots "+" menu and the New Bot row's
+/// context menu).
+struct BotTeamsGroupsCreateButtons: View {
+    @ObservedObject var vm: BotsViewModel
+
+    var body: some View {
+        Button("New Team…") { vm.beginCreateTeam() }
+            .disabled(!vm.isControlPlaneActive)
+            .accessibilityIdentifier("bots.roster.add.team")
+        Button("New Group…") { vm.beginCreateGroup() }
+            .disabled(!vm.isControlPlaneActive || vm.bots.isEmpty)
+            .accessibilityIdentifier("bots.roster.add.group")
+    }
+}
 
 /// Team sections, "Other Bots" and "Group Conversations" under My Bots.
 /// Bot rows are the roster's own row (`row`), never a second implementation.
@@ -687,9 +792,10 @@ struct BotGroupConversationsSection: View {
     }
 
     private var filteredGroups: [BotGroupConversation] {
+        let shown = vm.showHidden ? teamsGroups.groups : teamsGroups.groups.filter { !$0.hidden }
         let query = vm.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return teamsGroups.groups }
-        return teamsGroups.groups.filter { $0.title.localizedCaseInsensitiveContains(query) }
+        guard !query.isEmpty else { return shown }
+        return shown.filter { $0.title.localizedCaseInsensitiveContains(query) }
     }
 
     private func dotColor(_ state: BotAttentionState) -> Color? {
@@ -748,12 +854,15 @@ struct BotGroupConversationsSection: View {
         .buttonStyle(.plain)
         .help("\(group.title) · \(BotsChrome.statusTitle(for: group.attentionState))")
         .accessibilityLabel(group.title)
-        .accessibilityValue("\(BotsChrome.statusTitle(for: group.attentionState)). \(names)")
+        .accessibilityValue("\(group.hidden ? "Hidden. " : "")\(BotsChrome.statusTitle(for: group.attentionState)). \(names)")
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityIdentifier("bots.groups.row.\(key)")
         .contextMenu {
             Button(group.pinned ? "Unpin" : "Pin") { teamsGroups.setPinned(!group.pinned, groupID: group.id) }
                 .disabled(!vm.isControlPlaneActive)
+            Button(group.hidden ? "Unhide" : "Hide") { teamsGroups.setHidden(!group.hidden, groupID: group.id) }
+                .disabled(!vm.isControlPlaneActive)
+                .accessibilityIdentifier("bots.groups.menu.hide")
             Button("Edit Group…") { teamsGroups.sheet = .editGroup(group.id) }
                 .disabled(!vm.isControlPlaneActive)
             Divider()
@@ -796,14 +905,7 @@ struct BotTeamsGroupsSheets: ViewModifier {
         if enabled {
             content
                 .sheet(item: $teamsGroups.sheet) { sheet in
-                    switch sheet {
-                    case .team(let id):
-                        BotTeamEditorSheet(vm: vm, teamsGroups: teamsGroups, teamID: id)
-                    case .newGroup(let teamID):
-                        BotGroupEditorSheet(vm: vm, teamsGroups: teamsGroups, mode: .create(teamID: teamID))
-                    case .editGroup(let id):
-                        BotGroupEditorSheet(vm: vm, teamsGroups: teamsGroups, mode: .edit(id))
-                    }
+                    BotTeamsGroupsSheetContent(vm: vm, teamsGroups: teamsGroups, sheet: sheet)
                 }
                 .confirmationDialog(
                     deleteTitle,
@@ -850,6 +952,23 @@ struct BotTeamsGroupsSheets: ViewModifier {
 }
 
 // MARK: - Sheets
+
+struct BotTeamsGroupsSheetContent: View {
+    @ObservedObject var vm: BotsViewModel
+    @ObservedObject var teamsGroups: BotTeamsGroupsController
+    let sheet: BotTeamsGroupsController.Sheet
+
+    var body: some View {
+        switch sheet {
+        case .team(let id):
+            BotTeamEditorSheet(vm: vm, teamsGroups: teamsGroups, teamID: id)
+        case .newGroup(let teamID):
+            BotGroupEditorSheet(vm: vm, teamsGroups: teamsGroups, mode: .create(teamID: teamID))
+        case .editGroup(let id):
+            BotGroupEditorSheet(vm: vm, teamsGroups: teamsGroups, mode: .edit(id))
+        }
+    }
+}
 
 struct BotTeamEditorSheet: View {
     @ObservedObject var vm: BotsViewModel
@@ -1198,6 +1317,9 @@ struct BotGroupRoomScreen: View {
                 }
             }
             .accessibilityIdentifier("bots.group")
+            .sheet(item: $teamsGroups.roomSheet) { sheet in
+                BotTeamsGroupsSheetContent(vm: vm, teamsGroups: teamsGroups, sheet: sheet)
+            }
         } else {
             DSEmptyState(
                 icon: "person.3",
@@ -1224,6 +1346,13 @@ struct BotGroupRoomScreen: View {
                     .lineLimit(1)
             }
             Spacer(minLength: DS.Space.lg)
+            let retryable = teamsGroups.retryableTurns[group.id] ?? []
+            if !retryable.isEmpty {
+                Button(retryTitle(retryable)) { teamsGroups.retryFailedTurns(groupID: group.id) }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .help("Run the bots whose last answer failed or was interrupted again")
+                    .accessibilityIdentifier("bots.group.retry")
+            }
             if group.attentionState == .working {
                 Button("Stop") { teamsGroups.stop(groupID: group.id) }
                     .buttonStyle(DSSecondaryButtonStyle())
@@ -1242,6 +1371,13 @@ struct BotGroupRoomScreen: View {
         .padding(.trailing, DS.Space.xl)
         .frame(height: 44)
         .dsBar(edge: .bottom)
+    }
+
+    private func retryTitle(_ turns: [BotGroupTurn]) -> String {
+        guard turns.count == 1, let bot = vm.bots.first(where: { $0.id == turns[0].botID }) else {
+            return "Retry \(turns.count) bots"
+        }
+        return "Retry \(bot.name)"
     }
 
     @ViewBuilder
@@ -1299,7 +1435,7 @@ struct BotGroupInspector: View {
                 HStack {
                     Text("Participants").font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
                     Spacer()
-                    Button("Edit…") { teamsGroups.sheet = .editGroup(group.id) }
+                    Button("Edit…") { teamsGroups.roomSheet = .editGroup(group.id) }
                         .buttonStyle(.link)
                         .disabled(!vm.isControlPlaneActive)
                         .accessibilityIdentifier("bots.group.inspector.edit")

@@ -143,6 +143,22 @@ final class BotsTeamsGroupsUITests: XCTestCase {
         XCTAssertTrue(list.contains("} else if let sections = BotRosterSections.make("), "sections only when teams exist")
         XCTAssertTrue(list.contains("Text(BotsChrome.Label.myBots)"))
         XCTAssertTrue(list.contains("Text(vm.searchText.isEmpty ? \"No bots yet\" : \"No matches\")"))
+        // The My Bots header row: title, spacer, Show hidden. The "+" menu
+        // only exists once a team or group does.
+        let headerStart = try XCTUnwrap(list.range(of: "Text(BotsChrome.Label.myBots)"))
+        let headerEnd = try XCTUnwrap(list.range(of: "Toggle(\"Show hidden\"", range: headerStart.upperBound..<list.endIndex))
+        let header = String(list[headerStart.upperBound..<headerEnd.lowerBound])
+        let gate = try XCTUnwrap(
+            header.range(of: "if !teamsGroups.teams.isEmpty || !teamsGroups.groups.isEmpty {"),
+            "no teams and no groups → the header has no new control"
+        )
+        let menu = try XCTUnwrap(header.range(of: "Menu {"))
+        XCTAssertLessThan(gate.lowerBound, menu.lowerBound, "the + menu sits inside the gate")
+        XCTAssertEqual(header.components(separatedBy: "Menu {").count, 2, "one menu, the gated one")
+        XCTAssertTrue(
+            list.contains(".contextMenu { BotTeamsGroupsCreateButtons(vm: vm) }"),
+            "with no teams yet, New Team and New Group stay reachable from the New Bot row"
+        )
         let groupsView = try source("Sources/AppShell/BotsTeamsGroups.swift")
         XCTAssertTrue(groupsView.contains("if !visible.isEmpty {"), "no groups → no Group Conversations header")
     }
@@ -295,11 +311,202 @@ final class BotsTeamsGroupsUITests: XCTestCase {
         XCTAssertTrue(cleared)
         XCTAssertEqual(try f.ctx.botStore.group(id: first.id)?.unread, true, "A was left before its read landed")
 
-        // A row written to A's room never paints into B.
-        let stray = AgentMessage(threadId: first.roomThreadID, role: .assistant, content: "for A")
-        try f.ctx.messageRepo.append(stray)
-        vm.applyDeskPeerMessage(messageID: stray.id, threadID: first.roomThreadID, terminalStatus: nil)
-        XCTAssertFalse(roomB.messages.contains { $0.id == stray.id })
+    }
+
+    func test_aReplyForTheGroupLeftBehindNeverTouchesTheOpenRoom_andWaitsAsUnreadInItsOwn() async throws {
+        let f = try makeFixture()
+        let first = try await makeGroup(f, title: "A", bots: [f.ana])
+        let second = try await makeGroup(f, title: "B", bots: [f.bob])
+        let vm = makeViewModel(f)
+
+        vm.openGroup(first.id)
+        let roomA = try XCTUnwrap(vm.teamsGroups.roomVM)
+        roomA.prompt = "Draft the post"
+        await roomA.send()
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+
+        // Switch to B while Ana is still answering in A.
+        vm.openGroup(second.id)
+        let roomB = try XCTUnwrap(vm.teamsGroups.roomVM)
+        let bReadCleared = await waitUntil { (try? f.ctx.botStore.group(id: second.id))??.unread == false }
+        XCTAssertTrue(bReadCleared)
+        let bBefore = roomB.messages
+        XCTAssertTrue(f.runner.finish(
+            runID: try XCTUnwrap(f.runner.requests.first).runId, status: .completed, reply: "Here is the draft."
+        ))
+
+        // A's row resolves in A only: A is not on screen, so it is unread there.
+        let aUnread = await waitUntil {
+            vm.teamsGroups.groups.first { $0.id == first.id }.map { $0.unread && $0.attentionState == .unreadActivity } == true
+        }
+        XCTAssertTrue(aUnread, "the group left behind is marked unread")
+        XCTAssertEqual(roomB.messages, bBefore, "B's room is untouched by A's reply")
+        XCTAssertEqual(vm.teamsGroups.groups.first { $0.id == second.id }?.unread, false)
+
+        // Reopening A shows the reply from the store and reads it.
+        vm.openGroup(first.id)
+        let roomA2 = try XCTUnwrap(vm.teamsGroups.roomVM)
+        let shown = await waitUntil {
+            roomA2.messages.compactMap { BotPeerTranscript.parse($0.content)?.body } == ["Here is the draft."]
+        }
+        XCTAssertTrue(shown)
+        let aRead = await waitUntil { (try? f.ctx.botStore.group(id: first.id))??.unread == false }
+        XCTAssertTrue(aRead)
+    }
+
+    func test_aReplyInTheOpenRoomIsReadAsItLands() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let vm = makeViewModel(f)
+        vm.openGroup(group.id)
+        let room = try XCTUnwrap(vm.teamsGroups.roomVM)
+        room.prompt = "Status?"
+        await room.send()
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        XCTAssertTrue(f.runner.finish(
+            runID: try XCTUnwrap(f.runner.requests.first).runId, status: .completed, reply: "All green."
+        ))
+        let settled = await waitUntil {
+            (try? f.ctx.botStore.group(id: group.id))??.attentionState == BotAttentionState.none
+        }
+        XCTAssertTrue(settled, "a reply the user is watching needs no dot")
+        let stored = try XCTUnwrap(try f.ctx.botStore.group(id: group.id))
+        XCTAssertFalse(stored.unread, "paired devices must not get an unread group the Mac user already read")
+        let synced = await waitUntil {
+            vm.teamsGroups.groups.first { $0.id == group.id }.map { !$0.unread && $0.attentionState == .none } == true
+        }
+        XCTAssertTrue(synced, "the sidebar row shows no attention dot")
+
+        // Off screen again: the next reply is unread.
+        vm.screen = .desk
+        XCTAssertNil(vm.teamsGroups.roomVM)
+        _ = try f.ctx.botTeamGroupService.send(groupID: group.id, text: "And now?", submitKey: nil)
+        let second = await waitUntil { f.runner.requests.count == 2 }
+        XCTAssertTrue(second)
+        XCTAssertTrue(f.runner.finish(
+            runID: try XCTUnwrap(f.runner.requests.last).runId, status: .completed, reply: "Still green."
+        ))
+        let unread = await waitUntil { (try? f.ctx.botStore.group(id: group.id))??.unread == true }
+        XCTAssertTrue(unread, "a group nobody is looking at gets its unread dot")
+    }
+
+    func test_aFailedTurnIsRetriedFromTheRoom() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let vm = makeViewModel(f)
+        vm.openGroup(group.id)
+        let room = try XCTUnwrap(vm.teamsGroups.roomVM)
+        room.prompt = "Try this"
+        await room.send()
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        XCTAssertTrue(f.runner.finish(runID: try XCTUnwrap(f.runner.requests.first).runId, status: .failed, reply: nil))
+
+        let offered = await waitUntil { vm.teamsGroups.retryableTurns[group.id]?.map(\.botID) == [f.ana.id] }
+        XCTAssertTrue(offered, "a failed turn has something to act on in the room")
+        let stored = try XCTUnwrap(try f.ctx.botStore.group(id: group.id))
+        XCTAssertEqual(stored.attentionState, .needsAttention, "a failure still needs the user while the room is open")
+        XCTAssertFalse(stored.unread)
+
+        vm.teamsGroups.retryFailedTurns(groupID: group.id)
+        let rerun = await waitUntil { f.runner.requests.count == 2 }
+        XCTAssertTrue(rerun, "Retry runs the bot again")
+        XCTAssertTrue(vm.teamsGroups.retryableTurns[group.id]?.isEmpty ?? true, "nothing left to retry while it runs")
+        XCTAssertTrue(f.runner.finish(runID: try XCTUnwrap(f.runner.requests.last).runId, status: .completed, reply: "Worked."))
+        let painted = await waitUntil {
+            room.messages.compactMap { BotPeerTranscript.parse($0.content)?.body } == ["Worked."]
+        }
+        XCTAssertTrue(painted)
+    }
+
+    func test_hidingTheOpenGroupElsewhereKeepsItsRoom() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let vm = makeViewModel(f)
+        vm.openGroup(group.id)
+        let room = try XCTUnwrap(vm.teamsGroups.roomVM)
+
+        // A paired device hides it.
+        let current = try XCTUnwrap(try f.ctx.botStore.group(id: group.id))
+        try f.service.updateGroup(id: group.id, expectedRevision: current.revision) { $0.hidden = true }
+        let arrived = await waitUntil { vm.teamsGroups.groups.first { $0.id == group.id }?.hidden == true }
+        XCTAssertTrue(arrived, "hidden groups stay listed for Show hidden")
+        XCTAssertEqual(vm.screen, .group)
+        XCTAssertEqual(vm.teamsGroups.selectedGroup?.hidden, true, "the open room never turns into 'Select a group'")
+        XCTAssertTrue(vm.teamsGroups.roomVM === room)
+
+        // Unhide from the Mac (parity with the paired device).
+        vm.teamsGroups.setHidden(false, groupID: group.id)
+        XCTAssertEqual(try f.ctx.botStore.group(id: group.id)?.hidden, false)
+
+        // A hidden open group survives relaunch too.
+        vm.teamsGroups.setHidden(true, groupID: group.id)
+        let (ctx2, router2, _) = try openContext(support: f.support)
+        let reopened = BotsViewModel(context: ctx2, router: router2)
+        router2.botsViewModel = reopened
+        XCTAssertEqual(reopened.screen, .group)
+        XCTAssertNotNil(reopened.teamsGroups.roomVM)
+    }
+
+    func test_theFirstPaintDoesNoListReads_andALateSnapshotNeverOverwritesANewerOne() async throws {
+        let f = try makeFixture()
+        let team = try f.service.createTeam(name: "Writers", memberBotIDs: [f.ana.id])
+        _ = try await makeGroup(f, bots: [f.ana])
+        let vm = makeViewModel(f)
+
+        // Immediate path: creating the controller (the roster's first frame)
+        // applies nothing synchronously; the lists land in one async pass.
+        let controller = vm.teamsGroups
+        XCTAssertEqual(controller.reloadCountForTesting, 0)
+        XCTAssertTrue(controller.groups.isEmpty)
+
+        // A local reload while the initial pass is in flight wins; the late
+        // initial snapshot is dropped.
+        controller.reload()
+        XCTAssertEqual(controller.reloadCountForTesting, 1)
+        XCTAssertEqual(controller.teams.map(\.id), [team.id])
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(controller.reloadCountForTesting, 1, "the stale initial snapshot must not apply")
+
+        // Eventual completion on a fresh controller.
+        let vm2 = makeViewModel(f)
+        let landed = await waitUntil { vm2.teamsGroups.teams.map(\.id) == [team.id] && vm2.teamsGroups.groups.count == 1 }
+        XCTAssertTrue(landed)
+    }
+
+    func test_theRoomComposerOnlyRelays() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let vm = makeViewModel(f)
+        vm.openGroup(group.id)
+        let room = try XCTUnwrap(vm.teamsGroups.roomVM)
+
+        // No provider, model, source, run-as-user, permission or effort
+        // choice: none of them would change who answers or how.
+        XCTAssertEqual(AgentComposerChromePresentation.controls(for: .relay), [.attach, .sendStop])
+        XCTAssertEqual(room.composerPlaceholder, BotTeamsGroupsController.roomPlaceholder)
+        let surface = try source("Sources/Surfaces/AgentAppSurface.swift")
+        XCTAssertTrue(surface.contains("vm.embedding?.sendInterceptor != nil ? .relay : .power"),
+                      "the shared composer derives relay chrome from the interceptor, not a fork")
+        XCTAssertTrue(surface.contains("attachEnabled: composerChromeMode != .relay &&"))
+        XCTAssertTrue(surface.contains("? AgentComposerChromePresentation.relayAttachUnavailable : nil"),
+                      "a disabled attach says why")
+        XCTAssertEqual(
+            AgentComposerChromePresentation.relayAttachUnavailable,
+            BotGroupOrchestrator.SendError.attachmentsUnsupported.errorDescription
+        )
+    }
+
+    func test_theRoomPresentsItsOwnEditSheet() throws {
+        // WHY: the sidebar may be collapsed while the room is open; the
+        // inspector's Edit… must not latch a sheet nobody presents.
+        let groupsView = try source("Sources/AppShell/BotsTeamsGroups.swift")
+        XCTAssertTrue(groupsView.contains("Button(\"Edit…\") { teamsGroups.roomSheet = .editGroup(group.id) }"))
+        let room = try XCTUnwrap(groupsView.range(of: "struct BotGroupRoomScreen"))
+        let inspector = try XCTUnwrap(groupsView.range(of: "struct BotGroupInspector"))
+        XCTAssertTrue(groupsView[room.lowerBound..<inspector.lowerBound].contains(".sheet(item: $teamsGroups.roomSheet)"))
     }
 
     func test_aGroupDeletedElsewhereClosesItsRoom() async throws {
@@ -339,6 +546,11 @@ final class BotsTeamsGroupsUITests: XCTestCase {
         XCTAssertEqual(privateVM.prompt, "side question")
         try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertEqual(f.runner.requests.count, 1, "nothing runs from the private thread")
+        // Retry and Continue say why instead of a dead click.
+        await privateVM.retryLastPrompt()
+        XCTAssertEqual(privateVM.statusMessage, AgentAppViewModel.interceptedRunRefusal)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(f.runner.requests.count, 1, "retry from the private thread runs nothing")
         vm.teamsGroups.closePrivateThread()
         XCTAssertNil(vm.teamsGroups.privateThreadVM)
     }

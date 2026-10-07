@@ -21,6 +21,9 @@ final class BotGroupOrchestrator: AgentRunObserver {
         let roomThreadID: AgentThreadID
         let userMessageID: AgentMessageID
         let turns: [BotGroupTurn]
+        /// The user line and waiting rows this send wrote (empty for a
+        /// replayed `submitKey`: read the rows back by id).
+        var roomMessages: [AgentMessage] = []
     }
 
     enum SendError: LocalizedError, Equatable {
@@ -211,7 +214,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
             roundID: roundID,
             roomThreadID: group.roomThreadID,
             userMessageID: userMessage.id,
-            turns: turns
+            turns: turns,
+            roomMessages: [userMessage] + rows
         )
     }
 
@@ -996,6 +1000,11 @@ final class BotGroupOrchestrator: AgentRunObserver {
             guard let bot = try botStore.get(id: participant.botID), bot.deletedAt == nil else { return nil }
             return bot
         }
+    }
+
+    /// A participant's member thread (its provider and locked target).
+    func memberThread(id: AgentThreadID) -> AgentThread? {
+        (try? threadRepo.get(id: id)) ?? nil
     }
 
     private func memberThreadID(groupID: BotGroupID, botID: BotID) -> AgentThreadID? {

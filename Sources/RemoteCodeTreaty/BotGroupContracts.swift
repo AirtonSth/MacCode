@@ -73,6 +73,10 @@ public struct BotGroupParticipantRow: Codable, Equatable, Sendable {
     public let memberConversationID: String
     /// The participant's private thread; nil until its first turn.
     public let memberThreadID: String?
+    /// The member thread's provider (`codex`, `claude`, …); nil until its first turn.
+    public let provider: String?
+    /// Where its turns run (`mac` or `vm`) once the thread is locked; else nil.
+    public let executionTarget: String?
     public let sortOrder: Int
     public let joinedAt: Double
     /// Set when the bot left the group or was deleted.
@@ -82,6 +86,8 @@ public struct BotGroupParticipantRow: Codable, Equatable, Sendable {
         case botID = "bot_id"
         case memberConversationID = "member_conversation_id"
         case memberThreadID = "member_thread_id"
+        case provider
+        case executionTarget = "execution_target"
         case sortOrder = "sort_order"
         case joinedAt = "joined_at"
         case leftAt = "left_at"

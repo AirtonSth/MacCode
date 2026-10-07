@@ -52,6 +52,14 @@ final class BotTeamGroupService {
     /// Groups whose delete is in flight: nothing new may start in them.
     private var deletingGroups: Set<BotGroupID> = []
     static let deletingMessage = "This group is being deleted."
+    /// Groups whose room is on screen on the Mac, one entry per viewer (a
+    /// viewer that goes away stops counting). A reply there is already read.
+    private final class Viewer {
+        weak var owner: AnyObject?
+        var groupID: BotGroupID?
+        init(owner: AnyObject) { self.owner = owner }
+    }
+    private var viewers: [Viewer] = []
 
     init(botStore: BotStore, orchestrator: BotGroupOrchestrator, isControlPlaneActive: @escaping () -> Bool) {
         self.botStore = botStore
@@ -281,6 +289,22 @@ final class BotTeamGroupService {
 
     // MARK: - Attention
 
+    /// `viewer` shows `groupID`'s room now (nil: no room on screen).
+    func setViewing(_ groupID: BotGroupID?, by viewer: AnyObject) {
+        viewers.removeAll { $0.owner == nil }
+        if let entry = viewers.first(where: { $0.owner === viewer }) {
+            entry.groupID = groupID
+        } else if groupID != nil {
+            let entry = Viewer(owner: viewer)
+            entry.groupID = groupID
+            viewers.append(entry)
+        }
+    }
+
+    func isViewing(_ groupID: BotGroupID) -> Bool {
+        viewers.contains { $0.owner != nil && $0.groupID == groupID }
+    }
+
     private func noteTurnChanged(_ turn: BotGroupTurn) {
         pendingAttention[turn.groupID] = turn
         guard !attentionFlushScheduled else { return }
@@ -306,7 +330,7 @@ final class BotTeamGroupService {
                   let round = try? botStore.listGroupTurns(groupID: groupID, roundID: turn.roundID)
             else { continue }
             let turns = round + unsettled
-            let next = Self.attention(turns: turns, lastChanged: turn, current: group)
+            let next = Self.attention(turns: turns, lastChanged: turn, current: group, viewing: isViewing(groupID))
             guard next.state != group.attentionState || next.unread != group.unread else { continue }
             do {
                 let updated = try botStore.setGroupAttention(id: groupID, attentionState: next.state, unread: next.unread)
@@ -320,16 +344,20 @@ final class BotTeamGroupService {
     /// Working while any turn is unsettled; once all settle, the round of
     /// the last change decides: a failed or interrupted turn needs the user,
     /// a reply is unread activity, a round that was only stopped is quiet.
+    /// While the room is on screen (`viewing`) nothing is unread and a reply
+    /// needs no dot; a failure still needs the user (like an open Desk).
     nonisolated static func attention(
         turns: [BotGroupTurn],
         lastChanged: BotGroupTurn,
-        current: BotGroupConversation
+        current: BotGroupConversation,
+        viewing: Bool = false
     ) -> (state: BotAttentionState, unread: Bool) {
-        if turns.contains(where: { !$0.state.isTerminal }) { return (.working, current.unread) }
+        let unread = { (value: Bool) in viewing ? false : value }
+        if turns.contains(where: { !$0.state.isTerminal }) { return (.working, unread(current.unread)) }
         let round = turns.filter { $0.roundID == lastChanged.roundID }
-        if round.contains(where: { $0.state == .failed || $0.state == .interrupted }) { return (.needsAttention, true) }
-        if round.contains(where: { $0.state == .completed }) { return (.unreadActivity, true) }
-        return (current.attentionState == .working ? .none : current.attentionState, current.unread)
+        if round.contains(where: { $0.state == .failed || $0.state == .interrupted }) { return (.needsAttention, unread(true)) }
+        if round.contains(where: { $0.state == .completed }) { return (viewing ? .none : .unreadActivity, unread(true)) }
+        return (current.attentionState == .working ? .none : current.attentionState, unread(current.unread))
     }
 
     // MARK: - Remote (paired devices)
@@ -512,6 +540,13 @@ final class BotTeamGroupService {
         )
         let ordered = participants.filter(\.isActive) + participants.filter { !$0.isActive }
         func id(_ uuid: UUID?) -> JSONValue { uuid.map { .string(Self.key($0)) } ?? .null }
+        /// The member thread's provider and locked target (the Mac inspector's
+        /// route chip); null before the first turn or the target lock.
+        func route(_ threadID: AgentThreadID?) -> (provider: JSONValue, target: JSONValue) {
+            guard let threadID, let thread = orchestrator.memberThread(id: threadID) else { return (.null, .null) }
+            let target = thread.actorLockedAt == nil ? nil : thread.executionTarget
+            return (.string(thread.provider.rawValue), target.map { .string($0.rawValue) } ?? .null)
+        }
         return .object([
             "id": .string(Self.key(group.id.value)),
             "title": .string(group.title),
@@ -526,10 +561,14 @@ final class BotTeamGroupService {
             "attention_state": .string(Self.wireAttention(group.attentionState)),
             "revision": .number(Double(group.revision)),
             "participants": .array(ordered.map { participant in
-                .object([
+                let threadID = threads[participant.memberConversationID] ?? nil
+                let route = route(threadID)
+                return .object([
                     "bot_id": .string(Self.key(participant.botID.value)),
                     "member_conversation_id": .string(Self.key(participant.memberConversationID.value)),
-                    "member_thread_id": id((threads[participant.memberConversationID] ?? nil)?.value),
+                    "member_thread_id": id(threadID?.value),
+                    "provider": route.provider,
+                    "execution_target": route.target,
                     "sort_order": .number(Double(participant.sortOrder)),
                     "joined_at": .number(participant.joinedAt.timeIntervalSince1970),
                     "left_at": participant.leftAt.map { .number($0.timeIntervalSince1970) } ?? .null,

@@ -72,6 +72,16 @@ final class BotGroupContractsTests: XCTestCase {
         XCTAssertEqual(row.participants.map(\.memberThreadID), [nil, "th2"])
         XCTAssertEqual(row.participants.map(\.leftAt), [nil, 5])
         XCTAssertEqual(row.attentionState, "needs_attention")
+        XCTAssertEqual(row.participants.map(\.provider), [nil, nil], "older hosts send no route")
+    }
+
+    func testGroupParticipantDecodesItsRoute() throws {
+        let participant = try decoder.decode(BotGroupParticipantRow.self, from: Data(#"""
+        {"bot_id":"b1","member_conversation_id":"c1","member_thread_id":"th1","provider":"codex",
+         "execution_target":"vm","sort_order":0,"joined_at":1,"left_at":null}
+        """#.utf8))
+        XCTAssertEqual(participant.provider, "codex")
+        XCTAssertEqual(participant.executionTarget, "vm")
     }
 
     func testBotCapabilitiesDefaultTeamsAndGroupsOffForOlderHosts() throws {

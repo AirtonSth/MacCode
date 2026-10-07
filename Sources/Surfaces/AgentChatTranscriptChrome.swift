@@ -496,6 +496,8 @@ public struct AgentChatComposerBar: View {
     public var attachmentsIdentifier: String = "bots.desk.attachments"
     public var runStatusCaption: String?
     public var onFileDrop: (([String]) -> Void)?
+    /// Why attach is disabled (its tooltip); nil keeps "Attach files".
+    public var attachUnavailableReason: String?
 
     @State private var editorHeight: CGFloat = AgentComposerTextEditor.minHeight
     @State private var suggestionSelectedIndex: Int?
@@ -530,7 +532,8 @@ public struct AgentChatComposerBar: View {
         attachmentChipPrefix: String = "bots.desk.attachment.",
         attachmentsIdentifier: String = "bots.desk.attachments",
         runStatusCaption: String? = nil,
-        onFileDrop: (([String]) -> Void)? = nil
+        onFileDrop: (([String]) -> Void)? = nil,
+        attachUnavailableReason: String? = nil
     ) {
         self._text = text
         self.attachments = attachments
@@ -561,6 +564,7 @@ public struct AgentChatComposerBar: View {
         self.attachmentsIdentifier = attachmentsIdentifier
         self.runStatusCaption = runStatusCaption
         self.onFileDrop = onFileDrop
+        self.attachUnavailableReason = attachUnavailableReason
     }
 
     public var body: some View {
@@ -653,8 +657,9 @@ public struct AgentChatComposerBar: View {
                     .buttonStyle(.plain)
                     .disabled(!attachEnabled)
                     .foregroundColor(DS.Palette.textSecondary)
-                    .help("Attach files")
+                    .help(attachEnabled ? "Attach files" : (attachUnavailableReason ?? "Attach files"))
                     .accessibilityLabel("Attach files")
+                    .accessibilityHint(attachEnabled ? "" : (attachUnavailableReason ?? ""))
                     .accessibilityIdentifier("agent.attach")
                 }
                 if let leadingControls {

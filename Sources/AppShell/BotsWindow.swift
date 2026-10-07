@@ -11950,6 +11950,7 @@ public struct BotsRosterList: View {
                 .disabled(!vm.isControlPlaneActive)
                 .help("Create a named teammate")
                 .accessibilityIdentifier("bots.new")
+                .contextMenu { BotTeamsGroupsCreateButtons(vm: vm) }
 
                 Button(action: vm.openActiveBots) {
                     SidebarActionRow(
@@ -11994,24 +11995,24 @@ public struct BotsRosterList: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
                 Spacer(minLength: 0)
-                Menu {
-                    Button("New Team…") { vm.beginCreateTeam() }
-                        .accessibilityIdentifier("bots.roster.add.team")
-                    Button("New Group…") { vm.beginCreateGroup() }
-                        .disabled(vm.bots.isEmpty)
-                        .accessibilityIdentifier("bots.roster.add.group")
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
+                // With no teams or groups the header stays as it was; New Team
+                // and New Group are then on the New Bot row's context menu.
+                if !teamsGroups.teams.isEmpty || !teamsGroups.groups.isEmpty {
+                    Menu {
+                        BotTeamsGroupsCreateButtons(vm: vm)
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .disabled(!vm.isControlPlaneActive)
+                    .help("New team or group conversation")
+                    .accessibilityLabel("New team or group")
+                    .accessibilityIdentifier("bots.roster.add")
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .disabled(!vm.isControlPlaneActive)
-                .help("New team or group conversation")
-                .accessibilityLabel("New team or group")
-                .accessibilityIdentifier("bots.roster.add")
                 Toggle("Show hidden", isOn: $vm.showHidden)
                     .toggleStyle(.checkbox)
                     .font(DS.Font.caption2)

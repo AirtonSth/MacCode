@@ -383,6 +383,35 @@ final class BotTeamGroupServiceTests: XCTestCase {
         XCTAssertEqual(f.runner.requests.count, 2)
     }
 
+    /// WHY: the Mac inspector shows each participant's route (provider and
+    /// Mac or Linux VM); a paired device must get the same chip from the
+    /// group row, without one agent thread read per participant.
+    func test_groupRowParticipantsCarryTheirMemberThreadRoute() async throws {
+        let f = try makeFixture()
+        let group = try await createGroup(f, bots: [f.ana])
+        let before = try decode(BotGroupGet.Result.self, try await rpc(f, "bot.group.get", ["group_id": .string(group.id)]))
+        XCTAssertNil(before.group.participants[0].provider, "no member thread before the first turn")
+        XCTAssertNil(before.group.participants[0].executionTarget)
+
+        _ = try await rpc(f, "bot.group.send", [
+            "group_id": .string(group.id), "text": .string("Hi"), "submit_key": .string("route1"),
+        ])
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let threadID = f.runner.requests[0].threadId
+        let thread = try XCTUnwrap(try f.ctx.threadRepo.get(id: threadID))
+        let after = try decode(BotGroupGet.Result.self, try await rpc(f, "bot.group.get", ["group_id": .string(group.id)]))
+        let participant = after.group.participants[0]
+        XCTAssertEqual(participant.memberThreadID, threadID.value.uuidString.lowercased())
+        XCTAssertEqual(participant.provider, thread.provider.rawValue)
+        XCTAssertEqual(
+            participant.executionTarget,
+            thread.actorLockedAt == nil ? nil : thread.executionTarget?.rawValue,
+            "the locked target, exactly what the Mac chip shows"
+        )
+        f.runner.finish(runID: f.runner.requests[0].runId, status: .completed, reply: "Hello.")
+    }
+
     func test_removingAParticipantSettlesItsWaitingRowAndStopReturnsCancelledTurns() async throws {
         let f = try makeFixture()
         let (log, subscription) = recordEvents()
