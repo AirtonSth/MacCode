@@ -1900,13 +1900,25 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       if lockIsHeld { try? lockDatabase.execute("ROLLBACK;") }
     }
 
-    let oneMiB = String(repeating: "x", count: 1024 * 1024)
-    let rejectedMarker = "RC2_OUTPUT_AFTER_HISTORY_CAP_\(UUID().uuidString)"
+    // Payloads above one PTY handoff (256 KiB) stream through a single
+    // system-output lease and a concurrent one is refused as
+    // `system_output_busy` before history sees it. Handoff-sized slices take the
+    // synchronous live write path, which is the layer this test pins.
+    // The backlog admits newest-first: crossing the cap evicts the oldest
+    // buffered bytes (423c0f9c5). Mark an early slice (not the first, whose
+    // first chunk may already be the one in-flight write blocked on the lock)
+    // and push 5 MiB so that slice is evicted while the newest tail is kept.
+    let handoffSlice = String(repeating: "x", count: 256 * 1024)
+    let evictedMarker = "RC2_OUTPUT_EVICTED_BY_HISTORY_CAP_\(UUID().uuidString)"
+    let newestMarker = "RC2_OUTPUT_AFTER_HISTORY_CAP_\(UUID().uuidString)"
     let startedAt = ProcessInfo.processInfo.systemUptime
-    for _ in 0..<4 {
-      surface.appendSystemText(oneMiB)
+    for index in 0..<20 {
+      let slice = index == 1
+        ? evictedMarker + String(handoffSlice.dropFirst(evictedMarker.utf8.count))
+        : handoffSlice
+      XCTAssertTrue(surface.appendSystemText(slice))
     }
-    surface.appendSystemText(rejectedMarker)
+    surface.appendSystemText(newestMarker)
     let appendElapsed = ProcessInfo.processInfo.systemUptime - startedAt
     bus.flushNow(surface.descriptor.id)
 
@@ -1932,8 +1944,12 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       "the mirror snapshot must expose why history is partial while live output continues"
     )
     XCTAssertTrue(
-      collector.data(for: surface.descriptor.id).contains(Data(rejectedMarker.utf8)),
+      collector.data(for: surface.descriptor.id).contains(Data(evictedMarker.utf8)),
       "history backpressure must not suppress the same bytes from the real-time mirror stream"
+    )
+    XCTAssertTrue(
+      collector.data(for: surface.descriptor.id).contains(Data(newestMarker.utf8)),
+      "live output past the history cap must keep reaching the real-time mirror stream"
     )
     print(
       "TerminalLockedHistory appendElapsed=\(appendElapsed) "
@@ -1956,8 +1972,12 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     ).text
 
     XCTAssertFalse(
-      persisted.contains(rejectedMarker),
-      "bytes rejected at the explicit memory cap must not be misrepresented as durable"
+      persisted.contains(evictedMarker),
+      "bytes evicted at the explicit memory cap must not be misrepresented as durable"
+    )
+    XCTAssertTrue(
+      persisted.contains(newestMarker),
+      "the cap evicts oldest bytes first, so the newest output admitted under the lock must persist"
     )
     XCTAssertTrue(
       persisted.contains(recoveryMarker),
@@ -1979,10 +1999,13 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       surface.flushPersistedHistory()
       surface.close()
     }
-    let oneMiB = String(repeating: "x", count: 1024 * 1024)
+    // Handoff-sized slices (256 KiB) take the synchronous live write path;
+    // larger payloads stream through one system-output lease and a concurrent
+    // one is refused as `system_output_busy` before reaching history.
+    let handoffSlice = String(repeating: "x", count: 256 * 1024)
 
-    for _ in 0..<8 {
-      surface.appendSystemText(oneMiB)
+    for _ in 0..<32 {
+      XCTAssertTrue(surface.appendSystemText(handoffSlice))
     }
 
     XCTAssertLessThanOrEqual(
