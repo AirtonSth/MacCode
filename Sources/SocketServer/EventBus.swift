@@ -358,44 +358,121 @@ public final class EventBus: @unchecked Sendable {
     ) throws -> [Event] {
         precondition(DispatchQueue.getSpecific(key: deliveryQueueKey) == nil)
         return try deliveryQueue.sync {
-            let fence: (() -> Void)?
+            try performPersistedCommitOnDeliveryQueue(commit)
+        }
+    }
+
+    /// Completion token for one `enqueuePersistedCommit` batch. It resolves
+    /// exactly once, with the committed events or the commit's error.
+    public final class PersistedCommitTicket: @unchecked Sendable {
+        private let lock = NSLock()
+        private var outcome: Result<[Event], Error>?
+        private var waiter: CheckedContinuation<[Event], Error>?
+
+        fileprivate init() {}
+
+        fileprivate func resolve(_ result: Result<[Event], Error>) {
             lock.lock()
-            fence = persistenceCommitFence
-            lock.unlock()
-            fence?()
-            snapshotBarrierLock.lock()
-            let floor: Int64
-            lock.lock()
-            floor = lastSeq
-            lock.unlock()
-            do {
-                let events = try commit(floor)
-                var deliveries: [(Event, [Subscriber])] = []
-                lock.lock()
-                for event in events {
-                    precondition(event.seq > lastSeq)
-                    lastSeq = event.seq
-                    domainRevisions = Self.revisions(after: event, current: domainRevisions)
-                    advanceSnapshotStateRevisionLocked(after: event)
-                    retainRecentOrStandIn(event)
-                    deliveries.append((event, subscribersSnapshot))
-                }
+            if let waiter {
+                self.waiter = nil
                 lock.unlock()
-                snapshotBarrierLock.unlock()
-                for (event, subscribers) in deliveries {
-                    for subscriber in subscribers {
-                        guard let mapped = subscriber.filter.map(event) else {
-                            subscriber.onFilteredEvent(event.seq)
-                            continue
-                        }
-                        subscriber.handler(mapped)
-                    }
-                }
-                return events
-            } catch {
-                snapshotBarrierLock.unlock()
-                throw error
+                waiter.resume(with: result)
+            } else {
+                outcome = result
+                lock.unlock()
             }
+        }
+
+        public func value() async throws -> [Event] {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if let outcome {
+                    lock.unlock()
+                    continuation.resume(with: outcome)
+                } else {
+                    waiter = continuation
+                    lock.unlock()
+                }
+            }
+        }
+    }
+
+    /// C6: the same receipt commit as `commitPersistedEvents`, without blocking
+    /// the caller. The commit is queued on the delivery lane before this
+    /// returns, so a publish the caller makes afterwards still gets a later
+    /// sequence (sequence order keeps matching effect order); the fence, the
+    /// SQLite transaction and fanout then run on the delivery lane at
+    /// `.userInitiated`. Await the ticket for the outcome.
+    public func enqueuePersistedCommit(
+        _ commit: @escaping @Sendable (Int64) throws -> [Event]
+    ) -> PersistedCommitTicket {
+        let ticket = PersistedCommitTicket()
+#if DEBUG
+        lock.lock()
+        pendingPersistedCommitCount += 1
+        lock.unlock()
+#endif
+        deliveryQueue.async(qos: .userInitiated) { [self] in
+            let result = Result { try performPersistedCommitOnDeliveryQueue(commit) }
+#if DEBUG
+            lock.lock()
+            pendingPersistedCommitCount -= 1
+            lock.unlock()
+#endif
+            ticket.resolve(result)
+        }
+        return ticket
+    }
+
+#if DEBUG
+    private var pendingPersistedCommitCount = 0
+    /// Test probe: commits queued by `enqueuePersistedCommit` not yet resolved.
+    public var pendingPersistedCommitCountForTesting: Int {
+        lock.lock(); defer { lock.unlock() }
+        return pendingPersistedCommitCount
+    }
+#endif
+
+    private func performPersistedCommitOnDeliveryQueue(
+        _ commit: (Int64) throws -> [Event]
+    ) throws -> [Event] {
+        let fence: (() -> Void)?
+        lock.lock()
+        fence = persistenceCommitFence
+        lock.unlock()
+        fence?()
+        snapshotBarrierLock.lock()
+        let floor: Int64
+        lock.lock()
+        floor = lastSeq
+        lock.unlock()
+        do {
+            let events = try commit(floor)
+            var deliveries: [(Event, [Subscriber])] = []
+            lock.lock()
+            for event in events {
+                precondition(event.seq > lastSeq)
+                lastSeq = event.seq
+                domainRevisions = Self.revisions(after: event, current: domainRevisions)
+                advanceSnapshotStateRevisionLocked(after: event)
+                retainRecentOrStandIn(event)
+                deliveries.append((event, subscribersSnapshot))
+            }
+            lock.unlock()
+            snapshotBarrierLock.unlock()
+            for (event, subscribers) in deliveries {
+                for subscriber in subscribers {
+                    guard let mapped = subscriber.filter.map(event) else {
+                        subscriber.onFilteredEvent(event.seq)
+                        continue
+                    }
+                    subscriber.handler(mapped)
+                }
+            }
+            return events
+        } catch {
+            snapshotBarrierLock.unlock()
+            throw error
         }
     }
 

@@ -117,6 +117,132 @@ public final class CommandReceiptPersistenceGateway: @unchecked Sendable {
         }
         return try queue.sync(execute: work)
     }
+
+    /// Runs `work` on the receipt queue and resumes the caller when it has
+    /// landed. The awaiting actor (MainActor for the dispatcher) is suspended,
+    /// not blocked, while SQLite runs.
+    public func perform<T>(_ work: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result { try work() })
+            }
+        }
+    }
+}
+
+/// C6: the dispatcher's off-MainActor receipt writer. Claim and commit await
+/// the receipt queue; finalize builds the transaction `EventBus` runs on its
+/// delivery lane. Encoding uses sorted keys, like the router's synchronous
+/// methods, so stored result and payload bytes are unchanged.
+struct CommandReceiptOffMainWriter: CommandReceiptOffMainWriting {
+    private final class RepositoryBox: @unchecked Sendable {
+        let repo: CommandReceiptRepository
+        init(_ repo: CommandReceiptRepository) { self.repo = repo }
+    }
+
+    private let box: RepositoryBox
+    private let gateway: CommandReceiptPersistenceGateway
+
+    init(repo: CommandReceiptRepository, gateway: CommandReceiptPersistenceGateway = .shared) {
+        self.box = RepositoryBox(repo)
+        self.gateway = gateway
+    }
+
+    private static func sortedJSON<T: Encodable>(_ value: T) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let json = String(data: try encoder.encode(value), encoding: .utf8) else {
+            throw JSONRPCError.internalError
+        }
+        return json
+    }
+
+    func claim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) async throws -> CommandReceiptClaimResult {
+        let box = box
+        return try await gateway.perform {
+            let signposter = PerfSwitchMetrics.signposter
+            let interval = signposter.beginInterval("receipt_claim", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("receipt_claim", interval) }
+            return try box.repo.claim(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash
+            )
+        }
+    }
+
+    func commit(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue
+    ) async throws {
+        let box = box
+        try await gateway.perform {
+            try box.repo.commit(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash,
+                resultJSON: try Self.sortedJSON(result)
+            )
+        }
+    }
+
+    func finalizeTransaction(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue,
+        events: [EventBus.MutationEventIntent]
+    ) -> @Sendable (Int64) throws -> [EventBus.Event] {
+        let box = box
+        let gateway = gateway
+        return { minimumEventSequence in
+            let signposter = PerfSwitchMetrics.signposter
+            let interval = signposter.beginInterval("receipt_finalize", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("receipt_finalize", interval) }
+            let resultJSON = try Self.sortedJSON(result)
+            let intents = try events.map { event in
+                CommandReceiptEventIntent(
+                    kind: event.kind.rawValue,
+                    payloadJSON: try Self.sortedJSON(event.payload),
+                    createdAt: event.createdAt
+                )
+            }
+            let persisted = try gateway.syncThrowing {
+                try box.repo.finalize(
+                    method: method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: ownerFingerprint,
+                    paramsHash: paramsHash,
+                    resultJSON: resultJSON,
+                    events: intents,
+                    minimumEventSequence: minimumEventSequence
+                )
+            }
+            return try persisted.map { event in
+                guard let payloadData = event.payloadJSON.data(using: .utf8),
+                      let payload = JSONValue.decode(from: payloadData) else {
+                    throw JSONRPCError.internalError
+                }
+                return EventBus.Event(
+                    seq: event.seq,
+                    kind: event.kind,
+                    payload: payload,
+                    ts: event.createdAt.timeIntervalSince1970
+                )
+            }
+        }
+    }
 }
 
 /// Off-MainActor owner for Agent App refresh/read RPC persistence work.
@@ -6095,45 +6221,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         minimumEventSequence: Int64
     ) throws -> [EventBus.Event] {
         guard let context else { throw LayoutError.workspaceNotFound }
-        let resultData = try commandReceiptSortedEncoder.encode(result)
-        guard let resultJSON = String(data: resultData, encoding: .utf8) else {
-            throw JSONRPCError.internalError
-        }
-        let intents = try events.map { event -> CommandReceiptEventIntent in
-            let payloadData = try commandReceiptSortedEncoder.encode(event.payload)
-            guard let payloadJSON = String(data: payloadData, encoding: .utf8) else {
-                throw JSONRPCError.internalError
-            }
-            return CommandReceiptEventIntent(
-                kind: event.kind.rawValue,
-                payloadJSON: payloadJSON,
-                createdAt: event.createdAt
-            )
-        }
-        let repo = context.commandReceiptRepo
-        let persisted = try CommandReceiptPersistenceGateway.shared.syncThrowing {
-            try repo.finalize(
-                method: method,
-                clientRequestId: clientRequestId,
-                ownerFingerprint: ownerFingerprint,
-                paramsHash: paramsHash,
-                resultJSON: resultJSON,
-                events: intents,
-                minimumEventSequence: minimumEventSequence
-            )
-        }
-        return try persisted.map { event in
-            guard let payloadData = event.payloadJSON.data(using: .utf8),
-                  let payload = JSONValue.decode(from: payloadData) else {
-                throw JSONRPCError.internalError
-            }
-            return EventBus.Event(
-                seq: event.seq,
-                kind: event.kind,
-                payload: payload,
-                ts: event.createdAt.timeIntervalSince1970
-            )
-        }
+        return try CommandReceiptOffMainWriter(repo: context.commandReceiptRepo).finalizeTransaction(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash,
+            result: result,
+            events: events
+        )(minimumEventSequence)
+    }
+
+    public var commandReceiptOffMainWriter: (any CommandReceiptOffMainWriting)? {
+        guard let context else { return nil }
+        return CommandReceiptOffMainWriter(repo: context.commandReceiptRepo)
     }
 
     public func markCommandReceiptUnknown(

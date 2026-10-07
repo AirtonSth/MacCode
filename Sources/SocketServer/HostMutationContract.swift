@@ -755,4 +755,42 @@ public protocol CommandReceiptStateRouting: AnyObject {
         clientRequestId: String,
         ownerFingerprint: String
     ) throws -> CommandReceiptStatusResult
+    /// C6: when non-nil, the dispatcher claims, commits and finalizes through
+    /// this writer so receipt SQLite never runs on MainActor. Routers without
+    /// one keep the synchronous methods above.
+    var commandReceiptOffMainWriter: (any CommandReceiptOffMainWriting)? { get }
+}
+
+extension CommandReceiptStateRouting {
+    public var commandReceiptOffMainWriter: (any CommandReceiptOffMainWriting)? { nil }
+}
+
+/// Durable receipt store that is safe to use off MainActor (C6).
+///
+/// `claim` and `commit` resume when their transaction has landed.
+/// `finalizeTransaction` only builds the receipt + event transaction; the
+/// caller hands it to `EventBus.enqueuePersistedCommit`, which runs it exactly
+/// once on the delivery lane with the reserved sequence floor.
+public protocol CommandReceiptOffMainWriting: Sendable {
+    func claim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) async throws -> CommandReceiptClaimResult
+    func commit(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue
+    ) async throws
+    func finalizeTransaction(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue,
+        events: [EventBus.MutationEventIntent]
+    ) -> @Sendable (_ minimumEventSequence: Int64) throws -> [EventBus.Event]
 }

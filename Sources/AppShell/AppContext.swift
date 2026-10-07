@@ -2624,24 +2624,57 @@ public final class AppContext {
     /// and land in ONE transaction when the scheduled flush runs. The flush is
     /// enqueued as soon as the buffer becomes non-empty, so an idle writer
     /// persists with the same latency as before and only storms coalesce.
+    ///
+    /// C6: each drained batch holds a completion token until its transaction
+    /// returns. The receipt commit fence waits only for those in-flight
+    /// batches and then writes any rows no writer has picked up yet itself,
+    /// instead of `backgroundWriterQueue.sync {}`, which also waited behind
+    /// unrelated utility work (snapshot saves, storage cleanup, usage files).
     final class PendingEventLogRows: @unchecked Sendable {
-        private let lock = NSLock()
+        private let condition = NSCondition()
         private var rows: [EventBus.Event] = []
+        private var inFlightBatches = 0
 
         /// Returns true when this event opened a new batch (caller schedules the flush).
         func append(_ event: EventBus.Event) -> Bool {
-            lock.lock(); defer { lock.unlock() }
+            condition.lock(); defer { condition.unlock() }
             rows.append(event)
             return rows.count == 1
         }
 
-        func drain() -> [EventBus.Event] {
-            lock.lock(); defer { lock.unlock() }
+        /// Takes every queued row as one batch. A non-empty batch stays in
+        /// flight until the caller passes its token back to `finishBatch()`.
+        func drainBatch() -> [EventBus.Event] {
+            condition.lock(); defer { condition.unlock() }
+            return takeRowsLocked()
+        }
+
+        /// Fence side: waits for batches already being written (they hold
+        /// earlier sequences), then takes the remaining rows as a new batch.
+        func drainBatchAfterInFlight() -> [EventBus.Event] {
+            condition.lock(); defer { condition.unlock() }
+            while inFlightBatches > 0 { condition.wait() }
+            return takeRowsLocked()
+        }
+
+        func finishBatch() {
+            condition.lock()
+            inFlightBatches -= 1
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        private func takeRowsLocked() -> [EventBus.Event] {
             let drained = rows
             rows.removeAll(keepingCapacity: true)
+            if !drained.isEmpty { inFlightBatches += 1 }
             return drained
         }
     }
+
+    /// Test seam: runs before each event-log batch transaction, on the thread
+    /// that writes it (the writer queue, or a receipt commit's fence).
+    nonisolated(unsafe) static var beforeEventLogBatchWriteForTesting: (() -> Void)?
 
     private let pendingEventLogRows = PendingEventLogRows()
     private let eventLogFlushLock = NSLock()
@@ -2662,27 +2695,38 @@ public final class AppContext {
         let queue = backgroundWriterQueue
         let pending = pendingEventLogRows
         let flushLock = eventLogFlushLock
-        eventBus.persistenceCommitFence = {
-            queue.sync {}
+        let writeBatch: ([EventBus.Event]) -> Void = { [weak self] batch in
+            defer { pending.finishBatch() }
+            Self.beforeEventLogBatchWriteForTesting?()
+            let rows = batch.map { event in
+                EventLogRepository.PendingRow(
+                    seq: event.seq,
+                    kind: event.kind,
+                    payloadJSON: EventBus.encodePayloadForPersistence(event.payload)
+                )
+            }
+            _ = try? log.appendBatch(rows)
+            flushLock.lock()
+            self?.eventLogFlushCountValue += 1
+            self?.eventLogPersistedRowCountValue += rows.count
+            flushLock.unlock()
         }
-        eventBus.persister = { [weak self] ev in
+        // Runs on the EventBus delivery lane, so no new rows arrive meanwhile.
+        eventBus.persistenceCommitFence = {
+            let signposter = PerfSwitchMetrics.signposter
+            let interval = signposter.beginInterval("event_log_commit_fence", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("event_log_commit_fence", interval) }
+            let batch = pending.drainBatchAfterInFlight()
+            guard !batch.isEmpty else { return }
+            writeBatch(batch)
+        }
+        eventBus.persister = { ev in
             guard AppDelegate.shouldPersistEvent(ev) else { return }
             guard pending.append(ev) else { return }
             queue.async {
-                let batch = pending.drain()
+                let batch = pending.drainBatch()
                 guard !batch.isEmpty else { return }
-                let rows = batch.map { event in
-                    EventLogRepository.PendingRow(
-                        seq: event.seq,
-                        kind: event.kind,
-                        payloadJSON: EventBus.encodePayloadForPersistence(event.payload)
-                    )
-                }
-                _ = try? log.appendBatch(rows)
-                flushLock.lock()
-                self?.eventLogFlushCountValue += 1
-                self?.eventLogPersistedRowCountValue += rows.count
-                flushLock.unlock()
+                writeBatch(batch)
             }
         }
     }

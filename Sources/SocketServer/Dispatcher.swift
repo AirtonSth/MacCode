@@ -1892,13 +1892,23 @@ public final class JSONRPCDispatcher {
 
         let claim: CommandReceiptClaimResult
         let claimStarted = DispatchTime.now().uptimeNanoseconds
+        let offMainReceiptWriter = receiptRouter.commandReceiptOffMainWriter
         do {
-            claim = try receiptRouter.claimCommandReceipt(
-                method: req.method,
-                clientRequestId: clientRequestId,
-                ownerFingerprint: context.ownerFingerprint,
-                paramsHash: paramsHash
-            )
+            if let offMainReceiptWriter {
+                claim = try await offMainReceiptWriter.claim(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
+            } else {
+                claim = try receiptRouter.claimCommandReceipt(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
+            }
             commandReceiptMetrics.recordClaim(
                 claim,
                 latencyMilliseconds: Self.elapsedMilliseconds(since: claimStarted)
@@ -2092,17 +2102,40 @@ public final class JSONRPCDispatcher {
         do {
             if let eventSink {
                 let events = try eventSink.seal()
-                _ = try EventBus.shared.commitPersistedEvents { minimumEventSequence in
-                    try receiptRouter.finalizeCommandReceipt(
-                        method: req.method,
-                        clientRequestId: clientRequestId,
-                        ownerFingerprint: context.ownerFingerprint,
-                        paramsHash: paramsHash,
-                        result: committedResult,
-                        events: events,
-                        minimumEventSequence: minimumEventSequence
-                    )
+                if let offMainReceiptWriter {
+                    // Queued on the delivery lane before this task suspends, so
+                    // a later MainActor publish still sorts after these events.
+                    _ = try await EventBus.shared.enqueuePersistedCommit(
+                        offMainReceiptWriter.finalizeTransaction(
+                            method: req.method,
+                            clientRequestId: clientRequestId,
+                            ownerFingerprint: context.ownerFingerprint,
+                            paramsHash: paramsHash,
+                            result: committedResult,
+                            events: events
+                        )
+                    ).value()
+                } else {
+                    _ = try EventBus.shared.commitPersistedEvents { minimumEventSequence in
+                        try receiptRouter.finalizeCommandReceipt(
+                            method: req.method,
+                            clientRequestId: clientRequestId,
+                            ownerFingerprint: context.ownerFingerprint,
+                            paramsHash: paramsHash,
+                            result: committedResult,
+                            events: events,
+                            minimumEventSequence: minimumEventSequence
+                        )
+                    }
                 }
+            } else if let offMainReceiptWriter {
+                try await offMainReceiptWriter.commit(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash,
+                    result: committedResult
+                )
             } else {
                 try receiptRouter.commitCommandReceipt(
                     method: req.method,
