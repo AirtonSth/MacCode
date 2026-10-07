@@ -792,7 +792,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
     }
 
     private func replyText(threadID: AgentThreadID, runID: AgentRunID, finalMessage: String?) -> String? {
-        let stored = (try? checkpointRepo.list(threadId: threadID))?
+        // Summaries only: the snapshot/diff blobs are never needed here.
+        let stored = (try? checkpointRepo.listSummaries(threadId: threadID))?
             .last(where: { $0.runId == runID })?
             .assistantMessageId
             .flatMap { try? messageRepo.get(id: $0) }

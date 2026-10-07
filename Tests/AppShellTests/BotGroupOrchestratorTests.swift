@@ -534,6 +534,29 @@ final class BotGroupOrchestratorTests: XCTestCase {
         XCTAssertTrue(done)
     }
 
+    func test_settlingATurnFindsItsReplyWithoutReadingCheckpointBlobs() async throws {
+        // WHY: every settle runs on the MainActor. The member thread keeps one
+        // checkpoint per turn with file snapshots and diffs, so loading those
+        // blobs to find one run's assistant message grows with the group's life.
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let receipt = try f.orchestrator.send(groupID: group.id, text: "Plan the launch")
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let checkpoints = f.ctx.turnCheckpointRepo
+        let blobReadsBefore = checkpoints.fullRowListReadCountForTesting
+        let summaryReadsBefore = checkpoints.summaryListReadCountForTesting
+
+        f.runner.finish(runID: try XCTUnwrap(f.runner.requests.first).runId, status: .completed, reply: "Ship it on Monday.")
+        let done = await waitUntil { (try? f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state) == .completed }
+        XCTAssertTrue(done)
+
+        let row = try XCTUnwrap(try f.ctx.messageRepo.get(id: receipt.turns[0].roomMessageID))
+        XCTAssertEqual(BotPeerTranscript.parse(row.content)?.body, "Ship it on Monday.")
+        XCTAssertEqual(checkpoints.fullRowListReadCountForTesting, blobReadsBefore, "no blob columns on the settle path")
+        XCTAssertGreaterThan(checkpoints.summaryListReadCountForTesting, summaryReadsBefore, "the stored reply is still looked up")
+    }
+
     // MARK: - Hand-offs
 
     func test_aReplyMentioningParticipantsHandsThemTheFloorUpToTheHopBudget() async throws {
