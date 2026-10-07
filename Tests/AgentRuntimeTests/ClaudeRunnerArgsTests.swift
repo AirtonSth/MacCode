@@ -335,8 +335,13 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let sonnetEfforts = sonnet?.supportedReasoningEfforts ?? []
         XCTAssertTrue(sonnetEfforts.contains(.xhigh) && sonnetEfforts.contains(.max),
                        "the Sonnet 5 alias supports xhigh and max")
-        XCTAssertEqual(models.first { $0.id == "haiku" || $0.id.contains("haiku") }?.supportedReasoningEfforts, [],
-                       "Haiku has no configurable thinking effort")
+        // Live Claude Code 2.1.293 resolves the `haiku` alias to Haiku 5.5, which
+        // advertises efforts; the dated Haiku 4.5 entry still advertises none.
+        // The static fallback lists only the alias, also without efforts.
+        let effortlessHaiku = models.first { $0.id.hasPrefix("claude-haiku-4") }
+            ?? models.first { $0.id == "haiku" }
+        XCTAssertEqual(effortlessHaiku?.supportedReasoningEfforts, [],
+                       "Haiku 4.5 has no configurable thinking effort")
         XCTAssertFalse(models.contains { $0.supportsServiceTier == true },
                        "Claude models must not expose Codex-only fast service-tier controls")
         XCTAssertEqual(fable?.supportsCustomModel, true)
