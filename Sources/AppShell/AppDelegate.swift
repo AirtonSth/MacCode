@@ -122,6 +122,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var lifecycleRecorder: AppLifecycleRecorder?
     /// Forensic-only hang detector (plan-final W0). Never mutates run status.
     private var hangWatchdog: HangWatchdog?
+    /// S-F4a: reclaims hidden terminals when the OS reports memory pressure.
+    private var memoryPressureMonitor: MemoryPressureMonitor?
     /// Sleep-aware awake state for HangWatchdog (updated from NSWorkspace sleep/wake).
     private let hangWatchdogAwakeState = HangWatchdogAwakeBox(initial: .unknown)
     /// Distributed-notification observer: schedule store commits → rail reload.
@@ -172,6 +174,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let appSupportDirectory = AppPaths.appSupportDirectory(
             for: channel,
             override: appSupportOverride
+        )
+        // First, before anything can start GhosttyKit: its init deletes the
+        // previous run's crash files.
+        let harvestedGhosttyCrashFiles = GhosttyCrashHarvester.harvest(
+            from: GhosttyCrashHarvester.defaultSourceDirectories(),
+            into: appSupportDirectory.appendingPathComponent("diagnostics/ghostty-crash", isDirectory: true)
         )
         ProviderProcessOwnership.shared.configure(
             fileURL: appSupportDirectory
@@ -232,7 +240,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             }
         }
 
-        installLifecycleRecorder()
+        installLifecycleRecorder(harvestedGhosttyCrashFiles: harvestedGhosttyCrashFiles)
+        startMemoryPressureMonitor()
         // PERF (cold launch): the orphan provider sweep is a process scan and
         // the event-log decode + PTY restore are heavy. StartupPlan defers them
         // past the first frame; see runDeferredStartup().
@@ -645,6 +654,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func persistRestorableStateBeforeUpdate() {
+        router?.flushPendingTerminalTitles()
         context?.saveSnapshot()
         // Sparkle may relaunch immediately after this hook returns. Make every
         // previously published event durable before handing control back.
@@ -789,39 +799,76 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         )
     }
 
-    private func installLifecycleRecorder() {
+    private func installLifecycleRecorder(harvestedGhosttyCrashFiles: [URL]) {
         let directory = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride)
             .appendingPathComponent("diagnostics", isDirectory: true)
         let recorder = AppLifecycleRecorder(directory: directory)
-        if let stale = recorder.consumeStaleRunMarker() {
+        let staleMarkers = recorder.consumeStaleRunMarkerRecords()
+        for stale in staleMarkers.map(\.contents) {
             // The previous run never reached applicationWillTerminate: it was
             // killed (SIGTERM/SIGKILL) or died abruptly with no crash report.
             // This is the on-disk evidence for the "app silently vanished" report.
             appLifecycleLog.fault("app.previous_run_unclean \(stale, privacy: .public)")
             recorder.record("previous_run_ended_uncleanly \(stale)")
         }
+        // The Ghostty folders are shared with Ghostty.app, so a harvested dump
+        // is not necessarily RemoteCode's own crash.
+        for file in harvestedGhosttyCrashFiles {
+            appLifecycleLog.info("app.ghostty_crash_harvested source=shared-ghostty file=\(file.lastPathComponent, privacy: .public)")
+            recorder.record("ghostty_crash_harvested source=shared-ghostty file=\(file.lastPathComponent)")
+        }
         recorder.beginRun()
         recorder.installSignalHandlers()
         recorder.installExitHandler()
         lifecycleRecorder = recorder
-        startHangWatchdog(recorder: recorder)
+        // How each unclean run ended comes from launchd's log, which takes a
+        // second or more to query, so it is recorded off the launch path.
+        let uncleanRuns = staleMarkers.compactMap { marker in marker.pid.map { ($0, marker.lastAlive) } }
+        if !uncleanRuns.isEmpty {
+            let bundleIdentifier = Bundle.main.bundleIdentifier
+            DispatchQueue.global(qos: .utility).async {
+                for (pid, lastAlive) in uncleanRuns {
+                    recorder.record(PreviousRunExitStatus.lifecycleLine(
+                        pid: pid,
+                        lastAlive: lastAlive,
+                        bundleIdentifier: bundleIdentifier
+                    ))
+                }
+            }
+        }
+        startHangWatchdog(recorder: recorder, diagnosticsDirectory: directory)
     }
 
-    private func startHangWatchdog(recorder: AppLifecycleRecorder) {
+    private func startMemoryPressureMonitor() {
+        let monitor = MemoryPressureMonitor(log: { [weak self] line in
+            appLifecycleLog.info("app.\(line, privacy: .public)")
+            self?.lifecycleRecorder?.record(line)
+        })
+        memoryPressureMonitor = monitor
+        monitor.start()
+    }
+
+    private func startHangWatchdog(recorder: AppLifecycleRecorder, diagnosticsDirectory: URL) {
         hangWatchdog?.stop()
         hangWatchdogAwakeState.value = .awake
         let bootId = HostBootIdentity.currentBootId()
         let awakeBox = hangWatchdogAwakeState
+        // S-F5: a hang that lasts 5 s gets one `sample` stack per episode.
+        let stackCapture = HangStackCapture(
+            directory: diagnosticsDirectory,
+            log: { [weak recorder] line in recorder?.record(line) }
+        )
         let watchdog = HangWatchdog(
             pingInterval: 1.0,
             hangThreshold: 2.0,
             awakeProvider: { awakeBox.value },
             sideContextProvider: { [weak self] in
                 HangWatchdogSideContext(
-                    providerProcessCount: self?.context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
+                    activeAgentThreadCount: self?.context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
                     recoveryInFlight: false,
                     bootId: bootId,
-                    // Spindump capture is residual; do not claim samples were taken.
+                    // The breach fires at 2 s; HangStackCapture logs its own
+                    // hang_stack_* line once a sample is actually taken.
                     sampleCountRequested: 0
                 )
             },
@@ -830,6 +877,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 recorder?.record(
                     "\(breach.sideContext.lifecycleLine) gapSec=\(Int(breach.gapSeconds)) kind=\(breach.kind.rawValue) awake=\(breach.awake.rawValue)"
                 )
+            },
+            gapObserver: { gapSeconds, kind, episodeStart in
+                stackCapture.observe(gapSeconds: gapSeconds, kind: kind, episodeStart: episodeStart)
             }
         )
         hangWatchdog = watchdog
@@ -971,16 +1021,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         windowController?.repairSelectedTerminalFocus(reason: "app_active")
     }
 
+    /// S-F6: the scan, the DB writes and the process teardown run on the
+    /// reaper queue; the main thread only logs the outcome.
     private func reapIdleProviderSessions() {
-        do {
-            let result = try context.reapIdleProviderSessions(
-                idleAge: managedProcessMemoryProfile.idleReleaseAge
-            )
-            if !result.stoppedThreadIds.isEmpty {
-                NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s).")
+        context.reapIdleProviderSessionsOffMain(
+            idleAge: managedProcessMemoryProfile.idleReleaseAge
+        ) { outcome in
+            switch outcome {
+            case .success(let result):
+                if !result.stoppedThreadIds.isEmpty || !result.cappedThreadIds.isEmpty {
+                    NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s); released \(result.cappedThreadIds.count) over the resident cap of \(ProviderSessionReaper.providerRootCap).")
+                }
+            case .failure(let error):
+                NSLog("Failed to reap idle provider sessions: \(error)")
             }
-        } catch {
-            NSLog("Failed to reap idle provider sessions: \(error)")
         }
     }
 

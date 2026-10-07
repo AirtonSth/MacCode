@@ -376,6 +376,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     private var currentShellHostingView: NSView?
     /// Test seam: Workspaces <-> Bots must reattach this instance, not remount.
     var botsHostingViewForTesting: NSView? { botsHostingView }
+    var sidebarWorkspacesForTesting: [Workspace] { sidebar.workspacesForTesting }
     private var destinationPersistenceTask: Task<Void, Never>?
     private var workspaceRebuildTask: Task<Void, Never>?
     private var workspaceRebuildGeneration: UInt64 = 0
@@ -933,6 +934,19 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             self.sidebar.refreshActiveCount()
             self.activeThreadsViewModel?.refreshLive()
         }
+    }
+
+    /// H3: title-only change. Patches the matching tab label in place across the
+    /// main and detached windows instead of a full refreshFromState pass.
+    public func updateSurfaceTabTitle(_ surfaceID: SurfaceID, title: String) {
+        for controller in paneControllers {
+            controller.setTabTitle(surfaceID, title: title)
+        }
+        for controller in workspaceWindows.values {
+            controller.updateSurfaceTabTitle(surfaceID, title: title)
+        }
+        // Busy tooltips read titles from the sidebar's workspace snapshot.
+        sidebar.refresh()
     }
 
     public func refreshSurfaceRuntimeState() {
@@ -2239,6 +2253,12 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneK
     func refreshSurfaceRuntimeState() {
         for controller in paneControllers {
             controller.refreshBusyStates()
+        }
+    }
+
+    func updateSurfaceTabTitle(_ surfaceID: SurfaceID, title: String) {
+        for controller in paneControllers {
+            controller.setTabTitle(surfaceID, title: title)
         }
     }
 

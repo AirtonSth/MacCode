@@ -315,12 +315,22 @@ public struct AgentProviderSessionSummary: Sendable, Equatable {
     public let provider: AgentProvider
     public let status: AgentRunStatus
     public let providerThreadId: String?
+    /// A turn was ended by the host while a tool call was still open, so the
+    /// tool may still be running in this session's process tree.
+    public let toolsMayStillRun: Bool
 
-    public init(threadId: AgentThreadID, provider: AgentProvider, status: AgentRunStatus, providerThreadId: String?) {
+    public init(
+        threadId: AgentThreadID,
+        provider: AgentProvider,
+        status: AgentRunStatus,
+        providerThreadId: String?,
+        toolsMayStillRun: Bool = false
+    ) {
         self.threadId = threadId
         self.provider = provider
         self.status = status
         self.providerThreadId = providerThreadId
+        self.toolsMayStillRun = toolsMayStillRun
     }
 }
 

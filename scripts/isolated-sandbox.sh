@@ -259,6 +259,12 @@ cmd_stop() {
   for pid in $(exact_pids "$executable"); do
     kill "$pid" 2>/dev/null || true
   done
+  # The app holds a single-instance lock on its App Support until it exits;
+  # wait (bounded) so an immediate relaunch is not refused as a second instance.
+  for _ in $(seq 1 50); do
+    [ -z "$(exact_pids "$executable")" ] && break
+    sleep 0.1
+  done
   echo "[sandbox] stopped $executable"
 }
 

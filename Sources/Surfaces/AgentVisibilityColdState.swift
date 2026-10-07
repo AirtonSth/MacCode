@@ -1,3 +1,4 @@
+import CoreModel
 import Foundation
 
 /// Agent visibility cold-state protocol (S6 / T-003).
@@ -147,4 +148,21 @@ public enum AgentVisibilityColdState {
 
     /// Explicit product decision: no host-wide Agent LRU until residual breach.
     public static let globalAgentLRUEnabled = false
+}
+
+/// S-F4c: the cold form of a hidden Agent App tab's timeline. A hidden tab
+/// whose thread has no live run gives up the in-memory tree for this
+/// LZFSE-compressed Codable snapshot. `AssistantTimelineState` round-trips
+/// exactly through Codable (location maps are rebuilt on decode and excluded
+/// from equality), so reveal restores the same timeline, not a re-derived one.
+public enum AgentColdTimelineArchive {
+    public static func archive(_ timeline: AssistantTimelineState) throws -> Data {
+        let encoded = try JSONEncoder().encode(timeline)
+        return try (encoded as NSData).compressed(using: .lzfse) as Data
+    }
+
+    public static func restore(_ archive: Data) throws -> AssistantTimelineState {
+        let encoded = try (archive as NSData).decompressed(using: .lzfse) as Data
+        return try JSONDecoder().decode(AssistantTimelineState.self, from: encoded)
+    }
 }

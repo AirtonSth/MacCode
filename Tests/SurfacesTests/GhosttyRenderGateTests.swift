@@ -15,7 +15,8 @@ final class GhosttyRenderGateTests: XCTestCase {
         windowMiniaturized: Bool = false,
         windowOnScreen: Bool = true,
         windowPresent: Bool = true,
-        windowIsKey: Bool = false
+        windowIsKey: Bool = false,
+        windowOnActiveSpace: Bool = true
     ) -> Bool {
         GhosttyTerminalView.canRender(
             visibleInUI: true,
@@ -25,7 +26,8 @@ final class GhosttyRenderGateTests: XCTestCase {
             windowVisible: windowVisible,
             windowMiniaturized: windowMiniaturized,
             windowOnScreen: windowOnScreen,
-            windowIsKey: windowIsKey
+            windowIsKey: windowIsKey,
+            windowOnActiveSpace: windowOnActiveSpace
         )
     }
 
@@ -83,7 +85,7 @@ final class GhosttyRenderGateTests: XCTestCase {
             GhosttyTerminalView.canRender(
                 visibleInUI: true, isHidden: false, hasNonEmptyBounds: true,
                 windowPresent: false, windowVisible: false,
-                windowMiniaturized: false, windowOnScreen: false, windowIsKey: false),
+                windowMiniaturized: false, windowOnScreen: false, windowIsKey: false, windowOnActiveSpace: true),
             "a selected terminal whose view is mid-move (windowless) must not render — keying on visibleInUI alone freezes on nextDrawable")
     }
 
@@ -94,7 +96,7 @@ final class GhosttyRenderGateTests: XCTestCase {
             GhosttyTerminalView.canRender(
                 visibleInUI: true, isHidden: false, hasNonEmptyBounds: true,
                 windowPresent: true, windowVisible: false,
-                windowMiniaturized: false, windowOnScreen: false, windowIsKey: false),
+                windowMiniaturized: false, windowOnScreen: false, windowIsKey: false, windowOnActiveSpace: true),
             "a selected terminal in a new window that is not yet on screen must not render")
     }
 
@@ -106,7 +108,7 @@ final class GhosttyRenderGateTests: XCTestCase {
         let renderable = GhosttyTerminalView.canRender(
             visibleInUI: visibleInUI, isHidden: false, hasNonEmptyBounds: true,
             windowPresent: false, windowVisible: false,
-            windowMiniaturized: false, windowOnScreen: false, windowIsKey: false)
+            windowMiniaturized: false, windowOnScreen: false, windowIsKey: false, windowOnActiveSpace: true)
         XCTAssertTrue(visibleInUI, "precondition: the moved tab is still logically selected")
         XCTAssertNotEqual(renderable, visibleInUI,
             "render decision must NOT equal visibleInUI in the windowless mid-move state — that equality was the freeze bug")
@@ -116,17 +118,17 @@ final class GhosttyRenderGateTests: XCTestCase {
         XCTAssertFalse(
             GhosttyTerminalView.canRender(
                 visibleInUI: false, isHidden: false, hasNonEmptyBounds: true,
-                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true, windowIsKey: false),
+                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true, windowIsKey: false, windowOnActiveSpace: true),
             "an unselected tab must not render even if its window is on screen")
         XCTAssertFalse(
             GhosttyTerminalView.canRender(
                 visibleInUI: true, isHidden: true, hasNonEmptyBounds: true,
-                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true, windowIsKey: false),
+                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true, windowIsKey: false, windowOnActiveSpace: true),
             "a hidden view must not render")
         XCTAssertFalse(
             GhosttyTerminalView.canRender(
                 visibleInUI: true, isHidden: false, hasNonEmptyBounds: false,
-                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true, windowIsKey: false),
+                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true, windowIsKey: false, windowOnActiveSpace: true),
             "a zero-sized view has no drawable and must not render")
     }
 
@@ -143,7 +145,7 @@ final class GhosttyRenderGateTests: XCTestCase {
 
     func test_keyWindowRendersEvenWhenOcclusionStateFalseNegatives() {
         XCTAssertTrue(
-            onScreenSelected(windowOnScreen: false, windowIsKey: true),
+            onScreenSelected(windowOnScreen: false, windowIsKey: true, windowOnActiveSpace: true),
             "a KEY window must render even when occlusionState falsely reports not-visible — that latch was the freeze (audit #1)")
     }
 
@@ -151,11 +153,81 @@ final class GhosttyRenderGateTests: XCTestCase {
         // The heal must NOT defeat the AGX-trap guards: a minimized or ordered-out
         // window has no valid drawable even if AppKit somehow reported it as key.
         XCTAssertFalse(
-            onScreenSelected(windowVisible: true, windowMiniaturized: true, windowOnScreen: false, windowIsKey: true),
+            onScreenSelected(windowVisible: true, windowMiniaturized: true, windowOnScreen: false, windowIsKey: true, windowOnActiveSpace: true),
             "a minimized window has no drawable — isKey must not force a render into it")
         XCTAssertFalse(
-            onScreenSelected(windowVisible: false, windowOnScreen: false, windowIsKey: true),
+            onScreenSelected(windowVisible: false, windowOnScreen: false, windowIsKey: true, windowOnActiveSpace: true),
             "an ordered-out (invisible) window has no drawable — isKey must not force a render into it")
+    }
+
+    // MARK: - Key-window override needs the active Space (S-F2)
+    //
+    // A window can stay key while the user is looking at another Space (a Space
+    // switch with no other app taking focus). Its occlusionState correctly says
+    // not-visible, so the only thing that could re-enable rendering is the key
+    // override, and the window has no on-screen drawable there. Rendering into it
+    // is the AGX off-screen trap that Ghostty's crash reporter turns into a
+    // silent exit, so the override must also require the active Space.
+
+    func test_keyWindowOnAnInactiveSpaceDoesNotRender() {
+        XCTAssertFalse(
+            onScreenSelected(windowOnScreen: false, windowIsKey: true, windowOnActiveSpace: false),
+            "a key window whose Space is not shown has no drawable; the key override must not render into it (S-F2)")
+    }
+
+    func test_inactiveSpaceDoesNotBlockAnOcclusionVisibleWindow() {
+        // The Space check narrows only the key override. AppKit's own on-screen
+        // signal still wins, so a correctly visible window keeps rendering.
+        XCTAssertTrue(
+            onScreenSelected(windowOnScreen: true, windowIsKey: false, windowOnActiveSpace: false),
+            "occlusionState visible is authoritative; the Space check applies only to the key override")
+    }
+
+    // `isRenderable` runs on every output drain, and `isOnActiveSpace` is a main-thread
+    // WindowServer round trip. A covered or background window streaming output for
+    // hours must not pay for it per chunk, so the Space is asked only for a key window
+    // with a live drawable whose occlusionState says not-visible.
+
+    func test_spaceIsNotQueriedForAnOcclusionVisibleWindow() {
+        var keyProbes = 0, spaceProbes = 0
+        let inputs = GhosttyTerminalView.keyOverrideInputs(
+            windowOnScreen: true,
+            keyLiveDrawable: { keyProbes += 1; return true },
+            onActiveSpace: { spaceProbes += 1; return true })
+        XCTAssertEqual(keyProbes, 0, "an on-screen window never needs the key override")
+        XCTAssertEqual(spaceProbes, 0, "an on-screen window must not pay for the Space query")
+        XCTAssertFalse(inputs.windowIsKey)
+        XCTAssertFalse(inputs.windowOnActiveSpace)
+    }
+
+    func test_spaceIsNotQueriedForANonKeyWindow() {
+        var spaceProbes = 0
+        let inputs = GhosttyTerminalView.keyOverrideInputs(
+            windowOnScreen: false,
+            keyLiveDrawable: { false },
+            onActiveSpace: { spaceProbes += 1; return true })
+        XCTAssertEqual(spaceProbes, 0,
+            "a covered non-key window (the hot path while output streams) must not query the Space")
+        XCTAssertFalse(
+            onScreenSelected(windowOnScreen: false, windowIsKey: inputs.windowIsKey,
+                             windowOnActiveSpace: inputs.windowOnActiveSpace),
+            "a covered non-key window stays gated off")
+    }
+
+    func test_spaceDecidesTheOverrideForAnOccludedKeyWindow() {
+        for spaceShown in [true, false] {
+            var spaceProbes = 0
+            let inputs = GhosttyTerminalView.keyOverrideInputs(
+                windowOnScreen: false,
+                keyLiveDrawable: { true },
+                onActiveSpace: { spaceProbes += 1; return spaceShown })
+            XCTAssertEqual(spaceProbes, 1, "the latch case must actually consult the Space")
+            XCTAssertEqual(
+                onScreenSelected(windowOnScreen: false, windowIsKey: inputs.windowIsKey,
+                                 windowOnActiveSpace: inputs.windowOnActiveSpace),
+                spaceShown,
+                "an occluded key window renders only on the active Space (audit #1 heal vs S-F2 trap)")
+        }
     }
 
     func test_keyWindowDoesNotRescueAnUnselectedOrHiddenTab() {
@@ -163,7 +235,7 @@ final class GhosttyRenderGateTests: XCTestCase {
             GhosttyTerminalView.canRender(
                 visibleInUI: false, isHidden: false, hasNonEmptyBounds: true,
                 windowPresent: true, windowVisible: true, windowMiniaturized: false,
-                windowOnScreen: true, windowIsKey: true),
+                windowOnScreen: true, windowIsKey: true, windowOnActiveSpace: true),
             "an unselected tab must still not render even in a key window")
     }
 

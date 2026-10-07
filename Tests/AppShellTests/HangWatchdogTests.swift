@@ -52,10 +52,13 @@ final class HangWatchdogTests: XCTestCase {
             gapSeconds: 3,
             kind: .hangLikely,
             awake: .awake,
-            sideContext: HangWatchdogSideContext(providerProcessCount: 2, bootId: "boot")
+            sideContext: HangWatchdogSideContext(activeAgentThreadCount: 2, bootId: "boot")
         )
         XCTAssertTrue(breach.sideContext.lifecycleLine.contains("hang_breach"))
-        XCTAssertTrue(breach.sideContext.lifecycleLine.contains("providerProcesses=2"))
+        // The count comes from active agent threads, so the line must not call
+        // it provider processes (the heartbeat owns that real process count).
+        XCTAssertTrue(breach.sideContext.lifecycleLine.contains("activeAgentThreads=2"))
+        XCTAssertFalse(breach.sideContext.lifecycleLine.contains("providerProcesses"))
     }
 
     func test_evaluateForTests_emitsBreachWhenAwakeAndStaleAck() {

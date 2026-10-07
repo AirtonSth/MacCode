@@ -147,6 +147,21 @@ final class TerminalReadTextSnapshotTests: XCTestCase {
         XCTAssertFalse(TerminalSurface.hasSpinnerTitle("\u{2733} Claude Code"))
     }
 
+    /// WHY (H3): only the text behind a spinner is user state. ◐◓◑◒ frames and
+    /// Claude Code's idle ✳ were not stripped, so each frame (and each busy/idle
+    /// flip) persisted and broadcast a rename about once a second.
+    func test_stableTitleStripsEverySpinnerGlyphFamily() {
+        XCTAssertEqual(TerminalSurface.stableTitle("\u{25D0} Running tests"), "Running tests")
+        XCTAssertEqual(TerminalSurface.stableTitle("\u{25D3}\u{25D1} Running tests"), "Running tests")
+        XCTAssertEqual(TerminalSurface.stableTitle("\u{2733} Claude Code"), "Claude Code")
+        XCTAssertEqual(TerminalSurface.stableTitle("\u{2733}\u{FE0F} Claude Code"), "Claude Code")
+        XCTAssertEqual(TerminalSurface.stableTitle("\u{2802} Claude Code"), "Claude Code")
+        XCTAssertEqual(TerminalSurface.stableTitle("\u{280B} - Fix build - Distill"), "Fix build - Distill")
+        XCTAssertEqual(TerminalSurface.stableTitle("\u{2733}"), "", "a bare spinner has no stable title")
+        XCTAssertEqual(TerminalSurface.stableTitle("vim - notes.md"), "vim - notes.md")
+        XCTAssertEqual(TerminalSurface.stableTitle("build \u{25D0}"), "build \u{25D0}", "only a leading run is a spinner")
+    }
+
     /// WHY: Distill idle at its prompt repaints ~10x/s with escape-only frames
     /// (sync-update brackets, cursor moves, kitty graphics probe). Counting those as
     /// output kept the tab/sidebar spinner on with no active work.

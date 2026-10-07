@@ -36,7 +36,8 @@ for _ in {1..80}; do
 done
 
 grep -q '^ready$' "$OUT"
-test -f "$TMP_DIR/running.marker"
+MARKER="$TMP_DIR/running.$PID.marker"
+test -f "$MARKER"
 
 kill -TERM "$PID"
 set +e
@@ -53,8 +54,8 @@ if [[ "$STATUS" -ne 143 ]]; then
 fi
 
 grep -q 'signal=SIGTERM terminating' "$TMP_DIR/lifecycle.log"
-if [[ -e "$TMP_DIR/running.marker" ]]; then
-  echo "FAIL: running.marker survived SIGTERM handler" >&2
+if [[ -e "$MARKER" ]]; then
+  echo "FAIL: run marker survived SIGTERM handler" >&2
   exit 1
 fi
 

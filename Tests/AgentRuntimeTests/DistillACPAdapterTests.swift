@@ -952,6 +952,45 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                        [DistillACPAdapter.incompatibleHistoryNotice + DistillACPAdapter.handoffMissingNoticeSuffix])
     }
 
+    func test_failedTurnKeepsItsSessionWarm_retryRunsInTheSameProcess() async throws {
+        // WHY (S-F3 review): a TERM right after the turn skips Distill's session
+        // shutdown, which flushes the records `session/load` replays. Killing a
+        // failed turn's process made Retry reload a session that could miss the
+        // failed prompt and the tool calls it already ran. The failed session
+        // stays resident (listed as failed) so Retry runs warm; the idle reaper
+        // releases it once it has been idle past idleReleaseAge.
+        let root = try makeTempRoot("distill-acp-failed-warm")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+
+        let thread = AgentThreadID()
+        let failed = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            distillRequest(thread: thread, model: "claude/claude-opus-5-5", prompt: "FAIL_DATA", root: root)
+        ) { failed.append($0) }
+        let failedFinished = try await failed.waitForFinish()
+        XCTAssertEqual(failedFinished.status, .failed)
+        XCTAssertTrue(adapter.hasSession(threadId: thread),
+                      "a failed turn must not kill its process: Retry needs the warm session and its unflushed context")
+        XCTAssertEqual(adapter.listSessions().first { $0.threadId == thread }?.status, .failed,
+                       "the reaper finds the failed session by its adapter status and releases it after idle")
+
+        let retry = DistillACPAdapterEventBox()
+        _ = try await adapter.sendTurn(
+            distillRequest(thread: thread, model: "claude/claude-opus-5-5", prompt: "Retry request", root: root,
+                           providerThreadId: failedFinished.providerThreadId)
+        ) { retry.append($0) }
+        let retried = try await retry.waitForFinish()
+        XCTAssertEqual(retried.status, .completed)
+        XCTAssertEqual(retried.providerThreadId, failedFinished.providerThreadId)
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertFalse(requests.contains { $0["method"] as? String == "session/load" },
+                       "Retry must reuse the live process, not reload the session in a new one")
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/prompt" }.count, 2)
+    }
+
     func test_modelFamilyIsDerivedFromDistillClaudePrefix() {
         XCTAssertTrue(DistillACPAdapter.isCrossModelFamilySwitch(from: "muse-spark-1.3-contributor", to: "claude/claude-opus-5-5"))
         XCTAssertTrue(DistillACPAdapter.isCrossModelFamilySwitch(from: "claude/claude-opus-5-5", to: "gpt-6-luna"))

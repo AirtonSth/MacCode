@@ -1045,6 +1045,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         activeThreads[threadId] = runId
         lock.unlock()
     }
+
+    /// Test-only: a run's finish still in flight on `threadId` (the terminal
+    /// barrier the idle reaper must wait out), or cleared again.
+    public func setFinishingRunForTesting(threadId: AgentThreadID, runId: AgentRunID, finishing: Bool) {
+        lock.lock()
+        if finishing {
+            pendingStreamRunIds[threadId] = runId
+            finishingRuns.insert(runId)
+        } else {
+            pendingStreamRunIds.removeValue(forKey: threadId)
+            finishingRuns.remove(runId)
+        }
+        lock.unlock()
+    }
     #endif
 
     /// Records the semantic mode selected by the primary AI's Bot tool call.
@@ -2520,12 +2534,32 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// finished long ago, so routing the release through stopRun/markStopRequested
     /// broadcast a spurious `.cancelled` ("Thread cancelled" notification, status
     /// pill flip, queued-message drain) for a thread nobody stopped. No-op when the
-    /// thread still has an active run or no live session.
-    public func releaseProviderSession(threadId: AgentThreadID) {
+    /// thread still has an active run or no live session. `markCompleted: false`
+    /// keeps the durable session status (a failed, cancelled or interrupted row).
+    ///
+    /// The capped pass targets threads that finished seconds ago, so the release
+    /// also waits out a finish still in flight (pending, deferred or finishing
+    /// terminal, the ghost-reconcile barrier) and any in-memory ownership, then
+    /// holds the thread's start gate across `stopSession`: a start cannot begin
+    /// on the session being stopped. A start that loses that race fails like any
+    /// other start that overlaps a provider mutation, and is never killed mid-turn.
+    public func releaseProviderSession(threadId: AgentThreadID, markCompleted: Bool = true) {
         lock.lock()
-        let hasActiveRun = activeThreads[threadId] != nil
+        let streamOwner = pendingStreamRunIds[threadId]
+        let terminalBarrierPending = streamOwner.map {
+            pendingTerminalEvents[$0] != nil
+                || deferredProviderTerminalEvents[$0] != nil
+                || finishingRuns.contains($0)
+        } ?? false
+        // A surface that reserved a start is about to send on this session.
+        let startReserved = reservedProviderStarts.values.contains(threadId)
+        guard !terminalBarrierPending, !startReserved, !hasUnsafeInMemoryOwnershipLocked(threadId) else {
+            lock.unlock()
+            return
+        }
+        exclusiveThreadMutations.insert(threadId)
         lock.unlock()
-        guard !hasActiveRun else { return }
+        defer { endExclusiveThreadMutation(threadId) }
         guard let adapter = try? adapterForThread(threadId),
               adapter.hasSession(threadId: threadId) else { return }
         try? adapter.stopSession(threadId: threadId)
@@ -2534,7 +2568,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
         // Preserve resume eligibility: default `.cancelled` removes Continue (plan-final W2).
         // Completed is the honest session status when the turn already finished.
-        try? providerSessionRepo?.markStopped(threadId: threadId, status: .completed)
+        if markCompleted {
+            try? providerSessionRepo?.markStopped(threadId: threadId, status: .completed)
+        }
+    }
+
+    /// Every resident adapter session across providers, for the idle reaper.
+    public func liveProviderSessions() -> [AgentProviderSessionSummary] {
+        lock.lock()
+        let adapters = Array(providers.values)
+        lock.unlock()
+        return adapters.flatMap { $0.listSessions() }
+    }
+
+    /// Marking a session stopped in the DB does not free its provider process:
+    /// release every thread the reaper picked, keeping the statuses it says to keep.
+    public func releaseReapedProviderSessions(_ result: ProviderSessionReaperResult) {
+        for threadId in result.stoppedThreadIds + result.cappedThreadIds {
+            releaseProviderSession(
+                threadId: threadId,
+                markCompleted: !result.statusPreservedThreadIds.contains(threadId)
+            )
+        }
     }
 
     /// Retires process-local ownership only after a thread DELETE has committed.
@@ -4834,6 +4889,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         providerTurnScopes[threadId] = ProviderTurnScope(environment: request.environment)
         lock.unlock()
+        // A recovery spawned a process for this thread: count it as use, or the
+        // idle reaper releases an old row's fresh process on its next tick.
+        try? providerSessionRepo?.stampUsed(threadId: threadId)
     }
 
     private func recoveryEventRunId(

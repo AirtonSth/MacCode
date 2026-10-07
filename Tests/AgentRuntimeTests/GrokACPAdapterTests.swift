@@ -88,6 +88,8 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(finished.finalMessage, "**COMPLETE** residual note")
         XCTAssertTrue(box.hasWatchdogSynthesizedMarker,
                       "inferred terminals must carry a distinct runtime marker for forensics")
+        XCTAssertEqual(adapter.listSessions().first { $0.threadId == request.threadId }?.toolsMayStillRun, false,
+                       "no tool call was open, so nothing keeps the session from the idle reaper")
         // Late real prompt results must not double-emit (generation + turnTerminalEmitted).
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(box.finishedCount, 1,
@@ -144,6 +146,9 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(box.hasWatchdogSynthesizedMarker)
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(box.finishedCount, 1)
+        // The prompt never returned, so the open tool may still be running in
+        // this process tree: the idle reaper reads this to keep the session.
+        XCTAssertEqual(adapter.listSessions().first { $0.threadId == request.threadId }?.toolsMayStillRun, true)
     }
 
     /// WHY: crash 2026-08-06 — fire→emit→refresh re-entered fire mid-synthesis
