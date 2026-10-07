@@ -8987,6 +8987,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             runThreads[runId] = nil
             if preparingRunGeneration[tid] == acceptedGeneration
                 || preparingRunGeneration[tid] == nil {
+                if !wasCancelled {
+                    failSurfacePendingStampIfUnowned(threadId: tid, runId: runId)
+                }
                 await MainActor.run {
                     if self.selectedThreadId == tid {
                         if wasCancelled {
@@ -9010,6 +9013,33 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             coordinator.releaseProviderStartReservation(threadId: tid, runId: runId)
             return nil
+        }
+    }
+
+    /// `coordinator.startRun` can refuse before it writes its own run row
+    /// (admission, fork recovery, a busy thread, a missing binary...). The
+    /// surface's `pending` stamp then has no owner that will ever finish it,
+    /// so stamp `failed` here, unless another start or live run owns the row.
+    private func failSurfacePendingStampIfUnowned(threadId tid: AgentThreadID, runId: AgentRunID) {
+        guard (try? threadRepo.status(of: tid)) == .pending,
+              (try? coordinator.runStatus(runId)) == nil,
+              coordinator.activeRunId(threadId: tid) == nil,
+              !coordinator.hasPendingProviderStart(threadId: tid),
+              !coordinator.hasProviderSession(threadId: tid) else { return }
+        let failedAt = Date()
+        let paintedUnread = threads.first(where: { $0.id == tid })?.hasUnread ?? false
+        guard (try? threadRepo.updateStatus(
+            id: tid,
+            status: .failed,
+            hasUnread: paintedUnread,
+            at: failedAt
+        )) != nil else { return }
+        onThreadChromeWritten?(AgentThreadChromeWrite(
+            threadID: tid, status: .failed, hasUnread: paintedUnread, updatedAt: failedAt
+        ))
+        if let index = threads.firstIndex(where: { $0.id == tid }) {
+            threads[index].status = .failed
+            threads[index].updatedAt = failedAt
         }
     }
 

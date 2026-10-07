@@ -125,6 +125,122 @@ final class AgentThreadChromeEventTests: XCTestCase {
         ), "no commit means no event")
     }
 
+    func test_restoreBeforeTheEventLogIsWired_holdsThenPersistsOneEventAboveTheDurableHead() async throws {
+        // App launch builds the authority (via `context.router`) before the
+        // event log is wired and reloaded. An event published then gets a seq
+        // the reload discards, is never persisted, and reaches no client.
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
+        )
+        let durableHead: Int64 = 40
+        try ctx.eventLog.append(seq: durableHead, kind: "test.seed", payloadJSON: "{}")
+        let origin = try seedOriginThread(ctx.threadRepo)
+        seedRestoredPeerHandoffs(originThreadID: origin.id, count: 2)
+        let bus = EventBus()
+        let delivered = DeliveredEvents()
+        _ = bus.subscribeFromCurrent(filter: .agentThreadAndQueue) { delivered.append($0) }
+
+        let authority = makeAuthority(
+            Repos(db: ctx.db, threadRepo: ctx.threadRepo),
+            eventBus: bus,
+            holdsThreadChromeUntilEventLogReady: true
+        )
+        defer { withExtendedLifetime(authority) {} }
+        XCTAssertEqual(try ctx.threadRepo.status(of: origin.id), .failed, "fixture: restore committed chrome")
+        XCTAssertTrue(delivered.events.isEmpty, "nothing may publish before the event log is ready")
+        XCTAssertEqual(bus.currentSeq, 0)
+
+        // Same order as AppDelegate: wire, reload to the durable head, flush.
+        AppDelegate.wireEventPersistence(context: ctx, eventBus: bus)
+        bus.reloadFromPersistence(lastSeq: try ctx.eventLog.lastSeq(), recent: [])
+        authority.publishRestoredThreadChrome()
+        authority.publishRestoredThreadChrome()
+
+        let events = delivered.events.filter { $0.payload.objectValue?["thread_id"]?.stringValue == origin.id.value.uuidString }
+        XCTAssertEqual(events.count, 1, "one event per restored thread, and a second flush publishes nothing")
+        let event = try XCTUnwrap(events.first)
+        XCTAssertGreaterThan(event.seq, durableHead, "the restored event must sort after the durable head")
+        XCTAssertGreaterThanOrEqual(bus.snapshotMetadata().domainRevisions.agentThreads, event.seq)
+
+        let deadline = Date().addingTimeInterval(5)
+        var persisted: [EventLogRepository.Row] = []
+        while Date() < deadline {
+            persisted = try ctx.eventLog.read(since: durableHead).filter {
+                $0.kind == RemoteCodeEventKind.agentThreadUpdated.rawValue
+            }
+            if !persisted.isEmpty { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(persisted.map(\.seq), [event.seq], "the restored event must reach the event log for C8 replay")
+    }
+
+    func test_newRunCursorAfterRunStarted_publishesOneCursorEventWithTheStoredUpdatedAt() throws {
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
+        )
+        let origin = try seedOriginThread(ctx.threadRepo)
+        let runID = AgentRunID()
+        startCapturing(filter: .kindPrefixes(["agent.thread.", "agent.run."]))
+
+        ctx.coordinator.onRunStarted?(origin.id, runID)
+        // The coordinator commits the cursor before it forwards `.threadStarted`.
+        let cursorAt = Date(timeIntervalSince1970: 5_000)
+        try ctx.threadRepo.updateProviderThreadId(id: origin.id, providerThreadId: "cursor-1", at: cursorAt)
+        ctx.coordinator.onAssistantEvent?(
+            .threadStarted(threadId: "cursor-1", providerThreadId: nil), origin.id, runID
+        )
+
+        XCTAssertEqual(runStartedEvents(for: origin.id).count, 1, "run.started stays deduplicated")
+        let events = threadUpdatedEvents(for: origin.id)
+        XCTAssertEqual(events.count, 1, "the cursor commit after run.started must be mirrored once")
+        let payload = try XCTUnwrap(events.first?.payload.objectValue)
+        XCTAssertEqual(payload["provider_thread_id"]?.stringValue, "cursor-1")
+        XCTAssertNil(payload["status"], "a cursor write must not claim a status")
+        XCTAssertEqual(
+            parseISO(payload["updated_at"]?.stringValue)?.timeIntervalSince1970 ?? 0,
+            cursorAt.timeIntervalSince1970,
+            accuracy: 0
+        )
+    }
+
+    func test_resumeOnlyThreadStarted_publishesRunStartedAndNoChromeEvent() throws {
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
+        )
+        let origin = try seedOriginThread(ctx.threadRepo)
+        let runID = AgentRunID()
+        startCapturing(filter: .kindPrefixes(["agent.thread.", "agent.run."]))
+
+        try ctx.threadRepo.updateProviderThreadId(id: origin.id, providerThreadId: "resumed", at: Date())
+        ctx.coordinator.onAssistantEvent?(
+            .threadStarted(threadId: "resumed", providerThreadId: nil), origin.id, runID
+        )
+
+        XCTAssertEqual(runStartedEvents(for: origin.id).count, 1, "resume paths only emit .threadStarted")
+        XCTAssertTrue(threadUpdatedEvents(for: origin.id).isEmpty, "run.started already covers this commit")
+    }
+
+    func test_cursorThatDidNotLand_publishesNoChromeEvent() throws {
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
+        )
+        let origin = try seedOriginThread(ctx.threadRepo)
+        let runID = AgentRunID()
+        startCapturing(filter: .kindPrefixes(["agent.thread.", "agent.run."]))
+
+        ctx.coordinator.onRunStarted?(origin.id, runID)
+        // No cursor write: the coordinator's update failed.
+        ctx.coordinator.onAssistantEvent?(
+            .threadStarted(threadId: "never-stored", providerThreadId: nil), origin.id, runID
+        )
+
+        XCTAssertTrue(threadUpdatedEvents(for: origin.id).isEmpty)
+    }
+
     // MARK: - Fixtures
 
     private struct Repos {
@@ -137,7 +253,11 @@ final class AgentThreadChromeEventTests: XCTestCase {
         return Repos(db: db, threadRepo: AgentThreadRepository(db: db))
     }
 
-    private func makeAuthority(_ repos: Repos) -> BotPeerHandoffAuthority {
+    private func makeAuthority(
+        _ repos: Repos,
+        eventBus: EventBus = .shared,
+        holdsThreadChromeUntilEventLogReady: Bool = false
+    ) -> BotPeerHandoffAuthority {
         let runRepo = AgentRunRepository(db: repos.db)
         let messageRepo = AgentMessageRepository(db: repos.db)
         let checkpointRepo = AgentTurnCheckpointRepository(db: repos.db)
@@ -156,7 +276,9 @@ final class AgentThreadChromeEventTests: XCTestCase {
                 checkpointRepo: checkpointRepo,
                 providers: [:]
             ),
-            appSupportDirectory: root
+            appSupportDirectory: root,
+            eventBus: eventBus,
+            holdsThreadChromeUntilEventLogReady: holdsThreadChromeUntilEventLogReady
         )
     }
 
@@ -213,8 +335,8 @@ final class AgentThreadChromeEventTests: XCTestCase {
         UserDefaults.standard.set(try? JSONEncoder().encode(rows), forKey: "bots.peerTurns.v2")
     }
 
-    private func startCapturing() {
-        subscription = EventBus.shared.subscribeFromCurrent(filter: .agentThreadAndQueue) { [weak self] event in
+    private func startCapturing(filter: EventStreamFilter = .agentThreadAndQueue) {
+        subscription = EventBus.shared.subscribeFromCurrent(filter: filter) { [weak self] event in
             guard let self else { return }
             self.lock.lock()
             self.captured.append(event)
@@ -231,10 +353,26 @@ final class AgentThreadChromeEventTests: XCTestCase {
         }
     }
 
+    private func runStartedEvents(for threadID: AgentThreadID) -> [EventBus.Event] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captured.filter {
+            $0.kind == RemoteCodeEventKind.agentRunStarted.rawValue
+                && $0.payload.objectValue?["thread_id"]?.stringValue == threadID.value.uuidString.lowercased()
+        }
+    }
+
     private func parseISO(_ raw: String?) -> Date? {
         guard let raw else { return nil }
         return ISO8601DateFormatter().date(from: raw)
     }
+}
+
+private final class DeliveredEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [EventBus.Event] = []
+    var events: [EventBus.Event] { lock.withLock { storage } }
+    func append(_ event: EventBus.Event) { lock.withLock { storage.append(event) } }
 }
 
 private struct RouteFixture: Codable {

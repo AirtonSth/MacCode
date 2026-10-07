@@ -178,6 +178,10 @@ public final class AppContext {
     public var state = LayoutState()
 
     public let coordinator: AgentRunCoordinator
+    /// Set by the app host before anything builds `botPeerHandoffAuthority`
+    /// when the event log is wired later; the host then calls
+    /// `publishRestoredThreadChrome()` once it is.
+    var holdsBotPeerThreadChromeUntilEventLogReady = false
     lazy var botPeerHandoffAuthority = BotPeerHandoffAuthority(
         botStore: botStore,
         threadRepo: threadRepo,
@@ -188,7 +192,8 @@ public final class AppContext {
         settingsRepo: settingsRepo,
         coordinator: coordinator,
         appSupportDirectory: appSupportDirectory,
-        orchestrationRuntime: orchestrationRuntime
+        orchestrationRuntime: orchestrationRuntime,
+        holdsThreadChromeUntilEventLogReady: holdsBotPeerThreadChromeUntilEventLogReady
     )
     lazy var botDraftPersistenceAuthority = BotDraftPersistenceAuthority()
     public var router: AppCommandRouter! {

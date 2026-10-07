@@ -245,6 +245,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // PERF (cold launch): the orphan provider sweep is a process scan and
         // the event-log decode + PTY restore are heavy. StartupPlan defers them
         // past the first frame; see runDeferredStartup().
+        // `context.router` builds the bot peer authority, whose restore
+        // reconcile commits thread chrome before the event log is wired below.
+        context.holdsBotPeerThreadChromeUntilEventLogReady = true
         router = AppCommandRouter(context: context)
         context.router = router
         context.distillAccountsController.ensureDistillInstalled()
@@ -264,6 +267,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         } catch {
             appLifecycleLog.error("event_log.sequence_init_failed error=\(error.localizedDescription, privacy: .public)")
         }
+        // The bus is wired and past the durable head: restored chrome now gets
+        // a persisted seq that counts toward agentThreads and C8 replay.
+        context.botPeerHandoffAuthority.publishRestoredThreadChrome()
         updater = SparkleAppUpdater.defaultIfConfigured()
         updater?.onWillInstallUpdate = { [weak self] in
             self?.persistRestorableStateBeforeUpdate()
