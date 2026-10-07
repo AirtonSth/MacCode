@@ -3235,7 +3235,7 @@ public final class AppContext {
                         existing: existing
                     ).filter { acceptsGrok || $0 != .grok }
                     for provider in toClear {
-                        self.clearTokenSaverAccountUsagePercentages(provider)
+                        self.clearTokenSaverAccountUsagePercentages(provider, reason: reason)
                     }
                 }
                 self.publishTokenSaverAccountUsageRefresh(
@@ -3294,20 +3294,27 @@ public final class AppContext {
             managed: [.grok]
         ).contains(.grok)
         if shouldClearGrok {
-            clearTokenSaverAccountUsagePercentages(.grok)
+            clearTokenSaverAccountUsagePercentages(.grok, reason: "periodic")
         }
         cycle.reconciledMiss = true
         tokenSaverPeriodicAccountUsageCycle = cycle
         return shouldClearGrok
     }
 
-    private func clearTokenSaverAccountUsagePercentages(_ provider: AgentProvider) {
+    private func clearTokenSaverAccountUsagePercentages(_ provider: AgentProvider, reason: String) {
         do {
-            _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory)
+            let snapshot = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory)
                 .clearAccountUsagePercentages(provider: provider)
             // Same non-blocking path as recordTokenSaverAccountUsage — account-
             // usage store mutations must not wait on NotificationCenter observers.
             scheduleTokenSaverUsageChangedNotification()
+            // Paired devices fold live `agent.account.usage` events on top of
+            // `agent.account.usage.get`; without this event the iPhone kept the
+            // pre-clear percent while the Mac sidebar showed 0%.
+            if let row = snapshot.providers.first(where: { $0.provider == provider }) {
+                EventBus.shared.publish(kind: .agentAccountUsage,
+                    payload: .object(Self.accountUsagePayload(reason: reason, usage: Self.clearedAccountUsage(row))))
+            }
         } catch {
             NSLog("RemoteCode Token Saver account usage clear failed (\(provider.rawValue)): \(error)")
         }
@@ -3522,6 +3529,24 @@ public final class AppContext {
         if let threadId { p["thread_id"] = .string(threadId) }
         if let reason   { p["reason"]    = .string(reason)   }
         return p
+    }
+
+    /// The live-event shape of a provider row as stored after
+    /// `clearAccountUsagePercentages`. Both percents go out as numbers (0):
+    /// clients fold events like the store does (null keeps the old value), so
+    /// a null session percent would leave a stale session ring on the phone.
+    nonisolated static func clearedAccountUsage(_ row: TokenSaverProviderUsage) -> AssistantAccountUsage {
+        func milliseconds(_ date: Date?) -> Int64? {
+            date.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) }
+        }
+        return AssistantAccountUsage(
+            provider: row.provider,
+            weeklyUsedPercent: row.weeklyUsedPercent ?? 0,
+            weeklyWindowDurationMinutes: row.weeklyWindowDurationMinutes,
+            weeklyResetsAtMs: milliseconds(row.weeklyResetsAt),
+            currentSessionUsedPercent: row.currentSessionUsedPercent ?? 0,
+            currentSessionResetsAtMs: milliseconds(row.currentSessionResetsAt)
+        )
     }
 
     /// Pure builder for the `agent.account.usage.refresh` event payload.

@@ -131,6 +131,7 @@ final class AgentAccountUsageGetTests: XCTestCase {
             jsonrpc: "2.0", id: .number(1), method: "agent.account.usage.get", params: nil
         ))
         XCTAssertNil(response.result)
-        XCTAssertNotNil(response.error)
+        XCTAssertEqual(response.error?.code, -32004, "JSONRPCError.notSupported, not method-not-found")
+        XCTAssertEqual(response.error?.data, .string("agent.account.usage.get"))
     }
 }
