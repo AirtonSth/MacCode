@@ -1853,14 +1853,19 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       allowRead.signal()
       database.beforeStatementStepForTesting = nil
       surface.closeAndDeletePersistedHistory()
-      let cleanupBarrier = TerminalHistoryCoordinator.pendingFinalDeleteBarrier()
-      XCTAssertNotNil(
-        cleanupBarrier,
-        "close must publish durable final-delete ownership before returning"
-      )
-      XCTAssertTrue(
-        cleanupBarrier?.wait(until: .now() + 2) ?? false,
-        "fixture cleanup must quiesce replay-overflow persistence before removing its database"
+      // Close registers the final delete synchronously, but the delete can
+      // finish and drain the registry before this line runs. A nil barrier
+      // then means "already done", so prove completion by the deleted rows.
+      if let cleanupBarrier = TerminalHistoryCoordinator.pendingFinalDeleteBarrier() {
+        XCTAssertTrue(
+          cleanupBarrier.wait(until: .now() + 2),
+          "fixture cleanup must quiesce replay-overflow persistence before removing its database"
+        )
+      }
+      XCTAssertEqual(
+        try? repository.totalBytes(surfaceID: surfaceID.value.uuidString),
+        0,
+        "close must run its final delete before the fixture removes the database"
       )
       XCTAssertNil(
         TerminalHistoryCoordinator.pendingFinalDeleteBarrier(),
