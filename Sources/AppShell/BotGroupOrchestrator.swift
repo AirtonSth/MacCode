@@ -318,6 +318,12 @@ final class BotGroupOrchestrator: AgentRunObserver {
         guard try activeParticipantBots(groupID: groupID).contains(where: { $0.id == turn.botID }) else {
             throw SendError.rejected("That bot is no longer in this group.")
         }
+        // The turn keeps its place, so it would run ahead of a newer
+        // message's turns and answer out of order.
+        let unsettled = try botStore.listGroupTurns(groupID: groupID, states: BotGroupTurn.State.pending + [.running])
+        guard !unsettled.contains(where: { $0.roundID != turn.roundID && $0.ordinal > turn.ordinal }) else {
+            throw SendError.rejected("Bots are still answering a newer message. Retry when they finish.")
+        }
         guard let moved = move(
             turn,
             from: [.failed, .interrupted],

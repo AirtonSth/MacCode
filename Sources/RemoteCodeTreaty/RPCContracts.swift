@@ -31,6 +31,13 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case commandOutcomeUnknown
         case commandInProgress
         case authenticatedHostMismatch
+        /// `bot.team.*` / `bot.group.*`: the team, group or turn is gone
+        /// (code -32044 with `data.domain == "bot_group"`; not a deleted bot).
+        case botGroupNotFound
+        /// `bot.team.*` / `bot.group.*`: `expected_revision` is stale; re-read.
+        case botGroupRevisionConflict
+        /// `bot.team.*` / `bot.group.*`: this host cannot run groups right now.
+        case botGroupRuntimeUnavailable
         case unknown(Int)
     }
 
@@ -45,6 +52,16 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
     }
 
     public var kind: Kind {
+        // Team and group refusals reuse some bot codes; their `data` tells
+        // them apart, so a bot handler never drops a bot for a missing group.
+        if case .object(let data)? = data, data["domain"] == .string("bot_group") {
+            switch data["kind"] {
+            case .string("not_found"): return .botGroupNotFound
+            case .string("revision_conflict"): return .botGroupRevisionConflict
+            case .string("runtime_unavailable"): return .botGroupRuntimeUnavailable
+            default: break
+            }
+        }
         switch code {
         case -32700: return .parseError
         case -32600: return .invalidRequest

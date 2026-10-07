@@ -3321,7 +3321,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
         if BotTeamGroupService.handles(method) {
             guard let ctx = context, ctx.hostsBotGroupConversations else {
-                throw JSONRPCError(code: -32091, message: "Bot runtime is unavailable.")
+                // Nothing changed: a definite refusal, told apart from a
+                // receipt failure by its data.
+                throw DefiniteMutationRejection(JSONRPCError(
+                    code: -32091,
+                    message: "Bot runtime is unavailable.",
+                    data: .object(["domain": .string("bot_group"), "kind": .string("runtime_unavailable")])
+                ))
             }
             return try await ctx.botTeamGroupService.dispatchRemote(method: method, params: params)
         }

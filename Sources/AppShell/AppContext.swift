@@ -435,7 +435,11 @@ public final class AppContext {
         appSupportDirectory: appSupportDirectory
     )
     /// Teams and groups for the Mac UI and paired devices (one event source).
-    lazy var botTeamGroupService = BotTeamGroupService(botStore: botStore, orchestrator: botGroupOrchestrator)
+    lazy var botTeamGroupService = BotTeamGroupService(
+        botStore: botStore,
+        orchestrator: botGroupOrchestrator,
+        isControlPlaneActive: { [db] in SettingsStore(db: db).load().isBotControlPlaneActive }
+    )
     private var tokenSaverCodexAdapter: CodexAppServerAdapter
     /// False for a background helper sharing this SQLite (Scheduled Task
     /// Agent): it never owns group conversation turns, so it never

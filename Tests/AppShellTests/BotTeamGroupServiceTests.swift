@@ -126,8 +126,11 @@ final class BotTeamGroupServiceTests: XCTestCase {
         return try decode(BotGroupCreate.Result.self, try await rpc(f, "bot.group.create", params)).readback.group
     }
 
-    private func groupAttentionItems(_ f: Fixture) async throws -> [[String: JSONValue]] {
-        let listed = try await f.router.dispatchPairedBotRemote(method: "bot.attention.list", params: [:])
+    private func groupAttentionItems(_ f: Fixture, optIn: Bool = true) async throws -> [[String: JSONValue]] {
+        let params: [String: JSONValue] = optIn
+            ? ["include_kinds": .array([.string("group")]), "host_id": .string("host-groups")]
+            : ["host_id": .string("host-groups")]
+        let listed = try await f.router.dispatchPairedBotRemote(method: "bot.attention.list", params: params)
         return (listed.objectValue?["items"]?.arrayValue ?? [])
             .compactMap(\.objectValue)
             .filter { $0["kind"]?.stringValue == "group" }
@@ -476,5 +479,244 @@ final class BotTeamGroupServiceTests: XCTestCase {
         ])
         XCTAssertEqual(badPolicy?.code, -32602)
         XCTAssertEqual(try f.ctx.botStore.group(id: BotGroupID(UUID(uuidString: group.id)!))?.revision, unlinked.revision)
+    }
+
+    // MARK: - Review fixes (T4)
+
+    /// WHY: the Bots "Control plane" switch is the user's off switch for
+    /// creating and messaging teammates. With it off, a paired device must not
+    /// make bots answer through a group, nor create or edit teams and groups.
+    func test_controlPlaneOffRefusesGroupAndTeamChangesAndRunsNothing() async throws {
+        let f = try makeFixture()
+        let group = try await createGroup(f, bots: [f.ana])
+        let groupID = BotGroupID(UUID(uuidString: group.id)!)
+        let room = AgentThreadID(UUID(uuidString: group.roomThreadID)!)
+        SettingsStore(db: f.ctx.db).update { $0.botsControlPlaneEnabled = false }
+
+        let send = await refusal(f, "bot.group.send", [
+            "group_id": .string(group.id), "text": .string("Go"), "submit_key": .string("k1"),
+        ])
+        XCTAssertEqual(send?.code, -32081)
+        XCTAssertEqual(RemoteCodeError(code: send?.code ?? 0, message: "", data: nil).kind, .botControlPlaneOff)
+        let create = await refusal(f, "bot.group.create", [
+            "title": .string("Second"), "participant_bot_ids": .array([key(f.ana.id.value)]),
+        ])
+        XCTAssertEqual(create?.code, -32081)
+        let team = await refusal(f, "bot.team.create", ["name": .string("Writers")])
+        XCTAssertEqual(team?.code, -32081)
+        let edit = await refusal(f, "bot.group.update", [
+            "group_id": .string(group.id), "expected_revision": .number(Double(group.revision)),
+            "title": .string("Renamed"),
+        ])
+        XCTAssertEqual(edit?.code, -32081)
+
+        XCTAssertTrue(try f.ctx.messageRepo.list(threadId: room).isEmpty, "no user row, no waiting rows")
+        XCTAssertTrue(try f.ctx.botStore.listGroupTurns(groupID: groupID).isEmpty)
+        XCTAssertEqual(try f.ctx.botStore.listGroups(includeHidden: true).count, 1)
+        XCTAssertTrue(try f.ctx.botStore.listTeams().isEmpty)
+        XCTAssertEqual(try f.ctx.botStore.group(id: groupID)?.title, "Launch room")
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(f.runner.requests.isEmpty, "no bot ran")
+
+        // Quieting and cleaning up stay possible with the switch off.
+        _ = try await rpc(f, "bot.group.select", ["group_id": .string(group.id)])
+        _ = try await rpc(f, "bot.group.stop", ["group_id": .string(group.id)])
+    }
+
+    /// WHY: an iPhone that does not know groups would show a group item as
+    /// the bot's own attention and could never clear it (`bot.attention.ack`
+    /// is per bot). Group items are opt-in, and they carry the host like the
+    /// other items so a multi-host client files them under the right Mac.
+    func test_groupAttentionItemsAreOptInAndCarryTheHost() async throws {
+        let f = try makeFixture()
+        let group = try await createGroup(f, bots: [f.ana])
+        _ = try await rpc(f, "bot.group.send", [
+            "group_id": .string(group.id), "text": .string("Hi"), "submit_key": .string("k1"),
+        ])
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        f.runner.finish(runID: f.runner.requests[0].runId, status: .completed, reply: "Hello.")
+        let groupID = BotGroupID(UUID(uuidString: group.id)!)
+        let answered = await waitUntil {
+            (try? f.ctx.botStore.listGroupTurns(groupID: groupID).first?.state) == .completed
+        }
+        XCTAssertTrue(answered)
+        f.service.flushAttention()
+        XCTAssertEqual(try f.ctx.botStore.group(id: groupID)?.attentionState, .unreadActivity)
+
+        let legacy = try await groupAttentionItems(f, optIn: false)
+        XCTAssertTrue(legacy.isEmpty, "a client without groups never sees a group item")
+        let items = try await groupAttentionItems(f)
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items.first?["host_id"]?.stringValue, "host-groups")
+        XCTAssertEqual(items.first?["group_id"]?.stringValue, group.id)
+    }
+
+    /// WHY: iOS applies `bot.group.turn.updated` in event order. A remote
+    /// send's own turn events are committed with its receipt; the run that
+    /// starts afterwards must never be sequenced before them, or the phone
+    /// would show a running turn going back to "planned".
+    func test_remoteSendTurnEventsAreSequencedBeforeTheRunTheyStart() async throws {
+        let f = try makeFixture()
+        let group = try await createGroup(f, bots: [f.ana, f.bob])
+        let lock = NSLock()
+        var turnEvents: [(seq: Int64, turnID: String, state: String)] = []
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "bot.group.turn.updated", let object = event.payload.objectValue,
+                  let turnID = object["turn_id"]?.stringValue, let state = object["state"]?.stringValue else { return }
+            lock.withLock { turnEvents.append((event.seq, turnID, state)) }
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+        let dispatcher = JSONRPCDispatcher(router: f.router)
+        let context = MutationRequestContext(ownerFingerprint: "owner-order", hostId: "host-order", bootEpoch: 1)
+        let response = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "bot.group.send",
+            params: [
+                "client_request_id": .string("send-order"), "connection_id": .string("conn"),
+                "expected_host_id": .string("host-order"), "expected_boot_epoch": .number(1),
+                "group_id": .string(group.id), "text": .string("Go"), "submit_key": .string("k1"),
+            ]
+        ), mutationContext: context)
+        XCTAssertNil(response.error)
+        let sent = try decode(BotGroupSend.Result.self, try XCTUnwrap(response.result)).readback
+        let first = sent.turns[0].turnID
+
+        let running = await waitUntil {
+            lock.withLock { turnEvents.contains { $0.turnID == first && $0.state == "running" } }
+        }
+        XCTAssertTrue(running)
+        let events = lock.withLock { turnEvents }.sorted { $0.seq < $1.seq }
+        let plannedSeqs = events.filter { $0.state == "planned" }.map(\.seq)
+        XCTAssertEqual(Set(events.filter { $0.state == "planned" }.map(\.turnID)), Set(sent.turns.map(\.turnID)),
+                       "the receipt's turn events were published")
+        let runningSeq = try XCTUnwrap(events.first { $0.turnID == first && $0.state == "running" }?.seq)
+        XCTAssertTrue(plannedSeqs.allSatisfy { $0 < runningSeq }, "planned before running, in seq order: \(events)")
+        f.runner.finish(runID: f.runner.requests[0].runId, status: .completed, reply: "Done.")
+    }
+
+    /// WHY: a retried turn keeps its place in the group's order. Retrying a
+    /// turn of an older message while a newer message is still being answered
+    /// would make that bot answer ahead of the newer turns (out of order), so
+    /// it is refused until the newer message settles, and then it runs.
+    func test_retryOfAnOlderRoundIsRefusedWhileANewerMessageIsAnswered() async throws {
+        let f = try makeFixture()
+        let group = try await createGroup(f, bots: [f.ana])
+        let groupID = BotGroupID(UUID(uuidString: group.id)!)
+        let first = try decode(BotGroupSend.Result.self, try await rpc(f, "bot.group.send", [
+            "group_id": .string(group.id), "text": .string("Draft A"), "submit_key": .string("k1"),
+        ])).readback
+        let oldTurn = BotGroupTurnID(UUID(uuidString: first.turns[0].turnID)!)
+        let startedA = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(startedA)
+        f.runner.finish(runID: f.runner.requests[0].runId, status: .failed, reply: nil)
+        let failed = await waitUntil { (try? f.ctx.botStore.groupTurn(id: oldTurn)?.state) == .failed }
+        XCTAssertTrue(failed)
+
+        _ = try await rpc(f, "bot.group.send", [
+            "group_id": .string(group.id), "text": .string("Draft B"), "submit_key": .string("k2"),
+        ])
+        let startedB = await waitUntil { f.runner.requests.count == 2 }
+        XCTAssertTrue(startedB)
+
+        let refused = await refusal(f, "bot.group.retry_turn", [
+            "group_id": .string(group.id), "turn_id": .string(first.turns[0].turnID),
+        ])
+        XCTAssertEqual(refused?.code, -32602)
+        XCTAssertEqual(refused?.message, "Bots are still answering a newer message. Retry when they finish.")
+        XCTAssertEqual(try f.ctx.botStore.groupTurn(id: oldTurn)?.state, .failed, "the refused retry changed nothing")
+
+        f.runner.finish(runID: f.runner.requests[1].runId, status: .completed, reply: "B done.")
+        let settledB = await waitUntil {
+            (try? f.ctx.botStore.listGroupTurns(groupID: groupID, states: BotGroupTurn.State.pending + [.running]))?.isEmpty == true
+        }
+        XCTAssertTrue(settledB)
+        let retried = try decode(BotGroupRetryTurn.Result.self, try await rpc(f, "bot.group.retry_turn", [
+            "group_id": .string(group.id), "turn_id": .string(first.turns[0].turnID),
+        ]))
+        XCTAssertEqual(retried.readback.turn.state, "planned")
+        let again = await waitUntil { f.runner.requests.count == 3 }
+        XCTAssertTrue(again, "once the newer message settled, the retry runs")
+        f.runner.finish(runID: f.runner.requests[2].runId, status: .completed, reply: "A done.")
+    }
+
+    /// WHY: deleting a group must never leave its room or private threads
+    /// behind as ordinary, unlinked Agent threads. The group stops first; if
+    /// its threads cannot be deleted (a run will not stop), the delete fails
+    /// and the group stays whole so the user can try again, and the next
+    /// delete removes everything.
+    func test_deleteGroupStopsFirstAndKeepsTheGroupWholeWhenItsThreadsCannotGo() async throws {
+        let f = try makeFixture()
+        let group = try await createGroup(f, bots: [f.ana])
+        let groupID = BotGroupID(UUID(uuidString: group.id)!)
+        let room = AgentThreadID(UUID(uuidString: group.roomThreadID)!)
+        let sent = try decode(BotGroupSend.Result.self, try await rpc(f, "bot.group.send", [
+            "group_id": .string(group.id), "text": .string("Hi"), "submit_key": .string("k1"),
+        ])).readback
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let memberThread = f.runner.requests[0].threadId
+        struct StopRefused: Error {}
+        var attempted: [AgentThreadID] = []
+        f.service.deleteThreadsOverride = { threads in
+            attempted = threads
+            throw StopRefused()
+        }
+
+        do {
+            try await f.service.deleteGroup(id: groupID)
+            XCTFail("a thread delete that fails must fail the group delete")
+        } catch {}
+        XCTAssertEqual(Set(attempted), [room, memberThread], "the room and the private thread")
+        let turn = try XCTUnwrap(try f.ctx.botStore.groupTurn(id: BotGroupTurnID(UUID(uuidString: sent.turns[0].turnID)!)))
+        XCTAssertEqual(turn.state, .cancelled, "the group was stopped before its threads went")
+        XCTAssertNotNil(try f.ctx.botStore.group(id: groupID), "the group stays")
+        XCTAssertNotNil(try f.ctx.threadRepo.get(id: room))
+        XCTAssertNotNil(try f.ctx.threadRepo.get(id: memberThread))
+        XCTAssertEqual(try f.ctx.botStore.listGroupMemberConversations(groupID: groupID).count, 1,
+                       "its private thread is still linked to the group")
+
+        f.service.deleteThreadsOverride = nil
+        try await f.service.deleteGroup(id: groupID)
+        XCTAssertNil(try f.ctx.botStore.group(id: groupID))
+        XCTAssertNil(try f.ctx.threadRepo.get(id: room))
+        XCTAssertNil(try f.ctx.threadRepo.get(id: memberThread))
+    }
+
+    /// WHY: the iPhone decodes the host's real event payloads with the
+    /// treaty types; a shape the host publishes but the treaty cannot read
+    /// would silently drop the change on the phone.
+    func test_publishedTeamGroupAndTurnEventsDecodeWithTheTreatyTypes() async throws {
+        let f = try makeFixture()
+        let (log, subscription) = recordEvents()
+        defer { EventBus.shared.unsubscribe(subscription) }
+        let first = try f.service.createTeam(name: "Writers", memberBotIDs: [f.ana.id])
+        let second = try f.service.createTeam(name: "Critics", memberBotIDs: [f.bob.id])
+        try f.service.reorderTeams([second.id, first.id])
+        try f.service.deleteTeam(id: first.id)
+        let group = try await createGroup(f, bots: [f.ana])
+        _ = try await rpc(f, "bot.group.send", [
+            "group_id": .string(group.id), "text": .string("Hi"), "submit_key": .string("k1"),
+        ])
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        f.runner.finish(runID: f.runner.requests[0].runId, status: .completed, reply: "Hello.")
+        let answered = await waitUntil { log.payloads("bot.group.turn.updated").contains { $0["state"]?.stringValue == "completed" } }
+        XCTAssertTrue(answered)
+        try await f.service.deleteGroup(id: BotGroupID(UUID(uuidString: group.id)!))
+        f.service.botWasDeleted(f.bob.id, cancelledTurnIDs: [])
+        let settled = await waitUntil {
+            log.payloads("bot.group.updated").contains { $0["change"]?.stringValue == "bot_deleted" }
+        }
+        XCTAssertTrue(settled)
+
+        let teams = try log.payloads("bot.team.updated").map { try decode(BotTeamUpdatedEvent.self, .object($0)) }
+        XCTAssertEqual(teams.map(\.change.rawValue), ["created", "created", "reordered", "deleted", "bot_deleted"])
+        XCTAssertEqual(teams[2].teamIDs, [second.id.value.uuidString.lowercased()] + [first.id.value.uuidString.lowercased()])
+        let groups = try log.payloads("bot.group.updated").map { try decode(BotGroupUpdatedEvent.self, .object($0)) }
+        XCTAssertEqual(groups.first?.group?.id, group.id)
+        XCTAssertTrue(groups.contains { $0.change == .deleted && $0.group == nil })
+        XCTAssertFalse(groups.contains { if case .unknown = $0.change { return true } else { return false } })
+        let turns = try log.payloads("bot.group.turn.updated").map { try decode(BotGroupTurnRow.self, .object($0)) }
+        XCTAssertEqual(Set(turns.map(\.state)), ["planned", "running", "completed"])
     }
 }

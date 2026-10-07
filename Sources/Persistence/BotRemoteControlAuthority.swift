@@ -219,7 +219,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "attention.list":
             try synchronizeDurableNeedsAttention()
             try synchronizeDelegatedAttention()
-            return ["items": attention.values.map { canonicalAttentionItem($0) } + groupAttentionItems()]
+            // Group items are opt-in (`include_kinds: ["group"]`): a client
+            // without groups would show one as the bot's own attention and
+            // could never clear it (bot.attention.ack is per bot).
+            let kinds = (params["include_kinds"] as? [Any])?.compactMap { $0 as? String } ?? []
+            let groups = kinds.contains("group") ? groupAttentionItems(hostID: string(params, "host_id")) : []
+            return ["items": attention.values.map { canonicalAttentionItem($0) } + groups]
         case "reserved.probe":
             throw Error.reserved
         default:
@@ -355,8 +360,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     /// One `kind: "group"` item per visible group whose attention is set,
     /// anchored on the turn that set it (its id is the item id). Cleared by
-    /// `bot.group.select`. A read failure drops only the group rows.
-    private func groupAttentionItems() -> [[String: Any]] {
+    /// `bot.group.select`. A read failure drops only the group rows. Only the
+    /// turns that can anchor the item are read, never the group's history.
+    private func groupAttentionItems(hostID: String?) -> [[String: Any]] {
         let groups: [BotGroupConversation]
         do {
             groups = try store.listGroups()
@@ -371,22 +377,24 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             let state: String
             let detail: String
             let anchor: BotGroupTurn?
-            let turns = (try? store.listGroupTurns(groupID: group.id)) ?? []
             switch group.attentionState {
             case .none:
                 return nil
             case .working:
                 state = "working"
                 detail = "Bots are answering"
-                anchor = turns.first { !$0.state.isTerminal }
+                anchor = (try? store.listGroupTurns(
+                    groupID: group.id,
+                    states: BotGroupTurn.State.pending + [.running]
+                ))?.first
             case .needsAttention:
                 state = "needs_attention"
                 detail = "A bot could not answer"
-                anchor = turns.last { $0.state == .failed || $0.state == .interrupted }
+                anchor = (try? store.latestGroupTurn(groupID: group.id, states: [.failed, .interrupted])) ?? nil
             case .unreadActivity:
                 state = "finished"
                 detail = "New replies"
-                anchor = turns.last { $0.state == .completed }
+                anchor = (try? store.latestGroupTurn(groupID: group.id, states: [.completed])) ?? nil
             }
             guard let anchor else { return nil }
             return canonicalAttentionItem([
@@ -407,7 +415,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 "created_at": anchor.createdAt.timeIntervalSince1970,
                 "updated_at": group.updatedAt.timeIntervalSince1970,
                 "finished_at": state == "working" ? NSNull() : anchor.updatedAt.timeIntervalSince1970 as Any,
-            ])
+            ], hostID: hostID)
         }
     }
 

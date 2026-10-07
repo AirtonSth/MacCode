@@ -543,6 +543,38 @@ extension BotStore {
         }
     }
 
+    /// The turns of one round, in order (reads only that round, never the
+    /// group's whole history).
+    public func listGroupTurns(groupID: BotGroupID, roundID: BotGroupRoundID) throws -> [BotGroupTurn] {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                Self.turnSelect + " WHERE round_id = ? AND group_id = ? ORDER BY ordinal, created_at, id;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, Self.key(roundID.value))
+            try statement.bind(2, Self.key(groupID.value))
+            var turns: [BotGroupTurn] = []
+            while try statement.step() { turns.append(try decodeTurn(statement)) }
+            return turns
+        }
+    }
+
+    /// The group's last turn (highest ordinal) in one of `states`, or nil.
+    public func latestGroupTurn(groupID: BotGroupID, states: [BotGroupTurn.State]) throws -> BotGroupTurn? {
+        guard !states.isEmpty else { return nil }
+        return try db.performSync { database in
+            let marks = Array(repeating: "?", count: states.count).joined(separator: ",")
+            let statement = try database.prepare(
+                Self.turnSelect + " WHERE group_id = ? AND state IN (\(marks))"
+                    + " ORDER BY ordinal DESC, created_at DESC, id DESC LIMIT 1;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, Self.key(groupID.value))
+            for (index, state) in states.enumerated() { try statement.bind(Int32(index + 2), state.rawValue) }
+            return try statement.step() ? try decodeTurn(statement) : nil
+        }
+    }
+
     /// Single-winner state change: applies only while the turn is in one of
     /// `expected` states and returns the updated turn, else nil (a stale or
     /// duplicate settle changes nothing). A run settling its turn passes

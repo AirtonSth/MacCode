@@ -24,6 +24,18 @@ final class BotTeamGroupService {
         readMethods.contains(method) || mutationMethods.contains(method)
     }
 
+    /// Remote calls that create or change teams and groups, or make bots
+    /// answer, need the Bots "Control plane" switch on (like `bot.create`,
+    /// `bot.save` and `bot.send`). Stop, select and delete stay allowed so a
+    /// paired device can still quiet or clean up a group.
+    static let controlPlaneMethods: Set<String> = [
+        "bot.team.create", "bot.team.update", "bot.team.set_members", "bot.team.reorder",
+        "bot.group.create", "bot.group.update", "bot.group.set_participants", "bot.group.send",
+        "bot.group.retry_turn",
+    ]
+    /// Same code and text as `BotRemoteControlAuthority.Error.controlPlaneOff`.
+    static let controlPlaneOffCode = -32081
+
     /// Stable codes for refusals; the message is user-presentable.
     static let notFoundCode = -32044
     static let revisionConflictCode = -32078
@@ -32,14 +44,19 @@ final class BotTeamGroupService {
 
     private let botStore: BotStore
     private let orchestrator: BotGroupOrchestrator
+    private let isControlPlaneActive: () -> Bool
     /// Last turn change per group, applied to the group's attention state
     /// once per main-actor turn (a send changes several turns at once).
     private var pendingAttention: [BotGroupID: BotGroupTurn] = [:]
     private var attentionFlushScheduled = false
+    /// Groups whose delete is in flight: nothing new may start in them.
+    private var deletingGroups: Set<BotGroupID> = []
+    static let deletingMessage = "This group is being deleted."
 
-    init(botStore: BotStore, orchestrator: BotGroupOrchestrator) {
+    init(botStore: BotStore, orchestrator: BotGroupOrchestrator, isControlPlaneActive: @escaping () -> Bool) {
         self.botStore = botStore
         self.orchestrator = orchestrator
+        self.isControlPlaneActive = isControlPlaneActive
         orchestrator.onTurnPublished = { [weak self] turn in self?.noteTurnChanged(turn) }
     }
 
@@ -179,7 +196,8 @@ final class BotTeamGroupService {
         submitKey: String?,
         attachments: [AgentAttachment] = []
     ) throws -> BotGroupOrchestrator.SendReceipt {
-        try orchestrator.send(groupID: groupID, text: text, submitKey: submitKey, attachments: attachments)
+        guard !deletingGroups.contains(groupID) else { throw BotGroupOrchestrator.SendError.rejected(Self.deletingMessage) }
+        return try orchestrator.send(groupID: groupID, text: text, submitKey: submitKey, attachments: attachments)
     }
 
     @discardableResult
@@ -190,7 +208,8 @@ final class BotTeamGroupService {
 
     @discardableResult
     func retryTurn(groupID: BotGroupID, turnID: BotGroupTurnID) throws -> BotGroupTurn {
-        try orchestrator.retry(turnID: turnID, groupID: groupID)
+        guard !deletingGroups.contains(groupID) else { throw BotGroupOrchestrator.SendError.rejected(Self.deletingMessage) }
+        return try orchestrator.retry(turnID: turnID, groupID: groupID)
     }
 
     /// The user opened the group: it is read and its attention is cleared
@@ -209,9 +228,19 @@ final class BotTeamGroupService {
     }
 
     /// Deletes the group with its room and private member threads (their
-    /// runs stop). Bots and teams stay.
+    /// runs stop). Bots and teams stay. The group stops first and its threads
+    /// go before its rows: when a run does not stop, the delete fails and the
+    /// group stays whole (try again), never leaving unlinked threads behind.
     func deleteGroup(id: BotGroupID) async throws {
-        let threads = try botStore.deleteGroup(id: id)
+        guard let group = try botStore.group(id: id) else { throw BotStoreError.notFound }
+        guard !deletingGroups.contains(id) else { throw BotGroupOrchestrator.SendError.rejected(Self.deletingMessage) }
+        deletingGroups.insert(id)
+        defer { deletingGroups.remove(id) }
+        orchestrator.stop(groupID: id)
+        let threads = [group.roomThreadID]
+            + (try botStore.listGroupMemberConversations(groupID: id)).compactMap(\.linkedAgentThreadID)
+        try await deleteThreads(threads)
+        let remaining = try botStore.deleteGroup(id: id).filter { !threads.contains($0) }
         pendingAttention.removeValue(forKey: id)
         EventBus.shared.publish(kind: .botGroupUpdated, payload: .object([
             "change": .string("deleted"),
@@ -220,13 +249,21 @@ final class BotTeamGroupService {
             "deleted": .bool(true),
             "group": .null,
         ]))
-        guard let router = orchestrator.router else { return }
+        // A member thread linked while the first threads were going.
+        guard !remaining.isEmpty else { return }
         do {
-            try await router.deleteAgentThreads(threads)
+            try await deleteThreads(remaining)
         } catch {
-            // The group is gone; its quiet threads are unreachable leftovers.
             teamGroupLog.error("bot.group.delete_threads_failed group=\(id.value.uuidString, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    /// Test seam for a thread delete that fails; nil deletes through the router.
+    var deleteThreadsOverride: (([AgentThreadID]) async throws -> Void)?
+
+    private func deleteThreads(_ threads: [AgentThreadID]) async throws {
+        if let deleteThreadsOverride { return try await deleteThreadsOverride(threads) }
+        try await orchestrator.router?.deleteAgentThreads(threads)
     }
 
     /// A deleted bot left its teams and groups (the store did it); the turn
@@ -260,8 +297,15 @@ final class BotTeamGroupService {
         let pending = pendingAttention
         pendingAttention = [:]
         for (groupID, turn) in pending {
+            // Only what decides attention: unsettled turns and the changed
+            // turn's round, never the group's whole history.
             guard let group = try? botStore.group(id: groupID),
-                  let turns = try? botStore.listGroupTurns(groupID: groupID) else { continue }
+                  let unsettled = try? botStore.listGroupTurns(
+                    groupID: groupID, states: BotGroupTurn.State.pending + [.running]
+                  ),
+                  let round = try? botStore.listGroupTurns(groupID: groupID, roundID: turn.roundID)
+            else { continue }
+            let turns = round + unsettled
             let next = Self.attention(turns: turns, lastChanged: turn, current: group)
             guard next.state != group.attentionState || next.unread != group.unread else { continue }
             do {
@@ -311,6 +355,12 @@ final class BotTeamGroupService {
                     "turns": .array(turns.map { Self.turnRow($0, roomThreadID: group.roomThreadID) }),
                 ])
             default:
+                if Self.controlPlaneMethods.contains(method), !isControlPlaneActive() {
+                    throw DefiniteMutationRejection(JSONRPCError(
+                        code: Self.controlPlaneOffCode,
+                        message: "Bot control plane is off."
+                    ))
+                }
                 return Self.receipt(params, readback: try await mutate(method: method, params: params))
             }
         } catch {

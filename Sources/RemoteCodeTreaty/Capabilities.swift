@@ -85,7 +85,8 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         /// `bot.team.*` RPCs and `bot.team.updated` events.
         public let teamsV1: Bool
         /// `bot.group.*` RPCs, `bot.group.updated` / `bot.group.turn.updated`
-        /// events and `kind: "group"` items in `bot.attention.list`.
+        /// events and `kind: "group"` items in `bot.attention.list` (sent only
+        /// when the call passes `include_kinds: ["group"]`).
         public let groupsV1: Bool
 
         public init(queueControls: [String], teamsV1: Bool = false, groupsV1: Bool = false) {

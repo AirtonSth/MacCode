@@ -85,4 +85,54 @@ final class BotGroupContractsTests: XCTestCase {
         XCTAssertTrue(current.teamsV1)
         XCTAssertTrue(current.groupsV1)
     }
+
+    /// WHY: team and group events come in several shapes (a reorder has no
+    /// team id, a bot delete names only the bot, a delete has no row). A
+    /// client must decode every one, and a change it does not know yet must
+    /// not fail decoding (it re-reads the list instead).
+    func testTeamAndGroupEventsDecodeEveryShape() throws {
+        let reordered = try decoder.decode(BotTeamUpdatedEvent.self, from: Data(
+            #"{"change":"reordered","team_ids":["t2","t1"],"deleted":false}"#.utf8
+        ))
+        XCTAssertEqual(reordered.change, .reordered)
+        XCTAssertNil(reordered.teamID)
+        XCTAssertEqual(reordered.teamIDs, ["t2", "t1"])
+        let teamDeleted = try decoder.decode(BotTeamUpdatedEvent.self, from: Data(
+            #"{"change":"deleted","team_id":"t1","revision":null,"deleted":true,"team":null}"#.utf8
+        ))
+        XCTAssertEqual(teamDeleted.change, .deleted)
+        XCTAssertTrue(teamDeleted.deleted)
+        XCTAssertNil(teamDeleted.team)
+        let botDeleted = try decoder.decode(BotGroupUpdatedEvent.self, from: Data(
+            #"{"change":"bot_deleted","bot_id":"b1","deleted":false}"#.utf8
+        ))
+        XCTAssertEqual(botDeleted.change, .botDeleted)
+        XCTAssertEqual(botDeleted.botID, "b1")
+        XCTAssertNil(botDeleted.groupID)
+        let future = try decoder.decode(BotGroupUpdatedEvent.self, from: Data(
+            #"{"change":"archived","group_id":"g1","revision":3,"deleted":false,"group":null}"#.utf8
+        ))
+        XCTAssertEqual(future.change, .unknown("archived"))
+        XCTAssertEqual(future.revision, 3)
+        let turn = try decoder.decode(BotGroupTurnRow.self, from: Data(turn().utf8))
+        XCTAssertEqual(turn.state, "planned")
+    }
+
+    /// WHY: group refusals reuse bot error codes (-32044 is also "bot not
+    /// found"). A generic handler that drops a bot on `.botNotFound` must never
+    /// drop one because a group or team is missing.
+    func testGroupRefusalsAreToldApartFromBotErrorsByTheirData() {
+        func error(_ code: Int, _ kind: String) -> RemoteCodeError {
+            RemoteCodeError(code: code, message: "", data: .object([
+                "domain": .string("bot_group"), "kind": .string(kind),
+            ]))
+        }
+        XCTAssertEqual(error(-32044, "not_found").kind, .botGroupNotFound)
+        XCTAssertEqual(error(-32078, "revision_conflict").kind, .botGroupRevisionConflict)
+        XCTAssertEqual(error(-32091, "runtime_unavailable").kind, .botGroupRuntimeUnavailable)
+        XCTAssertEqual(error(-32602, "send_refused").kind, .invalidParams)
+        XCTAssertEqual(RemoteCodeError(code: -32044, message: "", data: nil).kind, .botNotFound,
+                       "a real missing bot keeps its kind")
+        XCTAssertEqual(RemoteCodeError(code: -32091, message: "", data: nil).kind, .commandReceiptUnavailable)
+    }
 }

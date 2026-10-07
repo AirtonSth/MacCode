@@ -25,8 +25,10 @@ final class BotGroupAttentionProjectionTests: BotStoreGroupsFixture {
         super.tearDown()
     }
 
-    private func groupItems() throws -> [[String: Any]] {
-        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+    /// Group items are opt-in: a client without groups never gets one.
+    private func groupItems(optIn: Bool = true) throws -> [[String: Any]] {
+        let params: [String: Any] = optIn ? ["include_kinds": ["group"]] : [:]
+        let listed = try authority.dispatch(method: "bot.attention.list", params: params)
         return ((listed["items"] as? [[String: Any]]) ?? []).filter { $0["kind"] as? String == "group" }
     }
 
@@ -49,6 +51,7 @@ final class BotGroupAttentionProjectionTests: BotStoreGroupsFixture {
 
         let item = try XCTUnwrap(try groupItems().first)
         XCTAssertEqual(try groupItems().count, 1)
+        XCTAssertTrue(try groupItems(optIn: false).isEmpty, "an older client never sees a group item")
         XCTAssertEqual(item["state"] as? String, "needs_attention")
         XCTAssertEqual(item["group_id"] as? String, group.id.value.uuidString.lowercased())
         XCTAssertEqual(item["thread_id"] as? String, group.roomThreadID.value.uuidString.lowercased(),

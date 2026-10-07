@@ -3,9 +3,48 @@ import Foundation
 // Bot Teams and group conversations (host capabilities `bot.teams_v1` and
 // `bot.groups_v1`). Reads: `bot.team.list`, `bot.group.list`,
 // `bot.group.get`. Every mutation answers with a `BotGroupReceipt`; the host
-// publishes `bot.team.updated`, `bot.group.updated` and
-// `bot.group.turn.updated` for changes made on the Mac or from a remote.
+// publishes `bot.team.updated` (`BotTeamUpdatedEvent`), `bot.group.updated`
+// (`BotGroupUpdatedEvent`) and `bot.group.turn.updated` (`BotGroupTurnRow`)
+// for changes made on the Mac or from a remote.
 // Timestamps are seconds since 1970. Ids are lowercase UUID strings.
+//
+// Applying events and reads:
+// - `bot.group.turn.updated`: apply in event `seq` order, keyed by `turn_id`.
+//   A send's or retry's own turn events are in its receipt and always come
+//   before the runtime events that follow it. `updated_at` is not a version:
+//   reads round it to whole seconds and a retried turn goes back to
+//   `planned`, so never merge by it. `bot.group.get` returns the newest turns
+//   as a snapshot: replace the group's turns with it, then keep applying the
+//   events that arrive after it.
+// - Room rows are `agent.message.appended` on `room_thread_id`. A turn's row
+//   keeps one id (`room_message_id`) from waiting to reply; keep the copy
+//   with the highest `body_revision`. Row bodies:
+//   - user message: role `user`, plain text.
+//   - waiting / could not answer: role `assistant`,
+//     `[[rc:bot-activity:<phase>|<handle>|<name>|<title>]]` with phase
+//     `waiting` or `needsAttention`.
+//   - reply: role `assistant`,
+//     `[[rc:bot-from:<handle>|<name>|<title>|<avatar_symbol>]]\n<reply>`.
+//   - note: role `system`, `<name> (@<handle>) <text>`, where text is
+//     "stopped before answering.", "did not answer: a newer message took
+//     over." or "was removed before answering."
+// - Attention: group items are in `bot.attention.list` only when the call
+//   passes `include_kinds: ["group"]` (item `kind: "group"`, `group_id`,
+//   `turn_id`, `thread_id` = room). No `bot.attention.updated` or
+//   `bots.attention.changed` is published for groups: re-read
+//   `bot.attention.list` when `bot.group.updated` has
+//   change `attention`, `selected`, `deleted` or `bot_deleted`. Clear a
+//   group's item with `bot.group.select`, never `bot.attention.ack`.
+// - `bot.group.list` has no message preview; read a group's room with the
+//   agent message RPCs.
+//
+// Errors: refusals carry `data: {"domain": "bot_group", "kind": ...}` with
+// kind `not_found`, `revision_conflict`, `invalid_input`, `send_refused` or
+// `runtime_unavailable`. Tell them apart by `RemoteCodeError.kind` (which
+// reads that data) or by `data`, never by the code alone: -32044 here is a
+// missing team or group, not a deleted bot. -32081 is the Bots control plane
+// being off (create, edit, send and retry are refused; stop, select and
+// delete still work).
 
 public struct BotTeamRow: Codable, Equatable, Sendable {
     public let id: String
@@ -594,4 +633,100 @@ public enum BotGroupDelete: RemoteCodeRPCContract {
     public static let method = "bot.group.delete"
     public typealias Params = BotGroupStop.Params
     public typealias Result = BotGroupReceipt<BotDeletedReadback>
+}
+
+// MARK: - Events
+
+/// `bot.team.updated`. `change` is `created`, `updated`, `members`,
+/// `deleted`, `reordered` or `bot_deleted`. `team_id` and `team` are absent
+/// for `reordered` (use `team_ids`, the new order) and `bot_deleted` (use
+/// `bot_id`; re-read `bot.team.list`). A deleted team has `team: null`.
+public struct BotTeamUpdatedEvent: Codable, Equatable, Sendable {
+    public let change: BotGroupEventChange
+    public let teamID: String?
+    public let revision: Int?
+    public let deleted: Bool
+    public let team: BotTeamRow?
+    public let teamIDs: [String]?
+    public let botID: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case change, revision, deleted, team
+        case teamID = "team_id"
+        case teamIDs = "team_ids"
+        case botID = "bot_id"
+    }
+}
+
+/// `bot.group.updated`. `change` is `created`, `updated`, `participants`,
+/// `attention`, `selected`, `deleted` or `bot_deleted`. `group_id` and
+/// `group` are absent for `bot_deleted` (use `bot_id`; re-read
+/// `bot.group.list`). A deleted group has `group: null`.
+public struct BotGroupUpdatedEvent: Codable, Equatable, Sendable {
+    public let change: BotGroupEventChange
+    public let groupID: String?
+    public let revision: Int?
+    public let deleted: Bool
+    public let group: BotGroupRow?
+    public let botID: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case change, revision, deleted, group
+        case groupID = "group_id"
+        case botID = "bot_id"
+    }
+}
+
+/// The `change` of a team or group event. A newer host may send a change
+/// this client does not know: treat it as `unknown` and re-read the list.
+public enum BotGroupEventChange: Codable, Equatable, Sendable {
+    case created
+    case updated
+    case members
+    case participants
+    case attention
+    case selected
+    case deleted
+    case reordered
+    case botDeleted
+    case unknown(String)
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "created": self = .created
+        case "updated": self = .updated
+        case "members": self = .members
+        case "participants": self = .participants
+        case "attention": self = .attention
+        case "selected": self = .selected
+        case "deleted": self = .deleted
+        case "reordered": self = .reordered
+        case "bot_deleted": self = .botDeleted
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    public var rawValue: String {
+        switch self {
+        case .created: return "created"
+        case .updated: return "updated"
+        case .members: return "members"
+        case .participants: return "participants"
+        case .attention: return "attention"
+        case .selected: return "selected"
+        case .deleted: return "deleted"
+        case .reordered: return "reordered"
+        case .botDeleted: return "bot_deleted"
+        case .unknown(let value): return value
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
