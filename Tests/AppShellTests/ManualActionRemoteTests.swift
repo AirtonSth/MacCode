@@ -34,11 +34,15 @@ final class ManualActionRemoteTests: XCTestCase {
         let workspaceCwd: String
         let snapshots: [AgentProviderSnapshot]
         let control: BotComputerControl
+        /// Set by `makeFixture(withBots:)`: the Bots window that compiles bot turns.
+        let botsVM: BotsViewModel?
     }
+
+    private static let soulMarker = "MANUAL-REMOTE-SOUL-4417"
 
     private var surfaces: [AgentAppSurface] = []
 
-    private func makeFixture() throws -> Fixture {
+    private func makeFixture(withBots: Bool = false) throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("RC2ManualActionRemote-\(UUID().uuidString)", isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -63,7 +67,11 @@ final class ManualActionRemoteTests: XCTestCase {
             )
         ]
         router.rememberProviderSnapshotsForSend(snapshots)
-        let bot = try ctx.botStore.create(name: "Quinn", title: "Scout", description: "", handle: "quinn", soul: "soul")
+        // The Bots window installs the router's bot-turn hooks; its bot has a revision to compile.
+        let botsVM = withBots ? BotsViewModel(context: ctx, router: router) : nil
+        router.botsViewModel = botsVM
+        let bot = try botsVM?.create(name: "Quinn", title: "Scout", soul: Self.soulMarker)
+            ?? ctx.botStore.create(name: "Quinn", title: "Scout", description: "", handle: "quinn", soul: "soul")
         let workspace = try router.createWorkspace(name: "manual-remote-ws", cwd: workspaceDir.path)
         let thread = try router.createAgentThread(
             workspace: workspace.id,
@@ -75,7 +83,8 @@ final class ManualActionRemoteTests: XCTestCase {
         )
         return Fixture(
             ctx: ctx, router: router, runner: runner, bot: bot, thread: thread,
-            workspace: workspace, workspaceCwd: workspaceDir.path, snapshots: snapshots, control: control
+            workspace: workspace, workspaceCwd: workspaceDir.path, snapshots: snapshots, control: control,
+            botsVM: botsVM
         )
     }
 
@@ -122,14 +131,19 @@ final class ManualActionRemoteTests: XCTestCase {
 
     /// The bot asks for help the way the host does: in-memory request plus notification.
     @discardableResult
-    private func openRequest(_ f: Fixture, kind: ManualActionKind = .login) async -> ManualActionRequest {
-        let request = ManualActionRequest(botID: f.bot.id, threadID: f.thread.id, kind: kind, reason: "Entre na conta")
+    private func openRequest(
+        _ f: Fixture,
+        kind: ManualActionKind = .login,
+        thread: AgentThreadID? = nil
+    ) async -> ManualActionRequest {
+        let threadID = thread ?? f.thread.id
+        let request = ManualActionRequest(botID: f.bot.id, threadID: threadID, kind: kind, reason: "Entre na conta")
         f.control.requestHelp(request)
         NotificationCenter.default.post(
             name: .botManualActionRequested, object: nil,
             userInfo: [BotHostNotificationKey.request: request]
         )
-        _ = await waitUntil { f.router.manualActionStore.open(threadID: f.thread.id) != nil }
+        _ = await waitUntil { f.router.manualActionStore.open(threadID: threadID)?.id == request.id }
         return request
     }
 
@@ -142,6 +156,7 @@ final class ManualActionRemoteTests: XCTestCase {
         _ request: ManualActionRequest,
         action: String,
         note: String? = nil,
+        thread: AgentThreadID? = nil,
         requestID: String = UUID().uuidString
     ) -> JSONRPCRequest {
         var params: [String: JSONValue] = [
@@ -149,7 +164,7 @@ final class ManualActionRemoteTests: XCTestCase {
             "connection_id": .string("conn"),
             "expected_host_id": .string("host-manual"),
             "expected_boot_epoch": .number(1),
-            "thread_id": .string(f.thread.id.value.uuidString),
+            "thread_id": .string((thread ?? f.thread.id).value.uuidString),
             "manual_action_id": .string(request.id.uuidString),
             "action": .string(action),
         ]
@@ -428,5 +443,176 @@ final class ManualActionRemoteTests: XCTestCase {
         XCTAssertEqual(result.followUp?.delivered, false)
         XCTAssertFalse((result.followUp?.error ?? "").isEmpty)
         XCTAssertEqual(f.runner.requests.count, 0)
+    }
+
+    // MARK: - Bot turns (review P2)
+
+    /// WHY: after a pause the bot's follow-up is a bot turn. Answered from the
+    /// iPhone it reached the provider as bare text: no soul, no brain, no VM
+    /// rules, so a VM bot did not know its tools and could not act on "take a
+    /// new screenshot". It must be the same turn the Mac card starts.
+    func test_phoneFollowUpOnAVMBotThread_isTheSameCompiledTurnAsTheMacCards() async throws {
+        let f = try makeFixture(withBots: true)
+        try XCTUnwrap(f.router.botWorkspaceRunHooks).link(f.bot.id, f.thread.id)
+        XCTAssertTrue(try f.ctx.threadRepo.setActor(
+            id: f.thread.id, actor: .bot(f.bot.id), lockedAt: Date(), executionTarget: .vm
+        ))
+        let expectedText = ManualActionRequest.continueFollowUp(kind: .login, note: "logado")
+
+        let phoneRequest = await openRequest(f)
+        let response = await JSONRPCDispatcher(router: f.router)
+            .dispatch(resolveRequest(f, phoneRequest, action: "continue", note: "logado"), mutationContext: context("phone"))
+        XCTAssertNil(response.error)
+        _ = await waitUntil { f.runner.requests.count >= 1 }
+        let phone = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertTrue(phone.prompt.contains(Self.soulMarker), "the compiled bot brain reaches the provider")
+        XCTAssertTrue(phone.prompt.contains(BotStandingInstructions.vmThreadRules), "the VM rules tell the bot its tools")
+        XCTAssertTrue(phone.prompt.contains(expectedText))
+        XCTAssertEqual(phone.userMessageContent, expectedText, "the transcript shows the follow-up, not the brain")
+        XCTAssertEqual(phone.cwd, f.workspaceCwd, "a workspace thread keeps its workspace")
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, phone.runId, "D12: the turn holds the VM")
+        f.runner.finish(runID: phone.runId, status: .completed, reply: "ok")
+        let freed = await waitUntil {
+            BotVMRunRegistry.shared.active(botID: f.bot.id) == nil
+                && (try? f.ctx.threadRepo.get(id: f.thread.id))??.status == .completed
+        }
+        XCTAssertTrue(freed)
+
+        // The Mac card answers the next pause on the same thread the same way.
+        let surface = AgentAppSurface(
+            workspaceID: f.workspace.id,
+            cwd: f.workspaceCwd,
+            coordinator: f.ctx.coordinator,
+            threadRepo: f.ctx.threadRepo,
+            messageRepo: f.ctx.messageRepo,
+            queuedMessageRepo: f.ctx.queuedMessageRepo,
+            providerSessionRepo: f.ctx.providerSessionRuntimeRepo,
+            checkpointRepo: f.ctx.turnCheckpointRepo,
+            initialThreadId: f.thread.id
+        )
+        surfaces.append(surface)
+        f.router.configureAgentAppBotMentions(surface)
+        let vm = surface.viewModel
+        vm.providerSnapshots = f.snapshots
+        vm.providerLaunchConfig = { _, _ in ("/usr/bin/true", [:]) }
+        vm.botVMPreflight = { _, _ in nil }
+        vm.botComputerControl = f.control
+        vm.selectThread(f.thread.id)
+        _ = await openRequest(f)
+        _ = await waitUntil { vm.openManualAction != nil }
+        await vm.continueManualAction(note: "logado")
+        _ = await waitUntil { f.runner.requests.count >= 2 }
+        let mac = try XCTUnwrap(f.runner.requests.count >= 2 ? f.runner.requests[1] : nil, "\(String(describing: vm.statusMessage))")
+        XCTAssertEqual(mac.userMessageContent, phone.userMessageContent)
+        XCTAssertEqual(mac.cwd, phone.cwd)
+        XCTAssertTrue(mac.prompt.contains(Self.soulMarker))
+        XCTAssertTrue(mac.prompt.contains(BotStandingInstructions.vmThreadRules))
+        XCTAssertEqual(mac.tokenSaverCompressesPrompt, phone.tokenSaverCompressesPrompt)
+        f.runner.finish(runID: mac.runId, status: .completed, reply: "ok")
+        _ = await waitUntil { BotVMRunRegistry.shared.active(botID: f.bot.id) == nil }
+    }
+
+    /// WHY: a Bots Desk conversation has no workspace; its turns run in the
+    /// bot's home. A phone answer ran in the host process's cwd instead and
+    /// skipped the desk's run bookkeeping.
+    func test_phoneFollowUpOnAWorkspacelessDeskConversation_runsInBotHomeWithTheBrain() async throws {
+        let f = try makeFixture(withBots: true)
+        let botsVM = try XCTUnwrap(f.botsVM)
+        let desk = try f.router.createAgentThread(
+            workspace: nil, title: "Desk", provider: .codex, model: "fake-model",
+            permissionMode: .supervised, reasoningEffort: .medium,
+            routingConfiguration: nil, quiet: true
+        )
+        try f.ctx.botStore.upsertConversation(BotConversation(
+            botID: f.bot.id, title: desk.title, linkedAgentThreadID: desk.id
+        ))
+        let request = await openRequest(f, thread: desk.id)
+
+        let response = await JSONRPCDispatcher(router: f.router)
+            .dispatch(resolveRequest(f, request, action: "decline", thread: desk.id), mutationContext: context("phone"))
+
+        XCTAssertNil(response.error)
+        let result = try decode(AgentManualActionResolve.Result.self, try XCTUnwrap(response.result))
+        XCTAssertEqual(result.followUp?.delivered, true)
+        _ = await waitUntil { f.runner.requests.count >= 1 }
+        let run = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertTrue(run.prompt.contains(Self.soulMarker))
+        XCTAssertTrue(run.prompt.contains(ManualActionRequest.declineFollowUp))
+        XCTAssertEqual(run.userMessageContent, ManualActionRequest.declineFollowUp)
+        let home = BotHome(appSupportDirectory: f.ctx.appSupportDirectory, bot: f.bot).root
+        XCTAssertEqual(
+            URL(fileURLWithPath: run.cwd).resolvingSymlinksInPath().path,
+            home.resolvingSymlinksInPath().path,
+            "a workspace-less desk turn runs in the bot's home"
+        )
+        XCTAssertTrue(botsVM.lastSendStartedProviderRun, "the desk recorded the started run")
+        f.runner.finish(runID: run.runId, status: .completed, reply: "ok")
+    }
+
+    /// A plain Agent App thread (no bot) still gets exactly the follow-up text.
+    func test_phoneFollowUpOnAThreadWithoutABot_sendsThePlainText() async throws {
+        let f = try makeFixture(withBots: true)
+        let request = await openRequest(f)
+        _ = await JSONRPCDispatcher(router: f.router)
+            .dispatch(resolveRequest(f, request, action: "decline"), mutationContext: context("phone"))
+        _ = await waitUntil { f.runner.requests.count >= 1 }
+        XCTAssertEqual(f.runner.requests.first?.prompt, ManualActionRequest.declineFollowUp)
+        XCTAssertEqual(f.runner.requests.first?.cwd, f.workspaceCwd)
+        XCTAssertFalse(f.botsVM?.lastSendStartedProviderRun ?? true, "no desk bookkeeping for a thread without a bot")
+    }
+
+    // MARK: - Snapshot, not found and bot delete (review P2)
+
+    /// WHY: after missed events the iPhone rebuilds from sync.snapshot; without
+    /// the key it lost "Aguardando você" until it happened to re-list.
+    func test_syncSnapshotThreadRowsCarryPendingManualAction() async throws {
+        let f = try makeFixture()
+        func snapshotPending() async throws -> JSONValue? {
+            let state = try await f.router.readConnectionSnapshotState()
+            let rows = state.agentThreads.flatMap(\.items)
+            let row = rows.first { $0.objectValue?["id"]?.stringValue == f.thread.id.value.uuidString }
+            return try XCTUnwrap(row?.objectValue)["pending_manual_action"]
+        }
+        let before = try await snapshotPending()
+        XCTAssertEqual(before, .null, "the key is always present")
+        let request = await openRequest(f)
+        let open = try await snapshotPending()
+        let row = try decode(AgentManualActionRow.self, try XCTUnwrap(open))
+        XCTAssertEqual(row.id, request.id.uuidString)
+        XCTAssertEqual(row.state, "open")
+        XCTAssertEqual(row.botName, "Quinn")
+
+        _ = await JSONRPCDispatcher(router: f.router)
+            .dispatch(resolveRequest(f, request, action: "decline"), mutationContext: context("phone"))
+        let after = try await snapshotPending()
+        XCTAssertEqual(after, .null)
+    }
+
+    /// WHY: the phone must tell "no requests" from "wrong thread".
+    func test_listOnAnUnknownThread_isNotFound() async throws {
+        let f = try makeFixture()
+        let response = await JSONRPCDispatcher(router: f.router).dispatch(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "agent.manual_action.list",
+            params: ["thread_id": .string(UUID().uuidString)]
+        ))
+        XCTAssertEqual(response.error?.code, ManualActionWire.notFoundCode)
+        XCTAssertEqual(refusalKind(response), "not_found")
+    }
+
+    /// WHY: deleting a bot on the Mac closes its requests; the iPhone kept a
+    /// card nobody could answer because nothing was published.
+    func test_deletingTheBotOnTheMac_publishesTheClosedRequest() async throws {
+        let f = try makeFixture(withBots: true)
+        let (log, subscription) = recordEvents()
+        defer { EventBus.shared.unsubscribe(subscription) }
+        let request = await openRequest(f)
+        _ = await waitUntil { log.states(request.id) == ["open"] }
+
+        try XCTUnwrap(f.botsVM).delete(id: f.bot.id, navigate: false)
+
+        let published = await waitUntil { log.states(request.id) == ["open", "expired"] }
+        XCTAssertTrue(published, "\(log.states(request.id))")
+        XCTAssertEqual(log.last(request.id)?["pending_manual_action"], .null)
+        XCTAssertNil(f.router.pendingManualActions(for: [f.thread])[f.thread.id])
     }
 }

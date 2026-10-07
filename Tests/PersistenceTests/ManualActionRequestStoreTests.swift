@@ -69,6 +69,29 @@ final class ManualActionRequestStoreTests: XCTestCase {
         XCTAssertNotNil(store.open(threadID: threadB))
     }
 
+    /// WHY: thread payloads read the store on MainActor, so it keeps the decoded
+    /// file in memory; a bot deleted from a paired device closes its requests
+    /// through another store instance, and the cached reader must see that at
+    /// once instead of showing a card nobody can answer.
+    func test_cachedReaderSeesAnotherInstancesCloseAllAndCloseAllReturnsWhatItClosed() throws {
+        let dir = makeDir()
+        let reader = ManualActionRequestStore(appSupportDirectory: dir)
+        let bot = BotID()
+        let thread = AgentThreadID()
+        let request = ManualActionRequest(botID: bot, threadID: thread, kind: .login, reason: "x")
+        try reader.upsert(request)
+        XCTAssertEqual(reader.openByThread()[thread]?.id, request.id, "warm the reader's cache")
+
+        let closed = try ManualActionRequestStore(appSupportDirectory: dir).closeAll(botID: bot)
+
+        XCTAssertEqual(closed.map(\.id), [request.id])
+        XCTAssertEqual(closed.first?.state, .expired, "callers announce the closed state")
+        XCTAssertNil(reader.open(threadID: thread))
+        XCTAssertTrue(reader.openByThread().isEmpty)
+        XCTAssertEqual(reader.all(threadID: thread).first?.state, .expired)
+        XCTAssertTrue(try reader.closeAll(botID: bot).isEmpty, "nothing left to close or announce")
+    }
+
     private func unwritableStore() throws -> (ManualActionRequestStore, URL) {
         // A regular file where the ManualActions directory must be makes every write fail.
         let dir = makeDir()

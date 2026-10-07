@@ -38,6 +38,28 @@ final class ManualActionRPCAdmissionTests: XCTestCase {
         }
     }
 
+    /// A note of the wrong type was silently dropped and the bot got a follow-up
+    /// without the user's words; it must be refused before anything changes.
+    func test_resolveNoteMustBeAStringWhenPresent() {
+        let valid: [String: JSONValue] = [
+            "thread_id": .string(UUID().uuidString),
+            "manual_action_id": .string(UUID().uuidString),
+            "action": .string("continue"),
+        ]
+        for note in [JSONValue.string("logado"), .string(""), .null] {
+            var params = valid
+            params["note"] = note
+            XCTAssertNoThrow(try HostMutationContract.preflight(method: "agent.manual_action.resolve", params: params), "\(note)")
+        }
+        for note in [JSONValue.number(1), .bool(true), .object(["text": .string("x")]), .array([.string("x")])] {
+            var params = valid
+            params["note"] = note
+            XCTAssertThrowsError(try HostMutationContract.preflight(method: "agent.manual_action.resolve", params: params), "\(note)") {
+                XCTAssertEqual(($0 as? JSONRPCError)?.code, JSONRPCError.invalidParams.code)
+            }
+        }
+    }
+
     @MainActor
     func test_capabilitiesAdvertiseManualActionsOnBothAuthorities() async throws {
         let payload = DirectHTTPServer.capabilitiesProjection(loopbackOnly: false)

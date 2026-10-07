@@ -5760,7 +5760,9 @@ public final class BotsViewModel: ObservableObject {
             try botSecretStore.deleteAll(botID: id)
             try botStore.delete(id: id)
             BotComputerControl.shared.forget(id)
-            do { try router?.manualActionStore.closeAll(botID: id) } catch {
+            do {
+                try router?.manualActionStore.closeAll(botID: id).forEach(ManualActionRequestStore.postStateChanged)
+            } catch {
                 NSLog("RemoteCode: manual actions of deleted bot could not be closed: \(error)")
             }
             if let service = computerGuestService {

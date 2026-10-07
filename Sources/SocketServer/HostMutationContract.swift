@@ -184,6 +184,8 @@ public enum HostMutationContract {
     private enum SyntaxRule {
         case uuid(String)
         case optionalUUID(String)
+        /// Absent, null or a string; any other type is invalid params.
+        case optionalString(String)
         case anyUUID([String])
         case string(String, nonempty: Bool = false)
         case anyString([String], nonempty: Bool = false)
@@ -239,6 +241,10 @@ public enum HostMutationContract {
             guard params[key]?.stringValue.flatMap(UUID.init) != nil else { throw JSONRPCError.invalidParams }
         case .optionalUUID(let key):
             guard params[key] == nil || params[key]?.stringValue.flatMap(UUID.init) != nil else {
+                throw JSONRPCError.invalidParams
+            }
+        case .optionalString(let key):
+            guard params[key] == nil || params[key] == .null || params[key]?.stringValue != nil else {
                 throw JSONRPCError.invalidParams
             }
         case .anyUUID(let keys):
@@ -451,7 +457,7 @@ public enum HostMutationContract {
         case "agent.message.queue.reorder": return [.uuid("thread_id"), .anyUUID(["queued_message_id", "id"]), .int("position")]
         case "agent.request.respond": return [.uuid("thread_id"), .string("request_id"), .stringEnum("decision", ["approve", "approve_for_session", "approveForSession", "decline", "cancel"])]
         case "agent.user_input.respond": return [.uuid("thread_id"), .string("request_id"), .string("text")]
-        case "agent.manual_action.resolve": return [.uuid("thread_id"), .uuid("manual_action_id"), .stringEnum("action", ["take", "continue", "decline"])]
+        case "agent.manual_action.resolve": return [.uuid("thread_id"), .uuid("manual_action_id"), .stringEnum("action", ["take", "continue", "decline"]), .optionalString("note")]
         case "agent.plan.implement", "agent.plan.save": return [.uuid("thread_id"), .string("plan_id")]
         case "agent.plan.notes.save": return [.uuid("thread_id"), .string("notes")]
         case "agent.checkpoint.revert": return [.uuid("thread_id"), .firstPresentInt(["turn_count", "checkpoint_turn_count"])]
@@ -514,6 +520,7 @@ public enum HostMutationContract {
         switch rule {
         case .uuid(let key): params[key] = .string(probeUUID)
         case .optionalUUID: break
+        case .optionalString: break
         case .anyUUID(let keys): params[keys[0]] = .string(probeUUID)
         case .string(let key, _): params[key] = .string("value")
         case .anyString(let keys, _): params[keys[0]] = .string("value")
@@ -557,6 +564,8 @@ public enum HostMutationContract {
         case .optionalUUID(let key):
             add("\(key).type") { $0[key] = .bool(true) }
             add("\(key).uuid") { $0[key] = .string("not-a-uuid") }
+        case .optionalString(let key):
+            add("\(key).type") { $0[key] = .number(1) }
         case .anyUUID(let keys):
             add("\(keys.joined(separator: "/")).missing") { params in keys.forEach { params.removeValue(forKey: $0) } }
             add("\(keys.joined(separator: "/")).type") { params in keys.forEach { params[$0] = .bool(true) } }

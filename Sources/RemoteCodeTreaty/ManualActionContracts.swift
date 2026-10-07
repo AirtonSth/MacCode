@@ -5,10 +5,11 @@ import Foundation
 // opens a request on its thread; the Mac shows a card and the iPhone gets an
 // "Aguardando você" push.
 //
-// - Reads: `agent.manual_action.list` (batchable, read scope). Every agent
-//   thread payload (`agent.thread.list`, `agent.thread.created/updated/...`
-//   events) carries `pending_manual_action`: the open or taken request, or
-//   null.
+// - Reads: `agent.manual_action.list` (batchable, read scope); an unknown
+//   `thread_id` is -32060 `not_found`. Every agent thread payload
+//   (`agent.thread.list`, `agent.thread.created/updated/...` events and the
+//   `sync.snapshot` `agent_threads` rows) carries `pending_manual_action`:
+//   the open or taken request, or null.
 // - Write: `agent.manual_action.resolve` (receipt ledger, needs
 //   `client_request_id`). The store transition is single-winner across the
 //   Mac card, every device and parallel calls: exactly one caller wins and
@@ -17,13 +18,15 @@ import Foundation
 //   - `take`: open -> taken; the user drives the bot's computer. No message
 //     is sent. Refused (-32062 `take_unavailable`) on a thread that runs on
 //     the Mac (`can_take` false).
-//   - `continue` (optional `note`) / `decline`: open or taken -> continued /
+//   - `continue` (optional string `note`; any other type is -32602) /
+//     `decline`: open or taken -> continued /
 //     declined; control goes back to the bot and its follow-up message is
 //     sent (`follow_up`). A follow-up that could not be sent is reported as
 //     `delivered: false` with `error`; the request stays resolved.
 // - Event: `agent.manual_action.updated` (`AgentManualActionUpdatedEvent`)
 //   for every change made on the Mac or from a device, including a new
-//   request (state `open`). A resolve's own event is in its receipt.
+//   request (state `open`) and requests closed as `expired` when their bot is
+//   deleted. A resolve's own event is in its receipt.
 //   Apply in `seq` order: replace the thread's pending card with
 //   `pending_manual_action`.
 // - A taken request whose control was lost (the host restarted) reads as
@@ -32,7 +35,7 @@ import Foundation
 // case-insensitively.
 //
 // Errors carry `data: {"domain": "manual_action", "kind": ...}`: kind
-// `not_found` (-32060), `state_conflict` (-32061, with `state`),
+// `not_found` (-32060: unknown thread or request), `state_conflict` (-32061, with `state`),
 // `take_unavailable` (-32062) or `store_unavailable` (-32000, nothing saved).
 
 public struct AgentManualActionRow: Codable, Equatable, Sendable {

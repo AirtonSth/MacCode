@@ -135,10 +135,9 @@ extension AppCommandRouter {
                 viewModel.mirrorExecutionTarget(.mac, thread: thread)
             }
         }
-        _ = try? await sendAgentMessage(
+        _ = try? await sendBotThreadFollowUp(
             thread: thread,
-            text: approve ? Self.macExecutionApprovedFollowUp : Self.macExecutionDeclinedFollowUp,
-            provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil
+            text: approve ? Self.macExecutionApprovedFollowUp : Self.macExecutionDeclinedFollowUp
         )
     }
 

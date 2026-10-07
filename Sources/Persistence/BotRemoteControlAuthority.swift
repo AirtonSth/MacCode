@@ -891,7 +891,11 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         try? store.deleteQueuedFollowUps(botID: bot.id)
         BotComputerControl.shared.forget(bot.id)
-        do { try ManualActionRequestStore(appSupportDirectory: appSupport).closeAll(botID: bot.id) } catch {
+        do {
+            // Another store instance: the router's re-reads the file it replaced.
+            try ManualActionRequestStore(appSupportDirectory: appSupport).closeAll(botID: bot.id)
+                .forEach(ManualActionRequestStore.postStateChanged)
+        } catch {
             NSLog("RemoteCode: manual actions of deleted bot could not be closed: \(error)")
         }
 

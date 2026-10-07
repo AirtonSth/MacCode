@@ -8,17 +8,35 @@ import SocketServer
 /// and parallel calls resolve a request once and the bot gets one follow-up.
 extension AppCommandRouter {
     public func listManualActions(thread: AgentThreadID) throws -> [ManualActionSnapshot] {
-        guard let ctx = context, let stored = try ctx.threadRepo.get(id: thread) else { return [] }
+        guard let ctx = context else { return [] }
+        guard let stored = try ctx.threadRepo.get(id: thread) else {
+            throw ManualActionWire.refusal(
+                code: ManualActionWire.notFoundCode, kind: "not_found",
+                message: "Agent thread not found."
+            )
+        }
         return manualActionStore.all(threadID: thread).map { manualActionSnapshot($0, thread: stored) }
     }
 
     public func pendingManualActions(for threads: [AgentThread]) -> [AgentThreadID: ManualActionSnapshot] {
         guard !threads.isEmpty else { return [:] }
-        let open = manualActionStore.openByThread()
+        return pendingManualActions(for: threads, open: manualActionStore.openByThread())
+    }
+
+    /// `open` is `manualActionStore.openByThread()`, read by the caller (sync.snapshot
+    /// reads it with its other MainActor inputs, before its SQLite await).
+    func pendingManualActions(
+        for threads: [AgentThread],
+        open: [AgentThreadID: ManualActionRequest]
+    ) -> [AgentThreadID: ManualActionSnapshot] {
         guard !open.isEmpty else { return [:] }
         var pending: [AgentThreadID: ManualActionSnapshot] = [:]
+        var botNames: [BotID: String?] = [:]
         for thread in threads {
-            if let request = open[thread.id] { pending[thread.id] = manualActionSnapshot(request, thread: thread) }
+            guard let request = open[thread.id] else { continue }
+            let name = botNames[request.botID] ?? botName(request.botID)
+            botNames[request.botID] = name
+            pending[thread.id] = manualActionSnapshot(request, thread: thread, botName: name)
         }
         return pending
     }
@@ -85,12 +103,9 @@ extension AppCommandRouter {
         postManualActionStateChanged(changed)
         var followUp: ManualActionResolveOutcome.FollowUp?
         if let followUpText {
-            // Same follow-up text and send path as the Mac card and Mac-execution approvals.
+            // Same follow-up text as the Mac card; a bot thread runs it as a bot turn, like the card.
             do {
-                followUp = .sent(try await sendAgentMessage(
-                    thread: thread, text: followUpText,
-                    provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil
-                ))
+                followUp = .sent(try await sendBotThreadFollowUp(thread: thread, text: followUpText))
             } catch {
                 followUp = .failed((error as? LocalizedError)?.errorDescription ?? String(describing: error))
             }
@@ -131,10 +146,19 @@ extension AppCommandRouter {
         ))
     }
 
-    private func manualActionSnapshot(_ request: ManualActionRequest, thread: AgentThread) -> ManualActionSnapshot {
+    /// `botName` lets a batch look each bot up once; nil reads it here.
+    private func manualActionSnapshot(
+        _ request: ManualActionRequest,
+        thread: AgentThread,
+        botName knownName: String?? = nil
+    ) -> ManualActionSnapshot {
         var shown = request
         if shown.state == .taken, !botComputerControl.isControlledByUser(shown.botID) { shown.state = .open }
-        let botName = (try? context?.botStore.get(id: request.botID))??.name
-        return ManualActionSnapshot(request: shown, botName: botName, canTake: thread.executionTarget != .mac)
+        let name = knownName ?? botName(request.botID)
+        return ManualActionSnapshot(request: shown, botName: name, canTake: thread.executionTarget != .mac)
+    }
+
+    private func botName(_ id: BotID) -> String? {
+        (try? context?.botStore.get(id: id))??.name
     }
 }

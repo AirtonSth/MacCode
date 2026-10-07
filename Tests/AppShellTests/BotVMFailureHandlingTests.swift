@@ -95,7 +95,10 @@ final class BotVMFailureHandlingTests: XCTestCase {
         return predicate()
     }
 
+    /// Linked and locked the way the app stores a VM-bot thread: the follow-ups
+    /// after an approval run as bot turns, which need the linked conversation.
     private func lockOnVM(_ f: Fixture) throws {
+        try XCTUnwrap(f.vm.botThreadLinker)(f.bot.id, f.thread.id)
         XCTAssertTrue(try f.ctx.threadRepo.setActor(
             id: f.thread.id, actor: .bot(f.bot.id), lockedAt: Date(), executionTarget: .vm
         ))
@@ -144,6 +147,10 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertEqual(
             f.runner.requests.first?.userMessageContent,
             "O usuário recusou a execução no Mac. Continue na VM ou pare e explique."
+        )
+        XCTAssertEqual(
+            f.runner.requests.first?.prompt.contains(BotStandingInstructions.vmThreadRules), true,
+            "the follow-up is a bot turn: without its VM rules the bot does not know its tools"
         )
         await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
         XCTAssertEqual(try f.ctx.threadRepo.get(id: f.thread.id)?.executionTarget, .vm, "no pending request, no switch")

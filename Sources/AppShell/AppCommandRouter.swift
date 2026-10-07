@@ -1210,8 +1210,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     ?? ""
             }
         }
+        let openManualActions = manualActionStore.openByThread()
         // SQLite list/decode must never run on MainActor (Dispatcher is @MainActor).
         let threads = try await ctx.agentThreadListGateway.list(workspaceId: nil)
+        let manualActionsByThread = pendingManualActions(for: threads, open: openManualActions)
         var surfaceGroups: [ConnectionSnapshotWorkspaceItems] = []
         var threadGroups: [ConnectionSnapshotWorkspaceItems] = []
         var browserStates: [ConnectionSnapshotSurfaceState] = []
@@ -1233,7 +1235,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ))
             threadGroups.append(ConnectionSnapshotWorkspaceItems(
                 workspaceId: workspace.id.value.uuidString,
-                items: workspaceThreads.map(Self.connectionSnapshotThread)
+                items: workspaceThreads.map {
+                    Self.connectionSnapshotThread($0, pendingManualAction: manualActionsByThread[$0.id])
+                }
             ))
 
             for descriptor in descriptors {
@@ -1318,12 +1322,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return .object(object)
     }
 
-    nonisolated private static func connectionSnapshotThread(_ thread: AgentThread) -> JSONValue {
+    nonisolated private static func connectionSnapshotThread(
+        _ thread: AgentThread,
+        pendingManualAction: ManualActionSnapshot?
+    ) -> JSONValue {
         guard case .object(var object) = connectionSnapshotJSON(thread) else { return .null }
         object["id"] = .string(thread.id.value.uuidString)
         object["workspaceId"] = thread.workspaceId
             .map { .string($0.value.uuidString) }
             ?? .null
+        object["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualAction)
         return .object(object)
     }
 
@@ -5132,6 +5140,28 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    /// A follow-up the host sends for the user (manual-action answers,
+    /// Mac-execution approvals). On a bot thread it is a bot turn like the Mac
+    /// card's: compiled brain, VM/guest rules, bot-home cwd and the desk's run
+    /// bookkeeping. Any other thread gets the plain text.
+    func sendBotThreadFollowUp(thread: AgentThreadID, text: String) async throws -> AgentMessageSendResult {
+        try await sendAgentMessage(
+            thread: thread,
+            text: text,
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            interactionMode: nil,
+            modelSelection: nil,
+            providerInstanceId: nil,
+            attachments: [],
+            queueMessageId: nil,
+            compilesBotPrompt: true
+        )
+    }
+
     /// Path B / scheduled Auto: same send as Agent App, with the preflight orchestration
     /// snapshot so admit + launch match what was verified.
     public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = [], orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot?) async throws -> AgentMessageSendResult {
@@ -5253,7 +5283,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true, compilesBotPrompt: Bool = false) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         // Status + permission + provider identity only. A leftover 26-column
         // + routing `get` hitchs every send before configureAgentThread loads
@@ -5535,7 +5565,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var runPrompt = text
         var runCwd = cwd
         var botPromptApplied = false
-        if queueMessageId != nil,
+        if queueMessageId != nil || compilesBotPrompt,
            let transform = botThreadPromptTransform,
            let transformed = try await transform(thread, text, requestedRunID) {
             runPrompt = transformed.prompt
