@@ -2695,7 +2695,25 @@ public final class AppContext {
         let queue = backgroundWriterQueue
         let pending = pendingEventLogRows
         let flushLock = eventLogFlushLock
-        let writeBatch: ([EventBus.Event]) -> Void = { [weak self] batch in
+        // C8: durable replay reads the event log on the read-only connection.
+        // Wired before the persister so every later durable event is tracked.
+        let replayLog = EventLogRepository(db: readDB)
+        eventBus.durableReplaySource = EventBus.DurableReplaySource(page: { after, through, limit in
+            let page = try replayLog.readReplayPage(after: after, through: through, limit: limit)
+            let events = try page.rows.map { row -> EventBus.Event in
+                guard let data = row.payloadJSON.data(using: .utf8),
+                      let payload = JSONValue.decode(from: data) else {
+                    // A row that cannot be replayed must not be skipped silently.
+                    throw SQLiteError.execute("Undecodable event log row \(row.seq).")
+                }
+                let ts = EventLogRepository.createdAtDate(row.createdAt)?.timeIntervalSince1970 ?? 0
+                return EventBus.Event(seq: row.seq, kind: row.kind, payload: payload, ts: ts)
+            }
+            return EventBus.DurableReplaySourcePage(events: events, anchored: page.anchored)
+        }, estimate: { after, through in
+            try replayLog.estimateReplay(after: after, through: through)
+        })
+        let writeBatch: ([EventBus.Event]) -> Void = { [weak self, weak eventBus] batch in
             defer { pending.finishBatch() }
             Self.beforeEventLogBatchWriteForTesting?()
             let rows = batch.map { event in
@@ -2705,7 +2723,12 @@ public final class AppContext {
                     payloadJSON: EventBus.encodePayloadForPersistence(event.payload)
                 )
             }
-            _ = try? log.appendBatch(rows)
+            let written = (try? log.appendBatch(rows)) != nil
+            // C8: durable replay only trusts the log up to acknowledged rows.
+            eventBus?.acknowledgeDurablePersistence(
+                sequences: batch.map(\.seq),
+                succeeded: written
+            )
             flushLock.lock()
             self?.eventLogFlushCountValue += 1
             self?.eventLogPersistedRowCountValue += rows.count

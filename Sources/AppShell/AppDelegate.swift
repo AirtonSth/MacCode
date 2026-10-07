@@ -255,6 +255,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         Self.wireEventPersistence(context: context)
         do {
             EventBus.shared.reloadFromPersistence(lastSeq: try context.eventLog.lastSeq(), recent: [])
+            // C8: a clean previous quit lets its cursors resume from the log.
+            DurableReplayResumeRecord.restore(
+                eventBus: .shared,
+                settings: context.settingsRepo,
+                bootEpoch: context.liveActivityHostIdentity.bootEpoch
+            )
         } catch {
             appLifecycleLog.error("event_log.sequence_init_failed error=\(error.localizedDescription, privacy: .public)")
         }
@@ -644,6 +650,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         accountUsageRefreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        // C8: last, after the servers stopped: flush, then record what the
+        // next boot needs to resume this boot's cursors from the event log.
+        if let context {
+            context.flushEventPersistence()
+            DurableReplayResumeRecord.write(
+                eventBus: .shared,
+                settings: context.settingsRepo,
+                bootEpoch: context.liveActivityHostIdentity.bootEpoch
+            )
+        }
     }
 
     private func disableInsomniaForAppClose() {

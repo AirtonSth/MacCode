@@ -1,0 +1,503 @@
+{
+  "after": {
+    "resume_after_1_h_gap": {
+      "bytes": [
+        129233,
+        129233,
+        129233,
+        129233,
+        129233,
+        129240,
+        129241
+      ],
+      "bytes_p50": 129233,
+      "header_sent": true,
+      "max_ms": 117.491,
+      "n": 7,
+      "p50_ms": 111.529,
+      "p95_ms": 117.491,
+      "paths": [
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot"
+      ],
+      "replayed_events": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ms": [
+        110.466,
+        111.529,
+        117.491,
+        108.609,
+        114.927,
+        108.593,
+        113.183
+      ],
+      "scenario": "resume_after_1_h_gap",
+      "stream_gaps": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "resume_after_5_min_gap": {
+      "bytes": [
+        69402,
+        69402,
+        69402,
+        69402,
+        69402,
+        69402,
+        69402
+      ],
+      "bytes_p50": 69402,
+      "header_sent": true,
+      "max_ms": 23.924,
+      "n": 7,
+      "p50_ms": 22.922,
+      "p95_ms": 23.924,
+      "paths": [
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay"
+      ],
+      "replayed_events": [
+        150,
+        150,
+        150,
+        150,
+        150,
+        150,
+        150
+      ],
+      "samples_ms": [
+        22.796,
+        23.924,
+        23.652,
+        22.922,
+        23.874,
+        22.539,
+        21.581
+      ],
+      "scenario": "resume_after_5_min_gap",
+      "stream_gaps": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    },
+    "resume_after_5_min_gap_legacy_client": {
+      "bytes": [
+        129221,
+        129221,
+        129221,
+        129221,
+        129221,
+        129221,
+        129221
+      ],
+      "bytes_p50": 129221,
+      "header_sent": false,
+      "max_ms": 93.021,
+      "n": 7,
+      "p50_ms": 87.548,
+      "p95_ms": 93.021,
+      "paths": [
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot"
+      ],
+      "replayed_events": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ms": [
+        93.021,
+        92.142,
+        86.994,
+        85.122,
+        85.75,
+        87.548,
+        91.178
+      ],
+      "scenario": "resume_after_5_min_gap_legacy_client",
+      "stream_gaps": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "after_without_budget": {
+    "resume_after_1_h_gap": {
+      "bytes": [
+        818699,
+        818699,
+        818699,
+        819088,
+        818699,
+        820801,
+        822307
+      ],
+      "bytes_p50": 818699,
+      "header_sent": true,
+      "max_ms": 312.462,
+      "n": 7,
+      "p50_ms": 289.61,
+      "p95_ms": 312.462,
+      "paths": [
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay"
+      ],
+      "replayed_events": [
+        1800,
+        1800,
+        1800,
+        1801,
+        1800,
+        1800,
+        1800
+      ],
+      "samples_ms": [
+        287.727,
+        312.462,
+        295.092,
+        292.744,
+        289.61,
+        285.524,
+        286.114
+      ],
+      "scenario": "resume_after_1_h_gap",
+      "stream_gaps": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    },
+    "resume_after_5_min_gap": {
+      "bytes": [
+        69402,
+        69402,
+        69402,
+        69402,
+        69402,
+        69402,
+        69402
+      ],
+      "bytes_p50": 69402,
+      "header_sent": true,
+      "max_ms": 24.491,
+      "n": 7,
+      "p50_ms": 22.977,
+      "p95_ms": 24.491,
+      "paths": [
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay",
+        "durable_replay"
+      ],
+      "replayed_events": [
+        150,
+        150,
+        150,
+        150,
+        150,
+        150,
+        150
+      ],
+      "samples_ms": [
+        20.618,
+        21.657,
+        22.977,
+        24.491,
+        23.42,
+        22.119,
+        24.377
+      ],
+      "scenario": "resume_after_5_min_gap",
+      "stream_gaps": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ]
+    },
+    "resume_after_5_min_gap_legacy_client": {
+      "bytes": [
+        129220,
+        129220,
+        129220,
+        129220,
+        129220,
+        129220,
+        129220
+      ],
+      "bytes_p50": 129220,
+      "header_sent": false,
+      "max_ms": 94.358,
+      "n": 7,
+      "p50_ms": 87.521,
+      "p95_ms": 94.358,
+      "paths": [
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot"
+      ],
+      "replayed_events": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ms": [
+        87.521,
+        85.803,
+        85.601,
+        94.358,
+        91.4,
+        87.252,
+        88.536
+      ],
+      "scenario": "resume_after_5_min_gap_legacy_client",
+      "stream_gaps": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "before": {
+    "resume_after_1_h_gap": {
+      "bytes": [
+        129182,
+        129182,
+        129182,
+        129182,
+        129182,
+        129188,
+        129189
+      ],
+      "bytes_p50": 129182,
+      "header_sent": true,
+      "max_ms": 109.817,
+      "n": 7,
+      "p50_ms": 109.18,
+      "p95_ms": 109.817,
+      "paths": [
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot"
+      ],
+      "replayed_events": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ms": [
+        109.817,
+        108.001,
+        107.406,
+        107.53,
+        109.434,
+        109.213,
+        109.18
+      ],
+      "scenario": "resume_after_1_h_gap",
+      "stream_gaps": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "resume_after_5_min_gap": {
+      "bytes": [
+        129192,
+        129192,
+        129192,
+        129192,
+        129192,
+        129192,
+        129192
+      ],
+      "bytes_p50": 129192,
+      "header_sent": true,
+      "max_ms": 88.843,
+      "n": 7,
+      "p50_ms": 86.822,
+      "p95_ms": 88.843,
+      "paths": [
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot"
+      ],
+      "replayed_events": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ms": [
+        86.822,
+        84.934,
+        88.843,
+        86.656,
+        84.136,
+        87.508,
+        88.324
+      ],
+      "scenario": "resume_after_5_min_gap",
+      "stream_gaps": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "resume_after_5_min_gap_legacy_client": {
+      "bytes": [
+        129191,
+        129191,
+        129191,
+        129191,
+        129191,
+        129191,
+        129191
+      ],
+      "bytes_p50": 129191,
+      "header_sent": false,
+      "max_ms": 90.026,
+      "n": 7,
+      "p50_ms": 86.563,
+      "p95_ms": 90.026,
+      "paths": [
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot",
+        "baseline_snapshot"
+      ],
+      "replayed_events": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ms": [
+        86.14,
+        86.563,
+        86.991,
+        85.31,
+        84.828,
+        90.026,
+        88.732
+      ],
+      "scenario": "resume_after_5_min_gap_legacy_client",
+      "stream_gaps": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "before_commit": "cb90e98cb",
+  "date": "2026-10-07",
+  "load_averages": [
+    "2:02  up 3 days, 13:10, 4 users, load averages: 19.63 15.93 18.98",
+    " 2:03  up 3 days, 13:10, 4 users, load averages: 19.38 16.25 18.99",
+    " 2:03  up 3 days, 13:10, 4 users, load averages: 14.07 15.29 18.55"
+  ],
+  "machine": "Apple M5 Max, macOS 27.0.1",
+  "slice": "C8"
+}

@@ -384,6 +384,12 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         return queuedBytes
     }
 
+    /// False once the queue is closing or closed.
+    var isOpen: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return state == .open
+    }
+
     var queuedFrameCountForTests: Int {
         lock.lock(); defer { lock.unlock() }
         return queuedFrames

@@ -2573,7 +2573,25 @@ public final class JSONRPCDispatcher {
             case "events.recent":
                 let sinceSeq = params["since_seq"]?.intValue.map(Int64.init) ?? 0
                 let maxBytes = params["max_bytes"]?.intValue
-                let result = EventBus.shared.recentEvents(since: sinceSeq, maxBytes: maxBytes)
+                // C8: `durable: true` (after the welcome capability
+                // `events.durable_replay_v1`) replays the event log when the
+                // ring no longer reaches the cursor. Absent keeps the old shape.
+                let durable: Bool
+                switch params["durable"] {
+                case nil: durable = false
+                case .bool(let value)?: durable = value
+                default: throw JSONRPCError.invalidParams
+                }
+                let result: EventBus.RecentEventsResult
+                var streamGaps: [EventBus.StreamGap] = []
+                if durable {
+                    // The event-log read uses the read-only connection, off main.
+                    (result, streamGaps) = await Task.detached(priority: .userInitiated) {
+                        EventBus.shared.durableRecentEvents(since: sinceSeq, maxBytes: maxBytes)
+                    }.value
+                } else {
+                    result = EventBus.shared.recentEvents(since: sinceSeq, maxBytes: maxBytes)
+                }
                 let arr: [JSONValue] = result.events.map { ev in
                     var envelope: [String: JSONValue] = [
                         "seq": .number(Double(ev.seq)),
@@ -2601,6 +2619,19 @@ public final class JSONRPCDispatcher {
                         "minor": .number(0),
                     ]),
                 ]
+                if durable {
+                    response["stream_gaps"] = .array(streamGaps.map { gap in
+                        var object: [String: JSONValue] = [
+                            "since_seq": .number(Double(gap.sinceSequence)),
+                            "through_seq": .number(Double(gap.throughSequence)),
+                        ]
+                        switch gap.stream {
+                        case .thread(let id): object["thread_id"] = .string(id)
+                        case .surface(let id): object["surface_id"] = .string(id)
+                        }
+                        return .object(object)
+                    })
+                }
                 if let eventIdentity {
                     response["host_id"] = .string(eventIdentity.hostId)
                     response["boot_epoch"] = .number(Double(eventIdentity.bootEpoch))

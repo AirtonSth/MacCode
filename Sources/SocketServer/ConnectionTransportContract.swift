@@ -310,6 +310,8 @@ struct ConnectionWelcomeFrame: Codable, Equatable, Sendable {
     /// decode welcome with an exact key set keep working.
     var apiVersion: String? = nil
     var capabilitiesDigest: String? = nil
+    /// C8: present only on durable-replay sockets (see `DurableReplayContract`).
+    var replayFromSequence: Int64? = nil
 }
 
 /// C-W: opt-in welcome fields that let a pinned client validate a reconnect
@@ -540,6 +542,9 @@ enum ConnectionTransportFrame: Equatable, Sendable {
     case event(ConnectionEventFrame)
     case baselineRequired(ConnectionBaselineRequiredFrame)
     case snapshot(ConnectionSnapshotFrame)
+    /// C8: durable-replay sockets only.
+    case streamGap(ConnectionStreamGapFrame)
+    case replayComplete(ConnectionReplayCompleteFrame)
 
     func encoded() throws -> Data {
         Self.codecLock.lock()
@@ -553,6 +558,8 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         case .event(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         case .baselineRequired(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         case .snapshot(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .streamGap(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .replayComplete(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         }
         guard data.count <= Self.maximumEncodedBytes else {
             throw ConnectionProtocolFailure.frameTooLarge
@@ -594,6 +601,9 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             if !ConnectionWelcomeIdentity.keys.isDisjoint(with: object.keys) {
                 allowedKeys = allowedKeys.union(ConnectionWelcomeIdentity.keys)
             }
+            if object[DurableReplayContract.welcomeKey] != nil {
+                allowedKeys.insert(DurableReplayContract.welcomeKey)
+            }
         case "heartbeat":
             allowedKeys = [
                 "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
@@ -623,6 +633,18 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             allowedKeys = [
                 "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
                 "sequence", "snapshotId", "generatedAtEpochMs", "stateVersion", "state",
+            ]
+        case "streamGap":
+            allowedKeys = [
+                "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
+                "sinceSequence", "throughSequence",
+            ]
+            if object["threadId"] != nil { allowedKeys.insert("threadId") }
+            if object["surfaceId"] != nil { allowedKeys.insert("surfaceId") }
+        case "replayComplete":
+            allowedKeys = [
+                "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
+                "throughSequence",
             ]
         default:
             throw ConnectionProtocolFailure.unknownType
@@ -669,6 +691,14 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 let frame = try sharedDecoder.decode(ConnectionSnapshotFrame.self, from: data)
                 try validate(frame)
                 return .snapshot(frame)
+            case "streamGap":
+                let frame = try sharedDecoder.decode(ConnectionStreamGapFrame.self, from: data)
+                try validate(frame)
+                return .streamGap(frame)
+            case "replayComplete":
+                let frame = try sharedDecoder.decode(ConnectionReplayCompleteFrame.self, from: data)
+                try validate(frame)
+                return .replayComplete(frame)
             default: throw ConnectionProtocolFailure.unknownType
             }
         } catch let failure as ConnectionProtocolFailure {
@@ -702,7 +732,8 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 "bootEpoch", "serverTimeEpochMs", "heartbeatIntervalMs",
                 "heartbeatTimeoutMs", "snapshotTimeoutMs",
                 "currentSequence", "oldestReplaySequence",
-            ]
+            ] + (object[DurableReplayContract.welcomeKey] != nil
+                ? [DurableReplayContract.welcomeKey] : [])
         case "heartbeat":
             requiredKeys = ["bootEpoch", "sentAtEpochMs", "lastReceivedSequence"]
         case "closing":
@@ -715,6 +746,10 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             requiredKeys = ["bootEpoch", "requestedAfterSequence", "currentSequence"]
         case "snapshot":
             requiredKeys = ["bootEpoch", "sequence", "generatedAtEpochMs", "stateVersion"]
+        case "streamGap":
+            requiredKeys = ["bootEpoch", "sinceSequence", "throughSequence"]
+        case "replayComplete":
+            requiredKeys = ["bootEpoch", "throughSequence"]
         default:
             return false
         }
@@ -763,6 +798,10 @@ enum ConnectionTransportFrame: Equatable, Sendable {
               frame.oldestReplaySequence <= frame.currentSequence,
               !frame.capabilities.isEmpty,
               Set(frame.capabilities).count == frame.capabilities.count else {
+            throw ConnectionProtocolFailure.invalidFrame
+        }
+        if let replayFrom = frame.replayFromSequence,
+           !(0...frame.currentSequence).contains(replayFrom) {
             throw ConnectionProtocolFailure.invalidFrame
         }
         // C-W: the identity extension is all-or-nothing.
@@ -863,6 +902,36 @@ enum ConnectionTransportFrame: Equatable, Sendable {
               frame.snapshotMethod == "sync.snapshot" else {
             throw ConnectionProtocolFailure.invalidFrame
         }
+    }
+
+    private static func validate(_ frame: ConnectionStreamGapFrame) throws {
+        try validateCommon(
+            protocolVersion: frame.protocolVersion,
+            type: frame.type,
+            expectedType: "streamGap",
+            connectionId: frame.connectionId,
+            hostId: frame.hostId,
+            bootEpoch: frame.bootEpoch
+        )
+        let streamIDs = [frame.threadId, frame.surfaceId].compactMap { $0 }
+        guard streamIDs.count == 1,
+              streamIDs.allSatisfy(isNonEmpty),
+              frame.sinceSequence >= 0,
+              frame.throughSequence > frame.sinceSequence else {
+            throw ConnectionProtocolFailure.invalidFrame
+        }
+    }
+
+    private static func validate(_ frame: ConnectionReplayCompleteFrame) throws {
+        try validateCommon(
+            protocolVersion: frame.protocolVersion,
+            type: frame.type,
+            expectedType: "replayComplete",
+            connectionId: frame.connectionId,
+            hostId: frame.hostId,
+            bootEpoch: frame.bootEpoch
+        )
+        guard frame.throughSequence >= 0 else { throw ConnectionProtocolFailure.invalidFrame }
     }
 
     private static func validate(_ frame: ConnectionSnapshotFrame) throws {

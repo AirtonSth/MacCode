@@ -973,6 +973,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxAttachmentUploadRequestBodyBytes = 36 * 1024 * 1024
     static let maxClientFramePayloadBytes = WebSocketClientFrameAssembler.maxFragmentedMessageBytes
     public static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
+    /// C8: one durable-replay slice; the next waits until the outbound queue
+    /// is back under it (a quarter of the queue, so live frames keep room).
+    static let durableReplaySliceBytes = maxWebSocketOutboundQueuedBytes / 4
 
     /// Baseline welcome capabilities required by old and new peers. Optional
     /// negotiated controls (e.g. `stream.interest.v1`) are appended only when
@@ -983,6 +986,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         SnapshotChunkCapability.wireName,
         sequenceOmissionsCapability,
         ConnectionSnapshotThreadWindow.capability,
+        DurableReplayContract.capability,
     ]
 
     /// Every WS filter (including the default `.full`) may skip sequences:
@@ -1542,6 +1546,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Per-reason `/v1/ws` close counters (/v1/health) and the rate-limited
     /// `diagnostic.ws_connection_closed` event.
     public let wsCloseDiagnostics = WebSocketCloseDiagnostics()
+    /// C8: durable-replay resume outcomes (/v1/health `durable_replay`).
+    public let durableReplayMetrics = DurableReplayMetrics()
     /// Secret-free HTTP/RPC phase aggregates (admit/read/encode/write).
     public let requestPhaseMetrics = HTTPRequestPhaseMetrics()
     private let activeWebSocketConnections = ActiveWebSocketConnectionRegistry()
@@ -2689,14 +2695,73 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let requestedResumeBootEpoch = headers["x-rc2-resume-boot-epoch"]
                 .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
-            let wsSinceSeq = Self.acceptedResumeSequence(
-                requestedSinceSequence: requestedSinceSequence,
-                requestedResumeHost: requestedResumeHost,
-                requestedResumeBootEpoch: requestedResumeBootEpoch,
-                serverId: serverId,
-                bootEpoch: Int64(bootEpoch),
-                currentSequence: eventSnapshot.sequence
+            // C8: opt-in durable replay (event log + stream gaps, previous-boot
+            // cursors). Without the header nothing below changes.
+            let durableReplayRequested = DurableReplayContract.isRequested(
+                header: headers[DurableReplayContract.header]
             )
+            let wsSinceSeq: Int64
+            var durablePreviousBoot = false
+            if durableReplayRequested {
+                (wsSinceSeq, durablePreviousBoot) = DurableReplayContract.acceptedResume(
+                    requestedSinceSequence: requestedSinceSequence,
+                    requestedResumeHost: requestedResumeHost,
+                    requestedResumeBootEpoch: requestedResumeBootEpoch,
+                    serverId: serverId,
+                    bootEpoch: Int64(bootEpoch),
+                    currentSequence: eventSnapshot.sequence,
+                    previousBoot: EventBus.shared.previousBootReplay
+                )
+            } else {
+                wsSinceSeq = Self.acceptedResumeSequence(
+                    requestedSinceSequence: requestedSinceSequence,
+                    requestedResumeHost: requestedResumeHost,
+                    requestedResumeBootEpoch: requestedResumeBootEpoch,
+                    serverId: serverId,
+                    bootEpoch: Int64(bootEpoch),
+                    currentSequence: eventSnapshot.sequence
+                )
+            }
+            // Subscribed before the welcome: live events buffer until the
+            // backlog is out, and the welcome reports the plan it got.
+            let durableSubscription = durableReplayRequested
+                ? EventBus.shared.subscribeDurableReplay(
+                    since: wsSinceSeq,
+                    previousBoot: durablePreviousBoot,
+                    filter: wsFilter
+                )
+                : nil
+            if let durableSubscription { subID = durableSubscription.id }
+            var durableFirstPage: EventBus.DurableReplayPage?
+            var durableNeedsBaseline = durableSubscription.map { subscription in
+                subscription.plan.outcome == .baselineRequired
+                    || EventBus.shared.durableReplayExceedsBudget(
+                        subscription.plan,
+                        maxBytes: DurableReplayContract.maximumReplayBytes
+                    )
+            } ?? false
+            if !durableNeedsBaseline,
+               let plan = durableSubscription?.plan,
+               plan.outcome == .replay,
+               plan.durableThrough > plan.since {
+                // Proves the event log still reaches the cursor before the
+                // welcome promises a replay.
+                durableFirstPage = EventBus.shared.readDurableReplayPage(
+                    after: plan.since,
+                    through: plan.durableThrough,
+                    maxBytes: Self.durableReplaySliceBytes
+                )
+                durableNeedsBaseline = durableFirstPage == nil
+            }
+            let welcomeCurrentSequence = durableSubscription?.plan.head ?? eventSnapshot.sequence
+            let welcomeOldestReplaySequence: Int64 = {
+                guard let plan = durableSubscription?.plan else {
+                    return eventSnapshot.oldestReplaySequence
+                }
+                return durableNeedsBaseline
+                    ? plan.metadata.oldestReplaySequence
+                    : min(plan.since + 1, plan.head)
+            }()
             let sequenceWatermark = ConnectionSequenceWatermark(initialSequence: wsSinceSeq)
             // C-W: only a client that asks gets the extra welcome fields.
             let welcomeIdentityRequested = ConnectionWelcomeIdentity.isRequested(
@@ -2712,8 +2777,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 heartbeatIntervalMs: heartbeat.intervalMs,
                 heartbeatTimeoutMs: heartbeat.timeoutMs,
                 snapshotTimeoutMs: snapshotTimeoutMs,
-                currentSequence: eventSnapshot.sequence,
-                oldestReplaySequence: eventSnapshot.oldestReplaySequence,
+                currentSequence: welcomeCurrentSequence,
+                oldestReplaySequence: welcomeOldestReplaySequence,
                 // Snapshot deltas and replay are advertised independently of
                 // the event-only WebSocket transport.
                 // stream.interest.v1 only when the host applies rc2.interest
@@ -2725,7 +2790,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         loopbackOnly: bindLoopbackOnly,
                         attachmentUpload: dispatcher.agentAttachmentUploadCapability
                     ).digest
-                    : nil
+                    : nil,
+                replayFromSequence: durableSubscription.map { subscription in
+                    durableNeedsBaseline ? subscription.plan.head : subscription.plan.since
+                }
             ))
             activeWebSocketConnections.insert(
                 connectionId,
@@ -2978,50 +3046,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     enqueueEventOrDegrade(frame)
                 }
             )
-            // PERF-MAC_SOCKET-:110 -- honor the client's last-seen seq so a
-            // reconnect receives only the delta (events after that seq), not the
-            // full retained backlog (~4 MiB on a busy session).
-            // Slice boundary: EventBus.subscribe delivers event.seq > since, so
-            // the first event the client receives is the first it has NOT yet seen.
-            // A missing or non-numeric header falls back to 0 (full backlog) so
-            // first-connect and legacy clients continue to work correctly.
-            let id = EventBus.shared.subscribeDetectingReplayExpiry(
-                since: wsSinceSeq,
-                filter: wsFilter,
-                onReplayExpired: { metadata in
-                    closeRecord.markReplayExpired()
-                    // The delivery cursor re-anchored to the live head
-                    // (metadata.sequence); the gap watermark must follow BEFORE
-                    // any live event is enqueued, or the first event after
-                    // baselineRequired reads as a gap and closes 1012.
-                    sequenceWatermark.reanchorForExpiredReplay(
-                        sequence: metadata.sequence
-                    )
-                    guard let data = self.connectionBaselineRequiredData(
-                        connectionId: connectionId,
-                        requestedAfterSequence: wsSinceSeq,
-                        currentSequence: metadata.sequence
-                    ) else { return }
-                    // C-04: never close for queue pressure; degrade and retry.
-                    switch outbound.enqueueApplication(data) {
-                    case .accepted:
-                        break
-                    case .queueFull:
-                        _ = outbound.degrade()
-                        if outbound.enqueueApplication(data) == .queueFull {
-                            emitPressureBaseline()
-                        }
-                    case .closed:
-                        break
-                    }
-                },
-                onFilteredEvent: { sequence in
-                    // A seq dropped by this connection's negotiated filter is
-                    // not a gap; account for it so the next delivered event
-                    // stays contiguous instead of closing 1012.
-                    sequenceWatermark.recordFilteredEvent(sequence: sequence)
-                }
-            ) { ev in
+            // Live delivery of one event; durable replay feeds its backlog
+            // through the same path so frames and gap accounting match.
+            let deliverEvent: (EventBus.Event) -> Void = { ev in
                 if let knownEvent = ev.knownEvent {
                     batcher.enqueue(KnownConnectionEventFrame(
                         event: knownEvent,
@@ -3087,6 +3114,149 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 case .closed:
                     break
                 }
+            }
+            let deliverFiltered: (Int64) -> Void = { sequence in
+                // A seq dropped by this connection's negotiated filter is
+                // not a gap; account for it so the next delivered event
+                // stays contiguous instead of closing 1012.
+                sequenceWatermark.recordFilteredEvent(sequence: sequence)
+            }
+            let requireBaseline: (Int64) -> Void = { head in
+                closeRecord.markReplayExpired()
+                // The delivery cursor re-anchored to the live head; the gap
+                // watermark must follow BEFORE any live event is enqueued, or
+                // the first event after baselineRequired reads as a gap and
+                // closes 1012.
+                sequenceWatermark.reanchorForExpiredReplay(sequence: head)
+                guard let data = self.connectionBaselineRequiredData(
+                    connectionId: connectionId,
+                    requestedAfterSequence: wsSinceSeq,
+                    currentSequence: head
+                ) else { return }
+                // C-04: never close for queue pressure; degrade and retry.
+                switch outbound.enqueueApplication(data) {
+                case .accepted:
+                    break
+                case .queueFull:
+                    _ = outbound.degrade()
+                    if outbound.enqueueApplication(data) == .queueFull {
+                        emitPressureBaseline()
+                    }
+                case .closed:
+                    break
+                }
+            }
+            let id: UUID
+            if let durableSubscription {
+                // C8: stream the backlog off this thread and off the EventBus
+                // delivery queue; live events wait in the subscription.
+                id = durableSubscription.id
+                let driver = DurableReplayDriver(
+                    sliceBytes: Self.durableReplaySliceBytes,
+                    firstPage: durableFirstPage,
+                    readPage: { after, through, maxBytes in
+                        EventBus.shared.readDurableReplayPage(
+                            after: after, through: through, maxBytes: maxBytes
+                        )
+                    },
+                    deliverEvent: deliverEvent,
+                    deliverFiltered: deliverFiltered,
+                    advanceWatermark: { sequence in
+                        batcher.flush()
+                        sequenceWatermark.reanchorForExpiredReplay(sequence: sequence)
+                    },
+                    queuedBytes: { outbound.queuedByteCount },
+                    isOpen: { outbound.isOpen },
+                    sendGap: { gap in
+                        guard let data = DurableReplayContract.streamGapData(
+                            connectionId: connectionId,
+                            hostId: self.serverId,
+                            bootEpoch: self.bootEpoch,
+                            gap: gap
+                        ) else { return false }
+                        switch outbound.enqueueApplication(data) {
+                        case .accepted:
+                            return true
+                        case .queueFull:
+                            _ = outbound.degrade()
+                            return outbound.enqueueApplication(data) == .accepted
+                        case .closed:
+                            return false
+                        }
+                    },
+                    requireBaseline: { head in
+                        batcher.flush()
+                        requireBaseline(head)
+                    }
+                )
+                let needsBaseline = durableNeedsBaseline
+                let metrics = durableReplayMetrics
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let started = DispatchTime.now()
+                    let plan = durableSubscription.plan
+                    let outcome: DurableReplayDriver.Outcome
+                    if needsBaseline {
+                        requireBaseline(plan.head)
+                        outcome = .baselineRequired
+                    } else if plan.outcome == .replay {
+                        outcome = driver.run(subscription: durableSubscription)
+                    } else {
+                        outcome = .completed(eventsReplayed: 0, gapsSent: 0)
+                    }
+                    metrics.record(outcome)
+                    NSLog(
+                        "[RC2.WS] durable replay since=%lld head=%lld outcome=%@ ms=%.1f",
+                        plan.since,
+                        plan.head,
+                        String(describing: outcome),
+                        Double(DispatchTime.now().uptimeNanoseconds &- started.uptimeNanoseconds) / 1_000_000
+                    )
+                    guard outcome != .closed else { return }
+                    batcher.flush()
+                    if case .completed = outcome,
+                       let complete = DurableReplayContract.replayCompleteData(
+                           connectionId: connectionId,
+                           hostId: self.serverId,
+                           bootEpoch: self.bootEpoch,
+                           throughSequence: plan.head
+                       ),
+                       outbound.enqueueApplication(complete) != .accepted {
+                        // Without the end marker the client cannot finish
+                        // catch-up; fall back to the baseline it handles anyway.
+                        _ = outbound.degrade()
+                        if outbound.enqueueApplication(complete) != .accepted {
+                            requireBaseline(plan.head)
+                        }
+                    }
+                    durableSubscription.goLive(
+                        deliver: { item in
+                            switch item {
+                            case .event(let event): deliverEvent(event)
+                            case .filtered(let sequence): deliverFiltered(sequence)
+                            }
+                        },
+                        onOverflow: { lastSequence in
+                            batcher.flush()
+                            metrics.recordOverflow()
+                            requireBaseline(lastSequence)
+                        }
+                    )
+                }
+            } else {
+                // PERF-MAC_SOCKET-:110 -- honor the client's last-seen seq so a
+                // reconnect receives only the delta (events after that seq), not the
+                // full retained backlog (~4 MiB on a busy session).
+                // Slice boundary: EventBus.subscribe delivers event.seq > since, so
+                // the first event the client receives is the first it has NOT yet seen.
+                // A missing or non-numeric header falls back to 0 (full backlog) so
+                // first-connect and legacy clients continue to work correctly.
+                id = EventBus.shared.subscribeDetectingReplayExpiry(
+                    since: wsSinceSeq,
+                    filter: wsFilter,
+                    onReplayExpired: { metadata in requireBaseline(metadata.sequence) },
+                    onFilteredEvent: deliverFiltered,
+                    deliverEvent
+                )
             }
             subIDBox.value = id
             subID = id
@@ -3411,6 +3581,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     outboundQueueWait: wsTracker.outboundQueueWaitMetrics
                 ),
                 "connection_closes": wsCloseDiagnostics.healthJSON(),
+                "durable_replay": durableReplayMetrics.healthJSON(),
                 "request_phases": Self.requestPhaseMetricsJSON(phaseMetrics),
                 "command_receipts": [
                     "claims_total": receiptMetrics.claimsTotal,

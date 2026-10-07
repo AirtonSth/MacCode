@@ -187,6 +187,32 @@ public final class EventBus: @unchecked Sendable {
         let handler: (Event) -> Void
     }
 
+    // MARK: C8 durable replay state (all guarded by `lock`)
+
+    /// Every seq in `(ringCoverageFloor, lastSeq]` is in `recent` or is a lost
+    /// replay-only event recorded in `lostStreams`. Older state-bearing events
+    /// come from the durable event log.
+    private var ringCoverageFloor: Int64 = 0
+    /// Newest lost replay-only seq per stream (ring eviction or not retained).
+    private var lostStreams: [StreamGap.Stream: Int64] = [:]
+    /// Newest seq whose ledger entry was dropped to bound `lostStreams`. A
+    /// cursor below it cannot be told which streams lost events.
+    private var lostStreamsOverflowFloor: Int64 = 0
+    static let lostStreamLedgerLimit = 1_024
+    /// Durable (persisted) seqs published but not yet acknowledged by the
+    /// event-log writer, oldest first from `pendingDurableHead`.
+    private var pendingDurableSeqs: [Int64] = []
+    private var pendingDurableHead = 0
+    private var acknowledgedDurableSeqs = Set<Int64>()
+    /// Newest seq that may be missing from the event log (a failed write, or
+    /// published before durable tracking was wired).
+    private var durableHoleFloor: Int64 = 0
+    private var durableReplaySourceStorage: DurableReplaySource?
+    private var previousBootReplayStorage: PreviousBootReplay?
+    /// Set once a quit recorded its resume state: a later non-diagnostic
+    /// event would make that record lie, so it invalidates it (once).
+    private var resumeRecordInvalidation: (() -> Void)?
+
     private var subscribers: [UUID: Subscriber] = [:]
     /// Cached flat array rebuilt only when subscribers are added or removed.
     /// publish() reads this instead of copying subscribers.values every call.
@@ -472,7 +498,10 @@ public final class EventBus: @unchecked Sendable {
             let events = try commit(floor)
             var deliveries: [(Event, [Subscriber])] = []
             lock.lock()
+            var invalidateResumeRecord: (() -> Void)?
             for event in events {
+                invalidateResumeRecord = invalidateResumeRecord
+                    ?? takeResumeRecordInvalidationLocked(kind: event.kind)
                 precondition(event.seq > lastSeq)
                 lastSeq = event.seq
                 domainRevisions = Self.revisions(after: event, current: domainRevisions)
@@ -482,6 +511,7 @@ public final class EventBus: @unchecked Sendable {
             }
             lock.unlock()
             snapshotBarrierLock.unlock()
+            invalidateResumeRecord?()
             for (event, subscribers) in deliveries {
                 for subscriber in subscribers {
                     guard let mapped = subscriber.filter.map(event) else {
@@ -515,8 +545,14 @@ public final class EventBus: @unchecked Sendable {
         retainRecentOrStandIn(ev)
         let subs = subscribersSnapshot
         let p = persister
+        if p != nil, durableReplaySourceStorage != nil,
+           !Self.liveOnlyStreamEventKinds.contains(kind) {
+            pendingDurableSeqs.append(ev.seq)
+        }
+        let invalidateResumeRecord = takeResumeRecordInvalidationLocked(kind: kind)
         lock.unlock()
         snapshotBarrierLock.unlock()
+        invalidateResumeRecord?()
         for s in subs {
             guard let mapped = s.filter.map(ev) else {
                 s.onFilteredEvent(ev.seq)
@@ -552,6 +588,9 @@ public final class EventBus: @unchecked Sendable {
         // added between the two lock regions; sizes are already walked via newSizes.
         lock.lock()
         self.lastSeq = max(self.lastSeq, lastSeq)
+        // Everything up to the persisted head is in the event log; reloaded
+        // rows (oldest first) are below it and never count as ring coverage.
+        raiseRingCoverageFloorLocked(to: lastSeq)
         snapshotStateRevision = max(snapshotStateRevision, self.lastSeq)
         snapshotFenceRevision = max(snapshotFenceRevision, self.lastSeq)
         let liveKnown = Set(self.recent.map(\.seq))
@@ -812,6 +851,485 @@ public final class EventBus: @unchecked Sendable {
         return floor
     }
 
+    // MARK: - C8 durable replay
+
+    /// Kinds the event log never stores: the live-only stream kinds plus the
+    /// `surface.output.summary` ring stand-in. A lost one cannot be replayed,
+    /// so durable replay reports its stream as a `StreamGap` instead.
+    static let replayOnlyKinds: Set<String> = liveOnlyStreamEventKinds
+        .union([RemoteCodeEventKind.surfaceOutputSummary.rawValue])
+
+    /// Stream whose replay-only events were lost before a cursor caught up.
+    public struct StreamGap: Equatable, Sendable {
+        public enum Stream: Hashable, Sendable {
+            /// `agent.item.delta` / `agent.item.progress`: refetch the thread tail.
+            case thread(String)
+            /// `surface.output` (or its summary stand-in): refetch the terminal.
+            case surface(String)
+        }
+
+        public let stream: Stream
+        /// The client's cursor: events after it may be missing for this stream.
+        public let sinceSequence: Int64
+        /// Newest lost (or, once a stream has a gap, skipped) event of this stream.
+        public let throughSequence: Int64
+    }
+
+    /// One page from the durable event log: durable events with seq in
+    /// `(after, through]`, oldest first. `anchored` is false when no row with
+    /// seq <= `after` is left, so retention may have pruned events after it.
+    public struct DurableReplaySourcePage: Sendable {
+        public let events: [Event]
+        public let anchored: Bool
+
+        public init(events: [Event], anchored: Bool) {
+            self.events = events
+            self.anchored = anchored
+        }
+    }
+
+    /// The event log on a read-only connection.
+    public struct DurableReplaySource: Sendable {
+        /// `(after, through, limit)`: one page of durable events.
+        public var page: @Sendable (Int64, Int64, Int) throws -> DurableReplaySourcePage
+        /// `(after, through)`: stored rows and their kind + payload bytes.
+        public var estimate: @Sendable (Int64, Int64) throws -> (rows: Int, bytes: Int)
+
+        public init(
+            page: @escaping @Sendable (Int64, Int64, Int) throws -> DurableReplaySourcePage,
+            estimate: @escaping @Sendable (Int64, Int64) throws -> (rows: Int, bytes: Int)
+        ) {
+            self.page = page
+            self.estimate = estimate
+        }
+    }
+
+    /// Envelope bytes a replayed event frame adds to its kind and payload
+    /// (measured: about 195 per frame on the C8 receipt workload).
+    static let replayFrameOverheadBytes = 200
+
+    /// What the previous process left for cursors from its boot epoch
+    /// (written only after a clean, fully flushed shutdown).
+    public struct PreviousBootReplay: Equatable, Sendable {
+        public let bootEpoch: UInt64
+        /// Last seq the previous boot published. This boot starts above it.
+        public let highWater: Int64
+        /// Replay-only events of the previous boot are all gone after a
+        /// restart: the newest one per stream.
+        public let lostStreams: [StreamGap.Stream: Int64]
+        /// A cursor below this cannot be served (dropped ledger entries or
+        /// event-log holes in the previous boot).
+        public let minimumCursor: Int64
+
+        public init(
+            bootEpoch: UInt64,
+            highWater: Int64,
+            lostStreams: [StreamGap.Stream: Int64],
+            minimumCursor: Int64
+        ) {
+            self.bootEpoch = bootEpoch
+            self.highWater = highWater
+            self.lostStreams = lostStreams
+            self.minimumCursor = minimumCursor
+        }
+    }
+
+    public struct DurableReplayPlan: Sendable {
+        public enum Outcome: Equatable, Sendable {
+            /// The cursor is at the head: nothing to replay.
+            case live
+            /// Replay the event log for `(since, durableThrough]`, then
+            /// `ringBacklog`, then report `streamGaps`.
+            case replay
+            /// The cursor cannot be served: the client needs a baseline.
+            case baselineRequired
+        }
+
+        public let outcome: Outcome
+        public let since: Int64
+        /// `lastSeq` when the plan was taken. Live delivery starts after it.
+        public let head: Int64
+        /// Event-log range is `(since, durableThrough]`; equal to `since`
+        /// when the ring alone covers the cursor.
+        public let durableThrough: Int64
+        /// Ring events in `(durableThrough, head]`, unfiltered, oldest first.
+        public let ringBacklog: [Event]
+        public let streamGaps: [StreamGap]
+        public let metadata: SnapshotMetadata
+    }
+
+    /// Wires the read side of the event log. Setting it (re)starts durable
+    /// tracking: anything published before is treated as possibly missing.
+    public var durableReplaySource: DurableReplaySource? {
+        get {
+            lock.lock(); defer { lock.unlock() }
+            return durableReplaySourceStorage
+        }
+        set {
+            lock.lock(); defer { lock.unlock() }
+            durableReplaySourceStorage = newValue
+            pendingDurableSeqs.removeAll()
+            pendingDurableHead = 0
+            acknowledgedDurableSeqs.removeAll()
+            durableHoleFloor = max(durableHoleFloor, lastSeq)
+        }
+    }
+
+    /// The event-log writer reports a finished batch. Failed rows are not in
+    /// the log, so no cursor below them can use durable replay.
+    public func acknowledgeDurablePersistence(sequences: [Int64], succeeded: Bool) {
+        guard !sequences.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        if !succeeded, let newest = sequences.max() {
+            durableHoleFloor = max(durableHoleFloor, newest)
+        }
+        acknowledgedDurableSeqs.formUnion(sequences)
+        while pendingDurableHead < pendingDurableSeqs.count,
+              acknowledgedDurableSeqs.remove(pendingDurableSeqs[pendingDurableHead]) != nil {
+            pendingDurableHead += 1
+        }
+        if pendingDurableHead > 1_024, pendingDurableHead * 2 > pendingDurableSeqs.count {
+            pendingDurableSeqs.removeFirst(pendingDurableHead)
+            pendingDurableHead = 0
+        }
+    }
+
+    /// Every durable event with seq <= this is in the event log.
+    private func persistedThroughLocked() -> Int64 {
+        pendingDurableHead < pendingDurableSeqs.count
+            ? pendingDurableSeqs[pendingDurableHead] - 1
+            : lastSeq
+    }
+
+    /// State the next boot needs to serve this boot's cursors. Nil while
+    /// durable writes are still pending (the log is not complete yet).
+    public func durableResumeState() -> PreviousBootReplay? {
+        lock.lock(); defer { lock.unlock() }
+        guard durableReplaySourceStorage != nil,
+              persistedThroughLocked() >= lastSeq else { return nil }
+        // After a restart the ring is gone too: every replay-only event of
+        // this boot is lost, not only the ones the ring already dropped.
+        var streams = lostStreams
+        for event in recent where Self.replayOnlyKinds.contains(event.kind) {
+            guard let stream = Self.replayStream(of: event) else { continue }
+            streams[stream] = max(streams[stream] ?? 0, event.seq)
+        }
+        var minimumCursor = max(lostStreamsOverflowFloor, durableHoleFloor)
+        if streams.count > Self.lostStreamLedgerLimit {
+            let kept = streams.sorted { $0.value > $1.value }.prefix(Self.lostStreamLedgerLimit)
+            let droppedNewest = streams.values.sorted(by: >)
+                .dropFirst(Self.lostStreamLedgerLimit).first ?? 0
+            minimumCursor = max(minimumCursor, droppedNewest)
+            streams = Dictionary(uniqueKeysWithValues: kept.map { ($0.key, $0.value) })
+        }
+        return PreviousBootReplay(
+            bootEpoch: 0,
+            highWater: lastSeq,
+            lostStreams: streams,
+            minimumCursor: minimumCursor
+        )
+    }
+
+    /// Arms `invalidate` to run once if any non-diagnostic event is published
+    /// after the quit recorded its resume state.
+    public func sealDurableResume(invalidate: @escaping () -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        resumeRecordInvalidation = invalidate
+    }
+
+    private func takeResumeRecordInvalidationLocked(kind: String) -> (() -> Void)? {
+        guard let invalidate = resumeRecordInvalidation,
+              !kind.hasPrefix("diagnostic.") else { return nil }
+        resumeRecordInvalidation = nil
+        return invalidate
+    }
+
+    /// Installs what the previous clean boot left. This boot's sequence
+    /// continues above its high water, so no seq a client saw is reused.
+    public func installPreviousBootReplay(_ previous: PreviousBootReplay) {
+        lock.lock(); defer { lock.unlock() }
+        lastSeq = max(lastSeq, previous.highWater)
+        snapshotStateRevision = max(snapshotStateRevision, lastSeq)
+        snapshotFenceRevision = max(snapshotFenceRevision, lastSeq)
+        raiseRingCoverageFloorLocked(to: lastSeq)
+        previousBootReplayStorage = previous
+    }
+
+    public var previousBootReplay: PreviousBootReplay? {
+        lock.lock(); defer { lock.unlock() }
+        return previousBootReplayStorage
+    }
+
+#if DEBUG
+    /// Test seam: the shared bus outlives a test that installed a record.
+    public func clearPreviousBootReplayForTesting() {
+        lock.lock(); defer { lock.unlock() }
+        previousBootReplayStorage = nil
+    }
+#endif
+
+    /// Plans a durable replay from `since`. `previousBoot` marks a cursor
+    /// accepted from the previous boot epoch.
+    public func durableReplayPlan(since: Int64, previousBoot: Bool = false) -> DurableReplayPlan {
+        lock.lock(); defer { lock.unlock() }
+        return durableReplayPlanLocked(since: since, previousBoot: previousBoot)
+    }
+
+    private func durableReplayPlanLocked(since: Int64, previousBoot: Bool) -> DurableReplayPlan {
+        let metadata = snapshotMetadataLocked()
+        let head = lastSeq
+        func plan(
+            _ outcome: DurableReplayPlan.Outcome,
+            durableThrough: Int64 = since,
+            ringBacklog: [Event] = [],
+            gaps: [StreamGap] = []
+        ) -> DurableReplayPlan {
+            DurableReplayPlan(
+                outcome: outcome,
+                since: since,
+                head: head,
+                durableThrough: durableThrough,
+                ringBacklog: ringBacklog,
+                streamGaps: gaps,
+                metadata: metadata
+            )
+        }
+        guard since >= 0 else { return plan(.baselineRequired) }
+        guard since < head else { return plan(.live) }
+        var lost: [StreamGap.Stream: Int64] = [:]
+        for (stream, seq) in lostStreams where seq > since {
+            lost[stream] = seq
+        }
+        if previousBoot {
+            guard let previous = previousBootReplayStorage,
+                  since >= previous.minimumCursor,
+                  since <= previous.highWater else {
+                return plan(.baselineRequired)
+            }
+            for (stream, seq) in previous.lostStreams where seq > since {
+                lost[stream] = max(lost[stream] ?? 0, seq)
+            }
+        }
+        if since < lostStreamsOverflowFloor { return plan(.baselineRequired) }
+        let durableThrough: Int64
+        if since >= ringCoverageFloor {
+            durableThrough = since
+        } else {
+            guard durableReplaySourceStorage != nil,
+                  since >= durableHoleFloor,
+                  persistedThroughLocked() >= ringCoverageFloor else {
+                return plan(.baselineRequired)
+            }
+            durableThrough = ringCoverageFloor
+        }
+        var backlog: [Event] = []
+        for event in recent where event.seq > durableThrough && event.seq <= head {
+            // A stream that already has a gap is refetched whole by the client,
+            // so its later replay-only events would only be resent bytes.
+            if Self.replayOnlyKinds.contains(event.kind),
+               let stream = Self.replayStream(of: event),
+               let lostThrough = lost[stream] {
+                lost[stream] = max(lostThrough, event.seq)
+                continue
+            }
+            backlog.append(event)
+        }
+        let gaps = lost
+            .map { StreamGap(stream: $0.key, sinceSequence: since, throughSequence: $0.value) }
+            .sorted { $0.throughSequence < $1.throughSequence }
+        return plan(.replay, durableThrough: durableThrough, ringBacklog: backlog, gaps: gaps)
+    }
+
+    /// Result of one bounded durable page.
+    public struct DurableReplayPage: Sendable {
+        public let events: [Event]
+        /// Highest seq this page accounts for (the next `after`).
+        public let coveredThrough: Int64
+        public let complete: Bool
+    }
+
+    /// Reads event-log events in `(after, through]` up to `maxBytes`
+    /// (always at least one event, so paging progresses). Nil when there is
+    /// no source, the read failed, or retention pruned past `after`.
+    public func readDurableReplayPage(
+        after: Int64,
+        through: Int64,
+        maxBytes: Int,
+        rowLimit: Int = 256
+    ) -> DurableReplayPage? {
+        guard after < through else {
+            return DurableReplayPage(events: [], coveredThrough: through, complete: true)
+        }
+        guard let source = durableReplaySource,
+              let page = try? source.page(after, through, max(1, rowLimit)),
+              page.anchored else { return nil }
+        var selected: [Event] = []
+        var used = 0
+        for event in page.events where event.seq > after && event.seq <= through {
+            let size = Self.retainedJSONByteCount(event)
+            if !selected.isEmpty, used + size > maxBytes {
+                return DurableReplayPage(
+                    events: selected,
+                    coveredThrough: selected[selected.count - 1].seq,
+                    complete: false
+                )
+            }
+            selected.append(event)
+            used += size
+        }
+        if page.events.count >= max(1, rowLimit), let last = selected.last {
+            return DurableReplayPage(events: selected, coveredThrough: last.seq, complete: false)
+        }
+        return DurableReplayPage(events: selected, coveredThrough: through, complete: true)
+    }
+
+    /// Estimated wire bytes of the event-log part of `plan` plus its ring
+    /// backlog. Nil when the plan needs no event log (the ring alone covers
+    /// the cursor, as for any client) or the estimate cannot be read.
+    public func estimatedDurableReplayBytes(_ plan: DurableReplayPlan) -> Int? {
+        guard plan.outcome == .replay, plan.durableThrough > plan.since,
+              let source = durableReplaySource,
+              let stored = try? source.estimate(plan.since, plan.durableThrough) else { return nil }
+        let ring = plan.ringBacklog.reduce(0) {
+            $0 + Self.retainedJSONByteCount($1) + Self.replayFrameOverheadBytes
+        }
+        return stored.bytes + stored.rows * Self.replayFrameOverheadBytes + ring
+    }
+
+    /// True when the plan replays from the event log and that replay is
+    /// estimated to cost more than `maxBytes` (or cannot be estimated): a
+    /// baseline is then the cheaper honest answer.
+    public func durableReplayExceedsBudget(_ plan: DurableReplayPlan, maxBytes: Int) -> Bool {
+        guard plan.outcome == .replay, plan.durableThrough > plan.since else { return false }
+        guard let estimate = estimatedDurableReplayBytes(plan) else { return true }
+        return estimate > maxBytes
+    }
+
+    /// Durable `events.recent`: event-log events, then ring events, one page
+    /// within `maxBytes`. `truncated` means more pages follow from the last
+    /// returned seq; `requiresBaseline` only when the cursor cannot be served.
+    public func durableRecentEvents(
+        since: Int64,
+        maxBytes: Int?,
+        replayBudgetBytes: Int = DurableReplayContract.maximumReplayBytes
+    ) -> (result: RecentEventsResult, streamGaps: [StreamGap]) {
+        let plan = durableReplayPlan(since: since)
+        let budget = (maxBytes ?? 0) > 0 ? maxBytes! : Int.max
+        switch plan.outcome {
+        case .live:
+            return (RecentEventsResult(lastSeq: plan.head, events: [], truncated: false,
+                                       requiresBaseline: false), [])
+        case .baselineRequired:
+            return (RecentEventsResult(lastSeq: plan.head, events: [], truncated: true,
+                                       requiresBaseline: true), [])
+        case .replay:
+            break
+        }
+        var events: [Event] = []
+        var used = 0
+        if plan.durableThrough > since {
+            guard !durableReplayExceedsBudget(plan, maxBytes: replayBudgetBytes),
+                  let page = readDurableReplayPage(
+                after: since, through: plan.durableThrough, maxBytes: budget
+            ) else {
+                return (RecentEventsResult(lastSeq: plan.head, events: [], truncated: true,
+                                           requiresBaseline: true), [])
+            }
+            events = page.events
+            used = page.events.reduce(0) { $0 + Self.retainedJSONByteCount($1) }
+            if !page.complete {
+                return (RecentEventsResult(lastSeq: plan.head, events: events, truncated: true,
+                                           requiresBaseline: false), plan.streamGaps)
+            }
+        }
+        for event in plan.ringBacklog {
+            let size = Self.retainedJSONByteCount(event)
+            if !events.isEmpty, used + size > budget {
+                return (RecentEventsResult(lastSeq: plan.head, events: events, truncated: true,
+                                           requiresBaseline: false), plan.streamGaps)
+            }
+            events.append(event)
+            used += size
+        }
+        return (RecentEventsResult(lastSeq: plan.head, events: events, truncated: false,
+                                   requiresBaseline: false), plan.streamGaps)
+    }
+
+    /// Subscribes for a durable replay. The subscriber buffers live events
+    /// until `DurableReplaySubscription.goLive` so the caller can stream the
+    /// backlog outside the delivery queue first.
+    public func subscribeDurableReplay(
+        since: Int64,
+        previousBoot: Bool = false,
+        filter: EventStreamFilter = .full
+    ) -> DurableReplaySubscription {
+        let register = { [self] () -> DurableReplaySubscription in
+            lock.lock()
+            let plan = durableReplayPlanLocked(since: since, previousBoot: previousBoot)
+            let id = UUID()
+            let subscription = DurableReplaySubscription(id: id, plan: plan, bus: self)
+            subscribers[id] = Subscriber(
+                filter: filter,
+                onFilteredEvent: { [weak subscription] seq in subscription?.receive(.filtered(seq)) },
+                handler: { [weak subscription] event in subscription?.receive(.event(event)) }
+            )
+            subscribersSnapshot = Array(subscribers.values)
+            lock.unlock()
+            Self.notifySubscriberAdded()
+            return subscription
+        }
+        if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
+            return register()
+        }
+        return deliveryQueue.sync(execute: register)
+    }
+
+    /// Maps a replayed event through the subscriber's current filter.
+    func mapForSubscriber(_ id: UUID, _ event: Event) -> Event? {
+        lock.lock()
+        let filter = subscribers[id]?.filter
+        lock.unlock()
+        return (filter ?? .full).map(event)
+    }
+
+    private static func replayStream(of event: Event) -> StreamGap.Stream? {
+        guard case .object(let payload) = event.payload else { return nil }
+        switch event.kind {
+        case RemoteCodeEventKind.agentItemDelta.rawValue,
+             RemoteCodeEventKind.agentItemProgress.rawValue:
+            guard let thread = payload["thread_id"]?.stringValue, !thread.isEmpty else { return nil }
+            return .thread(thread)
+        case RemoteCodeEventKind.surfaceOutput.rawValue,
+             RemoteCodeEventKind.surfaceOutputSummary.rawValue:
+            guard let surface = payload["surface_id"]?.stringValue, !surface.isEmpty else { return nil }
+            return .surface(surface)
+        default:
+            // agent.provider_runtime.event is diagnostics only.
+            return nil
+        }
+    }
+
+    private func recordLostReplayOnlyLocked(_ event: Event) {
+        guard let stream = Self.replayStream(of: event) else { return }
+        lostStreams[stream] = max(lostStreams[stream] ?? 0, event.seq)
+        guard lostStreams.count > Self.lostStreamLedgerLimit,
+              let oldest = lostStreams.min(by: { $0.value < $1.value }) else { return }
+        lostStreams.removeValue(forKey: oldest.key)
+        lostStreamsOverflowFloor = max(lostStreamsOverflowFloor, oldest.value)
+    }
+
+    /// Moves ring coverage up; replay-only ring events it passes are lost to
+    /// replay from then on, so they enter the ledger.
+    private func raiseRingCoverageFloorLocked(to floor: Int64) {
+        guard floor > ringCoverageFloor else { return }
+        for event in recent
+        where event.seq > ringCoverageFloor && event.seq <= floor
+            && Self.replayOnlyKinds.contains(event.kind) {
+            recordLostReplayOnlyLocked(event)
+        }
+        ringCoverageFloor = floor
+    }
+
     private static func revisions(
         after event: Event,
         current: ConnectionDomainRevisions
@@ -840,15 +1358,28 @@ public final class EventBus: @unchecked Sendable {
             retainRecent(ev)
         } else if let standIn = recentReplayStandIn?(ev), standIn.seq == ev.seq {
             retainRecent(standIn)
+        } else if Self.replayOnlyKinds.contains(ev.kind) {
+            recordLostReplayOnlyLocked(ev)
+        } else {
+            // A durable event outside the ring: only the event log has it.
+            raiseRingCoverageFloorLocked(to: ev.seq)
         }
     }
 
     private func retainRecent(_ ev: Event) {
         let bytes = encodedSize(ev)
-        guard recentLimit > 0, recentByteLimit > 0 else { return }
+        guard recentLimit > 0, recentByteLimit > 0 else {
+            if Self.replayOnlyKinds.contains(ev.kind) {
+                recordLostReplayOnlyLocked(ev)
+            } else {
+                raiseRingCoverageFloorLocked(to: ev.seq)
+            }
+            return
+        }
         // Single frame larger than the whole recent window: reclaim everything
         // older and still admit the newest event so replay keeps progressing.
         if bytes > recentByteLimit {
+            raiseRingCoverageFloorLocked(to: ev.seq - 1)
             recent.removeAll(keepingCapacity: true)
             recentBytes = 0
             encodedCache.removeAll(keepingCapacity: true)
@@ -869,6 +1400,10 @@ public final class EventBus: @unchecked Sendable {
                 return
             }
             let removed = recent.removeFirst()
+            if Self.replayOnlyKinds.contains(removed.kind) {
+                recordLostReplayOnlyLocked(removed)
+            }
+            ringCoverageFloor = max(ringCoverageFloor, removed.seq)
             recentBytes = max(0, recentBytes - encodedSize(removed))
             encodedCache.removeValue(forKey: removed.seq)
             encodedSizeCache.removeValue(forKey: removed.seq)

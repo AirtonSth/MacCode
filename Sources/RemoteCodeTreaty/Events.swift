@@ -233,15 +233,44 @@ public enum EventsRecent: RemoteCodeRPCContract {
     public struct Params: Codable, Equatable, Sendable {
         public let sinceSeq: Int64
         public let maxBytes: Int?
+        /// C8: replay the host event log past the in-memory ring. Send only
+        /// after the welcome capability `events.durable_replay_v1`.
+        public let durable: Bool?
 
-        public init(sinceSeq: Int64, maxBytes: Int? = nil) {
+        public init(sinceSeq: Int64, maxBytes: Int? = nil, durable: Bool? = nil) {
             self.sinceSeq = sinceSeq
             self.maxBytes = maxBytes
+            self.durable = durable
         }
 
         private enum CodingKeys: String, CodingKey {
             case sinceSeq = "since_seq"
             case maxBytes = "max_bytes"
+            case durable
+        }
+    }
+
+    /// C8: replay-only events of one stream were lost after `sinceSeq`.
+    /// Exactly one of `threadID` (refetch the thread tail) or `surfaceID`
+    /// (refetch the terminal) is set.
+    public struct StreamGap: Codable, Equatable, Sendable {
+        public let threadID: String?
+        public let surfaceID: String?
+        public let sinceSeq: Int64
+        public let throughSeq: Int64
+
+        public init(threadID: String?, surfaceID: String?, sinceSeq: Int64, throughSeq: Int64) {
+            self.threadID = threadID
+            self.surfaceID = surfaceID
+            self.sinceSeq = sinceSeq
+            self.throughSeq = throughSeq
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case threadID = "thread_id"
+            case surfaceID = "surface_id"
+            case sinceSeq = "since_seq"
+            case throughSeq = "through_seq"
         }
     }
 
@@ -253,6 +282,8 @@ public enum EventsRecent: RemoteCodeRPCContract {
         public let hostID: String?
         public let bootEpoch: UInt64?
         public let treatyVersion: TreatyVersion?
+        /// C8: present only on a `durable: true` request.
+        public let streamGaps: [StreamGap]?
 
         public init(
             lastSeq: Int64,
@@ -261,7 +292,8 @@ public enum EventsRecent: RemoteCodeRPCContract {
             requiresBaseline: Bool,
             hostID: String?,
             bootEpoch: UInt64?,
-            treatyVersion: TreatyVersion?
+            treatyVersion: TreatyVersion?,
+            streamGaps: [StreamGap]? = nil
         ) {
             self.lastSeq = lastSeq
             self.events = events
@@ -270,6 +302,7 @@ public enum EventsRecent: RemoteCodeRPCContract {
             self.hostID = hostID
             self.bootEpoch = bootEpoch
             self.treatyVersion = treatyVersion
+            self.streamGaps = streamGaps
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -279,6 +312,7 @@ public enum EventsRecent: RemoteCodeRPCContract {
             case hostID = "host_id"
             case bootEpoch = "boot_epoch"
             case treatyVersion = "treaty_version"
+            case streamGaps = "stream_gaps"
         }
 
         public init(from decoder: Decoder) throws {
@@ -290,6 +324,7 @@ public enum EventsRecent: RemoteCodeRPCContract {
             hostID = try container.decodeIfPresent(String.self, forKey: .hostID)
             bootEpoch = try container.decodeIfPresent(UInt64.self, forKey: .bootEpoch)
             treatyVersion = try container.decodeIfPresent(TreatyVersion.self, forKey: .treatyVersion)
+            streamGaps = try container.decodeIfPresent([StreamGap].self, forKey: .streamGaps)
 
             let hasAnyIdentity = hostID != nil || bootEpoch != nil || treatyVersion != nil
             let hasCompleteIdentity = hostID?.isEmpty == false
