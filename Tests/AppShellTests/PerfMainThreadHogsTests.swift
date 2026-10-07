@@ -363,19 +363,32 @@ final class PerfMainThreadHogsTests: XCTestCase {
         // WHY: with a paint window, events can still be pending when the run
         // finishes. Terminal handling reads the timeline, so it must flush first
         // and the final timeline must contain every event.
+        //
+        // The coordinator persists each stream event before it notifies
+        // observers, and terminal reconciliation adopts that durable replay as
+        // authoritative (c87799818). Deliver events the same way so the
+        // finished tail is judged against a realistic store, not an empty one.
         let h = try makeDeskHarness()
         h.vm.openDesk(h.bot)
         h.vm.selectDeskThread(h.conversation.id)
-        let runID = AgentRunID()
-        h.vm.runCoordinator(h.context.coordinator, didReceive: .turnStarted(turnId: "t1"), run: runID, threadId: h.thread.id)
-        for i in 0..<20 {
-            h.vm.runCoordinator(
-                h.context.coordinator,
-                didReceive: .itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t1", type: .tool, startedAtMs: Int64(i))),
-                run: runID,
-                threadId: h.thread.id
-            )
+        let run = AgentRun(threadId: h.thread.id, provider: .claude, model: "opus", status: .running)
+        try h.context.runRepo.upsert(run)
+        let runID = run.id
+        var seq = 1
+        func deliver(_ event: AssistantEvent) throws {
+            let json = String(decoding: try JSONEncoder().encode(event), as: UTF8.self)
+            try h.context.runRepo.appendStreamEvent(runId: runID, seq: seq, kind: event.debugDescription, payloadJSON: json)
+            seq += 1
+            h.vm.runCoordinator(h.context.coordinator, didReceive: event, run: runID, threadId: h.thread.id)
         }
+        try deliver(.turnStarted(turnId: "t1"))
+        for i in 0..<20 {
+            try deliver(.itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t1", type: .tool, startedAtMs: Int64(i))))
+        }
+        var finished = run
+        finished.status = .completed
+        finished.finishedAt = Date()
+        try h.context.runRepo.upsert(finished)
         h.vm.runCoordinator(
             h.context.coordinator,
             didFinish: runID,
