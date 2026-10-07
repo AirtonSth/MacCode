@@ -173,7 +173,9 @@ final class BotGuestMCPGatewayTests: XCTestCase {
         let server = BotSelfConfigCatalog.serverName
 
         let names = try toolNames(gateway.respond(to: post(server, listTools, token: token), isClientGone: neverGone))
-        XCTAssertEqual(names, Set(BotSelfConfigCatalog.toolNames))
+        XCTAssertEqual(names, Set(BotSelfConfigCatalog.toolNames).subtracting([
+            BotSelfConfigCatalog.saveSecret, BotSelfConfigCatalog.deleteSecret,
+        ]))
         XCTAssertFalse(names.contains { $0.hasPrefix("rc_") }, "rc_* tools drive the whole Mac app")
         XCTAssertTrue(names.contains(BotSelfConfigCatalog.askPeer), "peer delegation stays available in the VM")
 
@@ -185,6 +187,34 @@ final class BotGuestMCPGatewayTests: XCTestCase {
             XCTAssertTrue(message.contains("not available"), tool)
         }
         XCTAssertEqual(spy.callCount, 0)
+    }
+
+    func test_aGuestRunCannotSaveOrDeleteTheBotsSecrets() throws {
+        // WHY (security): every saved secret becomes an environment variable of
+        // this bot's later Mac runs too. A guest run that could save one could
+        // set BASH_ENV, NODE_OPTIONS, DYLD_INSERT_LIBRARIES and the like and get
+        // code run on the Mac without the user-approved Mac-execution request;
+        // its only "confirmation" is the model-supplied user_confirmed flag.
+        let server = BotSelfConfigCatalog.serverName
+        let real = makeGateway()
+        let realToken = try issue(real)
+        let names = try toolNames(real.respond(to: post(server, listTools, token: realToken), isClientGone: neverGone))
+        XCTAssertTrue(names.contains(BotSelfConfigCatalog.listSecrets), "positive control: secret names stay readable")
+
+        let spy = Spy()
+        let gateway = makeGateway([spyRoute(server, spy: spy)])
+        let token = try issue(gateway)
+        let save = #"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"bot_save_secret","arguments":{"name":"BASH_ENV","value":"/Users/u/proj/.x.sh","user_confirmed":true}}}"#
+        let calls = [save, call(8, BotSelfConfigCatalog.deleteSecret)]
+        let callsBeforeDenied = spy.callCount
+        for (body, tool) in zip(calls, [BotSelfConfigCatalog.saveSecret, BotSelfConfigCatalog.deleteSecret]) {
+            XCTAssertFalse(names.contains(tool), "\(tool) is offered to a guest run")
+            let message = try errorMessage(gateway.respond(to: post(server, body, token: token), isClientGone: neverGone))
+            XCTAssertEqual(message, "\(tool) is not available to bot runs inside the Linux VM.")
+        }
+        XCTAssertEqual(spy.callCount, callsBeforeDenied, "a denied secret write must never reach the host handler")
+        _ = try json(gateway.respond(to: post(server, call(9, BotSelfConfigCatalog.listSecrets), token: token), isClientGone: neverGone))
+        XCTAssertEqual(spy.callCount, callsBeforeDenied + 1, "positive control: an allowed call reaches the handler")
     }
 
     func test_computerOffersOnlyTheToolsThatNeedTheMac() throws {

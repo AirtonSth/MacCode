@@ -74,7 +74,13 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
     public static let defaultRoutes: [Route] = [
         Route(
             name: BotSelfConfigCatalog.serverName,
-            allowedTools: Set(BotSelfConfigCatalog.toolNames),
+            // A saved secret becomes an environment variable of this bot's Mac
+            // runs too (BASH_ENV, NODE_OPTIONS, DYLD_*...), so writing one from
+            // the guest would reach the Mac without a Mac-execution approval.
+            allowedTools: Set(BotSelfConfigCatalog.toolNames).subtracting([
+                BotSelfConfigCatalog.saveSecret,
+                BotSelfConfigCatalog.deleteSecret,
+            ]),
             keepsServerInstructions: false
         ) { environment, line in
             ManagedBotSelfConfigMCP(environment: environment).handle(line)

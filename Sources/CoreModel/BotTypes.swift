@@ -341,7 +341,7 @@ public enum BotStandingInstructions {
     public static let guestThreadRules: String = """
     Este ambiente é a VM Linux deste bot: seu shell, seus arquivos e suas ferramentas rodam aqui, com as contas do usuário. Ferramentas só-macOS (swift, xcodebuild, xcrun) não existem. Use request_mac_execution(reason) para pedir execução no Mac.
 
-    Ferramentas: seu próprio shell (comandos e pacotes rodam nesta VM); desktop Linux pelas ferramentas linux-use (list_windows, screenshot, left_click, type, key, scroll); sites pelas ferramentas Playwright (browser_navigate, browser_snapshot, browser_click, browser_type) no Chromium visível, onde ficam os logins que o usuário fez; as ferramentas bot_* para memória, skills, rotinas, segredos, web, perguntas ao usuário e outros bots. bot_computer_*, bot_browser_* e o computer-use do Mac não existem aqui.
+    Ferramentas: seu próprio shell (comandos e pacotes rodam nesta VM); desktop Linux pelas ferramentas linux-use (list_windows, screenshot, left_click, type, key, scroll); sites pelas ferramentas Playwright (browser_navigate, browser_snapshot, browser_click, browser_type) no Chromium visível, onde ficam os logins que o usuário fez; as ferramentas bot_* para memória, skills, rotinas, nomes de segredos, web, perguntas ao usuário e outros bots. bot_computer_*, bot_browser_* e o computer-use do Mac não existem aqui.
 
     Screenshots: enviar bot_post_screenshot em: fim de tarefa visual; erro visível; pedido de login/ação humana; antes de ação irreversível; mudança grande de tela em tarefa longa.
 
@@ -387,6 +387,11 @@ public enum BotStandingInstructions {
 
     public static let generatedSecretsLine =
         "When explicitly instructed by the user to save a secret, call \(saveSecretTool) with the exact environment-variable name and value and user_confirmed=true. Secret values are write-only: never repeat them. Use \(listSecretsTool) for names only; use \(deleteSecretTool) only when explicitly instructed. Saved secrets are available only to this Bot's runtime."
+
+    /// A run inside the bot's guest cannot save or delete secrets: they reach
+    /// the bot's Mac runs as environment variables.
+    public static let generatedInGuestSecretsLine =
+        "Saved secrets are available to this Bot's runtime. Use \(listSecretsTool) for names only. Secrets cannot be saved or deleted from inside the Linux VM: ask the user to do it in a conversation of this Bot that runs on the Mac. Never repeat a secret value."
 
     public static let generatedBrowserLine =
         "When asked to open a website, call \(openBrowserTool). When asked what is open in that browser, call \(getBrowserTool). When asked to wait for a login, call \(waitLoginTool). When asked to read or use that page, call \(snapshotBrowserTool) then \(actBrowserTool). That browser is this teammate's own Playwright-driven browser — not the user's, and never a RemoteCode in-app browser tab."
@@ -434,7 +439,7 @@ public enum BotStandingInstructions {
         var lines = [
             generatedCapabilityLine,
             generatedMutateLine,
-            generatedSecretsLine,
+            runsInGuest ? generatedInGuestSecretsLine : generatedSecretsLine,
         ]
         if runsInGuest {
             lines.append(generatedInGuestComputerLine)
