@@ -33,26 +33,26 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
             )
         }
 
-        let first = await dispatcher.dispatchUnixSocket(request(name: "Oliver", operationID: "op-1"))
+        let first = await dispatcher.dispatchUnixSocket(request(name: "Oliver", operationID: "operation-1"))
         XCTAssertNil(first.error)
         XCTAssertEqual(first.result?.objectValue?["name"]?.stringValue, "Oliver")
         XCTAssertEqual(router.createCount, 1)
 
-        let replay = await dispatcher.dispatchUnixSocket(request(name: "Oliver", operationID: "op-1"))
+        let replay = await dispatcher.dispatchUnixSocket(request(name: "Oliver", operationID: "operation-1"))
         XCTAssertNil(replay.error)
         XCTAssertEqual(replay.result?.objectValue?["id"]?.stringValue, first.result?.objectValue?["id"]?.stringValue)
         XCTAssertEqual(router.createCount, 1, "same operation_id must not create a second Bot")
 
-        let mismatch = await dispatcher.dispatchUnixSocket(request(name: "Nora", operationID: "op-1"))
+        let mismatch = await dispatcher.dispatchUnixSocket(request(name: "Nora", operationID: "operation-1"))
         XCTAssertEqual(mismatch.error?.code, -32093)
         XCTAssertEqual(mismatch.error?.data?.objectValue?["reason"]?.stringValue, "idempotencyRequestMismatch")
         XCTAssertEqual(router.createCount, 1)
 
         router.markNextUnknown = true
-        let lost = await dispatcher.dispatchUnixSocket(request(name: "Piper", operationID: "op-2"))
+        let lost = await dispatcher.dispatchUnixSocket(request(name: "Piper", operationID: "operation-2"))
         XCTAssertEqual(lost.error?.code, -32095)
         XCTAssertEqual(lost.error?.data?.objectValue?["requiresSnapshot"]?.boolValue, true)
-        let retryLost = await dispatcher.dispatchUnixSocket(request(name: "Piper", operationID: "op-2"))
+        let retryLost = await dispatcher.dispatchUnixSocket(request(name: "Piper", operationID: "operation-2"))
         XCTAssertEqual(retryLost.error?.code, -32095)
         XCTAssertEqual(router.createCount, 2, "unknown outcomes must not be blindly retried as a new create")
     }
@@ -314,13 +314,13 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
         }
 
         router.seedReceipt(method: "bot.peer.ask", requestID: "in-progress", ownerParams: params("in-progress"), state: "claimed")
-        router.seedReceipt(method: "bot.peer.ask", requestID: "unknown", ownerParams: params("unknown"), state: "unknown")
+        router.seedReceipt(method: "bot.peer.ask", requestID: "unknown-request", ownerParams: params("unknown-request"), state: "unknown")
 
         let inProgress = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
             jsonrpc: "2.0", id: .number(1), method: "bot.peer.receipt.status", params: params("in-progress")
         ))
         let unknown = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
-            jsonrpc: "2.0", id: .number(2), method: "bot.peer.receipt.status", params: params("unknown")
+            jsonrpc: "2.0", id: .number(2), method: "bot.peer.receipt.status", params: params("unknown-request")
         ))
         XCTAssertEqual(inProgress.result?.objectValue?["status"]?.stringValue, "inProgress")
         XCTAssertNil(inProgress.result?.objectValue?["result"])
@@ -360,9 +360,10 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
             "reply_mode": .string("consult"),
         ]
 
-        for malformed in [JSONValue.string("not-a-uuid"), .bool(true), .number(1)] {
+        for (index, malformed) in [JSONValue.string("not-a-uuid"), .bool(true), .number(1)].enumerated() {
             var params = common
-            params["client_request_id"] = .string("malformed-\(malformed)")
+            // A well-formed request id isolates the consultation-id defect.
+            params["client_request_id"] = .string("malformed-\(index)")
             params[BotPeerDelegation.consultationIDParameterKey] = malformed
             let response = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
                 jsonrpc: "2.0",
@@ -425,7 +426,7 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
             method: RemoteCodeHostCatalog.botCreateRPC,
             params: params([
                 "name": .string("Oliver"),
-                "client_request_id": .string("create-1"),
+                "client_request_id": .string("create-request-1"),
             ])
         ))
         let botID = try XCTUnwrap(created.result?.objectValue?["id"]?.stringValue)
@@ -437,7 +438,7 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
             method: RemoteCodeHostCatalog.botOpenRPC,
             params: params([
                 "bot_id": .string(botID),
-                "client_request_id": .string("open-1"),
+                "client_request_id": .string("open-request-1"),
             ])
         ))
         XCTAssertEqual(opened.result?.objectValue?["opened"]?.boolValue, true)
@@ -449,7 +450,7 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
             params: params([
                 "bot_id": .string(botID),
                 "text": .string("Use my exact provider"),
-                "client_request_id": .string("send-1"),
+                "client_request_id": .string("send-request-1"),
             ])
         ))
         XCTAssertNil(sent.error)
@@ -464,7 +465,7 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
                 "bot_id": .string(botID),
                 "skill_id": .string("qa"),
                 "body": .string("skill-body"),
-                "client_request_id": .string("skill-1"),
+                "client_request_id": .string("skill-request-1"),
             ])
         ))
         XCTAssertEqual(skill.result?.objectValue?["body"]?.stringValue, "skill-body")

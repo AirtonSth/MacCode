@@ -1360,7 +1360,10 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             for (index, probe) in probes.enumerated() {
                 probeCount += 1
                 var params = probe.params
-                params["client_request_id"] = .string("preflight-\(method)-\(index)")
+                // Request ids admit only [A-Za-z0-9_-]; dotted method names would
+                // trip the -32097 identity gate before syntactic preflight runs.
+                let requestMethod = method.replacingOccurrences(of: ".", with: "-")
+                params["client_request_id"] = .string("preflight-\(requestMethod)-\(index)")
                 params["connection_id"] = .string("phase4-connection")
                 params["expected_host_id"] = .string("phase4-host")
                 params["expected_boot_epoch"] = .number(1)
@@ -1466,7 +1469,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         for (name, params) in admitted {
             var uniqueParams = params
             if uniqueParams["client_request_id"] as? String == "gate-valid" {
-                uniqueParams["client_request_id"] = "gate-\(name)"
+                uniqueParams["client_request_id"] = "gate-\(name.replacingOccurrences(of: " ", with: "-"))"
             }
             let response = try await live.rpc(
                 method: "agent.message.send",

@@ -670,7 +670,7 @@ final class HTTPServerTests: XCTestCase {
             return (data, try XCTUnwrap(response as? HTTPURLResponse))
         }
 
-        let exact = try await response(decodedByteCount: 25 * 1024 * 1024, requestId: "exact")
+        let exact = try await response(decodedByteCount: 25 * 1024 * 1024, requestId: "exact-size")
         XCTAssertEqual(exact.1.statusCode, 200)
         let exactJSON = try XCTUnwrap(try JSONSerialization.jsonObject(with: exact.0) as? [String: Any])
         XCTAssertNotNil(
