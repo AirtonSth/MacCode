@@ -4810,6 +4810,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         // admission throws before sendTurn, a destructive waiter must observe
         // that failed completion rather than waiting five seconds for a handle
         // that can never exist. The prepared queue intent must roll back safely.
+        // Distill is the only shipped provider; its send preflight needs a
+        // signed-in snapshot so the Force reaches provider admission.
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("admission-failure-stop-\(UUID().uuidString)", isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -4822,8 +4824,9 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
-        let runner = RequestCaptureRunner(provider: .claude)
-        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        rememberSignedInSnapshot(.distill, router: router)
+        let runner = RequestCaptureRunner(provider: .distill)
+        ctx.coordinator.replaceProvider(.distill, runner: runner)
         ctx.coordinator.hardStopTimeout = 0.25
         let admissionBarrier = QueueDrainAsyncBarrier()
         ctx.coordinator.providerAdmissionCheck = { _, _ in
@@ -4841,7 +4844,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let thread = try router.createAgentThread(
             workspace: workspace.id,
             title: "admission failure stop",
-            provider: .claude,
+            provider: .distill,
             model: "test-model",
             permissionMode: .supervised,
             reasoningEffort: .medium
@@ -4897,6 +4900,13 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                       "an early admission failure must complete termination without a hard timeout")
         XCTAssertLessThan(releasedAt.duration(to: .now), .milliseconds(200))
 
+        // Once the thread is idle the queue waiter may retry the restored row;
+        // admission rejects that retry the same way, so let it settle.
+        let settled = await waitUntil(timeout: 2) {
+            !ctx.coordinator.hasPendingProviderStart(threadId: thread.id)
+                && (try? ctx.queuedMessageRepo.dispatch(id: queued.id)?.state) == .queued
+        }
+        XCTAssertTrue(settled, "the prepared queue intent must roll back to queued")
         XCTAssertFalse(ctx.coordinator.hasPendingProviderStart(threadId: thread.id))
         XCTAssertNil(runner.lastRequest,
                      "provider admission failure must not cross the physical write boundary")

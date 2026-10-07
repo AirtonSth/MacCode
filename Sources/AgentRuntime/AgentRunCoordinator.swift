@@ -2193,7 +2193,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             ?? (pendingResult?.failed == true ? nil : settledPendingStart?.runId)
             ?? durableRun?.id
         let handle = activeHandle ?? pendingResult?.handle
-        let awaitsInMemoryProvider = activeRunId != nil || activeHandle != nil || settledPendingStart != nil
+        // A pending start that settled without a handle (admission or sendTurn
+        // threw) launched no provider turn to acknowledge; only durable rows,
+        // preparation and an adapter session can still be live, and the
+        // durable branch below waits for exactly those.
+        let pendingStartLaunched = settledPendingStart != nil && pendingResult?.failed != true
+        let awaitsInMemoryProvider = activeRunId != nil || activeHandle != nil || pendingStartLaunched
         if let runId {
             lock.lock()
             awaitingTerminationRuns.insert(runId)
