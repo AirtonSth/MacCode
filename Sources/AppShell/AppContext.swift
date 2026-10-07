@@ -1106,8 +1106,15 @@ public final class AppContext {
             let streamErrorAction = runErrorActions.take(runId: rid)
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // The hand-off starts the next thread (VM preflight, guest
+                // launch) and can take minutes; it must never hold back this
+                // run's terminal events, drain waiter or notification. Spawned
+                // first so its synchronous start still runs ahead of this
+                // thread's own queue drain.
                 if let nextWaiting {
-                    await self.router?.handOffBotVM(botID: nextWaiting.botID, to: nextWaiting.threadID)
+                    Task { @MainActor [weak self] in
+                        await self?.router?.handOffBotVM(botID: nextWaiting.botID, to: nextWaiting.threadID)
+                    }
                 }
                 let kind: RemoteCodeEventKind = status == .completed
                     ? .agentRunCompleted

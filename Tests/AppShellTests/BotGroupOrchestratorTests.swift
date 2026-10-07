@@ -290,6 +290,69 @@ final class BotGroupOrchestratorTests: XCTestCase {
         XCTAssertTrue(completed)
     }
 
+    /// WHY: the VM hand-off starts the next thread (Docker preflight, guest
+    /// launch) and can take minutes. The run that just ended must publish its
+    /// terminal events at once, so iOS and the desk never keep showing it as
+    /// running while the next thread's VM start is still in flight.
+    func test_aFinishedRunPublishesItsTerminalEventsBeforeTheVMHandOffFinishes() async throws {
+        let f = try makeFixture(anaDesktop: .dockerDesktop)
+        let gate = PreflightGate()
+        f.orchestrator.vmPreflight = { _ in await gate.wait() }
+        let group = try await makeGroup(f, bots: [f.ana])
+        let holderThread = AgentThreadID()
+        let holder = BotVMRunRegistry.Entry(threadID: holderThread, runID: AgentRunID(), title: "Tarefa A", workspace: "")
+        XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.ana.id, entry: holder))
+        defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
+
+        try f.orchestrator.send(groupID: group.id, text: "Check the VM")
+        let waiting = await waitUntil { (try? self.turns(f, group).first?.state) == .waitingForBot }
+        XCTAssertTrue(waiting, "a busy VM makes the turn wait")
+
+        let finished = EventLog()
+        let runID = holder.runID.value.uuidString.lowercased()
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.run.finished" || event.kind == "agent.run.completed",
+                  event.payload.objectValue?["run_id"]?.stringValue == runID else { return }
+            finished.append(event.kind, [:])
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
+
+        f.ctx.coordinator.onRunFinished?(holderThread, holder.runID, .completed)
+        let handOffStarted = await waitUntil { gate.entered }
+        XCTAssertTrue(handOffStarted, "the freed VM is handed to the waiting group turn")
+        let published = await waitUntil(timeout: 2) { finished.events.count == 2 }
+        XCTAssertTrue(published, "the finished run's terminal events never wait on the next thread's VM start")
+
+        gate.release()
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started, "the hand-off still starts the waiting turn")
+        if let request = f.runner.requests.first {
+            f.runner.finish(runID: request.runId, status: .completed, reply: "VM ok")
+            _ = await waitUntil { (try? self.turns(f, group).first?.state) == .completed }
+        }
+    }
+
+    @MainActor
+    private final class PreflightGate {
+        private(set) var entered = false
+        private var released = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func wait() async -> String? {
+            entered = true
+            if !released {
+                await withCheckedContinuation { continuation = $0 }
+            }
+            return nil
+        }
+
+        func release() {
+            released = true
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
     // MARK: - Relaunch
 
     func test_relaunchInterruptsTheRunningTurnAndResumesPlannedOnes() async throws {
