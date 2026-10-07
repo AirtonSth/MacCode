@@ -323,6 +323,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
         // resume and ordinary cold starts must keep today's event order.
         let snapshot = try XCTUnwrap(makeSnapshot(user: "prior user", assistant: "prior assistant"))
         let live = ContextSeedMockClient(freshThreadId: "live-thread")
+        live.emitTurnStartedNotification = true
         let resumeAdapter = CodexAppServerAdapter(clientFactory: { _, notificationHandler, _ in
             live.notificationHandler = notificationHandler
             return live
@@ -343,6 +344,7 @@ final class ConversationContextSeedRuntimeTests: XCTestCase {
         XCTAssertEqual(resumeEvents.lifecycleNames, ["running", "threadStarted", "turnStarted"])
 
         let cold = ContextSeedMockClient(freshThreadId: "cold-thread")
+        cold.emitTurnStartedNotification = true
         let coldAdapter = CodexAppServerAdapter(clientFactory: { _, notificationHandler, _ in
             cold.notificationHandler = notificationHandler
             return cold
@@ -838,6 +840,9 @@ private final class ContextSeedMockClient: CodexAppServerControlling, @unchecked
     var onStartTurn: (@Sendable () -> Void)?
     var onAfterThreadStartedNotification: (@Sendable () -> Void)?
     var emitThreadStartedNotification = false
+    /// Real Codex answers turn/start and then announces `turn/started`; the
+    /// adapter emits `.turnStarted` only from that notification (036c6a5db).
+    var emitTurnStartedNotification = false
     var terminateOnStartTurn = false
     let openThreadError: Error?
     let startTurnError: Error?
@@ -889,6 +894,12 @@ private final class ContextSeedMockClient: CodexAppServerControlling, @unchecked
         }
         lock.lock(); _startedTurns.append(StartedTurn(providerThreadId: providerThreadId, request: request)); lock.unlock()
         if let startTurnError { throw startTurnError }
+        if emitTurnStartedNotification {
+            notificationHandler?("turn/started", [
+                "threadId": providerThreadId,
+                "turn": ["id": "turn-app-server-1"],
+            ])
+        }
         return ["turn": ["id": "turn-app-server-1"]]
     }
 

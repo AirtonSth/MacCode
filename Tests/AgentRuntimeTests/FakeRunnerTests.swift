@@ -282,7 +282,11 @@ final class FakeRunnerTests: XCTestCase {
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
             let checkpoints = (try? checkpointRepo.list(threadId: thread.id)) ?? []
-            if let checkpoint = checkpoints.first {
+            // The coordinator first persists a minimal identity row (status
+            // .missing, no error) on the terminal path and enriches it with the
+            // git diff asynchronously; assert on the enriched row only.
+            if let checkpoint = checkpoints.first,
+               checkpoint.status != .missing || checkpoint.errorMessage != nil {
                 XCTAssertEqual(checkpoint.runId, runId)
                 XCTAssertFalse(checkpoint.turnId.isEmpty)
                 XCTAssertEqual(checkpoint.checkpointTurnCount, 1)
@@ -322,7 +326,10 @@ final class FakeRunnerTests: XCTestCase {
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
             let checkpoints = (try? checkpointRepo.list(threadId: thread.id)) ?? []
-            if let checkpoint = checkpoints.first {
+            // Skip the minimal identity row (status .missing, no error) the
+            // terminal path writes before the async git enrichment lands.
+            if let checkpoint = checkpoints.first,
+               checkpoint.status != .missing || checkpoint.errorMessage != nil {
                 XCTAssertEqual(checkpoint.status, .missing)
                 XCTAssertEqual(checkpoint.errorMessage, "Not a git repository.",
                                "completed turns outside a git repo must leave an explicit missing checkpoint status instead of pretending recovery exists")
@@ -918,7 +925,10 @@ final class FakeRunnerTests: XCTestCase {
         let sessionRepo = ProviderSessionRuntimeRepository(db: db)
         let thread = AgentThread(title: "codex continuity", provider: .codex, model: "gpt-5.5")
         try threadRepo.upsert(thread)
-        let adapter = SpyProviderAdapter(provider: .codex)
+        // A completed turn with no assistant output is reclassified as failed
+        // (ProviderStderrClassifier.resolveTerminal), and a failed session is not
+        // resumable; the spy must answer like a real provider turn.
+        let adapter = SpyProviderAdapter(provider: .codex, finalMessage: "done")
         let coordinator = AgentRunCoordinator(runRepo: runRepo,
                                               messageRepo: messageRepo,
                                               threadRepo: threadRepo,
@@ -2629,6 +2639,7 @@ private final class ScriptedClaudeRunner: AgentProviderRunner, @unchecked Sendab
 private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendable {
     let provider: AgentProvider
     let finishImmediately: Bool
+    let finalMessage: String?
     private let lock = NSLock()
     private var _sendTurnCount = 0
     private var _cancelCount = 0
@@ -2710,9 +2721,10 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
         return _lastRecoveredExtraArgs
     }
 
-    init(provider: AgentProvider, finishImmediately: Bool = true) {
+    init(provider: AgentProvider, finishImmediately: Bool = true, finalMessage: String? = nil) {
         self.provider = provider
         self.finishImmediately = finishImmediately
+        self.finalMessage = finalMessage
     }
 
     func listModels() async -> [AgentModelDescriptor] { [] }
@@ -2731,10 +2743,11 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
         _lastInteractionMode = request.interactionMode
         lock.unlock()
         if finishImmediately {
+            let finalMessage = self.finalMessage
             Task.detached {
                 let providerThreadId = request.providerThreadId ?? UUID().uuidString
                 onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
-                onEvent(.finished(.completed, finalMessage: nil, providerThreadId: providerThreadId))
+                onEvent(.finished(.completed, finalMessage: finalMessage, providerThreadId: providerThreadId))
             }
         }
         return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
