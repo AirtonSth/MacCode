@@ -660,8 +660,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
         return base64
     }
 
-    private func waitForPNG(name: String) throws -> Data {
+    private func waitForPNG(name: String, attempts: Int? = nil) throws -> Data {
         var lastError: Error = BotComputerGuestError.observeFailed
+        let observeAttempts = attempts.map { max(1, $0) } ?? self.observeAttempts
         for attempt in 0..<observeAttempts {
             do {
                 let png = try docker.exec(
@@ -896,9 +897,12 @@ public final class BotComputerGuestService: @unchecked Sendable {
         return (png, hash, Self.pngMagic(png))
     }
 
+    /// `attempts` caps the screenshot retries (default: the service's observe
+    /// budget). A paired viewer's observe passes 1 so a failing guest answers now.
     public func remoteFrame(
         botID: BotID,
-        ready: BotComputerGuestReady? = nil
+        ready: BotComputerGuestReady? = nil,
+        attempts: Int? = nil
     ) throws -> BotComputerGuestFrameEvidence {
         let name = BotComputerGuestSpec.containerName(botID: botID)
         let inspect = try docker.inspect(name: name)
@@ -913,7 +917,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             }
             png = ready.capturedPNG
         } else {
-            png = try waitForPNG(name: name)
+            png = try waitForPNG(name: name, attempts: attempts)
         }
         let hash = try BotComputerGuestObserve.validatePNG(png)
         let dimensions = try Self.pngDimensions(png)

@@ -74,6 +74,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onStopGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onRebuildGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onGuestInput: ((BotID, [String: Any], String, [String: Any]) throws -> Void)?
+    /// Who drives each bot computer. `bot.guest.control` takes or releases it
+    /// and `bot.guest.state` reports it as `controlled_by_user`.
+    public var computerControl: BotComputerControl = .shared
+    /// After `bot.guest.control` changed who drives (true: the user took it).
+    /// Runs under the authority lock, so it must not call back into this authority.
+    public var onGuestControlChanged: ((BotID, Bool) -> Void)?
     public var onDockerClear: ((BotID) throws -> Void)?
     /// Routing is nil when the send carries no routing receipt: the host then
     /// runs the conversation's own desk route (or the resolved Distill default)
@@ -97,6 +103,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var files: [String: [String: Any]] = [:]
     private var browser: [String: [String: Any]] = [:]
     private var guest: [String: [String: Any]] = [:]
+    /// Frames an observing viewer replaced, per bot and runtime grant (newest
+    /// last). Input aimed at one of them is still on the screen the user saw.
+    private var guestRecentFrames: [String: (grantID: String, frameIDs: [String])] = [:]
     private var liveRuns: [String: [String: Any]] = [:]
     private var attention: [String: [String: Any]] = [:]
     private var peerReceipts: [String: [String: Any]] = [:]
@@ -170,7 +179,18 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             if let botID = existing["bot_id"] as? String,
                var current = guest[botID],
                readback["viewer_path"] != nil || readback["viewer"] != nil {
+                let shownFrame = current["frame"] as? [String: Any]
                 for (key, value) in readback { current[key] = value }
+                // An observing viewer may have replaced the frame this result
+                // was built on: keep frame sequences strictly increasing.
+                if var settledFrame = current["frame"] as? [String: Any],
+                   let shownSequence = shownFrame?["sequence"] as? Int,
+                   let settledSequence = settledFrame["sequence"] as? Int,
+                   settledSequence <= shownSequence,
+                   settledFrame["frame_id"] as? String != shownFrame?["frame_id"] as? String {
+                    settledFrame["sequence"] = shownSequence + 1
+                    current["frame"] = settledFrame
+                }
                 current["viewer"] = "/vnc.html"
                 current["viewer_path"] = "/vnc.html"
                 current["security"] = Self.guestSecurity
@@ -659,13 +679,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         let botID = id(bot)
         let hostID = try requireGuestHost(params)
+        var state: [String: Any]
         if let existing = guest[botID] {
             guard existing["host_id"] as? String == hostID else { throw Error.guestConflict }
-            return existing
+            state = existing
+        } else {
+            state = makeStoppedGuestState(botID: botID, hostID: hostID)
+            guest[botID] = state
+            persistSidecar()
         }
-        let state = makeStoppedGuestState(botID: botID, hostID: hostID)
-        guest[botID] = state
-        persistSidecar()
+        // Live, never stored: control is in-memory and a relaunch hands it back to the bot.
+        state["controlled_by_user"] = computerControl.isControlledByUser(bot.id)
         return state
     }
 
@@ -792,6 +816,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try linkOpen(params: params, requestID: requestID)
         case "guest.input", "guest.start", "guest.stop", "guest.rebuild", "guest.revoke":
             return try guestCommand(name: name, params: params, requestID: requestID)
+        case "guest.control":
+            return try guestControl(params: params, requestID: requestID)
         case "docker.clear":
             return try dockerClear(params: params, requestID: requestID)
         case "notify.set":
@@ -2351,6 +2377,210 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return receipt(requestID: requestID, status: receiptStatus, botID: botID, readback: state)
     }
 
+    /// `bot.guest.control`: the paired user takes the bot's computer (the bot's
+    /// act and exec steps are refused while they drive) or hands it back.
+    /// Release does not answer an open manual action; `agent.manual_action.resolve` does.
+    private func guestControl(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        let botID = id(bot)
+        let hostID = try requireGuestHost(params)
+        let take: Bool
+        switch string(params, "action") {
+        case "take": take = true
+        case "release": take = false
+        default: throw Error.invalidParams
+        }
+        if guest[botID] == nil {
+            guest[botID] = makeStoppedGuestState(botID: botID, hostID: hostID)
+        }
+        guard var readback = guest[botID], readback["host_id"] as? String == hostID else {
+            throw Error.guestConflict
+        }
+        if take {
+            computerControl.take(bot.id)
+        } else {
+            computerControl.release(bot.id)
+        }
+        onGuestControlChanged?(bot.id, take)
+        readback["controlled_by_user"] = computerControl.isControlledByUser(bot.id)
+        readback["control_action"] = take ? "take" : "release"
+        return receipt(requestID: requestID, status: .completed, botID: botID, readback: readback)
+    }
+
+    // MARK: - Guest observe (paired live viewer)
+
+    /// A frame captured for a paired viewer (`bot.guest.state` with `observe: true`).
+    public struct ObservedGuestFrame: Sendable, Equatable {
+        public let containerID: String
+        public let viewerPath: String
+        public let pixelWidth: Int
+        public let pixelHeight: Int
+        public let pngBase64: String
+        public let pngHash: String
+
+        public init(
+            containerID: String,
+            viewerPath: String,
+            pixelWidth: Int,
+            pixelHeight: Int,
+            pngBase64: String,
+            pngHash: String
+        ) {
+            self.containerID = containerID
+            self.viewerPath = viewerPath
+            self.pixelWidth = pixelWidth
+            self.pixelHeight = pixelHeight
+            self.pngBase64 = pngBase64
+            self.pngHash = pngHash
+        }
+    }
+
+    public enum GuestObserveTarget: Equatable, Sendable {
+        /// Running on this runtime grant and showing `frameID` (nil before the first frame).
+        case running(grantID: String, frameID: String?)
+        /// Not running here: a viewer may adopt the bot's container if Docker runs it.
+        case adoptable
+        /// Starting, stopping, revoked or never read by this host: nothing to capture.
+        case unavailable
+    }
+
+    private static let adoptableGuestStatuses: Set<String> = ["stopped", "failed", "reconnect_required"]
+
+    public func guestObserveTarget(botID: BotID, hostID: String) -> GuestObserveTarget {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let state = guest[botID.value.uuidString.lowercased()],
+              state["host_id"] as? String == hostID,
+              let status = state["status"] as? String else { return .unavailable }
+        if status == "running" {
+            guard state["grant_invalidated"] as? Bool == false,
+                  let grantID = (state["runtime"] as? [String: Any])?["grant_id"] as? String else {
+                return .unavailable
+            }
+            return .running(grantID: grantID, frameID: (state["frame"] as? [String: Any])?["frame_id"] as? String)
+        }
+        return Self.adoptableGuestStatuses.contains(status) ? .adoptable : .unavailable
+    }
+
+    /// Adopts the bot's running container (started by the bot's own run, or
+    /// before a relaunch) as a new runtime grant, so a paired viewer sees the
+    /// screen the bot is working on. Returns the grant id, or nil when the
+    /// state moved meanwhile. Call it only after Docker said the container runs.
+    public func adoptRunningGuest(botID: BotID, hostID: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = botID.value.uuidString.lowercased()
+        guard var state = guest[key],
+              state["host_id"] as? String == hostID,
+              let status = state["status"] as? String,
+              Self.adoptableGuestStatuses.contains(status),
+              let catalog = state["task_catalog"] as? [String: Any],
+              let tasks = catalog["tasks"] as? [[String: Any]],
+              let startTask = tasks.first(where: { $0["axis"] as? String == "start" }),
+              let recipeID = startTask["recipe_id"] as? String else { return nil }
+        let runtime = makeGuestRuntime(botID: key, hostID: hostID, recipeID: recipeID, previousState: state)
+        state["runtime"] = runtime
+        state["frame"] = nil
+        state["input"] = nil
+        state["status"] = "running"
+        state["grant_generation"] = runtime["grant_generation"]
+        state["grant_invalidated"] = false
+        state["error_message"] = nil
+        state["recovery"] = nil
+        state["recipe"] = startTask["recipe"]
+        state["viewer"] = "/vnc.html"
+        state["viewer_path"] = "/vnc.html"
+        state["security"] = Self.guestSecurity
+        state["embed_html_is_not_runtime"] = true
+        guest[key] = state
+        persistSidecar()
+        return runtime["grant_id"] as? String
+    }
+
+    /// Stores a frame captured for an observing viewer. Latest wins: the frame
+    /// is dropped unless the guest still runs on `grantID` and still shows
+    /// `expectedFrameID`. Kept in memory only (a relaunch invalidates grants).
+    @discardableResult
+    public func applyObservedGuestFrame(
+        botID: BotID,
+        grantID: String,
+        expectedFrameID: String?,
+        frame observed: ObservedGuestFrame
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = botID.value.uuidString.lowercased()
+        guard var state = guest[key],
+              state["status"] as? String == "running",
+              state["grant_invalidated"] as? Bool == false,
+              var runtime = state["runtime"] as? [String: Any],
+              runtime["grant_id"] as? String == grantID else { return false }
+        let previous = state["frame"] as? [String: Any]
+        let previousID = previous?["frame_id"] as? String
+        guard previousID == expectedFrameID else { return false }
+        runtime["container_id"] = observed.containerID
+        runtime["viewer_path"] = observed.viewerPath
+        let frameID = UUID().uuidString.lowercased()
+        state["runtime"] = runtime
+        state["frame"] = [
+            "runtime": runtime,
+            "frame_id": frameID,
+            "sequence": (previous?["sequence"] as? Int ?? -1) + 1,
+            "pixel_width": observed.pixelWidth,
+            "pixel_height": observed.pixelHeight,
+            "png_base64": observed.pngBase64,
+            "png_hash": observed.pngHash,
+        ]
+        state["before_frame_id"] = previousID
+        state["after_frame_id"] = frameID
+        if let previousID {
+            var recent = guestRecentFrames[key]
+            if recent?.grantID != grantID { recent = (grantID, []) }
+            recent?.frameIDs.append(previousID)
+            if let kept = recent?.frameIDs.suffix(Self.recentObservedFrameLimit) {
+                recent?.frameIDs = Array(kept)
+            }
+            guestRecentFrames[key] = recent
+        }
+        guest[key] = state
+        return true
+    }
+
+    /// The container the viewer watched is gone: the grant ends as `stopped`.
+    @discardableResult
+    public func markObservedGuestStopped(botID: BotID, grantID: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = botID.value.uuidString.lowercased()
+        guard var state = guest[key],
+              state["status"] as? String == "running",
+              (state["runtime"] as? [String: Any])?["grant_id"] as? String == grantID else { return false }
+        invalidateGuestGrant(state: &state, status: "stopped")
+        guest[key] = state
+        persistSidecar()
+        return true
+    }
+
+    /// The paired host binding of the bot's guest state, nil before any client read it.
+    public func guestHostID(botID: BotID) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return guest[botID.value.uuidString.lowercased()]?["host_id"] as? String
+    }
+
+    /// Frames a viewer saw a moment ago stay valid input targets: at 1-2 fps an
+    /// observe can replace the frame between the user's tap and its arrival.
+    private static let recentObservedFrameLimit = 4
+
+    private func isRecentObservedFrame(_ frameID: String?, state: [String: Any]) -> Bool {
+        guard let frameID,
+              let botID = state["bot_id"] as? String,
+              let grantID = (state["runtime"] as? [String: Any])?["grant_id"] as? String,
+              let recent = guestRecentFrames[botID],
+              recent.grantID == grantID else { return false }
+        return recent.frameIDs.contains(frameID)
+    }
+
     private func requireGuestHost(_ params: [String: Any]) throws -> String {
         let hostID = string(params, "host_id")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !hostID.isEmpty, hostID.count <= 256 else { throw Error.guestConflict }
@@ -2476,9 +2706,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         state: [String: Any]
     ) throws {
         try requireGuestRuntime(params: params, state: state)
+        let beforeFrameID = string(params, "before_frame_id")
         guard let frame = state["frame"] as? [String: Any],
               let frameID = frame["frame_id"] as? String,
-              frameID == string(params, "before_frame_id"),
+              frameID == beforeFrameID || isRecentObservedFrame(beforeFrameID, state: state),
               let width = frame["pixel_width"] as? Int,
               let height = frame["pixel_height"] as? Int,
               let input = params["input"] as? [String: Any],

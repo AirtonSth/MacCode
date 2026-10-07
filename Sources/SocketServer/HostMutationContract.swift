@@ -153,6 +153,7 @@ public enum HostMutationContract {
     bot.guest.stop
     bot.guest.rebuild
     bot.guest.revoke
+    bot.guest.control
     bot.docker.clear
     bot.notify.set
     bot.desktop.set
@@ -409,6 +410,8 @@ public enum HostMutationContract {
                     .uuid("bot_id"),
                     .string("task_id", nonempty: true), .object("runtime"),
                 ]
+            case "bot.guest.control":
+                return [.uuid("bot_id"), .stringEnum("action", ["take", "release"])]
             case "bot.team.create":
                 return [.string("name", nonempty: true)]
             case "bot.team.update":

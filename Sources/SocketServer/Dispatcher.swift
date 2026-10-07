@@ -920,6 +920,7 @@ public final class JSONRPCDispatcher {
         "bot.guest.stop",
         "bot.guest.rebuild",
         "bot.guest.revoke",
+        "bot.guest.control",
         "bot.docker.clear",
         "bot.notify.set",
         "bot.desktop.set",
@@ -1490,7 +1491,8 @@ public final class JSONRPCDispatcher {
                 kind = object["readback"]?.objectValue?["link_kind"]?.stringValue == "file"
                     ? .botFilesOpened
                     : .botBrowserUpdated
-            case "bot.guest.input", "bot.guest.start", "bot.guest.stop", "bot.guest.rebuild", "bot.guest.revoke":
+            case "bot.guest.input", "bot.guest.start", "bot.guest.stop", "bot.guest.rebuild", "bot.guest.revoke",
+                 "bot.guest.control":
                 kind = .botGuestUpdated
             case "bot.docker.clear": kind = .botDockerCleared
             case "bot.attention.ack": kind = .botAttentionUpdated
@@ -1522,6 +1524,7 @@ public final class JSONRPCDispatcher {
                     for key in [
                         "host_id", "viewer_path", "grant_generation", "grant_invalidated",
                         "before_frame_id", "after_frame_id", "status", "error_message",
+                        "controlled_by_user", "control_action",
                     ] {
                         payload[key] = readback[key]
                     }

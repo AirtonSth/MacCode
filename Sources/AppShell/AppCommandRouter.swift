@@ -3383,6 +3383,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private var pairedBotRemote: BotRemoteControlAuthority?
+    private var pairedGuestObserver: BotGuestObserveCoordinator?
     private var pairedBotSettlementWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private lazy var botRuntimeEvidenceProjector = BotRuntimeEvidenceProjector { [weak self] terminal in
         _ = self?.pairedBotRemote?.settleRuntime(
@@ -3408,6 +3409,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let authority = try pairedBotAuthority()
         let foundation = Self.foundationObject(params)
         do {
+            if method == "bot.guest.state", foundation["observe"] as? Bool == true {
+                let observed = try await pairedGuestObserveCoordinator(authority).state(params: foundation)
+                return JSONValue.from(observed)
+            }
             var result = try authority.dispatch(method: method, params: foundation)
             if method == "bot.stop" || method == "bot.force_stop",
                result["status"] as? String == BotRemoteControlAuthority.Status.accepted.rawValue,
@@ -3566,6 +3571,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
             }
         }
+        created.computerControl = botComputerControl
+        created.onGuestControlChanged = { [weak self] id, took in
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.syncManualActionsAfterGuestControl(botID: id, took: took) }
+            } else {
+                Task { @MainActor [weak self] in self?.syncManualActionsAfterGuestControl(botID: id, took: took) }
+            }
+        }
         created.onDockerClear = { [weak self] id in
             guard let service = self?.botsViewModel?.computerGuestService else {
                 throw BotRemoteControlAuthority.Error(
@@ -3655,6 +3668,72 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         pairedBotRemote = created
         return created
+    }
+
+    private func pairedGuestObserveCoordinator(
+        _ authority: BotRemoteControlAuthority
+    ) -> BotGuestObserveCoordinator {
+        if let pairedGuestObserver { return pairedGuestObserver }
+        let created = BotGuestObserveCoordinator(
+            authority: authority,
+            capture: { [weak self] botID in
+                guard let service = self?.botsViewModel?.computerGuestService else {
+                    throw BotRemoteControlAuthority.Error(code: -32091, message: "Bot guest is unavailable.")
+                }
+                // One screenshot attempt: an observing viewer must not wait out the start retries.
+                return try await Task.detached(priority: .userInitiated) { [service] in
+                    let evidence = try service.remoteFrame(botID: botID, attempts: 1)
+                    return BotRemoteControlAuthority.ObservedGuestFrame(
+                        containerID: evidence.containerID,
+                        viewerPath: evidence.viewerPath,
+                        pixelWidth: evidence.pixelWidth,
+                        pixelHeight: evidence.pixelHeight,
+                        pngBase64: evidence.png.base64EncodedString(),
+                        pngHash: evidence.pngHash
+                    )
+                }.value
+            },
+            isContainerRunning: { [weak self] botID in
+                guard let service = self?.botsViewModel?.computerGuestService else { return false }
+                return await Task.detached(priority: .userInitiated) { [service] in
+                    service.isContainerRunning(botID: botID)
+                }.value
+            }
+        )
+        pairedGuestObserver = created
+        return created
+    }
+
+    /// `bot.guest.updated` with `reason: "agent_step"` after the bot acted on
+    /// its guest, sent only while a paired viewer is watching that bot (it then
+    /// re-observes). Carries no frame: the next `bot.guest.state` observe does.
+    func publishGuestAgentStep(botID: BotID, step: String) {
+        guard let pairedGuestObserver, pairedGuestObserver.isWatching(botID) else { return }
+        var payload: [String: JSONValue] = [
+            "bot_id": .string(botID.value.uuidString.lowercased()),
+            "reason": .string("agent_step"),
+            "step": .string(step),
+            "frame_stale": .bool(true),
+            "controlled_by_user": .bool(botComputerControl.isControlledByUser(botID)),
+        ]
+        if let hostID = pairedBotRemote?.guestHostID(botID: botID) {
+            payload["host_id"] = .string(hostID)
+        }
+        EventBus.shared.publish(kind: .botGuestUpdated, payload: .object(payload))
+    }
+
+    /// `bot.guest.control take` also takes the bot's open manual action (as the
+    /// Mac card's Take does), and every Mac card refreshes its control toggle.
+    private func syncManualActionsAfterGuestControl(botID: BotID, took: Bool) {
+        if took {
+            for request in manualActionStore.openByThread().values
+            where request.botID == botID && request.state == .open {
+                if let taken = try? manualActionStore.take(id: request.id, control: botComputerControl) {
+                    ManualActionRequestStore.postStateChanged(taken)
+                }
+            }
+        }
+        NotificationCenter.default.post(name: .manualActionStateChanged, object: nil)
     }
 
     /// Settle after `dispatch` returns. `mutate` overwrites in-flight settle,
@@ -8366,7 +8445,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let beforeAct = botBrowserBeforeBridgeActForTesting
         // Guest provisioning (docker CLI) and child-process IO must never run
         // on MainActor — hop to a utility queue and await the result.
-        return try await withCheckedThrowingContinuation { continuation in
+        let payload: String = try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 do {
                     try ensureGuest?()
@@ -8394,6 +8473,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
             }
         }
+        if action.kind == BotBrowserCatalog.act, route == .playwrightGuest, payload != Self.botBrowserRefusalPayload {
+            publishGuestAgentStep(botID: botID, step: "browser_act")
+        }
+        return payload
     }
 
     /// Drain MCP pending guest observe/act through the app-process Docker CLI.
@@ -8403,8 +8486,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         botComputerReconciliationScheduled = true
         let appSupport = ctx.appSupportDirectory
         let botStore = ctx.botStore
+        // The worker and its step hops live for one drain pass only (no cycle).
         let worker = botComputerReconciliationWorkerForTesting ?? {
-            Self.reconcileBotComputerActions(appSupport: appSupport, botStore: botStore)
+            Self.reconcileBotComputerActions(appSupport: appSupport, botStore: botStore) { botID, step in
+                Task { @MainActor in self.publishGuestAgentStep(botID: botID, step: step) }
+            }
         }
         botComputerReconciliationQueue.async { [weak self] in
             worker()
@@ -8422,7 +8508,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         label: "io.remotecode.bot-computer-action"
     )
 
-    nonisolated private static func reconcileBotComputerActions(appSupport: URL, botStore: BotStore) {
+    nonisolated private static func reconcileBotComputerActions(
+        appSupport: URL,
+        botStore: BotStore,
+        onGuestStep: @escaping @Sendable (BotID, String) -> Void
+    ) {
         let store = BotComputerStore(appSupportDirectory: appSupport)
         let service = BotComputerGuestService(
             appSupport: appSupport,
@@ -8443,7 +8533,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                       BotDesktopAdmission.forPublished(revision.desktopKind).allowsGuestComputer else {
                     throw BotComputerError.notDockerDesktop
                 }
-                return try service.apply(action)
+                let result = try service.apply(action)
+                if result["refusal"] == nil {
+                    switch action.kind {
+                    case BotComputerCatalog.act: onGuestStep(botID, "act")
+                    case BotComputerCatalog.exec: onGuestStep(botID, "exec")
+                    default: break
+                    }
+                }
+                return result
             }) ?? 0
             guard count > 0 else { return }
         }

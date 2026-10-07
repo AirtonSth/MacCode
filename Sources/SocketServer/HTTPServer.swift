@@ -1368,7 +1368,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "queue_controls": ["remove", "update", "reorder", "force_now"],
                 "linked_thread_v1": true,
                 "teams_v1": true,
-                "groups_v1": true
+                "groups_v1": true,
+                // bot.guest.state observe:true (rate-limited fresh frame),
+                // controlled_by_user, bot.guest.control take|release and
+                // bot.guest.updated reason "agent_step".
+                "guest_observe_v1": true
             ],
             "git": [
                 "read_only": false,
