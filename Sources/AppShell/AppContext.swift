@@ -1697,7 +1697,7 @@ public final class AppContext {
                 // clients can show the reason and a Retry affordance instead
                 // of a bare FAIL badge.
                 var errorPayload = agentRunPayload(threadId: tid, runId: runId).objectValue ?? [:]
-                errorPayload["message"] = .string(message)
+                errorPayload.merge(AgentRunErrorWire.fields(message: message, recoverable: recoverable)) { $1 }
                 errorPayload["recoverable"] = .bool(recoverable)
                 EventBus.shared.publish(kind: .agentRunError, payload: .object(errorPayload))
             }
@@ -1715,7 +1715,7 @@ public final class AppContext {
                 var failedPayload = agentRunPayload(threadId: tid, runId: rid, status: status)
                 if status == .failed, let msg = try? self.runRepo.errorMessage(of: rid), !msg.isEmpty {
                     var obj = failedPayload.objectValue ?? [:]
-                    obj["message"] = .string(msg)
+                    obj.merge(AgentRunErrorWire.fields(message: msg, recoverable: false)) { $1 }
                     failedPayload = .object(obj)
                 }
                 EventBus.shared.publish(kind: kind, payload: kind == .agentRunFailed ? failedPayload : agentRunPayload(threadId: tid, runId: rid, status: status))

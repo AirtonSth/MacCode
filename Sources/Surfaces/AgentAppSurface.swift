@@ -320,6 +320,40 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
         case .startFresh: return "Start fresh"
         }
     }
+
+    /// `[fresh-session:<reason>]`: the adapter already retired the provider
+    /// session whose history the model rejected (`DistillACPFailureTaxonomy`).
+    public static let freshSessionMarkerPrefix = "[fresh-session:"
+
+    private static let freshSessionMarkerRegex = try! NSRegularExpression(
+        pattern: "\\[fresh-session:[^\\]]*\\]\\s*"
+    )
+
+    /// Error text for people: the fresh-session marker is a machine tag, so it
+    /// is removed. Classify on the raw message, never on this text.
+    public static func displayText(_ message: String) -> String {
+        guard message.contains(freshSessionMarkerPrefix) else { return message }
+        let range = NSRange(message.startIndex..<message.endIndex, in: message)
+        return freshSessionMarkerRegex.stringByReplacingMatches(
+            in: message, options: [], range: range, withTemplate: ""
+        )
+    }
+
+    /// Paired-client `recovery_action` for a failed run, from the same
+    /// classifier the Mac error row uses. `new_session` is the classifier's
+    /// Retry for a fresh-session failure: retry on the SAME thread (a bot desk
+    /// keeps its conversation link); the host already started a new provider
+    /// session, so the retry does not reuse the rejected history.
+    public static func pairedWireValue(message: String, recoverable: Bool) -> String? {
+        guard let action = AgentAppViewModel.errorRecoveryAction(message: message, recoverable: recoverable) else {
+            return nil
+        }
+        switch action {
+        case .signIn: return "sign_in"
+        case .startFresh: return "start_fresh"
+        case .retry: return message.contains(freshSessionMarkerPrefix) ? "new_session" : "retry"
+        }
+    }
 }
 
 private struct BotRunUnavailableError: LocalizedError {
@@ -9922,6 +9956,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         message: String,
         recoverable: Bool
     ) -> AgentErrorRecoveryAction? {
+        _ = provider // classification deliberately shares one vocabulary across providers.
+        return errorRecoveryAction(message: message, recoverable: recoverable)
+    }
+
+    nonisolated public static func errorRecoveryAction(
+        message: String,
+        recoverable: Bool
+    ) -> AgentErrorRecoveryAction? {
         let normalized = message.lowercased()
         // `[fresh-session:…]`: the adapter already retired the session whose
         // history the model rejected, so Retry re-runs the prompt in a new
@@ -9953,7 +9995,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if retryMarkers.contains(where: normalized.contains) || recoverable {
             return .retry
         }
-        _ = provider // classification deliberately shares one vocabulary across providers.
         return nil
     }
 
@@ -12702,6 +12743,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         case .failed: return "Failed"
         case .cancelled: return "Cancelled"
         case .completed:
+            if isFreshSessionNotice(item) { return "New session" }
             switch item.type {
             case .fileChange: return "Changed"
             case .webSearch: return "Searched"
@@ -12718,6 +12760,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         if item.state == .streaming { return "circle.dotted" }
         if item.state == .failed { return "xmark.octagon" }
         if item.state == .cancelled { return "nosign" }
+        if isFreshSessionNotice(item) { return "arrow.triangle.2.circlepath" }
         switch item.type {
         case .fileChange: return "doc.badge.gearshape"
         case .mcpToolCall, .dynamicToolCall, .collabToolCall: return "puzzlepiece.extension"
@@ -12728,6 +12771,13 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         case .error: return "exclamationmark.triangle"
         default: return "terminal"
         }
+    }
+
+    /// Distill's replacement-session notice rides as `.contextCompaction` for
+    /// decoder compatibility (`DistillACPAdapter.emitFreshSessionNotice`); it
+    /// is a new provider session, not a compaction.
+    static func isFreshSessionNotice(_ item: AssistantItem) -> Bool {
+        item.type == .contextCompaction && item.id.hasPrefix("distill-fresh-session-")
     }
 
 }
@@ -17483,7 +17533,7 @@ public struct AgentAppView: View {
                     .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
                     .frame(width: 14, height: 14, alignment: .center)
                 AgentSelectablePlainText(
-                    text: err,
+                    text: AgentErrorRecoveryAction.displayText(err),
                     fontSize: 11,
                     monospaced: true,
                     textColor: recoverable ? DS.NS.warning : DS.NS.danger,
