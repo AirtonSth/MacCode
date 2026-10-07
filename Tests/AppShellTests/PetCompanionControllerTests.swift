@@ -207,6 +207,15 @@ final class PetCompanionControllerTests: XCTestCase {
         EventBus.shared.publish(kind: .agentRunStarted, payload: .object([
             "run_id": .string(runUUID.uuidString),
         ]))
+        // The host projection is authoritative for starts (an empty snapshot
+        // alone is treated as a projection race), so seed the ghost the way
+        // production does: bus start, then a projection listing that run.
+        controller.applyActiveRunProjectionForTests(ActiveRunProjection(runs: [
+            ActiveRunProjection.Run(
+                threadId: AgentThreadID(UUID()),
+                runId: AgentRunID(runUUID)
+            ),
+        ]))
         try await waitForState(.coding, controller: controller)
 
         // Missed finish on the bus; host Active section is empty.
