@@ -2,8 +2,8 @@ import XCTest
 import CoreModel
 @testable import Persistence
 
-/// P6 host authority: the paired live viewer's frame CAS, adoption, input
-/// tolerance and `bot.guest.control`.
+/// P6 host authority: the paired live viewer's frame CAS, observe target,
+/// input tolerance and `bot.guest.control`.
 final class BotGuestObserveAuthorityTests: XCTestCase {
     private let hostID = "test-host"
     private var db: SQLiteDB!
@@ -86,12 +86,12 @@ final class BotGuestObserveAuthorityTests: XCTestCase {
         return try state(botID)
     }
 
-    private func frame(_ hash: String) -> BotRemoteControlAuthority.ObservedGuestFrame {
+    private func frame(_ hash: String, width: Int = 1_600, height: Int = 1_200) -> BotRemoteControlAuthority.ObservedGuestFrame {
         .init(
             containerID: "container",
             viewerPath: "/vnc.html",
-            pixelWidth: 1_600,
-            pixelHeight: 1_200,
+            pixelWidth: width,
+            pixelHeight: height,
             pngBase64: "cG5n",
             pngHash: hash
         )
@@ -182,6 +182,60 @@ final class BotGuestObserveAuthorityTests: XCTestCase {
         )
     }
 
+    func test_aSettledInputFrameRetiresTheFramesAnObserveReplaced() throws {
+        // WHY: after an input lands, the screen changed; a second tap aimed at
+        // a frame from before that input would hit something else.
+        let bot = try createBot()
+        var stored: [String: Any] = [:]
+        authority.onGuestInput = { _, _, _, context in stored = context }
+        let running = try runningGuest(bot.id)
+        let (grant, first) = try grantAndFrame(running)
+        let firstID = try XCTUnwrap(first)
+        XCTAssertTrue(authority.applyObservedGuestFrame(
+            botID: bot.botID, grantID: grant, expectedFrameID: first, frame: frame("observed")
+        ))
+        // An observe refreshes the runtime's container id: input names the current runtime.
+        let runtime = try XCTUnwrap(try state(bot.id)["runtime"] as? [String: Any])
+        let observed = try XCTUnwrap(try grantAndFrame(try state(bot.id)).frame)
+        let accepted = try pointer(bot.id, runtime: runtime, beforeFrameID: firstID, requestID: "tap-on-replaced")
+        XCTAssertEqual(accepted["status"] as? String, "accepted", "the replaced frame is still the screen the user saw")
+
+        var readback = stored
+        readback["status"] = "running"
+        readback["frame"] = [
+            "runtime": runtime,
+            "frame_id": UUID().uuidString.lowercased(),
+            "sequence": 2,
+            "pixel_width": 1_600,
+            "pixel_height": 1_200,
+            "png_base64": "",
+            "png_hash": "after-tap",
+        ]
+        authority.settle(requestID: try XCTUnwrap(accepted["request_id"] as? String), status: .completed, readback: readback)
+        XCTAssertThrowsError(try pointer(bot.id, runtime: runtime, beforeFrameID: firstID, requestID: "second-tap")) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .guestConflict)
+        }
+        XCTAssertThrowsError(try pointer(bot.id, runtime: runtime, beforeFrameID: observed, requestID: "third-tap"))
+    }
+
+    func test_aReplacedFrameOfAnotherSizeIsNotAnInputTarget() throws {
+        // WHY: coordinates are in the named frame's pixels and run on the
+        // screen as it is now; after a resolution change they would land elsewhere.
+        let bot = try createBot()
+        authority.onGuestInput = { _, _, _, _ in }
+        let running = try runningGuest(bot.id)
+        let (grant, first) = try grantAndFrame(running)
+        XCTAssertTrue(authority.applyObservedGuestFrame(
+            botID: bot.botID, grantID: grant, expectedFrameID: first, frame: frame("small", width: 800, height: 600)
+        ))
+        let runtime = try XCTUnwrap(try state(bot.id)["runtime"] as? [String: Any])
+        XCTAssertThrowsError(try pointer(bot.id, runtime: runtime, beforeFrameID: try XCTUnwrap(first), requestID: "old-size")) { error in
+            XCTAssertEqual(error as? BotRemoteControlAuthority.Error, .guestConflict)
+        }
+        let current = try XCTUnwrap(try grantAndFrame(try state(bot.id)).frame)
+        XCTAssertEqual(try pointer(bot.id, runtime: runtime, beforeFrameID: current, requestID: "new-size")["status"] as? String, "accepted")
+    }
+
     func test_settleAfterAnObservedFrameKeepsSequenceIncreasing() throws {
         // WHY: an input result is built on the frame the input started from; if
         // an observe replaced it meanwhile, the iPhone still needs a newer sequence.
@@ -214,35 +268,29 @@ final class BotGuestObserveAuthorityTests: XCTestCase {
 
     // MARK: - Adoption and stop
 
-    func test_adoptionTurnsAStoppedStateIntoANewRunningGrantOnlyWhenAdoptable() throws {
-        // WHY: a VM bot's own run starts its guest; a viewer must be able to
-        // watch it without a client-side Start, but never revive a revoked grant.
+    func test_observeTargetIsAdoptableOnlyForAStoppedStateOfThisHostAndNeverAfterRevoke() throws {
+        // WHY: a VM bot's own run starts its guest; observe reports it as
+        // adoptable (the client adopts with bot.guest.start), but never for
+        // another host's binding or a grant the user revoked.
         let bot = try createBot()
-        let stopped = try state(bot.id)
-        XCTAssertEqual(stopped["status"] as? String, "stopped")
+        XCTAssertEqual(try state(bot.id)["status"] as? String, "stopped")
         XCTAssertEqual(authority.guestObserveTarget(botID: bot.botID, hostID: hostID), .adoptable)
         XCTAssertEqual(authority.guestObserveTarget(botID: bot.botID, hostID: "other-host"), .unavailable)
 
-        let grant = try XCTUnwrap(authority.adoptRunningGuest(botID: bot.botID, hostID: hostID))
-        let adopted = try state(bot.id)
-        XCTAssertEqual(adopted["status"] as? String, "running")
-        XCTAssertEqual(adopted["grant_invalidated"] as? Bool, false)
-        XCTAssertEqual((adopted["runtime"] as? [String: Any])?["grant_id"] as? String, grant)
-        XCTAssertEqual(authority.guestObserveTarget(botID: bot.botID, hostID: hostID), .running(grantID: grant, frameID: nil))
-        XCTAssertNil(authority.adoptRunningGuest(botID: bot.botID, hostID: hostID), "a running grant is not adopted twice")
+        let running = try runningGuest(bot.id)
+        let (grant, frameID) = try grantAndFrame(running)
+        XCTAssertEqual(authority.guestObserveTarget(botID: bot.botID, hostID: hostID), .running(grantID: grant, frameID: frameID))
 
         // Revoked access is the user's choice: observe must not undo it.
-        let runtime = try XCTUnwrap(adopted["runtime"] as? [String: Any])
         let revoke = try task(bot.id, axis: "grantRevoke")
         _ = try authority.dispatch(method: "bot.guest.revoke", params: [
             "client_request_id": "revoke",
             "bot_id": bot.id,
             "host_id": hostID,
             "task_id": try XCTUnwrap(revoke["id"] as? String),
-            "runtime": runtime,
+            "runtime": try XCTUnwrap(running["runtime"] as? [String: Any]),
         ])
         XCTAssertEqual(authority.guestObserveTarget(botID: bot.botID, hostID: hostID), .unavailable)
-        XCTAssertNil(authority.adoptRunningGuest(botID: bot.botID, hostID: hostID))
     }
 
     func test_markStoppedEndsOnlyTheWatchedGrant() throws {
@@ -288,6 +336,20 @@ final class BotGuestObserveAuthorityTests: XCTestCase {
         XCTAssertEqual((released["readback"] as? [String: Any])?["controlled_by_user"] as? Bool, false)
         XCTAssertFalse(control.isControlledByUser(bot.botID))
         XCTAssertEqual(changes, [true, false])
+    }
+
+    func test_guestControlReceiptCarriesNoScreenshot() throws {
+        // WHY: receipts are stored and replayed; a multi-MB PNG in each take or
+        // release receipt would bloat the sidecar and every retry.
+        let bot = try createBot()
+        XCTAssertNotNil(try runningGuest(bot.id)["frame"])
+        let taken = try authority.dispatch(method: "bot.guest.control", params: [
+            "client_request_id": "take-frame", "bot_id": bot.id, "host_id": hostID, "action": "take",
+        ])
+        let readback = try XCTUnwrap(taken["readback"] as? [String: Any])
+        XCTAssertNil(readback["frame"])
+        XCTAssertEqual(readback["status"] as? String, "running")
+        XCTAssertNotNil(try state(bot.id)["frame"], "the guest state keeps its frame")
     }
 
     func test_guestControlRejectsUnknownActionsAndAnotherHostsBinding() throws {

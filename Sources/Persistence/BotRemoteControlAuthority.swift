@@ -104,8 +104,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var browser: [String: [String: Any]] = [:]
     private var guest: [String: [String: Any]] = [:]
     /// Frames an observing viewer replaced, per bot and runtime grant (newest
-    /// last). Input aimed at one of them is still on the screen the user saw.
-    private var guestRecentFrames: [String: (grantID: String, frameIDs: [String])] = [:]
+    /// last). Input aimed at one of them is still on the screen the user saw,
+    /// until an input settles a new frame.
+    private var guestRecentFrames: [String: (grantID: String, frames: [RecentGuestFrame])] = [:]
     private var liveRuns: [String: [String: Any]] = [:]
     private var attention: [String: [String: Any]] = [:]
     private var peerReceipts: [String: [String: Any]] = [:]
@@ -190,6 +191,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                    settledFrame["frame_id"] as? String != shownFrame?["frame_id"] as? String {
                     settledFrame["sequence"] = shownSequence + 1
                     current["frame"] = settledFrame
+                }
+                // A settled frame shows the screen after the input: frames an
+                // observe replaced before it no longer match what is there.
+                if (current["frame"] as? [String: Any])?["frame_id"] as? String
+                    != shownFrame?["frame_id"] as? String {
+                    guestRecentFrames[botID] = nil
                 }
                 current["viewer"] = "/vnc.html"
                 current["viewer_path"] = "/vnc.html"
@@ -2402,6 +2409,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             computerControl.release(bot.id)
         }
         onGuestControlChanged?(bot.id, take)
+        // The receipt is stored and replayed: no screenshot in it (bot.guest.state serves the frame).
+        readback["frame"] = nil
         readback["controlled_by_user"] = computerControl.isControlledByUser(bot.id)
         readback["control_action"] = take ? "take" : "release"
         return receipt(requestID: requestID, status: .completed, botID: botID, readback: readback)
@@ -2438,7 +2447,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public enum GuestObserveTarget: Equatable, Sendable {
         /// Running on this runtime grant and showing `frameID` (nil before the first frame).
         case running(grantID: String, frameID: String?)
-        /// Not running here: a viewer may adopt the bot's container if Docker runs it.
+        /// Not running here: if Docker runs the bot's container, a client may
+        /// adopt it with `bot.guest.start` (observe itself never mints a grant).
         case adoptable
         /// Starting, stopping, revoked or never read by this host: nothing to capture.
         case unavailable
@@ -2460,41 +2470,6 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return .running(grantID: grantID, frameID: (state["frame"] as? [String: Any])?["frame_id"] as? String)
         }
         return Self.adoptableGuestStatuses.contains(status) ? .adoptable : .unavailable
-    }
-
-    /// Adopts the bot's running container (started by the bot's own run, or
-    /// before a relaunch) as a new runtime grant, so a paired viewer sees the
-    /// screen the bot is working on. Returns the grant id, or nil when the
-    /// state moved meanwhile. Call it only after Docker said the container runs.
-    public func adoptRunningGuest(botID: BotID, hostID: String) -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        let key = botID.value.uuidString.lowercased()
-        guard var state = guest[key],
-              state["host_id"] as? String == hostID,
-              let status = state["status"] as? String,
-              Self.adoptableGuestStatuses.contains(status),
-              let catalog = state["task_catalog"] as? [String: Any],
-              let tasks = catalog["tasks"] as? [[String: Any]],
-              let startTask = tasks.first(where: { $0["axis"] as? String == "start" }),
-              let recipeID = startTask["recipe_id"] as? String else { return nil }
-        let runtime = makeGuestRuntime(botID: key, hostID: hostID, recipeID: recipeID, previousState: state)
-        state["runtime"] = runtime
-        state["frame"] = nil
-        state["input"] = nil
-        state["status"] = "running"
-        state["grant_generation"] = runtime["grant_generation"]
-        state["grant_invalidated"] = false
-        state["error_message"] = nil
-        state["recovery"] = nil
-        state["recipe"] = startTask["recipe"]
-        state["viewer"] = "/vnc.html"
-        state["viewer_path"] = "/vnc.html"
-        state["security"] = Self.guestSecurity
-        state["embed_html_is_not_runtime"] = true
-        guest[key] = state
-        persistSidecar()
-        return runtime["grant_id"] as? String
     }
 
     /// Stores a frame captured for an observing viewer. Latest wins: the frame
@@ -2533,12 +2508,14 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         ]
         state["before_frame_id"] = previousID
         state["after_frame_id"] = frameID
-        if let previousID {
+        if let previousID,
+           let width = previous?["pixel_width"] as? Int,
+           let height = previous?["pixel_height"] as? Int {
             var recent = guestRecentFrames[key]
             if recent?.grantID != grantID { recent = (grantID, []) }
-            recent?.frameIDs.append(previousID)
-            if let kept = recent?.frameIDs.suffix(Self.recentObservedFrameLimit) {
-                recent?.frameIDs = Array(kept)
+            recent?.frames.append(RecentGuestFrame(id: previousID, width: width, height: height))
+            if let kept = recent?.frames.suffix(Self.recentObservedFrameLimit) {
+                recent?.frames = Array(kept)
             }
             guestRecentFrames[key] = recent
         }
@@ -2572,13 +2549,27 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// observe can replace the frame between the user's tap and its arrival.
     private static let recentObservedFrameLimit = 4
 
-    private func isRecentObservedFrame(_ frameID: String?, state: [String: Any]) -> Bool {
+    private struct RecentGuestFrame {
+        let id: String
+        let width: Int
+        let height: Int
+    }
+
+    /// Only a recent frame of the current frame's size: input coordinates are
+    /// in the named frame's pixels and run on the screen as it is now.
+    private func isRecentObservedFrame(
+        _ frameID: String?,
+        state: [String: Any],
+        width: Int,
+        height: Int
+    ) -> Bool {
         guard let frameID,
               let botID = state["bot_id"] as? String,
               let grantID = (state["runtime"] as? [String: Any])?["grant_id"] as? String,
               let recent = guestRecentFrames[botID],
-              recent.grantID == grantID else { return false }
-        return recent.frameIDs.contains(frameID)
+              recent.grantID == grantID,
+              let named = recent.frames.last(where: { $0.id == frameID }) else { return false }
+        return named.width == width && named.height == height
     }
 
     private func requireGuestHost(_ params: [String: Any]) throws -> String {
@@ -2709,9 +2700,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let beforeFrameID = string(params, "before_frame_id")
         guard let frame = state["frame"] as? [String: Any],
               let frameID = frame["frame_id"] as? String,
-              frameID == beforeFrameID || isRecentObservedFrame(beforeFrameID, state: state),
               let width = frame["pixel_width"] as? Int,
               let height = frame["pixel_height"] as? Int,
+              frameID == beforeFrameID
+                || isRecentObservedFrame(beforeFrameID, state: state, width: width, height: height),
               let input = params["input"] as? [String: Any],
               let kind = input["kind"] as? String,
               kind == task["axis"] as? String else { throw Error.guestConflict }

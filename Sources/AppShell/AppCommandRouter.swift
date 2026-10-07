@@ -548,6 +548,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 Task { @MainActor [weak self] in self?.publishManualActionUpdated(thread: threadID, requestID: request.id) }
             }
         })
+        // Hops even on the main thread: `bot.guest.control` changes control under the
+        // paired authority's lock, and the event reads that authority.
+        botHostObservers.append(center.addObserver(forName: .botComputerControlChanged, object: nil, queue: nil) { [weak self] note in
+            guard let source = note.object as? BotComputerControl,
+                  let botID = note.userInfo?[BotHostNotificationKey.botID] as? BotID else { return }
+            Task { @MainActor [weak self] in
+                guard let self, source === self.botComputerControl else { return }
+                self.publishGuestControlChanged(botID: botID)
+            }
+        })
         botHostObservers.append(center.addObserver(forName: .botMacExecutionRequested, object: nil, queue: nil) { [weak self] note in
             guard let info = note.userInfo,
                   let threadID = info[BotHostNotificationKey.threadID] as? AgentThreadID else { return }
@@ -3698,6 +3708,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 return await Task.detached(priority: .userInitiated) { [service] in
                     service.isContainerRunning(botID: botID)
                 }.value
+            },
+            onStopped: { [weak self] botID, hostID in
+                self?.publishGuestObservedStopped(botID: botID, hostID: hostID)
             }
         )
         pairedGuestObserver = created
@@ -3722,14 +3735,53 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         EventBus.shared.publish(kind: .botGuestUpdated, payload: .object(payload))
     }
 
-    /// `bot.guest.control take` also takes the bot's open manual action (as the
-    /// Mac card's Take does), and every Mac card refreshes its control toggle.
+    /// An observe saw the watched container gone and ended its grant as
+    /// `stopped`: every paired client learns it, not only the one that polled.
+    func publishGuestObservedStopped(botID: BotID, hostID: String) {
+        EventBus.shared.publish(kind: .botGuestUpdated, payload: .object([
+            "bot_id": .string(botID.value.uuidString.lowercased()),
+            "host_id": .string(hostID),
+            "method": .string("bot.guest.state"),
+            "reason": .string("observe_stopped"),
+            "status": .string("stopped"),
+            "grant_invalidated": .bool(true),
+            "controlled_by_user": .bool(botComputerControl.isControlledByUser(botID)),
+        ]))
+    }
+
+    /// `bot.guest.updated` with `reason: "control"` whenever who drives the
+    /// bot's computer changed, from the Mac (card, screen toggle) or a paired device.
+    func publishGuestControlChanged(botID: BotID) {
+        var payload: [String: JSONValue] = [
+            "bot_id": .string(botID.value.uuidString.lowercased()),
+            "reason": .string("control"),
+            "controlled_by_user": .bool(botComputerControl.isControlledByUser(botID)),
+        ]
+        if let hostID = pairedBotRemote?.guestHostID(botID: botID) {
+            payload["host_id"] = .string(hostID)
+        }
+        EventBus.shared.publish(kind: .botGuestUpdated, payload: .object(payload))
+    }
+
+    /// `bot.guest.control take` also takes the bot's open manual action, as the
+    /// Mac card's Take does (never on a thread that runs on the Mac). `release`
+    /// hands a taken request back to the bot as `open`, unanswered (the Mac
+    /// card's Devolver continues it instead). Every Mac card refreshes its toggle.
     private func syncManualActionsAfterGuestControl(botID: BotID, took: Bool) {
-        if took {
-            for request in manualActionStore.openByThread().values
-            where request.botID == botID && request.state == .open {
+        let threads = context?.threadRepo
+        for request in manualActionStore.openByThread().values where request.botID == botID {
+            if took, request.state == .open {
+                guard let threadID = request.threadID,
+                      let thread = try? threads?.get(id: threadID),
+                      thread.executionTarget != .mac else { continue }
                 if let taken = try? manualActionStore.take(id: request.id, control: botComputerControl) {
                     ManualActionRequestStore.postStateChanged(taken)
+                }
+            } else if !took, request.state == .taken {
+                var reopened = request
+                reopened.state = .open
+                if (try? manualActionStore.upsert(reopened)) != nil {
+                    ManualActionRequestStore.postStateChanged(reopened)
                 }
             }
         }
