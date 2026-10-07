@@ -314,17 +314,16 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     let path = directory.appendingPathComponent("history.sqlite").path
     let database = try SQLiteDB(path: path)
     try Schema.migrate(database)
-    try database.execute("PRAGMA busy_timeout=25;")
+    // This test pins the coordinator's own retry chain against its finalizing
+    // deadline. SQLiteDB layers its own bounded wait under every call (the
+    // busy handler plus up to 8 transient-lock attempts per transaction,
+    // covered by SQLiteBusyRetryTests), which the coordinator deadline cannot
+    // interrupt. Make each SQLite call one immediate attempt so the timing
+    // below measures the coordinator, not SQLite's busy waits.
+    try database.execute("PRAGMA busy_timeout=0;")
+    database.busyRetryMaxAttemptsForTesting = 1
     let lockDatabase = try SQLiteDB(path: path)
     let repository = TerminalOutputRepository(db: database)
-    let attempts = LockedCounter()
-    database.beforeStatementStepForTesting = { sql in
-      if sql.contains("INSERT INTO terminal_output_chunks")
-          || sql.contains("INSERT INTO settings") {
-        _ = attempts.increment()
-      }
-    }
-    defer { database.beforeStatementStepForTesting = nil }
     let surfaceID = SurfaceID().value.uuidString
     let coordinator = TerminalHistoryCoordinator(
       repository: repository,
@@ -333,6 +332,22 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     )
     coordinator.prepare(restored: false)
     try waitForPreparation(coordinator, expected: .ready(nextChunkIndex: 1))
+    // Every history write is a BEGIN IMMEDIATE transaction, and under the lock
+    // it fails before any INSERT steps, so count transaction attempts. The
+    // unresolved-failure marker fallback deliberately keeps retrying on its own
+    // queue until the partial marker is durable; it does not occupy the history
+    // queue and is not part of the payload retry chain this test bounds.
+    let attempts = LockedCounter()
+    database.beforeExecuteForTesting = { sql in
+      guard sql.hasPrefix("BEGIN IMMEDIATE") else { return }
+      let fromUnresolvedFallback = Thread.callStackSymbols.contains {
+        $0.contains("scheduleUnresolvedFailureRetry")
+      }
+      if !fromUnresolvedFallback {
+        _ = attempts.increment()
+      }
+    }
+    defer { database.beforeExecuteForTesting = nil }
     try lockDatabase.execute("BEGIN IMMEDIATE;")
     var lockHeld = true
     defer {
@@ -362,10 +377,22 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     let attemptsAfterBarrier = attempts.value
     RunLoop.main.run(until: Date().addingTimeInterval(0.25))
 
-    XCTAssertLessThan(elapsed, 0.8)
+    XCTAssertLessThan(
+      elapsed,
+      0.8,
+      "the final barrier must resolve shortly after the 0.18 s finalizing deadline"
+    )
     XCTAssertGreaterThan(attemptsAfterBarrier, 0)
-    XCTAssertLessThanOrEqual(attemptsAfterBarrier, 4)
-    XCTAssertEqual(attempts.value, attemptsAfterBarrier)
+    // prepareRetryDelays starts [0.05, 0.1, 0.2, ...]: inside 0.18 s the payload
+    // gets at most three append attempts (t = 0, 0.05, 0.15). The failure path
+    // then makes one partial-marker attempt and one retention check before the
+    // barrier, all on the serial history queue.
+    XCTAssertLessThanOrEqual(attemptsAfterBarrier, 5)
+    XCTAssertEqual(
+      attempts.value,
+      attemptsAfterBarrier,
+      "no history-queue write may retry after the finalizing barrier resolved"
+    )
     XCTAssertEqual(coordinator.outstandingBytes, 0)
     XCTAssertGreaterThan(coordinator.writeFailures, 0)
     XCTAssertEqual(try repository.totalBytes(surfaceID: surfaceID), 0)
