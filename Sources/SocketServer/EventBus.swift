@@ -146,6 +146,20 @@ public final class EventBus: @unchecked Sendable {
         "agent.item.progress",
         "agent.provider_runtime.event",
     ]
+
+    /// `agent.*` kinds that never change an `agentThreads` snapshot row
+    /// (`AgentThread` has no stream or usage fields): the live-only
+    /// stream kinds plus usage telemetry. They must not advance the
+    /// `agentThreads` domain revision, or every `knownDomainRevisions`
+    /// reconnect resends the whole thread list while an agent streams.
+    /// `surface.output` still advances `surfaces`: snapshot surface rows carry
+    /// the time-derived `busy` flag that iOS reads.
+    static let agentThreadsRevisionExemptKinds: Set<String> = liveOnlyStreamEventKinds
+        .union([
+            RemoteCodeEventKind.agentThreadTokenUsage.rawValue,
+            RemoteCodeEventKind.agentAccountUsage.rawValue,
+            RemoteCodeEventKind.agentAccountUsageRefresh.rawValue,
+        ])
     private struct Subscriber {
         var filter: EventStreamFilter
         /// Called with the seq of an event this subscriber's filter dropped,
@@ -706,6 +720,7 @@ public final class EventBus: @unchecked Sendable {
             || kind == "settings.updated"
         let surfaces = kind.hasPrefix("surface.") || kind.hasPrefix("pane.")
         let agentThreads = kind.hasPrefix("agent.")
+            && !agentThreadsRevisionExemptKinds.contains(kind)
         let browser = kind.hasPrefix("browser.") || kind == "surface.browser"
         let files = kind.hasPrefix("files.") || kind.hasPrefix("fs.")
         return ConnectionDomainRevisions(
