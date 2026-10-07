@@ -42,6 +42,20 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         return predicate()
     }
 
+    /// Distill is the only provider RemoteCode ships, and its send preflight
+    /// refuses a signed-out snapshot, so Distill queue fixtures seed a signed-in one.
+    private func rememberSignedInSnapshot(_ provider: AgentProvider, router: AppCommandRouter) {
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(id: "test-model", label: "Test Model", provider: provider)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: provider.rawValue
+            )
+        ])
+    }
+
     private func isTerminal(_ status: AgentRunStatus?) -> Bool {
         switch status {
         case .completed, .failed, .cancelled, .interrupted:
@@ -1649,7 +1663,10 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         // WHY: stopRun publishes the host-side cancellation before a native
         // provider necessarily becomes idle. The first drain can therefore see
         // a live adapter session; Force still owes exactly one later start.
-        for provider in AgentProvider.allCases {
+        // Distill is the only shipped provider. Its adapter keeps the session
+        // live until the provider acknowledges the Stop, and it names its
+        // thread when the prompt is accepted; the fixture models both.
+        for provider in [AgentProvider.distill] {
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -1666,8 +1683,9 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
             let router = AppCommandRouter(context: ctx)
             ctx.router = router
-            let runner = DelayedCancelQueueRunner(provider: provider)
-            ctx.coordinator.replaceProvider(provider, runner: runner)
+            rememberSignedInSnapshot(provider, router: router)
+            let runner = DelayedCancelQueueRunner(provider: provider, reportsProviderThreadAtStart: true)
+            ctx.coordinator.replaceProviderAdapter(provider, adapter: TerminalRetiringOneShotAdapter(runner: runner))
             let workspace = try router.createWorkspace(
                 name: "delayed-force-\(provider.rawValue)",
                 cwd: workspaceDir.path
@@ -1741,6 +1759,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             )
             XCTAssertEqual(failures.count, 1,
                            "\(provider.rawValue) must emit one timeout status while continuing the late-idle watcher")
+            XCTAssertTrue(failures.failureMessages.allSatisfy { $0.hasPrefix("Provider is still stopping.") },
+                          "the one failure must be the delayed-stop status, not a dispatch error: \(failures.failureMessages)")
             ctx.coordinator.stopRun(threadId: thread.id)
         }
     }
@@ -1749,7 +1769,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         // WHY: the queue timeout describes delayed stop recovery, not normal
         // queue residence. A legitimately running turn may exceed it without
         // making the durable follow-up unsafe or showing a false failure.
-        for provider in AgentProvider.allCases {
+        // Distill is the only shipped provider.
+        for provider in [AgentProvider.distill] {
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -1763,6 +1784,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             ctx.queueDrainProviderIdleTimeout = 0.02
             let router = AppCommandRouter(context: ctx)
             ctx.router = router
+            rememberSignedInSnapshot(provider, router: router)
             let runner = DelayedCancelQueueRunner(provider: provider, cancellationDelay: nil)
             ctx.coordinator.replaceProvider(provider, runner: runner)
             let sleeper = QueueDrainTestSleeper()
@@ -1840,7 +1862,9 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
     func test_forceQueueNeverIdlePreservesIntentWithSingleTimeoutFailureAcrossProviders() async throws {
         // WHY: a provider that ignores cancellation must not trigger repeated
         // drain attempts, emit a false terminal failure, or consume the row.
-      for provider in AgentProvider.allCases {
+        // Distill is the only shipped provider; its adapter keeps the session
+        // live until the provider acknowledges the Stop.
+      for provider in [AgentProvider.distill] {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -1857,8 +1881,13 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
-        let runner = DelayedCancelQueueRunner(provider: provider, cancellationDelay: nil)
-        ctx.coordinator.replaceProvider(provider, runner: runner)
+        rememberSignedInSnapshot(provider, router: router)
+        let runner = DelayedCancelQueueRunner(
+            provider: provider,
+            cancellationDelay: nil,
+            reportsProviderThreadAtStart: true
+        )
+        ctx.coordinator.replaceProviderAdapter(provider, adapter: TerminalRetiringOneShotAdapter(runner: runner))
         let workspace = try router.createWorkspace(name: "never-idle", cwd: workspaceDir.path)
         let thread = try router.createAgentThread(
             workspace: workspace.id,
@@ -1891,6 +1920,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         await failures.waitForCount(1)
 
         XCTAssertEqual(failures.count, 1)
+        XCTAssertTrue(failures.failureMessages.allSatisfy { $0.hasPrefix("Provider is still stopping.") },
+                      "the one failure must be the delayed-stop status, not a dispatch error: \(failures.failureMessages)")
         XCTAssertEqual(runner.startCount, 1)
         XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["preserve after timeout"])
         XCTAssertEqual(
@@ -1906,7 +1937,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
     }
 
     func test_terminalRunWithNoQueuedRowsSkipsNeverIdleWaitAcrossProviders() async throws {
-      for provider in AgentProvider.allCases {
+      // Distill is the only shipped provider.
+      for provider in [AgentProvider.distill] {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -1920,6 +1952,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         ctx.queueDrainProviderIdleTimeout = 0.02
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
+        rememberSignedInSnapshot(provider, router: router)
         let runner = DelayedCancelQueueRunner(provider: provider, cancellationDelay: nil)
         ctx.coordinator.replaceProvider(provider, runner: runner)
         let workspace = try router.createWorkspace(name: "empty-queue", cwd: workspaceDir.path)
@@ -2059,6 +2092,11 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
     }
 
     func test_cancellingFinalQueuedRowCancelsLateIdleWaiter() async throws {
+        // WHY: a follow-up sent after Stop waits for the still-live provider.
+        // Cancelling that last queued row must also cancel its idle waiter.
+        // Distill's adapter keeps the session live until the provider
+        // acknowledges the Stop, and names its thread when the prompt is
+        // accepted; the fixture models both.
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -2072,13 +2110,18 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         ctx.queueDrainProviderIdleTimeout = 0.5
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
-        let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
-        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        rememberSignedInSnapshot(.distill, router: router)
+        let runner = DelayedCancelQueueRunner(
+            provider: .distill,
+            cancellationDelay: nil,
+            reportsProviderThreadAtStart: true
+        )
+        ctx.coordinator.replaceProviderAdapter(.distill, adapter: TerminalRetiringOneShotAdapter(runner: runner))
         let workspace = try router.createWorkspace(name: "cancel-waiter", cwd: workspaceDir.path)
         let thread = try router.createAgentThread(
             workspace: workspace.id,
             title: "cancel waiter",
-            provider: .claude,
+            provider: .distill,
             model: "test-model",
             permissionMode: .supervised,
             reasoningEffort: .medium
@@ -4569,6 +4612,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         // WHY: a claimed provider write has durable `.pending` state before its
         // adapter session/handle exists. A second Force must queue behind that
         // owner, not claim a second write or replace coordinator ownership.
+        // Distill is the only shipped provider; like its adapter, the fixture
+        // names the provider thread once the prompt is accepted.
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("post-claim-second-force-\(UUID().uuidString)", isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -4581,9 +4626,14 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
+        rememberSignedInSnapshot(.distill, router: router)
         let startBarrier = PostClaimPreHandleStartBarrier()
-        let runner = PostClaimPreHandleRunner(barrier: startBarrier)
-        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let runner = PostClaimPreHandleRunner(
+            barrier: startBarrier,
+            provider: .distill,
+            reportsProviderThreadOnAccept: true
+        )
+        ctx.coordinator.replaceProvider(.distill, runner: runner)
         let workspace = try router.createWorkspace(
             name: "post claim second Force",
             cwd: workspaceDir.path
@@ -4591,7 +4641,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         var thread = try router.createAgentThread(
             workspace: workspace.id,
             title: "second Force",
-            provider: .claude,
+            provider: .distill,
             model: "test-model",
             permissionMode: .supervised,
             reasoningEffort: .medium
@@ -6630,10 +6680,19 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
     private var callbacks: [Int: @Sendable (AgentRunEvent) -> Void] = [:]
     private var finishWasMainThread = true
     private let finishOnCancel: Bool
+    private let reportsProviderThreadAtStart: Bool
 
-    init(provider: AgentProvider, cancellationDelay: TimeInterval? = nil) {
+    /// `reportsProviderThreadAtStart` names the provider thread as soon as the
+    /// turn starts, as Distill does once session/new accepts the prompt, so a
+    /// later turn can retire the session under a new process scope.
+    init(
+        provider: AgentProvider,
+        cancellationDelay: TimeInterval? = nil,
+        reportsProviderThreadAtStart: Bool = false
+    ) {
         self.provider = provider
         self.finishOnCancel = cancellationDelay != nil
+        self.reportsProviderThreadAtStart = reportsProviderThreadAtStart
     }
 
     var startCount: Int {
@@ -6659,6 +6718,9 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
             return starts
         }
         onEvent(.status(.running))
+        if reportsProviderThreadAtStart {
+            onEvent(.event(.threadStarted(threadId: "delayed-session", providerThreadId: "delayed-session")))
+        }
         return AgentRunHandle(runId: request.runId, process: nil) {
             guard ordinal == 1, self.finishOnCancel else { return }
             self.finishRun(ordinal: ordinal, status: .cancelled)
@@ -6719,11 +6781,20 @@ private final class ConcurrentBulkStopRunner: AgentProviderRunner, @unchecked Se
 }
 
 private final class PostClaimPreHandleRunner: AgentProviderRunner, @unchecked Sendable {
-    let provider: AgentProvider = .claude
+    let provider: AgentProvider
     private let barrier: PostClaimPreHandleStartBarrier
+    private let reportsProviderThreadOnAccept: Bool
 
-    init(barrier: PostClaimPreHandleStartBarrier) {
+    /// `reportsProviderThreadOnAccept` names the provider thread once the
+    /// prompt write is accepted, as Distill does.
+    init(
+        barrier: PostClaimPreHandleStartBarrier,
+        provider: AgentProvider = .claude,
+        reportsProviderThreadOnAccept: Bool = false
+    ) {
         self.barrier = barrier
+        self.provider = provider
+        self.reportsProviderThreadOnAccept = reportsProviderThreadOnAccept
     }
 
     func listModels() async -> [AgentModelDescriptor] { [] }
@@ -6739,6 +6810,9 @@ private final class PostClaimPreHandleRunner: AgentProviderRunner, @unchecked Se
             barrier.claimAndBlockPhysicalWrite()
         }
         onEvent(.status(.running))
+        if reportsProviderThreadOnAccept {
+            onEvent(.event(.threadStarted(threadId: "post-claim-session", providerThreadId: "post-claim-session")))
+        }
         return AgentRunHandle(runId: request.runId, process: nil) {
             self.barrier.recordCancellation()
             onEvent(.status(.cancelled))
@@ -6754,38 +6828,26 @@ private final class PostClaimPreHandleStartBarrier: @unchecked Sendable {
     private var claims = 0
     private var writes = 0
     private var cancellations = 0
-    private var claimWaiters: [CheckedContinuation<Void, Never>] = []
-    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
 
     var physicalWriteCount: Int { lock.withLock { writes } }
     var claimCount: Int { lock.withLock { claims } }
     var cancelCount: Int { lock.withLock { cancellations } }
 
     func claimAndBlockPhysicalWrite() {
-        let claim = lock.withLock { () -> (Int, [CheckedContinuation<Void, Never>]) in
+        let claim = lock.withLock { () -> Int in
             claimed = true
             claims += 1
-            let waiters = claimWaiters
-            claimWaiters.removeAll()
-            return (claims, waiters)
+            return claims
         }
-        claim.1.forEach { $0.resume() }
-        if claim.0 == 1 {
+        if claim == 1 {
             writeRelease.wait()
         }
         lock.withLock { writes += 1 }
     }
 
-    func waitUntilClaimed() async {
-        if lock.withLock({ claimed }) { return }
-        await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock { () -> Bool in
-                guard !claimed else { return true }
-                claimWaiters.append(continuation)
-                return false
-            }
-            if resumeNow { continuation.resume() }
-        }
+    /// Bounded so a claim that never happens fails the test instead of hanging the suite.
+    func waitUntilClaimed(timeout: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line) async {
+        await waitUntil("provider write claimed", timeout: timeout, file: file, line: line) { claimed }
     }
 
     func releaseWrite() {
@@ -6793,24 +6855,28 @@ private final class PostClaimPreHandleStartBarrier: @unchecked Sendable {
     }
 
     func recordCancellation() {
-        let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
-            cancellations += 1
-            let waiters = cancellationWaiters
-            cancellationWaiters.removeAll()
-            return waiters
-        }
-        waiters.forEach { $0.resume() }
+        lock.withLock { cancellations += 1 }
     }
 
-    func waitUntilCancelled() async {
-        if lock.withLock({ cancellations > 0 }) { return }
-        await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock { () -> Bool in
-                guard cancellations == 0 else { return true }
-                cancellationWaiters.append(continuation)
-                return false
+    /// Bounded so a cancellation that never happens fails the test instead of hanging the suite.
+    func waitUntilCancelled(timeout: TimeInterval = 10, file: StaticString = #filePath, line: UInt = #line) async {
+        await waitUntil("provider run cancelled", timeout: timeout, file: file, line: line) { cancellations > 0 }
+    }
+
+    private func waitUntil(
+        _ what: String,
+        timeout: TimeInterval,
+        file: StaticString,
+        line: UInt,
+        _ condition: () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !lock.withLock(condition) {
+            guard Date() < deadline else {
+                XCTFail("timed out waiting for \(what)", file: file, line: line)
+                return
             }
-            if resumeNow { continuation.resume() }
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 }
@@ -6857,35 +6923,39 @@ private final class QueueFailureCounter: @unchecked Sendable {
     private let lock = NSLock()
     private let threadId: String
     private var value = 0
-    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var messages: [String] = []
 
     init(threadId: AgentThreadID) {
         self.threadId = threadId.value.uuidString
     }
 
     var count: Int { lock.withLock { value } }
+    var failureMessages: [String] { lock.withLock { messages } }
 
     func record(_ event: EventBus.Event) {
         guard event.kind == "agent.message.queue.failed",
               event.payload.objectValue?["thread_id"]?.stringValue == threadId else { return }
-        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+        let message = event.payload.objectValue?["message"]?.stringValue ?? ""
+        lock.withLock {
             value += 1
-            let ready = waiters.filter { $0.0 <= value }.map(\.1)
-            waiters.removeAll { $0.0 <= value }
-            return ready
+            messages.append(message)
         }
-        ready.forEach { $0.resume() }
     }
 
-    func waitForCount(_ count: Int) async {
-        if lock.withLock({ value >= count }) { return }
-        await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock { () -> Bool in
-                guard value < count else { return true }
-                waiters.append((count, continuation))
-                return false
+    /// Bounded so a missing failure event fails the test instead of hanging the suite.
+    func waitForCount(
+        _ expected: Int,
+        timeout: TimeInterval = 10,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while lock.withLock({ value < expected }) {
+            guard Date() < deadline else {
+                XCTFail("saw \(count) queue failures, expected \(expected)", file: file, line: line)
+                return
             }
-            if resumeNow { continuation.resume() }
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 }
@@ -6928,18 +6998,37 @@ private final class QueueEventSignal: @unchecked Sendable {
 
 private actor QueueDrainAsyncSignal {
     private var signalled = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
     func signal() {
         signalled = true
-        let pending = waiters
+        let pending = waiters.values
         waiters.removeAll()
         for waiter in pending { waiter.resume() }
     }
 
-    func wait() async {
+    /// Resumes as soon as `signal()` runs (callers rely on that ordering), and
+    /// fails after `timeout` instead of hanging the suite.
+    func wait(
+        timeout: TimeInterval = 10,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
         guard !signalled else { return }
-        await withCheckedContinuation { waiters.append($0) }
+        let id = UUID()
+        await withCheckedContinuation { continuation in
+            waiters[id] = continuation
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                await self.expire(id, file: file, line: line)
+            }
+        }
+    }
+
+    private func expire(_ id: UUID, file: StaticString, line: UInt) {
+        guard let waiter = waiters.removeValue(forKey: id) else { return }
+        XCTFail("signal never arrived", file: file, line: line)
+        waiter.resume()
     }
 
     var isSignalled: Bool { signalled }
