@@ -304,6 +304,39 @@ struct ConnectionWelcomeFrame: Codable, Equatable, Sendable {
     let currentSequence: Int64
     let oldestReplaySequence: Int64
     let capabilities: [String]
+    /// C-W: present only when the client opted in with
+    /// `X-RC2-Welcome-Fields: identity.v1` (see `ConnectionWelcomeIdentity`).
+    /// Both are omitted, never null, on the default shape so clients that
+    /// decode welcome with an exact key set keep working.
+    var apiVersion: String? = nil
+    var capabilitiesDigest: String? = nil
+}
+
+/// C-W: opt-in welcome fields that let a pinned client validate a reconnect
+/// from the welcome alone. `hostId` and `bootEpoch` are on every welcome;
+/// with the extension the welcome also carries `apiVersion` and
+/// `capabilitiesDigest`, which equals `capabilities_digest` on
+/// `GET /v1/capabilities/authenticated` while that response's `treaty` and
+/// `capabilities` are unchanged. The digest is opaque: compare it, never parse it.
+/// Old clients never send the header, so they keep the exact pre-C-W welcome.
+enum ConnectionWelcomeIdentity {
+    static let header = "x-rc2-welcome-fields"
+    static let extensionName = "identity.v1"
+    static let keys: Set<String> = ["apiVersion", "capabilitiesDigest"]
+
+    /// True when the comma-separated header lists `identity.v1`.
+    static func isRequested(header value: String?) -> Bool {
+        guard let value else { return false }
+        return value.split(separator: ",").contains {
+            $0.trimmingCharacters(in: .whitespaces).lowercased() == extensionName
+        }
+    }
+
+    static func isValidDigest(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            (0x30...0x39).contains($0) || (0x61...0x66).contains($0)
+        }
+    }
 }
 
 struct ConnectionHeartbeatFrame: Codable, Equatable, Sendable {
@@ -549,7 +582,7 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             throw ConnectionProtocolFailure.invalidFrame
         }
 
-        let allowedKeys: Set<String>
+        var allowedKeys: Set<String>
         switch type {
         case "welcome":
             allowedKeys = [
@@ -558,6 +591,9 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 "snapshotTimeoutMs",
                 "currentSequence", "oldestReplaySequence", "capabilities",
             ]
+            if !ConnectionWelcomeIdentity.keys.isDisjoint(with: object.keys) {
+                allowedKeys = allowedKeys.union(ConnectionWelcomeIdentity.keys)
+            }
         case "heartbeat":
             allowedKeys = [
                 "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
@@ -727,6 +763,16 @@ enum ConnectionTransportFrame: Equatable, Sendable {
               frame.oldestReplaySequence <= frame.currentSequence,
               !frame.capabilities.isEmpty,
               Set(frame.capabilities).count == frame.capabilities.count else {
+            throw ConnectionProtocolFailure.invalidFrame
+        }
+        // C-W: the identity extension is all-or-nothing.
+        switch (frame.apiVersion, frame.capabilitiesDigest) {
+        case (nil, nil):
+            break
+        case let (apiVersion?, digest?)
+            where isNonEmpty(apiVersion) && ConnectionWelcomeIdentity.isValidDigest(digest):
+            break
+        default:
             throw ConnectionProtocolFailure.invalidFrame
         }
     }

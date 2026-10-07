@@ -1280,22 +1280,48 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         func publicPayload() -> [String: Any] { capabilities }
 
+        private var treatyPayload: [String: Any] {
+            [
+                "current": [
+                    "major": treaty.current.major,
+                    "minor": treaty.current.minor,
+                ],
+                "supported_majors": treaty.supportedMajors,
+            ]
+        }
+
+        /// C-W: lowercase SHA-256 hex over sorted-key JSON of the API version,
+        /// treaty and capabilities. Identity is excluded (it travels beside the
+        /// digest), so an unchanged capability set keeps its digest across
+        /// host restarts and a changed one always gets a new digest.
+        var digest: String {
+            let material: [String: Any] = [
+                "api_version": DirectHTTPServer.hostAPIVersion,
+                "treaty": treatyPayload,
+                "capabilities": capabilities,
+            ]
+            let data = (try? JSONSerialization.data(
+                withJSONObject: material,
+                options: [.sortedKeys]
+            )) ?? Data()
+            return DirectHTTPServer.hexDigest(SHA256.hash(data: data))
+        }
+
         func authenticatedPayload(serverID: String, bootEpoch: UInt64) -> [String: Any] {
             [
                 "authenticated": true,
                 "server_id": serverID,
                 "boot_epoch": Int64(bootEpoch),
-                "treaty": [
-                    "current": [
-                        "major": treaty.current.major,
-                        "minor": treaty.current.minor,
-                    ],
-                    "supported_majors": treaty.supportedMajors,
-                ],
+                "treaty": treatyPayload,
                 "capabilities": capabilities,
+                // C-W: same value as welcome `capabilitiesDigest`.
+                "capabilities_digest": digest,
             ]
         }
     }
+
+    /// Host API version (discovery `api_version`, welcome `apiVersion`).
+    static let hostAPIVersion = "2"
 
     nonisolated static func capabilitiesProjection(
         loopbackOnly: Bool,
@@ -2672,6 +2698,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 currentSequence: eventSnapshot.sequence
             )
             let sequenceWatermark = ConnectionSequenceWatermark(initialSequence: wsSinceSeq)
+            // C-W: only a client that asks gets the extra welcome fields.
+            let welcomeIdentityRequested = ConnectionWelcomeIdentity.isRequested(
+                header: headers[ConnectionWelcomeIdentity.header]
+            )
             let welcome = ConnectionTransportFrame.welcome(ConnectionWelcomeFrame(
                 protocolVersion: ConnectionTransportFrame.protocolVersion,
                 type: "welcome",
@@ -2688,7 +2718,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 // the event-only WebSocket transport.
                 // stream.interest.v1 only when the host applies rc2.interest
                 // (see welcomeCapabilities); old peers ignore unknown caps.
-                capabilities: Self.welcomeCapabilities()
+                capabilities: Self.welcomeCapabilities(),
+                apiVersion: welcomeIdentityRequested ? Self.hostAPIVersion : nil,
+                capabilitiesDigest: welcomeIdentityRequested
+                    ? Self.capabilitiesProjection(
+                        loopbackOnly: bindLoopbackOnly,
+                        attachmentUpload: dispatcher.agentAttachmentUploadCapability
+                    ).digest
+                    : nil
             ))
             activeWebSocketConnections.insert(
                 connectionId,

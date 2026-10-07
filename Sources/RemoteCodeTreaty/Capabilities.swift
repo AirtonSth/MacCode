@@ -6,19 +6,25 @@ public struct AuthenticatedCapabilities: Codable, Equatable, Sendable {
     public let bootEpoch: UInt64
     public let treaty: TreatyCompatibility?
     public let capabilities: HostCapabilities
+    /// Opaque digest of `treaty` + `capabilities` (+ API version). Equals the
+    /// WebSocket welcome `capabilitiesDigest` sent to clients that opt in with
+    /// `X-RC2-Welcome-Fields: identity.v1`. Nil from hosts that predate it.
+    public let capabilitiesDigest: String?
 
     public init(
         authenticated: Bool,
         serverID: String,
         bootEpoch: UInt64,
         treaty: TreatyCompatibility?,
-        capabilities: HostCapabilities
+        capabilities: HostCapabilities,
+        capabilitiesDigest: String? = nil
     ) {
         self.authenticated = authenticated
         self.serverID = serverID
         self.bootEpoch = bootEpoch
         self.treaty = treaty
         self.capabilities = capabilities
+        self.capabilitiesDigest = capabilitiesDigest
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -27,6 +33,7 @@ public struct AuthenticatedCapabilities: Codable, Equatable, Sendable {
         case bootEpoch = "boot_epoch"
         case treaty
         case capabilities
+        case capabilitiesDigest = "capabilities_digest"
     }
 }
 
