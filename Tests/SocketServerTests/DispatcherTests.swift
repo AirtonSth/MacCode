@@ -5456,8 +5456,12 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(body["total_bytes"], .number(Double(newNotes.utf8.count)))
         XCTAssertNil(body["notes"], "compact save result must not re-emit notes")
 
-        // Receipt replay must be byte-identical to the first success.
-        let firstEncoded = try JSONEncoder().encode(try XCTUnwrap(resp.result))
+        // Receipt replay must be byte-identical to the first success. Sort keys:
+        // unsorted JSONEncoder output can order the same object differently
+        // on every encode, which made this comparison flaky.
+        let canonicalEncoder = JSONEncoder()
+        canonicalEncoder.outputFormatting = [.sortedKeys]
+        let firstEncoded = try canonicalEncoder.encode(try XCTUnwrap(resp.result))
         let replay = await dispatcher.dispatch(JSONRPCRequest(
             jsonrpc: "2.0",
             id: .number(2),
@@ -5465,7 +5469,7 @@ final class DispatcherTests: XCTestCase {
             params: params
         ))
         XCTAssertNil(replay.error)
-        let replayEncoded = try JSONEncoder().encode(try XCTUnwrap(replay.result))
+        let replayEncoded = try canonicalEncoder.encode(try XCTUnwrap(replay.result))
         XCTAssertEqual(replayEncoded, firstEncoded,
                        "command-receipt replay must be byte-identical")
         XCTAssertEqual(router.planNotesSaveCallCount, 1,
