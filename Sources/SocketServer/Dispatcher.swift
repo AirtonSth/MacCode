@@ -376,6 +376,9 @@ public protocol CommandRouting: AnyObject {
     /// event (host capability `agent.run_recovery_action_v1`), from the same
     /// classifier as the live `agent.run.error` event. Empty leaves the row as stored.
     func replayedRunErrorFields(message: String, recoverable: Bool) -> [String: JSONValue]
+    /// `agent.attachment.get`: one message attachment's bytes (or a JPEG
+    /// thumbnail), read off the main actor with `AgentAttachmentGetWire.load`.
+    func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue
 }
 
 public extension CommandRouting {
@@ -394,6 +397,9 @@ public extension CommandRouting {
         throw JSONRPCError.notSupported("agent.mac_execution.resolve")
     }
     func replayedRunErrorFields(message: String, recoverable: Bool) -> [String: JSONValue] { [:] }
+    func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("agent.attachment.get")
+    }
 
     func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
         try sshTransferUpload(surface: surface, localPath: localPath, remotePath: remotePath)
@@ -2493,7 +2499,9 @@ public final class JSONRPCDispatcher {
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
                     "thread_actor_v1": .bool(true),
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
-                    "run_recovery_action_v1": .bool(true)
+                    "run_recovery_action_v1": .bool(true),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "attachment_get_v1": .bool(true)
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {
@@ -3837,6 +3845,9 @@ public final class JSONRPCDispatcher {
             case "agent.pending_callbacks.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: encode(try await router.listAgentPendingCallbacksOffMain(thread: tid)))
+            case "agent.attachment.get":
+                let request = try AgentAttachmentGetWire.request(from: params)
+                return .init(id: id, result: try await router.getAgentAttachment(request))
             case "agent.manual_action.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let actions = try router.listManualActions(thread: tid)
@@ -4897,6 +4908,7 @@ public final class JSONRPCDispatcher {
         "surface.health", "surface.read_text", "surface.read_history",
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
         "agent.message.list", "agent.message.get", "agent.pending_callbacks.list", "agent.manual_action.list",
+        "agent.attachment.get",
         // Legacy agent.checkpoint.list remains batch-admitted. Explicit
         // response_version 1 is rejected by preflightTransport before execution.
         "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",

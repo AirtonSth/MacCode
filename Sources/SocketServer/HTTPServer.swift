@@ -1329,6 +1329,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // recovery_action (+ display message) on agent.run.error,
             // agent.run.failed and replayed agent.thread.read error rows.
             "run_recovery_action_v1": true,
+            // agent.attachment.get (read-only bytes or JPEG thumbnail of one
+            // message attachment) and agent.message.appended for bot screenshots.
+            "attachment_get_v1": true,
         ]
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject

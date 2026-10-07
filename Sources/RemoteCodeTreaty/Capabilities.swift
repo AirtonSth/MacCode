@@ -52,6 +52,11 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         /// action as given (null = no action). False for older hosts: fall back
         /// to a generic Retry.
         public let runRecoveryActionV1: Bool
+        /// `agent.attachment.get` (one message attachment's bytes or JPEG
+        /// thumbnail) and `agent.message.appended` for bot screenshots (see
+        /// AgentAttachmentGetContracts.swift). False for older hosts: show the
+        /// filename chip only.
+        public let attachmentGetV1: Bool
 
         public init(
             providers: [String],
@@ -59,7 +64,8 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             supportsResume: Bool,
             manualActionsV1: Bool = false,
             threadActorV1: Bool = false,
-            runRecoveryActionV1: Bool = false
+            runRecoveryActionV1: Bool = false,
+            attachmentGetV1: Bool = false
         ) {
             self.providers = providers
             self.supportsStreamEvents = supportsStreamEvents
@@ -67,6 +73,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             self.manualActionsV1 = manualActionsV1
             self.threadActorV1 = threadActorV1
             self.runRecoveryActionV1 = runRecoveryActionV1
+            self.attachmentGetV1 = attachmentGetV1
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -76,6 +83,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             case manualActionsV1 = "manual_actions_v1"
             case threadActorV1 = "thread_actor_v1"
             case runRecoveryActionV1 = "run_recovery_action_v1"
+            case attachmentGetV1 = "attachment_get_v1"
         }
 
         public init(from decoder: Decoder) throws {
@@ -86,6 +94,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             manualActionsV1 = try container.decodeIfPresent(Bool.self, forKey: .manualActionsV1) ?? false
             threadActorV1 = try container.decodeIfPresent(Bool.self, forKey: .threadActorV1) ?? false
             runRecoveryActionV1 = try container.decodeIfPresent(Bool.self, forKey: .runRecoveryActionV1) ?? false
+            attachmentGetV1 = try container.decodeIfPresent(Bool.self, forKey: .attachmentGetV1) ?? false
         }
     }
 

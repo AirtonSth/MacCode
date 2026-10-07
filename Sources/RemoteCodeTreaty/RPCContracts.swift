@@ -54,6 +54,12 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case macExecutionNotFound
         /// `agent.mac_execution.resolve`: nothing pending (already answered).
         case macExecutionNotPending
+        /// `agent.attachment.get`: the message is not on this thread, or the attachment is not on it.
+        case attachmentNotFound
+        /// `agent.attachment.get`: the bytes exceed `max_bytes`; `data.data_size_bytes` says by how much.
+        case attachmentTooLarge
+        /// `agent.attachment.get`: stored bytes gone or changed, or a thumbnail of a non-image.
+        case attachmentUnavailable
         case unknown(Int)
     }
 
@@ -90,6 +96,14 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
             switch data["kind"] {
             case .string("not_found"): return .macExecutionNotFound
             case .string("not_pending"): return .macExecutionNotPending
+            default: break
+            }
+        }
+        if case .object(let data)? = data, data["domain"] == .string("attachment") {
+            switch data["kind"] {
+            case .string("not_found"): return .attachmentNotFound
+            case .string("too_large"): return .attachmentTooLarge
+            case .string("unavailable"): return .attachmentUnavailable
             default: break
             }
         }

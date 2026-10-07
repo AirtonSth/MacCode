@@ -161,6 +161,12 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         }
     }
 
+    public func message(id: AgentMessageID) async throws -> AgentMessage? {
+        try await execute {
+            try AgentMessageRepository(db: self.db).get(id: id)
+        }
+    }
+
     public func threadIdsWithMessages() async throws -> Set<AgentThreadID> {
         try await execute {
             try AgentMessageRepository(db: self.db).threadIdsWithMessages()
@@ -593,11 +599,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let attachment = try agentAttachmentStore().stage(
                 data: jpeg, displayName: "screenshot.jpg", kind: .image, mimeType: "image/jpeg"
             )
-            try ctx.messageRepo.append(AgentMessage(
+            let message = AgentMessage(
                 threadId: threadID, role: .assistant, content: "📷 \(reason)", attachments: [attachment]
-            ))
+            )
+            try ctx.messageRepo.append(message)
+            // Paired devices see the screenshot row now, not on their next reload.
+            EventBus.shared.publish(
+                kind: .agentMessageAppended,
+                payload: AgentMessageTransport.appendedEventPayload(from: message)
+            )
             refreshAgentSurfaces(thread: threadID, reloadTranscriptIfSelected: true)
-        } catch {}
+        } catch {
+            NSLog("RemoteCode: bot screenshot could not be saved: \(error)")
+        }
     }
 
     func publishAgentThreadUpdated(_ thread: AgentThread) {
@@ -7803,6 +7817,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let insertionPath = (try? Self.composerInsertionPath(for: attachment, store: agentAttachmentStore()))
             ?? attachment.path
         return AgentAttachmentUploadResult(reference, composerInsertionText: insertionPath)
+    }
+
+    /// Message lookup and file/image work both run off the main actor.
+    public func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue {
+        let store = try agentAttachmentStore()
+        let message = try await agentAppReadGateway.message(id: request.messageID)
+        return try await Task.detached(priority: .userInitiated) {
+            try AgentAttachmentGetWire.load(request, message: message, store: store)
+        }.value
     }
 
     public func importAgentAttachment(workspace: WorkspaceID, relativePath: String) throws -> AgentAttachmentUploadResult {
