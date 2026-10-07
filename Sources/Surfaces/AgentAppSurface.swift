@@ -333,21 +333,33 @@ public struct AgentAppEmbedding {
     public let promptTransform: (@MainActor (_ text: String, _ threadId: AgentThreadID, _ runId: AgentRunID) async throws -> String)?
     public let onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)?
     public let onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)?
+    /// Takes every composer send before any provider work (a bot group room
+    /// never runs a provider). Returns the rows it wrote to the pinned thread,
+    /// painted at once; a thrown error keeps the prompt and shows its text.
+    public let sendInterceptor: AgentAppSendInterceptor?
 
     public init(
         pinnedThreadId: AgentThreadID,
         executionCwd: String? = nil,
         promptTransform: (@MainActor (_ text: String, _ threadId: AgentThreadID, _ runId: AgentRunID) async throws -> String)? = nil,
         onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)? = nil,
-        onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)? = nil
+        onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)? = nil,
+        sendInterceptor: AgentAppSendInterceptor? = nil
     ) {
         self.pinnedThreadId = pinnedThreadId
         self.executionCwd = executionCwd
         self.promptTransform = promptTransform
         self.onRunStarted = onRunStarted
         self.onRunFinished = onRunFinished
+        self.sendInterceptor = sendInterceptor
     }
 }
+
+public typealias AgentAppSendInterceptor = @MainActor (
+    _ text: String,
+    _ attachments: [AgentAttachment],
+    _ threadId: AgentThreadID
+) throws -> [AgentMessage]
 
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
@@ -8514,6 +8526,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let sendThreadId = selectedThreadId
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
+        if let interceptor = embedding?.sendInterceptor {
+            sendThroughInterceptor(interceptor, text: trimmed)
+            return
+        }
         if refuseLegacyProviderThreadRun() { return }
         if refuseUnavailableBotThreadRun() { return }
         if let message = selectedDistillEffortValidationMessage {
@@ -8706,6 +8722,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if selectedThreadId == sendThreadId { statusMessage = busy }
         restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+    }
+
+    /// The interceptor writes the send; its rows paint on this turn and the
+    /// composer clears only once it accepted the message.
+    private func sendThroughInterceptor(_ interceptor: AgentAppSendInterceptor, text: String) {
+        guard let threadId = selectedThreadId ?? embedding?.pinnedThreadId else { return }
+        do {
+            let rows = try interceptor(text, attachments, threadId)
+            prompt = ""
+            attachments = []
+            statusMessage = ""
+            try? clearComposerDraft(threadId: threadId, providerInstanceId: providerInstanceId)
+            guard selectedThreadId == threadId else { return }
+            // Rows already projected while the send ran (waiting rows) are
+            // re-placed in the send's order: the user line first.
+            let sent = rows.filter { $0.threadId == threadId }
+            let ids = Set(sent.map(\.id))
+            var next = messages
+            let insertAt = next.firstIndex { ids.contains($0.id) } ?? next.endIndex
+            next.removeAll { ids.contains($0.id) }
+            next.insert(contentsOf: sent, at: min(insertAt, next.endIndex))
+            messages = next
+            ensureBotPeerReconciliation()
+        } catch {
+            statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        }
     }
 
     @discardableResult
@@ -9085,6 +9127,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         recoveryDisplayText: String? = nil
     ) async -> AgentRunID? {
         botVMClaimRefusal = nil
+        // A surface whose sends are intercepted (a bot group room) never runs a provider.
+        guard embedding?.sendInterceptor == nil else { return nil }
         guard !refuseLegacyProviderThreadRun() else { return nil }
         guard !refuseUnavailableBotThreadRun() else { return nil }
         let baseRouting = queuedRoutingSnapshot?.configuration

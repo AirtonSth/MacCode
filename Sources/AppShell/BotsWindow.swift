@@ -2703,6 +2703,8 @@ public enum BotsScreen: String, Equatable {
     case attention
     case activeBots
     case scheduleTasks
+    /// A bot group conversation (`BotTeamsGroupsController.selectedGroupID`).
+    case group
 
     /// Home/fleet and the old Attention full-screen are not destinations.
     /// Leftover persist remaps them to Chat.
@@ -2714,6 +2716,8 @@ public enum BotsScreen: String, Equatable {
             return .activeBots
         case .scheduleTasks:
             return .scheduleTasks
+        case .group:
+            return .group
         case .desk, .fleet, .attention:
             return .desk
         }
@@ -3198,8 +3202,19 @@ public final class BotsViewModel: ObservableObject {
             router?.windowController?.refreshBotsChromeTitle()
             publishInterestedDeskThreadID()
             syncDeskAgentVM()
+            teamsGroups.setRoomVisible(screen == .group)
         }
     }
+    /// Bot teams and group conversations (sidebar sections, group room).
+    public private(set) lazy var teamsGroups: BotTeamsGroupsController = {
+        let controller = BotTeamsGroupsController(context: context) { [weak self] in self?.resolvedRouter() }
+        controller.onError = { [weak self] message in self?.errorMessage = message }
+        controller.onSelectedGroupVanished = { [weak self] in
+            guard let self, self.screen == .group else { return }
+            self.screen = .desk
+        }
+        return controller
+    }()
     @Published public var activeBotsTab: ActiveBotsTab = .active
     @Published public var activeBotsSearchText: String = ""
     @Published public private(set) var activeBotItems: [ActiveBotScreenItem] = []
@@ -7445,6 +7460,15 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// Group inspector route chip: the provider of the bot's member thread and
+    /// where its turns run (its locked target, else the bot's desktop default).
+    func groupRouteLabel(for bot: BotDefinition, memberThread: BotTeamsGroupsController.MemberThread?) -> String {
+        let target = memberThread?.target ?? BotExecutionDefault.target(for: cachedRevision(for: bot))
+        let place = target == .vm ? "Linux VM" : "Mac"
+        guard let memberThread else { return place }
+        return "\(providerChipTitle(memberThread.provider)) · \(place)"
+    }
+
     public func providerLabel(for bot: BotDefinition) -> String? {
         if bot.id == selectedBotID {
             return providerChipTitle(deskRouting.provider)
@@ -8882,6 +8906,12 @@ public final class BotsViewModel: ObservableObject {
         case .scheduleTasks:
             screen = .scheduleTasks
             reloadScheduleTasks()
+        case .group:
+            if let id = teamsGroups.selectedGroupID, teamsGroups.selectedGroup != nil {
+                openGroup(id)
+            } else {
+                screen = .desk
+            }
         case .desk, .fleet, .attention:
             if selectionMatches, let bot = selectedBot {
                 openDesk(bot)
@@ -10503,6 +10533,7 @@ public final class BotsViewModel: ObservableObject {
             threadId: threadID,
             terminalStatus: terminalStatus
         )
+        teamsGroups.applyPeerMessage(messageID: messageID, threadID: threadID, terminalStatus: terminalStatus)
     }
 
     /// Reuses the conversation's linked thread (drifting model/effort/permission
@@ -11890,6 +11921,7 @@ public struct BotsModeSwitcher: View {
 /// Roster body shared by the shell sidebar and the detached Bots window.
 public struct BotsRosterList: View {
     @ObservedObject private var vm: BotsViewModel
+    @ObservedObject private var teamsGroups: BotTeamsGroupsController
     /// Sidebar hosts the roster in a sibling NSHostingView from BotsRootView.
     /// Attach the delete confirm here so right-click Delete is not a silent latch.
     private let attachDeleteConfirmation: Bool
@@ -11902,6 +11934,7 @@ public struct BotsRosterList: View {
         onOpenScheduledTasks: (() -> Void)? = nil
     ) {
         self.vm = vm
+        self.teamsGroups = vm.teamsGroups
         self.attachDeleteConfirmation = attachDeleteConfirmation
         _ = isScheduledTasksSelected
         _ = onOpenScheduledTasks
@@ -11961,6 +11994,24 @@ public struct BotsRosterList: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
                 Spacer(minLength: 0)
+                Menu {
+                    Button("New Team…") { vm.beginCreateTeam() }
+                        .accessibilityIdentifier("bots.roster.add.team")
+                    Button("New Group…") { vm.beginCreateGroup() }
+                        .disabled(vm.bots.isEmpty)
+                        .accessibilityIdentifier("bots.roster.add.group")
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .disabled(!vm.isControlPlaneActive)
+                .help("New team or group conversation")
+                .accessibilityLabel("New team or group")
+                .accessibilityIdentifier("bots.roster.add")
                 Toggle("Show hidden", isOn: $vm.showHidden)
                     .toggleStyle(.checkbox)
                     .font(DS.Font.caption2)
@@ -11987,11 +12038,20 @@ public struct BotsRosterList: View {
                             .foregroundColor(DS.Palette.textTertiary)
                             .padding(.horizontal, DS.Space.md)
                             .padding(.vertical, DS.Space.sm)
+                    } else if let sections = BotRosterSections.make(
+                        roster: vm.publishedRoster,
+                        teams: teamsGroups.teams,
+                        membersByTeam: teamsGroups.membersByTeam
+                    ) {
+                        BotRosterTeamSections(vm: vm, teamsGroups: teamsGroups, sections: sections) { bot in
+                            rosterRow(bot)
+                        }
                     } else {
                         ForEach(vm.publishedRoster, id: \.id) { bot in
                             rosterRow(bot)
                         }
                     }
+                    BotGroupConversationsSection(vm: vm, teamsGroups: teamsGroups)
                 }
                 .padding(.horizontal, DS.Space.sm)
             }
@@ -11999,6 +12059,7 @@ public struct BotsRosterList: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityIdentifier("bots.roster")
         .modifier(BotsDeleteConfirmation(vm: vm, enabled: attachDeleteConfirmation))
+        .modifier(BotTeamsGroupsSheets(vm: vm, teamsGroups: teamsGroups, enabled: attachDeleteConfirmation))
     }
 
     private func rosterStatusColor(_ state: BotAttentionState) -> Color {
@@ -12013,6 +12074,7 @@ public struct BotsRosterList: View {
         let selected = vm.selectedBotID == bot.id
             && vm.screen.resolvedDestination != .activeBots
             && vm.screen.resolvedDestination != .scheduleTasks
+            && vm.screen.resolvedDestination != .group
         let state = vm.attentionState(for: bot)
         let preview = vm.rosterPreview(for: bot)
         let identity = BotsChrome.identityColor(
@@ -12258,6 +12320,8 @@ public struct BotsRootView: View {
                     ActiveBotsRootView(vm: vm)
                 case .scheduleTasks:
                     BotScheduleTasksRootView(vm: vm)
+                case .group:
+                    BotGroupRoomScreen(vm: vm, teamsGroups: vm.teamsGroups)
                 case .desk, .fleet, .attention:
                     deskScreen
                 }
@@ -12300,6 +12364,7 @@ public struct BotsRootView: View {
             Text("This deletes the protected value from this Bot's storage.")
         }
         .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail))
+        .modifier(BotTeamsGroupsSheets(vm: vm, teamsGroups: vm.teamsGroups, enabled: embedsRosterRail))
         .modifier(BotsUnsavedNewBotConfirmation(vm: vm))
         .onAppear { vm.scheduleFreshnessPass() }
     }
