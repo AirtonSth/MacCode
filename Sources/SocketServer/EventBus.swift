@@ -1238,6 +1238,7 @@ private struct EventStreamClassification {
              .diagnosticUnixRequestLimit,
              .diagnosticUnixRequestTimeout,
              .diagnosticUnixSlowClient,
+             .diagnosticWSConnectionClosed,
              .diagnosticWSOutboundPressure,
              .diagnosticWSSlowClient:
             return EventStreamClassification(priority: .diagnostic, reducerRequired: false)

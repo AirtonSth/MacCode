@@ -1512,6 +1512,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     /// Live connection-level metrics surfaced via /v1/health.
     let wsTracker = WSConnectionTracker()
+    /// Per-reason `/v1/ws` close counters (/v1/health) and the rate-limited
+    /// `diagnostic.ws_connection_closed` event.
+    public let wsCloseDiagnostics = WebSocketCloseDiagnostics()
     /// Secret-free HTTP/RPC phase aggregates (admit/read/encode/write).
     public let requestPhaseMetrics = HTTPRequestPhaseMetrics()
     private let activeWebSocketConnections = ActiveWebSocketConnectionRegistry()
@@ -2699,6 +2702,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             afterWelcomeWriteForTests?(connectionId)
             let subIDBox = LockedSubscriberID()
+            let closeRecord = WebSocketCloseRecord(sinceSequence: wsSinceSeq)
             let writeFailureClosing = connectionClosingData(
                 connectionId: connectionId,
                 reason: "write_failed",
@@ -2721,6 +2725,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 },
                 writeFailureClosingData: writeFailureClosing,
                 onTerminal: { [weak self] reason in
+                    closeRecord.recordTerminal(reason)
                     // C-04: queue_full no longer terminates. Only true write
                     // failures close the socket.
                     guard reason == "write_failed" else { return }
@@ -2840,7 +2845,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                             reason: "eventGap_\(expected)_\(received)",
                             code: 1012,
                             retryable: true,
-                            retryAfterMs: 0
+                            // Jittered so clients that lost the same burst do
+                            // not all reconnect in the same instant.
+                            retryAfterMs: WebSocketCloseDiagnostics.eventGapRetryAfterMilliseconds()
                         ),
                         reason: "event_gap"
                     )
@@ -2869,6 +2876,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     let outcome = outbound.degrade()
                     if outcome.freedFrames > 0 {
                         wsTracker.recordFramesRejectedOrEvicted(outcome.freedFrames)
+                        closeRecord.recordFramesShed(outcome.freedFrames)
                         sampleOutboundQueuedBytes()
                     }
                     if outcome.needsBaselineRequired {
@@ -2878,6 +2886,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     if WebSocketOutboundQueue.isSheddableKind(frame.event.kind.rawValue) {
                         sequenceWatermark.recordFilteredEvent(sequence: frame.event.seq)
                         wsTracker.recordFramesRejectedOrEvicted(1)
+                        closeRecord.recordFramesShed(1)
                         emitPressureBaseline()
                         return
                     }
@@ -2890,6 +2899,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         // watermark accounting; socket stays open.
                         sequenceWatermark.recordFilteredEvent(sequence: frame.event.seq)
                         wsTracker.recordFramesRejectedOrEvicted(1)
+                        closeRecord.recordFramesShed(1)
                         emitPressureBaseline()
                     case .closed:
                         break
@@ -2923,6 +2933,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     for sequence in lostSequences {
                         sequenceWatermark.recordFilteredEvent(sequence: sequence)
                     }
+                    closeRecord.recordFramesShed(lostSequences.count)
                     emitPressureBaseline()
                 },
                 sendKnownEvent: { frame in
@@ -2940,6 +2951,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 since: wsSinceSeq,
                 filter: wsFilter,
                 onReplayExpired: { metadata in
+                    closeRecord.markReplayExpired()
                     // The delivery cursor re-anchored to the live head
                     // (metadata.sequence); the gap watermark must follow BEFORE
                     // any live event is enqueued, or the first event after
@@ -3031,6 +3043,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         sampleOutboundQueuedBytes()
                     } else {
                         sequenceWatermark.recordFilteredEvent(sequence: ev.seq)
+                        closeRecord.recordFramesShed(1)
                         emitPressureBaseline()
                     }
                 case .closed:
@@ -3135,7 +3148,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 ownerFingerprint: webSocketOwnerFingerprint,
                 subscriberIDBox: subIDBox,
                 initialFilter: wsFilter,
-                initialBuffer: leftoverBuffer
+                initialBuffer: leftoverBuffer,
+                closeRecord: closeRecord
             )
             heartbeatTimer.cancel()
             batcher.stop()
@@ -3145,6 +3159,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Remove this connection's last sampled contribution (not post-close
             // residual) so total_queued_bytes stays non-negative and accurate.
             wsTracker.clientDisconnected(queuedBytes: queuedBytesSample.value)
+            let closeSummary = closeRecord.summary()
+            NSLog(
+                "[RC2.WS] connection closed reason=%@ code=%@ duration_ms=%lld since_seq=%lld replay_expired=%d frames_shed=%ld",
+                closeSummary.reason,
+                closeSummary.code.map(String.init) ?? "-",
+                closeSummary.durationMilliseconds,
+                closeSummary.sinceSequence,
+                closeSummary.replayExpired ? 1 : 0,
+                closeSummary.framesShed
+            )
+            wsCloseDiagnostics.record(closeSummary)
             return
         }
 
@@ -3347,9 +3372,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     framesRejectedOrEvicted: wsTracker.framesRejectedOrEvicted,
                     outboundQueueWait: wsTracker.outboundQueueWaitMetrics
                 ),
+                "connection_closes": wsCloseDiagnostics.healthJSON(),
                 "request_phases": Self.requestPhaseMetricsJSON(phaseMetrics),
                 "command_receipts": [
                     "claims_total": receiptMetrics.claimsTotal,
+                    "push_token_unchanged_skips_total": receiptMetrics.pushTokenUnchangedSkipsTotal,
                     "new_claims_total": receiptMetrics.newClaimsTotal,
                     "claim_failures_total": receiptMetrics.claimFailuresTotal,
                     "duplicates": [
@@ -5814,8 +5841,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
         ownerFingerprint: String,
         subscriberIDBox: LockedSubscriberID? = nil,
         initialFilter: EventStreamFilter = .full,
-        initialBuffer: Data = Data()
+        initialBuffer: Data = Data(),
+        closeRecord: WebSocketCloseRecord? = nil
     ) {
+        // Reads that end without a close frame record RFC 6455's 1006. A host
+        // terminate recorded earlier wins (first reason is kept).
+        defer { closeRecord?.recordClose(reason: "socketReleased", code: 1006) }
         // PERF-009: keep a contiguous [UInt8] buffer with a read offset
         // instead of Data + removeFirst(consumed). removeFirst is O(n) per
         // frame (shifting the whole buffer), which is quadratic under
@@ -5849,15 +5880,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 if n > 0 {
                     // continue below
                 } else if n == 0 {
+                    closeRecord?.recordClose(reason: "peerEOF", code: 1006)
                     return
                 } else {
                     let err = errno
                     if err == EAGAIN || err == EWOULDBLOCK {
                         if !Self.waitForReadable(fd: fd, timeout: Self.wsSocketReadTimeout) {
+                            closeRecord?.recordClose(reason: "readTimeout", code: 1006)
                             return
                         }
                         continue
                     }
+                    closeRecord?.recordClose(reason: "readError", code: 1006)
                     return
                 }
                 // Any bytes from the peer prove the path is live (C-06 traffic liveness).
@@ -5881,6 +5915,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     return
                 case .mustClose(let closeCode):
                     offset += consumed
+                    closeRecord?.recordClose(reason: "protocolError", code: Int(closeCode))
                     _ = outbound.terminate(
                         errorData: nil,
                         closingData: connectionClosingData(

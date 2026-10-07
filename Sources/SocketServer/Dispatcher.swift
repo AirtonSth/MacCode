@@ -337,6 +337,9 @@ public protocol CommandRouting: AnyObject {
         capabilities: [String]?
     ) throws -> JSONValue
     func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws
+    /// True only when the durable push target and attention binding already
+    /// hold exactly what `probe` would write. Read-only.
+    func privatePushRegistrationIsCurrent(_ probe: PrivatePushRegistrationProbe) -> Bool
     // settings
     func settingsGet(keys: [String]) throws -> [String: String]
     func settingsSet(key: String, value: String) throws
@@ -377,6 +380,7 @@ public extension CommandRouting {
     func cancelDistillAccountOperation() throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
 
     func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {}
+    func privatePushRegistrationIsCurrent(_ probe: PrivatePushRegistrationProbe) -> Bool { false }
 
     func agentThreadHasMessages(thread: AgentThreadID) throws -> Bool {
         !(try listAgentMessages(thread: thread, limit: 1).isEmpty)
@@ -1850,6 +1854,15 @@ public final class JSONRPCDispatcher {
                 retryable: false,
                 requiresSnapshot: true
             )
+        }
+        // An unchanged alert/legacy push token re-sent on reconnect: the host
+        // already holds this exact registration, so answer before the durable
+        // claim. No receipt, settings write or private.push_token.updated event.
+        if req.method == "private.push_token.update",
+           let probe = PrivatePushRegistrationProbe.make(from: businessParams),
+           router.privatePushRegistrationIsCurrent(probe) {
+            commandReceiptMetrics.recordPushTokenUnchangedSkip()
+            return .init(id: req.id, result: probe.result)
         }
         // workspace.select: reject a syntactically valid but absent workspace
         // before the durable claim so the failure is a stable domain error and

@@ -85,6 +85,7 @@ public enum RemoteCodeEventKind: String, Codable, CaseIterable, Sendable {
     case diagnosticUnixRequestLimit = "diagnostic.unix_request_limit"
     case diagnosticUnixRequestTimeout = "diagnostic.unix_request_timeout"
     case diagnosticUnixSlowClient = "diagnostic.unix_slow_client"
+    case diagnosticWSConnectionClosed = "diagnostic.ws_connection_closed"
     case diagnosticWSOutboundPressure = "diagnostic.ws_outbound_pressure"
     case diagnosticWSSlowClient = "diagnostic.ws_slow_client"
     case deviceRevoke = "device.revoke"

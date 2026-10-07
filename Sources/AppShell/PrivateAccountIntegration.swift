@@ -880,6 +880,44 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
         try? repo.set(key, "")
     }
 
+    /// True when `save` with these arguments would rewrite only `updatedAt`.
+    public func legacyTargetMatches(
+        pushToken: String,
+        pushTokenType: String,
+        liveActivityToken: String?,
+        deviceId: String?
+    ) -> Bool {
+        guard let stored = load(),
+              stored.pushToken == pushToken,
+              stored.pushTokenType == pushTokenType else { return false }
+        if let liveActivityToken,
+           !liveActivityToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           stored.liveActivityToken != liveActivityToken {
+            return false
+        }
+        if let deviceId,
+           !deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           stored.deviceId != deviceId {
+            return false
+        }
+        return true
+    }
+
+    /// True when `upsert(record)` would rewrite only `updatedAt`.
+    public func containsCurrentRecord(_ record: PrivatePushTargetRecord) -> Bool {
+        guard let values = try? records() else { return false }
+        return values.contains {
+            Self.sameIdentity($0, record) &&
+            $0.token == record.token &&
+            $0.activityGeneration == record.activityGeneration &&
+            $0.activityId == record.activityId &&
+            $0.bootEpoch == record.bootEpoch &&
+            $0.activitySessionId == record.activitySessionId &&
+            $0.contractVersion == record.contractVersion &&
+            $0.capabilities == record.capabilities
+        }
+    }
+
     /// After a Mac relaunch/update, rebind durable alert + push-to-start records
     /// to the current host `serverId` so Live Activity start pushes still find a
     /// target without requiring the user to open iOS first. Activity-update

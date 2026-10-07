@@ -49,6 +49,19 @@ public final class BotAttentionPushBindingStore: @unchecked Sendable {
         return loadUnlocked().contains { $0.profileID == profileID && $0.hostID == hostID }
     }
 
+    /// True when `bind` with these arguments would rewrite only `updatedAt`.
+    public func contains(profileID: String, hostID: String, deviceID: String) -> Bool {
+        let profileID = profileID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hostID = hostID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let deviceID = deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !profileID.isEmpty, !hostID.isEmpty, !deviceID.isEmpty else { return false }
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        return loadUnlocked().contains {
+            $0.profileID == profileID && $0.hostID == hostID && $0.deviceID == deviceID
+        }
+    }
+
     public func unique(hostID: String) -> BotAttentionPushBinding? {
         Self.lock.lock()
         defer { Self.lock.unlock() }

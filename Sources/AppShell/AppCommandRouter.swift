@@ -8463,6 +8463,41 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    /// Reads on the WAL reader so a reconnect's unchanged push token never waits
+    /// behind a long writer transaction. Any read failure answers false and the
+    /// request takes the full durable path.
+    public func privatePushRegistrationIsCurrent(_ probe: PrivatePushRegistrationProbe) -> Bool {
+        guard let ctx = context else { return false }
+        let store = PrivatePushTargetStore(repo: SettingsRepository(db: ctx.readDB))
+        guard store.legacyTargetMatches(
+            pushToken: probe.pushToken,
+            pushTokenType: probe.pushTokenType,
+            liveActivityToken: probe.liveActivityToken,
+            deviceId: probe.deviceID
+        ) else { return false }
+        if let alert = probe.alert {
+            guard let deviceID = probe.deviceID,
+                  let environment = PrivatePushEnvironment(rawValue: alert.environment),
+                  store.containsCurrentRecord(PrivatePushTargetRecord(
+                      deviceId: deviceID,
+                      serverId: alert.serverID,
+                      purpose: .alert,
+                      environment: environment,
+                      token: probe.pushToken,
+                      contractVersion: alert.contractVersion,
+                      capabilities: alert.capabilities
+                  )) else { return false }
+        }
+        if let binding = probe.profileBinding {
+            guard BotAttentionPushBindingStore(db: ctx.readDB).contains(
+                profileID: binding.profileID,
+                hostID: binding.hostID,
+                deviceID: binding.deviceID
+            ) else { return false }
+        }
+        return true
+    }
+
     public func settingsGet(keys: [String]) throws -> [String: String] {
         guard let ctx = context else { return [:] }
         var values: [String: String] = [:]

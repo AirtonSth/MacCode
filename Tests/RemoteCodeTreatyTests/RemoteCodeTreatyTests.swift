@@ -252,7 +252,7 @@ final class RemoteCodeTreatyTests: XCTestCase {
     }
 
     func testEveryKnownEventKindHasAnIdentityBearingGoldenEnvelope() throws {
-        XCTAssertEqual(RemoteCodeEventKind.allCases.count, 144)
+        XCTAssertEqual(RemoteCodeEventKind.allCases.count, 145)
         XCTAssertEqual(
             Set(RemoteCodeEventKind.allCases.map(\.rawValue)).count,
             RemoteCodeEventKind.allCases.count
