@@ -916,6 +916,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     ) throws -> [String: Any] {
         let botID = id(bot)
         let quarantined = quarantineBotState(botID: botID)
+        // A Docker bot's container is also started by its runs (desk and
+        // group turns), not only by `bot.guest.start`, so the remote guest
+        // state alone does not say whether one exists.
+        let ownsGuestRuntime = quarantined.guest != nil
+            || ((try? bot.currentRevisionID.flatMap { try store.getRevision(id: $0) }) ?? nil)?
+                .desktopKind == .dockerDesktop
         do {
             try store.delete(id: bot.id, now: now)
         } catch {
@@ -933,7 +939,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
 
         var residuals: [String] = []
-        if quarantined.guest != nil {
+        if ownsGuestRuntime {
             if let onDockerClear {
                 do {
                     try onDockerClear(bot.id)
