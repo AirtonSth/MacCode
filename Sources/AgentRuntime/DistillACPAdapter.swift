@@ -1062,6 +1062,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 context: loadExisting ? .resume : .start
             )
         }
+        // Stop before the prompt is accepted ends the open now instead of after
+        // initialize/session/new/set_model; the coordinator records the Stop.
+        request.acceptancePermit?.onInvalidate { [weak client] in client?.stop() }
         do {
             let capabilities = try await client.initialize()
             if let guestPlan {
@@ -1215,7 +1218,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             }
             guestPlan?.finish(.failed)
             client.stop()
-            if error is AgentProviderAdapterError { throw error }
+            if error is AgentProviderAdapterError || error is AgentRunAcceptanceError { throw error }
             throw DistillACPFailureTaxonomy.normalize(
                 error,
                 context: loadExisting ? .resume : .start

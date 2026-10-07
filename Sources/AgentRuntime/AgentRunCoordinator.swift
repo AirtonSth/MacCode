@@ -1591,7 +1591,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 threadId: effectiveRequest.threadId,
                 event: .providerFinished(generation: gen, reason: .providerFailure)
             )
+            // Stop revoked this start before the provider accepted the prompt
+            // (e.g. while Distill was still opening its session). The start's
+            // failure is the Stop itself: a user cancellation, not a run failure.
+            let stoppedBeforeAcceptance = pendingProviderStart.isAcceptanceInvalidated()
+            if stoppedBeforeAcceptance {
+                pendingThreadStops.remove(effectiveRequest.threadId)
+            }
             lock.unlock()
+            if stoppedBeforeAcceptance {
+                markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
+                throw AgentRunAcceptanceError.cancelled
+            }
             markStartFailure(
                 error,
                 request: effectiveRequest,
