@@ -8,7 +8,7 @@ public enum BotGroupPromptComposer {
 
     public struct Composition: Equatable, Sendable {
         public let prompt: String
-        /// The new watermark once the turn starts, or nil when it must not
+        /// The new watermark once the turn completes, or nil when it must not
         /// move. It stops just before the first waiting row of another bot
         /// that can still become a reply: that row is replaced in place, so
         /// it is read again on this bot's next turn.

@@ -449,6 +449,39 @@ final class BotGroupOrchestratorTests: XCTestCase {
         f.runner.finish(runID: try XCTUnwrap(f.runner.requests.last).runId, status: .completed, reply: "done")
     }
 
+    func test_aRetriedTurnReadsTheMessagesItsFailedRunNeverAnswered() async throws {
+        // WHY: the watermark marks what the bot has answered. A failed run
+        // answered nothing, so Retry must show the user's message again instead
+        // of "no new messages"; only a completed turn moves the watermark.
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana])
+        let receipt = try f.orchestrator.send(groupID: group.id, text: "Summarize the launch plan")
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        f.runner.finish(runID: try XCTUnwrap(f.runner.requests.first).runId, status: .failed, reply: nil)
+        let failed = await waitUntil { (try? f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state) == .failed }
+        XCTAssertTrue(failed)
+
+        try f.orchestrator.retry(turnID: receipt.turns[0].id, groupID: group.id)
+
+        let retried = await waitUntil { f.runner.requests.count == 2 }
+        XCTAssertTrue(retried)
+        let retryPrompt = try XCTUnwrap(f.runner.requests.last).prompt
+        XCTAssertTrue(retryPrompt.contains("Summarize the launch plan"), "the retry still sees the unanswered message")
+        XCTAssertFalse(retryPrompt.contains("There are no new messages in the group since your last turn."))
+
+        f.runner.finish(runID: try XCTUnwrap(f.runner.requests.last).runId, status: .completed, reply: "Here it is")
+        let done = await waitUntil { (try? f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state) == .completed }
+        XCTAssertTrue(done)
+        try f.orchestrator.send(groupID: group.id, text: "Thanks, now the budget")
+        let next = await waitUntil { f.runner.requests.count == 3 }
+        XCTAssertTrue(next)
+        let nextPrompt = try XCTUnwrap(f.runner.requests.last).prompt
+        XCTAssertTrue(nextPrompt.contains("now the budget"))
+        XCTAssertFalse(nextPrompt.contains("Summarize the launch plan"), "a completed turn moves the watermark")
+        f.runner.finish(runID: try XCTUnwrap(f.runner.requests.last).runId, status: .completed, reply: "Budget")
+    }
+
     // MARK: - Supersede (A -> B)
 
     func test_aNewMessageCancelsTheOldRoundsUnstartedTurnsAndRunsAfterTheRunningOne() async throws {

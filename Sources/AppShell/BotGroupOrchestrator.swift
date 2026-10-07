@@ -62,6 +62,11 @@ final class BotGroupOrchestrator: AgentRunObserver {
     /// run finish in the app reaches `settle`; any other run returns there
     /// without touching SQLite.
     private var ownedRunIDs: Set<AgentRunID> = []
+    /// The room watermark each owned run's prompt read through. It moves only
+    /// when the run settles as completed: a failed, interrupted or stopped run
+    /// never answered those messages, so its retry (or the bot's next turn)
+    /// must read them again.
+    private var seenThroughOnCompletion: [AgentRunID: (id: AgentMessageID, createdAt: Date)] = [:]
 
     init(
         botStore: BotStore,
@@ -299,6 +304,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
                   ) else { continue }
             stopped.append(moved)
             ownedRunIDs.remove(runID)
+            seenThroughOnCompletion.removeValue(forKey: runID)
             coordinator.stopRun(runID)
             if let memberThread = memberThreadID(groupID: groupID, botID: turn.botID) {
                 // A start still being prepared has no run to stop yet.
@@ -575,9 +581,15 @@ final class BotGroupOrchestrator: AgentRunObserver {
             coordinator.stopRun(runID)
         }
         if let seenID = composition.lastSeenMessageID, let seenAt = composition.lastSeenCreatedAt {
-            try? botStore.setGroupParticipantWatermark(
-                groupID: group.id, botID: bot.id, messageID: seenID, createdAt: seenAt
-            )
+            let current = try? botStore.groupTurn(id: turn.id)
+            if current?.memberRunID == runID, current?.state == .running {
+                seenThroughOnCompletion[runID] = (seenID, seenAt)
+            } else if current?.memberRunID == runID, current?.state == .completed {
+                // The run settled while its start was still returning.
+                try? botStore.setGroupParticipantWatermark(
+                    groupID: group.id, botID: bot.id, messageID: seenID, createdAt: seenAt
+                )
+            }
         }
         receipt.runID = runID
         _ = try? botStore.insertContextReceipt(receipt)
@@ -685,6 +697,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
     /// The turn is found by its run alone (unique, compare-and-set guarded):
     /// a bot deleted mid-turn has no member conversation any more.
     func settle(runID: AgentRunID, threadID: AgentThreadID, status: AgentRunStatus, finalMessage: String?) {
+        let seenThrough = seenThroughOnCompletion.removeValue(forKey: runID)
         guard ownedRunIDs.remove(runID) != nil,
               let turn = (try? botStore.listGroupTurns(groupID: nil, states: [.running]))?
                 .first(where: { $0.memberRunID == runID }),
@@ -718,6 +731,11 @@ final class BotGroupOrchestrator: AgentRunObserver {
             roomThreadID: roomThreadID,
             outcome: .reply(reply)
         ) else { return }
+        if let seenThrough {
+            try? botStore.setGroupParticipantWatermark(
+                groupID: group.id, botID: completed.botID, messageID: seenThrough.id, createdAt: seenThrough.createdAt
+            )
+        }
         planHandOff(after: completed, reply: reply, group: group)
     }
 
@@ -884,6 +902,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
                 outcome: .note(Self.removedNote)
             ) != nil else { continue }
             ownedRunIDs.remove(runID)
+            seenThroughOnCompletion.removeValue(forKey: runID)
             coordinator.stopRun(runID)
         }
         groups.forEach(schedulePump)
