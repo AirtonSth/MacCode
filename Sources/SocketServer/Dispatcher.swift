@@ -361,6 +361,17 @@ public protocol CommandRouting: AnyObject {
     func pendingManualActions(for threads: [AgentThread]) -> [AgentThreadID: ManualActionSnapshot]
     /// Single-winner transition shared with the Mac card; refusals are `DefiniteMutationRejection`.
     func resolveManualAction(thread: AgentThreadID, id: UUID, resolution: ManualActionResolution, note: String?) async throws -> ManualActionResolveOutcome
+    // thread actor: who runs a thread (a bot), where (VM or Mac), and the bot's "run on the Mac?" request
+    /// The thread's guest runtime marker (`BotGuestRuntime`), nil when none.
+    func threadGuestRuntime(thread: AgentThreadID) -> String?
+    /// Every marked thread's guest runtime, read off the main actor (agent.thread.list).
+    func threadGuestRuntimesOffMain() async -> [AgentThreadID: String]
+    /// The bot's pending "run on the Mac?" reason for this thread, nil when none.
+    func pendingMacExecutionReason(thread: AgentThreadID) -> String?
+    /// Locks the thread to `actor` with the composer's lock rules; refusals are `DefiniteMutationRejection`.
+    func setAgentThreadActor(thread: AgentThreadID, actor: RunActor, executionTarget: ExecutionTarget?) async throws -> AgentThread
+    /// Single-winner answer to the bot's Mac-execution request, shared with the Mac banner.
+    func resolveMacExecutionRemote(thread: AgentThreadID, approve: Bool) async throws -> MacExecutionResolveOutcome
 }
 
 public extension CommandRouting {
@@ -368,6 +379,15 @@ public extension CommandRouting {
     func pendingManualActions(for threads: [AgentThread]) -> [AgentThreadID: ManualActionSnapshot] { [:] }
     func resolveManualAction(thread: AgentThreadID, id: UUID, resolution: ManualActionResolution, note: String?) async throws -> ManualActionResolveOutcome {
         throw JSONRPCError.notSupported("agent.manual_action.resolve")
+    }
+    func threadGuestRuntime(thread: AgentThreadID) -> String? { nil }
+    func threadGuestRuntimesOffMain() async -> [AgentThreadID: String] { [:] }
+    func pendingMacExecutionReason(thread: AgentThreadID) -> String? { nil }
+    func setAgentThreadActor(thread: AgentThreadID, actor: RunActor, executionTarget: ExecutionTarget?) async throws -> AgentThread {
+        throw JSONRPCError.notSupported("agent.thread.actor.set")
+    }
+    func resolveMacExecutionRemote(thread: AgentThreadID, approve: Bool) async throws -> MacExecutionResolveOutcome {
+        throw JSONRPCError.notSupported("agent.mac_execution.resolve")
     }
 
     func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
@@ -953,6 +973,10 @@ public final class JSONRPCDispatcher {
         // Not canonical-immediate: the router publishes agent.manual_action.updated
         // inside the call, and the ledger captures it into the receipt.
         "agent.manual_action.resolve",
+        // Not canonical-immediate either: the router publishes agent.thread.updated
+        // inside the call, and the ledger captures it into the receipt.
+        "agent.thread.actor.set",
+        "agent.mac_execution.resolve",
         "agent.plan.implement",
         "agent.plan.save",
         "agent.plan.notes.save",
@@ -2460,7 +2484,9 @@ public final class JSONRPCDispatcher {
                     "plan_notes": PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue,
                     "checkpoint_list": AgentCheckpointListCapabilityV1.jsonValue,
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
-                    "manual_actions_v1": .bool(true)
+                    "manual_actions_v1": .bool(true),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "thread_actor_v1": .bool(true)
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {
@@ -3251,8 +3277,10 @@ public final class JSONRPCDispatcher {
                 let lockedThreads = (try? await router.threadIdsWithMessagesOffMain()) ?? []
                 // One store read for every thread's pending_manual_action.
                 let manualActions = router.pendingManualActions(for: threads)
+                // One off-main query for every thread's guest_runtime.
+                let guestRuntimes = await router.threadGuestRuntimesOffMain()
                 return .init(id: id, result: .array(threads.map {
-                    encodeThread($0, lockedThreads: lockedThreads, pendingManualActions: manualActions)
+                    encodeThread($0, lockedThreads: lockedThreads, pendingManualActions: manualActions, guestRuntimes: guestRuntimes)
                 }))
             case "agent.thread.create", "host.agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
@@ -3838,6 +3866,42 @@ public final class JSONRPCDispatcher {
                     "pending_manual_action": ManualActionWire.pendingRow(outcome.pending),
                     "follow_up": followUp,
                 ])
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.thread.actor.set":
+                // HostMutationContract preflight already checked the shapes.
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let actor = ThreadActorWire.parseActor(params["actor"]) else { throw JSONRPCError.invalidParams }
+                let target = params["execution_target"]?.stringValue.flatMap(ExecutionTarget.init(rawValue:))
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let t = try await router.setAgentThreadActor(thread: tid, actor: actor, executionTarget: target)
+                let result: JSONValue = .object(threadActorResult(t))
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.mac_execution.resolve":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let approve = params["approve"]?.boolValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let outcome = try await router.resolveMacExecutionRemote(thread: tid, approve: approve)
+                let followUp: JSONValue
+                switch outcome.followUp {
+                case .sent(let sent):
+                    var object = messageSendResultPayload(sent).objectValue ?? [:]
+                    object["delivered"] = .bool(true)
+                    followUp = .object(object)
+                case .failed(let message):
+                    followUp = .object(["delivered": .bool(false), "error": .string(message)])
+                }
+                var resolved = threadActorResult(outcome.thread)
+                resolved["approved"] = .bool(outcome.approved)
+                resolved["follow_up"] = followUp
+                let result: JSONValue = .object(resolved)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
             case "agent.thread.read":
@@ -5072,6 +5136,7 @@ public final class JSONRPCDispatcher {
         appendRouting(thread.effectiveRoutingConfiguration, to: &object)
         appendActiveRun(to: &object, thread: thread.id)
         object["pending_manual_action"] = ManualActionWire.pendingRow(router.pendingManualActions(for: [thread])[thread.id])
+        appendThreadActor(thread, guestRuntime: router.threadGuestRuntime(thread: thread.id), to: &object)
         return .object(object)
     }
 
@@ -5080,7 +5145,8 @@ public final class JSONRPCDispatcher {
     private func encodeThread(
         _ thread: AgentThread,
         lockedThreads: Set<AgentThreadID>,
-        pendingManualActions: [AgentThreadID: ManualActionSnapshot]
+        pendingManualActions: [AgentThreadID: ManualActionSnapshot],
+        guestRuntimes: [AgentThreadID: String]
     ) -> JSONValue {
         guard case .object(var object) = encode(thread) else { return .null }
         let display = AgentThreadTitle.display(thread.title)
@@ -5102,7 +5168,27 @@ public final class JSONRPCDispatcher {
         appendRouting(thread.effectiveRoutingConfiguration, to: &object)
         appendActiveRun(to: &object, thread: thread.id)
         object["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualActions[thread.id])
+        appendThreadActor(thread, guestRuntime: guestRuntimes[thread.id], to: &object)
         return .object(object)
+    }
+
+    /// `agent.thread.actor.set` / `agent.mac_execution.resolve` result: the
+    /// thread's actor fields at the top level plus its full payload as `thread`.
+    private func threadActorResult(_ thread: AgentThread) -> [String: JSONValue] {
+        var result: [String: JSONValue] = ["thread_id": .string(thread.id.value.uuidString)]
+        appendThreadActor(thread, guestRuntime: router.threadGuestRuntime(thread: thread.id), to: &result)
+        result["thread"] = encodeThread(thread)
+        return result
+    }
+
+    /// Same shape as AppCommandRouter.agentThreadPayload (ThreadActorWire).
+    private func appendThreadActor(_ thread: AgentThread, guestRuntime: String?, to object: inout [String: JSONValue]) {
+        ThreadActorWire.append(
+            thread: thread,
+            guestRuntime: guestRuntime,
+            pendingMacExecutionReason: router.pendingMacExecutionReason(thread: thread.id),
+            to: &object
+        )
     }
 
     private func appendFlatModelSelection(_ thread: AgentThread, to object: inout [String: JSONValue]) {
@@ -5546,6 +5632,7 @@ public final class JSONRPCDispatcher {
         payload["sort_order"] = .number(Double(thread.sortOrder))
         appendRouting(thread.effectiveRoutingConfiguration, to: &payload)
         payload["pending_manual_action"] = ManualActionWire.pendingRow(router.pendingManualActions(for: [thread])[thread.id])
+        appendThreadActor(thread, guestRuntime: router.threadGuestRuntime(thread: thread.id), to: &payload)
         return .object(payload)
     }
 

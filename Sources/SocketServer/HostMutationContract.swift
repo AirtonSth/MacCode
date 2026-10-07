@@ -59,6 +59,8 @@ public enum HostMutationContract {
     agent.request.respond
     agent.user_input.respond
     agent.manual_action.resolve
+    agent.thread.actor.set
+    agent.mac_execution.resolve
     agent.plan.implement
     agent.plan.save
     agent.plan.notes.save
@@ -203,6 +205,9 @@ public enum HostMutationContract {
         case requiredSSHProfile
         case optionalSSHProfile
         case pushTokenContract
+        /// `actor` `{"kind":"none"}` or `{"kind":"bot","bot_id":<uuid>}`, and an
+        /// optional `execution_target` `vm` / `mac` (absent or null for the default).
+        case threadActor
     }
 
     /// Private managed-provider mutations reuse the same syntactic and durable
@@ -295,6 +300,13 @@ public enum HostMutationContract {
             }
         case .pushTokenContract:
             try validatePushToken(params)
+        case .threadActor:
+            guard ThreadActorWire.parseActor(params["actor"]) != nil else { throw JSONRPCError.invalidParams }
+            let target = params["execution_target"]
+            guard target == nil || target == .null
+                || target?.stringValue.flatMap(ExecutionTarget.init(rawValue:)) != nil else {
+                throw JSONRPCError.invalidParams
+            }
         }
     }
 
@@ -457,6 +469,8 @@ public enum HostMutationContract {
         case "agent.message.queue.reorder": return [.uuid("thread_id"), .anyUUID(["queued_message_id", "id"]), .int("position")]
         case "agent.request.respond": return [.uuid("thread_id"), .string("request_id"), .stringEnum("decision", ["approve", "approve_for_session", "approveForSession", "decline", "cancel"])]
         case "agent.user_input.respond": return [.uuid("thread_id"), .string("request_id"), .string("text")]
+        case "agent.thread.actor.set": return [.uuid("thread_id"), .threadActor]
+        case "agent.mac_execution.resolve": return [.uuid("thread_id"), .bool("approve")]
         case "agent.manual_action.resolve": return [.uuid("thread_id"), .uuid("manual_action_id"), .stringEnum("action", ["take", "continue", "decline"]), .optionalString("note")]
         case "agent.plan.implement", "agent.plan.save": return [.uuid("thread_id"), .string("plan_id")]
         case "agent.plan.notes.save": return [.uuid("thread_id"), .string("notes")]
@@ -543,6 +557,8 @@ public enum HostMutationContract {
         case .pushTokenContract:
             params["push_token"] = .string("token")
             params["push_token_type"] = .string("apns")
+        case .threadActor:
+            params["actor"] = .object(["kind": .string("bot"), "bot_id": .string(probeUUID)])
         }
     }
 
@@ -633,6 +649,14 @@ public enum HostMutationContract {
             add("profile.object.destination") { $0["profile"] = .object([:]) }
         case .pushTokenContract:
             appendPushTokenProbes(valid: valid, to: &probes)
+        case .threadActor:
+            add("actor.missing") { $0.removeValue(forKey: "actor") }
+            add("actor.type") { $0["actor"] = .string("bot") }
+            add("actor.kind.enum") { $0["actor"] = .object(["kind": .string("user")]) }
+            add("actor.bot_id.missing") { $0["actor"] = .object(["kind": .string("bot")]) }
+            add("actor.bot_id.uuid") { $0["actor"] = .object(["kind": .string("bot"), "bot_id": .string("not-a-uuid")]) }
+            add("execution_target.type") { $0["execution_target"] = .bool(true) }
+            add("execution_target.enum") { $0["execution_target"] = .string("cloud") }
         }
         return probes
     }

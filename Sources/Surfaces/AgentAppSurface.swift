@@ -6424,17 +6424,46 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Links the thread to the bot and locks the thread's actor and execution target.
     private func lockBotActor(botID: BotID, threadId tid: AgentThreadID) throws {
         guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
+        let target = botExecutionTargetProvider(botID)
+        // The composer's provider belongs to the selected thread only.
+        let lockedAt = try Self.lockThreadToBot(
+            botID: botID,
+            threadID: tid,
+            target: target,
+            composerProvider: selectedThreadId == tid ? provider : nil,
+            threadRepo: threadRepo,
+            linker: linker
+        )
+        if let index = threads.firstIndex(where: { $0.id == tid }) {
+            threads[index].actor = .bot(botID)
+            threads[index].actorLockedAt = lockedAt
+            threads[index].executionTarget = target
+        }
+    }
+
+    /// Links the thread to the bot, writes the guest runtime marker and locks
+    /// the thread's actor and execution target. Shared by the composer's first
+    /// bot send and `agent.thread.actor.set` from a paired device. Returns the
+    /// lock date. `composerProvider` is the provider the composer will run the
+    /// thread with; nil reads the thread's own.
+    @MainActor
+    public static func lockThreadToBot(
+        botID: BotID,
+        threadID tid: AgentThreadID,
+        target: ExecutionTarget,
+        composerProvider: AgentProvider?,
+        threadRepo: AgentThreadRepository,
+        linker: @MainActor (BotID, AgentThreadID) throws -> Void
+    ) throws -> Date {
         try linker(botID, tid)
         let lockedAt = Date()
-        let target = botExecutionTargetProvider(botID)
         // Plan A: a new Distill conversation of a Docker-desktop bot runs
         // inside the bot's Linux guest. One that already has a Mac Distill
         // session keeps running on the Mac (D5). Written before the lock: on
         // its own (no `.vm` target yet) the marker routes nothing.
         let thread = try threadRepo.get(id: tid)
         let hasMacDistillSession = thread?.provider == .distill && thread?.providerThreadId?.isEmpty == false
-        // The composer's provider belongs to the selected thread only.
-        let threadProvider = selectedThreadId == tid ? provider : (thread?.provider ?? provider)
+        let threadProvider = composerProvider ?? thread?.provider
         let runsInGuest = target == .vm && threadProvider == .distill && !hasMacDistillSession
         try threadRepo.setGuestRuntime(id: tid, runsInGuest ? BotGuestRuntime.distillV1 : nil)
         guard try threadRepo.setActor(
@@ -6446,11 +6475,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 userInfo: [NSLocalizedDescriptionKey: "A conversa sumiu antes de iniciar."]
             )
         }
-        if let index = threads.firstIndex(where: { $0.id == tid }) {
-            threads[index].actor = .bot(botID)
-            threads[index].actorLockedAt = lockedAt
-            threads[index].executionTarget = target
-        }
+        return lockedAt
+    }
+
+    /// Updates the painted row and, on the selected thread, the actor chip.
+    /// The caller already persisted the lock (a paired device set the actor).
+    public func mirrorActorLock(_ actor: RunActor, lockedAt: Date?, target: ExecutionTarget?, thread id: AgentThreadID) {
+        guard let index = threads.firstIndex(where: { $0.id == id }) else { return }
+        threads[index].actor = actor
+        threads[index].actorLockedAt = lockedAt
+        threads[index].executionTarget = target
+        if selectedThreadId == id { selectedRunActor = actor }
     }
 
     /// "Iniciar VM": provisions through the host, then clears the banner.

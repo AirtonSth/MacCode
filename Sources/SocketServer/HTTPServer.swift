@@ -1322,6 +1322,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // agent.manual_action.list/resolve, agent.manual_action.updated and
             // pending_manual_action on thread payloads.
             "manual_actions_v1": true,
+            // actor/actor_locked_at/execution_target/guest_runtime/pending_mac_execution
+            // on thread payloads, agent.thread.actor.set, agent.mac_execution.resolve
+            // and agent.mac_execution.requested.
+            "thread_actor_v1": true,
         ]
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject

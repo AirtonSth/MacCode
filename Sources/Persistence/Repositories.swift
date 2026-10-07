@@ -2316,6 +2316,32 @@ public final class AgentThreadRepository {
         )
     }
 
+    /// The bot a thread is locked to (actor locked and a bot actor); nil
+    /// otherwise or when the row is gone. Two columns, no full row decode.
+    public func lockedBotActor(of id: AgentThreadID) throws -> BotID? {
+        let st = try db.prepare(
+            "SELECT actor_json, actor_locked_at FROM agent_threads WHERE id = ? LIMIT 1;"
+        )
+        try st.bind(1, id.value.uuidString)
+        guard try st.step(), st.columnText(1) != nil else { return nil }
+        return decodeRunActor(st.columnText(0)).botID
+    }
+
+    /// Every thread that carries a guest runtime marker, for batch thread
+    /// payloads (`guest_runtime`). Threads without one are absent.
+    public func guestRuntimesByThread() throws -> [AgentThreadID: String] {
+        let st = try db.prepare(
+            "SELECT id, guest_runtime FROM agent_threads WHERE guest_runtime IS NOT NULL AND guest_runtime != '';"
+        )
+        var runtimes: [AgentThreadID: String] = [:]
+        while try st.step() {
+            guard let id = st.columnText(0).flatMap(UUID.init(uuidString:)),
+                  let runtime = st.columnText(1) else { continue }
+            runtimes[AgentThreadID(id)] = runtime
+        }
+        return runtimes
+    }
+
     /// Permission-mode chrome only. Avoids the full get+upsert (26 columns +
     /// routing JSON rewrite) when an unselected session-grant must persist
     /// `permission_mode`. Missing rows return false.

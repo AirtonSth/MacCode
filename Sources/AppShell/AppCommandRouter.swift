@@ -167,6 +167,12 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         }
     }
 
+    public func guestRuntimesByThread() async throws -> [AgentThreadID: String] {
+        try await execute {
+            try AgentThreadRepository(db: self.db).guestRuntimesByThread()
+        }
+    }
+
     public func listMessages(threadId: AgentThreadID, limit: Int) async throws -> [AgentMessage] {
         try await execute {
             try AgentMessageRepository(db: self.db).listRecent(
@@ -594,7 +600,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } catch {}
     }
 
-    private func publishAgentThreadUpdated(_ thread: AgentThread) {
+    func publishAgentThreadUpdated(_ thread: AgentThread) {
         EventBus.shared.publish(kind: .agentThreadUpdated, payload: agentThreadPayload(thread))
     }
 
@@ -654,6 +660,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         appendAgentRouting(thread.effectiveRoutingConfiguration, to: &payload)
         appendAgentActiveRun(to: &payload, thread: thread.id)
         payload["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualActions(for: [thread])[thread.id])
+        // Same shape as Dispatcher.threadPayload.
+        ThreadActorWire.append(
+            thread: thread,
+            guestRuntime: threadGuestRuntime(thread: thread.id),
+            pendingMacExecutionReason: pendingMacExecution[thread.id],
+            to: &payload
+        )
         return .object(payload)
     }
 
@@ -1211,8 +1224,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
         }
         let openManualActions = manualActionStore.openByThread()
+        let pendingMacExecutions = pendingMacExecution
         // SQLite list/decode must never run on MainActor (Dispatcher is @MainActor).
         let threads = try await ctx.agentThreadListGateway.list(workspaceId: nil)
+        let guestRuntimes = await threadGuestRuntimesOffMain()
         let manualActionsByThread = pendingManualActions(for: threads, open: openManualActions)
         var surfaceGroups: [ConnectionSnapshotWorkspaceItems] = []
         var threadGroups: [ConnectionSnapshotWorkspaceItems] = []
@@ -1236,7 +1251,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             threadGroups.append(ConnectionSnapshotWorkspaceItems(
                 workspaceId: workspace.id.value.uuidString,
                 items: workspaceThreads.map {
-                    Self.connectionSnapshotThread($0, pendingManualAction: manualActionsByThread[$0.id])
+                    Self.connectionSnapshotThread(
+                        $0,
+                        pendingManualAction: manualActionsByThread[$0.id],
+                        guestRuntime: guestRuntimes[$0.id],
+                        pendingMacExecutionReason: pendingMacExecutions[$0.id]
+                    )
                 }
             ))
 
@@ -1324,7 +1344,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     nonisolated private static func connectionSnapshotThread(
         _ thread: AgentThread,
-        pendingManualAction: ManualActionSnapshot?
+        pendingManualAction: ManualActionSnapshot?,
+        guestRuntime: String?,
+        pendingMacExecutionReason: String?
     ) -> JSONValue {
         guard case .object(var object) = connectionSnapshotJSON(thread) else { return .null }
         object["id"] = .string(thread.id.value.uuidString)
@@ -1332,6 +1354,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             .map { .string($0.value.uuidString) }
             ?? .null
         object["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualAction)
+        ThreadActorWire.append(
+            thread: thread,
+            guestRuntime: guestRuntime,
+            pendingMacExecutionReason: pendingMacExecutionReason,
+            to: &object
+        )
         return .object(object)
     }
 
@@ -2899,7 +2927,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         viewModel.botReleaseVM = { [weak self] runID in self?.releaseBotVMRun(runID) }
         viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
-            await self?.resolveMacExecution(thread: threadID, approve: approve)
+            _ = await self?.resolveMacExecution(thread: threadID, approve: approve)
         }
         viewModel.botVMPreflight = { [weak self] botID, workspace in
             await self?.botVMPreflight(botID, workspace: workspace)
@@ -4739,6 +4767,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         try await agentAppReadGateway.threadIdsWithMessages()
     }
 
+    /// Off the main actor; an unreadable table reads as no markers.
+    public func threadGuestRuntimesOffMain() async -> [AgentThreadID: String] {
+        (try? await agentAppReadGateway.guestRuntimesByThread()) ?? [:]
+    }
+
     public func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor? = nil) throws -> AgentMessagePage {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         return try ctx.messageRepo.listPage(threadId: thread, limit: max(0, min(limit, 500)), before: before, after: after)
@@ -5232,7 +5265,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             queueMessageId: nil,
             routingConfiguration: storedRouting,
             nestedRunContext: nestedRunContext,
-            preflightRejectionIsDefinite: true
+            preflightRejectionIsDefinite: true,
+            // A thread locked to a bot runs as that bot, as the Mac composer's
+            // sends do (a paired device may have locked it with agent.thread.actor.set).
+            compilesBotPrompt: try ctx.threadRepo.lockedBotActor(of: thread) != nil
         )
     }
 

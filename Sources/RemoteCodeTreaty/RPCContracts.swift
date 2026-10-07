@@ -44,6 +44,16 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case manualActionStateConflict
         /// `agent.manual_action.resolve` `take` on a thread that runs on the Mac.
         case manualActionTakeUnavailable
+        /// `agent.thread.actor.set`: unknown thread or bot.
+        case threadActorNotFound
+        /// `agent.thread.actor.set`: the thread is locked (messages, a locked actor or a run).
+        case threadActorLocked
+        /// `agent.thread.actor.set` `execution_target` `vm` for a bot without a VM.
+        case threadActorTargetUnavailable
+        /// `agent.mac_execution.resolve`: unknown thread.
+        case macExecutionNotFound
+        /// `agent.mac_execution.resolve`: nothing pending (already answered).
+        case macExecutionNotPending
         case unknown(Int)
     }
 
@@ -65,6 +75,21 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
             case .string("not_found"): return .botGroupNotFound
             case .string("revision_conflict"): return .botGroupRevisionConflict
             case .string("runtime_unavailable"): return .botGroupRuntimeUnavailable
+            default: break
+            }
+        }
+        if case .object(let data)? = data, data["domain"] == .string("thread_actor") {
+            switch data["kind"] {
+            case .string("not_found"): return .threadActorNotFound
+            case .string("locked"): return .threadActorLocked
+            case .string("target_unavailable"): return .threadActorTargetUnavailable
+            default: break
+            }
+        }
+        if case .object(let data)? = data, data["domain"] == .string("mac_execution") {
+            switch data["kind"] {
+            case .string("not_found"): return .macExecutionNotFound
+            case .string("not_pending"): return .macExecutionNotPending
             default: break
             }
         }

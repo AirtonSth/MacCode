@@ -1,6 +1,7 @@
 import Foundation
 import AgentRuntime
 import CoreModel
+import SocketServer
 import Surfaces
 
 /// A desk, peer or hop send found the bot's VM busy in another thread. Nothing
@@ -114,31 +115,48 @@ extension AppCommandRouter {
         for viewModel in botThreadViewModels {
             viewModel.pendingMacExecutionByThread[threadID] = reason
         }
+        // iOS parity: paired devices show the same approve/decline row.
+        EventBus.shared.publish(
+            kind: .agentMacExecutionRequested,
+            payload: ThreadActorWire.macExecutionRequestedEvent(thread: threadID, reason: reason)
+        )
     }
 
     /// Approve switches the thread to the Mac (actor and lock kept); decline leaves the target alone.
-    /// Both send a follow-up so the bot learns the outcome. Only ever called from a user click.
+    /// Both send a follow-up so the bot learns the outcome. Only ever called from a user click, on
+    /// the Mac banner or a paired device (`agent.mac_execution.resolve`): the first answer wins and
+    /// later ones get nil. Paired devices learn the answer from `agent.thread.updated`.
     /// A guest thread keeps its marker: its next run (this follow-up, once a
     /// still-finishing guest turn ends) starts a new Mac session with a
     /// handoff summary (`AgentRunCoordinator.pendingMacHandoff`).
-    func resolveMacExecution(thread: AgentThreadID, approve: Bool) async {
-        guard pendingMacExecution.removeValue(forKey: thread) != nil else { return }
+    @discardableResult
+    func resolveMacExecution(thread: AgentThreadID, approve: Bool) async -> MacExecutionResolveOutcome? {
+        guard pendingMacExecution.removeValue(forKey: thread) != nil else { return nil }
         for viewModel in botThreadViewModels {
             viewModel.pendingMacExecutionByThread[thread] = nil
         }
+        guard var stored = try? context?.threadRepo.get(id: thread) else { return nil }
         if approve {
-            guard let stored = try? context?.threadRepo.get(id: thread),
-                  (try? context?.threadRepo.setActor(
-                      id: thread, actor: stored.actor, lockedAt: stored.actorLockedAt, executionTarget: .mac
-                  )) == true else { return }
+            guard (try? context?.threadRepo.setActor(
+                id: thread, actor: stored.actor, lockedAt: stored.actorLockedAt, executionTarget: .mac
+            )) == true else { return nil }
+            stored.executionTarget = .mac
             for viewModel in botThreadViewModels {
                 viewModel.mirrorExecutionTarget(.mac, thread: thread)
             }
         }
-        _ = try? await sendBotThreadFollowUp(
-            thread: thread,
-            text: approve ? Self.macExecutionApprovedFollowUp : Self.macExecutionDeclinedFollowUp
-        )
+        publishAgentThreadUpdated(stored)
+        let followUp: ManualActionResolveOutcome.FollowUp
+        do {
+            followUp = .sent(try await sendBotThreadFollowUp(
+                thread: thread,
+                text: approve ? Self.macExecutionApprovedFollowUp : Self.macExecutionDeclinedFollowUp
+            ))
+        } catch {
+            followUp = .failed((error as? LocalizedError)?.errorDescription ?? String(describing: error))
+        }
+        let latest = ((try? context?.threadRepo.get(id: thread)) ?? nil) ?? stored
+        return MacExecutionResolveOutcome(thread: latest, approved: approve, followUp: followUp)
     }
 
     /// nil when Docker answers and the run's workspace is mounted; otherwise the user-facing failure.

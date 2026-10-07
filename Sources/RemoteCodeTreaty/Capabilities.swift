@@ -39,17 +39,25 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         /// `agent.manual_action.updated` and `pending_manual_action` on thread
         /// payloads (see ManualActionContracts.swift). False for older hosts.
         public let manualActionsV1: Bool
+        /// `actor` / `actor_locked_at` / `execution_target` / `guest_runtime` /
+        /// `runs_in_guest` / `pending_mac_execution` on thread payloads,
+        /// `agent.thread.actor.set`, `agent.mac_execution.resolve` and
+        /// `agent.mac_execution.requested` (see ThreadActorContracts.swift).
+        /// False for older hosts.
+        public let threadActorV1: Bool
 
         public init(
             providers: [String],
             supportsStreamEvents: Bool,
             supportsResume: Bool,
-            manualActionsV1: Bool = false
+            manualActionsV1: Bool = false,
+            threadActorV1: Bool = false
         ) {
             self.providers = providers
             self.supportsStreamEvents = supportsStreamEvents
             self.supportsResume = supportsResume
             self.manualActionsV1 = manualActionsV1
+            self.threadActorV1 = threadActorV1
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -57,6 +65,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             case supportsStreamEvents = "supports_stream_events"
             case supportsResume = "supports_resume"
             case manualActionsV1 = "manual_actions_v1"
+            case threadActorV1 = "thread_actor_v1"
         }
 
         public init(from decoder: Decoder) throws {
@@ -65,6 +74,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             supportsStreamEvents = try container.decode(Bool.self, forKey: .supportsStreamEvents)
             supportsResume = try container.decode(Bool.self, forKey: .supportsResume)
             manualActionsV1 = try container.decodeIfPresent(Bool.self, forKey: .manualActionsV1) ?? false
+            threadActorV1 = try container.decodeIfPresent(Bool.self, forKey: .threadActorV1) ?? false
         }
     }
 
