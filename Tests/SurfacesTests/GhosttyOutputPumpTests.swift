@@ -562,6 +562,7 @@ private final class FakeNative: @unchecked Sendable {
   private var _events: [String] = []
   private var _fed: [Int: Data] = [:]
   private var _fedAll = Data()
+  private var released = false
   let entered = DispatchSemaphore(value: 0)
   var viewportText: String?
   var scrollbackText: String?
@@ -583,9 +584,12 @@ private final class FakeNative: @unchecked Sendable {
     )
   }
 
-  /// Lets every present and future feed finish.
+  /// Lets every present and future feed finish. Future feeds skip the gate
+  /// entirely: a fixed permit count ran out after 4,096 feeds and wedged a
+  /// multi-megabyte stream on the 4,097th chunk.
   func release() {
     guard let gate else { return }
+    locked { released = true }
     for _ in 0..<4096 { gate.signal() }
   }
 
@@ -633,7 +637,7 @@ private final class FakeNative: @unchecked Sendable {
       _events.append("feed:\(id)")
     }
     entered.signal()
-    gate?.wait()
+    if let gate, !locked({ released }) { gate.wait() }
     locked {
       _fed[id, default: Data()].append(chunk)
       _fedAll.append(chunk)
