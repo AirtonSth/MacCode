@@ -7763,7 +7763,15 @@ final class BotsWindowTests: XCTestCase {
                 meta = params.get("_meta", {})
                 record({"method":method,"sessionId":params.get("sessionId"),"modelId":meta.get("modelId")})
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":params.get("sessionId", "bot-distill-session"),"models":{"availableModels":[{"modelId":"gpt-6-luna","name":"GPT-6 Luna"}],"currentModelId":"gpt-6-luna"}}})
-            elif method in ("session/set_mode", "session/set_model", "session/set_config_option"):
+            elif method == "session/set_model":
+                # Distill 2.0.25 acknowledges the applied Main model; the adapter refuses to prompt without it.
+                requested = params.get("modelId")
+                ack = {"model":{"Ok":requested},"canonicalModelId":requested}
+                auto = params.get("_meta", {}).get("reasoningEffortAuto")
+                if auto is not None:
+                    ack["reasoningEffortAuto"] = auto
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"_meta":ack}})
+            elif method in ("session/set_mode", "session/set_config_option"):
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
             elif method == "session/prompt":
                 count = int(counter.read_text()) if counter.exists() else 0
@@ -7844,6 +7852,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual((reopenedThread.runAsUser ?? AgentRunAsUser.current()).shortName, reopenedVM.deskRouting.runAsUser.shortName)
         XCTAssertEqual(reopenedVM.deskRunProvider, .distill)
         XCTAssertEqual(reopenedVM.deskRunModel, "gpt-6-luna")
+        // The Auto Main effort gate reads the Desk provider catalog, which a fresh
+        // Bots window fills from the router's send cache on its next turn.
+        let reopenedCatalogLoaded = await waitUntil(timeout: 5) { !reopenedVM.providers.isEmpty }
+        XCTAssertTrue(reopenedCatalogLoaded, "the reopened Desk must load the cached Distill provider snapshot")
         reopenedVM.composerText = "Follow-up Distill bot turn"
         XCTAssertTrue(reopenedVM.send())
         let followUpReplyArrived = await waitUntil(timeout: 8) {
