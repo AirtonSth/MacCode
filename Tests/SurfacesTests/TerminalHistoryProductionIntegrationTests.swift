@@ -411,7 +411,13 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     let path = directory.appendingPathComponent("history.sqlite").path
     var database: SQLiteDB? = try SQLiteDB(path: path)
     try Schema.migrate(try XCTUnwrap(database))
-    try database?.execute("PRAGMA busy_timeout=25;")
+    // SQLiteDB layers its own transient-lock retry (up to 8 attempts per
+    // transaction, covered by SQLiteBusyRetryTests) under every call, which the
+    // coordinator's 0.18 s finalizing deadline cannot interrupt; under the held
+    // lock each call then takes about 1 s and the backlog cannot drain in this
+    // test's window. One immediate attempt per call pins the coordinator path.
+    try database?.execute("PRAGMA busy_timeout=0;")
+    database?.busyRetryMaxAttemptsForTesting = 1
     let lockDatabase = try SQLiteDB(path: path)
     var repository: TerminalOutputRepository? = TerminalOutputRepository(
       db: try XCTUnwrap(database)
@@ -1871,8 +1877,16 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       "the test must hold the real persisted-history read before producing live output"
     )
 
+    // 4 MiB of live output in handoff-sized slices (256 KiB). A single larger
+    // payload streams through the system-output lease, which pauses while the
+    // replay owns the renderer, so it could never overflow the merge during
+    // the blocked read; handoff slices take the synchronous live path that
+    // records replay-time live bytes.
     let liveLine = String(repeating: "L", count: 63) + "\n"
-    surface.appendSystemText(String(repeating: liveLine, count: 65_536))
+    let handoffSlice = String(repeating: liveLine, count: 4_096)
+    for _ in 0..<16 {
+      XCTAssertTrue(surface.appendSystemText(handoffSlice))
+    }
     let newestMarker = "RC2_REPLAY_NEWEST_TAIL_\(UUID().uuidString)"
     surface.appendSystemText(newestMarker + "\n")
     XCTAssertTrue(
@@ -2048,7 +2062,7 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     XCTAssertTrue(surface.runtimeHealth().outputPartial)
   }
 
-  func testWeeksOfHighVolumeLiveWritesStayBoundedAndRetainNewestBytes() throws {
+  func testWeeksOfHighVolumeLiveWritesStayBoundedAndRetainNewestBytes() async throws {
     let db = try SQLiteDB(path: ":memory:")
     try Schema.migrate(db)
     let repository = TerminalOutputRepository(db: db)
@@ -2065,12 +2079,24 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
 
     // Model more than a month of daily 1 MiB bursts without a restart. The
     // storage ceiling must depend on the rolling window, not session age.
+    // Each burst is fed as four handoff-sized slices (256 KiB): a single
+    // larger payload streams through the one system-output lease, and the next
+    // burst would be refused as `system_output_busy` before history sees it.
+    let handoffBytes = 256 * 1024
     for index in 0..<34 {
       let marker = String(format: "RC2_HISTORY_%03d|", index)
-      surface.appendSystemText(
-        marker + String(repeating: "x", count: payloadBytes - marker.utf8.count))
-      surface.flushPersistedHistory()
-      RunLoop.main.run(until: Date().addingTimeInterval(0.002))
+      let burst = marker + String(repeating: "x", count: payloadBytes - marker.utf8.count)
+      var offset = burst.startIndex
+      while offset < burst.endIndex {
+        let end = burst.index(offset, offsetBy: handoffBytes, limitedBy: burst.endIndex) ?? burst.endIndex
+        XCTAssertTrue(surface.appendSystemText(String(burst[offset..<end])))
+        offset = end
+      }
+      // Bytes parked behind the one in-flight SQLite write drain on the main
+      // actor, so a blocking main-thread wait cannot see them land; await the
+      // barrier the way the app's quit flush does.
+      let flushed = await surface.flushPersistedHistoryAsync(timeout: 10)
+      XCTAssertTrue(flushed, "burst \(index) must be durable before the next one")
     }
 
     XCTAssertLessThanOrEqual(
