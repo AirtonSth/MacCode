@@ -136,6 +136,17 @@ final class SurfaceVisibilityReconciliationTests: XCTestCase {
 
         try router.selectWorkspace(backgroundWorkspace.id)
 
+        // Loading rules: selectWorkspace commits the selection synchronously and
+        // reconciles surface visibility on the next main-queue turn, so wait for
+        // that freshness pass (bounded) before asserting the reveal.
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline,
+              !(SurfaceRegistry.shared.isVisible(descriptor.id)
+                && terminal.readerAllowsRenderForTesting
+                && terminal.runtimeHealth().outputPendingBytes == 0) {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+
         XCTAssertTrue(SurfaceRegistry.shared.isVisible(descriptor.id))
         XCTAssertTrue(terminal.readerAllowsRenderForTesting)
         XCTAssertTrue(terminal.runtimeHealth().renderDiagnostics?.logicalVisible ?? false)
