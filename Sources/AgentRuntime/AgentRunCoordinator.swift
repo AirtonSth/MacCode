@@ -6301,20 +6301,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             } ?? -1
             agentRunLog.info("run.finished thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) durationMs=\(durationMs, privacy: .public)")
             // S5: terminalize generation-owned prep so the next accept is not poisoned.
+            // Only this run's own generation: activeThreads was released above,
+            // so a zero-delay auto-continuation or a new send may already have
+            // accepted a newer generation, and terminalizing that one revokes its
+            // spawn permit (it then ends cancelled before reaching the provider).
             lock.lock()
-            let prepGen = preparationStates[threadId]?.generation ?? 0
-            let prepReason: ProviderPreparationTerminalReason = {
-                switch status {
-                case .completed: return .completed
-                case .cancelled: return .cancelled
-                case .failed, .interrupted: return .providerFailure
-                case .pending, .running: return .completed
-                }
-            }()
-            _ = applyPreparationLocked(
-                threadId: threadId,
-                event: .providerFinished(generation: prepGen, reason: prepReason)
-            )
+            if let prep = preparationStates[threadId],
+               prep.draftMessageId == runId.value.uuidString {
+                let prepReason: ProviderPreparationTerminalReason = {
+                    switch status {
+                    case .completed: return .completed
+                    case .cancelled: return .cancelled
+                    case .failed, .interrupted: return .providerFailure
+                    case .pending, .running: return .completed
+                    }
+                }()
+                _ = applyPreparationLocked(
+                    threadId: threadId,
+                    event: .providerFinished(generation: prep.generation, reason: prepReason)
+                )
+            }
             lock.unlock()
             for observer in observersSnapshot() {
                 observer.runCoordinator(
