@@ -3316,10 +3316,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    /// Paired-device `bot.*` reads that touch only the authority's own state
+    /// and SQLite (no MainActor callback, no queue write). They run off
+    /// MainActor and never reload the desk's queued follow-ups.
+    /// `bot.attention.list` stays on MainActor: its delegated-attention
+    /// snapshot callback reads router state.
+    nonisolated static let pairedBotOffMainReadMethods: Set<String> = [
+        "bot.list",
+        "bot.get",
+        "bot.settings.get",
+        "bot.queue.list",
+        "bot.conversation.list",
+        "bot.attachment.list",
+        "bot.routine.list",
+        "bot.files.list",
+        "bot.browser.state",
+        "bot.guest.state",
+        "bot.receipt.status",
+    ]
+    nonisolated static let pairedBotMainActorReadMethods: Set<String> = [
+        "bot.attention.list",
+        "bot.reserved.probe",
+    ]
+
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
         let authority = try pairedBotAuthority()
         let foundation = Self.foundationObject(params)
+        if Self.pairedBotOffMainReadMethods.contains(method) {
+            return try await dispatchPairedBotRead(authority: authority, method: method, params: foundation)
+        }
         do {
+            if Self.pairedBotMainActorReadMethods.contains(method) {
+                return JSONValue.from(try authority.dispatch(method: method, params: foundation))
+            }
             var result = try authority.dispatch(method: method, params: foundation)
             if method == "bot.stop" || method == "bot.force_stop",
                result["status"] as? String == BotRemoteControlAuthority.Status.accepted.rawValue,
@@ -3330,8 +3359,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     params: ["client_request_id": requestID]
                 )
             }
-            botsViewModel?.reloadQueuedFollowUpsFromStore()
-            if method == "bot.get" || method == "bot.send" {
+            reloadPairedBotQueue(params: foundation)
+            if method == "bot.send" {
                 result = enrichPairedBotAssistant(params: foundation, result: result)
             }
             if method == "bot.send" {
@@ -3348,6 +3377,52 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 return JSONValue.from(failed)
             }
             throw JSONRPCError(code: error.code, message: error.message)
+        }
+    }
+
+    /// A write can change only its own bot's persisted queue; reload that bot
+    /// (and publish only if its rows changed). Writes that name no bot keep the
+    /// fleet-wide reload.
+    private func reloadPairedBotQueue(params: [String: Any]) {
+        guard let botsViewModel else { return }
+        if let raw = params["bot_id"] as? String, let uuid = UUID(uuidString: raw) {
+            botsViewModel.reloadQueuedFollowUpsFromStore(botID: BotID(uuid))
+        } else {
+            botsViewModel.reloadQueuedFollowUpsFromStore()
+        }
+    }
+
+    private func dispatchPairedBotRead(
+        authority: BotRemoteControlAuthority,
+        method: String,
+        params: [String: Any]
+    ) async throws -> JSONValue {
+        let request = PairedBotReadRequest(authority: authority, method: method, params: params)
+        let outcome: PairedBotReadOutcome = await Task.detached(priority: .userInitiated) {
+            do {
+                return .value(try request.authority.dispatch(method: request.method, params: request.params))
+            } catch {
+                return .failure(error)
+            }
+        }.value
+        switch outcome {
+        case .value(let result):
+            guard method == "bot.get" else { return JSONValue.from(result) }
+            return JSONValue.from(enrichPairedBotAssistant(params: params, result: result))
+        case .failure(let error as BotRemoteControlAuthority.Error):
+            // Same contract as the write path: a request id whose receipt
+            // already failed answers with that receipt.
+            if let requestID = params["client_request_id"] as? String,
+               let failed = try? authority.dispatch(
+                   method: "bot.receipt.status",
+                   params: ["client_request_id": requestID]
+               ),
+               failed["status"] as? String == BotRemoteControlAuthority.Status.failed.rawValue {
+                return JSONValue.from(failed)
+            }
+            throw JSONRPCError(code: error.code, message: error.message)
+        case .failure(let error):
+            throw error
         }
     }
 
@@ -6203,26 +6278,35 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ) async throws -> AgentThreadMirrorSnapshot {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         // v1: metadata-first length inspection + decode only the selected suffix.
+        // Runs off MainActor: the barrier waits on this thread's mirror lock
+        // (a long stream flush) and the selection reads SQLite, neither of
+        // which may stall the UI or other paired-device RPCs.
         if let eventRowLimit, let maxPayloadBytes {
-            return try ctx.coordinator.withMirrorEventSnapshotForThreadReadV1(
-                threadId: thread,
-                eventLimit: eventRowLimit,
-                maxPayloadBytes: maxPayloadBytes
-            ) { selection in
-                let blocked = selection.blockedNewest.map {
-                    AgentThreadMirrorSnapshot.BlockedMirrorEvent(
-                        id: $0.id,
-                        payloadBytes: $0.payloadBytes,
-                        reason: $0.reason
+            let coordinator = ctx.coordinator
+            return try await Task.detached(priority: .userInitiated) {
+                let signposter = PerfSwitchMetrics.signposter
+                let interval = signposter.beginInterval("thread_read_v1_snapshot", id: signposter.makeSignpostID())
+                defer { signposter.endInterval("thread_read_v1_snapshot", interval) }
+                return try coordinator.withMirrorEventSnapshotForThreadReadV1(
+                    threadId: thread,
+                    eventLimit: eventRowLimit,
+                    maxPayloadBytes: maxPayloadBytes
+                ) { selection in
+                    let blocked = selection.blockedNewest.map {
+                        AgentThreadMirrorSnapshot.BlockedMirrorEvent(
+                            id: $0.id,
+                            payloadBytes: $0.payloadBytes,
+                            reason: $0.reason
+                        )
+                    }
+                    return AgentThreadMirrorSnapshot(
+                        events: selection.events,
+                        eventWatermark: EventBus.shared.currentSeq,
+                        sourceHadOlderEvents: selection.hasMoreOlder,
+                        blockedEvent: blocked
                     )
                 }
-                return AgentThreadMirrorSnapshot(
-                    events: selection.events,
-                    eventWatermark: EventBus.shared.currentSeq,
-                    sourceHadOlderEvents: selection.hasMoreOlder,
-                    blockedEvent: blocked
-                )
-            }
+            }.value
         }
         // Legacy: unbounded (or optional count-only) decode path.
         let sqlLimit = eventRowLimit.map { max(1, $0) + 1 } ?? Int.max
@@ -9715,4 +9799,18 @@ struct KeychainSSHPasswordStore: SSHPasswordStoring {
     func delete(account: String) {
         SecItemDelete(Self.baseQuery(account: account) as CFDictionary)
     }
+}
+
+/// Carries a paired `bot.*` read across the detached hop. The authority
+/// serializes every dispatch under its own lock; the params dictionary is
+/// built from JSON values and is never mutated after hand-off.
+private struct PairedBotReadRequest: @unchecked Sendable {
+    let authority: BotRemoteControlAuthority
+    let method: String
+    let params: [String: Any]
+}
+
+private enum PairedBotReadOutcome: @unchecked Sendable {
+    case value([String: Any])
+    case failure(Error)
 }

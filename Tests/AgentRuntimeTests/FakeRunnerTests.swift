@@ -1200,6 +1200,10 @@ final class FakeRunnerTests: XCTestCase {
                        "recovery must carry the active provider turn id so Codex app-server can interrupt the exact running turn")
         XCTAssertEqual(adapter.interruptTurnCallCount, 1,
                        "stop after app restart must call provider-native interrupt instead of only queuing a local cancellation")
+        // stopRun drives recovery from a `[weak self]` Task; in the app the
+        // coordinator is owned by AppContext for the process lifetime. Without
+        // this, ARC may free it after its last use above and the Task no-ops.
+        withExtendedLifetime(coordinator) {}
     }
 
     func test_coordinator_emitsVisibleErrorWhenLifecyclePersistenceFails() async throws {

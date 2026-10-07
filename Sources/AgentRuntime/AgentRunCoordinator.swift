@@ -658,7 +658,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// onAssistantEvent fan-out or stopRun — host callbacks can block on main
     /// while the HTTP mirror path waits on this lock. Recursive so nested
     /// flush helpers can re-enter during a snapshot barrier.
-    private let mirrorEventLock = NSRecursiveLock()
+    ///
+    /// One lock per thread: every holder (stream append/flush, resume-cursor
+    /// read, purge, snapshot barrier) is scoped to a single thread id, so a long
+    /// flush or snapshot on thread A no longer stalls a paired-device
+    /// `agent.thread.read` of thread B.
+    private let mirrorEventLocks = MirrorEventLockTable()
+
+    private func mirrorEventLock(for threadId: AgentThreadID) -> NSRecursiveLock {
+        mirrorEventLocks.lock(for: threadId)
+    }
+
+    #if DEBUG
+    func mirrorEventLockForTesting(threadId: AgentThreadID) -> NSRecursiveLock {
+        mirrorEventLock(for: threadId)
+    }
+    #endif
     private static let externalReceiptLeaseRenewalInterval: TimeInterval = 6 * 60 * 60
     private static let externalReceiptLeaseRetryInterval: TimeInterval = 60
     private var observerRefs: [WeakAgentRunObserver] = []
@@ -2754,14 +2769,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         // Stream writers take mirrorEventLock before lock. Match that order so a
         // last buffered event cannot resurrect a deleted thread while we clear it.
-        mirrorEventLock.lock()
+        mirrorEventLock(for: threadId).lock()
         lock.lock()
         let mayPurge = !hasUnsafeInMemoryOwnershipLocked(threadId)
         if mayPurge {
             purgeDeletedThreadRuntimeLocked(threadId)
         }
         lock.unlock()
-        mirrorEventLock.unlock()
+        mirrorEventLock(for: threadId).unlock()
         return mayPurge ? .retired : .retryRequired
     }
 
@@ -3127,11 +3142,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         generation: UInt64,
         threadAbsent: Bool
     ) {
-        mirrorEventLock.lock()
+        mirrorEventLock(for: threadId).lock()
         lock.lock()
         defer {
             lock.unlock()
-            mirrorEventLock.unlock()
+            mirrorEventLock(for: threadId).unlock()
         }
         guard let claim = lateRunAdmissionClaims[runId],
               claim.matches(threadId: threadId, generation: generation) else {
@@ -4560,8 +4575,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         _ body: () throws -> T
     ) throws -> T {
         let outcome: MirrorEventLockOutcome<T> = {
-            mirrorEventLock.lock()
-            defer { mirrorEventLock.unlock() }
+            mirrorEventLock(for: threadId).lock()
+            defer { mirrorEventLock(for: threadId).unlock() }
             lock.lock()
             let priorFailure = mirrorPersistenceFailures[threadId]
             lock.unlock()
@@ -5060,8 +5075,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         runId: AgentRunID,
         threadId: AgentThreadID
     ) -> StreamFlushAttempt {
-        mirrorEventLock.lock()
-        defer { mirrorEventLock.unlock() }
+        mirrorEventLock(for: threadId).lock()
+        defer { mirrorEventLock(for: threadId).unlock() }
         lock.lock()
         if let bufferedRunId = pendingStreamRunIds[threadId], bufferedRunId != runId {
             lock.unlock()
@@ -5674,8 +5689,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 case storeBeforeLossFailure(Error)
             }
             let postAction: MirrorEventPostAction = {
-                mirrorEventLock.lock()
-                defer { mirrorEventLock.unlock() }
+                mirrorEventLock(for: threadId).lock()
+                defer { mirrorEventLock(for: threadId).unlock() }
 
                 var deferredPersistenceIssues: [DeferredPersistenceIssue] = []
                 var appendedMessages: [AgentMessage] = []
@@ -6311,7 +6326,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             latestRunErrorMessages[runId] = m
             lock.unlock()
-            mirrorEventLock.lock()
+            mirrorEventLock(for: threadId).lock()
             // Cursor only. A leftover 16-column session `get` (including
             // `runtime_payload_json`) hitchs the error path under
             // `mirrorEventLock` just to copy resume_cursor for recoverable.
@@ -6320,7 +6335,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // error path just to copy provider_thread_id for recoverable.
             let threadCursor = (try? threadRepo.providerThreadId(of: threadId))
                 .flatMap { $0.isEmpty ? nil : $0 }
-            mirrorEventLock.unlock()
+            mirrorEventLock(for: threadId).unlock()
             let resumeCursor = (persistedCursor ?? threadCursor)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let recoverable = resumeCursor?.isEmpty == false
@@ -7475,8 +7490,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             case failed(operation: String, error: Error)
         }
         let outcome: ImmediatePublishOutcome = {
-            mirrorEventLock.lock()
-            defer { mirrorEventLock.unlock() }
+            mirrorEventLock(for: threadId).lock()
+            defer { mirrorEventLock(for: threadId).unlock() }
 
             lock.lock()
             let eventSequence = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
@@ -7723,5 +7738,22 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
         Self.codecLock.unlock()
         guard let data else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+}
+
+/// Per-thread recursive mirror locks. Entries are kept for the coordinator's
+/// lifetime (one small lock per thread touched), so a lock handed out is never
+/// replaced while another caller may still hold it.
+final class MirrorEventLockTable: @unchecked Sendable {
+    private let guardLock = NSLock()
+    private var locks: [AgentThreadID: NSRecursiveLock] = [:]
+
+    func lock(for threadId: AgentThreadID) -> NSRecursiveLock {
+        guardLock.lock()
+        defer { guardLock.unlock() }
+        if let existing = locks[threadId] { return existing }
+        let created = NSRecursiveLock()
+        locks[threadId] = created
+        return created
     }
 }

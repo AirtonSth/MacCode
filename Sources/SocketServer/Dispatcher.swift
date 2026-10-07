@@ -3784,33 +3784,13 @@ public final class JSONRPCDispatcher {
                         eventRowLimit: caps.eventLimit,
                         maxPayloadBytes: Int64(caps.maxBytes)
                     )
-                    let encodedEvents = snapshot.events.map { encode($0) }
-                    let blocked = snapshot.blockedEvent.map {
-                        AgentThreadReadV1.BlockedEvent(
-                            id: $0.id,
-                            payloadBytes: $0.payloadBytes,
-                            reason: $0.reason
-                        )
-                    }
-                    let window = AgentThreadReadV1.boundToEnvelope(
-                        events: snapshot.events,
-                        encodedEvents: encodedEvents,
-                        sourceHadOlderEvents: snapshot.sourceHadOlderEvents,
-                        blockedEvent: blocked,
-                        maxBytes: caps.maxBytes,
-                        eventWatermark: snapshot.eventWatermark,
-                        responseId: id,
-                        measureEnvelope: { [self] result in
-                            envelopeUTF8ByteCount(id: id, result: result)
-                        }
-                    )
-                    return .init(
-                        id: id,
-                        result: AgentThreadReadV1.payload(
-                            window: window,
-                            eventWatermark: snapshot.eventWatermark
-                        )
-                    )
+                    // Encode and envelope-bound off MainActor (up to 128 events,
+                    // ~log2(N) full-envelope measurements per read).
+                    let maxBytes = caps.maxBytes
+                    let result = await Task.detached(priority: .userInitiated) {
+                        Self.threadReadV1Result(snapshot: snapshot, maxBytes: maxBytes, id: id)
+                    }.value
+                    return .init(id: id, result: result)
                 }
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 if params["include_event_watermark"]?.boolValue == true {
@@ -4942,11 +4922,45 @@ public final class JSONRPCDispatcher {
         return result
     }
 
-    /// Full JSON-RPC response UTF-8 size (keys, separators, escaping, id).
-    /// PERF: agent.thread.read boundToEnvelope measures ~log2(N) times per read.
-    /// Structural count matches default JSONEncoder length without allocating Data.
-    private func envelopeUTF8ByteCount(id: JSONRPCID?, result: JSONValue) -> Int {
-        EventBus.jsonRPCResponseByteCount(id: id, result: result)
+    /// `agent.thread.read` v1 result: encode each event, then bound the newest
+    /// suffix to the full JSON-RPC envelope. Same bytes as the MainActor path
+    /// (default JSONEncoder → JSONValue); its own coders, so it is safe off main.
+    nonisolated static func threadReadV1Result(
+        snapshot: AgentThreadMirrorSnapshot,
+        maxBytes: Int,
+        id: JSONRPCID?
+    ) -> JSONValue {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let encodedEvents: [JSONValue] = snapshot.events.map { event in
+            guard let data = try? encoder.encode(event),
+                  let value = try? decoder.decode(JSONValue.self, from: data) else {
+                return .null
+            }
+            return value
+        }
+        let blocked = snapshot.blockedEvent.map {
+            AgentThreadReadV1.BlockedEvent(
+                id: $0.id,
+                payloadBytes: $0.payloadBytes,
+                reason: $0.reason
+            )
+        }
+        let window = AgentThreadReadV1.boundToEnvelope(
+            events: snapshot.events,
+            encodedEvents: encodedEvents,
+            sourceHadOlderEvents: snapshot.sourceHadOlderEvents,
+            blockedEvent: blocked,
+            maxBytes: maxBytes,
+            eventWatermark: snapshot.eventWatermark,
+            responseId: id,
+            // Full JSON-RPC response UTF-8 size, measured structurally (~log2(N)
+            // times per read) without allocating Data.
+            measureEnvelope: { result in
+                EventBus.jsonRPCResponseByteCount(id: id, result: result)
+            }
+        )
+        return AgentThreadReadV1.payload(window: window, eventWatermark: snapshot.eventWatermark)
     }
 
     private func workspaceID(from params: [String: JSONValue]) throws -> WorkspaceID {

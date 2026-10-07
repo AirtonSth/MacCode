@@ -5896,9 +5896,39 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func reloadQueuedFollowUpsFromStore() {
+        let signposter = PerfSwitchMetrics.signposter
+        let interval = signposter.beginInterval("bot_queue_reload_all", id: signposter.makeSignpostID())
+        defer { signposter.endInterval("bot_queue_reload_all", interval) }
         queuedFollowUpsByBot = decodeQueuedFollowUpsFromStore()
         syncQueuedFollowUps()
+        #if DEBUG
+        queuedFollowUpsFleetReloadCountForTesting += 1
+        #endif
     }
+
+    /// Reloads one bot's persisted queue after a paired-device write to that
+    /// bot. Nothing is published when its rows are unchanged; a failed read
+    /// keeps the current queue rather than passing for an empty one.
+    public func reloadQueuedFollowUpsFromStore(botID: BotID) {
+        let signposter = PerfSwitchMetrics.signposter
+        let interval = signposter.beginInterval("bot_queue_reload_bot", id: signposter.makeSignpostID())
+        defer { signposter.endInterval("bot_queue_reload_bot", interval) }
+        guard let stored = try? botStore.listQueuedFollowUps(botID: botID) else { return }
+        let items = stored.map(decodeQueuedFollowUp).filter {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !$0.attachments.isEmpty
+        }
+        let next: [BotQueuedFollowUp]? = items.isEmpty ? nil : items
+        guard queuedFollowUpsByBot[botID] != next else { return }
+        queuedFollowUpsByBot[botID] = next
+        syncQueuedFollowUps()
+    }
+
+    #if DEBUG
+    var queuedFollowUpsFleetReloadCountForTesting = 0
+    func queuedFollowUpsForTesting(botID: BotID) -> [BotQueuedFollowUp] {
+        queuedFollowUpsByBot[botID] ?? []
+    }
+    #endif
 
     /// Promote an exact persisted remote queue row and either interrupt its
     /// current conversation or start it immediately when that conversation is
