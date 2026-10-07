@@ -3941,7 +3941,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         reason: IncompleteTurnContinuationReason
     ) -> AgentRunRequest {
         let prompt = IncompleteTurnContinuation.prompt(for: reason)
-        let runAsUser = (try? threadRepo.identity(of: threadId))?.runAsUser
+        let identity = try? threadRepo.identity(of: threadId)
         return AgentRunRequest(
             threadId: threadId,
             provider: runMetadata.provider,
@@ -3952,10 +3952,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             userMessageContent: prompt,
             providerThreadId: resumeCursor,
             permissionMode: runMetadata.runtimeMode,
-            reasoningModel: (try? threadRepo.get(id: threadId))?.reasoningModel,
+            reasoningModel: identity?.reasoningModel,
             serviceTier: runMetadata.serviceTier,
             interactionMode: runMetadata.interactionMode,
-            runAsUser: runAsUser
+            runAsUser: identity?.runAsUser
         )
     }
 

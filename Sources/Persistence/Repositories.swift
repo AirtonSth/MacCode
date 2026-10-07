@@ -419,13 +419,14 @@ public final class AgentThreadRepository {
 
     /// Cheap identity/scope probe for same-user, persistent scope,
     /// and env stamps. Avoids the full `get` (26 columns + routing JSON) when
-    /// only workspace/project/model/instance/run-as-user are needed.
+    /// only workspace/project/model/instance/run-as-user/reasoning model are needed.
     public struct IdentityChrome: Equatable, Sendable {
         public let workspaceId: WorkspaceID?
         public let projectId: ProjectID?
         public let model: String
         public let providerInstanceId: String
         public let runAsUser: AgentRunAsUser?
+        public let reasoningModel: String?
     }
 
     /// Adapter-session recovery only needs status plus cwd/model/identity.
@@ -1394,7 +1395,7 @@ public final class AgentThreadRepository {
     public func identity(of id: AgentThreadID) throws -> IdentityChrome? {
         identityProbeCountForTesting += 1
         let st = try db.prepare(
-            "SELECT workspace_id, project_id, model, provider, provider_instance_id, run_as_user_json FROM agent_threads WHERE id = ? LIMIT 1;"
+            "SELECT workspace_id, project_id, model, provider, provider_instance_id, run_as_user_json, reasoning_model FROM agent_threads WHERE id = ? LIMIT 1;"
         )
         try st.bind(1, id.value.uuidString)
         guard try st.step() else { return nil }
@@ -1407,7 +1408,8 @@ public final class AgentThreadRepository {
             projectId: projectId,
             model: model,
             providerInstanceId: st.columnText(4) ?? provider.rawValue,
-            runAsUser: decodeRunAsUser(st.columnText(5))
+            runAsUser: decodeRunAsUser(st.columnText(5)),
+            reasoningModel: st.columnText(6)
         )
     }
 
