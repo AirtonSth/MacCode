@@ -76,7 +76,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         initializeCapabilities: String,
         workerResult: String,
         sessionModels: String = #"{"currentModelId":"main"}"#,
-        setModelResult: String? = nil
+        setModelResult: String? = nil,
+        sessionOpenJSON: String? = nil
     ) throws -> (harness: URL, requests: URL) {
         let requestsURL = root.appendingPathComponent("requests.jsonl")
         let harnessURL = root.appendingPathComponent("distill-agent")
@@ -93,7 +94,10 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             if method == "initialize":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":\(initializeCapabilities)}})
             elif method == "session/new":
-                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"worker-session","models":\(sessionModels)}})
+                result = {"sessionId":"worker-session","models":\(sessionModels)}
+                extra = \(String(reflecting: sessionOpenJSON ?? ""))
+                if extra: result.update(json.loads(extra))
+                send({"jsonrpc":"2.0", "id":message["id"], "result":result})
             elif method == "session/set_model":
                 fixed = \(String(reflecting: setModelResult ?? ""))
                 result = json.loads(fixed) if fixed else {"_meta":{"model":params.get("modelId"),"contextWindow":1000}}
@@ -260,6 +264,110 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual((params["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "medium")
         let methods = try recordedRequests(requestsURL).compactMap { $0["method"] as? String }
         XCTAssertTrue(methods.contains("session/prompt"), "the prompt must be sent once the catalog effort is bound")
+    }
+
+    /// `chatgpt/gpt-6-luna` as the live Mac distill 2.0.33 session/new advertises it (captured 2026-10-07).
+    private static let liveLunaCatalogEntry = #"{"modelId":"chatgpt/gpt-6-luna","name":"GPT-6-Luna (ChatGPT)","_meta":{"totalContextTokens":872000,"agentType":"distill-plan","supportsReasoningEffort":true,"reasoningEffort":"medium","reasoningEfforts":[{"id":"low","value":"low","label":"low","default":false},{"id":"medium","value":"medium","label":"medium","default":true},{"id":"high","value":"high","label":"high","default":false},{"id":"xhigh","value":"xhigh","label":"xhigh","default":false},{"id":"max","value":"max","label":"max","default":false}]}}"#
+
+    func test_mainEffortAdvertisedOnlyByTheSessionEffortOption_isSent_becauseTheUIOffersIt() async throws {
+        // WHY: a build may list a model's efforts only in the session `reasoning_effort` option
+        // (no per-model `_meta.reasoningEfforts`). The static policy does not know gpt-6-luna, so
+        // reading only the per-model catalog failed with "Selected Main model does not advertise that effort".
+        let root = try makeTempRoot("distill-acp-config-effort")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{}",
+            workerResult: "{}",
+            setModelResult: #"{"_meta":{"model":{"Ok":"gpt-6-luna"},"contextWindow":872000,"canonicalModelId":"chatgpt/gpt-6-luna","reasoningEffort":"medium","reasoningEffortAuto":false}}"#,
+            sessionOpenJSON: #"{"models":{"currentModelId":"chatgpt/gpt-6-luna","availableModels":[{"modelId":"chatgpt/gpt-6-luna","name":"GPT-6-Luna (ChatGPT)"}]},"configOptions":[{"id":"reasoning_effort","type":"select","currentValue":"medium","options":[{"value":"low","name":"low"},{"value":"medium","name":"medium"},{"value":"high","name":"high"}]}]}"#
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .distill,
+                model: "chatgpt/gpt-6-luna",
+                cwd: root.path,
+                prompt: "Go",
+                distillMainEffortSelection: .fixed(.medium)
+            )
+        ) { events.append($0) }
+        _ = try await events.waitForFinish()
+        let requests = try recordedRequests(requestsURL)
+        let setModel = try XCTUnwrap(requests.last { $0["method"] as? String == "session/set_model" }?["params"] as? [String: Any])
+        XCTAssertEqual(setModel["modelId"] as? String, "chatgpt/gpt-6-luna")
+        XCTAssertEqual((setModel["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "medium")
+        XCTAssertTrue(requests.contains { $0["method"] as? String == "session/prompt" },
+                      "the prompt must be sent once the advertised effort is bound")
+    }
+
+    func test_mainEffortForBareModelAlias_usesTheCanonicalCatalogEntry_becauseAcksUseTheBareId() async throws {
+        // WHY: Distill acks a switch with the bare id (`{"Ok":"gpt-6-luna"}`) while the catalog
+        // keys the canonical `chatgpt/gpt-6-luna`. A Main selection carrying the bare id must still
+        // find that model's live efforts instead of failing the turn.
+        let root = try makeTempRoot("distill-acp-alias-effort")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{}",
+            workerResult: "{}",
+            setModelResult: #"{"_meta":{"model":{"Ok":"gpt-6-luna"},"contextWindow":872000}}"#,
+            sessionOpenJSON: #"{"models":{"currentModelId":"chatgpt/gpt-6-luna","availableModels":["# + Self.liveLunaCatalogEntry + #"]}}"#
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .distill,
+                model: "gpt-6-luna",
+                cwd: root.path,
+                prompt: "Go",
+                distillMainEffortSelection: .fixed(.medium)
+            )
+        ) { events.append($0) }
+        _ = try await events.waitForFinish()
+        let requests = try recordedRequests(requestsURL)
+        let setModel = try XCTUnwrap(requests.last { $0["method"] as? String == "session/set_model" }?["params"] as? [String: Any])
+        XCTAssertEqual((setModel["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "medium")
+        XCTAssertTrue(requests.contains { $0["method"] as? String == "session/prompt" })
+    }
+
+    func test_liveLunaCatalogShape_bindsMediumAndSendsPrompt() async throws {
+        // WHY: locks the exact catalog shape the Mac's distill advertises for chatgpt/gpt-6-luna
+        // (object effort entries, set_model `{"Ok": bare}` + canonical ack).
+        let root = try makeTempRoot("distill-acp-live-luna")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root,
+            initializeCapabilities: "{}",
+            workerResult: "{}",
+            setModelResult: #"{"_meta":{"model":{"Ok":"gpt-6-luna"},"contextWindow":872000,"canonicalModelId":"chatgpt/gpt-6-luna","reasoningEffort":"medium","reasoningEffortAuto":false}}"#,
+            sessionOpenJSON: #"{"models":{"currentModelId":"chatgpt/gpt-6-luna","availableModels":["# + Self.liveLunaCatalogEntry + #"]},"configOptions":[{"id":"reasoning_effort","type":"select","currentValue":"max","options":[{"value":"low"},{"value":"medium"},{"value":"high"},{"value":"xhigh"},{"value":"max"}]}]}"#
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .distill,
+                model: "chatgpt/gpt-6-luna",
+                cwd: root.path,
+                prompt: "Go",
+                distillMainEffortSelection: .fixed(.medium)
+            )
+        ) { events.append($0) }
+        _ = try await events.waitForFinish()
+        let requests = try recordedRequests(requestsURL)
+        let setModel = try XCTUnwrap(requests.last { $0["method"] as? String == "session/set_model" }?["params"] as? [String: Any])
+        XCTAssertEqual(setModel["modelId"] as? String, "chatgpt/gpt-6-luna")
+        XCTAssertEqual((setModel["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "medium")
+        XCTAssertTrue(requests.contains { $0["method"] as? String == "session/prompt" })
     }
 
     func test_setModelAcceptsDistill2025ResultWrappedModelAck_becauseLatestDistillAnswersOkObject() async throws {

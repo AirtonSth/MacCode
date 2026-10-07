@@ -152,6 +152,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         let advertisedEfforts: [AgentReasoningEffort]
         /// Live catalog efforts per model id from session/new|load; the static policy only knows a few ids.
         let modelEfforts: [String: [AgentReasoningEffort]]
+        /// The session's current model when `advertisedEfforts` was read.
+        let advertisedEffortsModelId: String?
         let availableModeIDs: Set<String>
         let planModeID: String?
         var mode: String?
@@ -213,6 +215,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             advertisesReasoningEffortConfig: Bool = false,
             advertisedEfforts: [AgentReasoningEffort] = [],
             modelEfforts: [String: [AgentReasoningEffort]] = [:],
+            advertisedEffortsModelId: String? = nil,
             availableModeIDs: Set<String>,
             planModeID: String?,
             mode: String?,
@@ -235,6 +238,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             self.advertisesReasoningEffortConfig = advertisesReasoningEffortConfig
             self.advertisedEfforts = advertisedEfforts
             self.modelEfforts = modelEfforts
+            self.advertisedEffortsModelId = advertisedEffortsModelId
             self.availableModeIDs = availableModeIDs
             self.planModeID = planModeID
             self.mode = mode
@@ -243,6 +247,17 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 byteLimit: maxReadableBytes
             )
             self.onEvent = onEvent
+        }
+
+        /// Live efforts for `modelId` (catalog by canonical or alias id, plus the
+        /// open-time `reasoning_effort` option for the then-current model).
+        func catalogEfforts(for modelId: String?) -> [AgentReasoningEffort] {
+            DistillACPClient.advertisedEfforts(
+                for: modelId,
+                catalog: modelEfforts,
+                currentModelId: advertisedEffortsModelId,
+                currentModelEfforts: advertisedEfforts
+            )
         }
     }
 
@@ -1123,6 +1138,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     opened.models.map { ($0.id, $0.supportedReasoningEfforts) },
                     uniquingKeysWith: { first, _ in first }
                 ),
+                advertisedEffortsModelId: opened.currentModelId,
                 availableModeIDs: availableModeIDs,
                 planModeID: planModeID,
                 mode: opened.currentModeId,
@@ -1282,7 +1298,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     sessionId: session.providerThreadId,
                     modelId: normalizedReasoningModel,
                     effortSelection: requestedReasoningEffortSelection,
-                    advertisedEfforts: normalizedReasoningModel.flatMap { session.modelEfforts[$0] } ?? []
+                    advertisedEfforts: session.catalogEfforts(for: normalizedReasoningModel)
                 )
                 let appliedEffortSelection: AgentEffortSelection
                 if normalizedReasoningModel == nil || applied.isAutomatic {
@@ -1322,7 +1338,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                         sessionId: session.providerThreadId,
                         modelId: modelId,
                         reasoningEffort: reasoningEffort,
-                        advertisedEfforts: session.modelEfforts[modelId] ?? []
+                        advertisedEfforts: session.catalogEfforts(for: modelId)
                     )
                     synchronized {
                         session.model = applied.activeModelId
@@ -1340,7 +1356,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     modelId: modelForEffort,
                     reasoningEffort: mainEffortSelection.effort,
                     reasoningEffortAuto: mainEffortSelection.isAutomatic,
-                    advertisedEfforts: session.modelEfforts[modelForEffort] ?? []
+                    advertisedEfforts: session.catalogEfforts(for: modelForEffort)
                 )
                 guard applied.canonicalModelId == modelForEffort,
                       applied.canonicalModelId != normalizedReasoningModel,
@@ -1362,7 +1378,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     sessionId: session.providerThreadId,
                     modelId: normalizedReasoningModel,
                     effortSelection: requestedReasoningEffortSelection,
-                    advertisedEfforts: normalizedReasoningModel.flatMap { session.modelEfforts[$0] } ?? []
+                    advertisedEfforts: session.catalogEfforts(for: normalizedReasoningModel)
                 )
                 let appliedEffortSelection: AgentEffortSelection
                 if normalizedReasoningModel == nil || applied.isAutomatic {

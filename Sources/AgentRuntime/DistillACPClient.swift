@@ -445,8 +445,15 @@ struct DistillACPSessionOpenResult {
 
     /// Live catalog efforts for one model; the static policy only knows a few ids.
     func catalogEfforts(for modelId: String?) -> [AgentReasoningEffort] {
-        let id = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return models.first { $0.id == id }?.supportedReasoningEfforts ?? []
+        DistillACPClient.advertisedEfforts(
+            for: modelId,
+            catalog: Dictionary(
+                models.map { ($0.id, $0.supportedReasoningEfforts) },
+                uniquingKeysWith: { first, _ in first }
+            ),
+            currentModelId: currentModelId,
+            currentModelEfforts: advertisedReasoningEffortIds.compactMap(AgentReasoningEffort.init(rawValue:))
+        )
     }
 
     /// True when session/new|load advertised a selectable `reasoning_effort` option.
@@ -1023,6 +1030,37 @@ public final class DistillACPClient: @unchecked Sendable {
             }
         }
         return opened
+    }
+
+    /// Efforts the live session advertises for `modelId`: its catalog entry
+    /// (exact id, else the one canonical/alias match — the catalog says
+    /// `chatgpt/gpt-6-luna` while set_model acks `gpt-6-luna`), plus the
+    /// session `reasoning_effort` option when `modelId` is the session's
+    /// current model (some builds advertise efforts only there).
+    static func advertisedEfforts(
+        for modelId: String?,
+        catalog: [String: [AgentReasoningEffort]],
+        currentModelId: String?,
+        currentModelEfforts: [AgentReasoningEffort]
+    ) -> [AgentReasoningEffort] {
+        let id = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !id.isEmpty else { return [] }
+        var efforts = catalog[id] ?? {
+            let aliases = catalog.filter { modelIdsMatch($0.key, id) }
+            return aliases.count == 1 ? aliases.first?.value ?? [] : []
+        }()
+        if let currentModelId, modelIdsMatch(currentModelId, id) {
+            efforts += currentModelEfforts.filter { !efforts.contains($0) }
+        }
+        return efforts
+    }
+
+    /// Same model when equal or when one is the other's provider-qualified form.
+    static func modelIdsMatch(_ lhs: String, _ rhs: String) -> Bool {
+        let a = lhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = rhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        return a == b || a.hasSuffix("/" + b) || b.hasSuffix("/" + a)
     }
 
     /// Model-aware ACP value. Nil means the selected model does not advertise
