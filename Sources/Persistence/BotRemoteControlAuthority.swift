@@ -1208,9 +1208,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             ]
         }
         consumeAttachments(attachmentIDs)
-        let effectiveRouting: Any = routing
-            ?? authoritativeSend["effective_routing"]
-            ?? NSNull()
+        // The route that ran: the host's resolved route over the stored
+        // receipt route, so a receipt-bound send keeps `routing_receipt_id`,
+        // `host_id` and `bot_id` and both paths report one shape.
+        let ranRouting = authoritativeSend["effective_routing"] as? [String: Any]
+        let effectiveRouting: Any
+        if let routing {
+            effectiveRouting = routing.merging(ranRouting ?? [:]) { _, ran in ran }
+        } else {
+            effectiveRouting = ranRouting ?? NSNull()
+        }
         let runID = authoritativeSend["run_id"] as? String
             ?? UUID().uuidString.lowercased()
         let conversationID = authoritativeSend["conversation_id"] as? String
@@ -2730,10 +2737,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
             pref["conversation_id"] = conversation.id.value.uuidString.lowercased()
             if let onConversationRoutingSet {
-                pref["effective"] = try onConversationRoutingSet(bot.id, conversation.id, pref)
+                // The receipt is the resolved desk route (an empty Main
+                // resolves like the Mac desk), so the device echoes and the
+                // send runs exactly this route. Receipt keys stay.
+                let resolved = try onConversationRoutingSet(bot.id, conversation.id, pref)
+                for key in ["model"] + Self.workerRoutingKeys {
+                    if let value = resolved[key] { pref[key] = value }
+                }
             }
         }
-        if pref["effective"] == nil { pref["effective"] = pref }
+        pref["effective"] = pref
         routingPref[id(bot)] = pref
         return receipt(
             requestID: requestID,

@@ -3642,6 +3642,8 @@ public final class BotsViewModel: ObservableObject {
     private var deskRoutingHydrated = false
     private var isApplyingDeskRouting = false
     private var deskRoutingByConversation: [BotConversationID: BotDeskRouting] = [:]
+    private var pendingDeskRoutingWrites: [BotConversationID: BotID?] = [:]
+    private var deskRoutingWriteTask: Task<Void, Never>?
     private var peerHandoffs: [UUID: PersistedBotPeerHandoff] = [:] {
         didSet { refreshActiveBotCount() }
     }
@@ -6345,7 +6347,8 @@ public final class BotsViewModel: ObservableObject {
         text: String,
         conversationID: BotConversationID?,
         attachments: [AgentAttachment] = [],
-        routing explicitRouting: BotDeskRouting? = nil
+        routing explicitRouting: BotDeskRouting? = nil,
+        adoptAsDeskRoute: Bool = false
     ) throws -> JSONValue {
         guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
             throw BotStoreError.notFound
@@ -6364,8 +6367,7 @@ public final class BotsViewModel: ObservableObject {
             }
             if let threadID = existing.linkedAgentThreadID,
                let activeRunID = context.coordinator.activeRunId(threadId: threadID) {
-                let routing = explicitRouting.map { adoptHostSendRouting($0, conversation: existing) }
-                    ?? frozenDeskRouting(for: existing)
+                let routing = hostSendRouting(explicitRouting, adopt: adoptAsDeskRoute, conversation: existing)
                 let followUp = BotQueuedFollowUp(
                     text: message,
                     attachments: attachments,
@@ -6399,10 +6401,7 @@ public final class BotsViewModel: ObservableObject {
             botID: bot.id,
             conversationID: conversation.id
         )
-        // No receipt: the conversation's own desk route (or the resolved
-        // Distill default), exactly what the Mac desk would send.
-        let routing = explicitRouting.map { adoptHostSendRouting($0, conversation: conversation) }
-            ?? frozenDeskRouting(for: conversation)
+        let routing = hostSendRouting(explicitRouting, adopt: adoptAsDeskRoute, conversation: conversation)
         guard let prepared = try enqueueSupervisedBotRun(
             bot: bot,
             conversation: conversation,
@@ -6422,6 +6421,21 @@ public final class BotsViewModel: ObservableObject {
             "queued_follow_up": .bool(false),
             "effective_routing": .object(routing.remoteWireObject),
         ])
+    }
+
+    /// No route (paired send without a receipt): the conversation's own desk
+    /// route, or the resolved Distill default, exactly what the Mac desk would
+    /// send. A paired receipt route is adopted as the desk route. Any other
+    /// explicit route (an Agent App caller's frozen run) runs unchanged for
+    /// this one send and never touches the conversation's desk route.
+    private func hostSendRouting(
+        _ explicitRouting: BotDeskRouting?,
+        adopt: Bool,
+        conversation: BotConversation
+    ) -> BotDeskRouting {
+        guard let explicitRouting else { return frozenDeskRouting(for: conversation) }
+        guard adopt else { return explicitRouting }
+        return adoptHostSendRouting(explicitRouting, conversation: conversation)
     }
 
     /// A paired route (receipt-bound send or `bot.routing.set`) becomes the
@@ -8464,20 +8478,46 @@ public final class BotsViewModel: ObservableObject {
         if deskRouting.model != before { normalizeDeskReasoning() }
     }
 
-    /// Writes one conversation's route to the DB (the single source the Mac
-    /// desk and paired `bot.send` share) and tells paired devices.
+    /// Schedules one conversation's route for the DB (the single source the
+    /// Mac desk and paired `bot.send` share) and paired devices. The in-memory
+    /// route is already current; the write and event run once per
+    /// conversation in one coalesced pass after this turn, so navigation and
+    /// the `deskRouting` didSet never wait on SQLite.
     private func persistDeskRouting(for conversationID: BotConversationID, botID: BotID?) {
-        guard let routing = deskRoutingByConversation[conversationID],
-              let data = try? Self.encodeJSON(routing),
-              let json = String(data: data, encoding: .utf8) else { return }
-        _ = try? botStore.setDeskRoutingJSON(json, conversationID: conversationID)
-        guard let botID else { return }
-        EventBus.shared.publish(kind: .botConversationUpdated, payload: .object([
-            "reason": .string("desk_routing"),
-            "bot_id": .string(botID.value.uuidString.lowercased()),
-            "conversation_id": .string(conversationID.value.uuidString.lowercased()),
-            "desk_routing": .object(routing.remoteWireObject),
-        ]))
+        if let botID {
+            pendingDeskRoutingWrites[conversationID] = botID
+        } else if pendingDeskRoutingWrites[conversationID] == nil {
+            pendingDeskRoutingWrites[conversationID] = .some(nil)
+        }
+        guard deskRoutingWriteTask == nil else { return }
+        // Strong: a desk closed on this turn still stores the user's route.
+        deskRoutingWriteTask = Task { @MainActor in
+            await Task.yield()
+            self.flushDeskRoutingWrites()
+        }
+    }
+
+    /// Latest wins: each pending conversation writes the route it has now; a
+    /// conversation deleted since then has no route and writes nothing.
+    private func flushDeskRoutingWrites() {
+        deskRoutingWriteTask = nil
+        let pending = pendingDeskRoutingWrites
+        pendingDeskRoutingWrites = [:]
+        for (conversationID, botID) in pending {
+            guard let routing = deskRoutingByConversation[conversationID],
+                  let data = try? Self.encodeJSON(routing),
+                  let json = String(data: data, encoding: .utf8) else { continue }
+            // A conversation deleted meanwhile has no row and no event.
+            guard (try? botStore.setDeskRoutingJSON(json, conversationID: conversationID)) == true,
+                  let botID else { continue }
+            EventBus.shared.publish(kind: .botConversationUpdated, payload: .object([
+                "method": .string("bot.conversation.desk_routing"),
+                "reason": .string("desk_routing"),
+                "bot_id": .string(botID.value.uuidString.lowercased()),
+                "conversation_id": .string(conversationID.value.uuidString.lowercased()),
+                "desk_routing": .object(routing.remoteWireObject),
+            ]))
+        }
     }
 
     private func restoreDeskRoutingIfNeeded() {

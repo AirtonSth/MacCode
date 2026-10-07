@@ -120,8 +120,14 @@ final class BotSendRoutingParityTests: XCTestCase {
         XCTAssertEqual(readback["conversation_id"] as? String, planID)
         XCTAssertEqual((readback["effective"] as? [String: Any])?["model"] as? String, "main-a",
                        "the receipt shows the host-resolved route, not the empty request model")
+        XCTAssertEqual(readback["model"] as? String, "main-a",
+                       "the device echoes the resolved model, so what runs equals its receipt")
+        XCTAssertEqual((readback["effective"] as? [String: Any])?["routing_receipt_id"] as? String, receiptID,
+                       "effective keeps the receipt keys with conversation_id too")
+        XCTAssertEqual((readback["effective"] as? [String: Any])?["host_id"] as? String, "host")
 
         var send: [String: Any] = routeParams
+        send["model"] = readback["model"]
         send["client_request_id"] = "send"
         send["routing_receipt_id"] = receiptID
         send["text"] = "go"

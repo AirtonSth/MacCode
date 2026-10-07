@@ -3510,12 +3510,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             let routing = try routingValues.map(Self.pairedBotDeskRouting)
             let attachments = try self.resolveInboundAgentAttachments(attachmentReferences)
+            // A receipt route becomes the conversation's desk route, unless an
+            // older client sent a legacy provider: that route was reset to
+            // Distill defaults and runs for this send only, never over the
+            // Main/Worker saved on the Mac.
             let result = try vm.enqueueHostMessage(
                 botID: id,
                 text: text,
                 conversationID: conversationID,
                 attachments: attachments,
-                routing: routing
+                routing: routing,
+                adoptAsDeskRoute: routingValues.map(Self.pairedRouteKeepsItsProvider) ?? false
             )
             return Self.foundationObject(result.objectValue ?? [:])
         }
@@ -3525,6 +3530,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     code: -32091,
                     message: "Bot runtime is unavailable."
                 )
+            }
+            // A conversation's desk route is never a legacy-provider reset.
+            guard Self.pairedRouteKeepsItsProvider(routingValues) else {
+                throw BotRemoteControlAuthority.Error.invalidParams
             }
             let routing = try Self.pairedBotDeskRouting(routingValues)
             let adopted = try vm.adoptRemoteDeskRouting(routing, botID: id, conversationID: conversationID)
@@ -3814,6 +3823,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             return nil
         }
         return value
+    }
+
+    /// False when the paired route names a provider RemoteCode no longer
+    /// runs; `BotDeskRouting` resets such a route to Distill defaults.
+    private static func pairedRouteKeepsItsProvider(_ values: [String: Any]) -> Bool {
+        (values["provider"] as? String).flatMap(AgentProvider.init(rawValue:))?.isSelectable == true
     }
 
     private static func pairedBotDeskRouting(

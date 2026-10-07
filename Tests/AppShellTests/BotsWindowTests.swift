@@ -8254,7 +8254,7 @@ final class BotsWindowTests: XCTestCase {
                       "Token Saver off must not admit compression into either Distill ACP process")
     }
 
-    func test_deskProviderChoicePersistsPerThread_notPerBot() throws {
+    func test_deskProviderChoicePersistsPerThread_notPerBot() async throws {
         // WHY: one Bot can be called from Grok in one thread and Claude in
         // another. Reopening either thread must restore that user's choice
         // without turning either provider into a Bot property.
@@ -8295,6 +8295,11 @@ final class BotsWindowTests: XCTestCase {
             XCTAssertEqual(vm.deskRunProvider, .claude)
             XCTAssertEqual(vm.deskRunModel, "opus")
         }
+        // Desk routes are written after the interaction turn.
+        let stored = await waitUntil(timeout: 5) {
+            (try? context.botStore.listDeskRoutingJSON().count) == 3
+        }
+        XCTAssertTrue(stored)
 
         let restored = BotsViewModel(context: context)
         restored.openDesk(bot)
