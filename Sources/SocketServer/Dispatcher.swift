@@ -707,6 +707,20 @@ private final class ConnectionSnapshotReadOutcome: @unchecked Sendable {
     private let lock = NSLock()
     private var completion: Result<Value, Error>?
     private var continuation: CheckedContinuation<Result<Value, Error>, Never>?
+    private var observers: [(Result<Value, Error>) -> Void] = []
+
+    /// Calls `body` once with the completion: now if already resolved,
+    /// otherwise when `resolve` first runs.
+    func observe(_ body: @escaping (Result<Value, Error>) -> Void) {
+        lock.lock()
+        if let completion {
+            lock.unlock()
+            body(completion)
+        } else {
+            observers.append(body)
+            lock.unlock()
+        }
+    }
 
     func wait() async -> Result<Value, Error> {
         await withCheckedContinuation { continuation in
@@ -731,10 +745,21 @@ private final class ConnectionSnapshotReadOutcome: @unchecked Sendable {
         self.completion = completion
         let continuation = self.continuation
         self.continuation = nil
+        let observers = self.observers
+        self.observers = []
         lock.unlock()
         continuation?.resume(returning: completion)
+        observers.forEach { $0(completion) }
         return true
     }
+}
+
+/// One physical `sync.snapshot` state read and the callers waiting on it.
+/// MainActor-owned: `waiters` is read by the read loop between attempts.
+@MainActor
+private final class ConnectionSnapshotSharedRead {
+    let outcome = ConnectionSnapshotReadOutcome()
+    var waiters = 0
 }
 
 @MainActor
@@ -776,10 +801,11 @@ public final class JSONRPCDispatcher {
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
     /// store request payloads or secrets — only owner fingerprint + params hash.
     private var volatileUnknownReceipts = BoundedUnknownReceiptCache()
-    /// At most one physical snapshot state read may outlive a timed-out caller.
-    /// The task is retained until the underlying router continuation finishes,
-    /// preventing repeated timeouts from accumulating unbounded SQLite reads.
-    private var activeConnectionSnapshotRead: (id: UUID, task: Task<Void, Never>)?
+    /// The one physical snapshot state read. Every `sync.snapshot` caller that
+    /// arrives while it runs joins it, and it is retained until the underlying
+    /// router continuation finishes, so callers and timeouts never stack up
+    /// SQLite reads.
+    private var activeConnectionSnapshotRead: ConnectionSnapshotSharedRead?
     public nonisolated static let hostMutationMethods = HostMutationContract.methods
     private nonisolated static let durableSynchronousMutationMethods: Set<String> = [
         "workspace.create",
@@ -1022,64 +1048,41 @@ public final class JSONRPCDispatcher {
         // watermark then remains an honest sequence fence without starving
         // event delivery or HTTP recovery while the snapshot is built.
         //
-        // A deadline races the physical read through a one-shot outcome. The
-        // caller therefore returns even if an off-main continuation ignores
-        // cancellation. One retained task per dispatcher bounds those stale
-        // reads; while it exists, later callers fail fast with the same
-        // retryable timeout rather than waiting behind or spawning another read.
+        // One physical read runs at a time. A caller that arrives while it runs
+        // joins it and gets the same result: its pre-read watermark is honest
+        // for every caller, because the client replays every event after it.
+        // Each caller races the shared result against its own deadline and
+        // cancellation, so one caller timing out or disconnecting never fails
+        // another. The read stops before its next attempt once nobody waits.
         let readStarted = DispatchTime.now().uptimeNanoseconds
         do {
-            guard activeConnectionSnapshotRead == nil else {
-                throw Self.snapshotTimedOut
-            }
-
-            let readID = UUID()
-            let outcome = ConnectionSnapshotReadOutcome()
-            let readTask = Task { @MainActor [weak self] in
-                guard let self else {
-                    outcome.resolve(.failure(Self.snapshotCancelled))
-                    return
-                }
-
-                do {
-                    for attempt in 0..<3 {
-                        try Task.checkCancellation()
-                        let before = EventBus.shared.snapshotMetadata()
-                        let state = try await snapshotRouter.readConnectionSnapshotState()
-                        try Task.checkCancellation()
-                        let after = EventBus.shared.snapshotMetadata()
-                        // Live-only stream events (terminal output, agent
-                        // deltas) cannot change the state read above, so only
-                        // a state revision change forces a retry. Return the
-                        // pre-read watermark: the client applies every event
-                        // after it, including in-window deltas, from the stream.
-                        if before.stateRevision == after.stateRevision {
-                            outcome.resolve(.success(EventBus.SnapshotBarrierResult(
-                                state: state,
-                                metadata: before
-                            )))
-                            self.finishConnectionSnapshotRead(id: readID)
-                            return
-                        }
-                        phaseMetrics?.recordFenceRetry()
-                        if attempt == 2 {
-                            phaseMetrics?.recordFenceExhausted()
-                            throw Self.snapshotSequenceFenceUnstable
-                        }
+            let read: ConnectionSnapshotSharedRead
+            if let active = activeConnectionSnapshotRead {
+                read = active
+                phaseMetrics?.recordJoined()
+            } else {
+                read = ConnectionSnapshotSharedRead()
+                activeConnectionSnapshotRead = read
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        read.outcome.resolve(.failure(Self.snapshotCancelled))
+                        return
                     }
-                    phaseMetrics?.recordFenceExhausted()
-                    throw Self.snapshotSequenceFenceUnstable
-                } catch {
-                    outcome.resolve(.failure(error))
-                    self.finishConnectionSnapshotRead(id: readID)
+                    await self.runConnectionSnapshotRead(
+                        read,
+                        router: snapshotRouter,
+                        phaseMetrics: phaseMetrics
+                    )
                 }
             }
-            activeConnectionSnapshotRead = (readID, readTask)
+            read.waiters += 1
+            defer { read.waiters -= 1 }
 
+            let outcome = ConnectionSnapshotReadOutcome()
+            read.outcome.observe { outcome.resolve($0) }
             let timeoutTask = Task {
                 do {
                     try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                    readTask.cancel()
                     outcome.resolve(.failure(Self.snapshotTimedOut))
                 } catch is CancellationError {
                     // Read/caller completed first; normal deadline teardown.
@@ -1091,7 +1094,6 @@ public final class JSONRPCDispatcher {
             let completion = await withTaskCancellationHandler {
                 await outcome.wait()
             } onCancel: {
-                readTask.cancel()
                 timeoutTask.cancel()
                 outcome.resolve(.failure(Self.snapshotCancelled))
             }
@@ -1130,8 +1132,46 @@ public final class JSONRPCDispatcher {
         }
     }
 
-    private func finishConnectionSnapshotRead(id: UUID) {
-        guard activeConnectionSnapshotRead?.id == id else { return }
+    /// The physical read behind `readConnectionSnapshot`: up to three fenced
+    /// attempts. The fence ignores live-only stream kinds and idempotent
+    /// last-writer-wins kinds (`EventBus.snapshotFenceIdempotentKinds`); the
+    /// pre-read watermark makes the client replay those on top of the state.
+    private func runConnectionSnapshotRead(
+        _ read: ConnectionSnapshotSharedRead,
+        router snapshotRouter: ConnectionSnapshotRouting,
+        phaseMetrics: HTTPRequestPhaseMetrics?
+    ) async {
+        do {
+            for attempt in 0..<3 {
+                guard read.waiters > 0 else { throw Self.snapshotCancelled }
+                let before = EventBus.shared.snapshotMetadata()
+                let state = try await snapshotRouter.readConnectionSnapshotState()
+                let after = EventBus.shared.snapshotMetadata()
+                if before.fenceRevision == after.fenceRevision {
+                    if before.stateRevision != after.stateRevision {
+                        phaseMetrics?.recordFenceTolerated()
+                    }
+                    read.outcome.resolve(.success(EventBus.SnapshotBarrierResult(
+                        state: state,
+                        metadata: before
+                    )))
+                    finishConnectionSnapshotRead(read)
+                    return
+                }
+                phaseMetrics?.recordFenceRetry()
+                if attempt == 2 {
+                    phaseMetrics?.recordFenceExhausted()
+                }
+            }
+            throw Self.snapshotSequenceFenceUnstable
+        } catch {
+            read.outcome.resolve(.failure(error))
+            finishConnectionSnapshotRead(read)
+        }
+    }
+
+    private func finishConnectionSnapshotRead(_ read: ConnectionSnapshotSharedRead) {
+        guard activeConnectionSnapshotRead === read else { return }
         activeConnectionSnapshotRead = nil
     }
 

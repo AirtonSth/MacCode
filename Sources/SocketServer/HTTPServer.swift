@@ -982,6 +982,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         "snapshot.incremental", "resume.v1",
         SnapshotChunkCapability.wireName,
         sequenceOmissionsCapability,
+        ConnectionSnapshotThreadWindow.capability,
     ]
 
     /// Every WS filter (including the default `.full`) may skip sequences:
@@ -3784,6 +3785,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "timed_out_total": metrics.timedOutTotal,
             "fence_retry_total": metrics.fenceRetryTotal,
             "fence_exhausted_total": metrics.fenceExhaustedTotal,
+            "fence_tolerated_total": metrics.fenceToleratedTotal,
+            "snapshot_joined_total": metrics.joinedTotal,
             "write_aborted_total": metrics.writeAbortedTotal,
         ]
     }
@@ -4210,6 +4213,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return rpcErrorObject(.internalError, id: wireID)
     }
 
+    /// Parses the opt-in `ConnectionSnapshotThreadWindow.parameter`.
+    /// `recentPerWorkspace` nil means the full thread list.
+    private static func snapshotThreadWindow(
+        _ rawParams: [String: Any]
+    ) -> (valid: Bool, recentPerWorkspace: Int?) {
+        guard rawParams.keys.contains(ConnectionSnapshotThreadWindow.parameter) else {
+            return (true, nil)
+        }
+        let value = ConnectionSnapshotThreadWindow.parse(
+            rawParams[ConnectionSnapshotThreadWindow.parameter]
+        )
+        return (value != nil, value)
+    }
+
     private func encodeSyncSnapshotResponse(
         rawParams: [String: Any],
         wireID: Any,
@@ -4223,12 +4240,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
         _ = ownerFingerprint
         let allowedKeys: Set<String> = [
             "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
-            "knownDomainRevisions",
+            "knownDomainRevisions", ConnectionSnapshotThreadWindow.parameter,
         ]
         guard Set(rawParams.keys).isSubset(of: allowedKeys),
               rawParams.keys.contains("supportedStateVersion"),
               let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
               supportedStateVersion == 3 else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+        let threadWindow = Self.snapshotThreadWindow(rawParams)
+        guard threadWindow.valid else {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
 
@@ -4257,7 +4278,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             } else {
                 includeDomains = nil
             }
-            let state = snapshot.state.jsonValue(
+            let readState = threadWindow.recentPerWorkspace.map {
+                snapshot.state.boundingAgentThreads(recentPerWorkspace: $0)
+            } ?? snapshot.state
+            let state = readState.jsonValue(
                 domainRevisions: hostRevisions,
                 includeDomains: includeDomains
             )
@@ -4372,12 +4396,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // ignored noise of any JSON type — never parsed for auth or storage.
         let allowedKeys: Set<String> = [
             "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
-            "knownDomainRevisions", "preferredChunkBytes",
+            "knownDomainRevisions", "preferredChunkBytes", ConnectionSnapshotThreadWindow.parameter,
         ]
         guard Set(rawParams.keys).isSubset(of: allowedKeys),
               rawParams.keys.contains("supportedStateVersion"),
               let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
               supportedStateVersion == 3 else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+        let threadWindow = Self.snapshotThreadWindow(rawParams)
+        guard threadWindow.valid else {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
 
@@ -4420,7 +4448,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             } else {
                 includeDomains = nil
             }
-            let state = snapshot.state.jsonValue(
+            let readState = threadWindow.recentPerWorkspace.map {
+                snapshot.state.boundingAgentThreads(recentPerWorkspace: $0)
+            } ?? snapshot.state
+            let state = readState.jsonValue(
                 domainRevisions: hostRevisions,
                 includeDomains: includeDomains
             )
@@ -4446,7 +4477,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 .snapshotEncode,
                 latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: encodeStarted)
             )
-            guard frameBytes.count <= ConnectionTransportFrame.maximumEncodedBytes else {
+            guard frameBytes.count <= SnapshotChunkSizePolicy.maximumTotalBytes else {
                 return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
             }
             let inserted = try snapshotChunkTransfers.insert(

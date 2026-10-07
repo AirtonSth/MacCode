@@ -135,6 +135,25 @@ public final class EventBus: @unchecked Sendable {
     /// Seq of the latest event that can change snapshot-read state. Live-only
     /// stream kinds do not advance it (see `liveOnlyStreamEventKinds`).
     private var snapshotStateRevision: Int64 = 0
+    /// Seq of the latest event the `sync.snapshot` fence must retry for:
+    /// `snapshotStateRevision` minus `snapshotFenceIdempotentKinds`.
+    private var snapshotFenceRevision: Int64 = 0
+
+    /// State-bearing kinds whose payload only sets absolute field values on an
+    /// entity that already exists (title, color, metadata keys, unread, busy).
+    /// Replaying one on top of a snapshot that already holds its value is a
+    /// no-op, and replaying it on top of the older value lands on the same
+    /// final state. The snapshot returns the pre-read watermark, so the client
+    /// replays every such event that crossed the read; the fence therefore
+    /// does not need to retry for them. Creates, closes, moves, reorders and
+    /// deletes stay out of this set and still force a retry.
+    public static let snapshotFenceIdempotentKinds: Set<String> = [
+        "surface.renamed",
+        "surface.updated",
+        "surface.health",
+        "workspace.updated",
+        "agent.thread.updated",
+    ]
 
     /// High-frequency stream kinds that never back snapshot state: they are
     /// not persisted (`AppDelegate.shouldPersistEvent`) and carry no thread,
@@ -238,6 +257,9 @@ public final class EventBus: @unchecked Sendable {
         public let domainRevisions: ConnectionDomainRevisions
         /// Changes only for events outside `liveOnlyStreamEventKinds`.
         public let stateRevision: Int64
+        /// Changes only for events outside `liveOnlyStreamEventKinds` and
+        /// `snapshotFenceIdempotentKinds`. The `sync.snapshot` fence compares this.
+        public let fenceRevision: Int64
     }
 
     public struct SnapshotBarrierResult<Value> {
@@ -531,6 +553,7 @@ public final class EventBus: @unchecked Sendable {
         lock.lock()
         self.lastSeq = max(self.lastSeq, lastSeq)
         snapshotStateRevision = max(snapshotStateRevision, self.lastSeq)
+        snapshotFenceRevision = max(snapshotFenceRevision, self.lastSeq)
         let liveKnown = Set(self.recent.map(\.seq))
         for ev in candidates where !liveKnown.contains(ev.seq) {
             let bytes = newSizes[ev.seq] ?? 0
@@ -763,13 +786,16 @@ public final class EventBus: @unchecked Sendable {
             sequence: lastSeq,
             oldestReplaySequence: replayFloor < lastSeq ? replayFloor + 1 : lastSeq,
             domainRevisions: domainRevisions,
-            stateRevision: snapshotStateRevision
+            stateRevision: snapshotStateRevision,
+            fenceRevision: snapshotFenceRevision
         )
     }
 
     private func advanceSnapshotStateRevisionLocked(after event: Event) {
         guard !Self.liveOnlyStreamEventKinds.contains(event.kind) else { return }
         snapshotStateRevision = max(snapshotStateRevision, event.seq)
+        guard !Self.snapshotFenceIdempotentKinds.contains(event.kind) else { return }
+        snapshotFenceRevision = max(snapshotFenceRevision, event.seq)
     }
 
     /// Returns the oldest cursor that can reach `lastSeq` using only a

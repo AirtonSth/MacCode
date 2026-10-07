@@ -210,13 +210,15 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
     }
 
     func test_dispatcherSnapshotRead_stateMutationDuringEveryAttemptStillFailsFenceRetryably() async throws {
-        // WHY (C17): the fence still guards real snapshot-domain mutations. A
-        // rename landing inside every read could be applied twice on replay,
-        // so the host must keep returning the retryable -32012 for it.
+        // WHY (C17): the fence still guards structural snapshot mutations. A
+        // close landing inside every read leaves no stable state to return, so
+        // the host must keep returning the retryable -32012 for it. (Absolute
+        // value kinds such as surface.renamed are tolerated since C7; see
+        // ConnectionSnapshotJoinFenceTests.)
         let router = await MainActor.run {
             let router = Phase3SnapshotFakeRouter()
             router.offMainDelayNanoseconds = 1_000_000
-            router.publishKindsDuringRead = ["surface.renamed"]
+            router.publishKindsDuringRead = ["surface.closed"]
             return router
         }
 
@@ -274,7 +276,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
         XCTAssertLessThan(
             HTTPRequestPhaseMetrics.elapsedMilliseconds(since: secondStarted),
             50,
-            "a stale physical read must not make later callers wait or spawn another read"
+            "a later caller joins the stale physical read and waits only for its own deadline"
         )
 
         try await Task.sleep(nanoseconds: 250_000_000)

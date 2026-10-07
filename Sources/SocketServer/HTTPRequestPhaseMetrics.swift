@@ -32,6 +32,11 @@ public struct HTTPRequestPhaseMetricsSnapshot: Sendable, Equatable {
     public let fenceRetryTotal: UInt64
     public let fenceExhaustedTotal: UInt64
     public let writeAbortedTotal: UInt64
+    /// `sync.snapshot` callers that joined a read already in flight.
+    public var joinedTotal: UInt64 = 0
+    /// Snapshot reads that succeeded although an idempotent state event
+    /// (`EventBus.snapshotFenceIdempotentKinds`) crossed the read.
+    public var fenceToleratedTotal: UInt64 = 0
 
     public static let zero = HTTPRequestPhaseMetricsSnapshot(
         admit: .zero,
@@ -88,6 +93,8 @@ public final class HTTPRequestPhaseMetrics: @unchecked Sendable {
         var fenceRetryTotal: UInt64 = 0
         var fenceExhaustedTotal: UInt64 = 0
         var writeAbortedTotal: UInt64 = 0
+        var joinedTotal: UInt64 = 0
+        var fenceToleratedTotal: UInt64 = 0
     }
 
     private let lock = NSLock()
@@ -131,6 +138,18 @@ public final class HTTPRequestPhaseMetrics: @unchecked Sendable {
         lock.unlock()
     }
 
+    public func recordJoined() {
+        lock.lock()
+        storage.joinedTotal += 1
+        lock.unlock()
+    }
+
+    public func recordFenceTolerated() {
+        lock.lock()
+        storage.fenceToleratedTotal += 1
+        lock.unlock()
+    }
+
     public func recordWriteAborted() {
         lock.lock()
         storage.writeAbortedTotal += 1
@@ -140,7 +159,7 @@ public final class HTTPRequestPhaseMetrics: @unchecked Sendable {
     public func snapshot() -> HTTPRequestPhaseMetricsSnapshot {
         lock.lock()
         defer { lock.unlock() }
-        return HTTPRequestPhaseMetricsSnapshot(
+        var snapshot = HTTPRequestPhaseMetricsSnapshot(
             auth: storage.auth.snapshot,
             admit: storage.admit.snapshot,
             snapshotRead: storage.snapshotRead.snapshot,
@@ -152,6 +171,9 @@ public final class HTTPRequestPhaseMetrics: @unchecked Sendable {
             fenceExhaustedTotal: storage.fenceExhaustedTotal,
             writeAbortedTotal: storage.writeAbortedTotal
         )
+        snapshot.joinedTotal = storage.joinedTotal
+        snapshot.fenceToleratedTotal = storage.fenceToleratedTotal
+        return snapshot
     }
 
     /// Continuous-clock helper shared by HTTPServer / Dispatcher paths.

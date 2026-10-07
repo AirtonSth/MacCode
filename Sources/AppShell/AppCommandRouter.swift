@@ -1291,8 +1291,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 filesStates: []
             )
         }
+        let signposter = PerfSwitchMetrics.signposter
+        let captureInterval = signposter.beginInterval(
+            "connection_snapshot_capture",
+            id: signposter.makeSignpostID()
+        )
         let workspaceIDs = ctx.state.window.workspaces
         let workspaces = workspaceIDs.compactMap { ctx.state.workspaces[$0] }
+        let selectedWorkspaceId = ctx.state.window.selectedWorkspaceID?.value.uuidString
         // Capture all MainActor-owned layout/surface inputs before suspending for
         // SQLite. Otherwise a local persistence/layout callback can run during
         // the await and mix two host-state versions in one snapshot.
@@ -1309,8 +1315,34 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     ?? ""
             }
         }
+        signposter.endInterval("connection_snapshot_capture", captureInterval)
         // SQLite list/decode must never run on MainActor (Dispatcher is @MainActor).
         let threads = try await ctx.agentThreadListGateway.list(workspaceId: nil)
+        // Grouping and the per-row JSON round trip are pure work on the
+        // captured values: run them detached so MainActor stays free.
+        return await Task.detached(priority: .userInitiated) {
+            let encodeInterval = signposter.beginInterval(
+                "connection_snapshot_encode",
+                id: signposter.makeSignpostID()
+            )
+            defer { signposter.endInterval("connection_snapshot_encode", encodeInterval) }
+            return Self.connectionSnapshotState(
+                selectedWorkspaceId: selectedWorkspaceId,
+                workspaces: workspaces,
+                descriptorsByWorkspace: descriptorsByWorkspace,
+                browserURLs: browserURLs,
+                threads: threads
+            )
+        }.value
+    }
+
+    nonisolated private static func connectionSnapshotState(
+        selectedWorkspaceId: String?,
+        workspaces: [Workspace],
+        descriptorsByWorkspace: [String: [SurfaceDescriptor]],
+        browserURLs: [String: String],
+        threads: [AgentThread]
+    ) -> ConnectionSnapshotReadState {
         var surfaceGroups: [ConnectionSnapshotWorkspaceItems] = []
         var threadGroups: [ConnectionSnapshotWorkspaceItems] = []
         var browserStates: [ConnectionSnapshotSurfaceState] = []
@@ -1347,7 +1379,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         state: .object(["url": .string(url)])
                     ))
                 case .files:
-                    let stored = decodeFilesState(descriptor.metadata["files_state"])
+                    let stored = Self.decodeFilesState(descriptor.metadata["files_state"])
                     let stableState = stored ?? [
                         "surface_id": .string(descriptor.id.value.uuidString),
                         "workspace_id": .string(workspace.id.value.uuidString),
@@ -1368,7 +1400,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
 
         return ConnectionSnapshotReadState(
-            selectedWorkspaceId: ctx.state.window.selectedWorkspaceID?.value.uuidString,
+            selectedWorkspaceId: selectedWorkspaceId,
             workspaces: workspaces.map(Self.connectionSnapshotWorkspace),
             surfaces: surfaceGroups,
             agentThreads: threadGroups,
@@ -8731,7 +8763,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func filesStateGet(surface: SurfaceID) throws -> JSONValue {
         let located = try locateSurface(surface)
         let root = try workspaceCwd(located.workspaceID)
-        let state = decodeFilesState(located.descriptor.metadata["files_state"])
+        let state = Self.decodeFilesState(located.descriptor.metadata["files_state"])
             ?? defaultFilesState(surface: surface, workspace: located.workspaceID, root: root, descriptor: located.descriptor)
         return .object(state)
     }
@@ -8739,7 +8771,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func filesStateUpdate(surface: SurfaceID, patch: [String: JSONValue], baseRevision: Int?, deviceID: String?) throws -> JSONValue {
         let located = try locateSurface(surface)
         let root = try workspaceCwd(located.workspaceID)
-        var state = decodeFilesState(located.descriptor.metadata["files_state"])
+        var state = Self.decodeFilesState(located.descriptor.metadata["files_state"])
             ?? defaultFilesState(surface: surface, workspace: located.workspaceID, root: root, descriptor: located.descriptor)
         let currentRevision = state["revision"]?.intValue ?? 0
         if let baseRevision, baseRevision != currentRevision {
@@ -9632,7 +9664,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ]
     }
 
-    private func decodeFilesState(_ raw: String?) -> [String: JSONValue]? {
+    nonisolated private static func decodeFilesState(_ raw: String?) -> [String: JSONValue]? {
         guard let raw, let data = raw.data(using: .utf8),
               case .object(let state) = JSONValue.decode(from: data) else {
             return nil

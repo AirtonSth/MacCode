@@ -67,14 +67,52 @@ public struct ConnectionDomainRevisions: Codable, Equatable, Sendable {
 public struct ConnectionSnapshotWorkspaceItems: Equatable, Sendable {
     public let workspaceId: String
     public let items: [JSONValue]
+    /// Set only on a bounded agent-thread group (`ConnectionSnapshotThreadWindow`):
+    /// how many threads the workspace has in total. Emitted with `truncated`.
+    public let totalCount: Int?
 
-    public init(workspaceId: String, items: [JSONValue]) {
+    public init(workspaceId: String, items: [JSONValue], totalCount: Int? = nil) {
         self.workspaceId = workspaceId
         self.items = items
+        self.totalCount = totalCount
     }
 
     var jsonValue: JSONValue {
-        .object(["workspaceId": .string(workspaceId), "items": .array(items)])
+        var object: [String: JSONValue] = [
+            "workspaceId": .string(workspaceId),
+            "items": .array(items),
+        ]
+        if let totalCount {
+            object["totalCount"] = .number(Double(totalCount))
+            object["truncated"] = .bool(items.count < totalCount)
+        }
+        return .object(object)
+    }
+}
+
+/// Opt-in bounded agent-thread list for `sync.snapshot` and
+/// `sync.snapshot.begin`. A client that sees `capability` on welcome may send
+/// `parameter` (an integer >= 1). Each workspace then carries its pending and
+/// running threads, its pinned threads, the threads its surfaces select, and
+/// the `parameter` most recently updated others. Every thread group gains
+/// `totalCount` and `truncated`; a truncated workspace's full list comes from
+/// `agent.thread.list` with its `workspace_id`. Without the parameter the
+/// snapshot keeps every thread (old clients).
+public enum ConnectionSnapshotThreadWindow {
+    public static let capability = "snapshot.agent_threads.window.v1"
+    public static let parameter = "agentThreadsRecentPerWorkspace"
+    /// Larger requests are clamped to this.
+    public static let maximumRecentPerWorkspace = 500
+    static let activeStatuses: Set<String> = ["pending", "running"]
+
+    /// Strict parse: a non-boolean integer >= 1, clamped to the maximum.
+    static func parse(_ any: Any?) -> Int? {
+        guard let number = any as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !CFNumberIsFloatType(number) else { return nil }
+        let value = Int64(truncating: number)
+        guard value >= 1 else { return nil }
+        return Int(min(value, Int64(maximumRecentPerWorkspace)))
     }
 }
 
@@ -124,6 +162,55 @@ public struct ConnectionSnapshotReadState: Equatable, Sendable {
 
     func jsonValue(domainRevisions: ConnectionDomainRevisions) -> JSONValue {
         jsonValue(domainRevisions: domainRevisions, includeDomains: nil)
+    }
+
+    /// Applies `ConnectionSnapshotThreadWindow` to every agent-thread group.
+    /// Kept rows stay in their original order; surfaces are untouched, so a
+    /// surface's `selected_thread` always names a row that is present.
+    func boundingAgentThreads(recentPerWorkspace: Int) -> ConnectionSnapshotReadState {
+        var selectedByWorkspace: [String: Set<String>] = [:]
+        for group in surfaces {
+            for item in group.items {
+                guard let selected = item.objectValue?["metadata"]?.objectValue?["selected_thread"]?.stringValue,
+                      !selected.isEmpty else { continue }
+                selectedByWorkspace[group.workspaceId, default: []].insert(selected)
+            }
+        }
+        let bounded = agentThreads.map { group -> ConnectionSnapshotWorkspaceItems in
+            let selected = selectedByWorkspace[group.workspaceId] ?? []
+            var keep = Set<Int>()
+            var others: [(index: Int, updatedAt: Double)] = []
+            for (index, item) in group.items.enumerated() {
+                let row = item.objectValue ?? [:]
+                let status = row["status"]?.stringValue ?? ""
+                let id = row["id"]?.stringValue ?? ""
+                if ConnectionSnapshotThreadWindow.activeStatuses.contains(status)
+                    || row["pinned"]?.boolValue == true
+                    || selected.contains(id) {
+                    keep.insert(index)
+                } else {
+                    let updatedAt: Double
+                    if case .number(let value)? = row["updatedAt"] { updatedAt = value } else { updatedAt = -.infinity }
+                    others.append((index, updatedAt))
+                }
+            }
+            others.sort { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.index < $1.index }
+            keep.formUnion(others.prefix(max(0, recentPerWorkspace)).map(\.index))
+            let items = group.items.indices.filter(keep.contains).map { group.items[$0] }
+            return ConnectionSnapshotWorkspaceItems(
+                workspaceId: group.workspaceId,
+                items: items,
+                totalCount: group.items.count
+            )
+        }
+        return ConnectionSnapshotReadState(
+            selectedWorkspaceId: selectedWorkspaceId,
+            workspaces: workspaces,
+            surfaces: surfaces,
+            agentThreads: bounded,
+            browserStates: browserStates,
+            filesStates: filesStates
+        )
     }
 
     /// Wave 4: when `includeDomains` is non-nil, only those domains are emitted
@@ -880,11 +967,21 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         var groupedWorkspaceIDs = Set<String>()
         for group in groups {
             guard case .object(let object) = group,
-                  Set(object.keys) == ["workspaceId", "items"],
                   let workspaceID = object["workspaceId"]?.stringValue,
                   workspaceIDs.contains(workspaceID),
                   groupedWorkspaceIDs.insert(workspaceID).inserted,
                   case .array(let items)? = object["items"] else {
+                return false
+            }
+            // A bounded thread window (`ConnectionSnapshotThreadWindow`) adds
+            // exactly `totalCount` and `truncated`, consistent with `items`.
+            if Set(object.keys) == ["workspaceId", "items", "totalCount", "truncated"] {
+                guard let totalCount = object["totalCount"]?.intValue,
+                      totalCount >= items.count,
+                      object["truncated"]?.boolValue == (items.count < totalCount) else {
+                    return false
+                }
+            } else if Set(object.keys) != ["workspaceId", "items"] {
                 return false
             }
             for item in items {
