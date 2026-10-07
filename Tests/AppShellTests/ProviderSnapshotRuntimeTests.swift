@@ -6628,7 +6628,6 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
     private var starts = 0
     private var runIDs: [AgentRunID] = []
     private var callbacks: [Int: @Sendable (AgentRunEvent) -> Void] = [:]
-    private var startWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var finishWasMainThread = true
     private let finishOnCancel: Bool
 
@@ -6657,9 +6656,6 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
             starts += 1
             runIDs.append(request.runId)
             callbacks[starts] = onEvent
-            let ready = startWaiters.filter { $0.0 <= starts }
-            startWaiters.removeAll { $0.0 <= starts }
-            ready.forEach { $0.1.resume() }
             return starts
         }
         onEvent(.status(.running))
@@ -6669,15 +6665,20 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
         }
     }
 
-    func waitForStartCount(_ count: Int) async {
-        if lock.withLock({ starts >= count }) { return }
-        await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock { () -> Bool in
-                guard starts < count else { return true }
-                startWaiters.append((count, continuation))
-                return false
+    /// Bounded so a start that never happens fails the test instead of hanging the suite.
+    func waitForStartCount(
+        _ count: Int,
+        timeout: TimeInterval = 10,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while lock.withLock({ starts < count }) {
+            guard Date() < deadline else {
+                XCTFail("runner reached \(startCount) starts, expected \(count)", file: file, line: line)
+                return
             }
-            if resumeNow { continuation.resume() }
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 
@@ -6894,7 +6895,6 @@ private final class QueueEventSignal: @unchecked Sendable {
     private let threadId: String
     private let kind: String
     private var count = 0
-    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     init(threadId: AgentThreadID, kind: String) {
         self.threadId = threadId.value.uuidString
@@ -6904,24 +6904,24 @@ private final class QueueEventSignal: @unchecked Sendable {
     func record(_ event: EventBus.Event) {
         guard event.kind == kind,
               event.payload.objectValue?["thread_id"]?.stringValue == threadId else { return }
-        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
-            count += 1
-            let ready = waiters.filter { $0.0 <= count }.map(\.1)
-            waiters.removeAll { $0.0 <= count }
-            return ready
-        }
-        ready.forEach { $0.resume() }
+        lock.withLock { count += 1 }
     }
 
-    func waitForCount(_ expected: Int) async {
-        if lock.withLock({ count >= expected }) { return }
-        await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock { () -> Bool in
-                guard count < expected else { return true }
-                waiters.append((expected, continuation))
-                return false
+    /// Bounded so a missing event fails the test instead of hanging the suite.
+    func waitForCount(
+        _ expected: Int,
+        timeout: TimeInterval = 10,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while lock.withLock({ count < expected }) {
+            guard Date() < deadline else {
+                let seen = lock.withLock { count }
+                XCTFail("saw \(seen) \(kind) events, expected \(expected)", file: file, line: line)
+                return
             }
-            if resumeNow { continuation.resume() }
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 }
@@ -6955,7 +6955,6 @@ private actor QueueDrainTestSleeper {
     private var elapsedByThread: [AgentThreadID: Duration] = [:]
     private var intervalsByThread: [AgentThreadID: [Duration]] = [:]
     private var pendingByThread: [AgentThreadID: PendingSleep] = [:]
-    private var requestWaiters: [AgentThreadID: [(Int, CheckedContinuation<Void, Never>)]] = [:]
     private var cancelledSleepIDs = Set<UUID>()
 
     func sleep(threadId: AgentThreadID, duration: Duration) async throws -> Duration {
@@ -6972,7 +6971,6 @@ private actor QueueDrainTestSleeper {
                     duration: duration,
                     continuation: continuation
                 )
-                resumeSatisfiedRequestWaiters(threadId: threadId)
             }
         } onCancel: {
             Task { await self.cancel(threadId: threadId, sleepID: id) }
@@ -6992,10 +6990,25 @@ private actor QueueDrainTestSleeper {
         pending.continuation.resume(returning: elapsed)
     }
 
-    func waitForRequestCount(_ count: Int, threadId: AgentThreadID) async {
-        guard intervalsByThread[threadId, default: []].count < count else { return }
-        await withCheckedContinuation {
-            requestWaiters[threadId, default: []].append((count, $0))
+    /// Bounded so a sleep that is never requested fails the test instead of hanging the suite.
+    func waitForRequestCount(
+        _ count: Int,
+        threadId: AgentThreadID,
+        timeout: TimeInterval = 10,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while intervalsByThread[threadId, default: []].count < count {
+            guard Date() < deadline else {
+                XCTFail(
+                    "saw \(intervalsByThread[threadId, default: []].count) drain sleeps, expected \(count)",
+                    file: file,
+                    line: line
+                )
+                return
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 
@@ -7010,22 +7023,6 @@ private actor QueueDrainTestSleeper {
         }
         pendingByThread.removeValue(forKey: threadId)
         pending.continuation.resume(throwing: CancellationError())
-    }
-
-    private func resumeSatisfiedRequestWaiters(threadId: AgentThreadID) {
-        let count = intervalsByThread[threadId, default: []].count
-        let waiters = requestWaiters.removeValue(forKey: threadId) ?? []
-        var remaining: [(Int, CheckedContinuation<Void, Never>)] = []
-        for waiter in waiters {
-            if waiter.0 <= count {
-                waiter.1.resume()
-            } else {
-                remaining.append(waiter)
-            }
-        }
-        if !remaining.isEmpty {
-            requestWaiters[threadId] = remaining
-        }
     }
 }
 

@@ -95,6 +95,50 @@ final class AgentRuntimeUXGapTests: XCTestCase {
         }
     }
 
+    /// The coordinator retires a resident session with `stopSession` when the
+    /// next turn's process scope changes (a fresh delegation capability every
+    /// turn). After a finished turn the one-shot adapter holds the session but
+    /// no handle; stopping it must retire the session like the streaming
+    /// adapters do, not throw sessionNotFound and fail the next send.
+    func test_oneShotProviderAdapter_stopSessionRetiresFinishedResidentSession() async throws {
+        let adapter = OneShotProviderAdapter(runner: FakeProviderRunner())
+        let threadId = AgentThreadID()
+        let finished = expectation(description: "turn finished")
+        _ = try await adapter.sendTurn(
+            AgentRunRequest(threadId: threadId, provider: .codex, model: "fake-model", cwd: "/tmp", prompt: "hi")
+        ) { event in
+            if case .finished = event { finished.fulfill() }
+        }
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertTrue(adapter.hasSession(threadId: threadId), "a finished one-shot turn stays resident")
+
+        XCTAssertNoThrow(try adapter.stopSession(threadId: threadId))
+        XCTAssertFalse(adapter.hasSession(threadId: threadId))
+        XCTAssertThrowsError(try adapter.stopSession(threadId: threadId),
+                             "an unknown session is still reported as not found")
+    }
+
+    /// A one-shot session that is still starting (no handle yet) must keep
+    /// throwing so the coordinator arms its pending stop and cancels the run
+    /// when the handle registers; treating it as idle would drop the Stop.
+    func test_oneShotProviderAdapter_stopSessionStillThrowsWhileTheTurnIsStarting() async throws {
+        let runner = GatedStartRunner()
+        let adapter = OneShotProviderAdapter(runner: runner)
+        let threadId = AgentThreadID()
+        let send = Task {
+            try await adapter.sendTurn(
+                AgentRunRequest(threadId: threadId, provider: .codex, model: "fake-model", cwd: "/tmp", prompt: "hi")
+            ) { _ in }
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while !runner.isWaiting, Date() < deadline { try await Task.sleep(nanoseconds: 5_000_000) }
+        XCTAssertTrue(adapter.hasSession(threadId: threadId))
+        XCTAssertThrowsError(try adapter.stopSession(threadId: threadId))
+        XCTAssertTrue(adapter.hasSession(threadId: threadId), "the starting session must stay until its handle registers")
+        runner.release()
+        _ = try await send.value
+    }
+
     // MARK: - L91: Rollback target not found uses human copy
 
     /// The rollback "target not found" error copy must not expose the Swift
@@ -154,5 +198,40 @@ final class AgentRuntimeUXGapTests: XCTestCase {
                       "Must mention the UI action label so users know what to tap. got: \(desc)")
         XCTAssertTrue(desc.contains("checkpoint"),
                       "Must explain checkpoint so users know context can be restored. got: \(desc)")
+    }
+}
+
+private final class GatedStartRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+    private let lock = NSLock()
+    private var gate: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    var isWaiting: Bool { lock.withLock { gate != nil } }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                if released { return true }
+                gate = continuation
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+
+    func release() {
+        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            released = true
+            defer { gate = nil }
+            return gate
+        }
+        pending?.resume()
     }
 }

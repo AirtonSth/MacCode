@@ -516,6 +516,18 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
     }
 
     public func stopSession(threadId: AgentThreadID) throws {
+        // A resident session whose turn already finished has no handle; stopping
+        // it retires the session, like the streaming adapters do. A running
+        // session without a handle is still starting and keeps throwing, so the
+        // coordinator's pending stop cancels it once the handle registers.
+        lock.lock()
+        let finishedResident = handles[threadId] == nil
+            && sessions[threadId].map { $0.status != .running && $0.status != .pending } == true
+        if finishedResident {
+            sessions.removeValue(forKey: threadId)
+        }
+        lock.unlock()
+        if finishedResident { return }
         try interruptTurn(threadId: threadId)
         lock.lock()
         sessions.removeValue(forKey: threadId)
