@@ -72,7 +72,7 @@ final class AgentAppMiddlewareWorkflowTests: XCTestCase {
 
     func test_execute_routesHeadlessTurnThroughAgentAppAndReturnsFinalAssistantMessage() throws {
         // WHY: a delegated provider must traverse the same Agent App RPC path as
-        // a visible turn so Token Saver, Graphify, persistence, and usage events
+        // a visible turn so persistence and usage events
         // are owned by the host instead of a parallel raw-CLI implementation.
         let workspaceID = UUID()
         let threadID = UUID()
@@ -170,7 +170,7 @@ final class AgentAppMiddlewareWorkflowTests: XCTestCase {
 
     func test_execute_resolvesSelectedWorkspaceWhenNestedScopeDoesNotProvideOne() throws {
         // WHY: `remote-code agent-app ...` must also work from a normal terminal,
-        // not only from a provider process carrying Token Saver receipt metadata.
+        // not only from a provider process carrying receipt metadata.
         let workspaceID = UUID()
         let threadID = UUID()
 

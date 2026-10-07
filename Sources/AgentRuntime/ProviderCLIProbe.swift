@@ -14,7 +14,7 @@ struct PipeAccumulator: Sendable {
         case suffix
     }
 
-    /// Peak retained stdout/stderr per probe. Matches Token Saver /usage PTY
+    /// Peak retained stdout/stderr per probe. Matches account usage /usage PTY
     /// and Claude SDK npm install tails in order of magnitude; far above any
     /// legitimate `--version` / auth JSON payload. Was unbounded, then 256 KiB.
     static let defaultMaxBytes = 128 * 1_024

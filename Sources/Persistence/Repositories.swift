@@ -417,7 +417,7 @@ public final class AgentThreadRepository {
         public let model: String
     }
 
-    /// Cheap identity/scope probe for Token Saver same-user, persistent scope,
+    /// Cheap identity/scope probe for same-user, persistent scope,
     /// and env stamps. Avoids the full `get` (26 columns + routing JSON) when
     /// only workspace/project/model/instance/run-as-user are needed.
     public struct IdentityChrome: Equatable, Sendable {
@@ -1389,7 +1389,7 @@ public final class AgentThreadRepository {
         return st.columnText(0) ?? ""
     }
 
-    /// Cheap identity/scope probe for Token Saver env and same-user. Returns
+    /// Cheap identity/scope probe for provider env and same-user. Returns
     /// nil when the durable row is gone.
     public func identity(of id: AgentThreadID) throws -> IdentityChrome? {
         identityProbeCountForTesting += 1
@@ -2680,31 +2680,6 @@ public struct AgentMessageBodyChunk: Sendable, Equatable {
     }
 }
 
-public struct AgentMessageRCW1Response: Sendable, Equatable {
-    public let messageId: AgentMessageID
-    public let runId: AgentRunID
-    public let turnId: String
-    /// Exact provider bytes, including an optional transport envelope.
-    public let wireResponseText: String
-
-    public init(
-        messageId: AgentMessageID,
-        runId: AgentRunID,
-        turnId: String,
-        wireResponseText: String
-    ) {
-        self.messageId = messageId
-        self.runId = runId
-        self.turnId = turnId
-        self.wireResponseText = wireResponseText
-    }
-}
-
-public enum AgentMessageTokenSaverDisplayMode: String, Sendable, Equatable {
-    case human
-    case rcw1
-}
-
 public final class AgentMessageRepository: @unchecked Sendable {
     let db: SQLiteDB
     private let encoder = JSONEncoder()
@@ -2753,266 +2728,6 @@ public final class AgentMessageRepository: @unchecked Sendable {
         try st.bind(8, bodyBytes)
         _ = try st.step()
         try pruneMessagesKeepingLatest(threadId: m.threadId, limit: Self.maxMessagesPerThread)
-    }
-
-    /// Persist the provider-bound RCW1 bytes next to their retained human user
-    /// message. Stream events are intentionally evictable and cannot own this
-    /// transcript disclosure across long-thread pruning or app relaunch.
-    public func upsertRCW1RequestTranslation(
-        messageId: AgentMessageID,
-        wireRequestText: String
-    ) throws {
-        let frames = try RCWireProtocol.parse(wireRequestText)
-        guard !frames.isEmpty, frames.allSatisfy({ $0.direction == .request }) else {
-            throw SQLiteError.execute("Refusing to persist a non-request RCW1 message translation.")
-        }
-        let owner = try db.prepare("SELECT role FROM agent_messages WHERE id = ? LIMIT 1;")
-        try owner.bind(1, messageId.value.uuidString)
-        guard try owner.step(), owner.columnText(0) == AgentMessageRole.user.rawValue else {
-            throw SQLiteError.execute("RCW1 request owner must be an existing user message.")
-        }
-        let statement = try db.prepare("""
-            INSERT INTO agent_message_rcw1_requests(
-                message_id, wire_request_text, protocol_version, created_at
-            ) VALUES(?, ?, ?, ?)
-            ON CONFLICT(message_id) DO UPDATE SET
-                wire_request_text = excluded.wire_request_text,
-                protocol_version = excluded.protocol_version,
-                created_at = excluded.created_at;
-            """)
-        try statement.bind(1, messageId.value.uuidString)
-        try statement.bind(2, wireRequestText)
-        try statement.bind(3, RCWireProtocol.version)
-        try statement.bind(4, iso.string(from: Date()))
-        _ = try statement.step()
-    }
-
-    public func rcw1RequestTranslations(
-        threadId: AgentThreadID,
-        messageIds: [AgentMessageID]
-    ) throws -> [AgentMessageID: String] {
-        let uniqueMessageIds = Array(Set(messageIds))
-        guard !uniqueMessageIds.isEmpty else { return [:] }
-        let placeholders = Array(repeating: "?", count: uniqueMessageIds.count).joined(separator: ", ")
-        let statement = try db.prepare("""
-            SELECT r.message_id, r.wire_request_text
-            FROM agent_message_rcw1_requests r
-            JOIN agent_messages m ON m.id = r.message_id
-            WHERE m.thread_id = ? AND r.protocol_version = ?
-              AND r.message_id IN (\(placeholders))
-            ORDER BY m.created_at ASC, m.rowid ASC;
-            """)
-        try statement.bind(1, threadId.value.uuidString)
-        try statement.bind(2, RCWireProtocol.version)
-        for (offset, messageId) in uniqueMessageIds.enumerated() {
-            try statement.bind(Int32(offset + 3), messageId.value.uuidString)
-        }
-        var requests: [AgentMessageID: String] = [:]
-        while try statement.step() {
-            guard let rawId = statement.columnText(0),
-                  let uuid = UUID(uuidString: rawId),
-                  let wire = statement.columnText(1),
-                  let frames = try? RCWireProtocol.parse(wire),
-                  !frames.isEmpty,
-                  frames.allSatisfy({ $0.direction == .request }) else {
-                continue
-            }
-            requests[AgentMessageID(uuid)] = wire
-        }
-        return requests
-    }
-
-    /// Persist the exact provider RCW1 response next to its canonical readable
-    /// assistant message. The run/turn identities are required so timeline rows
-    /// never fall back to ambiguous content matching.
-    public func upsertRCW1ResponseTranslation(
-        messageId: AgentMessageID,
-        runId: AgentRunID,
-        turnId: String,
-        wireResponseText: String
-    ) throws {
-        let payload = RCWireProtocol.transportEnvelope(in: wireResponseText)?.payload
-            ?? wireResponseText
-        let frames = try RCWireProtocol.parse(payload)
-        guard !frames.isEmpty, frames.allSatisfy({ $0.direction == .response }) else {
-            throw SQLiteError.execute("Refusing to persist a non-response RCW1 message translation.")
-        }
-        let owner = try db.prepare("SELECT role FROM agent_messages WHERE id = ? LIMIT 1;")
-        try owner.bind(1, messageId.value.uuidString)
-        guard try owner.step(), owner.columnText(0) == AgentMessageRole.assistant.rawValue else {
-            throw SQLiteError.execute("RCW1 response owner must be an existing assistant message.")
-        }
-        let normalizedTurnId = turnId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalizedTurnId.isEmpty else {
-            throw SQLiteError.execute("RCW1 response turn identity must not be empty.")
-        }
-        let existing = try db.prepare("""
-            SELECT run_id, turn_id, wire_response_text
-            FROM agent_message_rcw1_responses
-            WHERE message_id = ?
-            LIMIT 1;
-            """)
-        try existing.bind(1, messageId.value.uuidString)
-        if try existing.step() {
-            let existingTurnId = existing.columnText(1)
-            let turnIdentityMatches = existingTurnId == normalizedTurnId
-            guard existing.columnText(0) == runId.value.uuidString,
-                  existing.columnText(2) == wireResponseText,
-                  turnIdentityMatches else {
-                throw SQLiteError.execute(
-                    "Conflicting RCW1 response identity \(messageId.value.uuidString)."
-                )
-            }
-        }
-        let statement = try db.prepare("""
-            INSERT INTO agent_message_rcw1_responses(
-                message_id, run_id, turn_id, wire_response_text,
-                protocol_version, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?)
-            ON CONFLICT(message_id) DO UPDATE SET
-                turn_id = COALESCE(agent_message_rcw1_responses.turn_id, excluded.turn_id),
-                protocol_version = excluded.protocol_version,
-                created_at = excluded.created_at;
-            """)
-        try statement.bind(1, messageId.value.uuidString)
-        try statement.bind(2, runId.value.uuidString)
-        try statement.bind(3, normalizedTurnId)
-        try statement.bind(4, wireResponseText)
-        try statement.bind(5, RCWireProtocol.version)
-        try statement.bind(6, iso.string(from: Date()))
-        _ = try statement.step()
-    }
-
-    /// Bounded projection for the message page currently held by the surface.
-    /// Invalid/legacy protocol rows fail closed and never gain a toggle.
-    public func rcw1ResponseTranslations(
-        threadId: AgentThreadID,
-        messageIds: [AgentMessageID]
-    ) throws -> [AgentMessageID: AgentMessageRCW1Response] {
-        let uniqueMessageIds = Array(Set(messageIds))
-        guard !uniqueMessageIds.isEmpty else { return [:] }
-        let placeholders = Array(repeating: "?", count: uniqueMessageIds.count).joined(separator: ", ")
-        let statement = try db.prepare("""
-            SELECT r.message_id, r.run_id, r.turn_id, r.wire_response_text
-            FROM agent_message_rcw1_responses r
-            JOIN agent_messages m ON m.id = r.message_id
-            WHERE m.thread_id = ? AND m.role = ? AND r.protocol_version = ?
-              AND r.message_id IN (\(placeholders))
-            ORDER BY m.created_at ASC, m.rowid ASC;
-            """)
-        try statement.bind(1, threadId.value.uuidString)
-        try statement.bind(2, AgentMessageRole.assistant.rawValue)
-        try statement.bind(3, RCWireProtocol.version)
-        for (offset, messageId) in uniqueMessageIds.enumerated() {
-            try statement.bind(Int32(offset + 4), messageId.value.uuidString)
-        }
-        var responses: [AgentMessageID: AgentMessageRCW1Response] = [:]
-        while try statement.step() {
-            guard let rawMessageId = statement.columnText(0),
-                  let messageUUID = UUID(uuidString: rawMessageId),
-                  let rawRunId = statement.columnText(1),
-                  let runUUID = UUID(uuidString: rawRunId),
-                  let turnId = statement.columnText(2),
-                  !turnId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  let wire = statement.columnText(3) else {
-                continue
-            }
-            let payload = RCWireProtocol.transportEnvelope(in: wire)?.payload ?? wire
-            guard let frames = try? RCWireProtocol.parse(payload),
-                  !frames.isEmpty,
-                  frames.allSatisfy({ $0.direction == .response }) else {
-                continue
-            }
-            let messageId = AgentMessageID(messageUUID)
-            responses[messageId] = AgentMessageRCW1Response(
-                messageId: messageId,
-                runId: AgentRunID(runUUID),
-                turnId: turnId,
-                wireResponseText: wire
-            )
-        }
-        return responses
-    }
-
-    /// Persist one canonical message row's explicit display choice. Human is
-    /// the default and therefore deletes the preference row; RCW1 is accepted
-    /// only for a message that still owns durable request/response wire bytes.
-    public func setTokenSaverDisplayMode(
-        messageId: AgentMessageID,
-        mode: AgentMessageTokenSaverDisplayMode
-    ) throws {
-        if mode == .human {
-            let statement = try db.prepare("""
-                DELETE FROM agent_message_token_saver_display_preferences
-                WHERE message_id = ?;
-                """)
-            try statement.bind(1, messageId.value.uuidString)
-            _ = try statement.step()
-            return
-        }
-
-        let owner = try db.prepare("""
-            SELECT EXISTS(
-                SELECT 1
-                FROM agent_messages m
-                LEFT JOIN agent_message_rcw1_requests q
-                    ON q.message_id = m.id AND q.protocol_version = 'RCW1'
-                LEFT JOIN agent_message_rcw1_responses a
-                    ON a.message_id = m.id AND a.protocol_version = 'RCW1'
-                WHERE m.id = ?
-                  AND (q.message_id IS NOT NULL OR a.message_id IS NOT NULL)
-            );
-            """)
-        try owner.bind(1, messageId.value.uuidString)
-        guard try owner.step(), owner.columnInt64(0) == 1 else {
-            throw SQLiteError.execute("Token Saver display preference requires a live RCW1 message owner.")
-        }
-
-        let statement = try db.prepare("""
-            INSERT INTO agent_message_token_saver_display_preferences(
-                message_id, display_mode, updated_at
-            ) VALUES(?, ?, ?)
-            ON CONFLICT(message_id) DO UPDATE SET
-                display_mode = excluded.display_mode,
-                updated_at = excluded.updated_at;
-            """)
-        try statement.bind(1, messageId.value.uuidString)
-        try statement.bind(2, mode.rawValue)
-        try statement.bind(3, iso.string(from: Date()))
-        _ = try statement.step()
-    }
-
-    /// Bounded page projection. Rows absent from the result are Human.
-    public func tokenSaverDisplayModes(
-        threadId: AgentThreadID,
-        messageIds: [AgentMessageID]
-    ) throws -> [AgentMessageID: AgentMessageTokenSaverDisplayMode] {
-        let uniqueMessageIds = Array(Set(messageIds))
-        guard !uniqueMessageIds.isEmpty else { return [:] }
-        let placeholders = Array(repeating: "?", count: uniqueMessageIds.count).joined(separator: ", ")
-        let statement = try db.prepare("""
-            SELECT p.message_id, p.display_mode
-            FROM agent_message_token_saver_display_preferences p
-            JOIN agent_messages m ON m.id = p.message_id
-            WHERE m.thread_id = ?
-              AND p.message_id IN (\(placeholders))
-            ORDER BY m.created_at ASC, m.rowid ASC;
-            """)
-        try statement.bind(1, threadId.value.uuidString)
-        for (offset, messageId) in uniqueMessageIds.enumerated() {
-            try statement.bind(Int32(offset + 2), messageId.value.uuidString)
-        }
-        var modes: [AgentMessageID: AgentMessageTokenSaverDisplayMode] = [:]
-        while try statement.step() {
-            guard let rawId = statement.columnText(0),
-                  let uuid = UUID(uuidString: rawId),
-                  let rawMode = statement.columnText(1),
-                  let mode = AgentMessageTokenSaverDisplayMode(rawValue: rawMode) else {
-                continue
-            }
-            modes[AgentMessageID(uuid)] = mode
-        }
-        return modes
     }
 
     /// Deletes oldest durable messages so only the newest `limit` remain.
@@ -4852,7 +4567,17 @@ public final class AgentRunRepository: @unchecked Sendable {
     private let committedProviderEventLock = NSLock()
     private var knownProviderEventIdsByThread: [String: Set<String>] = [:]
     private static let committedProviderEventCacheLimit = 128
-    public init(db: SQLiteDB) { self.db = db }
+    /// WAL reader for paired-device stream reads (`agent.thread.read` v1), so
+    /// they do not wait on the writer's operation gate. Defaults to `db`.
+    private let readDB: SQLiteDB
+    public init(db: SQLiteDB) {
+        self.db = db
+        self.readDB = db
+    }
+    public init(db: SQLiteDB, readDB: SQLiteDB) {
+        self.db = db
+        self.readDB = readDB
+    }
 #if DEBUG
     /// Exact pre-screening path retained only for same-process A/B receipts.
     var useLegacyDurableHostMetadataDecodingForBenchmark = false
@@ -5130,7 +4855,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         return AgentRunStatus(rawValue: st.columnText(0) ?? "") ?? .pending
     }
 
-    /// Cheap provider probe for Token Saver usage ticks. Avoids the full
+    /// Cheap provider probe for usage ticks. Avoids the full
     /// 10-column `get` (including `error_message`) when only `provider` seeds
     /// the in-memory usage accumulator. Returns nil when the durable row is gone.
     public func provider(of id: AgentRunID) throws -> AgentProvider? {
@@ -5141,9 +4866,9 @@ public final class AgentRunRepository: @unchecked Sendable {
         return AgentProvider(rawValue: st.columnText(0) ?? "") ?? .codex
     }
 
-    /// Cheap model probe for Token Saver attempt begin. Avoids the full
-    /// 10-column `get` (including `error_message`) when only `model` stamps
-    /// the measurement ledger. Returns nil when the durable row is gone.
+    /// Cheap model probe. Avoids the full 10-column `get` (including
+    /// `error_message`) when only `model` is needed. Returns nil when the
+    /// durable row is gone.
     public func model(of id: AgentRunID) throws -> String? {
         modelProbeCountForTesting += 1
         let st = try db.prepare("SELECT model FROM agent_runs WHERE id = ? LIMIT 1;")
@@ -5689,8 +5414,7 @@ public final class AgentRunRepository: @unchecked Sendable {
         run: AgentRun,
         thread: AgentThread?,
         providerSession: ProviderSessionRuntime?,
-        streamEvent: StreamWriteIntent? = nil,
-        rcw1Response: AgentMessageRCW1Response? = nil
+        streamEvent: StreamWriteIntent? = nil
     ) throws -> TerminalCommitResult {
         try db.performSync { database in
             try database.transaction {
@@ -5725,36 +5449,6 @@ public final class AgentRunRepository: @unchecked Sendable {
                         assistantMessageId = assistantMessage.id
                         insertedAssistantMessage = true
                     }
-                }
-
-                if let rcw1Response {
-                    guard rcw1Response.runId == run.id else {
-                        throw SQLiteError.execute(
-                            "RCW1 response run identity does not match terminal run."
-                        )
-                    }
-                    if let assistantMessageId, assistantMessageId != rcw1Response.messageId {
-                        throw SQLiteError.execute(
-                            "RCW1 response message identity does not match terminal assistant."
-                        )
-                    }
-                    let linkedOwner = try database.prepare(
-                        "SELECT thread_id FROM agent_messages WHERE id = ? AND role = ? LIMIT 1;"
-                    )
-                    try linkedOwner.bind(1, rcw1Response.messageId.value.uuidString)
-                    try linkedOwner.bind(2, AgentMessageRole.assistant.rawValue)
-                    guard try linkedOwner.step(),
-                          linkedOwner.columnText(0) == run.threadId.value.uuidString else {
-                        throw SQLiteError.execute(
-                            "RCW1 response message does not belong to terminal run thread."
-                        )
-                    }
-                    try AgentMessageRepository(db: database).upsertRCW1ResponseTranslation(
-                        messageId: rcw1Response.messageId,
-                        runId: rcw1Response.runId,
-                        turnId: rcw1Response.turnId,
-                        wireResponseText: rcw1Response.wireResponseText
-                    )
                 }
 
                 guard try stampTerminal(
@@ -6975,10 +6669,18 @@ public final class AgentRunRepository: @unchecked Sendable {
         threadId: AgentThreadID,
         limit: Int
     ) throws -> [StreamEventRowMeta] {
+        try latestStreamEventMetadata(threadId: threadId, limit: limit, on: db)
+    }
+
+    private func latestStreamEventMetadata(
+        threadId: AgentThreadID,
+        limit: Int,
+        on connection: SQLiteDB
+    ) throws -> [StreamEventRowMeta] {
         let safeLimit = max(0, limit)
         guard safeLimit > 0 else { return [] }
         // Project LENGTH(blob) + last ~240 characters only. Never SELECT full payload_json.
-        let st = try db.prepare("""
+        let st = try connection.prepare("""
             SELECT id, seq, presentation_bytes, trailer_suffix
             FROM (
                 SELECT id, seq, started_at, ordering_id,
@@ -7018,8 +6720,21 @@ public final class AgentRunRepository: @unchecked Sendable {
         remainingByteBudget: Int64? = nil
     ) throws -> [AssistantEvent] {
         guard !ids.isEmpty else { return [] }
+        return try decodeStreamEventPayloads(
+            try streamEventPayloads(ids, strictDecoding: strictDecoding, on: db),
+            strictDecoding: strictDecoding,
+            remainingByteBudget: remainingByteBudget
+        )
+    }
+
+    private func streamEventPayloads(
+        _ ids: [Int64],
+        strictDecoding: Bool,
+        on connection: SQLiteDB
+    ) throws -> [(eventId: Int64, data: Data)] {
+        guard !ids.isEmpty else { return [] }
         let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
-        let st = try db.prepare("""
+        let st = try connection.prepare("""
             SELECT id, payload_json
             FROM agent_replay_stream_events
             WHERE id IN (\(placeholders))
@@ -7040,11 +6755,7 @@ public final class AgentRunRepository: @unchecked Sendable {
             }
             payloads.append((eventId, data))
         }
-        return try decodeStreamEventPayloads(
-            payloads,
-            strictDecoding: strictDecoding,
-            remainingByteBudget: remainingByteBudget
-        )
+        return payloads
     }
 
     private func decodeStreamEventPayloads(
@@ -7112,10 +6823,16 @@ public final class AgentRunRepository: @unchecked Sendable {
         let safeEventLimit = max(1, eventLimit)
         let safeMaxBytes = max(1, maxPayloadBytes)
         // +1 probe for honest has_more without materializing full history.
-        let meta = try listLatestStreamEventMetadata(
-            threadId: threadId,
-            limit: safeEventLimit + 1
-        )
+        // Row reads use the WAL reader and release it before decode: rehydrating
+        // an oversized row touches the writer, and the reader is never held
+        // while waiting for it.
+        let meta = try readDB.performSync { reader in
+            try latestStreamEventMetadata(
+                threadId: threadId,
+                limit: safeEventLimit + 1,
+                on: reader
+            )
+        }
         guard !meta.isEmpty else {
             return BoundedStreamEventSelection(
                 events: [],
@@ -7158,8 +6875,11 @@ public final class AgentRunRepository: @unchecked Sendable {
         let droppedFromInspected = selected.count < meta.count
         let hasMoreOlder = droppedFromInspected
 
-        let events = try listStreamEventsByIds(
-            selectedIds,
+        let payloads = try readDB.performSync { reader in
+            try streamEventPayloads(selectedIds, strictDecoding: strictDecoding, on: reader)
+        }
+        let events = try decodeStreamEventPayloads(
+            payloads,
             strictDecoding: strictDecoding,
             remainingByteBudget: safeMaxBytes
         )

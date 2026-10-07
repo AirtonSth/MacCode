@@ -188,8 +188,78 @@ final class MirrorEventSnapshotTests: XCTestCase {
         )
     }
 
+    /// The mirror lock is per thread (C5): a snapshot of a thread still orders
+    /// that thread's terminal flush behind its watermark capture.
     func testTerminalFlushCannotCrossAnAtomicSnapshotLock() async throws {
         let appSupport = NSTemporaryDirectory() + "rc2-mirror-snapshot-lock-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: appSupport) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let activeThread = AgentThread(title: "active", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(activeThread)
+        let runner = ControlledMirrorRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: activeThread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: appSupport,
+            prompt: "test terminal flush locking"
+        ))
+        runner.emit(.event(.turnStarted(turnId: "turn-pending")))
+        XCTAssertEqual(try runRepo.countStreamEvents(threadId: activeThread.id), 0,
+                       "one event must remain buffered so the snapshot barrier owns the flush")
+
+        let snapshotEntered = DispatchSemaphore(value: 0)
+        let releaseSnapshot = DispatchSemaphore(value: 0)
+        let snapshotTask = Task.detached {
+            try coordinator.withMirrorEventSnapshot(threadId: activeThread.id) { events in
+                snapshotEntered.signal()
+                releaseSnapshot.wait()
+                return events
+            }
+        }
+        XCTAssertEqual(snapshotEntered.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(try runRepo.countStreamEvents(threadId: activeThread.id), 1,
+                       "the snapshot barrier persists the buffered event before capturing")
+
+        let finishStarted = DispatchSemaphore(value: 0)
+        let finishReturned = DispatchSemaphore(value: 0)
+        let finishTask = Task.detached {
+            finishStarted.signal()
+            runner.emit(.finished(.completed, finalMessage: nil, providerThreadId: "provider-thread"))
+            finishReturned.signal()
+        }
+        XCTAssertEqual(finishStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(
+            finishReturned.wait(timeout: .now() + 0.2),
+            .timedOut,
+            "a terminal flush must wait behind its thread's mirror lock while a snapshot captures its watermark"
+        )
+        XCTAssertNil(try runRepo.get(id: runId)?.finishedAt,
+                     "the terminal path must remain blocked until its durability barrier completes")
+
+        releaseSnapshot.signal()
+        let snapshot = try await snapshotTask.value
+        await finishTask.value
+
+        XCTAssertEqual(snapshot, [.turnStarted(turnId: "turn-pending")])
+        XCTAssertEqual(try runRepo.countStreamEvents(threadId: activeThread.id), 1)
+        XCTAssertNotNil(try runRepo.get(id: runId)?.finishedAt)
+    }
+
+    /// WHY (C5): with one process-wide lock, a paired device reading thread B
+    /// held every other thread's stream durability and terminal path. A
+    /// snapshot of another thread must not block this thread's terminal flush.
+    func testTerminalFlushIsNotBlockedByAnotherThreadsSnapshotLock() async throws {
+        let appSupport = NSTemporaryDirectory() + "rc2-mirror-snapshot-other-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -211,11 +281,9 @@ final class MirrorEventSnapshotTests: XCTestCase {
             provider: .codex,
             model: "fake-model",
             cwd: appSupport,
-            prompt: "test terminal flush locking"
+            prompt: "test terminal flush per-thread locking"
         ))
         runner.emit(.event(.turnStarted(turnId: "turn-pending")))
-        XCTAssertEqual(try runRepo.countStreamEvents(threadId: activeThread.id), 0,
-                       "one event must remain buffered so the terminal path owns the flush")
 
         let snapshotEntered = DispatchSemaphore(value: 0)
         let releaseSnapshot = DispatchSemaphore(value: 0)
@@ -228,30 +296,19 @@ final class MirrorEventSnapshotTests: XCTestCase {
         }
         XCTAssertEqual(snapshotEntered.wait(timeout: .now() + 1), .success)
 
-        let finishStarted = DispatchSemaphore(value: 0)
         let finishReturned = DispatchSemaphore(value: 0)
         let finishTask = Task.detached {
-            finishStarted.signal()
             runner.emit(.finished(.completed, finalMessage: nil, providerThreadId: "provider-thread"))
             finishReturned.signal()
         }
-        XCTAssertEqual(finishStarted.wait(timeout: .now() + 1), .success)
-        XCTAssertEqual(
-            finishReturned.wait(timeout: .now() + 0.2),
-            .timedOut,
-            "a terminal flush must wait behind the same mirror lock held while any atomic snapshot captures its watermark"
-        )
-        XCTAssertEqual(try runRepo.countStreamEvents(threadId: activeThread.id), 0,
-                       "the buffered event must not persist across the held snapshot lock")
-        XCTAssertNil(try runRepo.get(id: runId)?.finishedAt,
-                     "the terminal path must remain blocked until its durability barrier completes")
+        XCTAssertEqual(finishReturned.wait(timeout: .now() + 2), .success,
+                       "another thread's snapshot must not hold this thread's terminal path")
+        XCTAssertEqual(try runRepo.countStreamEvents(threadId: activeThread.id), 1)
+        XCTAssertNotNil(try runRepo.get(id: runId)?.finishedAt)
 
         releaseSnapshot.signal()
         _ = try await snapshotTask.value
         await finishTask.value
-
-        XCTAssertEqual(try runRepo.countStreamEvents(threadId: activeThread.id), 1)
-        XCTAssertNotNil(try runRepo.get(id: runId)?.finishedAt)
     }
 
     func testSnapshotIsPoisonedAndInvalidEventIsNotPublishedWhenEncodingFails() async throws {

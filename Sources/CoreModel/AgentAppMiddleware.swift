@@ -198,8 +198,8 @@ public protocol AgentAppMiddlewareSendFailure: Error {
 /// Synchronous, transport-neutral workflow used by the CLI middleware.
 ///
 /// All mutations deliberately use the existing Agent App RPCs. The host
-/// therefore remains the sole owner of prompt compression, provider launch,
-/// Token Saver/Graphify admission, usage accounting, persistence, and events.
+/// therefore remains the sole owner of provider launch, usage accounting,
+/// persistence, and events.
 public enum AgentAppMiddlewareWorkflow {
     public typealias Call = (_ method: String, _ params: [String: AgentAppRPCValue]) throws -> AgentAppRPCValue
 

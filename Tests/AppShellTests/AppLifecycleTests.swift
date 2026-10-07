@@ -184,9 +184,9 @@ final class AppLifecycleRecorderTests: XCTestCase {
         XCTAssertTrue(log.contains("providerRSSKB=235000"),
                       "disk heartbeat must retain provider RSS so Agent App memory can be separated from provider memory pressure")
         XCTAssertTrue(log.contains("sidecarProcesses=3"),
-                      "disk heartbeat must retain Token Saver sidecar process count separately from provider processes")
+                      "disk heartbeat must retain legacy Distill sidecar process count separately from provider processes")
         XCTAssertTrue(log.contains("sidecarRSSKB=4750000"),
-                      "disk heartbeat must retain Token Saver sidecar RSS because the sidecar can dominate memory pressure while Agent App RSS stays flat")
+                      "disk heartbeat must retain legacy Distill sidecar RSS because the sidecar can dominate memory pressure while Agent App RSS stays flat")
     }
 
     func test_recordWritesForensicLineToDisk() throws {

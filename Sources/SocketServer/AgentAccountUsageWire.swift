@@ -11,15 +11,15 @@ public enum AgentAccountUsageWire {
 
     /// Reads the usage file; call off the main actor.
     public static func load(appSupportDirectory: URL, now: Date = Date()) -> JSONValue {
-        let store = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory, now: { now })
+        let store = ProviderUsageStore(appSupportDirectory: appSupportDirectory, now: { now })
         let storedAt = (try? FileManager.default.attributesOfItem(atPath: store.storeURL.path))?[.modificationDate] as? Date
         return payload(snapshot: store.load(), storedAt: storedAt, now: now)
     }
 
-    static func payload(snapshot: TokenSaverUsageSnapshot, storedAt: Date?, now: Date) -> JSONValue {
+    static func payload(snapshot: ProviderUsageSnapshot, storedAt: Date?, now: Date) -> JSONValue {
         let rows: [JSONValue] = providers.map { provider in
             let usage = snapshot.providers.first { $0.provider == provider }
-                ?? TokenSaverProviderUsage(provider: provider)
+                ?? ProviderTokenUsage(provider: provider)
             return .object([
                 "provider": .string(provider.rawValue),
                 "weekly_used_percent": number(usage.effectiveWeeklyUsedPercent(now: now)),

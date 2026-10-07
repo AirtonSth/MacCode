@@ -1022,7 +1022,9 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(request.environment["REMOTE_CODE_INSTANCE"], "personal")
     }
 
-    func test_tokenSaverEnabledAddsClaudeSDKPostToolUseHookEnvironment() async throws {
+    func test_claudeRunCarriesNoTokenSaverHookEnvironment_evenWithLegacyPreferenceOn() async throws {
+        // WHY: Token Saver was removed. A preference an older build left ON must
+        // not bring back the Claude PostToolUse compression hook.
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
@@ -1031,7 +1033,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
         let support = root.appendingPathComponent("support", isDirectory: true)
         let ctx = try AppContext(channel: .debug, appSupportOverride: support.path)
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        try seedLegacyTokenSaverOn(ctx.settingsRepo)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
 
@@ -1057,12 +1059,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
 
         let request = try XCTUnwrap(capture.lastRequest)
-        XCTAssertEqual(request.environment["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
-        XCTAssertEqual(
-            request.environment["REMOTE_CODE_DISTILL_STATE_PATH"],
-            support.appendingPathComponent("Distill", isDirectory: true).appendingPathComponent("DistillCLIState.json").path,
-            "Claude SDK PostToolUse hook must read the same bearer-protected sidecar state as the managed distill CLI"
-        )
+        XCTAssertNil(request.environment["RC_TOKEN_SAVER_POST_TOOL_USE"])
+        XCTAssertNil(request.environment["REMOTE_CODE_DISTILL_STATE_PATH"])
     }
 
     func test_stopAgentRunCancelsCoordinatorThreadRun() async throws {
@@ -3957,7 +3955,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support").path
         )
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
@@ -4000,7 +3997,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
         ctx.prepareForApplicationTermination()
 
-        let usage = TokenSaverUsageStore(appSupportDirectory: ctx.appSupportDirectory).load()
+        let usage = ProviderUsageStore(appSupportDirectory: ctx.appSupportDirectory).load()
         XCTAssertEqual(
             usage.providers.first { $0.provider == .claude }?.actualProviderTokens,
             321,

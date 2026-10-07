@@ -67,14 +67,52 @@ public struct ConnectionDomainRevisions: Codable, Equatable, Sendable {
 public struct ConnectionSnapshotWorkspaceItems: Equatable, Sendable {
     public let workspaceId: String
     public let items: [JSONValue]
+    /// Set only on a bounded agent-thread group (`ConnectionSnapshotThreadWindow`):
+    /// how many threads the workspace has in total. Emitted with `truncated`.
+    public let totalCount: Int?
 
-    public init(workspaceId: String, items: [JSONValue]) {
+    public init(workspaceId: String, items: [JSONValue], totalCount: Int? = nil) {
         self.workspaceId = workspaceId
         self.items = items
+        self.totalCount = totalCount
     }
 
     var jsonValue: JSONValue {
-        .object(["workspaceId": .string(workspaceId), "items": .array(items)])
+        var object: [String: JSONValue] = [
+            "workspaceId": .string(workspaceId),
+            "items": .array(items),
+        ]
+        if let totalCount {
+            object["totalCount"] = .number(Double(totalCount))
+            object["truncated"] = .bool(items.count < totalCount)
+        }
+        return .object(object)
+    }
+}
+
+/// Opt-in bounded agent-thread list for `sync.snapshot` and
+/// `sync.snapshot.begin`. A client that sees `capability` on welcome may send
+/// `parameter` (an integer >= 1). Each workspace then carries its pending and
+/// running threads, its pinned threads, the threads its surfaces select, and
+/// the `parameter` most recently updated others. Every thread group gains
+/// `totalCount` and `truncated`; a truncated workspace's full list comes from
+/// `agent.thread.list` with its `workspace_id`. Without the parameter the
+/// snapshot keeps every thread (old clients).
+public enum ConnectionSnapshotThreadWindow {
+    public static let capability = "snapshot.agent_threads.window.v1"
+    public static let parameter = "agentThreadsRecentPerWorkspace"
+    /// Larger requests are clamped to this.
+    public static let maximumRecentPerWorkspace = 500
+    static let activeStatuses: Set<String> = ["pending", "running"]
+
+    /// Strict parse: a non-boolean integer >= 1, clamped to the maximum.
+    static func parse(_ any: Any?) -> Int? {
+        guard let number = any as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !CFNumberIsFloatType(number) else { return nil }
+        let value = Int64(truncating: number)
+        guard value >= 1 else { return nil }
+        return Int(min(value, Int64(maximumRecentPerWorkspace)))
     }
 }
 
@@ -124,6 +162,55 @@ public struct ConnectionSnapshotReadState: Equatable, Sendable {
 
     func jsonValue(domainRevisions: ConnectionDomainRevisions) -> JSONValue {
         jsonValue(domainRevisions: domainRevisions, includeDomains: nil)
+    }
+
+    /// Applies `ConnectionSnapshotThreadWindow` to every agent-thread group.
+    /// Kept rows stay in their original order; surfaces are untouched, so a
+    /// surface's `selected_thread` always names a row that is present.
+    func boundingAgentThreads(recentPerWorkspace: Int) -> ConnectionSnapshotReadState {
+        var selectedByWorkspace: [String: Set<String>] = [:]
+        for group in surfaces {
+            for item in group.items {
+                guard let selected = item.objectValue?["metadata"]?.objectValue?["selected_thread"]?.stringValue,
+                      !selected.isEmpty else { continue }
+                selectedByWorkspace[group.workspaceId, default: []].insert(selected)
+            }
+        }
+        let bounded = agentThreads.map { group -> ConnectionSnapshotWorkspaceItems in
+            let selected = selectedByWorkspace[group.workspaceId] ?? []
+            var keep = Set<Int>()
+            var others: [(index: Int, updatedAt: Double)] = []
+            for (index, item) in group.items.enumerated() {
+                let row = item.objectValue ?? [:]
+                let status = row["status"]?.stringValue ?? ""
+                let id = row["id"]?.stringValue ?? ""
+                if ConnectionSnapshotThreadWindow.activeStatuses.contains(status)
+                    || row["pinned"]?.boolValue == true
+                    || selected.contains(id) {
+                    keep.insert(index)
+                } else {
+                    let updatedAt: Double
+                    if case .number(let value)? = row["updatedAt"] { updatedAt = value } else { updatedAt = -.infinity }
+                    others.append((index, updatedAt))
+                }
+            }
+            others.sort { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.index < $1.index }
+            keep.formUnion(others.prefix(max(0, recentPerWorkspace)).map(\.index))
+            let items = group.items.indices.filter(keep.contains).map { group.items[$0] }
+            return ConnectionSnapshotWorkspaceItems(
+                workspaceId: group.workspaceId,
+                items: items,
+                totalCount: group.items.count
+            )
+        }
+        return ConnectionSnapshotReadState(
+            selectedWorkspaceId: selectedWorkspaceId,
+            workspaces: workspaces,
+            surfaces: surfaces,
+            agentThreads: bounded,
+            browserStates: browserStates,
+            filesStates: filesStates
+        )
     }
 
     /// Wave 4: when `includeDomains` is non-nil, only those domains are emitted
@@ -217,6 +304,41 @@ struct ConnectionWelcomeFrame: Codable, Equatable, Sendable {
     let currentSequence: Int64
     let oldestReplaySequence: Int64
     let capabilities: [String]
+    /// C-W: present only when the client opted in with
+    /// `X-RC2-Welcome-Fields: identity.v1` (see `ConnectionWelcomeIdentity`).
+    /// Both are omitted, never null, on the default shape so clients that
+    /// decode welcome with an exact key set keep working.
+    var apiVersion: String? = nil
+    var capabilitiesDigest: String? = nil
+    /// C8: present only on durable-replay sockets (see `DurableReplayContract`).
+    var replayFromSequence: Int64? = nil
+}
+
+/// C-W: opt-in welcome fields that let a pinned client validate a reconnect
+/// from the welcome alone. `hostId` and `bootEpoch` are on every welcome;
+/// with the extension the welcome also carries `apiVersion` and
+/// `capabilitiesDigest`, which equals `capabilities_digest` on
+/// `GET /v1/capabilities/authenticated` while that response's `treaty` and
+/// `capabilities` are unchanged. The digest is opaque: compare it, never parse it.
+/// Old clients never send the header, so they keep the exact pre-C-W welcome.
+enum ConnectionWelcomeIdentity {
+    static let header = "x-rc2-welcome-fields"
+    static let extensionName = "identity.v1"
+    static let keys: Set<String> = ["apiVersion", "capabilitiesDigest"]
+
+    /// True when the comma-separated header lists `identity.v1`.
+    static func isRequested(header value: String?) -> Bool {
+        guard let value else { return false }
+        return value.split(separator: ",").contains {
+            $0.trimmingCharacters(in: .whitespaces).lowercased() == extensionName
+        }
+    }
+
+    static func isValidDigest(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            (0x30...0x39).contains($0) || (0x61...0x66).contains($0)
+        }
+    }
 }
 
 struct ConnectionHeartbeatFrame: Codable, Equatable, Sendable {
@@ -420,6 +542,9 @@ enum ConnectionTransportFrame: Equatable, Sendable {
     case event(ConnectionEventFrame)
     case baselineRequired(ConnectionBaselineRequiredFrame)
     case snapshot(ConnectionSnapshotFrame)
+    /// C8: durable-replay sockets only.
+    case streamGap(ConnectionStreamGapFrame)
+    case replayComplete(ConnectionReplayCompleteFrame)
 
     func encoded() throws -> Data {
         Self.codecLock.lock()
@@ -433,6 +558,8 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         case .event(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         case .baselineRequired(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         case .snapshot(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .streamGap(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .replayComplete(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         }
         guard data.count <= Self.maximumEncodedBytes else {
             throw ConnectionProtocolFailure.frameTooLarge
@@ -462,7 +589,7 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             throw ConnectionProtocolFailure.invalidFrame
         }
 
-        let allowedKeys: Set<String>
+        var allowedKeys: Set<String>
         switch type {
         case "welcome":
             allowedKeys = [
@@ -471,6 +598,12 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 "snapshotTimeoutMs",
                 "currentSequence", "oldestReplaySequence", "capabilities",
             ]
+            if !ConnectionWelcomeIdentity.keys.isDisjoint(with: object.keys) {
+                allowedKeys = allowedKeys.union(ConnectionWelcomeIdentity.keys)
+            }
+            if object[DurableReplayContract.welcomeKey] != nil {
+                allowedKeys.insert(DurableReplayContract.welcomeKey)
+            }
         case "heartbeat":
             allowedKeys = [
                 "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
@@ -500,6 +633,18 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             allowedKeys = [
                 "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
                 "sequence", "snapshotId", "generatedAtEpochMs", "stateVersion", "state",
+            ]
+        case "streamGap":
+            allowedKeys = [
+                "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
+                "sinceSequence", "throughSequence",
+            ]
+            if object["threadId"] != nil { allowedKeys.insert("threadId") }
+            if object["surfaceId"] != nil { allowedKeys.insert("surfaceId") }
+        case "replayComplete":
+            allowedKeys = [
+                "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
+                "throughSequence",
             ]
         default:
             throw ConnectionProtocolFailure.unknownType
@@ -546,6 +691,14 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 let frame = try sharedDecoder.decode(ConnectionSnapshotFrame.self, from: data)
                 try validate(frame)
                 return .snapshot(frame)
+            case "streamGap":
+                let frame = try sharedDecoder.decode(ConnectionStreamGapFrame.self, from: data)
+                try validate(frame)
+                return .streamGap(frame)
+            case "replayComplete":
+                let frame = try sharedDecoder.decode(ConnectionReplayCompleteFrame.self, from: data)
+                try validate(frame)
+                return .replayComplete(frame)
             default: throw ConnectionProtocolFailure.unknownType
             }
         } catch let failure as ConnectionProtocolFailure {
@@ -579,7 +732,8 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 "bootEpoch", "serverTimeEpochMs", "heartbeatIntervalMs",
                 "heartbeatTimeoutMs", "snapshotTimeoutMs",
                 "currentSequence", "oldestReplaySequence",
-            ]
+            ] + (object[DurableReplayContract.welcomeKey] != nil
+                ? [DurableReplayContract.welcomeKey] : [])
         case "heartbeat":
             requiredKeys = ["bootEpoch", "sentAtEpochMs", "lastReceivedSequence"]
         case "closing":
@@ -592,6 +746,10 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             requiredKeys = ["bootEpoch", "requestedAfterSequence", "currentSequence"]
         case "snapshot":
             requiredKeys = ["bootEpoch", "sequence", "generatedAtEpochMs", "stateVersion"]
+        case "streamGap":
+            requiredKeys = ["bootEpoch", "sinceSequence", "throughSequence"]
+        case "replayComplete":
+            requiredKeys = ["bootEpoch", "throughSequence"]
         default:
             return false
         }
@@ -640,6 +798,20 @@ enum ConnectionTransportFrame: Equatable, Sendable {
               frame.oldestReplaySequence <= frame.currentSequence,
               !frame.capabilities.isEmpty,
               Set(frame.capabilities).count == frame.capabilities.count else {
+            throw ConnectionProtocolFailure.invalidFrame
+        }
+        if let replayFrom = frame.replayFromSequence,
+           !(0...frame.currentSequence).contains(replayFrom) {
+            throw ConnectionProtocolFailure.invalidFrame
+        }
+        // C-W: the identity extension is all-or-nothing.
+        switch (frame.apiVersion, frame.capabilitiesDigest) {
+        case (nil, nil):
+            break
+        case let (apiVersion?, digest?)
+            where isNonEmpty(apiVersion) && ConnectionWelcomeIdentity.isValidDigest(digest):
+            break
+        default:
             throw ConnectionProtocolFailure.invalidFrame
         }
     }
@@ -730,6 +902,36 @@ enum ConnectionTransportFrame: Equatable, Sendable {
               frame.snapshotMethod == "sync.snapshot" else {
             throw ConnectionProtocolFailure.invalidFrame
         }
+    }
+
+    private static func validate(_ frame: ConnectionStreamGapFrame) throws {
+        try validateCommon(
+            protocolVersion: frame.protocolVersion,
+            type: frame.type,
+            expectedType: "streamGap",
+            connectionId: frame.connectionId,
+            hostId: frame.hostId,
+            bootEpoch: frame.bootEpoch
+        )
+        let streamIDs = [frame.threadId, frame.surfaceId].compactMap { $0 }
+        guard streamIDs.count == 1,
+              streamIDs.allSatisfy(isNonEmpty),
+              frame.sinceSequence >= 0,
+              frame.throughSequence > frame.sinceSequence else {
+            throw ConnectionProtocolFailure.invalidFrame
+        }
+    }
+
+    private static func validate(_ frame: ConnectionReplayCompleteFrame) throws {
+        try validateCommon(
+            protocolVersion: frame.protocolVersion,
+            type: frame.type,
+            expectedType: "replayComplete",
+            connectionId: frame.connectionId,
+            hostId: frame.hostId,
+            bootEpoch: frame.bootEpoch
+        )
+        guard frame.throughSequence >= 0 else { throw ConnectionProtocolFailure.invalidFrame }
     }
 
     private static func validate(_ frame: ConnectionSnapshotFrame) throws {
@@ -880,11 +1082,21 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         var groupedWorkspaceIDs = Set<String>()
         for group in groups {
             guard case .object(let object) = group,
-                  Set(object.keys) == ["workspaceId", "items"],
                   let workspaceID = object["workspaceId"]?.stringValue,
                   workspaceIDs.contains(workspaceID),
                   groupedWorkspaceIDs.insert(workspaceID).inserted,
                   case .array(let items)? = object["items"] else {
+                return false
+            }
+            // A bounded thread window (`ConnectionSnapshotThreadWindow`) adds
+            // exactly `totalCount` and `truncated`, consistent with `items`.
+            if Set(object.keys) == ["workspaceId", "items", "totalCount", "truncated"] {
+                guard let totalCount = object["totalCount"]?.intValue,
+                      totalCount >= items.count,
+                      object["truncated"]?.boolValue == (items.count < totalCount) else {
+                    return false
+                }
+            } else if Set(object.keys) != ["workspaceId", "items"] {
                 return false
             }
             for item in items {

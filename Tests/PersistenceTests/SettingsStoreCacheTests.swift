@@ -107,11 +107,11 @@ final class SettingsStoreCacheTests: XCTestCase {
         let repo = CountingSettingsRepository()
         let store = SettingsStore(repo: repo)
 
-        store.save(AppSettings(diffWordWrap: true, tokenSaverEnabled: true))
+        store.save(AppSettings(diffWordWrap: true, terminalFontSize: 14))
         let result = store.load()
 
         XCTAssertTrue(result.diffWordWrap, "cached load must return the value that was written")
-        XCTAssertTrue(result.tokenSaverEnabled, "cached load must return all fields from the last write")
+        XCTAssertEqual(result.terminalFontSize, 14, "cached load must return all fields from the last write")
     }
 
     func test_reloadObservesWriteFromAnotherStoreInstance() {
@@ -191,7 +191,7 @@ final class SettingsStoreCacheTests: XCTestCase {
         let store = SettingsStore(repo: repo)
 
         _ = store.load()                                // decode #1
-        store.update { $0.tokenSaverEnabled = true }    // read-modify-write; must invalidate
+        store.update { $0.terminalFontSize = 14 }       // read-modify-write; must invalidate
         _ = store.load()                                // decode #2
 
         XCTAssertEqual(
@@ -209,7 +209,7 @@ final class SettingsStoreCacheTests: XCTestCase {
         // revision so a write from any instance invalidates them.
         let before = SettingsStore.revision
         let repo = CountingSettingsRepository()
-        SettingsStore(repo: repo).save(AppSettings(tokenSaverEnabled: true))
+        SettingsStore(repo: repo).save(AppSettings(terminalFontSize: 14))
         XCTAssertEqual(
             SettingsStore.revision,
             before + 1,
@@ -246,7 +246,7 @@ final class SettingsStoreCacheTests: XCTestCase {
                 } else if i % 3 == 1 {
                     store.save(AppSettings(diffWordWrap: i % 2 == 0))
                 } else {
-                    store.update { $0.tokenSaverEnabled = i % 2 == 0 }
+                    store.update { $0.diffIgnoreWhitespace = i % 2 == 0 }
                 }
                 group.leave()
             }

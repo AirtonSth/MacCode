@@ -2784,14 +2784,10 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         let wrapped = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(userPrompt: "fix the bug")
         XCTAssertTrue(wrapped.hasPrefix("$remote-code-orchestrate"))
         XCTAssertTrue(wrapped.contains("fix the bug"))
-        XCTAssertTrue(wrapped.contains("skill content must stay complete")
-                      || wrapped.contains("never Distill skill"),
+        XCTAssertTrue(wrapped.contains("skill content must stay complete"),
                       "Auto wrap must protect complete skill content")
-        XCTAssertTrue(wrapped.contains("Distill applies only to eligible ordinary")
-                      || wrapped.contains("do not require every worker prompt to restate Distill"),
-                      "Auto wrap must not force Distill restatement in every worker")
-        XCTAssertFalse(wrapped.contains("EVERY worker/reviewer prompt must require explicit `| distill`"),
-                       "removed: requiring Distill restatement in every worker prompt")
+        XCTAssertFalse(wrapped.contains("Distill"),
+                       "Token Saver was removed: the Auto wrap must not carry Distill tool-output policy")
         XCTAssertTrue(AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(wrapped))
 
         let already = "$remote-code-orchestrate\n\ndo the thing"

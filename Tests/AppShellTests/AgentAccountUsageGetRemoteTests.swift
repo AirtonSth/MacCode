@@ -22,7 +22,7 @@ final class AgentAccountUsageGetRemoteTests: XCTestCase {
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let resetsAt = Date().addingTimeInterval(86_400)
-        _ = try TokenSaverUsageStore(appSupportDirectory: ctx.appSupportDirectory).recordAccountUsage(
+        _ = try ProviderUsageStore(appSupportDirectory: ctx.appSupportDirectory).recordAccountUsage(
             provider: .grok, weeklyUsedPercent: 31, weeklyResetsAt: resetsAt
         )
 
@@ -41,11 +41,11 @@ final class AgentAccountUsageGetRemoteTests: XCTestCase {
 
     // MARK: - Clears reach a paired client
 
-    private actor StubRefresher: TokenSaverAccountUsageRefreshing {
+    private actor StubRefresher: ProviderAccountUsageRefreshing {
         let full: [AssistantAccountUsage]
         init(full: [AssistantAccountUsage]) { self.full = full }
-        func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] { full }
-        func grokAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? { nil }
+        func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] { full }
+        func grokAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? { nil }
     }
 
     /// A paired client exactly as the contract tells iOS to behave: start from
@@ -87,7 +87,7 @@ final class AgentAccountUsageGetRemoteTests: XCTestCase {
         let ctx = try AppContext(
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path,
-            tokenSaverAccountUsageRefresher: refresher
+            accountUsageRefresher: refresher
         )
         ctx.router = AppCommandRouter(context: ctx)
         PrivateAccountSessionStore(repo: ctx.settingsRepo).save(PrivateAccountSession(
@@ -132,7 +132,7 @@ final class AgentAccountUsageGetRemoteTests: XCTestCase {
             refresher: StubRefresher(full: [AssistantAccountUsage(provider: .codex, weeklyUsedPercent: 23)]),
             root: root
         )
-        let store = TokenSaverUsageStore(appSupportDirectory: ctx.appSupportDirectory)
+        let store = ProviderUsageStore(appSupportDirectory: ctx.appSupportDirectory)
         _ = try store.recordAccountUsage(provider: .claude, weeklyUsedPercent: 45, currentSessionUsedPercent: 30)
         _ = try store.recordAccountUsage(provider: .codex, weeklyUsedPercent: 10)
 
@@ -141,7 +141,7 @@ final class AgentAccountUsageGetRemoteTests: XCTestCase {
         XCTAssertEqual(client.shortRing("claude"), 30)
         let cursor = EventBus.shared.currentSeq
 
-        ctx.refreshTokenSaverAccountUsage(reason: "test")
+        ctx.refreshAccountUsage(reason: "test")
         let cleared = await waitForEvent(since: cursor, provider: "claude")
         XCTAssertTrue(cleared, "the clear must be announced to paired devices")
         for payload in usageEvents(since: cursor) { client.fold(event: payload) }
@@ -164,7 +164,7 @@ final class AgentAccountUsageGetRemoteTests: XCTestCase {
             refresher: StubRefresher(full: [AssistantAccountUsage(provider: .codex, weeklyUsedPercent: 23)]),
             root: root
         )
-        let store = TokenSaverUsageStore(appSupportDirectory: ctx.appSupportDirectory)
+        let store = ProviderUsageStore(appSupportDirectory: ctx.appSupportDirectory)
         _ = try store.recordAccountUsage(provider: .grok, weeklyUsedPercent: 65)
 
         var client = PairedClient()
@@ -172,7 +172,7 @@ final class AgentAccountUsageGetRemoteTests: XCTestCase {
         XCTAssertEqual(client.shortRing("grok"), 65)
         let cursor = EventBus.shared.currentSeq
 
-        ctx.refreshPeriodicTokenSaverAccountUsage()
+        ctx.refreshPeriodicAccountUsage()
         let cleared = await waitForEvent(since: cursor, provider: "grok")
         XCTAssertTrue(cleared, "the periodic Grok clear must be announced to paired devices")
         for payload in usageEvents(since: cursor) { client.fold(event: payload) }

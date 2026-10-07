@@ -347,9 +347,8 @@ public final class SQLiteDB {
         // only after a successful reset/checkpoint and never truncates live data.
         try execute("PRAGMA wal_autocheckpoint=512;")
         try execute("PRAGMA journal_size_limit=16777216;")
-        // WAL gives one writer + many readers across processes. The Token Saver
-        // sidecar and the app open this same file concurrently (CCR store writes
-        // in the sidecar, history/dedup writes in the app), so a writer can briefly
+        // WAL gives one writer + many readers across processes. Helper processes
+        // and the app can open this same file concurrently, so a writer can briefly
         // hold the lock. Wait instead of failing fast with SQLITE_BUSY.
         try execute("PRAGMA busy_timeout=5000;")
     }

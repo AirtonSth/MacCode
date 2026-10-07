@@ -28,38 +28,21 @@ final class GrokRunnerArgsTests: XCTestCase {
         )
     }
 
-    func test_tokenSaverOnDoesNotRegisterGrokPostToolUseOutputRewrite() {
-        // WHY: harvest has 680 large Grok `read_file`s (~11.7M chars). Claude
-        // PostToolUse can replace Read via updatedToolOutput. Grok PostToolUse
-        // stdout is ignored (official hooks guide). Do not invent that hook.
-        let on = GrokRunner.buildArgs(req(environment: [
+    func test_legacyTokenSaverFlagsNeverAddAHookOrDistillToGrokHeadless() {
+        // WHY: Token Saver was removed. Flags an older build left in the
+        // environment must not register an output-rewrite hook or bring back
+        // the Distill rules and safety ABI.
+        for environment in [[:], [
             "RC_TOKEN_SAVER_DISTILL_HINT": "1",
-            ClaudeRunner.tokenSaverPostToolUseEnvKey: "1",
-        ]))
-        // Prompt text may mention PostToolUse as a ceiling; argv must not
-        // register a Grok output-rewrite hook.
-        XCTAssertFalse(on.contains { $0 == "--settings" || $0.hasPrefix("--settings=") })
-        XCTAssertFalse(on.contains { $0.contains("hook post-tool-use") })
-        XCTAssertFalse(on.contains { $0.contains("updatedToolOutput") })
-    }
-
-    func test_tokenSaverSafetyABIIsInjectedExactlyOnceForGrokHeadless() {
-        let args = GrokRunner.buildArgs(req(environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]))
-        let prompt = args[args.index(after: args.firstIndex(of: "-p")!)]
-        XCTAssertEqual(prompt.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1)
-        XCTAssertTrue(prompt.contains("| distill"))
-        XCTAssertEqual(
-            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + prompt)
-                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
-            1,
-            "Grok headless effective disk plus runtime context receives the safety ABI exactly once"
-        )
-
-        // Token Saver off → no Distill / safety ABI on Grok headless.
-        let emptyEnvArgs = GrokRunner.buildArgs(req())
-        let emptyEnvPrompt = emptyEnvArgs[emptyEnvArgs.index(after: emptyEnvArgs.firstIndex(of: "-p")!)]
-        XCTAssertFalse(emptyEnvPrompt.contains(TokenSaverProviderSafetyABI.block))
-        XCTAssertFalse(emptyEnvPrompt.contains("| distill"))
+            "RC_TOKEN_SAVER_POST_TOOL_USE": "1",
+        ]] {
+            let args = GrokRunner.buildArgs(req(environment: environment))
+            XCTAssertFalse(args.contains { $0 == "--settings" || $0.hasPrefix("--settings=") })
+            XCTAssertFalse(args.contains { $0.contains("hook post-tool-use") })
+            let prompt = args[args.index(after: args.firstIndex(of: "-p")!)]
+            XCTAssertFalse(prompt.contains("TOKEN_SAVER_SAFETY_ABI"))
+            XCTAssertFalse(prompt.contains("| distill"))
+        }
     }
 
     func test_headlessStreamingJsonFlags() {

@@ -5,44 +5,33 @@ import Darwin
 @testable import AgentRuntime
 
 final class ProviderSubprocessLauncherTests: XCTestCase {
-    private func receiptEnvironment(for provider: AgentProvider) -> [String: String] {
-        let receipt = TokenSaverExecutionReceiptSeam.admit(
-            tokenSaverEnabled: true,
-            sameUser: true,
-            sidecarAvailable: true,
-            provider: provider,
-            threadId: "10000000-0000-0000-0000-000000000001",
-            rootRunId: "40000000-0000-0000-0000-000000000004",
-            attemptId: "50000000-0000-0000-0000-000000000005",
-            workspaceId: "20000000-0000-0000-0000-000000000002",
-            projectId: "30000000-0000-0000-0000-000000000003",
-            enabledLanes: ["deterministic_wrapper"]
-        )
-        return TokenSaverExecutionReceiptSeam.environment(from: receipt)
+    private let threadScope = "10000000-0000-0000-0000-000000000001"
+
+    private var scopedEnvironment: [String: String] {
+        ["RC_REMOTE_CODE_SUBAGENT_THREAD_ID": threadScope]
     }
 
-    func test_everyProviderLaunchUsesTheSameTokenSaverAndIdentityContract() throws {
+    func test_everyProviderLaunchUsesTheSameIdentityContract() throws {
         // WHY: a provider-specific adapter must not be able to create a child
-        // process without inheriting the host receipt and its provider identity.
+        // process without inheriting the host thread scope and its provider identity.
         for provider in AgentProvider.allCases {
             let process = try ProviderSubprocessLauncher.makeProcess(
                 provider: provider,
                 executablePath: "/bin/sh",
                 arguments: ["-c", "exit 0"],
                 currentDirectory: FileManager.default.currentDirectoryPath,
-                environment: receiptEnvironment(for: provider)
+                environment: scopedEnvironment
             )
 
             XCTAssertEqual(process.environment?["REMOTE_CODE_AGENT_PROVIDER"], provider.rawValue)
-            XCTAssertEqual(process.environment?[TokenSaverExecutionReceipt.envKey],
-                           receiptEnvironment(for: provider)[TokenSaverExecutionReceipt.envKey])
+            XCTAssertEqual(process.environment?["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"], threadScope)
             XCTAssertEqual(process.arguments, ["-c", "exit 0"])
         }
     }
 
-    func test_launchWithoutAValidReceiptRemainsRawForEveryProvider() throws {
-        // WHY: automaticity must never resurrect optimization flags from stale
-        // GUI/shell state when the host did not make a valid admission.
+    func test_leftoverTokenSaverFlagsNeverReachAnyProvider() throws {
+        // WHY: Token Saver was removed; flags from stale GUI/shell state must
+        // never reach a provider child.
         for provider in AgentProvider.allCases {
             let process = try ProviderSubprocessLauncher.makeProcess(
                 provider: provider,
@@ -61,16 +50,16 @@ final class ProviderSubprocessLauncherTests: XCTestCase {
         }
     }
 
-    func test_foreignUserLaunchPreservesProviderReceiptThroughInstalledHelper() throws {
+    func test_foreignUserLaunchPreservesProviderScopeThroughInstalledHelper() throws {
         // WHY: the run-as-user path is a second Process configuration route;
-        // it must not lose provider identity or the authorized receipt when it
+        // it must not lose provider identity or the host thread scope when it
         // rewrites the child to sudo.
         let process = try ProviderSubprocessLauncher.makeProcess(
             provider: .codex,
             executablePath: "/usr/local/bin/codex",
             arguments: ["exec", "--json"],
             currentDirectory: FileManager.default.currentDirectoryPath,
-            environment: receiptEnvironment(for: .codex),
+            environment: scopedEnvironment,
             runAsUser: AgentRunAsUser(
                 generatedUID: "target-generated-uid",
                 shortName: "target-user",
@@ -86,7 +75,7 @@ final class ProviderSubprocessLauncherTests: XCTestCase {
         XCTAssertTrue(process.arguments?.contains("/usr/local/bin/codex") == true)
         XCTAssertTrue(process.arguments?.contains("target-user") == true)
         XCTAssertEqual(process.environment?["REMOTE_CODE_AGENT_PROVIDER"], AgentProvider.codex.rawValue)
-        XCTAssertNotNil(process.environment?[TokenSaverExecutionReceipt.envKey])
+        XCTAssertEqual(process.environment?["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"], threadScope)
         XCTAssertNil(process.environment?["SUDO_ASKPASS"],
                      "provider children must not inherit a password-prompt script after helper installation")
     }

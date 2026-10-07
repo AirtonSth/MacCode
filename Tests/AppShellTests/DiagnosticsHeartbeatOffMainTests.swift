@@ -166,16 +166,12 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
         XCTAssertEqual(loads.read(), 2, "will_terminate must preserve the direct post-sweep process scan")
     }
 
-    func test_lowMemoryProfileBoundsProvidersSidecarQueueAndIdleRelease() {
+    func test_lowMemoryProfileBoundsProvidersAndIdleRelease() {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
 
         XCTAssertEqual(profile.name, "low-memory-8g")
         XCTAssertNil(profile.providerRootCap,
                      "session count is unlimited — user controls concurrent agents")
-        XCTAssertEqual(profile.sidecarMaxConcurrentRequests, 1)
-        XCTAssertEqual(profile.sidecarMaxQueueDepth, 4)
-        XCTAssertEqual(profile.sidecarMaxQueueWaitMilliseconds, 750,
-                       "tiny machines fail open quickly instead of stacking MLX waits")
         XCTAssertEqual(profile.idleReleaseAge, 60,
                        "only safely resumable completed sessions use the shorter release window")
         XCTAssertNil(profile.hostProcessCeilingKB,
@@ -183,33 +179,15 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
         XCTAssertNil(profile.managedTreeCeilingKB)
     }
 
-    func test_memoryProfileScalesDistillConcurrencyWithInstalledRAM() {
-        // WHY: multi-thread agents on high-RAM Macs were stuck at concurrent=4 because
-        // the profile only had 8g vs "everything else". Tiers must grow with RAM while
-        // still capping concurrent (GPU serializes MLX) and keeping a finite queue wait.
+    func test_memoryProfileTiersFollowInstalledRAM() {
+        // WHY: the profile picks idle release and pressure thresholds per RAM
+        // tier; every tier keeps provider starts user-controlled.
         let gib = UInt64(1_024 * 1_024 * 1_024)
-        let mid = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 16 * gib)
-        XCTAssertEqual(mid.name, "mid-memory-16g")
-        XCTAssertEqual(mid.sidecarMaxConcurrentRequests, 2)
-        XCTAssertEqual(mid.sidecarMaxQueueDepth, 8)
-        XCTAssertEqual(mid.sidecarMaxQueueWaitMilliseconds, 1_000)
-
-        let standard = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 32 * gib)
-        XCTAssertEqual(standard.name, "standard-32g")
-        XCTAssertEqual(standard.sidecarMaxConcurrentRequests, 4)
-        XCTAssertEqual(standard.sidecarMaxQueueDepth, 16)
-        XCTAssertEqual(standard.sidecarMaxQueueWaitMilliseconds, 1_500)
-
-        let high64 = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 64 * gib)
-        XCTAssertEqual(high64.name, "high-memory-64g")
-        XCTAssertEqual(high64.sidecarMaxConcurrentRequests, 6)
-        XCTAssertEqual(high64.sidecarMaxQueueDepth, 24)
-
+        XCTAssertEqual(ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 16 * gib).name, "mid-memory-16g")
+        XCTAssertEqual(ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 32 * gib).name, "standard-32g")
+        XCTAssertEqual(ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 64 * gib).name, "high-memory-64g")
         let high128 = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 128 * gib)
         XCTAssertEqual(high128.name, "high-memory-128g")
-        XCTAssertEqual(high128.sidecarMaxConcurrentRequests, 8)
-        XCTAssertEqual(high128.sidecarMaxQueueDepth, 32)
-        XCTAssertEqual(high128.sidecarMaxQueueWaitMilliseconds, 2_500)
         XCTAssertNil(high128.providerRootCap, "provider starts stay user-controlled at every tier")
     }
 
@@ -258,8 +236,6 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
             name: "test-capped",
             physicalMemoryBytes: eightGiB,
             providerRootCap: 2,
-            sidecarMaxConcurrentRequests: 1,
-            sidecarMaxQueueDepth: 4,
             idleReleaseAge: 30 * 60,
             warningFraction: 0.60,
             criticalFraction: 0.75,

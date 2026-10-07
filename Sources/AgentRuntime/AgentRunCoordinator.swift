@@ -10,96 +10,6 @@ import os
 // through the unified logging system, keyed by thread/run ids.
 private let agentRunLog = Logger(subsystem: "io.remotecode.agent", category: "run")
 
-/// Immutable host input for one best-of-three request decision. The admitted
-/// request already carries the provider/model chosen by Auto; the admitted
-/// environment is the scoped merge the provider ABI/system framing will see.
-/// Canonical Human stays separate so every arm is prepared from identical text.
-public struct TokenSaverOutboundSelectionRequest: Sendable {
-    public let canonicalHuman: String
-    public let admittedRequest: AgentRunRequest
-    public let autoRoute: AgentOrchestrationRoute?
-    public let admittedEnvironment: [String: String]
-
-    package init(
-        canonicalHuman: String,
-        admittedRequest: AgentRunRequest,
-        autoRoute: AgentOrchestrationRoute?,
-        admittedEnvironment: [String: String]
-    ) {
-        self.canonicalHuman = canonicalHuman
-        self.admittedRequest = admittedRequest
-        self.autoRoute = autoRoute
-        self.admittedEnvironment = admittedEnvironment
-    }
-
-    /// Per-format ABI environment counted and sent for one arm. Never invents
-    /// `RC_TOKEN_SAVER_WIRE_CAPABILITY`; version is `1` only when that
-    /// capability is already exactly `1`. Compact-span keys are exclusive to
-    /// RCS1 and are set exactly to `1` for that arm.
-    public func environment(
-        for format: TokenSaverBestOfThreeSelector.Format
-    ) -> [String: String] {
-        Self.environment(admittedEnvironment, for: format)
-    }
-
-    public static func environment(
-        _ base: [String: String],
-        for format: TokenSaverBestOfThreeSelector.Format
-    ) -> [String: String] {
-        var env = base
-        switch format {
-        case .human:
-            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey)
-            env.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
-            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey)
-            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey)
-        case .rcw1:
-            if env[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1" {
-                env["RC_TOKEN_SAVER_WIRE_VERSION"] = "1"
-            } else {
-                env.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
-            }
-            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey)
-            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey)
-        case .rcs1:
-            env.removeValue(forKey: TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey)
-            env.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
-            env[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey] = "1"
-            env[TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey] = "1"
-        }
-        return env
-    }
-}
-
-/// Content-free observation emitted exactly once for each typed selection when
-/// `startRun` exits after that decision. `outcome` is the local guarded-write
-/// result from `AgentRunAcceptancePermit`; it is not provider ACK, delivery,
-/// savings, or billing.
-public struct TokenSaverOutboundDelivery: Sendable {
-    public let receipt: TokenSaverBestOfThreeSelector.DecisionReceipt
-    public let provider: AgentProvider
-    public let resolvedModel: String
-    public let threadId: AgentThreadID
-    public let runId: AgentRunID
-    public let outcome: AgentRunAcceptanceOutcome
-
-    package init(
-        receipt: TokenSaverBestOfThreeSelector.DecisionReceipt,
-        provider: AgentProvider,
-        resolvedModel: String,
-        threadId: AgentThreadID,
-        runId: AgentRunID,
-        outcome: AgentRunAcceptanceOutcome
-    ) {
-        self.receipt = receipt
-        self.provider = provider
-        self.resolvedModel = resolvedModel
-        self.threadId = threadId
-        self.runId = runId
-        self.outcome = outcome
-    }
-}
-
 /// Process-local bearer for the exact currently active Agent run. The raw
 /// capability is never persisted; the durable orchestration receipt stores only
 /// its SHA-256 digest and remains the authority for thread/run/expiry checks.
@@ -119,26 +29,6 @@ public struct AgentActiveDelegationCapability: Sendable, Equatable {
         self.runId = runId
         self.capability = capability
         self.expiresAt = expiresAt
-    }
-}
-
-/// Resolves an async translator/timeout race exactly once without structured
-/// concurrency waiting for the losing task. A local model can block in native
-/// code and ignore cancellation; the provider turn still has to complete.
-private final class FirstStringContinuation: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<String, Never>?
-
-    init(_ continuation: CheckedContinuation<String, Never>) {
-        self.continuation = continuation
-    }
-
-    func resume(returning value: String) {
-        let pending = lock.withLock { () -> CheckedContinuation<String, Never>? in
-            defer { continuation = nil }
-            return continuation
-        }
-        pending?.resume(returning: value)
     }
 }
 
@@ -312,16 +202,14 @@ public struct ActiveRunProjection: Equatable, Sendable {
 
 /// Merge provider launch env with host-injected keys from the pre-route request.
 /// Auto-orchestration previously used `launch?.environment ?? request.environment`,
-/// which **dropped** `RC_GRAPHIFY_*` (and Token Saver) when a launch config existed —
-/// agents then saw BANNER_MISSING / NO_RC_GRAPHIFY_ENV despite host preflight.
+/// which **dropped** host-injected keys when a launch config existed.
 public enum AgentHostEnvironmentMerge {
     public static func preserveHostInjects(
         launch: [String: String]?,
         request: [String: String]
     ) -> [String: String] {
         // Start from launch (or request if no launch), strip host-owned keys so a
-        // stale RC_GRAPHIFY_* in launch cannot resurrect Graphify when the
-        // authoritative request has none (Token Saver / Graphify off).
+        // stale value in launch cannot override the authoritative request.
         var env = stripHostInjects(from: launch ?? request)
         for (key, value) in request where isHostInjectedKey(key) {
             env[key] = value
@@ -341,12 +229,36 @@ public enum AgentHostEnvironmentMerge {
         return env
     }
 
-    public static func isHostInjectedKey(_ key: String) -> Bool {
+    /// Drops the keys the removed Token Saver / Graphify / Distill compression
+    /// lanes read (nothing sets them any more, but a value inherited from an
+    /// older build's environment must never reach a provider) and the default
+    /// managed bin from PATH. Callers that want nested provider proxies put the
+    /// managed bin back first.
+    public static func scrubLegacyOptimizationKeys(_ environment: [String: String]) -> [String: String] {
+        var cleaned = environment
+        for key in environment.keys where isLegacyOptimizationKey(key) {
+            cleaned.removeValue(forKey: key)
+        }
+        if let path = cleaned["PATH"] {
+            let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            var kept: [String] = []
+            for part in path.split(separator: ":") where part != managedBin {
+                kept.append(String(part))
+            }
+            cleaned["PATH"] = kept.joined(separator: ":")
+        }
+        return cleaned
+    }
+
+    static func isLegacyOptimizationKey(_ key: String) -> Bool {
         key.hasPrefix("RC_GRAPHIFY_")
             || key.hasPrefix("RC_TOKEN_SAVER_")
             || key.hasPrefix("RC_DISTILL_")
-            // Claude PostToolUse sidecar path is host-owned Token Saver state (not a secret).
             || key == "REMOTE_CODE_DISTILL_STATE_PATH"
+    }
+
+    public static func isHostInjectedKey(_ key: String) -> Bool {
+        isLegacyOptimizationKey(key)
             // Managed Bot and Agent App MCPs receive these exact host-authoritative
             // identity, run, socket, and capability values for the active request.
             || key == BotSelfConfigCatalog.callerEnvironmentKey
@@ -356,595 +268,6 @@ public enum AgentHostEnvironmentMerge {
             || key == BotPeerDelegation.socketEnvironmentKey
             || key == BotPeerDelegation.capabilityEnvironmentKey
             || key == BotPeerDelegation.turnContextEnvironmentKey
-    }
-}
-
-// MARK: - Token Saver execution receipt (nested-worker propagation)
-
-/// Host-authoritative, content-free Token Saver capabilities for one provider
-/// root. Child orchestration processes inherit this environment unchanged.
-public struct TokenSaverExecutionReceipt: Codable, Sendable, Equatable {
-    public static let schemaVersion = 1
-    public static let envKey = "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1"
-
-    public enum DenialReason: String, Codable, Sendable, Equatable {
-        case none
-        case tokenSaverOff = "token_saver_off"
-        case crossUser = "cross_user"
-        case sidecarUnavailable = "sidecar_unavailable"
-    }
-
-    /// `nil` means the provider does not expose that capability. A supported
-    /// capability that is currently unavailable is represented by `false`.
-    public struct Capabilities: Codable, Sendable, Equatable {
-        public let distill: Bool?
-        public let graphify: Bool?
-        public let postToolUse: Bool?
-        public let recoveryScope: Bool?
-        public let managedPath: Bool?
-
-        public init(
-            distill: Bool? = nil,
-            graphify: Bool? = nil,
-            postToolUse: Bool? = nil,
-            recoveryScope: Bool? = nil,
-            managedPath: Bool? = nil
-        ) {
-            self.distill = distill
-            self.graphify = graphify
-            self.postToolUse = postToolUse
-            self.recoveryScope = recoveryScope
-            self.managedPath = managedPath
-        }
-
-        enum CodingKeys: String, CodingKey {
-            case distill, graphify
-            case postToolUse = "post_tool_use"
-            case recoveryScope = "recovery_scope"
-            case managedPath = "managed_path"
-        }
-    }
-
-    public let schemaVersion: Int
-    public let rootRunId: String?
-    public let threadId: String
-    public let attemptId: String?
-    public let provider: String
-    public let admitted: Bool
-    public let sameUser: Bool
-    public let denialReason: DenialReason
-    public let capabilities: Capabilities
-    public let disabledLanes: [String]
-    public let enabledLanes: [String]
-    public let workspaceId: String?
-    public let projectId: String?
-    public let waveLive: String?
-
-    public init(
-        schemaVersion: Int = TokenSaverExecutionReceipt.schemaVersion,
-        rootRunId: String? = nil,
-        threadId: String,
-        attemptId: String? = nil,
-        provider: String,
-        admitted: Bool,
-        sameUser: Bool,
-        denialReason: DenialReason = .none,
-        capabilities: Capabilities = Capabilities(),
-        disabledLanes: [String] = [],
-        enabledLanes: [String] = [],
-        workspaceId: String? = nil,
-        projectId: String? = nil,
-        waveLive: String? = nil
-    ) {
-        self.schemaVersion = schemaVersion
-        self.rootRunId = rootRunId
-        self.threadId = threadId
-        self.attemptId = attemptId
-        self.provider = provider
-        self.admitted = admitted
-        self.sameUser = sameUser
-        self.denialReason = denialReason
-        self.capabilities = capabilities
-        self.disabledLanes = disabledLanes.sorted()
-        self.enabledLanes = enabledLanes.sorted()
-        self.workspaceId = workspaceId
-        self.projectId = projectId
-        self.waveLive = waveLive
-    }
-
-    enum CodingKeys: String, CodingKey {
-        case schemaVersion = "v"
-        case rootRunId = "root_run_id"
-        case threadId = "thread_id"
-        case attemptId = "attempt_id"
-        case provider, admitted
-        case sameUser = "same_user"
-        case denialReason = "denial_reason"
-        case capabilities
-        case disabledLanes = "disabled_lanes"
-        case enabledLanes = "enabled_lanes"
-        case workspaceId = "workspace_id"
-        case projectId = "project_id"
-        case waveLive = "wave_live"
-    }
-
-    // PERF: every admitted Token Saver run encodes the receipt into provider
-    // env (and tests re-decode). JSONEncoder/Decoder are not thread-safe —
-    // share one sortedKeys encoder + decoder under a short lock so concurrent
-    // run starts avoid per-call codec allocation (wire JSON unchanged).
-    private static let codecLock = NSLock()
-    private static let encoder: JSONEncoder = {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return encoder
-    }()
-    private static let decoder = JSONDecoder()
-
-    public func encodedJSONString() -> String? {
-        guard TokenSaverExecutionReceiptSeam.isValid(self) else { return nil }
-        Self.codecLock.lock()
-        let data = try? Self.encoder.encode(self)
-        Self.codecLock.unlock()
-        guard let data,
-              data.count <= TokenSaverExecutionReceiptSeam.maximumEncodedBytes,
-              let text = String(data: data, encoding: .utf8),
-              !TokenSaverExecutionReceiptSeam.containsDisallowedContent(text) else {
-            return nil
-        }
-        return text
-    }
-
-    public static func decode(json: String) -> TokenSaverExecutionReceipt? {
-        guard let data = json.data(using: .utf8),
-              data.count <= TokenSaverExecutionReceiptSeam.maximumEncodedBytes,
-              !TokenSaverExecutionReceiptSeam.containsDisallowedContent(json),
-              TokenSaverExecutionReceiptSeam.hasOnlyReceiptKeys(data) else {
-            return nil
-        }
-        codecLock.lock()
-        let receipt = try? decoder.decode(TokenSaverExecutionReceipt.self, from: data)
-        codecLock.unlock()
-        guard let receipt, TokenSaverExecutionReceiptSeam.isValid(receipt) else {
-            return nil
-        }
-        return receipt
-    }
-
-    fileprivate func stamping(rootRunId: String, attemptId: String) -> TokenSaverExecutionReceipt {
-        TokenSaverExecutionReceipt(
-            schemaVersion: schemaVersion,
-            rootRunId: rootRunId,
-            threadId: threadId,
-            attemptId: attemptId,
-            provider: provider,
-            admitted: admitted,
-            sameUser: sameUser,
-            denialReason: denialReason,
-            capabilities: capabilities,
-            disabledLanes: disabledLanes,
-            enabledLanes: enabledLanes,
-            workspaceId: workspaceId,
-            projectId: projectId,
-            waveLive: waveLive
-        )
-    }
-}
-
-/// One environment seam for root, resumed, retried, recovered, and inherited
-/// provider processes. It transports capability decisions; it does not decide
-/// skill/exact-output policy or carry provider content.
-public enum TokenSaverExecutionReceiptSeam {
-    public static let disabledLanesEnvKey = "RC_TOKEN_SAVER_DISABLED_LANES"
-    public static let enabledLanesEnvKey = "RC_TOKEN_SAVER_ENABLED_LANES"
-    public static let wireCapabilityEnvKey = "RC_TOKEN_SAVER_WIRE_CAPABILITY"
-    public static let compactSpanCapabilityEnvKey = "RC_TOKEN_SAVER_COMPACT_SPAN_CAPABILITY"
-    public static let compactSpanVersionEnvKey = "RC_TOKEN_SAVER_COMPACT_SPAN_VERSION"
-    public static let maximumEncodedBytes = 4_096
-
-    public static func admit(
-        tokenSaverEnabled: Bool,
-        sameUser: Bool,
-        sidecarAvailable: Bool,
-        provider: AgentProvider,
-        threadId: String,
-        rootRunId: String? = nil,
-        attemptId: String? = nil,
-        workspaceId: String? = nil,
-        projectId: String? = nil,
-        disabledLanes: Set<String> = [],
-        enabledLanes: Set<String> = [],
-        waveLive: String? = nil,
-        graphifyActive: Bool = false
-    ) -> TokenSaverExecutionReceipt {
-        if !sameUser {
-            return rawDenied(
-                reason: .crossUser,
-                provider: provider,
-                threadId: threadId,
-                rootRunId: rootRunId,
-                attemptId: attemptId,
-                sameUser: false
-            )
-        }
-        if !tokenSaverEnabled {
-            return rawDenied(
-                reason: .tokenSaverOff,
-                provider: provider,
-                threadId: threadId,
-                rootRunId: rootRunId,
-                attemptId: attemptId,
-                sameUser: true
-            )
-        }
-        let postToolUse: Bool? = {
-            switch provider {
-            case .claude:
-                return sidecarAvailable
-            case .codex, .grok, .distill:
-                return nil
-            }
-        }()
-        let effectiveEnabledLanes = enabledLanes.subtracting(disabledLanes)
-        return TokenSaverExecutionReceipt(
-            rootRunId: rootRunId,
-            threadId: threadId,
-            attemptId: attemptId,
-            provider: provider.rawValue,
-            admitted: true,
-            sameUser: true,
-            denialReason: sidecarAvailable ? .none : .sidecarUnavailable,
-            capabilities: .init(
-                distill: sidecarAvailable,
-                graphify: graphifyActive,
-                postToolUse: postToolUse,
-                recoveryScope: workspaceId != nil,
-                managedPath: sidecarAvailable
-            ),
-            disabledLanes: Array(disabledLanes),
-            enabledLanes: Array(effectiveEnabledLanes),
-            workspaceId: workspaceId,
-            projectId: projectId ?? workspaceId,
-            waveLive: sidecarAvailable ? waveLive : nil
-        )
-    }
-
-    /// Denied receipts are useful to test and audit the pure admission decision,
-    /// but are never emitted into a provider environment.
-    public static func environment(from receipt: TokenSaverExecutionReceipt) -> [String: String] {
-        guard receipt.admitted, let encoded = receipt.encodedJSONString() else { return [:] }
-        var env = [TokenSaverExecutionReceipt.envKey: encoded]
-        if !receipt.disabledLanes.isEmpty {
-            env[disabledLanesEnvKey] = receipt.disabledLanes.joined(separator: ",")
-        }
-        if !receipt.enabledLanes.isEmpty {
-            env[enabledLanesEnvKey] = receipt.enabledLanes.joined(separator: ",")
-        }
-        if receipt.capabilities.distill == true {
-            env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
-            if !receipt.disabledLanes.contains("wire-encode"),
-               !receipt.disabledLanes.contains("wire-render-english") {
-                env[wireCapabilityEnvKey] = "1"
-            }
-            if let waveLive = receipt.waveLive, !waveLive.isEmpty {
-                env["RC_TOKEN_SAVER_WAVE_LIVE"] = waveLive
-            }
-        }
-        if receipt.capabilities.recoveryScope == true {
-            env["RC_TOKEN_SAVER_WORKSPACE_ID"] = receipt.workspaceId
-            env["RC_TOKEN_SAVER_PROJECT_ID"] = receipt.projectId
-        }
-        // Per-thread Token Saver chip reads `token_saver_thread_totals`. That
-        // accumulator only moves when delivered rows carry a thread id, which
-        // PATH wrappers/hooks take from this env var. Recovery scope needs a
-        // workspace; savings attribution does not.
-        let threadId = receipt.threadId.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !threadId.isEmpty {
-            env["RC_TOKEN_SAVER_THREAD_ID"] = threadId
-        }
-        if let rootRunId = receipt.rootRunId {
-            env["RC_TOKEN_SAVER_ROOT_RUN_ID"] = rootRunId
-        }
-        if let attemptId = receipt.attemptId,
-           receipt.capabilities.distill == true || receipt.capabilities.recoveryScope == true {
-            env["RC_TOKEN_SAVER_ATTEMPT_ID"] = attemptId
-        }
-        if receipt.capabilities.postToolUse == true {
-            env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
-        }
-        return env.compactMapValues { $0 }
-    }
-
-    public static func receipt(from environment: [String: String]) -> TokenSaverExecutionReceipt? {
-        environment[TokenSaverExecutionReceipt.envKey]
-            .flatMap(TokenSaverExecutionReceipt.decode(json:))
-    }
-
-    /// Upgrade an admitted-but-sidecar-degraded receipt when the Distill sidecar
-    /// is healthy again. Nested / cross-provider launches and host re-stamps use
-    /// this so a sticky `sidecar_unavailable` decision cannot permanently leave
-    /// distill / managed_path off after the sidecar recovers.
-    ///
-    /// - Does **not** invent admission when Token Saver was off or cross-user.
-    /// - Retargets `provider` (and Claude-only `postToolUse`) for the child provider.
-    /// - Preserves root/thread/attempt identity, lanes, and recovery scope.
-    public static func reAdmitSidecarIfAvailable(
-        receipt: TokenSaverExecutionReceipt,
-        sidecarAvailable: Bool,
-        provider: AgentProvider,
-        waveLive: String? = nil
-    ) -> TokenSaverExecutionReceipt {
-        guard receipt.admitted, receipt.sameUser else { return receipt }
-        guard sidecarAvailable else {
-            // Still degraded: only retarget provider-specific postToolUse for children.
-            if receipt.provider == provider.rawValue { return receipt }
-            return admit(
-                tokenSaverEnabled: true,
-                sameUser: true,
-                sidecarAvailable: false,
-                provider: provider,
-                threadId: receipt.threadId,
-                rootRunId: receipt.rootRunId,
-                attemptId: receipt.attemptId,
-                workspaceId: receipt.workspaceId,
-                projectId: receipt.projectId,
-                disabledLanes: Set(receipt.disabledLanes),
-                enabledLanes: Set(receipt.enabledLanes),
-                waveLive: waveLive ?? receipt.waveLive,
-                graphifyActive: receipt.capabilities.graphify == true
-            )
-        }
-        // Already fully admitted for this provider — keep identity, refresh waveLive if supplied.
-        if receipt.denialReason == .none,
-           receipt.capabilities.distill == true,
-           receipt.capabilities.managedPath == true,
-           receipt.provider == provider.rawValue {
-            guard let waveLive, !waveLive.isEmpty, waveLive != receipt.waveLive else {
-                return receipt
-            }
-            return admit(
-                tokenSaverEnabled: true,
-                sameUser: true,
-                sidecarAvailable: true,
-                provider: provider,
-                threadId: receipt.threadId,
-                rootRunId: receipt.rootRunId,
-                attemptId: receipt.attemptId,
-                workspaceId: receipt.workspaceId,
-                projectId: receipt.projectId,
-                disabledLanes: Set(receipt.disabledLanes),
-                enabledLanes: Set(receipt.enabledLanes),
-                waveLive: waveLive,
-                graphifyActive: receipt.capabilities.graphify == true
-            )
-        }
-        return admit(
-            tokenSaverEnabled: true,
-            sameUser: true,
-            sidecarAvailable: true,
-            provider: provider,
-            threadId: receipt.threadId,
-            rootRunId: receipt.rootRunId,
-            attemptId: receipt.attemptId,
-            workspaceId: receipt.workspaceId,
-            projectId: receipt.projectId,
-            disabledLanes: Set(receipt.disabledLanes),
-            enabledLanes: Set(receipt.enabledLanes),
-            waveLive: waveLive ?? receipt.waveLive,
-            graphifyActive: receipt.capabilities.graphify == true
-        )
-    }
-
-    /// Rebuild the discrete environment only from the signed-off receipt shape.
-    /// A malformed, denied, or provider-mismatched receipt is scrubbed to raw.
-    public static func propagate(
-        into environment: [String: String],
-        provider: AgentProvider
-    ) -> [String: String] {
-        guard environment[TokenSaverExecutionReceipt.envKey] != nil else {
-            return scrub(environment) // legacy hosts fail open without a receipt
-        }
-        guard let receipt = receipt(from: environment),
-              receipt.admitted,
-              receipt.provider == provider.rawValue else {
-            return scrub(environment)
-        }
-        return applying(receipt, to: environment)
-    }
-
-    /// Bind a new attempt without changing the durable root identity. This is
-    /// used for normal sends, retries/resumes, and crash-recovery launches.
-    public static func stampIdentity(
-        environment: [String: String],
-        rootRunId: String,
-        attemptId: String,
-        provider: AgentProvider
-    ) -> [String: String] {
-        guard environment[TokenSaverExecutionReceipt.envKey] != nil else {
-            var legacy = environment
-            if legacy["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-                legacy["RC_TOKEN_SAVER_ATTEMPT_ID"] = attemptId
-            }
-            return legacy
-        }
-        guard let receipt = receipt(from: environment),
-              receipt.admitted,
-              receipt.provider == provider.rawValue else {
-            return scrub(environment)
-        }
-        return applying(
-            receipt.stamping(rootRunId: rootRunId, attemptId: attemptId),
-            to: environment
-        )
-    }
-
-    public static func scrub(_ environment: [String: String]) -> [String: String] {
-        var cleaned = environment
-        for key in environment.keys
-        where key.hasPrefix("RC_GRAPHIFY_")
-            || key.hasPrefix("RC_TOKEN_SAVER_")
-            || key.hasPrefix("RC_DISTILL_")
-            || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
-            cleaned.removeValue(forKey: key)
-        }
-        if let path = cleaned["PATH"] {
-            let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-            let rawParts = path.split(separator: ":").map(String.init)
-            let scrubbedParts = rawParts.filter { $0 != managedBin }
-            cleaned["PATH"] = scrubbedParts.joined(separator: ":")
-        }
-        return cleaned
-    }
-
-    public static func containsDisallowedContent(_ text: String) -> Bool {
-        guard text.utf8.count <= maximumEncodedBytes else { return true }
-        let markers = [
-            "prompt", "transcript", "raw_output", "tool_output", "authorization",
-            "password", "secret", "api_key", "private_key", "bootstrap_token",
-            "sidecar_token", "sk-ant-", "sk-or-"
-        ]
-        return markers.contains { text.range(of: $0, options: .caseInsensitive) != nil }
-    }
-
-    fileprivate static func isValid(_ receipt: TokenSaverExecutionReceipt) -> Bool {
-        guard receipt.schemaVersion == TokenSaverExecutionReceipt.schemaVersion,
-              UUID(uuidString: receipt.threadId) != nil,
-              let provider = AgentProvider(rawValue: receipt.provider),
-              receipt.rootRunId.map({ UUID(uuidString: $0) != nil }) ?? true,
-              receipt.attemptId.map({ UUID(uuidString: $0) != nil }) ?? true,
-              receipt.workspaceId.map({ UUID(uuidString: $0) != nil }) ?? true,
-              receipt.projectId.map({ UUID(uuidString: $0) != nil }) ?? true,
-              receipt.disabledLanes.allSatisfy({ isSafeToken($0, maximumLength: 64) }),
-              receipt.enabledLanes.allSatisfy({ isSafeToken($0, maximumLength: 64) }),
-              receipt.waveLive.map({
-                  $0.split(separator: ",").allSatisfy {
-                      isSafeToken(String($0), maximumLength: 64)
-                  }
-              }) ?? true else {
-            return false
-        }
-        let capabilities = receipt.capabilities
-        if provider != .claude, capabilities.postToolUse != nil {
-            return false
-        }
-        if receipt.sameUser == false {
-            return receipt.admitted == false
-                && receipt.denialReason == .crossUser
-                && capabilities.distill == false
-                && capabilities.graphify == false
-                && capabilities.postToolUse != true
-                && capabilities.recoveryScope == false
-                && capabilities.managedPath == false
-                && receipt.waveLive == nil
-        }
-        guard receipt.admitted || receipt.denialReason == .tokenSaverOff else {
-            return false
-        }
-        if !receipt.admitted {
-            return receipt.denialReason == .tokenSaverOff
-                && capabilities.distill == false
-                && capabilities.graphify == false
-                && capabilities.postToolUse != true
-                && capabilities.recoveryScope == false
-                && capabilities.managedPath == false
-                && receipt.waveLive == nil
-        }
-        if receipt.denialReason == .sidecarUnavailable {
-            return capabilities.distill == false
-                && capabilities.managedPath == false
-                && capabilities.postToolUse != true
-                && receipt.waveLive == nil
-        }
-        return receipt.denialReason == .none
-            && capabilities.distill == true
-            && capabilities.managedPath == true
-    }
-
-    fileprivate static func hasOnlyReceiptKeys(_ data: Data) -> Bool {
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return false
-        }
-        let allowedTopLevel: Set<String> = [
-            "v", "root_run_id", "thread_id", "attempt_id", "provider", "admitted",
-            "same_user", "denial_reason", "capabilities", "disabled_lanes",
-            "enabled_lanes", "workspace_id", "project_id", "wave_live"
-        ]
-        guard Set(object.keys).isSubset(of: allowedTopLevel),
-              let capabilities = object["capabilities"] as? [String: Any] else {
-            return false
-        }
-        let allowedCapabilities: Set<String> = [
-            "distill", "graphify", "post_tool_use", "recovery_scope", "managed_path"
-        ]
-        return Set(capabilities.keys).isSubset(of: allowedCapabilities)
-    }
-
-    private static func applying(
-        _ receipt: TokenSaverExecutionReceipt,
-        to environment: [String: String]
-    ) -> [String: String] {
-        let statePath = environment["REMOTE_CODE_DISTILL_STATE_PATH"]
-        let managedBin = environment["RC_REMOTE_CODE_MANAGED_BIN"]
-        let pathBeforeScrub = environment["PATH"]
-        var updated = scrub(environment)
-        updated.merge(self.environment(from: receipt)) { _, receiptValue in receiptValue }
-        if receipt.capabilities.distill == true, let statePath, !statePath.isEmpty {
-            updated["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
-        }
-        // Receipt JSON does not carry PATH. scrub() strips the default managed
-        // bin so a denied receipt cannot keep wrappers. An admitted
-        // managed_path receipt must put them back or Codex/Grok (and Claude
-        // shell) lose the global interceptor on stampIdentity/propagate.
-        if receipt.capabilities.managedPath == true {
-            let trimmed = (managedBin ?? AgentSkillInstaller.defaultManagedCLIBinDirectory().path)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                updated["RC_REMOTE_CODE_MANAGED_BIN"] = trimmed
-                let currentPath = updated["PATH"] ?? pathBeforeScrub ?? ""
-                let parts = currentPath
-                    .split(separator: ":", omittingEmptySubsequences: false)
-                    .map(String.init)
-                    .filter { $0 != trimmed }
-                updated["PATH"] = ([trimmed] + parts).joined(separator: ":")
-            }
-        }
-        return updated
-    }
-
-    private static func rawDenied(
-        reason: TokenSaverExecutionReceipt.DenialReason,
-        provider: AgentProvider,
-        threadId: String,
-        rootRunId: String?,
-        attemptId: String?,
-        sameUser: Bool
-    ) -> TokenSaverExecutionReceipt {
-        TokenSaverExecutionReceipt(
-            rootRunId: rootRunId,
-            threadId: threadId,
-            attemptId: attemptId,
-            provider: provider.rawValue,
-            admitted: false,
-            sameUser: sameUser,
-            denialReason: reason,
-            capabilities: .init(
-                distill: false,
-                graphify: false,
-                postToolUse: provider == .claude ? false : nil,
-                recoveryScope: false,
-                managedPath: false
-            )
-        )
-    }
-
-    // PERF: isValid scans every Token Saver lane/wave token; the prior
-    // `"-_.".unicodeScalars.contains` built a temporary view per scalar.
-    // Share one alphanumerics+`-_.` set (same membership contract).
-    private static let safeTokenScalars = CharacterSet.alphanumerics
-        .union(CharacterSet(charactersIn: "-_."))
-
-    private static func isSafeToken(_ value: String, maximumLength: Int) -> Bool {
-        guard !value.isEmpty, value.count <= maximumLength else { return false }
-        return value.unicodeScalars.allSatisfy { safeTokenScalars.contains($0) }
     }
 }
 
@@ -980,31 +303,14 @@ public enum AgentDeletedThreadRetirementOutcome: Equatable, Sendable {
 }
 
 public final class AgentRunCoordinator: @unchecked Sendable {
-    private static func isStructurallyValidRCW1Request(_ payload: String) -> Bool {
-        guard let frames = try? RCWireProtocol.parse(payload), !frames.isEmpty else {
-            return false
-        }
-        return frames.allSatisfy { $0.direction == .request }
-    }
-
     private func captureCanonicalContextSnapshot(
         threadId: AgentThreadID,
         excludingCurrentUserText: String,
         excludingCurrentUserMessageId: AgentMessageID? = nil
-    ) throws -> TokenSaverCanonicalConversationSnapshot? {
+    ) throws -> ConversationContextSnapshot? {
         let messages = try messageRepo.list(threadId: threadId)
-        let assistantIds = messages.filter { $0.role == .assistant }.map(\.id)
-        let persisted = (try? messageRepo.rcw1ResponseTranslations(
-            threadId: threadId,
-            messageIds: assistantIds
-        )) ?? [:]
-        var wires: [String: String] = [:]
-        for (messageId, response) in persisted {
-            wires[messageId.value.uuidString] = response.wireResponseText
-        }
-        return TokenSaverCanonicalConversationSnapshot.capture(
+        return ConversationContextSnapshot.capture(
             messages: messages,
-            persistedRCW1ByMessageId: wires,
             excludingCurrentUserText: excludingCurrentUserText,
             excludingCurrentUserMessageId: excludingCurrentUserMessageId
         )
@@ -1100,23 +406,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private struct ProviderTurnScope: Equatable {
-        let tokenSaverEnabled: Bool
-        let workspaceID: String?
-        let projectID: String?
-        let threadID: String?
         let provider: String?
-        let attemptID: String?
         let delegationCapabilitySHA256: String?
         let botID: String?
         let botSecretValues: [String: String]
 
         init(environment: [String: String]) {
-            tokenSaverEnabled = environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
-            workspaceID = environment["RC_TOKEN_SAVER_WORKSPACE_ID"]
-            projectID = environment["RC_TOKEN_SAVER_PROJECT_ID"]
-            threadID = environment["RC_TOKEN_SAVER_THREAD_ID"]
             provider = environment["REMOTE_CODE_AGENT_PROVIDER"]
-            attemptID = environment["RC_TOKEN_SAVER_ATTEMPT_ID"]
             delegationCapabilitySHA256 = environment[
                 AgentDelegationCapabilityTransport.environmentKey
             ].flatMap {
@@ -1139,55 +435,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 } ?? [:]
         }
 
-        var carriesTokenSaverScope: Bool {
-            tokenSaverEnabled || workspaceID != nil || projectID != nil
-                || threadID != nil || attemptID != nil
-                || delegationCapabilitySHA256 != nil || botID != nil
+        var carriesHostScope: Bool {
+            delegationCapabilitySHA256 != nil || botID != nil
                 || !botSecretValues.isEmpty
-        }
-    }
-
-    /// Run-bound receipt authority captured before a provider can emit events.
-    /// The state file is re-read only at a terminal verification boundary so an
-    /// Off toggle (which removes the file) cannot mint new trusted metadata.
-    private struct DistillReceiptRunScope: Sendable {
-        let stateFileURL: URL
-        let verifierScope: DistillAppliedReceiptStreamVerifier.Scope
-
-        init?(environment: [String: String], runId: AgentRunID) {
-            guard environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1",
-                  let root = environment["RC_TOKEN_SAVER_ROOT_RUN_ID"],
-                  UUID(uuidString: root) == runId.value,
-                  let path = environment["REMOTE_CODE_DISTILL_STATE_PATH"],
-                  !path.isEmpty else {
-                return nil
-            }
-            let url = URL(fileURLWithPath: path)
-            guard url.lastPathComponent == "DistillCLIState.json",
-                  Self.isOwnerOnlyStateFile(url),
-                  let key = TokenSaverSidecarLeaseProbe.readLease(at: url)?.receiptKey else {
-                return nil
-            }
-            self.stateFileURL = url
-            self.verifierScope = .init(rootRunID: root, key: key)
-        }
-
-        var isCurrentlyActive: Bool {
-            guard Self.isOwnerOnlyStateFile(stateFileURL),
-                  let currentKey = TokenSaverSidecarLeaseProbe.readLease(at: stateFileURL)?.receiptKey else {
-                return false
-            }
-            return currentKey == verifierScope.key
-        }
-
-        private static func isOwnerOnlyStateFile(_ url: URL) -> Bool {
-            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-                  let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue,
-                  permissions & 0o077 == 0,
-                  let owner = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value else {
-                return false
-            }
-            return owner == getuid()
         }
     }
 
@@ -1250,28 +500,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private static let deletedThreadRetirementRetryMaximumDelayNanoseconds: UInt64 = 2_000_000_000
     private typealias RunMetadata = (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)
     private var activeRunMetadata: [AgentRunID: RunMetadata] = [:]
-    /// Exact provider-bound RCW1 prompt for the current turn. The human-authored
-    /// prompt remains canonical in AgentMessage; this copy is private disclosure
-    /// metadata attached to the response before the run is released.
-    private var activeWireRequestTexts: [AgentRunID: String] = [:]
     /// Process environments are immutable after launch. Resident provider adapters
     /// therefore retain the exact scope of the process that owns their idle session.
     /// A changed attempt/admission scope forces a process refresh before the next turn.
     private var providerTurnScopes: [AgentThreadID: ProviderTurnScope] = [:]
-    /// Unlike the resident-process scope above, receipt authority belongs to one
-    /// exact UI callback run and is removed at that run's terminal cleanup.
-    private var distillReceiptRunScopes: [AgentRunID: DistillReceiptRunScope] = [:]
-    private var distillReceiptVerifiers: [AgentRunID: DistillAppliedReceiptStreamVerifier] = [:]
-    private struct DistillReceiptItemIdentity: Hashable {
-        let turnId: String
-        let itemId: String
-    }
-    /// The latest turn owning each provider item id remains known through run
-    /// cleanup so late deltas cannot mutate bytes after host attestation. A new
-    /// itemStarted in another turn intentionally moves the id to that turn.
-    private var distillReceiptItemTurnIDs: [AgentRunID: [String: String]] = [:]
-    private var authenticatedDistillReceiptItems: [AgentRunID: Set<DistillReceiptItemIdentity>] = [:]
-    private var authenticatedFinalReceiptTexts: [AgentRunID: (sourceDigest: Data, stripped: String)] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
     private var latestTokenUsage: [AgentRunID: AssistantTokenUsage] = [:]
     private var reconciledTokenUsage: [AgentRunID: ReconciledTokenUsageAccumulator] = [:]
@@ -1311,19 +543,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// exact run's later assistant item/final instead of relying on model copy.
     private var replyOnlyPrimaryRuns: Set<AgentRunID> = []
     private var replyOnlyAssistantItemIDs: [AgentRunID: Set<String>] = [:]
-    private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
-    private var bufferedProviderTextItems: [AgentRunID: [String: BufferedProviderTextItem]] = [:]
-    /// Stream humanization is asynchronous. A provider can emit its terminal
-    /// callback before the translated item has been mirrored, so terminal
-    /// cleanup must wait until every in-flight translation finishes.
-    private var providerTextTranslationsInFlight: [AgentRunID: Int] = [:]
-    private var deferredProviderTerminalEvents: [AgentRunID: DeferredProviderTerminalEvent] = [:]
-    /// Bound on how long a provider-completed `.finished` may wait for wire rendering
-    /// Token Saver must fail open: a hung local renderer cannot leave Working
-    /// latched forever. Swift's deterministic renderer remains available after
-    /// this five-second hard deadline. Tests may inject a shorter value.
-    var providerTerminalTranslationDeadline: TimeInterval = 5
-    private var deferredProviderTerminalDeadlineWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var finishingRuns: Set<AgentRunID> = []
     /// Provider terminal payloads wait here until the final stream batch crosses
     /// the SQLite durability barrier. A transient writer lock must never let the
@@ -1439,7 +658,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// onAssistantEvent fan-out or stopRun — host callbacks can block on main
     /// while the HTTP mirror path waits on this lock. Recursive so nested
     /// flush helpers can re-enter during a snapshot barrier.
-    private let mirrorEventLock = NSRecursiveLock()
+    ///
+    /// One lock per thread: every holder (stream append/flush, resume-cursor
+    /// read, purge, snapshot barrier) is scoped to a single thread id, so a long
+    /// flush or snapshot on thread A no longer stalls a paired-device
+    /// `agent.thread.read` of thread B.
+    private let mirrorEventLocks = MirrorEventLockTable()
+
+    private func mirrorEventLock(for threadId: AgentThreadID) -> NSRecursiveLock {
+        mirrorEventLocks.lock(for: threadId)
+    }
+
+    #if DEBUG
+    func mirrorEventLockForTesting(threadId: AgentThreadID) -> NSRecursiveLock {
+        mirrorEventLock(for: threadId)
+    }
+    #endif
     private static let externalReceiptLeaseRenewalInterval: TimeInterval = 6 * 60 * 60
     private static let externalReceiptLeaseRetryInterval: TimeInterval = 60
     private var observerRefs: [WeakAgentRunObserver] = []
@@ -1484,32 +718,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// tests and hosts that do not install a policy.
     public var providerAdmissionCheck: @Sendable (AgentProvider, AgentThreadID) async throws -> Void = { _, _ in }
 
-    /// Token Saver hook: async transform applied to the outbound provider
-    /// prompt only. The original text is always preserved as the displayed
-    /// user message. Must be fail-open — return the input unchanged on any
-    /// error or when Token Saver is disabled.
-    public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> String)?
-    /// Best-of-three request hook. When present it owns final Auto-aware prompt
-    /// shaping and returns the exact provider-bound payload selected from Human,
-    /// RCW1, and RCS1. The legacy String compressor remains the fallback for
-    /// hosts that have not installed the typed selector.
-    public var tokenSaverOutboundSelector: (@Sendable (
-        _ request: TokenSaverOutboundSelectionRequest
-    ) async -> TokenSaverBestOfThreeSelector.Decision)?
-    /// Fires exactly once for every typed selection, including Human fallbacks
-    /// and all pre-write/provider-write failures.
-    public var onTokenSaverOutboundDelivery: (@Sendable (
-        _ delivery: TokenSaverOutboundDelivery
-    ) -> Void)?
-    /// Prepares an RCSEED1 document for a confirmed fresh-fallback destination.
-    public var tokenSaverContextSeedPreparer: TokenSaverContextSeedPreparing?
-    /// Token Saver hook for free-form follow-up answers. Defaults to
-    /// `promptCompressor` when nil, but app shells can provide a separate hook
-    /// to tag telemetry as `prompt_followup`.
-    public var followUpPromptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> String)?
-    /// P3: optionally compact large tool output in a persisted stream-event payload before it
-    /// is written (CCR-backed, structure-preserving). nil => payloads stored verbatim.
-    public var streamPayloadCompactor: (@Sendable (_ payloadJSON: String) -> String)?
     /// UX-MAC_AGENT-BG-AWAIT: delay before a full-access run that stalled awaiting a
     /// background job is auto-nudged to resume. Gives the background job time to make
     /// progress before the agent polls it. Injectable so tests drive it to ~0.
@@ -1519,32 +727,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     var gracefulStopTimeout: TimeInterval = 2
     var hardStopTimeout: TimeInterval = 5
 
-    /// Token Saver hook: async transform applied to an RCW1 provider response.
-    /// The returned value is what gets
-    /// persisted and shown to users. Must fail open by returning the input
-    /// unchanged on any error.
-    public var finalResponseTranslator: (@Sendable (_ response: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID) async -> String)?
-
-    /// Host-owned proof gate for RCW1 assistant responses. The complete wire
-    /// payload and its deterministic Human projection are supplied together so
-    /// a host with an exact provider tokenizer can enforce the paid-token
-    /// threshold before RemoteCode persists an optimized disclosure. RCW1 A v1
-    /// has framing but no reconstructive compression primitive, so the safe
-    /// default is Human fail-open with no RCW1 response toggle.
-    public var finalResponseWireAdmissionCheck: @Sendable (
-        _ wire: String,
-        _ deterministicHuman: String
-    ) -> Bool = { _, _ in false }
-
-    /// Token Saver hook for RECOVERED sessions. The coordinator rebuilds the run request for a
+    /// Host environment for RECOVERED sessions. The coordinator rebuilds the run request for a
     /// resumed session itself (`recoverAdapterSessionIfNeeded`), bypassing the app shell's
-    /// `providerEnvironment`. Without this the recovered run loses `RC_TOKEN_SAVER_DISTILL_HINT`
-    /// and silently stops piping `| distill` / speaking distill even with Token Saver on. Returns
-    /// the Token Saver env vars to merge for the given provider; nil/empty => pre-fix behavior.
+    /// `providerEnvironment`. Returns the host env vars (Subagents telemetry) to merge for the
+    /// given provider; nil/empty => none.
     public var recoveryEnvironmentProvider: (@Sendable (_ provider: AgentProvider, _ threadId: AgentThreadID) async -> [String: String])?
     /// Exact-thread provider environment overlay for every fresh turn. The app
-    /// shell uses this to avoid leaking project-scoped Token Saver hints into
-    /// provider probes or unrelated threads.
+    /// shell uses this to keep thread-scoped host keys out of provider probes
+    /// and unrelated threads.
     public var runEnvironmentProvider: (@Sendable (_ provider: AgentProvider, _ threadId: AgentThreadID, _ base: [String: String]) async -> [String: String])?
     /// Fires after the exact run/thread graph is durable and before provider
     /// start. Payload consumers must remain content-free or store only scoped,
@@ -1555,11 +745,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     var afterSpawnClaimForTesting: (@Sendable (_ request: AgentRunRequest) async -> Void)?
     /// After the post-claim Stop re-check and immediately before `sendTurn`.
     var afterSpawnConfirmForTesting: (@Sendable (_ request: AgentRunRequest) async -> Void)?
-
-    /// Fired (on an arbitrary executor) when a final assistant message was wire-rendered
-    /// and persisted. Callers can use the id to badge the message in the UI.
-    /// Not fired when translation is a no-op (finalResponseTranslator absent or text unchanged).
-    public var onWireTranslatedMessageId: (@Sendable (AgentMessageID) -> Void)?
 
     /// Optional durable terminal-transition ledger (write-before-UI). Forensic only.
     public var terminalTransitionLedger: TerminalTransitionLedger?
@@ -1655,7 +840,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Snapshot active runs before reconcile so we can stamp ledger rows.
         let preLaunchActive = (try? runRepo.listActive()) ?? []
         _ = try runRepo.reconcileRunningOnLaunch(preservingThreadIDs: preservingThreadIDs)
-        _ = try? runRepo.selectionReceipts().reconcileProvisionalOnRelaunch()
         for run in preLaunchActive {
             if preservingThreadIDs.contains(run.threadId) { continue }
             _ = recordTerminalTransition(
@@ -1968,9 +1152,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             contextSnapshot: request.contextSnapshot,
             preparedContextSeed: request.preparedContextSeed
         )
-        // Same contract as a bot-brain prompt: the provider prompt differs from
-        // the displayed text, so it is the prompt that goes out.
-        handed.tokenSaverCompressesPrompt = request.tokenSaverCompressesPrompt || summary != nil
         return handed
     }
 
@@ -2032,45 +1213,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runId: runId,
             acceptancePermit: request.acceptancePermit ?? AgentRunAcceptancePermit()
         )
-        var outboundDecisionContext: (
-            receipt: TokenSaverBestOfThreeSelector.DecisionReceipt,
-            provider: AgentProvider,
-            resolvedModel: String,
-            threadId: AgentThreadID,
-            runId: AgentRunID,
-            deliver: (@Sendable (TokenSaverOutboundDelivery) -> Void)?
-        )?
-        var pendingSelectionDecision: TokenSaverBestOfThreeSelector.Decision?
-        var receiptCommitted = false
-        var sendTurnEntered = false
-        defer {
-            if receiptCommitted {
-                let lifecycle: TokenSaverRequestSelectionReceipt.Lifecycle
-                if !sendTurnEntered {
-                    lifecycle = .notDelivered
-                } else if pendingProviderStart.acceptancePermit.outcome == .accepted {
-                    lifecycle = .delivered
-                } else {
-                    lifecycle = .deliveryUnknown
-                }
-                try? runRepo.selectionReceipts().acknowledgeBatch([
-                    TokenSaverRequestSelectionLifecycleAck(
-                        runId: runId.value.uuidString,
-                        lifecycle: lifecycle
-                    )
-                ])
-            }
-            if let outboundDecisionContext {
-                outboundDecisionContext.deliver?(TokenSaverOutboundDelivery(
-                    receipt: outboundDecisionContext.receipt,
-                    provider: outboundDecisionContext.provider,
-                    resolvedModel: outboundDecisionContext.resolvedModel,
-                    threadId: outboundDecisionContext.threadId,
-                    runId: outboundDecisionContext.runId,
-                    outcome: pendingProviderStart.acceptancePermit.outcome
-                ))
-            }
-        }
         lock.lock()
         let registeredPendingStart: Bool
         if pendingProviderStarts[request.threadId] == nil {
@@ -2225,144 +1367,23 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let recoveryContext = request.providerThreadId == nil && macHandoff == nil
             ? try recoverableResumeContext(for: request) : nil
         let resumeCursor = request.providerThreadId ?? recoveryContext?.resumeCursor
-        // Token Saver: compress only the text sent to the provider; the
-        // original prompt is preserved verbatim as the displayed user message.
+        // The displayed user message keeps the human text (with its attachment
+        // summary); the provider gets the request prompt (already wrapped by
+        // Auto admission, or a host-built bot / handoff prompt).
         let preservedUserContent = request.userMessageContent ?? request.prompt
-        let tokenSaverInput = request.tokenSaverCompressesPrompt ? request.prompt : preservedUserContent
-        var outboundPrompt = request.prompt
-        var selectedTransportFormat: TokenSaverBestOfThreeSelector.Format?
+        let outboundPrompt = request.prompt
         var effectiveEnvironment = request.environment
-        let selectedSelector = tokenSaverOutboundSelector
-        let selectedDelivery = onTokenSaverOutboundDelivery
+        if request.provider != .distill {
+            let scopedEnvironment = await runEnvironmentProvider?(
+                request.provider,
+                request.threadId,
+                request.environment
+            ) ?? [:]
+            effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
+        }
         let attemptId = request.runId.value.uuidString
-        if request.provider == .distill {
-            // Distill receives the human prompt unchanged; keep bot directives in its client.
-            outboundPrompt = request.prompt
-        } else if let selectedSelector {
-            // Typed path: Auto already bound provider/model. Stamp the scoped
-            // env with this attempt before selection, then project by format.
-            let scopedEnvironment = await runEnvironmentProvider?(
-                request.provider,
-                request.threadId,
-                request.environment
-            ) ?? [:]
-            effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
-            effectiveEnvironment = TokenSaverExecutionReceiptSeam.stampIdentity(
-                environment: effectiveEnvironment,
-                rootRunId: attemptId,
-                attemptId: attemptId,
-                provider: request.provider
-            )
-            let selectionRequest = TokenSaverOutboundSelectionRequest(
-                canonicalHuman: tokenSaverInput,
-                admittedRequest: request,
-                autoRoute: admittedRequest.autoRoute,
-                admittedEnvironment: effectiveEnvironment
-            )
-            var decision = await selectedSelector(selectionRequest)
-                .bindingToCurrentHuman(
-                    canonicalHuman: tokenSaverInput,
-                    admittedPrompt: request.prompt,
-                    provider: request.provider.rawValue,
-                    resolvedModel: request.model
-                )
-            if decision.selectedFormat == .rcw1 {
-                let projected = selectionRequest.environment(for: .rcw1)
-                let capable = projected[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1"
-                if !capable || !Self.isStructurallyValidRCW1Request(decision.selectedPayload) {
-                    decision = decision.fallingBackToHuman(
-                        payload: request.prompt,
-                        reason: .candidateError,
-                        canonicalHuman: tokenSaverInput
-                    )
-                }
-            }
-            if decision.selectedFormat == .rcs1 {
-                let projected = selectionRequest.environment(for: .rcs1)
-                let capable = projected[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey] == "1"
-                    && projected[TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey] == "1"
-                if !capable || RemoteCodeCompactSpan.decode(decision.selectedPayload) == nil {
-                    decision = decision.fallingBackToHuman(
-                        payload: request.prompt,
-                        reason: .candidateError,
-                        canonicalHuman: tokenSaverInput
-                    )
-                }
-            }
-            outboundPrompt = decision.selectedPayload
-            selectedTransportFormat = decision.selectedFormat
-            effectiveEnvironment = selectionRequest.environment(for: decision.selectedFormat)
-            pendingSelectionDecision = decision
-            outboundDecisionContext = (
-                decision.receipt,
-                request.provider,
-                request.model,
-                request.threadId,
-                request.runId,
-                selectedDelivery
-            )
-        } else {
-            // Legacy path: compressor (including Auto shaping) first, then one
-            // scoped-environment composition. Do not invert or double-run env.
-            if let promptCompressor {
-                let transformed = await promptCompressor(
-                    tokenSaverInput,
-                    request.provider,
-                    request.threadId,
-                    request.runId
-                )
-                if let route = admittedRequest.autoRoute {
-                    if RCWireProtocol.isWire(transformed) {
-                        outboundPrompt = (try? AgentOrchestrationRuntime.autoOrchestrateProviderWirePrompt(
-                            wirePrompt: transformed,
-                            admittedRoute: route
-                        )) ?? request.prompt
-                    } else {
-                        outboundPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
-                            userPrompt: transformed,
-                            admittedRoute: route
-                        )
-                    }
-                } else {
-                    outboundPrompt = transformed
-                }
-            }
-            let scopedEnvironment = await runEnvironmentProvider?(
-                request.provider,
-                request.threadId,
-                request.environment
-            ) ?? [:]
-            effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
-        }
-        let isWireOutbound = selectedTransportFormat.map { $0 == .rcw1 }
-            ?? RCWireProtocol.isWire(outboundPrompt)
-        lock.lock()
-        if isWireOutbound {
-            activeWireRequestTexts[request.runId] = outboundPrompt
-        } else {
-            activeWireRequestTexts.removeValue(forKey: request.runId)
-        }
-        lock.unlock()
-        // Per-turn atomic wire admission for the legacy String compressor only.
-        // Typed selection already applied the shared format projection above.
-        if selectedTransportFormat == nil {
-            if isWireOutbound {
-                effectiveEnvironment["RC_TOKEN_SAVER_WIRE_VERSION"] = "1"
-            } else {
-                effectiveEnvironment.removeValue(forKey: "RC_TOKEN_SAVER_WIRE_VERSION")
-            }
-            // Host-authoritative attempt identity: stamp discrete keys + compact receipt
-            // so nested Codex/Claude/Grok workers inherit the same attempt for attribution.
-            effectiveEnvironment = TokenSaverExecutionReceiptSeam.stampIdentity(
-                environment: effectiveEnvironment,
-                rootRunId: attemptId,
-                attemptId: attemptId,
-                provider: request.provider
-            )
-        }
-        // Parent linkage is lifecycle metadata, not a paid Token Saver lane.
-        // Keep it available when Token Saver is off so nested receipts still
-        // attach to the actual controller run.
+        // Parent linkage is lifecycle metadata: nested receipts attach to the
+        // actual controller run.
         effectiveEnvironment["RC_REMOTE_CODE_ROOT_RUN_ID"] = attemptId
         effectiveEnvironment["RC_REMOTE_CODE_ATTEMPT_ID"] = attemptId
         if let delegationCapability {
@@ -2410,7 +1431,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runAsUser: request.runAsUser,
             acceptancePermit: pendingProviderStart.acceptancePermit
         )
-        effectiveRequest.tokenSaverCompressesPrompt = request.tokenSaverCompressesPrompt
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)
         }
@@ -2451,19 +1471,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         // persist run
         let run = AgentRun(id: effectiveRequest.runId, threadId: effectiveRequest.threadId, provider: effectiveRequest.provider, providerInstanceId: effectiveRequest.providerInstanceId, model: effectiveRequest.model, status: .pending)
-        if let pendingSelectionDecision {
-            let record = TokenSaverRequestSelectionReceipt.project(
-                decision: pendingSelectionDecision,
-                runId: run.id.value.uuidString,
-                threadId: run.threadId.value.uuidString,
-                provider: effectiveRequest.provider.rawValue,
-                resolvedModel: effectiveRequest.model
-            )
-            try runRepo.selectionReceipts().persistPendingRun(run, record: record)
-            receiptCommitted = true
-        } else {
-            try runRepo.upsert(run)
-        }
+        try runRepo.upsert(run)
         // Status + unread + updated_at only. A leftover 26-column + routing
         // `get` then `upsert` hitchs every send and rewrites routing JSON.
         try threadRepo.updateStatus(
@@ -2480,11 +1488,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if let existingPayload {
                 runtimePayloadJSON = existingPayload
             } else {
-                var nextRuntimePayload = ProviderSessionRuntimePayload.decode(nil)
-                if effectiveEnvironment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1" {
-                    nextRuntimePayload.wireProtocolVersion = RCWireProtocol.version
-                }
-                runtimePayloadJSON = nextRuntimePayload.encoded()
+                runtimePayloadJSON = ProviderSessionRuntimePayload.decode(nil).encoded()
             }
             if effectiveRequest.provider == .distill,
                let resumeCursor = effectiveRequest.providerThreadId, !resumeCursor.isEmpty {
@@ -2558,49 +1562,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
             throw AgentRunAcceptanceError.cancelled
         }
-        if recordUserMessage, isWireOutbound {
-            // The human prompt is stored on AgentMessage; persist only the
-            // provider-bound RCW1 bytes here so the user row can disclose the
-            // exact translation without tripling large prompts in the hot-text
-            // budget. The user message id is intentionally the run id.
-            try messageRepo.upsertRCW1RequestTranslation(
-                messageId: AgentMessageID(effectiveRequest.runId.value),
-                wireRequestText: outboundPrompt
-            )
-            handle(
-                event: .event(.wireTranslation(AssistantWireTranslation(
-                    messageId: effectiveRequest.runId.value.uuidString,
-                    originalText: "",
-                    rewrittenText: "",
-                    fallbackReason: "outbound_wire_request",
-                    wireRequestText: outboundPrompt
-                ))),
-                runId: runId,
-                threadId: effectiveRequest.threadId,
-                allowFinalResponseTranslation: false
-            )
-            onWireTranslatedMessageId?(AgentMessageID(effectiveRequest.runId.value))
-        }
         agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
-
-        // Some adapters synchronously emit their first item before sendTurn
-        // returns. Capture receipt authority before crossing that boundary.
-        let distillReceiptScope = DistillReceiptRunScope(
-            environment: effectiveRequest.environment,
-            runId: runId
-        )
-        lock.withLock {
-            if let distillReceiptScope {
-                distillReceiptRunScopes[runId] = distillReceiptScope
-                distillReceiptVerifiers[runId] = DistillAppliedReceiptStreamVerifier()
-            } else {
-                distillReceiptRunScopes.removeValue(forKey: runId)
-                distillReceiptVerifiers.removeValue(forKey: runId)
-            }
-            distillReceiptItemTurnIDs.removeValue(forKey: runId)
-            authenticatedDistillReceiptItems.removeValue(forKey: runId)
-            authenticatedFinalReceiptTexts.removeValue(forKey: runId)
-        }
 
         let coordinator = self
         let handle: AgentRunHandle
@@ -2610,7 +1572,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 markStopRequested(threadId: effectiveRequest.threadId, runId: runId)
                 throw AgentRunAcceptanceError.cancelled
             }
-            sendTurnEntered = true
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
             }
@@ -2631,13 +1592,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 event: .providerFinished(generation: gen, reason: .providerFailure)
             )
             lock.unlock()
-            lock.withLock {
-                distillReceiptRunScopes.removeValue(forKey: runId)
-                distillReceiptVerifiers.removeValue(forKey: runId)
-                distillReceiptItemTurnIDs.removeValue(forKey: runId)
-                authenticatedDistillReceiptItems.removeValue(forKey: runId)
-                authenticatedFinalReceiptTexts.removeValue(forKey: runId)
-            }
             markStartFailure(
                 error,
                 request: effectiveRequest,
@@ -2743,7 +1697,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 ),
                 runId: runId,
                 threadId: threadId,
-                allowFinalResponseTranslation: false,
+                deduplicatesInFlightFinish: false,
                 providerTerminalAcknowledged: pending.providerTerminalAcknowledged
             )
         }
@@ -3051,7 +2005,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     @discardableResult
     public func stopRun(threadId: AgentThreadID) -> AgentRunStatus? {
         // RPC/iOS Stop must cancel surface-preflight reservations even when no
-        // durable/pending/active run exists yet (Graphify await window).
+        // durable/pending/active run exists yet (surface preparation window).
         cancelPreparation(threadId: threadId)
         lock.lock()
         let runId = activeThreads[threadId]
@@ -3387,7 +2341,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// S5: Stop/Escape cancels generation-owned preparation and arms pending stop
     /// so a late claimSpawn/sendTurn cannot start the provider.
     /// Arms `pendingThreadStops` only when a pending start or surface reservation
-    /// exists — pure Graphify-only cancel before claim must not poison resend.
+    /// exists — a preparation-only cancel before claim must not poison resend.
     /// Invalidates the pending start's acceptance permit under the coordinator
     /// lock so a concurrent `withAcceptance` cannot claim after Stop is recorded.
     public func cancelPreparation(threadId: AgentThreadID) {
@@ -3416,7 +2370,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Surface finished Graphify claim and is about to call startRun. Stop in the
+    /// Surface finished its preparation claim and is about to call startRun. Stop in the
     /// gap must arm pendingThreadStops so registration cannot spawn.
     /// Reservation is run-scoped so late registration of a cancelled run cannot
     /// clear a concurrent resend reservation on the same thread.
@@ -3576,7 +2530,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let streamOwner = pendingStreamRunIds[threadId]
         let terminalBarrierPending = streamOwner.map {
             pendingTerminalEvents[$0] != nil
-                || deferredProviderTerminalEvents[$0] != nil
                 || finishingRuns.contains($0)
         } ?? false
         lock.unlock()
@@ -3605,7 +2558,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// keeps the durable session status (a failed, cancelled or interrupted row).
     ///
     /// The capped pass targets threads that finished seconds ago, so the release
-    /// also waits out a finish still in flight (pending, deferred or finishing
+    /// also waits out a finish still in flight (pending or finishing
     /// terminal, the ghost-reconcile barrier) and any in-memory ownership, then
     /// holds the thread's start gate across `stopSession`: a start cannot begin
     /// on the session being stopped. A start that loses that race fails like any
@@ -3615,7 +2568,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let streamOwner = pendingStreamRunIds[threadId]
         let terminalBarrierPending = streamOwner.map {
             pendingTerminalEvents[$0] != nil
-                || deferredProviderTerminalEvents[$0] != nil
                 || finishingRuns.contains($0)
         } ?? false
         // A surface that reserved a start is about to send on this session.
@@ -3822,14 +2774,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         // Stream writers take mirrorEventLock before lock. Match that order so a
         // last buffered event cannot resurrect a deleted thread while we clear it.
-        mirrorEventLock.lock()
+        mirrorEventLock(for: threadId).lock()
         lock.lock()
         let mayPurge = !hasUnsafeInMemoryOwnershipLocked(threadId)
         if mayPurge {
             purgeDeletedThreadRuntimeLocked(threadId)
         }
         lock.unlock()
-        mirrorEventLock.unlock()
+        mirrorEventLock(for: threadId).unlock()
         return mayPurge ? .retired : .retryRequired
     }
 
@@ -3891,15 +2843,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             || orchestrationDeadlineWorkItems[runId] != nil
             || externalReceiptLeaseWorkItems[runId] != nil
             || activeAssistantMessageIds[runId] != nil
-            || activeProviderTextItemTypes[runId] != nil
-            || bufferedProviderTextItems[runId] != nil
-            || providerTextTranslationsInFlight[runId] != nil
-            || distillReceiptRunScopes[runId] != nil
-            || distillReceiptVerifiers[runId] != nil
-            || distillReceiptItemTurnIDs[runId] != nil
-            || authenticatedDistillReceiptItems[runId] != nil
-            || authenticatedFinalReceiptTexts[runId] != nil
-            || deferredProviderTerminalEvents[runId] != nil
             || finishingRuns.contains(runId)
             || pendingTerminalEvents[runId] != nil
             || terminalRetryScheduled.contains(runId)
@@ -3987,7 +2930,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         active.removeValue(forKey: runId)
         activeDelegationCapabilities.removeValue(forKey: runId)
         activeRunMetadata.removeValue(forKey: runId)
-        activeWireRequestTexts.removeValue(forKey: runId)
         activeTurnIds.removeValue(forKey: runId)
         latestTokenUsage.removeValue(forKey: runId)
         reconciledTokenUsage.removeValue(forKey: runId)
@@ -4001,16 +2943,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         activeAssistantMessageIds.removeValue(forKey: runId)
         replyOnlyPrimaryRuns.remove(runId)
         replyOnlyAssistantItemIDs.removeValue(forKey: runId)
-        activeProviderTextItemTypes.removeValue(forKey: runId)
-        bufferedProviderTextItems.removeValue(forKey: runId)
-        providerTextTranslationsInFlight.removeValue(forKey: runId)
-        distillReceiptRunScopes.removeValue(forKey: runId)
-        distillReceiptVerifiers.removeValue(forKey: runId)
-        distillReceiptItemTurnIDs.removeValue(forKey: runId)
-        authenticatedDistillReceiptItems.removeValue(forKey: runId)
-        authenticatedFinalReceiptTexts.removeValue(forKey: runId)
-        deferredProviderTerminalEvents.removeValue(forKey: runId)
-        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         finishingRuns.remove(runId)
         pendingTerminalEvents.removeValue(forKey: runId)
         terminalRetryScheduled.remove(runId)
@@ -4215,11 +3147,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         generation: UInt64,
         threadAbsent: Bool
     ) {
-        mirrorEventLock.lock()
+        mirrorEventLock(for: threadId).lock()
         lock.lock()
         defer {
             lock.unlock()
-            mirrorEventLock.unlock()
+            mirrorEventLock(for: threadId).unlock()
         }
         guard let claim = lateRunAdmissionClaims[runId],
               claim.matches(threadId: threadId, generation: generation) else {
@@ -4500,19 +3432,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // becomes the retained event and retries until the buffered stream tail
             // commits. This prevents Stop-first from evicting active ownership or
             // publishing `.cancelled` while SQLite still holds uncommitted events.
-            //
-            // User Stop must never wait on local wire rendering. In-flight text
-            // translations used to defer `.finished(.cancelled)` forever (or until
-            // distill startup timed out ~60s), leaving the UI on "Stopping…" with
-            // the button disabled. Clear that gate on every Stop claim/retry.
             lock.lock()
-            providerTextTranslationsInFlight.removeValue(forKey: runId)
-            // Drop a deferred provider terminal waiting on rendering — user cancel
-            // supersedes it when the durability slot is still free. If a terminal
-            // is already claimed below, the deferred entry is obsolete either way.
-            deferredProviderTerminalEvents.removeValue(forKey: runId)
-            deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
-
             if pendingTerminalEvents[runId] != nil {
                 // Provider (or a prior Stop) already owns the durability slot.
                 // Do not replace a retained `.completed` with `.cancelled` — see
@@ -4544,7 +3464,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 event: .finished(.cancelled, finalMessage: nil, providerThreadId: nil),
                 runId: runId,
                 threadId: threadId,
-                allowFinalResponseTranslation: false,
+                deduplicatesInFlightFinish: false,
                 providerTerminalAcknowledged: false
             )
             return
@@ -4577,11 +3497,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             delegatedRuns.removeValue(forKey: runId)
             activeRunMetadata.removeValue(forKey: runId)
-            activeWireRequestTexts.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
-            activeProviderTextItemTypes.removeValue(forKey: runId)
-            bufferedProviderTextItems.removeValue(forKey: runId)
             finishingRuns.remove(runId)
             // Do not clear seq while a failed flush still owns a retryable batch.
             // Clearing here reissued seq 1 for late Grok ACP events (e.g.
@@ -4695,7 +3612,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         delegatedRuns.removeValue(forKey: runId)
         activeRunMetadata.removeValue(forKey: runId)
-        activeWireRequestTexts.removeValue(forKey: runId)
         latestTokenUsage.removeValue(forKey: runId)
         reconciledTokenUsage.removeValue(forKey: runId)
         receiptUsageFinalizationInFlight.remove(runId)
@@ -4703,25 +3619,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         latestRunErrorMessages.removeValue(forKey: runId)
         activeTurnIds.removeValue(forKey: runId)
         activeAssistantMessageIds.removeValue(forKey: runId)
-        activeProviderTextItemTypes.removeValue(forKey: runId)
-        bufferedProviderTextItems.removeValue(forKey: runId)
         finishingRuns.remove(runId)
         pendingTerminalEvents.removeValue(forKey: runId)
         terminalRetryScheduled.remove(runId)
-        deferredProviderTerminalEvents.removeValue(forKey: runId)
-        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
-        providerTextTranslationsInFlight.removeValue(forKey: runId)
         pendingGracefulStopFallbacks.remove(runId)
         awaitingTerminationRuns.remove(runId)
         providerTerminatedRuns.remove(runId)
         pendingThreadStops.remove(threadId)
         orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
         externalReceiptLeaseWorkItems.removeValue(forKey: runId)?.cancel()
-        distillReceiptRunScopes.removeValue(forKey: runId)
-        distillReceiptVerifiers.removeValue(forKey: runId)
-        distillReceiptItemTurnIDs.removeValue(forKey: runId)
-        authenticatedDistillReceiptItems.removeValue(forKey: runId)
-        authenticatedFinalReceiptTexts.removeValue(forKey: runId)
         seq.removeValue(forKey: runId)
         discardRunThreadOwnershipIfReleasedLocked(runId)
         lastPersistedAssistantContent.removeValue(forKey: threadId)
@@ -4835,14 +3741,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             usage: nil,
             qualityOutcome: "test"
         )
-        deferredProviderTerminalEvents[runId] = DeferredProviderTerminalEvent(
-            status: .failed,
-            finalMessage: nil,
-            providerThreadId: nil,
-            threadId: threadId,
-            allowFinalResponseTranslation: false,
-            providerTerminalAcknowledged: true
-        )
         pendingTerminalEvents[runId] = PendingTerminalEvent(
             status: .failed,
             finalMessage: nil,
@@ -4888,7 +3786,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         ids.formUnion(lastPersistedAssistantContent.keys)
         ids.formUnion(pendingStartFailures.values.map { $0.request.threadId })
         ids.formUnion(pendingReceiptFinalizations.values.map(\.threadId))
-        ids.formUnion(deferredProviderTerminalEvents.values.map(\.threadId))
         ids.formUnion(runThreadOwnership.values)
         return ids
     }
@@ -4929,16 +3826,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 .union(receiptUsageEnrichmentRetryScheduled)
                 .union(pendingReceiptFinalizations.keys)
                 .union(receiptFinalizationRetryScheduled)
-        }
-    }
-
-    var distillReceiptAuthorityRunIDsForTesting: Set<AgentRunID> {
-        lock.withLock {
-            Set(distillReceiptRunScopes.keys)
-                .union(distillReceiptVerifiers.keys)
-                .union(distillReceiptItemTurnIDs.keys)
-                .union(authenticatedDistillReceiptItems.keys)
-                .union(authenticatedFinalReceiptTexts.keys)
         }
     }
     #endif
@@ -5087,7 +3974,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     userInfo: [NSLocalizedDescriptionKey: "Start failure event JSON was not UTF-8."]
                 )
             }
-            payloadJSON = streamPayloadCompactor?(json) ?? json
+            payloadJSON = json
         } catch {
             recordMirrorPersistenceFailure(error, threadId: request.threadId)
             emitPersistenceIssue("run.start_failure.encode", error: error, runId: runId, threadId: request.threadId)
@@ -5125,23 +4012,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) async throws {
         let adapter = try adapterForThread(threadId)
-        let activeRunID = (try? durableActiveRunChrome(threadId: threadId))?.id
-        let outboundText: String
-        if let followUpPromptCompressor {
-            outboundText = await followUpPromptCompressor(text, adapter.provider, threadId, activeRunID)
-        } else if let promptCompressor {
-            outboundText = await promptCompressor(text, adapter.provider, threadId, activeRunID)
-        } else {
-            outboundText = text
-        }
-        try adapter.respondToUserInput(threadId: threadId, requestId: requestId, verbatimText: text, outboundText: outboundText)
-    }
-
-    /// User-initiated retry for a persisted raw RCW1 response. This uses the
-    /// same bounded renderer race as the live path and never starts a provider
-    /// turn or mutates provider state.
-    public func retryWireResponse(_ response: String, threadId: AgentThreadID) async -> String {
-        await translateWireResponse(response, runId: AgentRunID(), threadId: threadId)
+        try adapter.respondToUserInput(threadId: threadId, requestId: requestId, verbatimText: text, outboundText: text)
     }
 
     public func cancelUserInput(threadId: AgentThreadID, requestId: String) throws {
@@ -5716,8 +4587,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         _ body: () throws -> T
     ) throws -> T {
         let outcome: MirrorEventLockOutcome<T> = {
-            mirrorEventLock.lock()
-            defer { mirrorEventLock.unlock() }
+            mirrorEventLock(for: threadId).lock()
+            defer { mirrorEventLock(for: threadId).unlock() }
             lock.lock()
             let priorFailure = mirrorPersistenceFailures[threadId]
             lock.unlock()
@@ -5968,11 +4839,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let priorScope = providerTurnScopes[request.threadId]
         lock.unlock()
         let scopeChanged = priorScope.map { $0 != nextScope }
-            ?? nextScope.carriesTokenSaverScope
+            ?? nextScope.carriesHostScope
         guard scopeChanged else { return }
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported(
-                "Provider process scope changed before a durable provider thread id was available; refusing to reuse stale Token Saver scope."
+                "Provider process scope changed before a durable provider thread id was available; refusing to reuse a stale provider process scope."
             )
         }
         try adapter.stopSession(threadId: request.threadId)
@@ -6008,22 +4879,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             throw AgentProviderAdapterError.unsupported("Provider session recovery requires cwd")
         }
         let activeTurnId = session.activeTurnId
-        // Recovered sessions are rebuilt here, bypassing the app shell's providerEnvironment, so
-        // re-derive the Token Saver env or distill silently turns off on resume. Always keep the
-        // provider tag so `| distill` savings attribute to claude/codex (not "unknown").
+        // Recovered sessions are rebuilt here, bypassing the app shell's
+        // providerEnvironment, so re-derive the host environment (Subagents
+        // telemetry) and always keep the provider tag.
         let recoveryRunID = AgentRunID()
         let recoveryEventRunId = try recoveryEventRunId(session: session, thread: thread, threadId: threadId)
         var environment = await recoveryEnvironmentProvider?(thread.provider, threadId) ?? [:]
         environment["REMOTE_CODE_AGENT_PROVIDER"] = thread.provider.rawValue
-        // Resume bypasses providerEnvironment; re-stamp attempt + receipt so distill
-        // attribution and nested worker inheritance match a normal startRun path.
+        // Resume bypasses providerEnvironment; stamp the attempt identity so
+        // nested worker inheritance matches a normal startRun path.
         let recoveryAttempt = recoveryRunID.value.uuidString
-        environment = TokenSaverExecutionReceiptSeam.stampIdentity(
-            environment: environment,
-            rootRunId: recoveryEventRunId.value.uuidString,
-            attemptId: recoveryAttempt,
-            provider: thread.provider
-        )
         environment["RC_REMOTE_CODE_ROOT_RUN_ID"] = recoveryEventRunId.value.uuidString
         environment["RC_REMOTE_CODE_ATTEMPT_ID"] = recoveryAttempt
         let request = AgentRunRequest(
@@ -6044,35 +4909,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? [],
             runAsUser: thread.runAsUser
         )
-        let distillReceiptScope = DistillReceiptRunScope(
-            environment: request.environment,
-            runId: recoveryEventRunId
-        )
-        lock.withLock {
-            if let distillReceiptScope {
-                distillReceiptRunScopes[recoveryEventRunId] = distillReceiptScope
-                distillReceiptVerifiers[recoveryEventRunId] = DistillAppliedReceiptStreamVerifier()
-            } else {
-                distillReceiptRunScopes.removeValue(forKey: recoveryEventRunId)
-                distillReceiptVerifiers.removeValue(forKey: recoveryEventRunId)
-            }
-            distillReceiptItemTurnIDs.removeValue(forKey: recoveryEventRunId)
-            authenticatedDistillReceiptItems.removeValue(forKey: recoveryEventRunId)
-            authenticatedFinalReceiptTexts.removeValue(forKey: recoveryEventRunId)
-        }
-        do {
-            try await adapter.recoverSession(request) { [weak self] event in
-                self?.handle(event: event, runId: recoveryEventRunId, threadId: threadId)
-            }
-        } catch {
-            lock.withLock {
-                distillReceiptRunScopes.removeValue(forKey: recoveryEventRunId)
-                distillReceiptVerifiers.removeValue(forKey: recoveryEventRunId)
-                distillReceiptItemTurnIDs.removeValue(forKey: recoveryEventRunId)
-                authenticatedDistillReceiptItems.removeValue(forKey: recoveryEventRunId)
-                authenticatedFinalReceiptTexts.removeValue(forKey: recoveryEventRunId)
-            }
-            throw error
+        try await adapter.recoverSession(request) { [weak self] event in
+            self?.handle(event: event, runId: recoveryEventRunId, threadId: threadId)
         }
         lock.lock()
         providerTurnScopes[threadId] = ProviderTurnScope(environment: request.environment)
@@ -6249,8 +5087,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         runId: AgentRunID,
         threadId: AgentThreadID
     ) -> StreamFlushAttempt {
-        mirrorEventLock.lock()
-        defer { mirrorEventLock.unlock() }
+        mirrorEventLock(for: threadId).lock()
+        defer { mirrorEventLock(for: threadId).unlock() }
         lock.lock()
         if let bufferedRunId = pendingStreamRunIds[threadId], bufferedRunId != runId {
             lock.unlock()
@@ -6381,7 +5219,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         runId: AgentRunID
     ) -> PersistAssistantOutcome {
         let text = AssistantTimelineState.cappedText(
-            sanitizeFinalAssistantText(text, runId: runId)
+            sanitizeFinalAssistantText(text)
         )
         guard !text.isEmpty else {
             return PersistAssistantOutcome(message: nil, deferredIssue: nil, pendingMessageAppendNotification: nil)
@@ -6463,59 +5301,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
     }
 
-    private func sanitizeFinalAssistantText(
-        _ text: String,
-        runId: AgentRunID? = nil
-    ) -> String {
+    private func sanitizeFinalAssistantText(_ text: String) -> String {
         // Shared provider-agnostic choke point for final assistant text: strip
-        // leaked model control tokens (e.g. Grok `<|eos|>`), authenticated
-        // Distill receipts, unresolved CCR handles, then raw tool-invocation
-        // markup (leaving the uncalled-tool incomplete-turn signal). Covers
-        // claude / codex / grok. Unauthenticated receipt-shaped prose remains
-        // visible instead of manufacturing a Token Saver claim.
-        let receiptChecked = runId.map {
-            stripAuthenticatedFinalReceipt(text, runId: $0)
-        } ?? text
-        return AssistantToolMarkupSanitizer.sanitize(
+        // leaked model control tokens (e.g. Grok `<|eos|>`), unresolved CCR
+        // handles, then raw tool-invocation markup (leaving the uncalled-tool
+        // incomplete-turn signal). Covers claude / codex / grok.
+        AssistantToolMarkupSanitizer.sanitize(
             RetrieveHandleSanitizer.strip(
-                ProviderControlTokenSanitizer.strip(receiptChecked)
+                ProviderControlTokenSanitizer.strip(text)
             )
         )
     }
 
-    private func sanitizeFinalAssistantText(
-        _ text: String?,
-        runId: AgentRunID? = nil
-    ) -> String? {
-        text.map { sanitizeFinalAssistantText($0, runId: runId) }
-    }
-
-    private func stripAuthenticatedFinalReceipt(
-        _ text: String,
-        runId: AgentRunID
-    ) -> String {
-        let sourceDigest = Data(SHA256.hash(data: Data(text.utf8)))
-        if let cached = lock.withLock({ authenticatedFinalReceiptTexts[runId] }),
-           cached.sourceDigest == sourceDigest {
-            return cached.stripped
-        }
-        guard let receiptScope = lock.withLock({ distillReceiptRunScopes[runId] }),
-              receiptScope.isCurrentlyActive else {
-            return text
-        }
-        let authenticated = lock.withLock { () -> Bool in
-            guard let verifier = distillReceiptVerifiers[runId] else { return false }
-            return verifier.validatesStandaloneForSanitization(
-                text,
-                scope: receiptScope.verifierScope
-            )
-        }
-        guard authenticated else { return text }
-        let stripped = DistillAppliedReceipt.strip(text)
-        lock.withLock {
-            authenticatedFinalReceiptTexts[runId] = (sourceDigest, stripped)
-        }
-        return stripped
+    private func sanitizeFinalAssistantText(_ text: String?) -> String? {
+        text.map { sanitizeFinalAssistantText($0) }
     }
 
     /// Stable identity for a final message synthesized from a provider terminal
@@ -6527,189 +5326,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return AgentMessageID(UUID(uuid: bytes))
     }
 
-    private struct PreparedAssistantEvent {
-        let event: AssistantEvent
-        let hostMetadataTrusted: Bool
-    }
-
-    /// Converts provider-owned events into a host-owned receipt metadata event
-    /// only after the exact terminal bytes authenticate for this run. The caller
-    /// persists these returned events in order before any observer sees them.
-    private func prepareDistillReceiptEvents(
-        _ event: AssistantEvent,
-        runId: AgentRunID
-    ) -> [PreparedAssistantEvent] {
-        switch event {
-        case .itemStarted(let item):
-            let providerItem = item.withoutHostMetadata()
-            let shouldAccept = lock.withLock { () -> Bool in
-                guard distillReceiptRunScopes[runId] != nil else { return true }
-                let identity = DistillReceiptItemIdentity(turnId: item.turnId, itemId: item.id)
-                guard authenticatedDistillReceiptItems[runId]?.contains(identity) != true else {
-                    return false
-                }
-                var verifier = distillReceiptVerifiers[runId]
-                    ?? DistillAppliedReceiptStreamVerifier()
-                verifier.startItem(
-                    id: item.id,
-                    itemType: item.type,
-                    body: item.body,
-                    output: item.output
-                )
-                distillReceiptVerifiers[runId] = verifier
-                distillReceiptItemTurnIDs[runId, default: [:]][item.id] = item.turnId
-                return true
-            }
-            guard shouldAccept else { return [] }
-            var prepared = [PreparedAssistantEvent(
-                event: .itemStarted(item: providerItem),
-                hostMetadataTrusted: false
-            )]
-            if item.state != .streaming,
-               let completion = completeDistillReceipt(itemID: item.id, runId: runId) {
-                prepared.append(PreparedAssistantEvent(
-                    event: .itemHostMetadata(
-                        turnId: completion.turnId,
-                        itemId: item.id,
-                        distillApplied: true,
-                        attestation: completion.attestation
-                    ),
-                    hostMetadataTrusted: true
-                ))
-            }
-            return prepared
-
-        case .itemDelta(let itemId, let bodyAppend, let outputAppend, let summary):
-            let shouldAccept = lock.withLock { () -> Bool in
-                if let turnId = distillReceiptItemTurnIDs[runId]?[itemId],
-                   authenticatedDistillReceiptItems[runId]?.contains(
-                       DistillReceiptItemIdentity(turnId: turnId, itemId: itemId)
-                   ) == true {
-                    return false
-                }
-                guard var verifier = distillReceiptVerifiers[runId] else { return true }
-                verifier.append(itemID: itemId, body: bodyAppend, output: outputAppend)
-                distillReceiptVerifiers[runId] = verifier
-                return true
-            }
-            guard shouldAccept else { return [] }
-            return [PreparedAssistantEvent(
-                event: .itemDelta(
-                    itemId: itemId,
-                    bodyAppend: bodyAppend,
-                    outputAppend: outputAppend,
-                    summary: summary
-                ),
-                hostMetadataTrusted: false
-            )]
-
-        case .itemCompleted(let itemId, let finalState):
-            var prepared: [PreparedAssistantEvent] = []
-            if let completion = completeDistillReceipt(itemID: itemId, runId: runId) {
-                prepared.append(PreparedAssistantEvent(
-                    event: .itemHostMetadata(
-                        turnId: completion.turnId,
-                        itemId: itemId,
-                        distillApplied: true,
-                        attestation: completion.attestation
-                    ),
-                    hostMetadataTrusted: true
-                ))
-            } else if authenticatedDistillReceiptTurnID(itemID: itemId, runId: runId) != nil {
-                // The first completion accompanies the newly authenticated
-                // metadata above. Later completions cannot rewrite terminal state.
-                return []
-            }
-            prepared.append(PreparedAssistantEvent(
-                event: .itemCompleted(itemId: itemId, finalState: finalState),
-                hostMetadataTrusted: false
-            ))
-            return prepared
-
-        case .itemState(let itemId, _):
-            guard authenticatedDistillReceiptTurnID(itemID: itemId, runId: runId) == nil else {
-                return []
-            }
-            return [PreparedAssistantEvent(event: event, hostMetadataTrusted: false)]
-
-        case .itemProgress(let itemId, _):
-            guard authenticatedDistillReceiptTurnID(itemID: itemId, runId: runId) == nil else {
-                return []
-            }
-            return [PreparedAssistantEvent(event: event, hostMetadataTrusted: false)]
-
-        case .itemHostMetadata:
-            // Providers and parsers share AssistantEvent but never this authority.
-            return []
-
-        case .turnCompleted:
-            lock.withLock {
-                if var verifier = distillReceiptVerifiers[runId] {
-                    verifier.endTurn()
-                    distillReceiptVerifiers[runId] = verifier
-                }
-            }
-            return [PreparedAssistantEvent(event: event, hostMetadataTrusted: false)]
-
-        default:
-            return [PreparedAssistantEvent(event: event, hostMetadataTrusted: false)]
-        }
-    }
-
-    private func completeDistillReceipt(
-        itemID: String,
-        runId: AgentRunID
-    ) -> (turnId: String, attestation: AssistantItemHostAttestation)? {
-        guard let receiptScope = lock.withLock({ distillReceiptRunScopes[runId] }),
-              receiptScope.isCurrentlyActive else {
-            return nil
-        }
-        return lock.withLock {
-            guard var verifier = distillReceiptVerifiers[runId] else { return nil }
-            let verified = verifier.completeWithFingerprint(
-                itemID: itemID,
-                scope: receiptScope.verifierScope
-            )
-            distillReceiptVerifiers[runId] = verifier
-            guard let verified,
-                  let turnId = distillReceiptItemTurnIDs[runId]?[itemID] else {
-                return nil
-            }
-            let identity = DistillReceiptItemIdentity(turnId: turnId, itemId: itemID)
-            guard authenticatedDistillReceiptItems[runId, default: []]
-                .insert(identity).inserted else {
-                return nil
-            }
-            return (
-                turnId,
-                AssistantItemHostAttestation(
-                    itemType: verified.itemType,
-                    body: verified.body,
-                    output: verified.output
-                )
-            )
-        }
-    }
-
-    private func authenticatedDistillReceiptTurnID(
-        itemID: String,
-        runId: AgentRunID
-    ) -> String? {
-        lock.withLock {
-            guard let turnId = distillReceiptItemTurnIDs[runId]?[itemID],
-                  authenticatedDistillReceiptItems[runId]?.contains(
-                      DistillReceiptItemIdentity(turnId: turnId, itemId: itemID)
-                  ) == true else {
-                return nil
-            }
-            return turnId
-        }
-    }
-
     private func sanitizeFinalAssistantEvent(
         _ ev: AssistantEvent,
-        runId: AgentRunID,
-        hostMetadataTrusted: Bool
+        runId: AgentRunID
     ) -> AssistantEvent? {
         let suppress = lock.withLock { replyOnlyPrimaryRuns.contains(runId) }
         if suppress {
@@ -6737,10 +5356,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         case .turnCompleted(let turnId, let finalMessage):
             return .turnCompleted(
                 turnId: turnId,
-                finalMessage: finalMessage.map { finalResponseDisplayText($0, runId: runId) }
+                finalMessage: finalMessage.map { sanitizeFinalAssistantText($0) }
             )
         case .itemHostMetadata:
-            return hostMetadataTrusted ? ev : nil
+            // Decode-only: host Distill attestations are no longer minted, and
+            // providers and parsers never own this authority.
+            return nil
         case .itemStarted(let item):
             guard item.distillApplied != nil else { return ev }
             return .itemStarted(item: item.withoutHostMetadata())
@@ -6986,11 +5607,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         event: AgentRunEvent,
         runId: AgentRunID,
         threadId: AgentThreadID,
-        allowFinalResponseTranslation: Bool = true,
+        deduplicatesInFlightFinish: Bool = true,
         providerTerminalAcknowledged: Bool = true,
-        continuationSourceFinalMessage: String? = nil,
-        distillReceiptPrepared: Bool = false,
-        hostDistillMetadataTrusted: Bool = false,
         isDurabilityRetry: Bool = false
     ) {
         guard let lease = admitRunCallback(runId: runId, threadId: threadId) else { return }
@@ -7001,27 +5619,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         defer { endAdmittedCallbackMutation(runId: runId) }
         switch event {
         case .event(let rawEvent):
-            if !distillReceiptPrepared,
-               lock.withLock({ distillReceiptRunScopes[runId] != nil }) {
-                for prepared in prepareDistillReceiptEvents(rawEvent, runId: runId) {
-                    handle(
-                        event: .event(prepared.event),
-                        runId: runId,
-                        threadId: threadId,
-                        allowFinalResponseTranslation: allowFinalResponseTranslation,
-                        providerTerminalAcknowledged: providerTerminalAcknowledged,
-                        continuationSourceFinalMessage: continuationSourceFinalMessage,
-                        distillReceiptPrepared: true,
-                        hostDistillMetadataTrusted: prepared.hostMetadataTrusted
-                    )
-                }
-                return
-            }
-            guard let ev = sanitizeFinalAssistantEvent(
-                rawEvent,
-                runId: runId,
-                hostMetadataTrusted: hostDistillMetadataTrusted
-            ) else { return }
+            guard let ev = sanitizeFinalAssistantEvent(rawEvent, runId: runId) else { return }
             persistProviderNativeSubagentLifecycle(
                 from: ev,
                 parentRunId: runId,
@@ -7034,84 +5632,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     threadId: threadId,
                     lease: lease
                 )
-            }
-            if allowFinalResponseTranslation,
-               case .turnCompleted(let turnId, let finalMessage) = ev,
-               let finalMessage,
-               shouldTranslateFinalResponse(finalMessage) {
-                rememberCompletedTurn(turnId, runId: runId)
-                return
-            }
-            if allowFinalResponseTranslation,
-               let decision = interceptProviderTextEvent(ev, runId: runId, threadId: threadId) {
-                switch decision {
-                case .hold:
-                    return
-                case .emit(let events):
-                    for event in events {
-                        handle(
-                            event: .event(event),
-                            runId: runId,
-                            threadId: threadId,
-                            allowFinalResponseTranslation: false
-                        )
-                    }
-                    return
-                case .translate(let itemId, let text, let target, let finalState):
-                    lock.lock()
-                    providerTextTranslationsInFlight[runId, default: 0] += 1
-                    lock.unlock()
-                    Task { [weak self] in
-                        guard let self else { return }
-                        let translated = await self.translateWireResponse(text, runId: runId, threadId: threadId)
-                        if translated != text {
-                            self.handle(
-                                event: .event(.wireTranslation(AssistantWireTranslation(
-                                    itemId: itemId,
-                                    originalText: text,
-                                    rewrittenText: translated,
-                                    wireRequestText: self.wireRequestText(runId: runId)
-                                ))),
-                                runId: runId,
-                                threadId: threadId,
-                                allowFinalResponseTranslation: false
-                            )
-                        }
-                        let delta: AssistantEvent
-                        switch target {
-                        case .body:
-                            delta = .itemDelta(itemId: itemId, bodyAppend: translated, outputAppend: nil, summary: nil)
-                        case .output:
-                            delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: translated, summary: nil)
-                        }
-                        self.handle(
-                            event: .event(delta),
-                            runId: runId,
-                            threadId: threadId,
-                            allowFinalResponseTranslation: false
-                        )
-                        self.handle(
-                            event: .event(.itemCompleted(itemId: itemId, finalState: finalState)),
-                            runId: runId,
-                            threadId: threadId,
-                            allowFinalResponseTranslation: false
-                        )
-                        if let terminal = self.completeProviderTextTranslation(runId: runId) {
-                            self.handle(
-                                event: .finished(
-                                    terminal.status,
-                                    finalMessage: terminal.finalMessage,
-                                    providerThreadId: terminal.providerThreadId
-                                ),
-                                runId: runId,
-                                threadId: terminal.threadId,
-                                allowFinalResponseTranslation: terminal.allowFinalResponseTranslation,
-                                providerTerminalAcknowledged: terminal.providerTerminalAcknowledged
-                            )
-                        }
-                    }
-                    return
-                }
             }
             // Encode/compact outside the mirror lock. Sequence allocation and
             // buffer ownership still require the lock; encoding does not.
@@ -7130,7 +5650,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     // presentation ceiling are stored before presentation loss.
                     // Store failure propagates — never discard the original silently.
                     let payloadJSON = try runRepo.boundPayloadForPersistence(
-                        streamPayloadCompactor?(json) ?? json,
+                        json,
                         byteLimit: Self.maximumBufferedEventBytes
                     )
                     let providerEvent: ProviderRuntimeEvent?
@@ -7181,8 +5701,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 case storeBeforeLossFailure(Error)
             }
             let postAction: MirrorEventPostAction = {
-                mirrorEventLock.lock()
-                defer { mirrorEventLock.unlock() }
+                mirrorEventLock(for: threadId).lock()
+                defer { mirrorEventLock(for: threadId).unlock() }
 
                 var deferredPersistenceIssues: [DeferredPersistenceIssue] = []
                 var appendedMessages: [AgentMessage] = []
@@ -7452,40 +5972,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let rawFinalMessage = lock.withLock { replyOnlyPrimaryRuns.contains(runId) }
                 ? nil
                 : rawFinalMessage
-            lock.lock()
-            if (providerTextTranslationsInFlight[runId] ?? 0) > 0 {
-                // User-initiated cancel (markStopRequested) must not wait for
-                // local wire rendering. Provider-completed terminals still defer
-                // so the translated final can land before ownership is released.
-                let isUserStopCancel = reportedStatus == .cancelled && !providerTerminalAcknowledged
-                if isUserStopCancel {
-                    providerTextTranslationsInFlight.removeValue(forKey: runId)
-                    deferredProviderTerminalEvents.removeValue(forKey: runId)
-                    // Fall through and finish as cancelled immediately.
-                } else {
-                    let firstDeferral = deferredProviderTerminalEvents[runId] == nil
-                    if var deferred = deferredProviderTerminalEvents[runId] {
-                        deferred.providerTerminalAcknowledged = deferred.providerTerminalAcknowledged
-                            || providerTerminalAcknowledged
-                        deferredProviderTerminalEvents[runId] = deferred
-                    } else {
-                        deferredProviderTerminalEvents[runId] = DeferredProviderTerminalEvent(
-                            status: reportedStatus,
-                            finalMessage: rawFinalMessage,
-                            providerThreadId: providerThreadId,
-                            threadId: threadId,
-                            allowFinalResponseTranslation: allowFinalResponseTranslation,
-                            providerTerminalAcknowledged: providerTerminalAcknowledged
-                        )
-                    }
-                    if firstDeferral {
-                        scheduleDeferredProviderTerminalDeadline(runId: runId, threadId: threadId)
-                    }
-                    lock.unlock()
-                    return
-                }
-            }
-            lock.unlock()
             // AG-002: mark the provider-side terminal acknowledgement before the
             // durable-row dedupe guard. stopRun may already have marked the row
             // cancelled, but destructive callers still need proof the provider
@@ -7509,14 +5995,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     runId: runId,
                     threadId: threadId,
                     preferredStatus: reportedStatus,
-                    finalMessage: sanitizeFinalAssistantText(rawFinalMessage, runId: runId),
+                    finalMessage: sanitizeFinalAssistantText(rawFinalMessage),
                     providerThreadId: providerThreadId
                 )
                 return
             }
             lock.lock()
             let finishAlreadyInFlight = finishingRuns.contains(runId)
-            if finishAlreadyInFlight && allowFinalResponseTranslation {
+            if finishAlreadyInFlight && deduplicatesInFlightFinish {
                 lock.unlock()
                 return
             }
@@ -7526,115 +6012,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.unlock()
 
             let finalMessage = rawFinalMessage.map {
-                finalResponseDisplayText($0, runId: runId)
+                sanitizeFinalAssistantText($0)
             }
-            if allowFinalResponseTranslation,
-               reportedStatus == .completed,
-               let rawProviderText = rawFinalMessage,
-               let displayedText = finalMessage,
-               !displayedText.isEmpty,
-               !shouldTranslateFinalResponse(rawProviderText),
-               RCWireProtocol.transportEnvelope(in: rawProviderText) == nil,
-               let admittedWireRequest = wireRequestText(runId: runId) {
-                // The request was admitted as wire, but the provider returned
-                // ordinary prose. Keep that readable prose instead of routing it
-                // through MLX, while still persisting the exact transport response
-                // and visibly disclosing the provider's protocol fallback.
-                lock.lock()
-                let messageId = activeAssistantMessageIds[runId]
-                    ?? Self.terminalAssistantMessageId(runId: runId)
-                lock.unlock()
-                self.handle(
-                    event: .event(.wireTranslation(AssistantWireTranslation(
-                        messageId: messageId.value.uuidString,
-                        originalText: rawProviderText,
-                        rewrittenText: displayedText,
-                        fallbackReason: "provider_plaintext_fallback",
-                        wireRequestText: admittedWireRequest
-                    ))),
-                    runId: runId,
-                    threadId: threadId,
-                    allowFinalResponseTranslation: false
-                )
-                onWireTranslatedMessageId?(messageId)
-            }
-            if allowFinalResponseTranslation,
-               reportedStatus == .completed,
-               let rawWire = rawFinalMessage,
-               shouldTranslateFinalResponse(rawWire) {
-                let wirePayload = RCWireProtocol.transportEnvelope(in: rawWire)?.payload ?? rawWire
-                let preliminary = (try? RCWireProtocol.parse(wirePayload))
-                    .map(RCWireProtocol.renderEnglish) ?? "Token Saver could not decode the provider response. The original response is available in the Token Saver optimized disclosure."
-                // Durably enqueue the exact provider frame before starting any
-                // local model work. A crash/timeout after this point can always
-                // replay the raw response and deterministic renderer.
-                self.handle(
-                    event: .event(.wireTranslation(AssistantWireTranslation(
-                        originalText: rawWire,
-                        rewrittenText: preliminary,
-                        fallbackReason: "pending_local_render",
-                        wireRequestText: self.wireRequestText(runId: runId)
-                    ))),
-                    runId: runId,
-                    threadId: threadId,
-                    allowFinalResponseTranslation: false
-                )
-                Task { [weak self] in
-                    guard let self else { return }
-                    let translated = await self.translateFinalResponse(rawWire, runId: runId, threadId: threadId)
-                    if translated != rawWire {
-                        // Store the raw provider frame before any user-facing rewrite.
-                        self.handle(
-                            event: .event(.wireTranslation(AssistantWireTranslation(
-                                originalText: rawWire,
-                                rewrittenText: translated,
-                                wireRequestText: self.wireRequestText(runId: runId)
-                            ))),
-                            runId: runId,
-                            threadId: threadId,
-                            allowFinalResponseTranslation: false
-                        )
-                    }
-                    if let completedTurnId = self.completedTurnId(runId: runId) {
-                        self.handle(
-                            event: .event(.turnCompleted(turnId: completedTurnId, finalMessage: translated)),
-                            runId: runId,
-                            threadId: threadId,
-                            allowFinalResponseTranslation: false
-                        )
-                    }
-                    self.lock.lock()
-                    let translatedMsgId = self.activeAssistantMessageIds[runId]
-                    self.lock.unlock()
-                    if let mid = translatedMsgId, translated != rawWire {
-                        self.handle(
-                            event: .event(.wireTranslation(AssistantWireTranslation(
-                                messageId: mid.value.uuidString,
-                                originalText: rawWire,
-                                rewrittenText: translated,
-                                wireRequestText: self.wireRequestText(runId: runId)
-                            ))),
-                            runId: runId,
-                            threadId: threadId,
-                            allowFinalResponseTranslation: false
-                        )
-                    }
-                    self.handle(
-                        event: .finished(reportedStatus, finalMessage: translated, providerThreadId: providerThreadId),
-                        runId: runId,
-                        threadId: threadId,
-                        allowFinalResponseTranslation: false,
-                        continuationSourceFinalMessage: rawWire
-                    )
-                    // Signal callers that a translated message was persisted.
-                    // activeAssistantMessageIds[runId] is set by the turnCompleted
-                    // handle above (persistAssistantIfMissing -> activeAssistantMessageIds).
-                    if let mid = translatedMsgId {
-                        self.onWireTranslatedMessageId?(mid)
-                    }
-                }
-	                return
-	            }
             lock.lock()
             let needsTerminalClaim = pendingTerminalEvents[runId] == nil
             let producedAssistantOutput =
@@ -7689,8 +6068,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         assistantMessage: assistantMessage,
                         finishedAt: Date(),
                         providerTerminalAcknowledged: providerTerminalAcknowledged,
-                        errorMessage: resolved.errorMessage,
-                        continuationSourceFinalMessage: continuationSourceFinalMessage
+                        errorMessage: resolved.errorMessage
                     )
                 }
                 lock.unlock()
@@ -7841,25 +6219,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeDelegationCapabilities.removeValue(forKey: runId)
             activeThreads.removeValue(forKey: threadId)
             activeRunMetadata.removeValue(forKey: runId)
-            activeWireRequestTexts.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
-            activeProviderTextItemTypes.removeValue(forKey: runId)
-            bufferedProviderTextItems.removeValue(forKey: runId)
-            distillReceiptRunScopes.removeValue(forKey: runId)
-            distillReceiptVerifiers.removeValue(forKey: runId)
-            distillReceiptItemTurnIDs.removeValue(forKey: runId)
-            authenticatedDistillReceiptItems.removeValue(forKey: runId)
-            authenticatedFinalReceiptTexts.removeValue(forKey: runId)
             latestRunErrorMessages.removeValue(forKey: runId)
             finishingRuns.remove(runId)
             pendingTerminalEvents.removeValue(forKey: runId)
             terminalRetryScheduled.remove(runId)
             terminalCheckpointAttempts.remove(runId)
             if isDurabilityRetry { terminalCommitsInFlight.remove(runId) }
-            deferredProviderTerminalEvents.removeValue(forKey: runId)
-            deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
-            providerTextTranslationsInFlight.removeValue(forKey: runId)
             pendingThreadStops.remove(threadId)
             // PERF-MAC_AGENT-005: flush a final prune at run end so events queued
             // since the last cadence-prune don't linger unbounded.
@@ -7896,7 +6263,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             maybeScheduleBackgroundAwaitContinuation(
                 threadId: threadId,
                 status: status,
-                finalMessage: pendingTerminal.continuationSourceFinalMessage ?? finalMessage,
+                finalMessage: finalMessage,
                 runMetadata: runMetadata,
                 resumeCursor: resumeCursor
             )
@@ -7971,7 +6338,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lock.lock()
             latestRunErrorMessages[runId] = m
             lock.unlock()
-            mirrorEventLock.lock()
+            mirrorEventLock(for: threadId).lock()
             // Cursor only. A leftover 16-column session `get` (including
             // `runtime_payload_json`) hitchs the error path under
             // `mirrorEventLock` just to copy resume_cursor for recoverable.
@@ -7980,15 +6347,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // error path just to copy provider_thread_id for recoverable.
             let threadCursor = (try? threadRepo.providerThreadId(of: threadId))
                 .flatMap { $0.isEmpty ? nil : $0 }
-            mirrorEventLock.unlock()
+            mirrorEventLock(for: threadId).unlock()
             let resumeCursor = (persistedCursor ?? threadCursor)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let recoverable = resumeCursor?.isEmpty == false
             handle(
                 event: .event(.error(message: m, recoverable: recoverable)),
                 runId: runId,
-                threadId: threadId,
-                allowFinalResponseTranslation: false
+                threadId: threadId
             )
             try? providerSessionRepo?.updateDiagnostics(threadId: threadId, lastEventKind: "error", lastErrorMessage: m)
         }
@@ -8106,37 +6472,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerSession = nil
         }
 
-        let rcw1Response: AgentMessageRCW1Response? = {
-            guard let rawResponse = pending.continuationSourceFinalMessage,
-                  let messageId = pending.assistantMessage?.id ?? priorAssistantMessageId else {
-                return nil
-            }
-            let payload = RCWireProtocol.transportEnvelope(in: rawResponse)?.payload
-                ?? rawResponse
-            guard let frames = try? RCWireProtocol.parse(payload),
-                  !frames.isEmpty,
-                  frames.allSatisfy({ $0.direction == .response }) else {
-                return nil
-            }
-            let trimmedTurnId = completedTurnId?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let durableTurnId = trimmedTurnId?.isEmpty == false
-                ? trimmedTurnId!
-                : "run-\(runId.value.uuidString)"
-            return AgentMessageRCW1Response(
-                messageId: messageId,
-                runId: runId,
-                turnId: durableTurnId,
-                wireResponseText: rawResponse
-            )
-        }()
-
         let result = try runRepo.persistTerminalGraph(
             assistantMessage: pending.assistantMessage,
             run: run,
             thread: thread,
-            providerSession: providerSession,
-            rcw1Response: rcw1Response
+            providerSession: providerSession
         )
 
         lock.lock()
@@ -8490,9 +6830,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 ),
                 runId: runId,
                 threadId: threadId,
-                allowFinalResponseTranslation: false,
+                deduplicatesInFlightFinish: false,
                 providerTerminalAcknowledged: pending.providerTerminalAcknowledged,
-                continuationSourceFinalMessage: pending.continuationSourceFinalMessage,
                 isDurabilityRetry: true
             )
         }
@@ -8507,420 +6846,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return pending
     }
 
-    private struct WireResponseProjection {
-        let wire: String
-        let human: String
-    }
-
-    private func wireResponseProjection(_ text: String) -> WireResponseProjection? {
-        guard let wire = RCWireProtocol.transportEnvelope(in: text)?.payload,
-              let frames = try? RCWireProtocol.parse(wire),
-              !frames.isEmpty,
-              frames.allSatisfy({ $0.direction == .response }) else {
-            return nil
-        }
-        let human = RCWireProtocol.renderEnglish(frames)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !human.isEmpty else { return nil }
-        return WireResponseProjection(wire: wire, human: human)
-    }
-
-    private func admitsWireResponse(_ projection: WireResponseProjection) -> Bool {
-        finalResponseWireAdmissionCheck(projection.wire, projection.human)
-    }
-
-    private func finalResponseDisplayText(
-        _ text: String,
-        runId: AgentRunID
-    ) -> String {
-        guard finalResponseTranslator != nil,
-              let projection = wireResponseProjection(text),
-              !admitsWireResponse(projection) else {
-            return sanitizeFinalAssistantText(text, runId: runId)
-        }
-        return sanitizeFinalAssistantText(projection.human, runId: runId)
-    }
-
-    private func shouldTranslateFinalResponse(_ text: String) -> Bool {
-        guard finalResponseTranslator != nil,
-              RCWireProtocol.transportEnvelope(in: text) != nil else {
-            return false
-        }
-        // Malformed/truncated transport still enters the existing safety renderer
-        // so raw protocol bytes never leak into the Human transcript. The
-        // economic gate applies only to complete, semantically renderable frames.
-        guard let projection = wireResponseProjection(text) else { return true }
-        return admitsWireResponse(projection)
-    }
-
-    private func completeProviderTextTranslation(runId: AgentRunID) -> DeferredProviderTerminalEvent? {
-        lock.lock()
-        defer { lock.unlock() }
-        let remaining = max(0, (providerTextTranslationsInFlight[runId] ?? 1) - 1)
-        if remaining > 0 {
-            providerTextTranslationsInFlight[runId] = remaining
-            return nil
-        }
-        providerTextTranslationsInFlight.removeValue(forKey: runId)
-        let deferred = deferredProviderTerminalEvents.removeValue(forKey: runId)
-        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
-        discardRunThreadOwnershipIfReleasedLocked(runId)
-        return deferred
-    }
-
-    /// Fail open when wire rendering never drains after a provider terminal.
-    /// Arms once per deferred terminal; cancel paths and successful translation
-    /// drain clear the work item.
-    private func scheduleDeferredProviderTerminalDeadline(runId: AgentRunID, threadId: AgentThreadID) {
-        // Caller holds `lock`.
-        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
-        let delay = max(0.05, providerTerminalTranslationDeadline)
-        let item = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.forceDrainDeferredProviderTerminal(runId: runId, threadId: threadId)
-        }
-        deferredProviderTerminalDeadlineWorkItems[runId] = item
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
-    }
-
-    private func forceDrainDeferredProviderTerminal(runId: AgentRunID, threadId: AgentThreadID) {
-        lock.lock()
-        deferredProviderTerminalDeadlineWorkItems.removeValue(forKey: runId)
-        guard let deferred = deferredProviderTerminalEvents.removeValue(forKey: runId) else {
-            lock.unlock()
-            return
-        }
-        // Drop the translation hold so later completeProviderTextTranslation
-        // calls are no-ops rather than re-arming a second terminal.
-        providerTextTranslationsInFlight.removeValue(forKey: runId)
-        lock.unlock()
-        agentRunLog.info(
-            "run.deferred_terminal.translation_deadline thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) status=\(deferred.status.rawValue, privacy: .public)"
-        )
-        handle(
-            event: .finished(
-                deferred.status,
-                finalMessage: deferred.finalMessage,
-                providerThreadId: deferred.providerThreadId
-            ),
-            runId: runId,
-            threadId: deferred.threadId,
-            allowFinalResponseTranslation: false,
-            providerTerminalAcknowledged: deferred.providerTerminalAcknowledged
-        )
-    }
-
-    private enum ProviderTextTarget {
-        case body
-        case output
-    }
-
-    private struct BufferedProviderTextItem {
-        var text: String
-        var rawText: String
-        var renderedText: String
-        var target: ProviderTextTarget
-        var itemType: AssistantItemType
-    }
-
-    private enum ProviderTextDecision {
-        case hold
-        case emit([AssistantEvent])
-        case translate(itemId: String, text: String, target: ProviderTextTarget, finalState: AssistantItemState)
-    }
-
-    private func interceptProviderTextEvent(_ ev: AssistantEvent, runId: AgentRunID, threadId: AgentThreadID) -> ProviderTextDecision? {
-        guard finalResponseTranslator != nil else { return nil }
-        switch ev {
-        case .itemStarted(let item):
-            if isWireDisclosureItem(item.type) {
-                lock.lock()
-                var items = activeProviderTextItemTypes[runId] ?? [:]
-                let isFirstObservation = items[item.id] == nil
-                items[item.id] = item.type
-                activeProviderTextItemTypes[runId] = items
-                lock.unlock()
-                if item.type == .reasoning,
-                   isFirstObservation,
-                   let request = wireRequestText(runId: runId) {
-                    // The outbound half already used RCW1 even if the provider
-                    // later falls back to streaming ordinary prose. Persist the
-                    // admission at item start so Work-so-far can expose the
-                    // Translated/RCW1 control immediately. A decoded response
-                    // frame replaces this placeholder under the same item id.
-                    return .emit([
-                        .wireTranslation(AssistantWireTranslation(
-                            itemId: item.id,
-                            originalText: "",
-                            rewrittenText: "",
-                            fallbackReason: "provider_response_pending",
-                            wireRequestText: request
-                        )),
-                        ev
-                    ])
-                }
-            }
-            return nil
-        case .itemDelta(let itemId, let bodyAppend, let outputAppend, _):
-            let itemType = providerTextItemType(runId: runId, itemId: itemId)
-            guard let itemType, isProviderTextItem(itemType) else { return nil }
-            let rawTarget: ProviderTextTarget?
-            let delta: String?
-            if let bodyAppend {
-                rawTarget = .body
-                delta = bodyAppend
-            } else if let outputAppend {
-                rawTarget = .output
-                delta = outputAppend
-            } else {
-                rawTarget = nil
-                delta = nil
-            }
-            guard let rawTarget, let delta, !delta.isEmpty else { return nil }
-            let target = itemType == .reasoning ? ProviderTextTarget.body : rawTarget
-
-            lock.lock()
-            // PERF: same O(n²) residual as timeline itemDelta — under the wire
-            // hold lock, `cappedText(text + delta)` rebuilt the growing buffer
-            // on every token. appendCapped stays under liveTextLimit without
-            // reallocating the full body on the common path.
-            //
-            // The append must run *through* the dictionary storage. Copying the
-            // entry out first (`if var buffered = runBuffers[itemId]`) leaves the
-            // String referenced by both the copy and the dictionary, so every
-            // append copies the whole accumulated body back out — the exact
-            // O(n)-per-token cost appendCapped exists to remove.
-            //
-            // The outer key is resolved once into an index and the inner
-            // existence is checked before the unwrap, so the only `!` left is on
-            // a key this same statement just proved present. Every mutation of
-            // `bufferedProviderTextItems` happens under `lock` (see the removals
-            // in purgeRunRuntimeLocked and the itemCompleted branch below), which
-            // is what keeps the check and the append agreeing. DO NOT move the
-            // append outside the lock or insert a call between the guard and the
-            // append: either would let a concurrent removal turn the unwrap into
-            // a process-fatal trap on a provider callback thread.
-            if let runIndex = bufferedProviderTextItems.index(forKey: runId),
-               bufferedProviderTextItems.values[runIndex].index(forKey: itemId) != nil {
-                AssistantTimelineState.appendCapped(
-                    &bufferedProviderTextItems.values[runIndex][itemId]!.text,
-                    append: delta,
-                    limit: AssistantTimelineState.liveTextLimit
-                )
-                AssistantTimelineState.appendCapped(
-                    &bufferedProviderTextItems.values[runIndex][itemId]!.rawText,
-                    append: delta,
-                    limit: AssistantTimelineState.liveTextLimit
-                )
-                if let envelope = RCWireProtocol.transportEnvelope(
-                    in: bufferedProviderTextItems.values[runIndex][itemId]!.text
-                ) {
-                    bufferedProviderTextItems.values[runIndex][itemId]!.text = envelope.payload
-                }
-                let buffered = bufferedProviderTextItems.values[runIndex][itemId]!
-                if RCWireProtocol.prefixDisposition(
-                    buffered.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                ) == .plainText,
-                   !RCWireProtocol.containsTransportCandidate(buffered.text) {
-                    bufferedProviderTextItems.values[runIndex].removeValue(forKey: itemId)
-                    if bufferedProviderTextItems.values[runIndex].isEmpty {
-                        bufferedProviderTextItems.removeValue(forKey: runId)
-                    }
-                    lock.unlock()
-                    let event: AssistantEvent
-                    switch buffered.target {
-                    case .body:
-                        event = .itemDelta(itemId: itemId, bodyAppend: buffered.text, outputAppend: nil, summary: nil)
-                    case .output:
-                        event = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: buffered.text, summary: nil)
-                    }
-                    return .emit([event])
-                }
-                if let frames = try? RCWireProtocol.parse(buffered.text),
-                   frames.allSatisfy({ $0.direction == .response }) {
-                    let rendered = RCWireProtocol.renderEnglish(frames)
-                    if !rendered.isEmpty {
-                        bufferedProviderTextItems.values[runIndex][itemId]!.text = ""
-                        let separator = buffered.renderedText.isEmpty ? "" : "\n\n"
-                        AssistantTimelineState.appendCapped(
-                            &bufferedProviderTextItems.values[runIndex][itemId]!.renderedText,
-                            append: separator + rendered,
-                            limit: AssistantTimelineState.liveTextLimit
-                        )
-                        let updated = bufferedProviderTextItems.values[runIndex][itemId]!
-                        lock.unlock()
-                        let deltaEvent: AssistantEvent
-                        switch updated.target {
-                        case .body:
-                            deltaEvent = .itemDelta(itemId: itemId, bodyAppend: separator + rendered, outputAppend: nil, summary: nil)
-                        case .output:
-                            deltaEvent = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: separator + rendered, summary: nil)
-                        }
-                        // Render complete records as they arrive, but wait for
-                        // item completion before exposing raw RCW1 metadata. The
-                        // host can only prove profitability against the complete
-                        // response, not a temporarily favorable prefix.
-                        return .emit([deltaEvent])
-                    }
-                }
-                lock.unlock()
-                return .hold
-            }
-            var runBuffers = bufferedProviderTextItems[runId] ?? [:]
-            let shouldBuffer = shouldBufferProviderTextPrefix(delta)
-            if shouldBuffer {
-                var newBuffer = BufferedProviderTextItem(
-                    text: AssistantTimelineState.cappedText(delta),
-                    rawText: AssistantTimelineState.cappedText(delta),
-                    renderedText: "",
-                    target: target,
-                    itemType: itemType
-                )
-                if let envelope = RCWireProtocol.transportEnvelope(in: newBuffer.text) {
-                    newBuffer.text = envelope.payload
-                }
-                if let frames = try? RCWireProtocol.parse(newBuffer.text),
-                   frames.allSatisfy({ $0.direction == .response }) {
-                    let rendered = RCWireProtocol.renderEnglish(frames)
-                    if !rendered.isEmpty {
-                        newBuffer.text = ""
-                        newBuffer.renderedText = rendered
-                        runBuffers[itemId] = newBuffer
-                        bufferedProviderTextItems[runId] = runBuffers
-                        lock.unlock()
-                        let deltaEvent: AssistantEvent
-                        switch target {
-                        case .body:
-                            deltaEvent = .itemDelta(itemId: itemId, bodyAppend: rendered, outputAppend: nil, summary: nil)
-                        case .output:
-                            deltaEvent = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: rendered, summary: nil)
-                        }
-                        return .emit([deltaEvent])
-                    }
-                }
-                runBuffers[itemId] = newBuffer
-                bufferedProviderTextItems[runId] = runBuffers
-                lock.unlock()
-                return .hold
-            }
-            lock.unlock()
-            return nil
-        case .itemCompleted(let itemId, let finalState):
-            lock.lock()
-            var runBuffers = bufferedProviderTextItems[runId] ?? [:]
-            let buffered = runBuffers.removeValue(forKey: itemId)
-            if runBuffers.isEmpty {
-                bufferedProviderTextItems.removeValue(forKey: runId)
-            } else {
-                bufferedProviderTextItems[runId] = runBuffers
-            }
-            var itemTypes = activeProviderTextItemTypes[runId] ?? [:]
-            itemTypes.removeValue(forKey: itemId)
-            if itemTypes.isEmpty {
-                activeProviderTextItemTypes.removeValue(forKey: runId)
-            } else {
-                activeProviderTextItemTypes[runId] = itemTypes
-            }
-            lock.unlock()
-            guard let buffered else { return nil }
-            if let wirePayload = RCWireProtocol.transportEnvelope(in: buffered.rawText)?.payload {
-                let completeRendered: String
-                if let frames = try? RCWireProtocol.parse(wirePayload),
-                   frames.allSatisfy({ $0.direction == .response }) {
-                    completeRendered = RCWireProtocol.renderEnglish(frames)
-                } else {
-                    let error = "Token Saver could not decode the provider response. The original response is available in the Token Saver optimized disclosure."
-                    completeRendered = buffered.renderedText.isEmpty
-                        ? error
-                        : buffered.renderedText + "\n\n" + error
-                }
-                var events: [AssistantEvent] = []
-                let projection = wireResponseProjection(buffered.rawText)
-                if projection.map(admitsWireResponse) ?? true {
-                    events.append(.wireTranslation(AssistantWireTranslation(
-                        itemId: itemId,
-                        originalText: buffered.rawText,
-                        rewrittenText: completeRendered,
-                        fallbackReason: completeRendered == buffered.renderedText ? nil : "deterministic_render",
-                        wireRequestText: wireRequestText(runId: runId)
-                    )))
-                }
-                if completeRendered != buffered.renderedText {
-                    let append: String
-                    if completeRendered.hasPrefix(buffered.renderedText) {
-                        append = String(completeRendered.dropFirst(buffered.renderedText.count))
-                    } else {
-                        append = completeRendered
-                    }
-                    switch buffered.target {
-                    case .body:
-                        events.append(.itemDelta(itemId: itemId, bodyAppend: append, outputAppend: nil, summary: nil))
-                    case .output:
-                        events.append(.itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: append, summary: nil))
-                    }
-                }
-                events.append(.itemCompleted(itemId: itemId, finalState: finalState))
-                return .emit(events)
-            }
-            if shouldTranslateProviderText(buffered.text, runId: runId) {
-                let target = buffered.itemType == .reasoning ? ProviderTextTarget.body : buffered.target
-                return .translate(itemId: itemId, text: buffered.text, target: target, finalState: finalState)
-            }
-            let delta: AssistantEvent
-            switch buffered.target {
-            case .body:
-                delta = .itemDelta(itemId: itemId, bodyAppend: buffered.text, outputAppend: nil, summary: nil)
-            case .output:
-                delta = .itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: buffered.text, summary: nil)
-            }
-            return .emit([delta, .itemCompleted(itemId: itemId, finalState: finalState)])
-        default:
-            return nil
-        }
-    }
-
-    private func providerTextItemType(runId: AgentRunID, itemId: String) -> AssistantItemType? {
-        lock.lock()
-        defer { lock.unlock() }
-        return activeProviderTextItemTypes[runId]?[itemId]
-    }
-
-    private func wireRequestText(runId: AgentRunID) -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return activeWireRequestTexts[runId]
-    }
-
-    private func isProviderTextItem(_ type: AssistantItemType) -> Bool {
-        type == .assistantMessage
-    }
-
-    /// Narrative reasoning is intentionally not decoded as RCW1, but it is the
-    /// only visible provider text during many live Grok turns. Record the
-    /// run's outbound wire admission for it so the UI can expose the exact
-    /// request immediately without waiting for a final assistant message.
-    private func isWireDisclosureItem(_ type: AssistantItemType) -> Bool {
-        type == .assistantMessage || type == .reasoning
-    }
-
-    private func shouldBufferProviderTextPrefix(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Pure-whitespace deltas are not wire signals; stream them live so a
-        // normal reply whose first chunk is "\n" does not appear all-at-once.
-        guard !trimmed.isEmpty else { return false }
-        if RCWireProtocol.containsTransportCandidate(text) { return true }
-        switch RCWireProtocol.prefixDisposition(trimmed) {
-        case .wire, .undecided:
-            return true
-        case .plainText:
-            return false
-        }
-    }
-
-    private func shouldTranslateProviderText(_ text: String, runId: AgentRunID) -> Bool {
-        RCWireProtocol.transportEnvelope(in: text) != nil
-    }
-
     private static func hasUnread(for status: AgentRunStatus) -> Bool {
         switch status {
         case .completed, .failed, .interrupted:
@@ -8928,64 +6853,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         case .pending, .running, .cancelled:
             false
         }
-    }
-
-    private func rememberCompletedTurn(_ turnId: String, runId: AgentRunID) {
-        lock.lock()
-        activeTurnIds[runId] = turnId
-        lock.unlock()
-    }
-
-    private func completedTurnId(runId: AgentRunID) -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return activeTurnIds[runId]
-    }
-
-    private func translateFinalResponse(_ response: String, runId: AgentRunID, threadId: AgentThreadID) async -> String {
-        await translateWireResponse(response, runId: runId, threadId: threadId)
-    }
-
-    private func translateWireResponse(_ response: String, runId: AgentRunID, threadId: AgentThreadID) async -> String {
-        guard let finalResponseTranslator else { return response }
-        let wirePayload = RCWireProtocol.transportEnvelope(in: response)?.payload ?? response
-        let provider: AgentProvider = {
-            lock.lock()
-            let activeProvider = activeRunMetadata[runId]?.provider
-            lock.unlock()
-            if let activeProvider { return activeProvider }
-            return (try? threadRepo.listChrome(ids: [threadId])[threadId]?.provider) ?? .codex
-        }()
-        // Fail open on a hung local renderer: never let wire rendering block the turn
-        // longer than the provider-terminal translation deadline. The translator
-        // Task may still complete later; its result is ignored after the race.
-        let deadlineNs = UInt64(max(0.05, providerTerminalTranslationDeadline) * 1_000_000_000)
-        let deterministicFallback: String = {
-            if let frames = try? RCWireProtocol.parse(wirePayload),
-               frames.allSatisfy({ $0.direction == .response }) {
-                let rendered = RCWireProtocol.renderEnglish(frames)
-                if !rendered.isEmpty { return rendered }
-            }
-            return "Token Saver could not decode the provider response. The original response is available in the Token Saver optimized disclosure."
-        }()
-        let translated: String = await withCheckedContinuation { continuation in
-            let first = FirstStringContinuation(continuation)
-            Task {
-                first.resume(returning: await finalResponseTranslator(wirePayload, provider, threadId, runId))
-            }
-            Task {
-                try? await Task.sleep(nanoseconds: deadlineNs)
-                first.resume(returning: deterministicFallback)
-            }
-        }
-        let trimmed = sanitizeFinalAssistantText(
-            translated,
-            runId: runId
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty || RCWireProtocol.transportEnvelope(in: trimmed) != nil {
-            return deterministicFallback
-        }
-        return trimmed
     }
 
     private func persistMinimalCheckpointIdentity(
@@ -9635,8 +7502,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             case failed(operation: String, error: Error)
         }
         let outcome: ImmediatePublishOutcome = {
-            mirrorEventLock.lock()
-            defer { mirrorEventLock.unlock() }
+            mirrorEventLock(for: threadId).lock()
+            defer { mirrorEventLock(for: threadId).unlock() }
 
             lock.lock()
             let eventSequence = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
@@ -9663,7 +7530,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     runId: runId,
                     seq: eventSequence,
                     kind: event.debugDescription,
-                    payloadJSON: streamPayloadCompactor?(json) ?? json
+                    payloadJSON: json
                 )
             } catch {
                 recordMirrorPersistenceFailure(error, threadId: threadId)
@@ -9753,19 +7620,6 @@ private struct PendingTerminalEvent {
     var errorMessage: String?
     /// Durable `agent_runs.terminal_reason` (`TerminalTransitionReason.rawValue`).
     var terminalReason: String? = nil
-    /// Raw provider final used only for incomplete-turn classification when the
-    /// user-facing final was locally rendered from RCW1. Never persisted as the
-    /// canonical assistant message.
-    var continuationSourceFinalMessage: String? = nil
-}
-
-private struct DeferredProviderTerminalEvent {
-    var status: AgentRunStatus
-    var finalMessage: String?
-    var providerThreadId: String?
-    var threadId: AgentThreadID
-    var allowFinalResponseTranslation: Bool
-    var providerTerminalAcknowledged: Bool
 }
 
 private struct PendingStartFailure {
@@ -9896,5 +7750,22 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
         Self.codecLock.unlock()
         guard let data else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+}
+
+/// Per-thread recursive mirror locks. Entries are kept for the coordinator's
+/// lifetime (one small lock per thread touched), so a lock handed out is never
+/// replaced while another caller may still hold it.
+final class MirrorEventLockTable: @unchecked Sendable {
+    private let guardLock = NSLock()
+    private var locks: [AgentThreadID: NSRecursiveLock] = [:]
+
+    func lock(for threadId: AgentThreadID) -> NSRecursiveLock {
+        guardLock.lock()
+        defer { guardLock.unlock() }
+        if let existing = locks[threadId] { return existing }
+        let created = NSRecursiveLock()
+        locks[threadId] = created
+        return created
     }
 }

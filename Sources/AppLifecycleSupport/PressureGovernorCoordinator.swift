@@ -2,29 +2,23 @@ import Foundation
 
 /// Generation-owned single-flight pressure coordinator (S7 / T-003).
 ///
-/// Revalidates epoch freshness plus surface visibility, provider/session activity,
-/// sidecar request generation, and Graphify child identity before every mutation.
+/// Revalidates epoch freshness plus surface visibility and provider/session
+/// activity before every mutation.
 /// Never kills active turns or defers scheduled occurrences.
 
 public struct PressureMutationTarget: Sendable, Equatable {
     public var epoch: UInt64
     public var surfaceVisible: Bool
     public var providerSessionActive: Bool
-    public var sidecarRequestGeneration: UInt64
-    public var graphifyChildIdentity: String?
 
     public init(
         epoch: UInt64,
         surfaceVisible: Bool,
-        providerSessionActive: Bool,
-        sidecarRequestGeneration: UInt64,
-        graphifyChildIdentity: String? = nil
+        providerSessionActive: Bool
     ) {
         self.epoch = epoch
         self.surfaceVisible = surfaceVisible
         self.providerSessionActive = providerSessionActive
-        self.sidecarRequestGeneration = sidecarRequestGeneration
-        self.graphifyChildIdentity = graphifyChildIdentity
     }
 }
 
@@ -59,8 +53,6 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
     private var state: PressureGovernorState
     private var thresholds: PressureThresholds
     private var inFlight = false
-    private var lastSidecarGeneration: UInt64 = 0
-    private var lastGraphifyIdentity: String?
 
     public init(
         state: PressureGovernorState = PressureGovernorState(),
@@ -109,7 +101,7 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
     }
 
     /// Same as `execute(plan:liveTarget:)` but re-reads identity immediately
-    /// before each mutation so sidecar/Graphify/provider drift is observed (S7).
+    /// before each mutation so surface/provider drift is observed (S7).
     public func execute(
         plan: PressureMutationPlan,
         liveTargetProvider: () -> PressureMutationTarget
@@ -183,24 +175,6 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
                     reason: "target_epoch_mismatch"
                 )
             }
-            if plan.target.sidecarRequestGeneration != liveTarget.sidecarRequestGeneration {
-                skipped.append(action)
-                skipped.append(contentsOf: remaining)
-                return PressureMutationOutcome(
-                    applied: applied,
-                    skipped: skipped,
-                    reason: "sidecar_generation_mismatch"
-                )
-            }
-            if plan.target.graphifyChildIdentity != liveTarget.graphifyChildIdentity {
-                skipped.append(action)
-                skipped.append(contentsOf: remaining)
-                return PressureMutationOutcome(
-                    applied: applied,
-                    skipped: skipped,
-                    reason: "graphify_identity_mismatch"
-                )
-            }
             // Hard cuts: these never execute as live mutations.
             if action == .neverKillActiveTurn || action == .neverDeferScheduledOccurrence {
                 skipped.append(action)
@@ -231,12 +205,6 @@ public final class PressureGovernorCoordinator: @unchecked Sendable {
                     skipped: skipped,
                     reason: !epochOK ? "stale_epoch" : "frozen_accounting"
                 )
-            }
-            if action == .pauseGraphifyEnsureAndWatchCallbacks {
-                lastGraphifyIdentity = liveTarget.graphifyChildIdentity
-            }
-            if action == .releaseDistillIdleModelGPU {
-                lastSidecarGeneration = liveTarget.sidecarRequestGeneration
             }
             lock.unlock()
             applied.append(action)

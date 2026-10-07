@@ -117,6 +117,132 @@ public final class CommandReceiptPersistenceGateway: @unchecked Sendable {
         }
         return try queue.sync(execute: work)
     }
+
+    /// Runs `work` on the receipt queue and resumes the caller when it has
+    /// landed. The awaiting actor (MainActor for the dispatcher) is suspended,
+    /// not blocked, while SQLite runs.
+    public func perform<T>(_ work: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result { try work() })
+            }
+        }
+    }
+}
+
+/// C6: the dispatcher's off-MainActor receipt writer. Claim and commit await
+/// the receipt queue; finalize builds the transaction `EventBus` runs on its
+/// delivery lane. Encoding uses sorted keys, like the router's synchronous
+/// methods, so stored result and payload bytes are unchanged.
+struct CommandReceiptOffMainWriter: CommandReceiptOffMainWriting {
+    private final class RepositoryBox: @unchecked Sendable {
+        let repo: CommandReceiptRepository
+        init(_ repo: CommandReceiptRepository) { self.repo = repo }
+    }
+
+    private let box: RepositoryBox
+    private let gateway: CommandReceiptPersistenceGateway
+
+    init(repo: CommandReceiptRepository, gateway: CommandReceiptPersistenceGateway = .shared) {
+        self.box = RepositoryBox(repo)
+        self.gateway = gateway
+    }
+
+    private static func sortedJSON<T: Encodable>(_ value: T) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let json = String(data: try encoder.encode(value), encoding: .utf8) else {
+            throw JSONRPCError.internalError
+        }
+        return json
+    }
+
+    func claim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) async throws -> CommandReceiptClaimResult {
+        let box = box
+        return try await gateway.perform {
+            let signposter = PerfSwitchMetrics.signposter
+            let interval = signposter.beginInterval("receipt_claim", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("receipt_claim", interval) }
+            return try box.repo.claim(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash
+            )
+        }
+    }
+
+    func commit(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue
+    ) async throws {
+        let box = box
+        try await gateway.perform {
+            try box.repo.commit(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash,
+                resultJSON: try Self.sortedJSON(result)
+            )
+        }
+    }
+
+    func finalizeTransaction(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue,
+        events: [EventBus.MutationEventIntent]
+    ) -> @Sendable (Int64) throws -> [EventBus.Event] {
+        let box = box
+        let gateway = gateway
+        return { minimumEventSequence in
+            let signposter = PerfSwitchMetrics.signposter
+            let interval = signposter.beginInterval("receipt_finalize", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("receipt_finalize", interval) }
+            let resultJSON = try Self.sortedJSON(result)
+            let intents = try events.map { event in
+                CommandReceiptEventIntent(
+                    kind: event.kind.rawValue,
+                    payloadJSON: try Self.sortedJSON(event.payload),
+                    createdAt: event.createdAt
+                )
+            }
+            let persisted = try gateway.syncThrowing {
+                try box.repo.finalize(
+                    method: method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: ownerFingerprint,
+                    paramsHash: paramsHash,
+                    resultJSON: resultJSON,
+                    events: intents,
+                    minimumEventSequence: minimumEventSequence
+                )
+            }
+            return try persisted.map { event in
+                guard let payloadData = event.payloadJSON.data(using: .utf8),
+                      let payload = JSONValue.decode(from: payloadData) else {
+                    throw JSONRPCError.internalError
+                }
+                return EventBus.Event(
+                    seq: event.seq,
+                    kind: event.kind,
+                    payload: payload,
+                    ts: event.createdAt.timeIntervalSince1970
+                )
+            }
+        }
+    }
 }
 
 /// Off-MainActor owner for Agent App refresh/read RPC persistence work.
@@ -143,45 +269,47 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         readOffMainActorCountForTesting = 0
     }
 
-    private let db: SQLiteDB
+    /// WAL reader. Every gateway method is a pure read, so paired-device
+    /// list/page reads never wait on the writer connection's operation gate.
+    private let readDB: SQLiteDB
     private let queue: DispatchQueue
     // PERF: listPendingCallbacks allocated JSONDecoder per off-MainActor poll.
     // Gateway work is serial on `queue`, so one instance decoder is safe and
     // avoids per-call codec construction while decode behavior is unchanged.
     private let pendingCallbackDecoder = JSONDecoder()
 
-    public init(db: SQLiteDB) {
-        self.db = db
+    public init(db: SQLiteDB, readDB: SQLiteDB? = nil) {
+        self.readDB = readDB ?? db
         self.queue = DispatchQueue(label: Self.queueLabel, qos: .userInitiated)
     }
 
     public func listThreads(workspaceId: WorkspaceID?) async throws -> [AgentThread] {
         try await execute {
-            try AgentThreadRepository(db: self.db).list(workspaceId: workspaceId)
+            try AgentThreadRepository(db: self.readDB).list(workspaceId: workspaceId)
         }
     }
 
     public func message(id: AgentMessageID) async throws -> AgentMessage? {
         try await execute {
-            try AgentMessageRepository(db: self.db).get(id: id)
+            try AgentMessageRepository(db: self.readDB).get(id: id)
         }
     }
 
     public func threadIdsWithMessages() async throws -> Set<AgentThreadID> {
         try await execute {
-            try AgentMessageRepository(db: self.db).threadIdsWithMessages()
+            try AgentMessageRepository(db: self.readDB).threadIdsWithMessages()
         }
     }
 
     public func guestRuntimesByThread() async throws -> [AgentThreadID: String] {
         try await execute {
-            try AgentThreadRepository(db: self.db).guestRuntimesByThread()
+            try AgentThreadRepository(db: self.readDB).guestRuntimesByThread()
         }
     }
 
     public func listMessages(threadId: AgentThreadID, limit: Int) async throws -> [AgentMessage] {
         try await execute {
-            try AgentMessageRepository(db: self.db).listRecent(
+            try AgentMessageRepository(db: self.readDB).listRecent(
                 threadId: threadId,
                 limit: max(0, min(limit, 500))
             )
@@ -195,7 +323,7 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         after: AgentMessageCursor?
     ) async throws -> AgentMessagePage {
         try await execute {
-            try AgentMessageRepository(db: self.db).listPage(
+            try AgentMessageRepository(db: self.readDB).listPage(
                 threadId: threadId,
                 limit: max(0, min(limit, 500)),
                 before: before,
@@ -213,7 +341,7 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         contentLimit: Int
     ) async throws -> AgentMessageBodyBudgetResult {
         try await execute {
-            try AgentMessageRepository(db: self.db).listPageWithinBodyBudget(
+            try AgentMessageRepository(db: self.readDB).listPageWithinBodyBudget(
                 threadId: threadId,
                 limit: max(1, min(limit, 500)),
                 before: before,
@@ -229,14 +357,14 @@ public final class AgentAppReadGateway: @unchecked Sendable {
 
     public func listQueuedMessages(threadId: AgentThreadID) async throws -> [AgentQueuedMessage] {
         try await execute {
-            try AgentQueuedMessageRepository(db: self.db).list(threadId: threadId)
+            try AgentQueuedMessageRepository(db: self.readDB).list(threadId: threadId)
         }
     }
 
     public func listPendingCallbacks(threadId: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot {
         try await execute {
             PendingCallbackSnapshotMapper.snapshot(
-                from: try ProviderPendingCallbackRepository(db: self.db).listVisible(threadId: threadId),
+                from: try ProviderPendingCallbackRepository(db: self.readDB).listVisible(threadId: threadId),
                 decoder: self.pendingCallbackDecoder
             )
         }
@@ -258,10 +386,10 @@ public final class AgentAppReadGateway: @unchecked Sendable {
                 }
                 do {
                     // The queue keeps the work off MainActor; performSync also
-                    // takes SQLiteDB's operation gate for the complete
-                    // statement/decode sequence so this gateway cannot race
-                    // existing readers or writers on the shared handle.
-                    let result = try self.db.performSync { _ in try work() }
+                    // takes the read connection's operation gate for the complete
+                    // statement/decode sequence and resets its statements after,
+                    // so no WAL read snapshot outlives the call.
+                    let result = try self.readDB.performSync { _ in try work() }
                     continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
@@ -513,7 +641,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         self.sshPasswordStore = sshPasswordStore
         self.sshCommandRunner = sshCommandRunner
         self.botSecretStore = secretStore
-        self.agentAppReadGateway = AgentAppReadGateway(db: context.db)
+        self.agentAppReadGateway = AgentAppReadGateway(db: context.db, readDB: context.readDB)
         installBotHostObservers()
     }
 
@@ -1046,6 +1174,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         agent.viewModel.onThreadLifecycle = { [weak self] event in
                             self?.publishAgentThreadLifecycle(event)
                         }
+                        agent.viewModel.onThreadChromeWritten = { write in
+                            write.publish()
+                        }
                         agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
                             ctx?.retireDeletedAgentThreads(
                                 ids,
@@ -1055,7 +1186,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                         wireQueueDrainControl(on: agent.viewModel, context: ctx)
                         wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
-                        Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
                         configureAgentAppBotMentions(agent)
                         agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                             self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
@@ -1229,8 +1359,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 filesStates: []
             )
         }
+        let signposter = PerfSwitchMetrics.signposter
+        let captureInterval = signposter.beginInterval(
+            "connection_snapshot_capture",
+            id: signposter.makeSignpostID()
+        )
         let workspaceIDs = ctx.state.window.workspaces
         let workspaces = workspaceIDs.compactMap { ctx.state.workspaces[$0] }
+        let selectedWorkspaceId = ctx.state.window.selectedWorkspaceID?.value.uuidString
         // Capture all MainActor-owned layout/surface inputs before suspending for
         // SQLite. Otherwise a local persistence/layout callback can run during
         // the await and mix two host-state versions in one snapshot.
@@ -1249,10 +1385,42 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let openManualActions = manualActionStore.openByThread()
         let pendingMacExecutions = pendingMacExecution
+        signposter.endInterval("connection_snapshot_capture", captureInterval)
         // SQLite list/decode must never run on MainActor (Dispatcher is @MainActor).
         let threads = try await ctx.agentThreadListGateway.list(workspaceId: nil)
         let guestRuntimes = await threadGuestRuntimesOffMain()
         let manualActionsByThread = pendingManualActions(for: threads, open: openManualActions)
+        // Grouping and the per-row JSON round trip are pure work on the
+        // captured values: run them detached so MainActor stays free.
+        return await Task.detached(priority: .userInitiated) {
+            let encodeInterval = signposter.beginInterval(
+                "connection_snapshot_encode",
+                id: signposter.makeSignpostID()
+            )
+            defer { signposter.endInterval("connection_snapshot_encode", encodeInterval) }
+            return Self.connectionSnapshotState(
+                selectedWorkspaceId: selectedWorkspaceId,
+                workspaces: workspaces,
+                descriptorsByWorkspace: descriptorsByWorkspace,
+                browserURLs: browserURLs,
+                threads: threads,
+                manualActionsByThread: manualActionsByThread,
+                guestRuntimes: guestRuntimes,
+                pendingMacExecutions: pendingMacExecutions
+            )
+        }.value
+    }
+
+    nonisolated private static func connectionSnapshotState(
+        selectedWorkspaceId: String?,
+        workspaces: [Workspace],
+        descriptorsByWorkspace: [String: [SurfaceDescriptor]],
+        browserURLs: [String: String],
+        threads: [AgentThread],
+        manualActionsByThread: [AgentThreadID: ManualActionSnapshot],
+        guestRuntimes: [AgentThreadID: String],
+        pendingMacExecutions: [AgentThreadID: String]
+    ) -> ConnectionSnapshotReadState {
         var surfaceGroups: [ConnectionSnapshotWorkspaceItems] = []
         var threadGroups: [ConnectionSnapshotWorkspaceItems] = []
         var browserStates: [ConnectionSnapshotSurfaceState] = []
@@ -1296,7 +1464,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         state: .object(["url": .string(url)])
                     ))
                 case .files:
-                    let stored = decodeFilesState(descriptor.metadata["files_state"])
+                    let stored = Self.decodeFilesState(descriptor.metadata["files_state"])
                     let stableState = stored ?? [
                         "surface_id": .string(descriptor.id.value.uuidString),
                         "workspace_id": .string(workspace.id.value.uuidString),
@@ -1317,7 +1485,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
 
         return ConnectionSnapshotReadState(
-            selectedWorkspaceId: ctx.state.window.selectedWorkspaceID?.value.uuidString,
+            selectedWorkspaceId: selectedWorkspaceId,
             workspaces: workspaces.map(Self.connectionSnapshotWorkspace),
             surfaces: surfaceGroups,
             agentThreads: threadGroups,
@@ -2661,9 +2829,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
-        let descriptor = try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
-        softGraphifyPreflight(workspace: workspace)
-        return descriptor
+        try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
     }
 
     /// Legacy helper: open + focus an Agent App tab for a workspace.
@@ -2862,13 +3028,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         destinationWindowIsKeyForTests?(window) ?? window.isKeyWindow
     }
 
+    /// `token_saver.digest.get` stays until iOS bumps its treaty pin. Token
+    /// Saver is gone, so it answers `enabled: false` plus the cached account
+    /// usage the iOS rings still read.
     public func tokenSaverDigest() -> JSONValue? {
         guard let context else { return nil }
-        // Rebuild from durable disk state before returning so RPC never serves
-        // a stale process cache after usage writes.
-        context.publishTokenSaverWidgetDigestFromDisk()
-        guard let body = TokenSaverWidgetDigest.lastCachedBody() else { return nil }
-        return .object(body)
+        // Refresh from durable disk state so the RPC never keeps serving a
+        // stale process cache after usage writes.
+        context.publishAccountUsageDigestFromDisk()
+        return .object(AccountUsageWidgetDigest.lastCachedBody() ?? ["enabled": .bool(false)])
     }
 
     public func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread] {
@@ -3403,6 +3571,29 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    /// Paired-device `bot.*` reads that touch only the authority's own state
+    /// and SQLite (no MainActor callback, no queue write). They run off
+    /// MainActor and never reload the desk's queued follow-ups.
+    /// `bot.attention.list` stays on MainActor: its delegated-attention
+    /// snapshot callback reads router state.
+    nonisolated static let pairedBotOffMainReadMethods: Set<String> = [
+        "bot.list",
+        "bot.get",
+        "bot.settings.get",
+        "bot.queue.list",
+        "bot.conversation.list",
+        "bot.attachment.list",
+        "bot.routine.list",
+        "bot.files.list",
+        "bot.browser.state",
+        "bot.guest.state",
+        "bot.receipt.status",
+    ]
+    nonisolated static let pairedBotMainActorReadMethods: Set<String> = [
+        "bot.attention.list",
+        "bot.reserved.probe",
+    ]
+
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
         if BotTeamGroupService.handles(method) {
             guard let ctx = context, ctx.hostsBotGroupConversations else {
@@ -3418,10 +3609,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let authority = try pairedBotAuthority()
         let foundation = Self.foundationObject(params)
+        // An observing `bot.guest.state` goes through the observe coordinator,
+        // never the plain off-main read.
+        let observesGuest = method == "bot.guest.state" && foundation["observe"] as? Bool == true
+        if !observesGuest, Self.pairedBotOffMainReadMethods.contains(method) {
+            return try await dispatchPairedBotRead(authority: authority, method: method, params: foundation)
+        }
         do {
-            if method == "bot.guest.state", foundation["observe"] as? Bool == true {
+            if observesGuest {
                 let observed = try await pairedGuestObserveCoordinator(authority).state(params: foundation)
                 return JSONValue.from(observed)
+            }
+            if Self.pairedBotMainActorReadMethods.contains(method) {
+                return JSONValue.from(try authority.dispatch(method: method, params: foundation))
             }
             var result = try authority.dispatch(method: method, params: foundation)
             if method == "bot.stop" || method == "bot.force_stop",
@@ -3433,8 +3633,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     params: ["client_request_id": requestID]
                 )
             }
-            botsViewModel?.reloadQueuedFollowUpsFromStore()
-            if method == "bot.get" || method == "bot.send" {
+            reloadPairedBotQueue(params: foundation)
+            if method == "bot.send" {
                 result = enrichPairedBotAssistant(params: foundation, result: result)
             }
             if method == "bot.send" {
@@ -3451,6 +3651,52 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 return JSONValue.from(failed)
             }
             throw JSONRPCError(code: error.code, message: error.message)
+        }
+    }
+
+    /// A write can change only its own bot's persisted queue; reload that bot
+    /// (and publish only if its rows changed). Writes that name no bot keep the
+    /// fleet-wide reload.
+    private func reloadPairedBotQueue(params: [String: Any]) {
+        guard let botsViewModel else { return }
+        if let raw = params["bot_id"] as? String, let uuid = UUID(uuidString: raw) {
+            botsViewModel.reloadQueuedFollowUpsFromStore(botID: BotID(uuid))
+        } else {
+            botsViewModel.reloadQueuedFollowUpsFromStore()
+        }
+    }
+
+    private func dispatchPairedBotRead(
+        authority: BotRemoteControlAuthority,
+        method: String,
+        params: [String: Any]
+    ) async throws -> JSONValue {
+        let request = PairedBotReadRequest(authority: authority, method: method, params: params)
+        let outcome: PairedBotReadOutcome = await Task.detached(priority: .userInitiated) {
+            do {
+                return .value(try request.authority.dispatch(method: request.method, params: request.params))
+            } catch {
+                return .failure(error)
+            }
+        }.value
+        switch outcome {
+        case .value(let result):
+            guard method == "bot.get" else { return JSONValue.from(result) }
+            return JSONValue.from(enrichPairedBotAssistant(params: params, result: result))
+        case .failure(let error as BotRemoteControlAuthority.Error):
+            // Same contract as the write path: a request id whose receipt
+            // already failed answers with that receipt.
+            if let requestID = params["client_request_id"] as? String,
+               let failed = try? authority.dispatch(
+                   method: "bot.receipt.status",
+                   params: ["client_request_id": requestID]
+               ),
+               failed["status"] as? String == BotRemoteControlAuthority.Status.failed.rawValue {
+                return JSONValue.from(failed)
+            }
+            throw JSONRPCError(code: error.code, message: error.message)
+        case .failure(let error):
+            throw error
         }
     }
 
@@ -4239,31 +4485,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    /// Bind the cumulative Token Saver "saved in this thread" footer to the shared ledger.
-    static func wireTokenSaverThreadFooter(on viewModel: AgentAppViewModel, context: AppContext) {
-        let savingsRepo = context.tokenSaverSavingsRepo
-        let db = context.db
-        let settingsRepo = context.settingsRepo
-        viewModel.bindTokenSaverThreadFooter(
-            savingsRepo: savingsRepo,
-            isEligible: {
-                // B-6: match sidebar paid claims — enabled AND subscribed.
-                // No teaser footer for free/lapsed accounts.
-                let settings = SettingsStore(db: db).load()
-                guard settings.tokenSaverEnabled else { return false }
-                return PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
-            },
-            isGraphifyActive: {
-                SettingsStore(db: db).load().isGraphifyRuntimeActive
-            },
-            graphifySignalCount: {
-                TokenSaverThreadFooterReload.currentDayGraphifySignalCount(
-                    repo: context.graphifyUsageRepo
-                )
-            }
-        )
-    }
-
     private func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
         viewModel.forceQueuedMessage = { [weak context] messageID in
             guard let router = context?.router else {
@@ -4427,7 +4648,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // subscribers (including Agent App surfaces that listen for thread.*)
         // see scheduled / RPC-created threads immediately.
         EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(t))
-        softGraphifyPreflight(workspace: resolvedWorkspace)
         return t
     }
 
@@ -5607,23 +5827,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } else {
             cwd = try prepareAgentExecutionCwd(thread: &t)
         }
-        // Provider-instance + host Token Saver injects for the Source provider.
-        // Same-host Auto never switches provider. The previous empty Auto base
-        // dropped instance config (HOME/CODEX_HOME/GROK_HOME, custom env) from the
-        // request shell; Token Saver receipt/DISTILL_HINT still arrived later via
-        // runEnvironmentProvider, but nested CLI children could miss instance
-        // homes and any early host injects. Always stamp the full base here.
-        let hostTokenSaverBase = providerEnvironment(
+        // Provider-instance host environment for the Source provider. Same-host
+        // Auto never switches provider. The previous empty Auto base dropped
+        // instance config (HOME/CODEX_HOME/GROK_HOME, custom env) from the
+        // request shell, so nested CLI children could miss instance homes.
+        // Always stamp the full base here.
+        let hostProviderBase = providerEnvironment(
             provider: prov,
             instanceId: t.providerInstanceId,
             threadId: thread
-        )
-        // Graphify: authoritative resolve after cwd is known. Fail-open; never blocks the run.
-        let graphifyEnv = await applyGraphifyOnSend(
-            thread: t,
-            cwd: cwd,
-            attachments: resolvedAttachments,
-            baseEnvironment: hostTokenSaverBase
         )
         let acceptancePermit = queueMessageId.map { _ in
             queueAcceptancePermit ?? AgentRunAcceptancePermit()
@@ -5636,7 +5848,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ctx.unregisterQueueDispatchAcceptancePermit(acceptancePermit, threadId: thread)
             }
         }
-        var providerRunEnvironment = graphifyEnv
+        var providerRunEnvironment = hostProviderBase
         providerRunEnvironment.removeValue(
             forKey: AgentAppRuntimeProfile.environmentKey
         )
@@ -5714,15 +5926,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     childCapability: childCapability,
                     requestedPermissionMode: t.permissionMode
                 )
-                // Rebuild host Token Saver for the *child* thread so every
-                // orchestrated worker gets the full technique surface (receipt,
-                // DISTILL_HINT, managed PATH wrappers, Distill state, Graphify)
-                // — not a thinned parent/Auto shell.
-                providerRunEnvironment = await completeOrchestratedWorkerEnvironment(
+                // Rebuild the host environment for the *child* thread so every
+                // orchestrated worker gets the full surface, not a thinned
+                // parent/Auto shell.
+                providerRunEnvironment = completeOrchestratedWorkerEnvironment(
                     thread: t,
                     provider: prov,
-                    cwd: cwd,
-                    attachments: resolvedAttachments,
                     childCapability: childCapability,
                     runtimeProfile: nestedRunContext.runtimeProfile
                 )
@@ -5766,7 +5975,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             if let botCwd = transformed.cwd { runCwd = GrokACPClient.resolvedSessionCwd(botCwd) }
             botPromptApplied = true
         }
-        var req = AgentRunRequest(
+        let req = AgentRunRequest(
             runId: requestedRunID,
             threadId: thread,
             provider: prov,
@@ -5791,7 +6000,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             runAsUser: t.runAsUser,
             acceptancePermit: acceptancePermit
         )
-        req.tokenSaverCompressesPrompt = botPromptApplied
         let runId: AgentRunID
         do {
             runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
@@ -6150,86 +6358,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
-    /// Soft Graphify preflight on Agent App open / create.
-    /// Single-repo: ensure that root. Multi-repo: sticky/pin/auto-bootstrap one child (never parent).
-    private func softGraphifyPreflight(workspace: WorkspaceID?) {
-        guard let ctx = context, let workspace else { return }
-        let settings = SettingsStore(db: ctx.db).load()
-        // Token Saver is the paid gate; Graphify is a sub-capability under it.
-        guard ctx.isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return }
-        configureGraphifyService(from: settings)
-        let cwd = ctx.state.workspaces[workspace]?.cwd ?? FileManager.default.currentDirectoryPath
-        let pinnedRoots = settings.graphifyPinnedRoots
-        // Thread creation is an acknowledgement boundary for local RPC. Binary
-        // ensure and repository probing can take seconds and must not hold the
-        // MainActor or the Unix request open after the thread is durable.
-        Task.detached(priority: .utility) { [weak self] in
-            let set = GraphifyWorkspaceService.shared.softPreflight(
-                workspaceCwd: cwd,
-                pinnedRoots: pinnedRoots
-            )
-            await MainActor.run {
-                self?.publishGraphifyWorkingSet(set, threadId: nil)
-            }
-        }
-    }
-
-    private func configureGraphifyService(from settings: AppSettings) {
-        let svc = GraphifyWorkspaceService.shared
-        let active = context?.isTokenSaverRuntimeActive(settings: settings) == true
-            && settings.isGraphifyRuntimeActive
-        let wasActive = svc.enabled
-        svc.enabled = active
-        svc.autoEnsure = active && settings.graphifyAutoEnsure
-        svc.writeInRepo = settings.graphifyWriteInRepo
-        svc.pinnedRoots = settings.graphifyPinnedRoots
-        let path = settings.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        svc.binaryPathOverride = path.isEmpty ? nil : path
-        if !active {
-            svc.stopWatchingAll()
-        } else if !wasActive {
-            // Transition-only: inactive → active. Do not dirty every hot send.
-            svc.resumeAfterDisable()
-        }
-    }
-
     /// Full host environment for an orchestrated Agent App worker (nested child).
     ///
-    /// Product rule: every worker / orchestrated agent must receive the same Token
-    /// Saver technique surface as a user-started primary turn — execution receipt,
-    /// `RC_TOKEN_SAVER_DISTILL_HINT`, managed PATH wrappers (`| distill` / proxies),
-    /// Distill state path (Claude PostToolUse), Graphify when active, and Subagents
-    /// lifecycle keys. Rebuilds from the child thread identity after nested
-    /// admission so cross-provider children are not stuck with a parent-only or
-    /// Auto-thinned shell.
+    /// Every worker gets the same host environment as a user-started primary
+    /// turn (instance homes, managed PATH proxies, Subagents lifecycle keys).
+    /// Rebuilds from the child thread identity after nested admission so
+    /// cross-provider children are not stuck with a parent-only or Auto-thinned
+    /// shell.
     private func completeOrchestratedWorkerEnvironment(
         thread: AgentThread,
         provider: AgentProvider,
-        cwd: String,
-        attachments: [AgentAttachment],
         childCapability: String,
         runtimeProfile: AgentAppRuntimeProfile?
-    ) async -> [String: String] {
-        let hostBase = providerEnvironment(
+    ) -> [String: String] {
+        var env = providerEnvironment(
             provider: provider,
             instanceId: thread.providerInstanceId,
             threadId: thread.id
-        )
-        var env = await applyGraphifyOnSend(
-            thread: thread,
-            cwd: cwd,
-            attachments: attachments,
-            baseEnvironment: hostBase
         )
         env.removeValue(forKey: AgentAppRuntimeProfile.environmentKey)
         if let runtimeProfile {
             env[AgentAppRuntimeProfile.environmentKey] = runtimeProfile.rawValue
         }
         env[AgentDelegationCapabilityTransport.environmentKey] = childCapability
-        // providerEnvironment already stamped Token Saver when admitted. Re-assert
-        // managed wrappers first so nested PATH proxies stay in front after any
-        // Graphify merge.
+        // Re-assert managed wrappers first so nested PATH proxies stay in front.
         if let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !managedBin.isEmpty,
@@ -6240,67 +6392,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
         }
         return env
-    }
-
-    /// Authoritative Graphify resolve on send (RPC path). Agent App UI uses the same
-    /// `GraphifyWorkspaceService.applyToAgentEnvironment` from AgentAppSurface.
-    private func applyGraphifyOnSend(
-        thread: AgentThread,
-        cwd: String,
-        attachments: [AgentAttachment],
-        baseEnvironment: [String: String]
-    ) async -> [String: String] {
-        guard let ctx = context else { return baseEnvironment }
-        let settings = SettingsStore(db: ctx.db).load()
-        guard ctx.isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return baseEnvironment }
-        // Bots Desk is workspace-less Local. Walking process cwd is the
-        // git-rev-parse beachball Agent App already pulled off send.
-        guard thread.workspaceId != nil else {
-            return GraphifyWorkspaceService.stripGraphifyKeys(from: baseEnvironment)
-        }
-        configureGraphifyService(from: settings)
-
-        let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? cwd
-        // Root resolution blocks on `git rev-parse` subprocesses (two per
-        // candidate directory, whole-tree walk when the workspace root is not a
-        // repo). Must not run on the MainActor — same beachball the Agent App
-        // composer path had. Awaited, so the run environment is unchanged.
-        let graphifyThreadId = thread.id.value
-        let graphifyWorktreePath = thread.worktreePath
-        let graphifyAttachmentPaths = attachments.map(\.path)
-        let applied = await Task.detached(priority: .userInitiated) {
-            GraphifyWorkspaceService.shared.applyToAgentEnvironment(
-                base: baseEnvironment,
-                threadId: graphifyThreadId,
-                threadCwd: cwd,
-                worktreePath: graphifyWorktreePath,
-                workspaceCwd: workspaceCwd,
-                attachmentPaths: graphifyAttachmentPaths
-            )
-        }.value
-        publishGraphifyWorkingSet(applied.workingSet, threadId: thread.id)
-        return applied.environment
-    }
-
-    private func publishGraphifyWorkingSet(_ set: GraphifyThreadWorkingSet, threadId: AgentThreadID?) {
-        var payload: [String: JSONValue] = [
-            "workspace_kind": .string(set.workspaceKind),
-            "ambiguous": .bool(set.ambiguous),
-            "roots": .array(set.roots.map { binding in
-                .object([
-                    "display_root": .string(binding.checkout.displayRoot),
-                    "common_dir": .string(binding.checkout.key.commonDir),
-                    "status": .string(binding.status.rawValue),
-                    "reason": .string(binding.reason),
-                    "artifact_root": binding.artifactRoot.map { .string($0) } ?? .null
-                ])
-            })
-        ]
-        if let threadId {
-            payload["thread_id"] = .string(threadId.value.uuidString)
-        }
-        EventBus.shared.publish(kind: .graphifyThreadRoots, payload: .object(payload))
     }
 
     func effectiveAgentExecutionCwd(for thread: AgentThread) throws -> String {
@@ -6523,45 +6614,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         minimumEventSequence: Int64
     ) throws -> [EventBus.Event] {
         guard let context else { throw LayoutError.workspaceNotFound }
-        let resultData = try commandReceiptSortedEncoder.encode(result)
-        guard let resultJSON = String(data: resultData, encoding: .utf8) else {
-            throw JSONRPCError.internalError
-        }
-        let intents = try events.map { event -> CommandReceiptEventIntent in
-            let payloadData = try commandReceiptSortedEncoder.encode(event.payload)
-            guard let payloadJSON = String(data: payloadData, encoding: .utf8) else {
-                throw JSONRPCError.internalError
-            }
-            return CommandReceiptEventIntent(
-                kind: event.kind.rawValue,
-                payloadJSON: payloadJSON,
-                createdAt: event.createdAt
-            )
-        }
-        let repo = context.commandReceiptRepo
-        let persisted = try CommandReceiptPersistenceGateway.shared.syncThrowing {
-            try repo.finalize(
-                method: method,
-                clientRequestId: clientRequestId,
-                ownerFingerprint: ownerFingerprint,
-                paramsHash: paramsHash,
-                resultJSON: resultJSON,
-                events: intents,
-                minimumEventSequence: minimumEventSequence
-            )
-        }
-        return try persisted.map { event in
-            guard let payloadData = event.payloadJSON.data(using: .utf8),
-                  let payload = JSONValue.decode(from: payloadData) else {
-                throw JSONRPCError.internalError
-            }
-            return EventBus.Event(
-                seq: event.seq,
-                kind: event.kind,
-                payload: payload,
-                ts: event.createdAt.timeIntervalSince1970
-            )
-        }
+        return try CommandReceiptOffMainWriter(repo: context.commandReceiptRepo).finalizeTransaction(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash,
+            result: result,
+            events: events
+        )(minimumEventSequence)
+    }
+
+    public var commandReceiptOffMainWriter: (any CommandReceiptOffMainWriting)? {
+        guard let context else { return nil }
+        return CommandReceiptOffMainWriter(repo: context.commandReceiptRepo)
     }
 
     public func markCommandReceiptUnknown(
@@ -6706,26 +6771,35 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ) async throws -> AgentThreadMirrorSnapshot {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         // v1: metadata-first length inspection + decode only the selected suffix.
+        // Runs off MainActor: the barrier waits on this thread's mirror lock
+        // (a long stream flush) and the selection reads SQLite, neither of
+        // which may stall the UI or other paired-device RPCs.
         if let eventRowLimit, let maxPayloadBytes {
-            return try ctx.coordinator.withMirrorEventSnapshotForThreadReadV1(
-                threadId: thread,
-                eventLimit: eventRowLimit,
-                maxPayloadBytes: maxPayloadBytes
-            ) { selection in
-                let blocked = selection.blockedNewest.map {
-                    AgentThreadMirrorSnapshot.BlockedMirrorEvent(
-                        id: $0.id,
-                        payloadBytes: $0.payloadBytes,
-                        reason: $0.reason
+            let coordinator = ctx.coordinator
+            return try await Task.detached(priority: .userInitiated) {
+                let signposter = PerfSwitchMetrics.signposter
+                let interval = signposter.beginInterval("thread_read_v1_snapshot", id: signposter.makeSignpostID())
+                defer { signposter.endInterval("thread_read_v1_snapshot", interval) }
+                return try coordinator.withMirrorEventSnapshotForThreadReadV1(
+                    threadId: thread,
+                    eventLimit: eventRowLimit,
+                    maxPayloadBytes: maxPayloadBytes
+                ) { selection in
+                    let blocked = selection.blockedNewest.map {
+                        AgentThreadMirrorSnapshot.BlockedMirrorEvent(
+                            id: $0.id,
+                            payloadBytes: $0.payloadBytes,
+                            reason: $0.reason
+                        )
+                    }
+                    return AgentThreadMirrorSnapshot(
+                        events: selection.events,
+                        eventWatermark: EventBus.shared.currentSeq,
+                        sourceHadOlderEvents: selection.hasMoreOlder,
+                        blockedEvent: blocked
                     )
                 }
-                return AgentThreadMirrorSnapshot(
-                    events: selection.events,
-                    eventWatermark: EventBus.shared.currentSeq,
-                    sourceHadOlderEvents: selection.hasMoreOlder,
-                    blockedEvent: blocked
-                )
-            }
+            }.value
         }
         // Legacy: unbounded (or optional count-only) decode path.
         let sqlLimit = eventRowLimit.map { max(1, $0) + 1 } ?? Int.max
@@ -7754,9 +7828,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 env["DISTILL_HOME"] = env["DISTILL_HOME"] ?? home
             }
         }
-        // VITAL for the savings report: tag the agent's environment with the provider so the
-        // local `distill` CLI attributes command-output savings to claude/codex/grok
-        // instead of "unknown". Set unconditionally — even with no instance config.
+        // Tag the agent's environment with the provider so child tooling (provider
+        // proxies, subagent telemetry) attributes work to claude/codex/grok instead
+        // of "unknown". Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
         if let context, let threadId {
             let telemetryEnv = context.subagentTelemetryEnvironment(
@@ -7765,40 +7839,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 baseEnvironment: env
             )
             env.merge(telemetryEnv) { _, new in new }
-            // Nested provider proxies (`grok`/`claude`/`codex` in managed bin) must resolve
-            // for every thread-scoped provider environment — not only when Token Saver is on.
-            // Token Saver command-compression wrappers remain gated by admission below.
+            // Nested provider proxies (`grok`/`claude`/`codex` in managed bin) must
+            // resolve for every thread-scoped provider environment.
             let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]
                 ?? AgentSkillInstaller.defaultManagedCLIBinDirectory().path
             let basePath = env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
-            env["PATH"] = Self.providerPathWithManagedWrappers(
-                currentPath: basePath,
+            // Drop any optimization keys an older build left in the inherited
+            // environment, then put managed bin back first on PATH so nested
+            // provider proxies + Subagents telemetry work.
+            var cleaned = Self.scrubProviderEnvironment(env)
+            cleaned["PATH"] = Self.providerPathWithManagedWrappers(
+                currentPath: cleaned["PATH"] ?? basePath,
                 managedBin: managedBin
             )
-            // task-08: Token Saver PATH/hint only when same-user admission allows.
-            let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
-            if tokenSaverEnv.isEmpty {
-                // Cross-user / raw-only: scrub Token Saver optimization keys, but keep
-                // managed bin on PATH so nested provider proxies + Subagents telemetry work.
-                var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
-                cleaned["PATH"] = Self.providerPathWithManagedWrappers(
-                    currentPath: cleaned["PATH"] ?? basePath,
-                    managedBin: managedBin
-                )
-                return applyDesktopChildEnvironment(cleaned, threadId: threadId, context: context)
-            }
-            env.merge(tokenSaverEnv) { _, new in new }
-            // Re-assert managed bin first after any Token Saver PATH rewrite.
-            if let path = env["PATH"] {
-                env["PATH"] = Self.providerPathWithManagedWrappers(
-                    currentPath: path,
-                    managedBin: managedBin
-                )
-            }
-            return applyDesktopChildEnvironment(env, threadId: threadId, context: context)
+            return applyDesktopChildEnvironment(cleaned, threadId: threadId, context: context)
         } else {
-            // No thread context: keep provider tag only; scrub any residual TS keys.
-            return Self.scrubTokenSaverEnvironment(env)
+            // No thread context: keep provider tag only; no managed bin on PATH.
+            return Self.scrubProviderEnvironment(env)
         }
     }
 
@@ -7825,27 +7882,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
-    /// Removes Token Saver env keys. For no-thread contexts also drops managed bin from
-    /// PATH (no nested provider interception without thread scope). Thread-scoped paths
-    /// re-apply managed bin after scrub so provider proxies stay available.
-    nonisolated static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
-        var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
-        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-        if let path = cleaned["PATH"] {
-            // PERF: single pass avoids the map + filter intermediates on the
-            // scrub path; joined PATH identical.
-            var kept: [String] = []
-            for part in path.split(separator: ":") where part != managedBin {
-                kept.append(String(part))
-            }
-            cleaned["PATH"] = kept.joined(separator: ":")
-        }
-        return cleaned
+    /// Drops the keys the removed Token Saver / Graphify / Distill compression
+    /// lanes read (nothing sets them any more, but a value inherited from an
+    /// older build's environment must never reach a provider) and the managed
+    /// bin from PATH. No-thread contexts use it as is (no nested provider
+    /// interception without thread scope); thread-scoped paths put managed bin
+    /// back first so provider proxies stay available.
+    nonisolated static func scrubProviderEnvironment(_ env: [String: String]) -> [String: String] {
+        AgentHostEnvironmentMerge.scrubLegacyOptimizationKeys(env)
     }
 
     /// Prepends the managed CLI bin (`~/.remote-code/bin`) so nested provider proxies
-    /// and (when Token Saver is on) command-compression wrappers win PATH lookup inside
-    /// the provider process. Host top-level launches use absolute binaries via
+    /// win PATH lookup inside the provider process. Host top-level launches use absolute binaries via
     /// `ProcessLocator` and skip provider proxy shims.
     static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
         let trimmed = managedBin.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -9030,6 +9078,41 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    /// Reads on the WAL reader so a reconnect's unchanged push token never waits
+    /// behind a long writer transaction. Any read failure answers false and the
+    /// request takes the full durable path.
+    public func privatePushRegistrationIsCurrent(_ probe: PrivatePushRegistrationProbe) -> Bool {
+        guard let ctx = context else { return false }
+        let store = PrivatePushTargetStore(repo: SettingsRepository(db: ctx.readDB))
+        guard store.legacyTargetMatches(
+            pushToken: probe.pushToken,
+            pushTokenType: probe.pushTokenType,
+            liveActivityToken: probe.liveActivityToken,
+            deviceId: probe.deviceID
+        ) else { return false }
+        if let alert = probe.alert {
+            guard let deviceID = probe.deviceID,
+                  let environment = PrivatePushEnvironment(rawValue: alert.environment),
+                  store.containsCurrentRecord(PrivatePushTargetRecord(
+                      deviceId: deviceID,
+                      serverId: alert.serverID,
+                      purpose: .alert,
+                      environment: environment,
+                      token: probe.pushToken,
+                      contractVersion: alert.contractVersion,
+                      capabilities: alert.capabilities
+                  )) else { return false }
+        }
+        if let binding = probe.profileBinding {
+            guard BotAttentionPushBindingStore(db: ctx.readDB).contains(
+                profileID: binding.profileID,
+                hostID: binding.hostID,
+                deviceID: binding.deviceID
+            ) else { return false }
+        }
+        return true
+    }
+
     public func settingsGet(keys: [String]) throws -> [String: String] {
         guard let ctx = context else { return [:] }
         var values: [String: String] = [:]
@@ -9079,7 +9162,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func filesStateGet(surface: SurfaceID) throws -> JSONValue {
         let located = try locateSurface(surface)
         let root = try workspaceCwd(located.workspaceID)
-        let state = decodeFilesState(located.descriptor.metadata["files_state"])
+        let state = Self.decodeFilesState(located.descriptor.metadata["files_state"])
             ?? defaultFilesState(surface: surface, workspace: located.workspaceID, root: root, descriptor: located.descriptor)
         return .object(state)
     }
@@ -9087,7 +9170,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func filesStateUpdate(surface: SurfaceID, patch: [String: JSONValue], baseRevision: Int?, deviceID: String?) throws -> JSONValue {
         let located = try locateSurface(surface)
         let root = try workspaceCwd(located.workspaceID)
-        var state = decodeFilesState(located.descriptor.metadata["files_state"])
+        var state = Self.decodeFilesState(located.descriptor.metadata["files_state"])
             ?? defaultFilesState(surface: surface, workspace: located.workspaceID, root: root, descriptor: located.descriptor)
         let currentRevision = state["revision"]?.intValue ?? 0
         if let baseRevision, baseRevision != currentRevision {
@@ -9321,6 +9404,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 agent.viewModel.onThreadLifecycle = { [weak self] event in
                     self?.publishAgentThreadLifecycle(event)
                 }
+                agent.viewModel.onThreadChromeWritten = { write in
+                    write.publish()
+                }
                 agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
                     ctx?.retireDeletedAgentThreads(
                         ids,
@@ -9330,7 +9416,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                 wireQueueDrainControl(on: agent.viewModel, context: ctx)
                 wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
-                Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
                 configureAgentAppBotMentions(agent)
                 agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                     self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
@@ -9981,7 +10066,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ]
     }
 
-    private func decodeFilesState(_ raw: String?) -> [String: JSONValue]? {
+    nonisolated private static func decodeFilesState(_ raw: String?) -> [String: JSONValue]? {
         guard let raw, let data = raw.data(using: .utf8),
               case .object(let state) = JSONValue.decode(from: data) else {
             return nil
@@ -10248,4 +10333,18 @@ struct KeychainSSHPasswordStore: SSHPasswordStoring {
     func delete(account: String) {
         SecItemDelete(Self.baseQuery(account: account) as CFDictionary)
     }
+}
+
+/// Carries a paired `bot.*` read across the detached hop. The authority
+/// serializes every dispatch under its own lock; the params dictionary is
+/// built from JSON values and is never mutated after hand-off.
+private struct PairedBotReadRequest: @unchecked Sendable {
+    let authority: BotRemoteControlAuthority
+    let method: String
+    let params: [String: Any]
+}
+
+private enum PairedBotReadOutcome: @unchecked Sendable {
+    case value([String: Any])
+    case failure(Error)
 }

@@ -9,38 +9,6 @@ import Persistence
 /// interrupted the main thread per stream event with N concurrent runs.
 @MainActor
 final class PerfMainThreadHogsTests: XCTestCase {
-    // MARK: PL-01 / EV-22
-
-    func test_tokenSaverDailyEconomyRecompute_coalescesTriggersAndPostsUsageChangedAfterUpsert() async throws {
-        // WHY: every usage flush (0.75 s per run) and every Graphify item settle
-        // ran the 7-read + upsert recompute synchronously on the main thread,
-        // each waiting on the SQLite lock behind the writers (~16% of the main
-        // thread in the live sample). Triggers must coalesce into one off-main
-        // recompute, and the usage-changed notification must follow the upsert.
-        let directory = NSTemporaryDirectory() + "RC2PL01-\(UUID().uuidString)"
-        let context = try AppContext(channel: .debug, appSupportOverride: directory)
-        context.tokenSaverDailyEconomyRecomputeDebounceForTesting = 0.05
-        context.tokenSaverDailyEconomySharedSnapshotLoadsForTesting = 0
-
-        let posted = expectation(forNotification: .rc2TokenSaverUsageChanged, object: nil)
-        for _ in 0..<10 {
-            context.scheduleTokenSaverDailyEconomyRecompute(notifyUsageChanged: true)
-        }
-        await fulfillment(of: [posted], timeout: 3)
-
-        XCTAssertEqual(
-            context.tokenSaverDailyEconomyOffMainRecomputeCountForTesting,
-            1,
-            "10 triggers inside the debounce window must produce ONE recompute"
-        )
-        XCTAssertEqual(context.tokenSaverDailyEconomySharedSnapshotLoadsForTesting, 1)
-        let todayMs = context.tokenSaverDailyEconomyRepo.dayStartMs(for: Date())
-        XCTAssertNotNil(
-            try context.tokenSaverDailyEconomyRepo.record(dayStartMs: todayMs),
-            "the day row must already be upserted when usage-changed is posted"
-        )
-    }
-
     // MARK: PL-03 / EV-29
 
     func test_petResolvesLinkedBotOnceOffMainAndReusesItAcrossActiveRunRefreshes() async throws {
@@ -152,22 +120,6 @@ final class PerfMainThreadHogsTests: XCTestCase {
     }
 
     // MARK: PL-02 / PL-04 source pins
-
-    func test_tokenSaverFooterReloadsAreDetachedFromTheMainActor() throws {
-        // WHY: `Task { }` inside a @MainActor view model inherits the actor. Both
-        // footer reloads claimed to read settings/ledger "off-main" but ran on
-        // main on every `.rc2TokenSaverUsageChanged` (107 samples in 8 s).
-        for (file, anchor) in [
-            ("Sources/AppShell/BotsWindow.swift", "func reloadTokenSaverThreadSavings() {"),
-            ("Sources/Surfaces/AgentAppSurface.swift", "public func reloadTokenSaverThreadSavings() {")
-        ] {
-            let source = try String(contentsOf: sourceURL(file), encoding: .utf8)
-            let start = try XCTUnwrap(source.range(of: anchor), file)
-            let slice = String(source[start.upperBound...].prefix(4_000))
-            XCTAssertTrue(slice.contains("tokenSaverFooterReloadTask = Task.detached("), "\(file): reload must run detached")
-            XCTAssertFalse(slice.contains("tokenSaverFooterReloadTask = Task {"), "\(file): actor-inheriting Task is the bug")
-        }
-    }
 
     func test_petDockPlacementCacheHasNoPeriodicRevalidationLoop() throws {
         // WHY: a 30 s loop hit-tested the Dock against the WindowServer for every

@@ -223,6 +223,25 @@ final class RemoteCodeTreatyTests: XCTestCase {
         )
     }
 
+    /// C-W: the client compares this digest with the welcome's
+    /// `capabilitiesDigest`; hosts that predate it must still decode (nil).
+    func testAuthenticatedCapabilitiesDigestIsOptional() throws {
+        func envelope(_ extra: String) throws -> AuthenticatedCapabilities {
+            try decoder.decode(AuthenticatedCapabilities.self, from: Data(#"""
+            {
+              "authenticated":true,"server_id":"host-1","boot_epoch":42,\#(extra)
+              "capabilities":{"surface_types":["terminal"],
+                "agent":{"providers":["codex"],"supports_stream_events":true,"supports_resume":true}}
+            }
+            """#.utf8))
+        }
+        XCTAssertNil(try envelope("").capabilitiesDigest)
+        XCTAssertEqual(
+            try envelope(#""capabilities_digest":"abc123","#).capabilitiesDigest,
+            "abc123"
+        )
+    }
+
     func testCompatibilityAcceptsLegacyV0V1AndFutureMinorButRejectsIncompatibleMajor() {
         XCTAssertEqual(TreatyCompatibility.evaluate(host: nil), .compatibleLegacyV0)
         XCTAssertEqual(
@@ -277,7 +296,7 @@ final class RemoteCodeTreatyTests: XCTestCase {
     }
 
     func testEveryKnownEventKindHasAnIdentityBearingGoldenEnvelope() throws {
-        XCTAssertEqual(RemoteCodeEventKind.allCases.count, 149)
+        XCTAssertEqual(RemoteCodeEventKind.allCases.count, 150)
         XCTAssertEqual(
             Set(RemoteCodeEventKind.allCases.map(\.rawValue)).count,
             RemoteCodeEventKind.allCases.count

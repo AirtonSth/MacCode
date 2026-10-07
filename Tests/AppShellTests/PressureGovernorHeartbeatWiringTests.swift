@@ -1,14 +1,12 @@
 import XCTest
 @testable import AppShell
 @testable import AppLifecycleSupport
-@testable import AgentRuntime
 
 /// S7 production wiring: AppDiagnostics heartbeat drives
 /// PressureGovernorCoordinator.ingest + execute (not test-only).
 @MainActor
 final class PressureGovernorHeartbeatWiringTests: XCTestCase {
     func test_heartbeatIngest_rssHysteresis_twoSamplesEscalate() {
-        GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(false)
         // Fresh coordinator so prior suite state cannot poison thresholds.
         // Replace shared by ingesting into a known high-RSS complete sample twice.
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: 16 * 1024 * 1024 * 1024)
@@ -58,17 +56,14 @@ final class PressureGovernorHeartbeatWiringTests: XCTestCase {
         let afterSecond = AppDiagnostics.pressureGovernor.currentState().level
         XCTAssertTrue(afterSecond >= afterFirst)
         XCTAssertNotEqual(afterSecond, .normal, "two high-RSS samples must escalate")
-        // Graphify pause is a real mutation when executed.
+        // An escalation must reach the governor's mutation path.
         if afterSecond >= .warning {
             XCTAssertTrue(
-                GraphifyWorkspaceService.shared.isPressurePauseEnsureAndWatch
-                    || AppDiagnostics.activePressureEffectsForTesting.contains(.pauseGraphifyEnsureAndWatchCallbacks)
-                    || !(AppDiagnostics.lastPressureExecuteOutcomeForTesting?.applied ?? []).isEmpty
+                !(AppDiagnostics.lastPressureExecuteOutcomeForTesting?.applied ?? []).isEmpty
                     || AppDiagnostics.lastPressureIngestEmittedForTesting.isEmpty == false
             )
         }
         XCTAssertFalse(PressureGovernorCoordinator.killsActiveTurns)
-        GraphifyWorkspaceService.shared.setPressurePauseEnsureAndWatch(false)
     }
 
     func test_pressureGovernor_isSharedProcessInstance() {

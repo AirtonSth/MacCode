@@ -3965,30 +3965,6 @@ final class AgentAppViewModelTests: XCTestCase {
             [persisted.id],
             "the turn final is the chat answer; the persisted copy must not paint beside it"
         )
-        XCTAssertTrue(
-            AgentAppView.keepsTokenSaverPersistedHidden(
-                requiresDurableRow: true,
-                messageText: persisted.content,
-                turns: [turn]
-            ),
-            "Token Saver must not un-hide a persisted row the live turn already paints"
-        )
-        XCTAssertTrue(
-            AgentAppView.keepsTokenSaverPersistedHidden(
-                requiresDurableRow: false,
-                messageText: persisted.content,
-                turns: [turn]
-            ),
-            "without a Token Saver durable-row claim the hide set already owns the duplicate"
-        )
-        XCTAssertFalse(
-            AgentAppView.keepsTokenSaverPersistedHidden(
-                requiresDurableRow: true,
-                messageText: "a different durable answer",
-                turns: [turn]
-            ),
-            "Token Saver may show the durable row only when the live turn does not already own that text"
-        )
     }
 
     /// WHY: user messages must never be character-truncated in the bubble; long
@@ -4259,7 +4235,7 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     /// WHY: between the user's bubble appearing and a run id existing, the surface
-    /// does real work — transcript load, Graphify root resolution (git subprocesses),
+    /// does real work — transcript load, git subprocesses,
     /// prompt compression, provider spawn. That window rendered NOTHING, so a slow
     /// dependency looked like the app had hung. "Loading…" must fill exactly that gap
     /// and must hand over to "Working for Xs" the moment the run is tracked, never
@@ -4292,7 +4268,7 @@ final class AgentAppViewModelTests: XCTestCase {
         }
 
         XCTAssertEqual(preparingMidWindow, true,
-                       "the prepare window must render Loading… — leaving it blank is what read as a hang while Graphify shelled out to git")
+                       "the prepare window must render Loading… — leaving it blank is what read as a hang while preparation shelled out to git")
         XCTAssertEqual(runActiveMidWindow, false,
                        "precondition: no run is tracked yet mid-prepare, so Working cannot be what covers this window")
         XCTAssertEqual(preparingForSiblingThread, false,
@@ -6347,44 +6323,6 @@ final class AgentAppViewModelTests: XCTestCase {
                 selectedThreadId: tid,
                 messagesThreadIds: [tid, other]
             )
-        )
-    }
-
-    /// WHY: soft reselect restarts token-saver work and reassigned identical
-    /// footer numbers, multipass-repainting the thread footer chrome.
-    func test_shouldPublishTokenSaverFooter_skipsEqualValues() {
-        XCTAssertFalse(
-            AgentAppViewModel.shouldPublishTokenSaverFooter(
-                currentEnabled: true,
-                nextEnabled: true,
-                currentMeasured: 10,
-                nextMeasured: 10,
-                currentDisplay: 12,
-                nextDisplay: 12
-            ),
-            "identical footer must not re-publish"
-        )
-        XCTAssertTrue(
-            AgentAppViewModel.shouldPublishTokenSaverFooter(
-                currentEnabled: true,
-                nextEnabled: true,
-                currentMeasured: 10,
-                nextMeasured: 11,
-                currentDisplay: 12,
-                nextDisplay: 12
-            ),
-            "measured change must publish"
-        )
-        XCTAssertTrue(
-            AgentAppViewModel.shouldPublishTokenSaverFooter(
-                currentEnabled: false,
-                nextEnabled: true,
-                currentMeasured: 0,
-                nextMeasured: 0,
-                currentDisplay: 0,
-                nextDisplay: 0
-            ),
-            "eligibility change must publish"
         )
     }
 
@@ -8888,58 +8826,6 @@ final class AgentAppViewModelTests: XCTestCase {
                       "the default model must be one the picker actually offers")
     }
 
-    // F6: the Token Saver translation maps were additive-only and never cleared on a thread
-    // switch, so they accumulated the union of every optimized message (and its full
-    // original text) across every thread visited for the whole session.
-    @MainActor
-    func test_tokenSaverTranslationMaps_resetOnThreadSwitchButSurviveReselect() async throws {
-        let (vm, threadRepo) = try makeVM()
-        let a = AgentThread(workspaceId: vm.workspaceID, title: "A", provider: .claude, model: "m")
-        let b = AgentThread(workspaceId: vm.workspaceID, title: "B", provider: .claude, model: "m")
-        try threadRepo.upsert(a)
-        try threadRepo.upsert(b)
-        vm.reloadThreads()
-
-        vm.selectThread(a.id)
-        let msgId = AgentMessageID(UUID())
-        vm.coordinator.onWireTranslatedMessageId?(msgId)   // live badge -> Task { @MainActor }
-        vm.runCoordinator(
-            vm.coordinator,
-            didReceive: .wireTranslation(AssistantWireTranslation(
-                itemId: "progress-item",
-                originalText: "RCW1\tA\t1\nA\tInspecting.\n.\n",
-                rewrittenText: "Action: Inspecting.",
-                wireRequestText: "RCW1\tQ\t1\nG\tInspect.\n.\n"
-            )),
-            run: AgentRunID(),
-            threadId: a.id
-        )
-        for _ in 0..<200 where !vm.tokenSaverOptimizedMessageIds.contains(msgId)
-            || vm.tokenSaverTranslation(forItemId: "progress-item") == nil {
-            try await Task.sleep(nanoseconds: 2_000_000)
-        }
-        XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.contains(msgId),
-                      "a live wire translation must mark the message on the current thread")
-        XCTAssertNotNil(vm.tokenSaverTranslation(forItemId: "progress-item"),
-                        "live progress transport must be visible on the current thread")
-
-        // Re-selecting the SAME thread must NOT wipe live translation state.
-        vm.selectThread(a.id)
-        XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.contains(msgId),
-                      "re-selecting the same thread must keep its Token Saver badge")
-
-        // Switching to a DIFFERENT thread (no translations) must clear the maps.
-        vm.selectThread(b.id)
-        XCTAssertTrue(vm.tokenSaverOptimizedMessageIds.isEmpty,
-                      "switching threads must reset Token Saver translation state (F6: no cross-thread accumulation)")
-        XCTAssertTrue(vm.tokenSaverOriginalTextsByMessageId.isEmpty,
-                      "switching threads must also drop the retained original texts")
-        XCTAssertTrue(vm.tokenSaverWireRequestTextsByMessageId.isEmpty,
-                      "switching threads must also drop private provider-bound request metadata")
-        XCTAssertTrue(vm.tokenSaverTranslationsByItemId.isEmpty,
-                      "switching threads must also drop timeline-item transport metadata")
-    }
-
     // F9: deleting a thread must evict its per-thread VM caches and the coordinator's
     // per-thread auto-continuation bookkeeping, which previously leaked one entry per
     // deleted thread for the life of the surface.
@@ -9194,10 +9080,6 @@ final class AgentAppViewModelTests: XCTestCase {
                        "selection recovery must keep unsent attachments in the fresh composer")
         XCTAssertEqual(vm.subagentActivity, .empty,
                        "partial-failure recovery must synchronously clear deleted-thread Subagents chrome")
-        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, 0,
-                       "partial-failure recovery must synchronously clear deleted-thread Token Saver display")
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0,
-                       "partial-failure recovery must synchronously clear deleted-thread Token Saver ledger total")
         XCTAssertTrue(vm.statusMessage.contains("Could not reload threads"),
                       "the partial list failure must still fail loud")
         XCTAssertTrue(vm.statusMessage.contains("your unsent draft was kept"),
@@ -9640,9 +9522,7 @@ final class AgentAppViewModelTests: XCTestCase {
                 && vm.timeline.turns.isEmpty
                 && vm.queueStatusMessage == nil
                 && vm.providerThreadSnapshotLastConfirmedAt == nil
-                && vm.subagentActivity == .empty
-                && vm.tokenSaverThreadSavedTokens == 0
-                && vm.tokenSaverThreadMeasuredTokens == 0,
+                && vm.subagentActivity == .empty,
             selectedThreadRecovered: vm.selectedThreadId == nil && recoveredSelection == nil,
             automaticPruneCreatedUndo: vm.pendingThreadDeletionUndo != nil,
             footprintBeforeReloadKB: footprintBeforeReloadKB,
@@ -10010,72 +9890,6 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(bots.contains { $0.name == "Rio" },
                       "a bot created after the cache must appear in the next catalog read")
         XCTAssertEqual(botStore.listQueryCountForTesting, 2)
-    }
-
-    func test_assistantCharsHot_matchesUTF8ReduceAndFooterDoesNotSnapshotMessages() throws {
-        // WHY: the Token Saver footer used to capture `[AgentMessage]` on every
-        // usage-changed reload. The hot Int must equal the previous reduce so
-        // displayTokens stay unchanged, and reload must not snapshot the array.
-        let (vm, _) = try makeVM()
-        let threadId = AgentThreadID()
-        vm.messages = [
-            AgentMessage(threadId: threadId, role: .user, content: "ask"),
-            AgentMessage(threadId: threadId, role: .assistant, content: "hello world"),
-            AgentMessage(threadId: threadId, role: .assistant, content: "second")
-        ]
-        let reduced = vm.messages
-            .filter { $0.role == .assistant }
-            .reduce(0) { $0 + $1.content.utf8.count }
-        XCTAssertEqual(
-            vm.transcriptState.assistantCharsHot,
-            reduced,
-            "assistantCharsHot must equal filter(role==assistant).utf8.count"
-        )
-        XCTAssertEqual(
-            AgentAppView.tokenSaverThreadFooterDisplayTokens(
-                measuredDelivered: 100,
-                assistantChars: vm.transcriptState.assistantCharsHot,
-                tokenSaverEnabled: true,
-                graphifyActive: false
-            ),
-            AgentAppView.tokenSaverThreadFooterDisplayTokens(
-                measuredDelivered: 100,
-                assistantChars: reduced,
-                tokenSaverEnabled: true,
-                graphifyActive: false
-            ),
-            "footer tokens from the hot Int must equal the previous message reduce"
-        )
-        XCTAssertEqual(
-            AgentAppView.tokenSaverThreadFooterDisplayTokens(
-                measuredDelivered: 100,
-                assistantChars: vm.transcriptState.assistantCharsHot,
-                tokenSaverEnabled: false,
-                graphifyActive: false
-            ),
-            100,
-            "Token Saver off still reports the measured floor, not a invented estimate"
-        )
-
-        let source = try String(
-            contentsOf: URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"),
-            encoding: .utf8
-        )
-        let marker = "public func reloadTokenSaverThreadSavings() {"
-        let start = try XCTUnwrap(source.range(of: marker))
-        let body = String(source[start.lowerBound...].prefix(2_400))
-        XCTAssertFalse(
-            body.contains("let messageSnapshot = messages"),
-            "reloadTokenSaverThreadSavings must not capture [AgentMessage]"
-        )
-        XCTAssertTrue(
-            body.contains("assistantCharsHot"),
-            "reload must pass the maintained assistantChars Int"
-        )
     }
 
     func test_hiddenSurface_coalescesStreamPublishesAndStopsTicks() async throws {

@@ -107,7 +107,7 @@ public enum AssistantAccountUsageParser {
             ?? payload
         // Claude Code 2.1.258+ stream-json `rate_limit_event` ships utilization under
         // `unifiedWindows.{five_hour,seven_day}` (0–1 or 0–100). Prefer that shape so
-        // live turns update Token Saver rings; fall back to legacy primary.usedPercent.
+        // live turns update the account usage rings; fall back to legacy primary.usedPercent.
         if let unified = claudeUnifiedWindowsUsage(from: info, payload: payload) {
             return unified
         }
@@ -378,7 +378,7 @@ public enum AssistantAccountUsageParser {
     /// WHY maxBytes defaults to 4 MiB: real `unified.jsonl` files routinely put
     /// more than 512 KiB of non-billing traffic between credit snapshots (observed
     /// gaps > 800 KiB). A too-small window returns nil, the partial account-usage
-    /// refresh treats Grok as missing, and Token Saver falsely paints Grok at 0%.
+    /// refresh treats Grok as missing, and the rings falsely paint Grok at 0%.
     public static func grokFromBillingLogFile(
         at url: URL,
         maxBytes: Int = 4 * 1024 * 1024

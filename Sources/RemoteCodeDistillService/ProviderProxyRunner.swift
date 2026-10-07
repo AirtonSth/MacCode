@@ -9,7 +9,7 @@ import Persistence
 /// Invoked when a managed symlink (`~/.remote-code/bin/{grok,claude,codex}`) is
 /// the process basename. Preserves argv/stdin/stdout/stderr/exit status, avoids
 /// recursion into the managed bin, and records a content-free Subagents receipt
-/// when the parent thread scope is present. Never invents Token Saver admission.
+/// when the parent thread scope is present.
 enum ProviderProxyRunner {
     /// Runs the real provider CLI. Always returns the real process exit code
     /// (or 127 when the real executable cannot be resolved).
@@ -18,18 +18,16 @@ enum ProviderProxyRunner {
             ProcessInfo.processInfo.environment
         )
         let basename = ProviderProxyPolicy.commandBasename(command)
-        let liveRuntime = validatedPaidRuntime(environment: env)
-        let runtimeEnvironment = liveRuntime.environment
+        // Leftover Token Saver / Graphify keys from an older build never reach
+        // a provider.
+        let runtimeEnvironment = ProviderProxyPolicy.removingLegacyOptimizationKeys(env)
 
         // Nested provider CLIs with a parent Agent App scope promote into
-        // `remote-code agent-app` so Token Saver (PATH wrappers, dialect, Claude
-        // PostToolUse, Graphify) runs through the same host pipeline as UI
-        // subagents. Fail open to the raw provider path when the ABI is not
+        // `remote-code agent-app` so they run through the same host pipeline
+        // as UI subagents. Fail open to the raw provider path when the ABI is not
         // agent-shaped. If stdin was already consumed for promotion, fail loud
         // instead of spawning a raw CLI with an empty prompt.
         let parentRunScope = runtimeEnvironment["RC_REMOTE_CODE_ROOT_RUN_ID"]
-            ?? runtimeEnvironment["RC_TOKEN_SAVER_ROOT_RUN_ID"]
-            ?? runtimeEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"]
         if runtimeEnvironment["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"] == "1",
            ProviderProxyPolicy.hasTelemetryScope(environment: runtimeEnvironment),
            parentRunScope.flatMap(UUID.init(uuidString:)) != nil,
@@ -119,8 +117,7 @@ enum ProviderProxyRunner {
             environment: runtimeEnvironment,
             targetProviderBasename: basename,
             childRunId: childRunId,
-            childDelegationCapability: childDelegationCapability,
-            paidAdmission: liveRuntime.admission
+            childDelegationCapability: childDelegationCapability
         )
         if let childRunId {
             scheduleExternalReceiptLeaseRenewal(
@@ -369,266 +366,23 @@ enum ProviderProxyRunner {
         return 77 // EX_NOPERM
     }
 
-    private struct PaidRuntimeAdmission {
-        let receipt: TokenSaverExecutionReceipt
-        let graphifyActive: Bool
-    }
-
-    private struct ValidatedPaidRuntime {
-        let environment: [String: String]
-        let admission: PaidRuntimeAdmission?
-    }
-
-    private struct LivePaidState {
-        let settings: AppSettings
-        let subscribed: Bool
-    }
-
-    /// Re-read the persisted setting for every nested provider launch. Inherited
-    /// environment is only capability transport; it cannot resurrect Token
-    /// Saver or Graphify after the user turns either feature off.
-    private static func validatedPaidRuntime(
-        environment: [String: String]
-    ) -> ValidatedPaidRuntime {
-        guard let controller = AgentProvider(
-            rawValue: environment["REMOTE_CODE_AGENT_PROVIDER"] ?? ""
-        ),
-        let receipt = TokenSaverExecutionReceiptSeam.receipt(from: environment),
-        receipt.admitted,
-        receipt.sameUser,
-        receipt.provider == controller.rawValue,
-        receipt.threadId == (
-            environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"]
-                ?? environment["RC_TOKEN_SAVER_THREAD_ID"]
-                ?? ""
-        ),
-        let liveState = livePaidState(environment: environment),
-        liveState.settings.tokenSaverEnabled,
-        liveState.subscribed else {
-            return ValidatedPaidRuntime(
-                environment: ProviderProxyPolicy.paidRuntimeEnvironment(
-                    environment: environment,
-                    tokenSaverRuntimeActive: false,
-                    graphifyRuntimeActive: false
-                ),
-                admission: nil
-            )
-        }
-
-        if let receiptRoot = receipt.rootRunId {
-            let inheritedRoot = environment["RC_REMOTE_CODE_ROOT_RUN_ID"]
-                ?? environment["RC_TOKEN_SAVER_ROOT_RUN_ID"]
-                ?? environment["RC_TOKEN_SAVER_ATTEMPT_ID"]
-            guard inheritedRoot == receiptRoot else {
-                return ValidatedPaidRuntime(
-                    environment: ProviderProxyPolicy.paidRuntimeEnvironment(
-                        environment: environment,
-                        tokenSaverRuntimeActive: false,
-                        graphifyRuntimeActive: false
-                    ),
-                    admission: nil
-                )
-            }
-        }
-
-        let graphifyActive = liveState.settings.isGraphifyRuntimeActive
-            && receipt.capabilities.graphify == true
-        var validated = ProviderProxyPolicy.paidRuntimeEnvironment(
-            environment: environment,
-            tokenSaverRuntimeActive: true,
-            graphifyRuntimeActive: graphifyActive
-        )
-
-        // Discrete RC_TOKEN_SAVER_* values are rebuilt from the validated
-        // receipt so stale/spoofed siblings cannot disagree with it.
-        for key in validated.keys where key.hasPrefix("RC_TOKEN_SAVER_") {
-            validated.removeValue(forKey: key)
-        }
-        validated.merge(
-            TokenSaverExecutionReceiptSeam.environment(from: receipt)
-        ) { _, receiptValue in receiptValue }
-        if receipt.capabilities.distill != true {
-            for key in validated.keys where key.hasPrefix("RC_DISTILL_") {
-                validated.removeValue(forKey: key)
-            }
-        }
-        if receipt.capabilities.distill != true {
-            validated.removeValue(forKey: "REMOTE_CODE_DISTILL_STATE_PATH")
-        }
-        return ValidatedPaidRuntime(
-            environment: validated,
-            admission: PaidRuntimeAdmission(
-                receipt: receipt,
-                graphifyActive: graphifyActive
-            )
-        )
-    }
-
-    private static func livePaidState(
-        environment: [String: String]
-    ) -> LivePaidState? {
-        let override = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let channel = bundledReleaseChannel()
-        guard override?.isEmpty == false || channel != nil else { return nil }
-        do {
-            let (_, db) = try Bootstrap(
-                channel: channel ?? .debug,
-                appSupportOverride: override?.isEmpty == false ? override : nil
-            ).run()
-            let repository = SettingsRepository(db: db)
-            let subscribed: Bool = {
-                guard let json = try? repository.get("private.account.session"),
-                      let data = json.data(using: .utf8),
-                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let user = object["user"] as? [String: Any] else {
-                    return false
-                }
-                return user["subscribed"] as? Bool == true
-            }()
-            return LivePaidState(
-                settings: SettingsStore(db: db).reload(),
-                subscribed: subscribed
-            )
-        } catch {
-            return nil
-        }
-    }
-
     private static func makeChildEnvironment(
         environment: [String: String],
         targetProviderBasename: String,
         childRunId: AgentRunID?,
-        childDelegationCapability: String?,
-        paidAdmission: PaidRuntimeAdmission?
+        childDelegationCapability: String?
     ) -> [String: String] {
         guard let targetProvider = AgentProvider(
             rawValue: ProviderProxyPolicy.commandBasename(targetProviderBasename)
         ) else {
-            return ProviderProxyPolicy.paidRuntimeEnvironment(
-                environment: environment,
-                tokenSaverRuntimeActive: false,
-                graphifyRuntimeActive: false
-            )
+            return ProviderProxyPolicy.removingLegacyOptimizationKeys(environment)
         }
-
-        let childId = childRunId?.value.uuidString
-        let tokenSaverEnvironment: [String: String]? = {
-            guard let childId,
-                  let admission = paidAdmission else {
-                return nil
-            }
-            let parent = admission.receipt
-            // Nested launch re-probes the Distill lease so a parent that started
-            // while the sidecar was still starting does not permanently starve
-            // child Codex/Claude/Grok processes of distill + managed_path.
-            let statePath = providerDistillStatePath(environment: environment)
-            let sidecarLive = TokenSaverSidecarLeaseProbe.isHealthy(
-                stateFileURL: statePath.map { URL(fileURLWithPath: $0) }
-            )
-            let seed = TokenSaverExecutionReceipt(
-                rootRunId: childId,
-                threadId: parent.threadId,
-                attemptId: childId,
-                provider: parent.provider,
-                admitted: parent.admitted,
-                sameUser: parent.sameUser,
-                denialReason: parent.denialReason,
-                capabilities: parent.capabilities,
-                disabledLanes: parent.disabledLanes,
-                enabledLanes: parent.enabledLanes,
-                workspaceId: parent.workspaceId,
-                projectId: parent.projectId,
-                waveLive: parent.waveLive
-            )
-            let retargeted = TokenSaverExecutionReceiptSeam.reAdmitSidecarIfAvailable(
-                receipt: seed,
-                sidecarAvailable: sidecarLive,
-                provider: targetProvider,
-                waveLive: parent.waveLive
-            )
-            // Graphify stays gated by live settings, not only the parent snapshot.
-            let graphifyActive = admission.graphifyActive
-                && retargeted.capabilities.graphify == true
-            let childCapabilities = TokenSaverExecutionReceipt.Capabilities(
-                distill: retargeted.capabilities.distill,
-                graphify: graphifyActive,
-                postToolUse: ProviderProxyPolicy.childPostToolUseCapability(
-                    targetProvider: targetProvider,
-                    distillAvailable: retargeted.capabilities.distill == true
-                ),
-                recoveryScope: retargeted.capabilities.recoveryScope,
-                managedPath: retargeted.capabilities.managedPath
-            )
-            let childReceipt = TokenSaverExecutionReceipt(
-                rootRunId: childId,
-                threadId: retargeted.threadId,
-                attemptId: childId,
-                provider: targetProvider.rawValue,
-                admitted: retargeted.admitted,
-                sameUser: retargeted.sameUser,
-                denialReason: retargeted.denialReason,
-                capabilities: childCapabilities,
-                disabledLanes: retargeted.disabledLanes,
-                enabledLanes: retargeted.enabledLanes,
-                workspaceId: retargeted.workspaceId,
-                projectId: retargeted.projectId,
-                waveLive: retargeted.waveLive
-            )
-            var childRuntime = TokenSaverExecutionReceiptSeam.environment(from: childReceipt)
-            if childCapabilities.distill == true,
-               let statePath {
-                childRuntime["REMOTE_CODE_DISTILL_STATE_PATH"] = statePath
-            }
-            // Child process PATH must put managed wrappers first when distill is admitted.
-            if childCapabilities.managedPath == true {
-                let managedBin = environment["RC_REMOTE_CODE_MANAGED_BIN"]?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                let bin = (managedBin?.isEmpty == false)
-                    ? managedBin!
-                    : AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-                let current = environment["PATH"]
-                    ?? ProcessInfo.processInfo.environment["PATH"]
-                    ?? ""
-                let parts = current
-                    .split(separator: ":", omittingEmptySubsequences: false)
-                    .map(String.init)
-                    .filter { $0 != bin }
-                childRuntime["PATH"] = ([bin] + parts).joined(separator: ":")
-                childRuntime["RC_REMOTE_CODE_MANAGED_BIN"] = bin
-            }
-            return childRuntime
-        }()
         return ProviderProxyPolicy.childScopedEnvironment(
             environment: environment,
             targetProvider: targetProvider,
-            childRunId: childId,
-            childDelegationCapability: childDelegationCapability,
-            tokenSaverEnvironment: tokenSaverEnvironment
+            childRunId: childRunId?.value.uuidString,
+            childDelegationCapability: childDelegationCapability
         )
-    }
-
-    private static func providerDistillStatePath(
-        environment: [String: String]
-    ) -> String? {
-        if let inherited = environment["REMOTE_CODE_DISTILL_STATE_PATH"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !inherited.isEmpty {
-            return inherited
-        }
-        if let appSupport = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !appSupport.isEmpty {
-            return URL(fileURLWithPath: appSupport, isDirectory: true)
-                .appendingPathComponent("Distill", isDirectory: true)
-                .appendingPathComponent("DistillCLIState.json")
-                .path
-        }
-        guard let channel = bundledReleaseChannel() else { return nil }
-        return AppPaths.appSupportDirectory(for: channel)
-            .appendingPathComponent("Distill", isDirectory: true)
-            .appendingPathComponent("DistillCLIState.json")
-            .path
     }
 
     private static func runAgentAppCLIOutcome(
@@ -806,8 +560,7 @@ enum ProviderProxyRunner {
                     delta: attempt.delta,
                     session: attempt.session,
                     providerBasename: providerBasename,
-                    environment: environment,
-                    eligibleRunCandidate: attempt.eligibleRunCandidate
+                    environment: environment
                 )
             }
         }
@@ -1026,9 +779,7 @@ enum ProviderProxyRunner {
                 costEstimator: AgentOrchestrationRuntime.productionCostEstimator
             )
             guard let threadUUID = UUID(
-                uuidString: environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"]
-                    ?? environment["RC_TOKEN_SAVER_THREAD_ID"]
-                    ?? ""
+                uuidString: environment["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"] ?? ""
             ),
                   let parentProvider = AgentProvider(rawValue: environment["REMOTE_CODE_AGENT_PROVIDER"] ?? "")
             else {
@@ -1037,14 +788,11 @@ enum ProviderProxyRunner {
                     : .permissionDenied("persisted parent scope is unavailable")
             }
             // Nested worker identity is the invoked provider basename; parent
-            // provider stays on the env for Token Saver inheritance context.
+            // provider stays on the env as inheritance context.
             let nestedProvider = AgentProvider(rawValue: providerBasename) ?? parentProvider
             let trimmedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines)
             let parentRunId: AgentRunID? = UUID(
-                uuidString: environment["RC_REMOTE_CODE_ROOT_RUN_ID"]
-                    ?? environment["RC_TOKEN_SAVER_ROOT_RUN_ID"]
-                    ?? environment["RC_TOKEN_SAVER_ATTEMPT_ID"]
-                    ?? ""
+                uuidString: environment["RC_REMOTE_CODE_ROOT_RUN_ID"] ?? ""
             ).map { AgentRunID($0) }
             if requestedPermissionMode != nil, parentRunId == nil {
                 return .permissionDenied("persisted parent receipt is unavailable")
@@ -1140,26 +888,20 @@ enum ProviderProxyRunner {
 
     /// Raw workers do not emit Agent App stream events, so mirror their
     /// provider-reported usage into the same local snapshot used by the
-    /// sidebar. Actual tokens are always recorded; host admission controls only
-    /// whether the run is eligible for paid Token Saver savings.
+    /// sidebar. No run is ever counted as an eligible (savings) run.
     @discardableResult
     private static func recordRawProviderUsage(
         delta: AssistantTokenUsage,
         session: AssistantTokenUsage,
         providerBasename: String,
-        environment: [String: String],
-        eligibleRunCandidate: Int
+        environment: [String: String]
     ) -> ProviderProxyUsagePersistenceResult {
-        // Actual provider usage is always-on telemetry. Paid eligibility is
-        // independently revalidated at write time so disabling Token Saver
-        // mid-run records tokens but never claims savings.
-        let liveRuntime = validatedPaidRuntime(environment: environment)
         guard delta.totalTokens > 0,
               let provider = AgentProvider(
                 rawValue: ProviderProxyPolicy.commandBasename(providerBasename)
               ),
               let controller = AgentProvider(
-                rawValue: liveRuntime.environment["REMOTE_CODE_AGENT_PROVIDER"] ?? ""
+                rawValue: environment["REMOTE_CODE_AGENT_PROVIDER"] ?? ""
               ),
               provider == controller else {
             return ProviderProxyUsagePersistenceResult(
@@ -1168,7 +910,7 @@ enum ProviderProxyRunner {
             )
         }
         let appSupportDirectory: URL?
-        if let override = liveRuntime.environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
+        if let override = environment["RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !override.isEmpty {
             appSupportDirectory = URL(fileURLWithPath: override, isDirectory: true)
@@ -1184,24 +926,20 @@ enum ProviderProxyRunner {
             )
         }
         do {
-            let eligibleRuns = ProviderProxyPolicy.rawUsageEligibleRuns(
-                tokenSaverAdmitted: liveRuntime.admission != nil,
-                candidate: eligibleRunCandidate
-            )
-            _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).record(
+            _ = try ProviderUsageStore(appSupportDirectory: appSupportDirectory).record(
                 provider: provider,
                 actualProviderTokens: delta.totalTokens,
                 estimatedRawTokens: delta.totalTokens,
                 actualProviderBilledTokenUnits: delta.billedTotalTokenUnits,
                 estimatedRawBilledTokenUnits: delta.billedTotalTokenUnits,
-                eligibleRuns: eligibleRuns,
+                eligibleRuns: 0,
                 currentSessionTokens: session.totalTokens,
                 currentSessionLimitTokens: session.contextWindow
             )
-            TokenSaverUsageCrossProcess.notifyStoreChanged()
+            ProviderUsageCrossProcess.notifyStoreChanged()
             return ProviderProxyUsagePersistenceResult(
                 persisted: true,
-                eligibleRunRecorded: eligibleRuns > 0
+                eligibleRunRecorded: false
             )
         } catch {
             return ProviderProxyUsagePersistenceResult(

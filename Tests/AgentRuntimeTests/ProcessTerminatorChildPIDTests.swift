@@ -30,7 +30,7 @@ final class ProcessTerminatorChildPIDTests: XCTestCase {
     }
 
     func test_unreapedDescendants_dropsRootAndDeadPids() {
-        // WHY: Graphify's Python resource_tracker can outlive the CLI root.
+        // WHY: a Python resource_tracker child can outlive the CLI root.
         // Timeout must recapture the tree and kill only still-alive children.
         let leftover = ProcessTerminator.unreapedDescendants(
             root: 10,

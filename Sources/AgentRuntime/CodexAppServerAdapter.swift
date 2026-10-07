@@ -226,8 +226,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     /// with continuous app-server activity can run long, while wedged deferrals
     /// still release (and unblock follow-up sends).
     private let pendingFinishInactivityTimeout: TimeInterval
-    public var contextSeedPreparer: TokenSaverContextSeedPreparing?
-    public var contextSeedReceipts: TokenSaverContextSelectionReceiptRepository?
+    public var contextSeedReceipts: ConversationContextSeedReceiptRepository?
     private var appliedContextSeeds: Set<String> = []
 
     // Model-list cache (guarded by `lock`).
@@ -286,8 +285,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 runAsUser: request.runAsUser,
                 askpassPath: askpass,
                 notificationHandler: notificationHandler,
-                serverRequestHandler: serverRequestHandler,
-                tokenSaverCensusAllowed: request.runAsUser?.uid == nil || request.runAsUser?.uid == getuid()
+                serverRequestHandler: serverRequestHandler
             )
         }
     }
@@ -1098,7 +1096,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard let snapshot = request.contextSnapshot, !snapshot.items.isEmpty else {
             return request
         }
-        let key = TokenSaverContextSeedApplication.applicationKey(
+        let key = ConversationContextSeedApplication.applicationKey(
             runId: request.runId.value.uuidString,
             destinationProviderThreadId: destinationProviderThreadId,
             snapshotDigest: snapshot.digest
@@ -1114,8 +1112,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         )) == true {
             return request
         }
-        let preparer = contextSeedPreparer ?? TokenSaverHumanContextSeedPreparer()
-        guard let prepared = await preparer.prepare(
+        let preparer = ConversationContextSeedPreparer()
+        guard let prepared = preparer.prepare(
             snapshot: snapshot,
             request: request,
             destinationProviderThreadId: destinationProviderThreadId
@@ -1139,22 +1137,22 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private func acknowledgeContextSeed(
         _ request: AgentRunRequest,
-        lifecycle: TokenSaverRequestSelectionReceipt.Lifecycle
+        lifecycle: ConversationContextSeedReceipt.Lifecycle
     ) {
         guard let seed = request.preparedContextSeed else { return }
         let acks = seed.receipts.map {
-            TokenSaverContextSelectionLifecycleAck(
-                runId: $0.winner.runId,
-                destinationProviderThreadId: $0.winner.destinationProviderThreadId,
-                snapshotDigest: $0.winner.snapshotDigest,
-                sourceMessageId: $0.winner.sourceMessageId,
-                ordinal: $0.winner.ordinal,
+            ConversationContextSeedAck(
+                runId: $0.runId,
+                destinationProviderThreadId: $0.destinationProviderThreadId,
+                snapshotDigest: $0.snapshotDigest,
+                sourceMessageId: $0.sourceMessageId,
+                ordinal: $0.ordinal,
                 lifecycle: lifecycle
             )
         }
         try? contextSeedReceipts?.acknowledge(acks)
-        if lifecycle != .delivered, let dest = seed.receipts.first?.winner.destinationProviderThreadId {
-            let key = TokenSaverContextSeedApplication.applicationKey(
+        if lifecycle != .delivered, let dest = seed.receipts.first?.destinationProviderThreadId {
+            let key = ConversationContextSeedApplication.applicationKey(
                 runId: request.runId.value.uuidString,
                 destinationProviderThreadId: dest,
                 snapshotDigest: seed.document.snapshotDigest
@@ -4047,7 +4045,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let last = container["last"] as? [String: Any]
         let total = container["total"] as? [String: Any]
         // Prefer per-turn `last` for reported input/output/totalTokens (existing
-        // Token Saver / cost accounting contract). Keep that source unchanged.
+        // cost accounting contract). Keep that source unchanged.
         let source = last ?? total ?? container
         let input = int(source["inputTokens"]) ?? int(source["input_tokens"]) ?? 0
         let output = int(source["outputTokens"]) ?? int(source["output_tokens"]) ?? 0

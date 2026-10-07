@@ -118,7 +118,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var providerSessionReaperTimer: Timer?
     private var ccrRetentionTimer: Timer?
     private var diagnosticsHeartbeatTimer: Timer?
-    private var tokenSaverAccountUsageRefreshTimer: Timer?
+    private var accountUsageRefreshTimer: Timer?
     private var lifecycleRecorder: AppLifecycleRecorder?
     /// Forensic-only hang detector (plan-final W0). Never mutates run status.
     private var hangWatchdog: HangWatchdog?
@@ -134,7 +134,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Menu items whose keyEquivalent is controlled by keybindings.json.
     /// Populated by installMainMenu(); refreshed by reapplyKeybindingOverrides().
     private var keybindableMenuItems: [(item: NSMenuItem, command: String)] = []
-    public static let tokenSaverAccountUsageRefreshInterval: TimeInterval = 60
+    public static let accountUsageRefreshInterval: TimeInterval = 60
 
     /// Accumulates server startup failures so Settings can show a status
     /// row rather than relying on NSLog alone (UX-MAC_SOCKET_SERVER-P1).
@@ -255,6 +255,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         Self.wireEventPersistence(context: context)
         do {
             EventBus.shared.reloadFromPersistence(lastSeq: try context.eventLog.lastSeq(), recent: [])
+            // C8: a clean previous quit lets its cursors resume from the log.
+            DurableReplayResumeRecord.restore(
+                eventBus: .shared,
+                settings: context.settingsRepo,
+                bootEpoch: context.liveActivityHostIdentity.bootEpoch
+            )
         } catch {
             appLifecycleLog.error("event_log.sequence_init_failed error=\(error.localizedDescription, privacy: .public)")
         }
@@ -405,7 +411,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         windowController.show()
         // Do not fire multi-provider account-usage probes (claude /usage, grok
         // models, …) on the first paint. Defer until the UI is interactive.
-        startTokenSaverAccountUsageRefreshLoop()
+        startAccountUsageRefreshLoop()
         startDiagnosticsHeartbeat()
         logDiagnosticsHeartbeat(reason: "launch")
         checkForUpdatesAfterOpeningApp()
@@ -420,10 +426,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             self?.presentHostFileAccessOnboardingIfNeeded()
             self?.runDeferredStartup()
         }
-        // Token Saver % rings: wait ~8s so boot probes do not pile on top of
+        // Account usage % rings: wait ~8s so boot probes do not pile on top of
         // workspace restore / first Agent surface open.
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-            self?.refreshTokenSaverAccountUsageOnLaunch()
+            self?.refreshAccountUsageOnLaunch()
         }
     }
 
@@ -616,15 +622,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         stopInProcessScheduledTaskScheduler()
         removeScheduledTaskStoreObserver()
         disableInsomniaForAppClose()
-        // Always stop a leftover Distill MLX server on quit — a multi-GB model must
-        // not linger. Token Saver was removed, so quit only purges what older
-        // builds installed; it never installs anything.
-        stopTokenSaverDistillServiceForAppTermination()
+        // Token Saver was removed, so quit only purges what older builds
+        // installed (and reinstalls the always-on routing); it never installs
+        // anything Token Saver owned.
         if ProcessInfo.processInfo.environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] == "1" {
             appLifecycleLog.info("app.will_terminate distill_integration=unchanged isolated_process=true")
         } else {
-            appLifecycleLog.info("app.will_terminate distill_integration=legacy_purged distill_server=stopped")
-            context?.prepareTokenSaverLifecycleForTermination()
+            appLifecycleLog.info("app.will_terminate distill_integration=legacy_purged")
+            context?.reconcileManagedIntegration()
         }
         persistRestorableStateBeforeUpdate()
         stopPetController()
@@ -645,27 +650,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         providerSessionReaperTimer?.invalidate()
         ccrRetentionTimer?.invalidate()
         diagnosticsHeartbeatTimer?.invalidate()
-        tokenSaverAccountUsageRefreshTimer?.invalidate()
+        accountUsageRefreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
-    }
-
-    /// Quit contract: stop the controller-owned sidecar and reap any foreign
-    /// Distill MLX servers so only zero servers remain after RemoteCode exits.
-    private func stopTokenSaverDistillServiceForAppTermination() {
-        guard Self.shouldStopDistillServerOnTerminate(
-            tokenSaverEnabled: context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
-        ) else { return }
-        context?.tokenSaverDistillServiceController.stop()
-    }
-
-    /// Pure quit policy: Distill MLX server always stops on terminate regardless
-    /// of Token Saver toggle (skills/PATH may still be retained when enabled).
-    nonisolated static func shouldStopDistillServerOnTerminate(tokenSaverEnabled: Bool) -> Bool {
-        // tokenSaverEnabled is accepted for call-site clarity / future gating;
-        // the process always dies with the app.
-        _ = tokenSaverEnabled
-        return true
+        // C8: last, after the servers stopped: flush, then record what the
+        // next boot needs to resume this boot's cursors from the event log.
+        if let context {
+            context.flushEventPersistence()
+            DurableReplayResumeRecord.write(
+                eventBus: .shared,
+                settings: context.settingsRepo,
+                bootEpoch: context.liveActivityHostIdentity.bootEpoch
+            )
+        }
     }
 
     private func disableInsomniaForAppClose() {
@@ -742,21 +739,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
-    private func refreshTokenSaverAccountUsageOnLaunch() {
-        context?.refreshTokenSaverAccountUsage(reason: "launch")
+    private func refreshAccountUsageOnLaunch() {
+        context?.refreshAccountUsage(reason: "launch")
     }
 
-    private func startTokenSaverAccountUsageRefreshLoop() {
-        tokenSaverAccountUsageRefreshTimer?.invalidate()
-        tokenSaverAccountUsageRefreshTimer = Timer.scheduledTimer(
-            withTimeInterval: Self.tokenSaverAccountUsageRefreshInterval,
+    private func startAccountUsageRefreshLoop() {
+        accountUsageRefreshTimer?.invalidate()
+        accountUsageRefreshTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.accountUsageRefreshInterval,
             repeats: true
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
                 // Grok stays independent from slow Claude/Codex probes, but the
                 // combined operation issues only one Grok credits request.
-                self.context?.refreshPeriodicTokenSaverAccountUsage()
+                self.context?.refreshPeriodicAccountUsage()
             }
         }
     }

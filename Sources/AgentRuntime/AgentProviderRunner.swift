@@ -32,8 +32,10 @@ public struct ProviderProcessStartIdentity: Codable, Sendable, Equatable {
 
 public enum ManagedProcessKind: String, Codable, Sendable, Equatable {
     case provider
+    /// Decode-only: older builds tagged Distill sidecar and Graphify CLI
+    /// children with these. The ledger decodes the whole tag array, so the
+    /// cases stay to keep old rows readable and their orphans reapable.
     case sidecar
-    /// Host Graphify CLI child (S9 ownership ledger).
     case graphify
 }
 
@@ -775,7 +777,7 @@ enum ProcessTerminator {
         childPIDProvider.directChildren(of: root).flatMap(processTreePIDs(root:)) + [root]
     }
 
-    /// After the root has been signalled, multiprocessing helpers (Graphify's
+    /// After the root has been signalled, multiprocessing helpers (for example a
     /// Python resource_tracker) can remain. Recapture the tree and keep only
     /// still-alive non-root PIDs so a timeout cannot leak them.
     static func unreapedDescendants(

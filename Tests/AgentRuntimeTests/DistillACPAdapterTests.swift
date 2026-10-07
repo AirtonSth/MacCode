@@ -691,7 +691,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             root: root,
             providerThreadId: firstFinished.providerThreadId
         )
-        second.contextSnapshot = TokenSaverCanonicalConversationSnapshot(
+        second.contextSnapshot = ConversationContextSnapshot(
             items: [
                 .init(messageId: "m1", role: .user, ordinal: 0, canonicalText: "First request"),
                 .init(messageId: "m2", role: .assistant, ordinal: 1, canonicalText: "reply from distill-session-1")
@@ -851,8 +851,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 content: "history-\(index)-marker " + String(repeating: "y", count: 1_000)
             )
         }
-        XCTAssertNil(TokenSaverCanonicalConversationSnapshot.capture(
-            messages: history, persistedRCW1ByMessageId: [:], excludingCurrentUserText: nil
+        XCTAssertNil(ConversationContextSnapshot.capture(
+            messages: history, excludingCurrentUserText: nil
         ), "precondition: this history is past the RCSEED limits")
 
         var request = distillRequest(thread: thread, model: "claude/claude-opus-5-5", prompt: "Continue please",

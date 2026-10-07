@@ -620,6 +620,10 @@ final class BotTeamGroupServiceTests: XCTestCase {
                        "the receipt's turn events were published")
         let runningSeq = try XCTUnwrap(events.first { $0.turnID == first && $0.state == "running" }?.seq)
         XCTAssertTrue(plannedSeqs.allSatisfy { $0 < runningSeq }, "planned before running, in seq order: \(events)")
+        // `running` is published before the provider start; wait for the run.
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        guard started else { return }
         f.runner.finish(runID: f.runner.requests[0].runId, status: .completed, reply: "Done.")
     }
 

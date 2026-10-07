@@ -119,21 +119,9 @@ public struct ProviderProcessSweepResult: Sendable, Equatable {
 }
 
 public enum ProviderProcessSweeper {
-    // MARK: - Single Distill MLX server policy
-
-    /// True when `command` is the long-running Token Saver Distill HTTP/MLX
-    /// server (auth-token / host / port), not a short-lived `mcp` CLI helper.
-    ///
-    /// WHY: agents invoke `RemoteCodeDistillService mcp` as the managed `| distill`
-    /// pipe. Those helpers must stay multi-instance. Only the multi-GB MLX server
-    /// is singleton-scoped.
-    public static func isRemoteCodeDistillServerCommand(_ command: String) -> Bool {
-        guard isRemoteCodeDistillService(command) else { return false }
-        return !isRemoteCodeDistillMCPCommand(command)
-    }
-
-    /// Per-run stdio MCP argv modes spawned by Claude/Codex/Grok. The long-running
-    /// Token Saver HTTP server is NOT in this set (`--auth-token` / `--host`).
+    /// Per-run stdio MCP argv modes spawned by Claude/Codex/Grok. `mcp` is the
+    /// removed Token Saver librarian: kept for one release so orphans an older
+    /// build left behind are still reaped.
     public static let distillMCPArgvModes: Set<String> = [
         "mcp",
         "bot-self-config",

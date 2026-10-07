@@ -243,7 +243,6 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private static var sharedDiscoveryCache: [String: (result: GrokACPDiscoveryResult, fetchedAt: Date)] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
     private var promptWriteAcceptanceCountForTestingStorage = 0
-    var tokenSaverCensusAllowedOverrideForTesting: Bool?
     var beforePromptWriteForTesting: (() -> Void)?
     var beforePhysicalPromptWriteForTesting: (() -> Void)?
     var afterPromptWriteForTesting: (() -> Void)?
@@ -281,13 +280,6 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         self.modelCacheTTL = max(0, modelCacheTTL)
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.maxReadableBytes = max(1, maxReadableBytes)
-    }
-
-    static func tokenSaverCensusAllowed(
-        runAsUser: AgentRunAsUser?,
-        currentUID: uid_t = getuid()
-    ) -> Bool {
-        runAsUser?.uid == nil || runAsUser?.uid == currentUID
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -765,9 +757,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 askpassPath: askpass,
                 notificationHandler: { method, params in
                     bufferedNotifications.append(method: method, params: params)
-                },
-                tokenSaverCensusAllowed: tokenSaverCensusAllowedOverrideForTesting
-                    ?? Self.tokenSaverCensusAllowed(runAsUser: request.runAsUser)
+                }
             )
         } catch {
             throw GrokACPFailureTaxonomy.normalize(

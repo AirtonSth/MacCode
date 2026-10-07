@@ -373,7 +373,7 @@ final class ProviderProxyInstallTests: XCTestCase {
     }
 
     func test_uninstallCommandWrappers_doesNotRemoveProviderProxies() throws {
-        // WHY: Token Saver off must drop compression wrappers, not the provider controller.
+        // WHY: removing legacy compression wrappers must not remove the provider controller.
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
         let binary = try fakeServiceBinary(in: home)
         let realBins = try fakeProviderBins(in: home, names: ["claude"])
@@ -393,7 +393,7 @@ final class ProviderProxyInstallTests: XCTestCase {
                 atPath: home.appendingPathComponent(".remote-code/bin/claude").path
             ),
             binary.path,
-            "provider proxy must survive Token Saver wrapper uninstall"
+            "provider proxy must survive legacy wrapper uninstall"
         )
     }
 
@@ -440,7 +440,7 @@ final class ProviderProxyInstallTests: XCTestCase {
 
     func test_runtimePromptAlwaysRoutesGenericCrossProviderDelegationThroughAgentApp() {
         let command = "/tmp/managed/remote-code"
-        let prompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+        let prompt = AgentSkillInstaller.nestedAgentProviderPrompt(
             "base",
             environment: [
                 "RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE": "1",
@@ -451,8 +451,8 @@ final class ProviderProxyInstallTests: XCTestCase {
         XCTAssertTrue(prompt.contains("REMOTE_CODE_SUBAGENT_ROUTING_V1"))
         XCTAssertTrue(prompt.contains(command))
         XCTAssertTrue(prompt.contains("agent-app <codex|claude|grok>"))
-        XCTAssertFalse(prompt.contains(TokenSaverProviderSafetyABI.block),
-                       "always-on subagent routing must not enable paid Token Saver lanes")
+        XCTAssertFalse(prompt.contains("TOKEN_SAVER_SAFETY_ABI"),
+                       "subagent routing carries no Token Saver text")
     }
 
     func test_providerProxyInjectsRuntimeIntoAllProvidersWithoutDroppingSkillABI() {
@@ -494,7 +494,10 @@ final class ProviderProxyInstallTests: XCTestCase {
         XCTAssertEqual(Array(codex.prefix(1)), ["--config"])
         for arguments in [grok, claude, codex] {
             XCTAssertTrue(arguments.joined(separator: "\n").contains("REMOTE_CODE_SUBAGENT_ROUTING_V1"))
-            XCTAssertTrue(arguments.joined(separator: "\n").contains("TOKEN_SAVER_SAFETY_ABI_V1"))
+            XCTAssertFalse(arguments.joined(separator: "\n").contains("TOKEN_SAVER_SAFETY_ABI_V1"),
+                           "a leftover Token Saver hint must not bring back the safety ABI")
+            XCTAssertFalse(arguments.joined(separator: "\n").contains("| distill"),
+                           "a leftover Token Saver hint must not bring back the Distill rules")
         }
     }
 
@@ -673,7 +676,7 @@ final class ProviderProxyInstallTests: XCTestCase {
         }
     }
 
-    func test_subagentTelemetryScopeKeepsHierarchyWhenTokenSaverIsOff() throws {
+    func test_subagentTelemetryScopeKeepsHierarchyFromAlwaysOnKeys() throws {
         // WHY: Subagents is lifecycle UI, not a paid optimization. A raw custom
         // worker must attach to its real controller using only always-on keys.
         let thread = UUID()
@@ -824,7 +827,7 @@ final class ProviderProxyInstallTests: XCTestCase {
     func test_managedProviderAndAgentAppAliasesRepairRecognizedRelocatedBuildTargets() throws {
         // WHY: isolated builds and app upgrades relocate the native service. A
         // still-executable old RemoteCode target previously blocked all Agent App
-        // delegation while ordinary Token Saver turns appeared healthy.
+        // delegation while ordinary turns appeared healthy.
         let home = tempHome()
         defer { try? FileManager.default.removeItem(at: home) }
         let installer = AgentSkillInstaller(homeDirectory: home)

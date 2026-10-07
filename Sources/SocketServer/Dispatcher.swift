@@ -142,7 +142,8 @@ public protocol CommandRouting: AnyObject {
     func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
-    /// Sticky glanceable Token Saver payload for deterministic iOS pull.
+    /// Sticky account usage digest for deterministic iOS pull (deprecated
+    /// `token_saver.digest.get` name kept until iOS bumps its treaty pin).
     func tokenSaverDigest() -> JSONValue?
     func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread
     func listDistillAccounts() -> JSONValue
@@ -336,6 +337,9 @@ public protocol CommandRouting: AnyObject {
         capabilities: [String]?
     ) throws -> JSONValue
     func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws
+    /// True only when the durable push target and attention binding already
+    /// hold exactly what `probe` would write. Read-only.
+    func privatePushRegistrationIsCurrent(_ probe: PrivatePushRegistrationProbe) -> Bool
     // settings
     func settingsGet(keys: [String]) throws -> [String: String]
     func settingsSet(key: String, value: String) throws
@@ -417,7 +421,7 @@ public extension CommandRouting {
         try sshFilesRemoteList(surface: surface, path: path)
     }
 
-    /// Test/fake hosts may omit Token Saver entirely.
+    /// Test/fake hosts may omit the account usage digest entirely.
     func tokenSaverDigest() -> JSONValue? { nil }
     func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread { throw JSONRPCError.notSupported("Worker model selection") }
     func listDistillAccounts() -> JSONValue { .object(["accounts": .array([]), "busy_provider": .null, "last_error": .null]) }
@@ -426,6 +430,7 @@ public extension CommandRouting {
     func cancelDistillAccountOperation() throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
 
     func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {}
+    func privatePushRegistrationIsCurrent(_ probe: PrivatePushRegistrationProbe) -> Bool { false }
 
     func agentThreadHasMessages(thread: AgentThreadID) throws -> Bool {
         !(try listAgentMessages(thread: thread, limit: 1).isEmpty)
@@ -752,6 +757,20 @@ private final class ConnectionSnapshotReadOutcome: @unchecked Sendable {
     private let lock = NSLock()
     private var completion: Result<Value, Error>?
     private var continuation: CheckedContinuation<Result<Value, Error>, Never>?
+    private var observers: [(Result<Value, Error>) -> Void] = []
+
+    /// Calls `body` once with the completion: now if already resolved,
+    /// otherwise when `resolve` first runs.
+    func observe(_ body: @escaping (Result<Value, Error>) -> Void) {
+        lock.lock()
+        if let completion {
+            lock.unlock()
+            body(completion)
+        } else {
+            observers.append(body)
+            lock.unlock()
+        }
+    }
 
     func wait() async -> Result<Value, Error> {
         await withCheckedContinuation { continuation in
@@ -776,10 +795,21 @@ private final class ConnectionSnapshotReadOutcome: @unchecked Sendable {
         self.completion = completion
         let continuation = self.continuation
         self.continuation = nil
+        let observers = self.observers
+        self.observers = []
         lock.unlock()
         continuation?.resume(returning: completion)
+        observers.forEach { $0(completion) }
         return true
     }
+}
+
+/// One physical `sync.snapshot` state read and the callers waiting on it.
+/// MainActor-owned: `waiters` is read by the read loop between attempts.
+@MainActor
+private final class ConnectionSnapshotSharedRead {
+    let outcome = ConnectionSnapshotReadOutcome()
+    var waiters = 0
 }
 
 @MainActor
@@ -821,10 +851,11 @@ public final class JSONRPCDispatcher {
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
     /// store request payloads or secrets — only owner fingerprint + params hash.
     private var volatileUnknownReceipts = BoundedUnknownReceiptCache()
-    /// At most one physical snapshot state read may outlive a timed-out caller.
-    /// The task is retained until the underlying router continuation finishes,
-    /// preventing repeated timeouts from accumulating unbounded SQLite reads.
-    private var activeConnectionSnapshotRead: (id: UUID, task: Task<Void, Never>)?
+    /// The one physical snapshot state read. Every `sync.snapshot` caller that
+    /// arrives while it runs joins it, and it is retained until the underlying
+    /// router continuation finishes, so callers and timeouts never stack up
+    /// SQLite reads.
+    private var activeConnectionSnapshotRead: ConnectionSnapshotSharedRead?
     public nonisolated static let hostMutationMethods = HostMutationContract.methods
     private nonisolated static let durableSynchronousMutationMethods: Set<String> = [
         "workspace.create",
@@ -1092,64 +1123,41 @@ public final class JSONRPCDispatcher {
         // watermark then remains an honest sequence fence without starving
         // event delivery or HTTP recovery while the snapshot is built.
         //
-        // A deadline races the physical read through a one-shot outcome. The
-        // caller therefore returns even if an off-main continuation ignores
-        // cancellation. One retained task per dispatcher bounds those stale
-        // reads; while it exists, later callers fail fast with the same
-        // retryable timeout rather than waiting behind or spawning another read.
+        // One physical read runs at a time. A caller that arrives while it runs
+        // joins it and gets the same result: its pre-read watermark is honest
+        // for every caller, because the client replays every event after it.
+        // Each caller races the shared result against its own deadline and
+        // cancellation, so one caller timing out or disconnecting never fails
+        // another. The read stops before its next attempt once nobody waits.
         let readStarted = DispatchTime.now().uptimeNanoseconds
         do {
-            guard activeConnectionSnapshotRead == nil else {
-                throw Self.snapshotTimedOut
-            }
-
-            let readID = UUID()
-            let outcome = ConnectionSnapshotReadOutcome()
-            let readTask = Task { @MainActor [weak self] in
-                guard let self else {
-                    outcome.resolve(.failure(Self.snapshotCancelled))
-                    return
-                }
-
-                do {
-                    for attempt in 0..<3 {
-                        try Task.checkCancellation()
-                        let before = EventBus.shared.snapshotMetadata()
-                        let state = try await snapshotRouter.readConnectionSnapshotState()
-                        try Task.checkCancellation()
-                        let after = EventBus.shared.snapshotMetadata()
-                        // Live-only stream events (terminal output, agent
-                        // deltas) cannot change the state read above, so only
-                        // a state revision change forces a retry. Return the
-                        // pre-read watermark: the client applies every event
-                        // after it, including in-window deltas, from the stream.
-                        if before.stateRevision == after.stateRevision {
-                            outcome.resolve(.success(EventBus.SnapshotBarrierResult(
-                                state: state,
-                                metadata: before
-                            )))
-                            self.finishConnectionSnapshotRead(id: readID)
-                            return
-                        }
-                        phaseMetrics?.recordFenceRetry()
-                        if attempt == 2 {
-                            phaseMetrics?.recordFenceExhausted()
-                            throw Self.snapshotSequenceFenceUnstable
-                        }
+            let read: ConnectionSnapshotSharedRead
+            if let active = activeConnectionSnapshotRead {
+                read = active
+                phaseMetrics?.recordJoined()
+            } else {
+                read = ConnectionSnapshotSharedRead()
+                activeConnectionSnapshotRead = read
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        read.outcome.resolve(.failure(Self.snapshotCancelled))
+                        return
                     }
-                    phaseMetrics?.recordFenceExhausted()
-                    throw Self.snapshotSequenceFenceUnstable
-                } catch {
-                    outcome.resolve(.failure(error))
-                    self.finishConnectionSnapshotRead(id: readID)
+                    await self.runConnectionSnapshotRead(
+                        read,
+                        router: snapshotRouter,
+                        phaseMetrics: phaseMetrics
+                    )
                 }
             }
-            activeConnectionSnapshotRead = (readID, readTask)
+            read.waiters += 1
+            defer { read.waiters -= 1 }
 
+            let outcome = ConnectionSnapshotReadOutcome()
+            read.outcome.observe { outcome.resolve($0) }
             let timeoutTask = Task {
                 do {
                     try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                    readTask.cancel()
                     outcome.resolve(.failure(Self.snapshotTimedOut))
                 } catch is CancellationError {
                     // Read/caller completed first; normal deadline teardown.
@@ -1161,7 +1169,6 @@ public final class JSONRPCDispatcher {
             let completion = await withTaskCancellationHandler {
                 await outcome.wait()
             } onCancel: {
-                readTask.cancel()
                 timeoutTask.cancel()
                 outcome.resolve(.failure(Self.snapshotCancelled))
             }
@@ -1200,8 +1207,46 @@ public final class JSONRPCDispatcher {
         }
     }
 
-    private func finishConnectionSnapshotRead(id: UUID) {
-        guard activeConnectionSnapshotRead?.id == id else { return }
+    /// The physical read behind `readConnectionSnapshot`: up to three fenced
+    /// attempts. The fence ignores live-only stream kinds and idempotent
+    /// last-writer-wins kinds (`EventBus.snapshotFenceIdempotentKinds`); the
+    /// pre-read watermark makes the client replay those on top of the state.
+    private func runConnectionSnapshotRead(
+        _ read: ConnectionSnapshotSharedRead,
+        router snapshotRouter: ConnectionSnapshotRouting,
+        phaseMetrics: HTTPRequestPhaseMetrics?
+    ) async {
+        do {
+            for attempt in 0..<3 {
+                guard read.waiters > 0 else { throw Self.snapshotCancelled }
+                let before = EventBus.shared.snapshotMetadata()
+                let state = try await snapshotRouter.readConnectionSnapshotState()
+                let after = EventBus.shared.snapshotMetadata()
+                if before.fenceRevision == after.fenceRevision {
+                    if before.stateRevision != after.stateRevision {
+                        phaseMetrics?.recordFenceTolerated()
+                    }
+                    read.outcome.resolve(.success(EventBus.SnapshotBarrierResult(
+                        state: state,
+                        metadata: before
+                    )))
+                    finishConnectionSnapshotRead(read)
+                    return
+                }
+                phaseMetrics?.recordFenceRetry()
+                if attempt == 2 {
+                    phaseMetrics?.recordFenceExhausted()
+                }
+            }
+            throw Self.snapshotSequenceFenceUnstable
+        } catch {
+            read.outcome.resolve(.failure(error))
+            finishConnectionSnapshotRead(read)
+        }
+    }
+
+    private func finishConnectionSnapshotRead(_ read: ConnectionSnapshotSharedRead) {
+        guard activeConnectionSnapshotRead === read else { return }
         activeConnectionSnapshotRead = nil
     }
 
@@ -1927,6 +1972,15 @@ public final class JSONRPCDispatcher {
                 requiresSnapshot: true
             )
         }
+        // An unchanged alert/legacy push token re-sent on reconnect: the host
+        // already holds this exact registration, so answer before the durable
+        // claim. No receipt, settings write or private.push_token.updated event.
+        if req.method == "private.push_token.update",
+           let probe = PrivatePushRegistrationProbe.make(from: businessParams),
+           router.privatePushRegistrationIsCurrent(probe) {
+            commandReceiptMetrics.recordPushTokenUnchangedSkip()
+            return .init(id: req.id, result: probe.result)
+        }
         // workspace.select: reject a syntactically valid but absent workspace
         // before the durable claim so the failure is a stable domain error and
         // never becomes permanent commandOutcomeUnknown. Skip when a prior
@@ -1955,13 +2009,23 @@ public final class JSONRPCDispatcher {
 
         let claim: CommandReceiptClaimResult
         let claimStarted = DispatchTime.now().uptimeNanoseconds
+        let offMainReceiptWriter = receiptRouter.commandReceiptOffMainWriter
         do {
-            claim = try receiptRouter.claimCommandReceipt(
-                method: req.method,
-                clientRequestId: clientRequestId,
-                ownerFingerprint: context.ownerFingerprint,
-                paramsHash: paramsHash
-            )
+            if let offMainReceiptWriter {
+                claim = try await offMainReceiptWriter.claim(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
+            } else {
+                claim = try receiptRouter.claimCommandReceipt(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
+            }
             commandReceiptMetrics.recordClaim(
                 claim,
                 latencyMilliseconds: Self.elapsedMilliseconds(since: claimStarted)
@@ -2155,17 +2219,40 @@ public final class JSONRPCDispatcher {
         do {
             if let eventSink {
                 let events = try eventSink.seal()
-                _ = try EventBus.shared.commitPersistedEvents { minimumEventSequence in
-                    try receiptRouter.finalizeCommandReceipt(
-                        method: req.method,
-                        clientRequestId: clientRequestId,
-                        ownerFingerprint: context.ownerFingerprint,
-                        paramsHash: paramsHash,
-                        result: committedResult,
-                        events: events,
-                        minimumEventSequence: minimumEventSequence
-                    )
+                if let offMainReceiptWriter {
+                    // Queued on the delivery lane before this task suspends, so
+                    // a later MainActor publish still sorts after these events.
+                    _ = try await EventBus.shared.enqueuePersistedCommit(
+                        offMainReceiptWriter.finalizeTransaction(
+                            method: req.method,
+                            clientRequestId: clientRequestId,
+                            ownerFingerprint: context.ownerFingerprint,
+                            paramsHash: paramsHash,
+                            result: committedResult,
+                            events: events
+                        )
+                    ).value()
+                } else {
+                    _ = try EventBus.shared.commitPersistedEvents { minimumEventSequence in
+                        try receiptRouter.finalizeCommandReceipt(
+                            method: req.method,
+                            clientRequestId: clientRequestId,
+                            ownerFingerprint: context.ownerFingerprint,
+                            paramsHash: paramsHash,
+                            result: committedResult,
+                            events: events,
+                            minimumEventSequence: minimumEventSequence
+                        )
+                    }
                 }
+            } else if let offMainReceiptWriter {
+                try await offMainReceiptWriter.commit(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash,
+                    result: committedResult
+                )
             } else {
                 try receiptRouter.commitCommandReceipt(
                     method: req.method,
@@ -2573,7 +2660,70 @@ public final class JSONRPCDispatcher {
             case "events.recent":
                 let sinceSeq = params["since_seq"]?.intValue.map(Int64.init) ?? 0
                 let maxBytes = params["max_bytes"]?.intValue
-                let result = EventBus.shared.recentEvents(since: sinceSeq, maxBytes: maxBytes)
+                // C8: `durable: true` (after the welcome capability
+                // `events.durable_replay_v1`) replays the event log when the
+                // ring no longer reaches the cursor. Absent keeps the old shape.
+                let durable: Bool
+                switch params["durable"] {
+                case nil: durable = false
+                case .bool(let value)?: durable = value
+                default: throw JSONRPCError.invalidParams
+                }
+                let result: EventBus.RecentEventsResult
+                var streamGaps: [EventBus.StreamGap] = []
+                if durable {
+                    // Only a cursor whose boot `resume_host_id` +
+                    // `resume_boot_epoch` prove (this boot, or the clean
+                    // previous one) may replay the event log; without them
+                    // the ring serves it or the caller needs a baseline.
+                    let resumeHost: String?
+                    switch params["resume_host_id"] {
+                    case nil: resumeHost = nil
+                    case .string(let value)?: resumeHost = value
+                    default: throw JSONRPCError.invalidParams
+                    }
+                    let resumeEpoch: Int64?
+                    switch params["resume_boot_epoch"] {
+                    case nil: resumeEpoch = nil
+                    case let value?:
+                        guard let epoch = value.intValue else { throw JSONRPCError.invalidParams }
+                        resumeEpoch = Int64(epoch)
+                    }
+                    let identity = eventIdentity.map { ($0.hostId, Int64($0.bootEpoch)) }
+                    // The event-log read uses the read-only connection, off main.
+                    (result, streamGaps) = await Task.detached(priority: .userInitiated) {
+                        let bus = EventBus.shared
+                        guard resumeHost != nil || resumeEpoch != nil, let identity else {
+                            return bus.durableRecentEvents(
+                                since: sinceSeq, maxBytes: maxBytes, allowEventLog: false
+                            )
+                        }
+                        let accepted = DurableReplayContract.acceptedResume(
+                            requestedSinceSequence: sinceSeq,
+                            requestedResumeHost: resumeHost,
+                            requestedResumeBootEpoch: resumeEpoch,
+                            serverId: identity.0,
+                            bootEpoch: identity.1,
+                            currentSequence: bus.currentSeq,
+                            previousBoot: bus.previousBootReplay
+                        )
+                        guard accepted.eventLog else {
+                            // A cursor from another host or an unrecoverable
+                            // boot: nothing after it can be trusted.
+                            let head = bus.currentSeq
+                            return (EventBus.RecentEventsResult(
+                                lastSeq: head, events: [], truncated: true, requiresBaseline: true
+                            ), [])
+                        }
+                        return bus.durableRecentEvents(
+                            since: accepted.since,
+                            maxBytes: maxBytes,
+                            previousBoot: accepted.previousBoot
+                        )
+                    }.value
+                } else {
+                    result = EventBus.shared.recentEvents(since: sinceSeq, maxBytes: maxBytes)
+                }
                 let arr: [JSONValue] = result.events.map { ev in
                     var envelope: [String: JSONValue] = [
                         "seq": .number(Double(ev.seq)),
@@ -2601,6 +2751,19 @@ public final class JSONRPCDispatcher {
                         "minor": .number(0),
                     ]),
                 ]
+                if durable {
+                    response["stream_gaps"] = .array(streamGaps.map { gap in
+                        var object: [String: JSONValue] = [
+                            "since_seq": .number(Double(gap.sinceSequence)),
+                            "through_seq": .number(Double(gap.throughSequence)),
+                        ]
+                        switch gap.stream {
+                        case .thread(let id): object["thread_id"] = .string(id)
+                        case .surface(let id): object["surface_id"] = .string(id)
+                        }
+                        return .object(object)
+                    })
+                }
                 if let eventIdentity {
                     response["host_id"] = .string(eventIdentity.hostId)
                     response["boot_epoch"] = .number(Double(eventIdentity.bootEpoch))
@@ -3946,33 +4109,28 @@ public final class JSONRPCDispatcher {
                         eventRowLimit: caps.eventLimit,
                         maxPayloadBytes: Int64(caps.maxBytes)
                     )
-                    let encodedEvents = snapshot.events.map { decorateReplayedRunError(encode($0)) }
-                    let blocked = snapshot.blockedEvent.map {
-                        AgentThreadReadV1.BlockedEvent(
-                            id: $0.id,
-                            payloadBytes: $0.payloadBytes,
-                            reason: $0.reason
-                        )
-                    }
-                    let window = AgentThreadReadV1.boundToEnvelope(
-                        events: snapshot.events,
-                        encodedEvents: encodedEvents,
-                        sourceHadOlderEvents: snapshot.sourceHadOlderEvents,
-                        blockedEvent: blocked,
-                        maxBytes: caps.maxBytes,
-                        eventWatermark: snapshot.eventWatermark,
-                        responseId: id,
-                        measureEnvelope: { [self] result in
-                            envelopeUTF8ByteCount(id: id, result: result)
+                    // Run-error decoration needs the router (MainActor); resolve
+                    // it per distinct error row here, then encode and
+                    // envelope-bound off MainActor (up to 128 events,
+                    // ~log2(N) full-envelope measurements per read).
+                    var runErrorFields: [ReplayedRunErrorKey: [String: JSONValue]] = [:]
+                    for event in snapshot.events {
+                        guard case .error(let message, let recoverable) = event else { continue }
+                        let key = ReplayedRunErrorKey(message: message, recoverable: recoverable)
+                        if runErrorFields[key] == nil {
+                            runErrorFields[key] = router.replayedRunErrorFields(message: message, recoverable: recoverable)
                         }
-                    )
-                    return .init(
-                        id: id,
-                        result: AgentThreadReadV1.payload(
-                            window: window,
-                            eventWatermark: snapshot.eventWatermark
+                    }
+                    let maxBytes = caps.maxBytes
+                    let result = await Task.detached(priority: .userInitiated) { [runErrorFields] in
+                        Self.threadReadV1Result(
+                            snapshot: snapshot,
+                            maxBytes: maxBytes,
+                            id: id,
+                            runErrorFields: runErrorFields
                         )
-                    )
+                    }.value
+                    return .init(id: id, result: result)
                 }
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 if params["include_event_watermark"]?.boolValue == true {
@@ -5113,14 +5271,9 @@ public final class JSONRPCDispatcher {
     /// the live event's display `message` and `recovery_action`, so a cold
     /// open or reconnect shows the same action as `agent.run.error`.
     func decorateReplayedRunError(_ event: JSONValue) -> JSONValue {
-        guard case .object(let outer) = event, outer.count == 1,
-              case .object(var error)? = outer["error"],
-              let message = error["message"]?.stringValue,
-              let recoverable = error["recoverable"]?.boolValue else { return event }
-        let fields = router.replayedRunErrorFields(message: message, recoverable: recoverable)
-        guard !fields.isEmpty else { return event }
-        error.merge(fields) { $1 }
-        return .object(["error": .object(error)])
+        Self.decorateReplayedRunError(event) { message, recoverable in
+            router.replayedRunErrorFields(message: message, recoverable: recoverable)
+        }
     }
 
     func decorateReplayedRunErrors(_ events: JSONValue) -> JSONValue {
@@ -5128,11 +5281,67 @@ public final class JSONRPCDispatcher {
         return .array(rows.map(decorateReplayedRunError))
     }
 
-    /// Full JSON-RPC response UTF-8 size (keys, separators, escaping, id).
-    /// PERF: agent.thread.read boundToEnvelope measures ~log2(N) times per read.
-    /// Structural count matches default JSONEncoder length without allocating Data.
-    private func envelopeUTF8ByteCount(id: JSONRPCID?, result: JSONValue) -> Int {
-        EventBus.jsonRPCResponseByteCount(id: id, result: result)
+    struct ReplayedRunErrorKey: Hashable, Sendable {
+        let message: String
+        let recoverable: Bool
+    }
+
+    nonisolated static func decorateReplayedRunError(
+        _ event: JSONValue,
+        fields fieldsFor: (String, Bool) -> [String: JSONValue]
+    ) -> JSONValue {
+        guard case .object(let outer) = event, outer.count == 1,
+              case .object(var error)? = outer["error"],
+              let message = error["message"]?.stringValue,
+              let recoverable = error["recoverable"]?.boolValue else { return event }
+        let fields = fieldsFor(message, recoverable)
+        guard !fields.isEmpty else { return event }
+        error.merge(fields) { $1 }
+        return .object(["error": .object(error)])
+    }
+
+    /// `agent.thread.read` v1 result: encode each event, then bound the newest
+    /// suffix to the full JSON-RPC envelope. Same bytes as the MainActor path
+    /// (default JSONEncoder → JSONValue); its own coders, so it is safe off main.
+    nonisolated static func threadReadV1Result(
+        snapshot: AgentThreadMirrorSnapshot,
+        maxBytes: Int,
+        id: JSONRPCID?,
+        runErrorFields: [ReplayedRunErrorKey: [String: JSONValue]] = [:]
+    ) -> JSONValue {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let encodedEvents: [JSONValue] = snapshot.events.map { event in
+            guard let data = try? encoder.encode(event),
+                  let value = try? decoder.decode(JSONValue.self, from: data) else {
+                return .null
+            }
+            return decorateReplayedRunError(value) { message, recoverable in
+                runErrorFields[ReplayedRunErrorKey(message: message, recoverable: recoverable)] ?? [:]
+            }
+        }
+        let blocked = snapshot.blockedEvent.map {
+            AgentThreadReadV1.BlockedEvent(
+                id: $0.id,
+                payloadBytes: $0.payloadBytes,
+                reason: $0.reason
+            )
+        }
+        let window = AgentThreadReadV1.boundToEnvelope(
+            events: snapshot.events,
+            encodedEvents: encodedEvents,
+            sourceHadOlderEvents: snapshot.sourceHadOlderEvents,
+            blockedEvent: blocked,
+            maxBytes: maxBytes,
+            eventWatermark: snapshot.eventWatermark,
+            responseId: id,
+            // Full JSON-RPC response UTF-8 size, measured structurally (~log2(N)
+            // times per read) without allocating Data.
+            measureEnvelope: { result in
+                EventBus.jsonRPCResponseByteCount(id: id, result: result)
+            }
+        )
+        return AgentThreadReadV1.payload(window: window, eventWatermark: snapshot.eventWatermark)
     }
 
     private func workspaceID(from params: [String: JSONValue]) throws -> WorkspaceID {

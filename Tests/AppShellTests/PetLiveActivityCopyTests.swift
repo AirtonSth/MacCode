@@ -121,7 +121,7 @@ final class PetLiveActivityCopyTests: XCTestCase {
     }
 
     /// WHY: only 1 Active + zero red badges must deep-link to that thread and
-    /// prefer live lastUpdatePreview over a stale LLM summary.
+    /// show its live lastUpdatePreview.
     func testSingleActiveNoRedBadge_prefersLastUpdateAndKeepsThreadIds() {
         let active = PetActiveThreadItem(
             threadID: threadA,
@@ -134,8 +134,7 @@ final class PetLiveActivityCopyTests: XCTestCase {
         guard let output = PetLiveActivityCopy.make(.init(
             active: [active],
             needsYou: [],
-            completed: [],
-            summary: "You are an autonomous coding agent…"
+            completed: []
         )) else { return XCTFail("expected surface") }
         XCTAssertEqual(output.preview, "Running: git status")
         XCTAssertEqual(output.threadId, threadA.value.uuidString)

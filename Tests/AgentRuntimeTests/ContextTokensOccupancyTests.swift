@@ -23,7 +23,7 @@ final class ContextTokensOccupancyTests: XCTestCase {
         XCTAssertEqual(usage?.inputTokens, 2_856_330)
         XCTAssertEqual(usage?.outputTokens, 24_243)
         XCTAssertEqual(usage?.totalTokens, 2_880_573,
-                       "totalTokens keeps cumulative billing meaning for Token Saver")
+                       "totalTokens keeps cumulative billing meaning")
         XCTAssertEqual(usage?.uncachedInputTokens, 322)
         XCTAssertEqual(usage?.cacheCreationInputTokens, 98_777)
         XCTAssertEqual(usage?.cacheReadInputTokens, 2_757_231)

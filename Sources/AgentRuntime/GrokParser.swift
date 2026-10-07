@@ -90,7 +90,7 @@ public final class GrokParser {
 
         case "usage":
             // grok-build 1.0 streaming-json emits a per-response `usage` line
-            // before `end`. Token Saver rings must not wait for `end` only.
+            // before `end`. Usage must not wait for `end` only.
             if let usage = Self.tokenUsage(from: obj) {
                 out.append(.tokenUsage(usage))
             }
@@ -103,7 +103,7 @@ public final class GrokParser {
                 // Re-emit so TimelineAggregator.providerThreadId is the real session.
                 out.append(.threadStarted(threadId: sid, providerThreadId: sid))
             }
-            // Token Saver rings need these events — without them Grok stays "No data"
+            // Usage needs these events — without them Grok stays "No data"
             // while Claude/Codex fill weekly used % / token totals.
             if let usage = Self.tokenUsage(from: obj) {
                 out.append(.tokenUsage(usage))

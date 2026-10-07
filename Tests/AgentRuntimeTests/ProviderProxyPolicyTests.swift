@@ -5,12 +5,10 @@ import Darwin
 
 final class ProviderProxyPolicyTests: XCTestCase {
     func test_catalogCoversAllThreeProvidersAndNotCompressionCommands() {
-        // WHY: nested provider interception is a separate controller from RTK wrap.
+        // WHY: nested provider interception covers exactly the three provider CLIs.
         for name in ["claude", "codex", "grok"] {
             XCTAssertTrue(ProviderProxyPolicy.isProviderProxy(name))
             XCTAssertTrue(ProviderProxyCatalog.isProviderProxyCommand("/usr/bin/\(name)"))
-            XCTAssertFalse(WrappedCommandCatalog.commands.contains(name))
-            XCTAssertFalse(WrappedCommandCatalog.exactOutputCommandSet.contains(name))
         }
         XCTAssertFalse(ProviderProxyPolicy.isProviderProxy("ls"))
         XCTAssertFalse(ProviderProxyPolicy.isProviderProxy("git"))
@@ -102,19 +100,15 @@ final class ProviderProxyPolicyTests: XCTestCase {
             "RC_TOKEN_SAVER_THREAD_ID": thread,
             "REMOTE_CODE_AGENT_PROVIDER": "grok"
         ])
-        let scrubbed = ProviderProxyPolicy.paidRuntimeEnvironment(
-            environment: promoted,
-            tokenSaverRuntimeActive: false,
-            graphifyRuntimeActive: false
-        )
+        let scrubbed = ProviderProxyPolicy.removingLegacyOptimizationKeys(promoted)
         XCTAssertNil(scrubbed["RC_TOKEN_SAVER_THREAD_ID"])
         XCTAssertEqual(scrubbed["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"], thread)
         XCTAssertTrue(ProviderProxyPolicy.hasTelemetryScope(environment: scrubbed))
     }
 
-    func test_paidRuntimeEnvironment_scrubsSpoofedPaidLanesButPreservesRouting() {
-        // WHY: stale inherited variables must not resurrect a paid feature
-        // after persisted Token Saver settings say it is off.
+    func test_removingLegacyOptimizationKeys_scrubsSpoofedLanesButPreservesRouting() {
+        // WHY: stale inherited variables from an older build must not resurrect
+        // the removed Token Saver / Graphify lanes, while routing stays intact.
         let environment = [
             "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": #"{"spoofed":true}"#,
             "RC_TOKEN_SAVER_DISTILL_HINT": "1",
@@ -127,11 +121,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             "REMOTE_CODE_AGENT_PROVIDER": "codex",
             "PATH": "/managed:/usr/bin"
         ]
-        let scrubbed = ProviderProxyPolicy.paidRuntimeEnvironment(
-            environment: environment,
-            tokenSaverRuntimeActive: false,
-            graphifyRuntimeActive: false
-        )
+        let scrubbed = ProviderProxyPolicy.removingLegacyOptimizationKeys(environment)
         XCTAssertFalse(scrubbed.keys.contains { $0.hasPrefix("RC_TOKEN_SAVER_") })
         XCTAssertFalse(scrubbed.keys.contains { $0.hasPrefix("RC_DISTILL_") })
         XCTAssertFalse(scrubbed.keys.contains { $0.hasPrefix("RC_GRAPHIFY_") })
@@ -139,22 +129,6 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(scrubbed["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
         XCTAssertEqual(scrubbed["RC_REMOTE_CODE_AGENT_APP_COMMAND"], "/managed/remote-code")
         XCTAssertEqual(scrubbed["PATH"], "/managed:/usr/bin")
-    }
-
-    func test_paidRuntimeEnvironment_scrubsOnlyGraphifyWhenItsLiveGateIsOff() {
-        let scrubbed = ProviderProxyPolicy.paidRuntimeEnvironment(
-            environment: [
-                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
-                "RC_DISTILL_ENDPOINT": "http://127.0.0.1:1",
-                "RC_GRAPHIFY_ENABLED": "1",
-                "RC_GRAPHIFY_ROOTS": "/tmp/project"
-            ],
-            tokenSaverRuntimeActive: true,
-            graphifyRuntimeActive: false
-        )
-        XCTAssertEqual(scrubbed["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
-        XCTAssertEqual(scrubbed["RC_DISTILL_ENDPOINT"], "http://127.0.0.1:1")
-        XCTAssertFalse(scrubbed.keys.contains { $0.hasPrefix("RC_GRAPHIFY_") })
     }
 
     func test_childScopedEnvironment_retargetsEachProviderGeneration() {
@@ -175,17 +149,13 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ],
             targetProvider: .grok,
             childRunId: child,
-            childDelegationCapability: childCapability,
-            tokenSaverEnvironment: [
-                "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "retargeted"
-            ]
+            childDelegationCapability: childCapability
         )
         XCTAssertEqual(scoped["REMOTE_CODE_AGENT_PROVIDER"], "grok")
         XCTAssertEqual(scoped["REMOTE_CODE_PROVIDER_INSTANCE_ID"], "grok")
         XCTAssertEqual(scoped["RC_REMOTE_CODE_ROOT_RUN_ID"], child)
-        XCTAssertEqual(scoped["RC_TOKEN_SAVER_ROOT_RUN_ID"], child)
-        XCTAssertEqual(scoped["RC_TOKEN_SAVER_ATTEMPT_ID"], child)
-        XCTAssertEqual(scoped["RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1"], "retargeted")
+        XCTAssertFalse(scoped.keys.contains { $0.hasPrefix("RC_TOKEN_SAVER_") },
+                       "a parent's leftover Token Saver keys must not reach the child")
         XCTAssertEqual(scoped["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
         XCTAssertEqual(
             scoped[AgentDelegationCapabilityTransport.environmentKey],
@@ -197,7 +167,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
         )
     }
 
-    func test_childScopedEnvironment_keepsHierarchyWhenTokenSaverIsOff() {
+    func test_childScopedEnvironment_keepsHierarchyAndDropsLegacyKeys() {
         let child = UUID().uuidString
         let childCapability = String(repeating: "c", count: 64)
         let scoped = ProviderProxyPolicy.childScopedEnvironment(
@@ -208,8 +178,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
             ],
             targetProvider: .claude,
             childRunId: child,
-            childDelegationCapability: childCapability,
-            tokenSaverEnvironment: nil
+            childDelegationCapability: childCapability
         )
         XCTAssertEqual(scoped["REMOTE_CODE_AGENT_PROVIDER"], "claude")
         XCTAssertEqual(scoped["RC_REMOTE_CODE_ROOT_RUN_ID"], child)
@@ -221,60 +190,22 @@ final class ProviderProxyPolicyTests: XCTestCase {
         )
     }
 
-    func test_childScopedEnvironment_recomputesClaudeOnlyPostToolUseAcrossProviders() {
-        // WHY: Claude→Codex/Grok must drop Claude's hook, while a
-        // Codex/Grok→Claude child receives it only through the retargeted live
-        // capability environment.
-        XCTAssertNil(ProviderProxyPolicy.childPostToolUseCapability(
-            targetProvider: .codex,
-            distillAvailable: true
-        ))
-        XCTAssertNil(ProviderProxyPolicy.childPostToolUseCapability(
-            targetProvider: .grok,
-            distillAvailable: true
-        ))
-        XCTAssertEqual(ProviderProxyPolicy.childPostToolUseCapability(
-            targetProvider: .claude,
-            distillAvailable: true
-        ), true)
-        XCTAssertEqual(ProviderProxyPolicy.childPostToolUseCapability(
-            targetProvider: .claude,
-            distillAvailable: false
-        ), false)
-
+    func test_childScopedEnvironment_neverInheritsAParentDistillStatePath() {
+        // WHY: the Distill sidecar lease path belonged to the removed Token
+        // Saver; a parent's leftover value must not reach any child provider.
         let child = UUID().uuidString
-        let claudeToCodex = ProviderProxyPolicy.childScopedEnvironment(
-            environment: [
-                "REMOTE_CODE_AGENT_PROVIDER": "claude",
-                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/claude-parent-state"
-            ],
-            targetProvider: .codex,
-            childRunId: child,
-            childDelegationCapability: String(repeating: "d", count: 64),
-            tokenSaverEnvironment: [
-                "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "codex-child",
-                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/codex-child-state"
-            ]
-        )
-        XCTAssertEqual(
-            claudeToCodex["REMOTE_CODE_DISTILL_STATE_PATH"],
-            "/tmp/codex-child-state"
-        )
-
-        let grokToClaude = ProviderProxyPolicy.childScopedEnvironment(
-            environment: ["REMOTE_CODE_AGENT_PROVIDER": "grok"],
-            targetProvider: .claude,
-            childRunId: child,
-            childDelegationCapability: String(repeating: "e", count: 64),
-            tokenSaverEnvironment: [
-                "RC_TOKEN_SAVER_EXECUTION_RECEIPT_V1": "claude-child",
-                "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/claude-child-state"
-            ]
-        )
-        XCTAssertEqual(
-            grokToClaude["REMOTE_CODE_DISTILL_STATE_PATH"],
-            "/tmp/claude-child-state"
-        )
+        for target in [AgentProvider.codex, .claude, .grok] {
+            let scoped = ProviderProxyPolicy.childScopedEnvironment(
+                environment: [
+                    "REMOTE_CODE_AGENT_PROVIDER": "claude",
+                    "REMOTE_CODE_DISTILL_STATE_PATH": "/tmp/claude-parent-state"
+                ],
+                targetProvider: target,
+                childRunId: child,
+                childDelegationCapability: String(repeating: "d", count: 64)
+            )
+            XCTAssertNil(scoped["REMOTE_CODE_DISTILL_STATE_PATH"], "\(target)")
+        }
     }
 
     func test_makeNodeId_isBoundedContentFreeAndSafe() {
@@ -367,7 +298,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
 
     func test_samGrokWorkerPromotion_preservesExactAgentAppContractForEveryEffort() throws {
         // WHY: the promoted execution must keep the worker report ABI while the
-        // real Agent App thread owns persistence, Token Saver and usage.
+        // real Agent App thread owns persistence and usage.
         // Live sam-grok-worker emits --model grok-4.6; grok-4.5 remains valid.
         let models = ["grok-4.5", "grok-4.6", "grok-4.6-preview"]
         for model in models {
@@ -503,7 +434,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
 
     func test_nestedCLIAgentAppDelegation_promotesClaudeCodexGrokAgentTurns() throws {
         // WHY: product requires nested shell `claude`/`codex`/`grok` to enter
-        // Agent App (full Token Saver) when the turn ABI is agent-shaped.
+        // Agent App when the turn ABI is agent-shaped.
         let prompt = "/tmp/rc-nested-prompt.txt"
         let claude = try XCTUnwrap(ProviderProxyPolicy.nestedCLIAgentAppDelegation(
             providerBasename: "claude",
@@ -1902,17 +1833,6 @@ final class ProviderProxyPolicyTests: XCTestCase {
         XCTAssertEqual(lines.last, Data([0xFF, 0x00]))
     }
 
-    func test_rawUsageEligibility_recordsActualTokensButNoEligibleRunWhenOff() {
-        XCTAssertEqual(ProviderProxyPolicy.rawUsageEligibleRuns(
-            tokenSaverAdmitted: false,
-            candidate: 1
-        ), 0)
-        XCTAssertEqual(ProviderProxyPolicy.rawUsageEligibleRuns(
-            tokenSaverAdmitted: true,
-            candidate: 1
-        ), 1)
-    }
-
     func test_streamUsage_reconcilesIncrementalClaudeWithFinalCumulativeSnapshot() throws {
         let assistant = Data(#"{"type":"assistant","message":{"usage":{"input_tokens":4,"cache_creation_input_tokens":3,"output_tokens":2}}}"#.utf8)
         let result = Data(#"{"type":"result","modelUsage":{"claude-sonnet":{"inputTokens":4,"cacheCreationInputTokens":3,"cacheReadInputTokens":5,"outputTokens":2,"contextWindow":200000}}}"#.utf8)
@@ -2080,7 +2000,7 @@ final class ProviderProxyPolicyTests: XCTestCase {
     }
 
     func test_usageCommitBuffer_offCommitsActualUsageWithoutConsumingEligibility() {
-        // WHY: Token Saver OFF still records provider usage with eligibleRuns=0.
+        // WHY: provider usage is still recorded, with eligibleRuns=0.
         // If it is enabled later in the same process, exactly the first admitted
         // commit may carry eligibleRuns=1.
         var buffer = ProviderProxyUsageCommitBuffer()

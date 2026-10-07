@@ -97,15 +97,18 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         tokens.filter { !isPendingTokenExpired(issuedAt: $0.value.issuedAt, now: now, ttl: ttl) }
     }
 
+    // Request auth goes through the repository's principal cache: a hit costs
+    // no SQLite, a revoke or pair anywhere in the process invalidates it, and
+    // last_seen_at is written off the request thread.
     public func verify(token: String) -> Bool {
-        ((try? repo.verify(token: token)) ?? nil) != nil
+        ((try? repo.verifyCached(token: token)) ?? nil) != nil
     }
 
     /// RPC authorization must use the same verified DeviceTrust row for both
     /// durable owner binding and persisted capability grants. A second lookup
     /// could observe a revoke or grant change between the two decisions.
     public func authorizedRPCPrincipal(token: String) -> DirectRPCPrincipal? {
-        guard let trust = (try? repo.verify(token: token)) ?? nil else { return nil }
+        guard let trust = (try? repo.verifyCached(token: token)) ?? nil else { return nil }
         return DirectRPCPrincipal(
             ownerFingerprint: Self.opaqueAuthorizedOwnerFingerprint(
                 stableIdentity: "token:\(trust.tokenHash)"
@@ -118,7 +121,7 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     /// hash permits revocation checks without retaining or exposing the bearer;
     /// Mac identity and client-supplied pairing metadata are not inputs.
     public func authorizedOwnerFingerprint(token: String) -> String? {
-        guard let trust = (try? repo.verify(token: token)) ?? nil else { return nil }
+        guard let trust = (try? repo.verifyCached(token: token)) ?? nil else { return nil }
         return Self.opaqueAuthorizedOwnerFingerprint(
             stableIdentity: "token:\(trust.tokenHash)"
         )

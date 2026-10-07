@@ -2,6 +2,7 @@ import XCTest
 @testable import AppShell
 import CoreModel
 import SocketServer
+import Persistence
 
 final class EventBusPersistencePerformanceTests: XCTestCase {
     private final class ErrorBox: @unchecked Sendable {
@@ -90,18 +91,19 @@ final class EventBusPersistencePerformanceTests: XCTestCase {
     }
 
     @MainActor
-    func test_persistedReceiptWaitsForEarlierBackgroundEventWrite() throws {
+    func test_persistedReceiptWritesEarlierEventFirstWithoutWaitingForUnrelatedWriterWork() throws {
         // WHY: command receipts write their events synchronously. If they can
         // pass an earlier normal event queued by the background persister, the
-        // physical retention order diverges from EventBus sequence order.
+        // physical retention order diverges from EventBus sequence order. C6:
+        // the fence must not get that order by draining the whole utility
+        // writer queue either: unrelated work there (snapshot saves, storage
+        // cleanup) used to hold every receipt, and the iPhone's mutation, for
+        // as long as it ran.
         let context = try makeContext(label: "receipt-fence")
         let eventBus = EventBus(recentLimit: 0, recentByteLimit: 0)
-        let writerEntered = expectation(description: "serial writer blocked before normal event")
-        let commitReturned = DispatchSemaphore(value: 0)
+        let writerEntered = expectation(description: "serial writer blocked by unrelated work")
         let releaseWriter = DispatchSemaphore(value: 0)
-        let commitError = ErrorBox()
         let eventLog = context.eventLog
-        let database = context.db
 
         context.backgroundWriterQueue.async {
             writerEntered.fulfill()
@@ -113,6 +115,66 @@ final class EventBusPersistencePerformanceTests: XCTestCase {
         AppDelegate.wireEventPersistence(context: context, eventBus: eventBus)
         eventBus.publish(kind: .agentRunStarted, payload: .string("normal"))
 
+        let outcome = Self.commitReceipt(on: eventBus, eventLog: eventLog)
+        XCTAssertEqual(
+            outcome.returned.wait(timeout: .now() + 2),
+            .success,
+            "the receipt must not wait for unrelated work on the writer queue"
+        )
+        XCTAssertNil(outcome.error.load(), "the earlier normal event must already be durable inside the commit")
+        XCTAssertEqual(try Self.physicalOrder(context), [1, 2],
+            "physical retention order must match EventBus sequence order")
+
+        releaseWriter.signal()
+        context.flushEventPersistence(eventBus: eventBus)
+        XCTAssertEqual(try Self.physicalOrder(context), [1, 2],
+            "the writer's own flush must find the batch the fence wrote and not write it again")
+        XCTAssertEqual(context.eventLogPersistedRowCountForTesting, 1, "the normal event is written exactly once")
+    }
+
+    @MainActor
+    func test_persistedReceiptWaitsForTheInFlightEarlierEventBatch() throws {
+        // WHY: a batch the writer already took holds earlier sequences. The
+        // fence must wait for that batch's completion token, or the receipt's
+        // events land before it.
+        let context = try makeContext(label: "receipt-fence-in-flight")
+        let eventBus = EventBus(recentLimit: 0, recentByteLimit: 0)
+        let batchEntered = DispatchSemaphore(value: 0)
+        let releaseBatch = DispatchSemaphore(value: 0)
+        let eventLog = context.eventLog
+        AppContext.beforeEventLogBatchWriteForTesting = {
+            batchEntered.signal()
+            releaseBatch.wait()
+        }
+        defer {
+            AppContext.beforeEventLogBatchWriteForTesting = nil
+            releaseBatch.signal()
+        }
+
+        AppDelegate.wireEventPersistence(context: context, eventBus: eventBus)
+        eventBus.publish(kind: .agentRunStarted, payload: .string("normal"))
+        XCTAssertEqual(batchEntered.wait(timeout: .now() + 2), .success, "the writer took the normal event's batch")
+
+        let outcome = Self.commitReceipt(on: eventBus, eventLog: eventLog)
+        XCTAssertEqual(
+            outcome.returned.wait(timeout: .now() + 0.05),
+            .timedOut,
+            "the receipt must not pass the in-flight batch holding the earlier event"
+        )
+        AppContext.beforeEventLogBatchWriteForTesting = nil
+        releaseBatch.signal()
+        XCTAssertEqual(outcome.returned.wait(timeout: .now() + 2), .success)
+        XCTAssertNil(outcome.error.load())
+        XCTAssertEqual(try Self.physicalOrder(context), [1, 2],
+            "physical retention order must match EventBus sequence order")
+    }
+
+    private static func commitReceipt(
+        on eventBus: EventBus,
+        eventLog: EventLogRepository
+    ) -> (returned: DispatchSemaphore, error: ErrorBox) {
+        let returned = DispatchSemaphore(value: 0)
+        let commitError = ErrorBox()
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 _ = try eventBus.commitPersistedEvents { floor in
@@ -141,26 +203,19 @@ final class EventBusPersistencePerformanceTests: XCTestCase {
             } catch {
                 commitError.store(error)
             }
-            commitReturned.signal()
+            returned.signal()
         }
+        return (returned, commitError)
+    }
 
-        XCTAssertEqual(
-            commitReturned.wait(timeout: .now() + 0.05),
-            .timedOut,
-            "the receipt must not pass an earlier event whose writer is blocked"
-        )
-        releaseWriter.signal()
-        XCTAssertEqual(commitReturned.wait(timeout: .now() + 2), .success)
-        XCTAssertNil(commitError.load())
-
-        let physicalOrder = try database.performSync { sqlite -> [Int64] in
+    @MainActor
+    private static func physicalOrder(_ context: AppContext) throws -> [Int64] {
+        try context.db.performSync { sqlite -> [Int64] in
             let statement = try sqlite.prepare("SELECT seq FROM events ORDER BY id ASC;")
             var sequences: [Int64] = []
             while try statement.step() { sequences.append(statement.columnInt64(0)) }
             return sequences
         }
-        XCTAssertEqual(physicalOrder, [1, 2],
-            "physical retention order must match EventBus sequence order")
     }
 
     @MainActor

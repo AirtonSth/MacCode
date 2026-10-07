@@ -419,16 +419,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         lock.unlock()
 
         do {
-            // Per-turn Graphify path hint: persistent SDK sessions do not re-apply
-            // system_prompt after creation, so App Support graph paths must ride on
-            // each turn when the host sets RC_GRAPHIFY_* on the environment.
             let writeTurn = {
                 var payload: [String: Any] = [
                     "type": "rc_turn",
-                    "prompt": GraphifyStableSkillText.augmentTurnPrompt(
-                        request.providerPrompt,
-                        environment: request.environment
-                    ),
+                    "prompt": request.providerPrompt,
                     "attachments": Self.attachmentPayload(request.attachments),
                     "session_id": session.providerThreadId ?? request.threadId.value.uuidString,
                     "mcp_servers": Self.botPeerMCPServers(environment: request.environment),
@@ -1030,7 +1024,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let cache = try sdkRuntimeCacheDirectory()
         // Multiple RemoteCode builds may coexist. Keep the shared dependency
         // tree, but make bridge bytes immutable per content hash so an older app
-        // cannot overwrite a newer PostToolUse implementation during launch.
+        // cannot overwrite a newer bridge implementation during launch.
         let cachedBridge = cache.appendingPathComponent(Self.cachedBridgeFileName(source: source))
         if !FileManager.default.isReadableFile(atPath: cachedBridge.path)
             || (((try? Data(contentsOf: cachedBridge, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) != source) {
@@ -1748,8 +1742,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         if let settings = ClaudeRunner.ultracodeSettingsArgs(
             normalizedEffort,
-            environment: request.environment,
-            cwd: request.cwd
+            environment: request.environment
         ).last {
             payload["settings"] = settings
         }
@@ -1763,7 +1756,6 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// does not reliably inherit the managed server written to settings.json.
     /// The definition is rebuilt per turn so the MCP receives that turn's exact
     /// thread/run/socket authority without deriving anything from user prose.
-    /// Carries the Distill librarian server too while Token Saver is enabled —
     /// SDK-engine parity with the CLI route's `--mcp-config` (see
     /// ClaudeRunner.botPeerMCPConfigJSON).
     static func botPeerMCPServers(
@@ -1782,12 +1774,6 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" {
             servers[ComputerUseMCPAdmit.serverName] = ComputerUseMCPAdmit.stdioConfig(command: resolved)
         }
-        if DistillMCPAdmit.isEnabled(environment: environment) {
-            servers[DistillMCPAdmit.serverName] = DistillMCPAdmit.claudeServer(
-                command: resolved,
-                environment: environment
-            )
-        }
         return servers
     }
 
@@ -1800,11 +1786,8 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// self-declaration marker + the MCP-tool-availability rule) so the agent marks
     /// any unavoidable wait with the recovery marker and does not preemptively refuse
     /// a connected MCP tool as "unauthenticated" in a non-interactive run.
-    /// Managed tool-output Distill policy and the separately admitted RCW1 ABI
-    /// only when Token Saver is active. Codex/Grok use the same environment gates —
-    /// never via `~/.claude/skills` / `~/.codex/skills`.
     static func claudeSystemPrompt(environment: [String: String]) -> String {
-        return AgentSkillInstaller.tokenSaverProviderPrompt(
+        return AgentSkillInstaller.nestedAgentProviderPrompt(
             BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
             environment: environment
         )

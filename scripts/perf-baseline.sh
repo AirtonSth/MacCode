@@ -44,12 +44,12 @@ if [[ -n "$DB_PATH" ]]; then
   DB_BYTES=$(stat -f%z "$DB_PATH" 2>/dev/null || stat -c%s "$DB_PATH" 2>/dev/null || echo null)
 fi
 
-SIDECAR_COUNT=$(pgrep -f RemoteCodeDistillService 2>/dev/null | wc -l | tr -d ' ')
-SIDECAR_RSS=0
+DISTILL_SERVICE_COUNT=$(pgrep -f RemoteCodeDistillService 2>/dev/null | wc -l | tr -d ' ')
+DISTILL_SERVICE_RSS=0
 while read -r spid; do
   [[ -z "$spid" ]] && continue
   sr=$(ps -o rss= -p "$spid" 2>/dev/null | tr -d ' ' || echo 0)
-  SIDECAR_RSS=$((SIDECAR_RSS + sr))
+  DISTILL_SERVICE_RSS=$((DISTILL_SERVICE_RSS + sr))
 done < <(pgrep -f RemoteCodeDistillService 2>/dev/null || true)
 
 SAMPLE_NOTE="skipped"
@@ -76,8 +76,8 @@ cat >"$OUT_JSON" <<EOF
   "machPorts": ${PORTS:-null},
   "dbPath": $( [[ -n "$DB_PATH" ]] && printf '"%s"' "$DB_PATH" || echo null ),
   "dbBytes": $DB_BYTES,
-  "distillSidecarCount": $SIDECAR_COUNT,
-  "distillSidecarRssKB": $SIDECAR_RSS,
+  "distillServiceProcessCount": $DISTILL_SERVICE_COUNT,
+  "distillServiceRssKB": $DISTILL_SERVICE_RSS,
   "sample": "$SAMPLE_NOTE",
   "metrics": {
     "continuousStallMsMax": null,
@@ -104,7 +104,7 @@ cat >"$OUT_MD" <<EOF
 - Children: $CHILDREN (zombies: $ZOMBIES)
 - Mach ports: ${PORTS:-n/a}
 - DB bytes: $DB_BYTES
-- Distill sidecars: $SIDECAR_COUNT (RSS KB sum: $SIDECAR_RSS)
+- RemoteCodeDistillService helper processes: $DISTILL_SERVICE_COUNT (RSS KB sum: $DISTILL_SERVICE_RSS)
 - Sample: $SAMPLE_NOTE
 - continuousStall / p95 event→UI / p95 stream-insert: **null** (need in-app signposts)
 

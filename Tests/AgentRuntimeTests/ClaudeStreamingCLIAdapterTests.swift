@@ -1095,7 +1095,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
-    func test_agentSDKBridgeAdapterSendsDistillSystemPromptOnlyWhenTokenSaverHintSet() async throws {
+    func test_agentSDKBridgeAdapterSystemPromptNeverCarriesDistillEvenWithALegacyHint() async throws {
         guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-sdk-distill-\(UUID().uuidString)", isDirectory: true)
@@ -1121,9 +1121,9 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         }
         """.write(to: bridge, atomically: true, encoding: .utf8)
 
-        func configureCommand(tokenSaverOn: Bool) async throws -> String {
+        func configureCommand(legacyHint: Bool) async throws -> String {
             let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
-            let log = tmp.appendingPathComponent("cfg-\(tokenSaverOn).jsonl")
+            let log = tmp.appendingPathComponent("cfg-\(legacyHint).jsonl")
             FileManager.default.createFile(atPath: log.path, contents: Data())
             let sink = EventSink()
             _ = try await adapter.sendTurn(AgentRunRequest(
@@ -1132,7 +1132,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                 model: "claude-haiku-4-5-20251001",
                 cwd: tmp.path,
                 prompt: "hi",
-                environment: tokenSaverOn ? ["RC_TOKEN_SAVER_DISTILL_HINT": "1"] : [:],
+                environment: legacyHint ? ["RC_TOKEN_SAVER_DISTILL_HINT": "1"] : [:],
                 extraArgs: [log.path]
             )) { event in Task { await sink.record(event) } }
             try await waitForFinish(in: sink, expected: "OK")
@@ -1140,62 +1140,30 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             return try String(contentsOf: log, encoding: .utf8)
         }
 
-        let on = try await configureCommand(tokenSaverOn: true)
-        XCTAssertTrue(on.contains("\"system_prompt\""),
-                      "rc_configure must send a system prompt")
-        XCTAssertTrue(on.contains("Background-await protocol"),
-                      "the system prompt must always carry the background-await self-declaration rule")
-        // WHY both sides: the injected prompt must carry the noisy-output allowlist
-        // AND the never-pipe list for exact-output tools. This previously asserted
-        // "pipe EVERY pipable ..." and was red — the template moved to the
-        // fidelity-based predicate and the assertion was left behind.
-        XCTAssertTrue(on.contains("MANDATORY default-pipe:"),
-                      "Token Saver on: system prompt carries the `| distill` piping rule")
-        XCTAssertTrue(
-            on.contains("NEVER auto-distill raw exact-output")
-                || on.contains("NEVER pipe `| distill` only for exact-output"),
-            "Token Saver on: exact-output stays skip-by-default"
-        )
-        XCTAssertTrue(on.contains(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")),
-                      "Token Saver on: system prompt carries the canonical exact-output catalog")
-
-        let off = try await configureCommand(tokenSaverOn: false)
-        // Background-await stays; Distill is paid (Token Saver only).
-        XCTAssertTrue(off.contains("\"system_prompt\""),
-                      "the background-await rule must be sent even with Token Saver off")
-        XCTAssertTrue(off.contains("Background-await protocol"),
-                      "the background-await self-declaration rule must be present regardless of Token Saver")
-        XCTAssertFalse(off.contains("pipe EVERY pipable, output-producing shell/tool call"),
-                       "Token Saver off must not inject Distill pipe rules")
-        XCTAssertFalse(off.contains("| distill"),
-                       "Token Saver off must not inject Distill pipe rules")
+        // Token Saver was removed: the system prompt always carries the
+        // background-await rule and never the Distill piping rules, even when an
+        // older build's hint is still in the environment.
+        for legacyHint in [true, false] {
+            let configure = try await configureCommand(legacyHint: legacyHint)
+            XCTAssertTrue(configure.contains("\"system_prompt\""),
+                          "rc_configure must send a system prompt")
+            XCTAssertTrue(configure.contains("Background-await protocol"),
+                          "the system prompt must always carry the background-await self-declaration rule")
+            XCTAssertFalse(configure.contains("| distill"),
+                           "no Distill pipe rule may reach the SDK (legacy hint: \(legacyHint))")
+            XCTAssertFalse(configure.contains("MANDATORY default-pipe:"))
+        }
     }
 
-    func test_claudeSystemPrompt_backgroundAwaitAlways_distillOnlyWithTokenSaver() {
-        // Background-await always; Distill only when Token Saver hint is present.
-        let emptyEnv = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: [:])
-        XCTAssertTrue(emptyEnv.contains(BackgroundAwaitContinuation.awaitingMarker),
-                      "the background-await rule must be present on every Claude call")
-        XCTAssertFalse(emptyEnv.contains("| distill"),
-                       "Token Saver off must not inject Distill")
-        XCTAssertFalse(emptyEnv.contains(TokenSaverProviderSafetyABI.block),
-                       "Token Saver off must not inject safety ABI")
-
-        let on = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
-        XCTAssertTrue(on.contains(BackgroundAwaitContinuation.awaitingMarker),
-                      "the background-await rule must remain present with Token Saver on")
-        XCTAssertTrue(on.contains("| distill"),
-                      "Token Saver hint carries the distill piping rule")
-        XCTAssertEqual(on.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
-                       "Claude receives the versioned Token Saver safety ABI exactly once")
-        XCTAssertEqual(
-            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + on)
-                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
-            1,
-            "Claude SDK effective disk plus runtime context receives the safety ABI exactly once"
-        )
-        XCTAssertEqual(emptyEnv.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 0,
-                       "Token Saver off must not inject the safety ABI")
+    func test_claudeSystemPrompt_backgroundAwaitAlways_neverDistill() {
+        // Background-await always; Distill never, even with an older build's hint.
+        for environment in [[:], ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]] {
+            let prompt = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: environment)
+            XCTAssertTrue(prompt.contains(BackgroundAwaitContinuation.awaitingMarker),
+                          "the background-await rule must be present on every Claude call")
+            XCTAssertFalse(prompt.contains("| distill"), "no Distill rule may be injected")
+            XCTAssertFalse(prompt.contains("TOKEN_SAVER_SAFETY_ABI"), "no Token Saver safety ABI may be injected")
+        }
     }
 
     func test_agentSDKBridgeAdapterFinalizesAssistantTextWhenBridgeExitsWithoutResult() async throws {
@@ -1773,7 +1741,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                        "attachment validation failure must not leave a registered half-started session")
     }
 
-    func test_agentSDKBridgeSourceWiresPostToolUseTokenSaverHook() throws {
+    func test_agentSDKBridgeSourceWiresHumanOriginAndEffortButNoToolOutputHook() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -1785,21 +1753,17 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "host-forwarded SDK user turns must set origin.kind=human")
         XCTAssertTrue(source.contains("function sdkEffortToken"),
                       "SDK query effort must coerce ultracode to xhigh")
-        XCTAssertTrue(source.contains("hooks: tokenSaverHooks()"),
-                      "I2: SDK query options must register the PostToolUse hook so tool_result bytes can be replaced before provider context replay")
-        XCTAssertTrue(source.contains("updatedMCPToolOutput"),
-                      "I2: PostToolUse must use the SDK replacement field, not only additionalContext, otherwise raw tool output still reaches the next request")
-        XCTAssertTrue(source.contains("RC_TOKEN_SAVER_POST_TOOL_USE"),
-                      "I2: hook must stay opt-in/default-off until Token Saver enables it")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_STORE_MIN_BYTES = 2048"),
-                      "I2: hooked tool output lane lowers reversible store floor from 8192 to 2048 bytes")
+        XCTAssertFalse(source.contains("PostToolUse"),
+                       "the Token Saver tool-output hook was removed; the bridge must not register one")
+        XCTAssertFalse(source.contains("RC_TOKEN_SAVER_"),
+                       "the bridge must not read any Token Saver variable")
     }
 
-    // The SDK bridge has no developer_instructions channel like Codex, so the Token Saver
-    // Token Saver rules (eligible `| distill` output plus optional RCW1 ABI) ride in the SDK
-    // `systemPrompt`. The host sends it as `system_prompt` on rc_configure; the bridge relays
-    // it into the query options. Locks both ends of that wiring.
-    func test_agentSDKBridgeSourceWiresTokenSaverSystemPrompt() throws {
+    // The SDK bridge has no developer_instructions channel like Codex, so the host
+    // rules (background-await marker, MCP availability, nested-agent routing) ride in the
+    // SDK `systemPrompt`. The host sends it as `system_prompt` on rc_configure; the bridge
+    // relays it into the query options. Locks both ends of that wiring.
+    func test_agentSDKBridgeSourceWiresHostSystemPrompt() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -1808,706 +1772,9 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let source = try String(contentsOf: bridge, encoding: .utf8)
 
         XCTAssertTrue(source.contains("systemPrompt: current.systemPrompt"),
-                      "SDK query options must pass the host-provided Token Saver system prompt")
+                      "SDK query options must pass the host-provided system prompt")
         XCTAssertTrue(source.contains("systemPrompt: command.system_prompt || undefined"),
-                      "rc_configure must relay the host `system_prompt` into session state (undefined keeps the SDK default empty prompt when Token Saver is off)")
-    }
-
-    // The Claude PostToolUse fallback must distill every non-Bash tool (no
-    // 4-tool allowlist) once output passes its hook threshold, excluding only
-    // exact-byte file tools and Skill content. Bash fails open because Claude
-    // normalizes its response before the hook; PATH wrappers / explicit
-    // `| distill` are the byte-exact lanes for eligible shell output.
-    func test_agentSDKBridgeTokenSaverCompressesAllToolsAbovePolicyThreshold() throws {
-        let packageRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
-        let source = try String(contentsOf: bridge, encoding: .utf8)
-
-        XCTAssertTrue(source.contains("TOKEN_SAVER_MIN_BYTES = 1024"),
-                      "threshold must match the distill policy (~1KB), not the prior 2048 that skipped 1-2KB output")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_MIN_LINES = 10"),
-                      "threshold must match the distill policy (~10 lines), not the prior 30 that skipped 10-30 line output")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_DEFAULT_PROFILE"),
-                      "unlisted tools must fall back to a compressing default profile, not passthrough")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_PROFILES.get(normalized) || TOKEN_SAVER_DEFAULT_PROFILE"),
-                      "the decision must default every tool to compression instead of a 4-tool allowlist")
-        XCTAssertFalse(source.contains("'not_allowlisted'"),
-                       "there must be no allowlist gate — every non-excluded tool compresses")
-        // The AND guard is correct De Morgan ("skip only when BOTH dimensions are
-        // small"); it must remain AND so output compresses when EITHER threshold trips.
-        XCTAssertTrue(source.contains("<= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES"),
-                      "skip guard must stay AND so a >1KB OR >10-line output is compressed")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['edit', 'write', 'multiedit', 'notebookedit', 'skill'])"),
-                      "edit/write/skill stay exempt; Read/Grep compress for Token Saver coverage")
-        XCTAssertTrue(source.contains("skill_content"),
-                      "Skill exclusion must use a dedicated skip reason so PostToolUse never compresses skill bodies")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_EXACT_OUTPUT_BASH"),
-                      "Bash must skip exact-output shell tools (rg/grep/sed/...) per AGENTS.md")
-        XCTAssertTrue(source.contains("isExactOutputBashCommand"),
-                      "Bash exact-output detection must inspect command segments, not only the first token")
-        XCTAssertTrue(source.contains("normalized_bash_output"),
-                      "ordinary Bash must fail open after Claude normalizes away terminal-LF state")
-        for command in WrappedCommandCatalog.exactOutputCommands {
-            XCTAssertTrue(
-                source.contains("'\(command)'"),
-                "Claude SDK hook must protect the canonical exact-output command: \(command)"
-            )
-        }
-        XCTAssertTrue(source.contains("updatedToolOutput"),
-                      "PostToolUse must use updatedToolOutput so built-in tools actually receive compressed output")
-    }
-
-    /// Behavioral pin: Skill tool output must bypass PostToolUse Distill even when
-    /// the payload is large enough that ordinary tools would compress.
-    func test_agentSDKBridgeTokenSaverSkipsSkillToolOutputRegardlessOfSize() throws {
-        let node = try XCTUnwrap(
-            ProcessLocator.resolve("node"),
-            "node is required for the bridge decision contract test"
-        )
-        let packageRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
-        let source = try String(contentsOf: bridge, encoding: .utf8)
-
-        // WHY: run the same decision function the bridge uses against a large skill
-        // fixture so we prove exclusion is behavioral, not just a string pin.
-        // Concatenate (no JS template literal) so bridge source with special chars
-        // cannot break Function construction.
-        let harness = """
-        import { readFileSync } from 'fs';
-        // argv[0]=node argv[1]=this harness argv[2]=bridge path
-        const src = readFileSync(process.argv[2], 'utf8');
-        const start = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
-        const end = src.indexOf('function tokenSaverContractQuestion');
-        if (start < 0 || end < 0) throw new Error('helper slice not found: ' + start + '/' + end);
-        const slice = src.slice(start, end);
-        const mod = new Function(slice + '; return { tokenSaverToolDecision, TOKEN_SAVER_EXCLUDED_TOOLS };')();
-        const largeSkill = 'SKILL_FIXTURE_BEGIN\\n' + ('x'.repeat(8000)) + '\\nSKILL_FIXTURE_END';
-        const skill = mod.tokenSaverToolDecision('Skill', { skill: 'remote-code-orchestrate' }, largeSkill);
-        const ordinary = mod.tokenSaverToolDecision('Bash', { command: 'swift test' }, largeSkill);
-        const exact = mod.tokenSaverToolDecision('Bash', { command: 'rg -n foo Sources' }, largeSkill);
-        const exactMatrix = [
-          'FOO=1 egrep needle file',
-          '/usr/bin/env FOO=1 xxd fixture.bin',
-          'env -- xxd fixture.bin',
-          'command base64 fixture.bin',
-          '/usr/bin/command -- base64 fixture.bin',
-          'env -S rg needle Sources',
-          "env -S 'rg -n needle Sources'",
-          'env -C /tmp rg -n needle Sources',
-          'env -P /usr/bin rg -n needle Sources',
-          'env -v rg -n needle Sources',
-          'env -iv rg -n needle Sources',
-          "FOO='a b' rg -n needle Sources",
-          "env FOO='a b' rg -n needle Sources",
-          "exec -a 'display name' rg -n needle Sources",
-          '"/usr/bin/env" FOO=1 rg -n needle Sources',
-          '"/usr/bin/command" -- rg -n needle Sources',
-          'exec -a display-name rg -n needle Sources',
-          'git -C repo show HEAD',
-        ].map((command) => mod.tokenSaverToolDecision('Bash', { command }, largeSkill));
-        console.log(JSON.stringify({
-          skillShouldCompress: skill.shouldCompress,
-          skillSkipReason: skill.skipReason,
-          ordinaryShouldCompress: ordinary.shouldCompress,
-          ordinarySkipReason: ordinary.skipReason,
-          exactShouldCompress: exact.shouldCompress,
-          exactSkipReason: exact.skipReason,
-          exactMatrixSkipped: exactMatrix.every((decision) => !decision.shouldCompress && decision.skipReason === 'exact_output_shell'),
-          skillExcluded: mod.TOKEN_SAVER_EXCLUDED_TOOLS.has('skill'),
-          skillLen: largeSkill.length,
-        }));
-        """
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("rc-skill-distill-decision-\(UUID().uuidString).mjs")
-        try harness.write(to: tmp, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [tmp.path, bridge.path]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
-        guard let data = out.data(using: .utf8),
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return XCTFail("expected JSON decision payload, got: \(out)")
-        }
-        XCTAssertEqual(json["skillShouldCompress"] as? Bool, false,
-                       "Skill tool output must never enter Distill PostToolUse compression")
-        XCTAssertEqual(json["skillSkipReason"] as? String, "skill_content")
-        XCTAssertEqual(json["ordinaryShouldCompress"] as? Bool, false,
-                       "ordinary Bash must fail open because Claude normalized its terminal-LF state")
-        XCTAssertEqual(json["ordinarySkipReason"] as? String, "normalized_bash_output")
-        XCTAssertEqual(json["exactShouldCompress"] as? Bool, false,
-                       "exact-output Bash (rg) stays excluded")
-        XCTAssertEqual(json["exactMatrixSkipped"] as? Bool, true,
-                       "prefixes, extended catalog commands, and git global options must stay exact")
-        XCTAssertEqual(json["skillExcluded"] as? Bool, true)
-        XCTAssertGreaterThan(json["skillLen"] as? Int ?? 0, 6000,
-                             "fixture must exceed presentation truncation limit to prove completeness path")
-        // Ensure the harness is grounded in the live bridge (no silent fallback).
-        XCTAssertTrue(source.contains("'skill'"), "bridge source must list skill exclusion")
-    }
-
-    func test_agentSDKBridgePostToolUse_bashWithOrWithoutTerminalLFFailsOpenBeforeSidecar() throws {
-        let node = try XCTUnwrap(
-            ProcessLocator.resolve("node"),
-            "node is required for the bridge PostToolUse contract test"
-        )
-        let packageRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
-
-        // WHY: Claude's SDK hands PostToolUse a normalized Bash response that
-        // cannot prove whether the real process emitted a terminal LF. Exercise
-        // the production hook with both apparent shapes and prove it returns an
-        // empty update before loading state or calling the sidecar. A non-Bash
-        // call remains compressible so this is not a blanket hook disable.
-        let harness = """
-        import { readFileSync } from 'fs';
-        const src = readFileSync(process.argv[2], 'utf8');
-        const helperStart = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
-        const helperEnd = src.indexOf('function tokenSaverContractQuestion');
-        const hookStart = src.indexOf('async function tokenSaverPostToolUse');
-        const hookEnd = src.indexOf('function tokenSaverHooks');
-        if ([helperStart, helperEnd, hookStart, hookEnd].some((offset) => offset < 0)) {
-          throw new Error('bridge helper slice not found');
-        }
-        const factory = new Function(
-          'current',
-          'loadTokenSaverState',
-          'postTokenSaverDistill',
-          'bestEffortRecordTokenSaverSavings',
-          'randomUUID',
-          'tokenSaverContractQuestion',
-          src.slice(helperStart, helperEnd) + '\\n' + src.slice(hookStart, hookEnd)
-            + '\\nreturn tokenSaverPostToolUse;'
-        );
-        let stateLoads = 0;
-        let sidecarCalls = 0;
-        const hook = factory(
-          { env: { RC_TOKEN_SAVER_POST_TOOL_USE: '1', REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
-          () => { stateLoads += 1; return { base_url: 'http://127.0.0.1', auth_token: 'tok' }; },
-          async () => {
-            sidecarCalls += 1;
-            return { output: 'DISTILLED_NON_BASH', routeStage: 'deterministic', recoveryConfirmations: [] };
-          },
-          async () => {},
-          () => '123e4567-e89b-12d3-a456-426614174000',
-          () => 'contract'
-        );
-        const raw = Array.from({ length: 80 }, (_, i) => `diagnostic line ${i}`).join('\\n')
-          + '\\nFINAL_SENTINEL';
-        const bashInput = (stdout) => ({
-          hook_event_name: 'PostToolUse',
-          tool_name: 'Bash',
-          tool_input: { command: 'swift noisy.swift' },
-          tool_response: {
-            stdout,
-            stderr: '',
-            interrupted: false,
-            isImage: false,
-            noOutputExpected: false,
-          },
-        });
-        const bashWithoutLF = await hook(bashInput(raw));
-        const bashWithLF = await hook(bashInput(raw + '\\n'));
-        const callsAfterBash = sidecarCalls;
-        const loadsAfterBash = stateLoads;
-        const web = await hook({
-          hook_event_name: 'PostToolUse',
-          tool_name: 'WebFetch',
-          tool_input: { url: 'https://example.invalid/noisy' },
-          tool_response: raw,
-        });
-        console.log(JSON.stringify({
-          bashWithoutLF,
-          bashWithLF,
-          callsAfterBash,
-          loadsAfterBash,
-          sidecarCalls,
-          stateLoads,
-          webUpdated: web.hookSpecificOutput?.updatedToolOutput,
-          webMCPUpdated: web.hookSpecificOutput?.updatedMCPToolOutput,
-        }));
-        """
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("rc-sdk-bash-normalized-output-\(UUID().uuidString).mjs")
-        try harness.write(to: tmp, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [tmp.path, bridge.path]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
-        let data = try XCTUnwrap(out.data(using: .utf8))
-        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual((json["bashWithoutLF"] as? [String: Any])?.count, 0)
-        XCTAssertEqual((json["bashWithLF"] as? [String: Any])?.count, 0)
-        XCTAssertEqual(json["callsAfterBash"] as? Int, 0)
-        XCTAssertEqual(json["loadsAfterBash"] as? Int, 0)
-        XCTAssertEqual(json["sidecarCalls"] as? Int, 1,
-                       "eligible non-Bash output must still call the sidecar")
-        XCTAssertEqual(json["stateLoads"] as? Int, 1)
-        XCTAssertEqual(json["webUpdated"] as? String, "DISTILLED_NON_BASH")
-        XCTAssertEqual(json["webMCPUpdated"] as? String, "DISTILLED_NON_BASH")
-    }
-
-    func test_agentSDKBridgePostToolUse_skipsNestedMixedMediaAndPreservesTextOnlyControl() throws {
-        let node = try XCTUnwrap(
-            ProcessLocator.resolve("node"),
-            "node is required for the bridge multimodal PostToolUse contract test"
-        )
-        let packageRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
-
-        // WHY: extractToolOutputText flattens text from mixed content, while the
-        // replacement API replaces the entire tool_response. A media response must
-        // therefore fail open so the SDK keeps the exact shape/bytes and no receipt
-        // can drive the persisted Distilled badge. Text-only output remains eligible.
-        let harness = #"""
-        import { readFileSync } from 'fs';
-        const src = readFileSync(process.argv[2], 'utf8');
-        const helperStart = src.indexOf('const TOKEN_SAVER_MIN_BYTES');
-        const helperEnd = src.indexOf('function tokenSaverContractQuestion');
-        const hookStart = src.indexOf('async function tokenSaverPostToolUse');
-        const hookEnd = src.indexOf('function tokenSaverHooks');
-        if ([helperStart, helperEnd, hookStart, hookEnd].some((offset) => offset < 0)) {
-          throw new Error('bridge multimodal slice not found');
-        }
-        const factory = new Function(
-          'current',
-          'loadTokenSaverState',
-          'postTokenSaverDistill',
-          'bestEffortRecordTokenSaverSavings',
-          'randomUUID',
-          'tokenSaverContractQuestion',
-          src.slice(helperStart, helperEnd) + '\n' + src.slice(hookStart, hookEnd)
-            + '\nreturn tokenSaverPostToolUse;'
-        );
-        let sidecarCalls = 0;
-        let ledgerCalls = 0;
-        const hook = factory(
-          { env: { RC_TOKEN_SAVER_POST_TOOL_USE: '1', REMOTE_CODE_AGENT_PROVIDER: 'claude' } },
-          () => ({ baseURL: 'http://127.0.0.1', authToken: 'tok' }),
-          async () => {
-            sidecarCalls += 1;
-            return { output: 'DISTILLED_TEXT\n[[rcd:applied]]', routeStage: 'deterministic', recoveryConfirmations: [] };
-          },
-          async () => { ledgerCalls += 1; },
-          () => '123e4567-e89b-12d3-a456-426614174000',
-          () => 'Compress fixture'
-        );
-        const raw = Array.from({ length: 80 }, (_, i) => `diagnostic line ${i}`).join('\n');
-        const imageBytes = 'iVBORw0KGgoAAAANSUhEUgAAAAE=';
-        const metadataImageBytes = 'METADATA_IMAGE_BYTES';
-        const screenshotBytes = 'SCREENSHOT_BYTES';
-        const mixed = {
-          content: [
-            { type: 'text', text: raw },
-            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBytes } },
-            { wrapper: { content: [
-              { type: 'text', text: 'nested text' },
-              { type: 'screenshot', mimeType: 'image/png', data: screenshotBytes },
-            ] } },
-          ],
-          metadata: { parts: [{ type: 'media', media_type: 'image/png', data: metadataImageBytes }] },
-        };
-        const mixedBefore = JSON.stringify(mixed);
-        const mixedResult = await hook({
-          hook_event_name: 'PostToolUse',
-          tool_name: 'WebFetch',
-          tool_input: { url: 'https://example.invalid/mixed' },
-          tool_response: mixed,
-        });
-        const mixedDelivered = mixedResult.hookSpecificOutput?.updatedToolOutput || mixed;
-        const mixedAfter = JSON.stringify(mixedDelivered);
-        const textResult = await hook({
-          hook_event_name: 'PostToolUse',
-          tool_name: 'WebFetch',
-          tool_input: { url: 'https://example.invalid/text' },
-          tool_response: raw,
-        });
-        await new Promise((resolve) => setImmediate(resolve));
-        console.log(JSON.stringify({
-          mixedResult,
-          mixedBefore,
-          mixedAfter,
-          mixedDeliveredContainsImageBytes: mixedAfter.includes(imageBytes),
-          mixedDeliveredContainsScreenshotBytes: mixedAfter.includes(screenshotBytes),
-          textUpdated: textResult.hookSpecificOutput?.updatedToolOutput,
-          textMCPUpdated: textResult.hookSpecificOutput?.updatedMCPToolOutput,
-          sidecarCalls,
-          ledgerCalls,
-        }));
-        """#
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("rc-sdk-mixed-media-\(UUID().uuidString).mjs")
-        try harness.write(to: tmp, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [tmp.path, bridge.path]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
-        let data = try XCTUnwrap(out.data(using: .utf8))
-        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual((json["mixedResult"] as? [String: Any])?.count, 0,
-                       "mixed media must return an empty hook update so Claude retains the original response")
-        XCTAssertEqual(json["mixedBefore"] as? String, json["mixedAfter"] as? String,
-                       "mixed media must preserve the exact original response shape and bytes")
-        XCTAssertEqual(json["mixedDeliveredContainsImageBytes"] as? Bool, true)
-        XCTAssertEqual(json["mixedDeliveredContainsScreenshotBytes"] as? Bool, true)
-        XCTAssertFalse((json["mixedAfter"] as? String)?.contains("[[rcd:") == true,
-                        "mixed media must not persist an applied receipt/badge marker")
-        XCTAssertEqual(json["textUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:applied]]",
-                       "text-only output must remain eligible for the existing replacement path")
-        XCTAssertEqual(json["textMCPUpdated"] as? String, "DISTILLED_TEXT\n[[rcd:applied]]")
-        XCTAssertEqual(json["sidecarCalls"] as? Int, 1,
-                       "only the text-only control may call the Distill sidecar")
-        XCTAssertEqual(json["ledgerCalls"] as? Int, 1,
-                       "only the accepted text replacement may enqueue savings accounting")
-    }
-
-    func test_agentSDKBridgePostToolUse_appliesReceiptOnlyForNetShrink() throws {
-        let node = try XCTUnwrap(
-            ProcessLocator.resolve("node"),
-            "node is required for the bridge receipt contract test"
-        )
-        let packageRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
-
-        // WHY: command syntax cannot prove that Distill actually replaced bytes.
-        // Exercise the bridge's direct sidecar lane so only a real, marker-inclusive
-        // UTF-8 shrink emits the receipt that drives the persisted UI badge.
-        let harness = #"""
-        import { readFileSync } from 'fs';
-        import { Buffer } from 'buffer';
-        import { createHash, createHmac } from 'crypto';
-        const src = readFileSync(process.argv[2], 'utf8');
-        const start = src.indexOf('function tokenSaverAppliedReceipt');
-        const end = src.indexOf('async function tokenSaverPostToolUse');
-        if (start < 0 || end < 0) throw new Error('bridge receipt slice not found');
-        let decoded = {};
-        const factory = new Function(
-          'current',
-          'fetch',
-          'randomUUID',
-          'randomBytes',
-          'createHash',
-          'createHmac',
-          'TOKEN_SAVER_HOOK_TIMEOUT_MS',
-          src.slice(start, end) + '\nreturn postTokenSaverDistill;'
-        );
-        const bridgeCurrent = { env: {
-          REMOTE_CODE_AGENT_PROVIDER: 'claude',
-          RC_TOKEN_SAVER_ROOT_RUN_ID: '123e4567-e89b-12d3-a456-426614174000'
-        } };
-        const post = factory(
-          bridgeCurrent,
-          async () => ({ ok: true, json: async () => decoded }),
-          () => '123e4567-e89b-12d3-a456-426614174000',
-          () => Buffer.alloc(16, 0xaa),
-          createHash,
-          createHmac,
-          100
-        );
-        const state = {
-          baseURL: 'http://127.0.0.1',
-          authToken: 'tok',
-          receiptKey: Buffer.from(Array.from({ length: 32 }, (_, i) => i))
-        };
-        const largeInput = 'é'.repeat(120);
-
-        decoded = { output: 'COMPRESSED', routeStage: 'deterministic' };
-        const lossless = await post(state, { id: 'one', input: largeInput });
-        decoded = {
-          output: 'LOSSY',
-          originalHandle: 'rcv1.ABCDEFGHIJKLMNOPQRSTUV',
-          routeStage: 'model'
-        };
-        const lossy = await post(state, { id: 'two', input: largeInput });
-        decoded = { output: largeInput, routeStage: 'deterministic' };
-        const unchanged = await post(state, { id: 'three', input: largeInput });
-        decoded = { output: 'short', routeStage: 'verbatim' };
-        const verbatim = await post(state, { id: 'four', input: largeInput });
-        decoded = { output: 'x', routeStage: 'deterministic' };
-        const noNetShrink = await post(state, { id: 'five', input: 'tiny' });
-        decoded = { output: 'COMPRESSED', routeStage: 'deterministic' };
-        const noKey = await post(
-          { baseURL: state.baseURL, authToken: state.authToken },
-          { id: 'six', input: largeInput }
-        );
-        delete bridgeCurrent.env.RC_TOKEN_SAVER_ROOT_RUN_ID;
-        const noRoot = await post(state, { id: 'seven', input: largeInput });
-
-        console.log(JSON.stringify({
-          lossless: lossless?.output,
-          lossy: lossy?.output,
-          unchanged,
-          verbatim,
-          noNetShrink,
-          noKey: noKey ?? null,
-          noRoot: noRoot ?? null
-        }));
-        """#
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("rc-sdk-distill-receipt-\(UUID().uuidString).mjs")
-        try harness.write(to: tmp, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [tmp.path, bridge.path]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
-        let data = try XCTUnwrap(out.data(using: .utf8))
-        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-        let trustedReceipt = "[[rcd:v2.qqqqqqqqqqqqqqqqqqqqqg.TGBL0F4FLPCrX7LMh5OGUsnui3T65Z3_HuZrCa08rzw]]"
-        XCTAssertEqual(json["lossless"] as? String, "COMPRESSED\n\(trustedReceipt)",
-                       "Node must match the Swift canonical HMAC vector byte-for-byte")
-        XCTAssertTrue((json["lossy"] as? String)?.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]") == true)
-        XCTAssertNotNil((json["lossy"] as? String)?.range(
-            of: #"\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]$"#,
-            options: .regularExpression
-        ))
-        XCTAssertTrue(json["unchanged"] is NSNull)
-        XCTAssertTrue(json["verbatim"] is NSNull)
-        XCTAssertTrue(json["noNetShrink"] is NSNull)
-        XCTAssertTrue(json["noKey"] is NSNull,
-                      "missing receipt key must fail open before replacing provider output")
-        XCTAssertTrue(json["noRoot"] is NSNull,
-                      "missing root run ID must fail open before replacing provider output")
-    }
-
-    func test_agentSDKBridgePostToolUse_recordsOnlyExactAcceptedReplacement() throws {
-        let node = try XCTUnwrap(
-            ProcessLocator.resolve("node"),
-            "node is required for the bridge delivered-savings contract test"
-        )
-        let packageRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
-
-        // WHY: displayed savings use the sidecar compressed body on the first POST.
-        // Recovery confirmation is a second POST after the hook returns and must
-        // not write another savings row.
-        let harness = #"""
-        import { readFileSync } from 'fs';
-        import { createHash, createHmac, randomBytes, randomUUID } from 'crypto';
-        const src = readFileSync(process.argv[2], 'utf8');
-        const start = src.indexOf('function tokenSaverAppliedReceipt');
-        const end = src.indexOf('function tokenSaverHooks');
-        if (start < 0 || end < 0) throw new Error('bridge delivered-savings slice not found');
-
-        let scenario = 'accepted';
-        let stateMode = 0o100600;
-        let includeReceiptKey = true;
-        let requests = [];
-        let deferredHeaders = [];
-        const fakeFetch = async (_url, options) => {
-          const body = JSON.parse(options.body);
-          requests.push(body);
-          deferredHeaders.push(options.headers['X-RemoteCode-Delivery-Deferred'] || null);
-          if (body.recordSavings === false && body.precomputedOutput) {
-            return { ok: true, json: async () => ({
-              output: body.precomputedOutput,
-              routeStage: body.precomputedRouteStage
-            }) };
-          }
-          if (scenario === 'accepted') {
-            return { ok: true, json: async () => ({
-              output: 'BUILD FAILED: 3 errors',
-              originalHandle: 'rcv1.ABCDEFGHIJKLMNOPQRSTUV',
-              recoveryIdempotencyKey: 'recovery-key',
-              routeStage: 'llm_mlx'
-            }) };
-          }
-          return { ok: true, json: async () => ({
-            output: 'x'.repeat(Buffer.byteLength(body.input, 'utf8') - 1),
-            routeStage: 'deterministic'
-          }) };
-        };
-        const factory = new Function(
-          'current',
-          'fetch',
-          'randomUUID',
-          'randomBytes',
-          'createHash',
-          'createHmac',
-          'fs',
-          'TOKEN_SAVER_HOOK_TIMEOUT_MS',
-          'TOKEN_SAVER_MIN_BYTES',
-          'TOKEN_SAVER_MIN_LINES',
-          'TOKEN_SAVER_STORE_MIN_BYTES',
-          src.slice(start, end) + '\nreturn tokenSaverPostToolUse;'
-        );
-        const hook = factory(
-          { env: {
-            RC_TOKEN_SAVER_POST_TOOL_USE: '1',
-            REMOTE_CODE_AGENT_PROVIDER: 'claude',
-            RC_TOKEN_SAVER_ROOT_RUN_ID: '123e4567-e89b-12d3-a456-426614174000',
-            REMOTE_CODE_DISTILL_STATE_PATH: '/tmp/state.json'
-          } },
-          fakeFetch,
-          randomUUID,
-          randomBytes,
-          createHash,
-          createHmac,
-          {
-            statSync: () => ({ isFile: () => true, uid: process.getuid(), mode: stateMode }),
-            readFileSync: () => JSON.stringify({
-              base_url: 'http://127.0.0.1',
-              auth_token: 'tok',
-              ...(includeReceiptKey ? {
-                receipt_key: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8='
-              } : {})
-            })
-          },
-          100,
-          1024,
-          10,
-          2048
-        );
-        const raw = Array.from({ length: 80 }, (_, i) => `diagnostic line ${i}`).join('\n');
-        const envelope = () => ({
-          hook_event_name: 'PostToolUse',
-          tool_name: 'WebFetch',
-          tool_input: { url: 'https://example.invalid/noisy' },
-          tool_response: raw,
-        });
-
-        const accepted = await hook(envelope());
-        const acceptedRequestCountAtReturn = requests.length;
-        await new Promise((resolve) => setImmediate(resolve));
-        const acceptedRequests = requests.splice(0);
-        const acceptedDeferredHeaders = deferredHeaders.splice(0);
-        scenario = 'rejected';
-        const rejected = await hook(envelope());
-        await new Promise((resolve) => setImmediate(resolve));
-        const rejectedRequests = requests.splice(0);
-        const rejectedDeferredHeaders = deferredHeaders.splice(0);
-        scenario = 'accepted';
-        stateMode = 0o100644;
-        const worldReadable = await hook(envelope());
-        await new Promise((resolve) => setImmediate(resolve));
-        const worldReadableRequests = requests.splice(0);
-        stateMode = 0o100600;
-        includeReceiptKey = false;
-        const legacyState = await hook(envelope());
-        await new Promise((resolve) => setImmediate(resolve));
-        const legacyStateRequests = requests.splice(0);
-        console.log(JSON.stringify({
-          accepted,
-          acceptedRequestCountAtReturn,
-          acceptedRequests,
-          acceptedDeferredHeaders,
-          rejected,
-          rejectedRequests,
-          rejectedDeferredHeaders,
-          worldReadable,
-          worldReadableRequests,
-          legacyState,
-          legacyStateRequests
-        }));
-        """#
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("rc-sdk-delivered-savings-\(UUID().uuidString).mjs")
-        try harness.write(to: tmp, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: tmp) }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: node)
-        process.arguments = [tmp.path, bridge.path]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        XCTAssertEqual(process.terminationStatus, 0, "node harness failed: \(out)")
-        let data = try XCTUnwrap(out.data(using: .utf8))
-        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
-
-        let accepted = try XCTUnwrap(json["accepted"] as? [String: Any])
-        let acceptedHook = try XCTUnwrap(accepted["hookSpecificOutput"] as? [String: Any])
-        let updated = try XCTUnwrap(acceptedHook["updatedToolOutput"] as? String)
-        XCTAssertTrue(updated.contains("[[rc:rcv1.ABCDEFGHIJKLMNOPQRSTUV]]"))
-        XCTAssertNotNil(updated.range(
-            of: #"\[\[rcd:v2\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\]\]$"#,
-            options: .regularExpression
-        ))
-        XCTAssertEqual(json["acceptedRequestCountAtReturn"] as? Int, 1,
-                       "recovery confirm must not start until after the native hook result returns")
-        let acceptedRequests = try XCTUnwrap(json["acceptedRequests"] as? [[String: Any]])
-        XCTAssertEqual(acceptedRequests.count, 2)
-        XCTAssertEqual(acceptedRequests[0]["recordSavings"] as? Bool, true)
-        XCTAssertNil(acceptedRequests[0]["precomputedOutput"])
-        XCTAssertEqual(acceptedRequests[1]["recordSavings"] as? Bool, false)
-        XCTAssertEqual(acceptedRequests[1]["precomputedOutput"] as? String, updated)
-        XCTAssertEqual(acceptedRequests[1]["precomputedRouteStage"] as? String, "llm_mlx")
-        let confirmations = try XCTUnwrap(
-            acceptedRequests[1]["precomputedRecoveryConfirmations"] as? [[String: Any]]
-        )
-        XCTAssertEqual(confirmations.count, 1)
-        XCTAssertEqual(confirmations[0]["capability"] as? String, "rcv1.ABCDEFGHIJKLMNOPQRSTUV")
-        XCTAssertEqual(confirmations[0]["idempotencyKey"] as? String, "recovery-key")
-        let acceptedDeferredHeaders = try XCTUnwrap(json["acceptedDeferredHeaders"] as? [Any])
-        XCTAssertEqual(acceptedDeferredHeaders.first as? String, "1")
-        XCTAssertTrue(acceptedDeferredHeaders.last is NSNull)
-
-        XCTAssertEqual((json["rejected"] as? [String: Any])?.count, 0)
-        let rejectedRequests = try XCTUnwrap(json["rejectedRequests"] as? [[String: Any]])
-        XCTAssertEqual(rejectedRequests.count, 1)
-        XCTAssertEqual(rejectedRequests[0]["recordSavings"] as? Bool, true)
-        XCTAssertNil(rejectedRequests[0]["precomputedOutput"])
-        XCTAssertEqual(json["rejectedDeferredHeaders"] as? [String], ["1"])
-        XCTAssertEqual((json["worldReadable"] as? [String: Any])?.count, 0,
-                       "a group/world-readable key file must fail open")
-        XCTAssertEqual((json["worldReadableRequests"] as? [[String: Any]])?.count, 0,
-                       "an insecure state file must be rejected before sidecar I/O")
-        XCTAssertEqual((json["legacyState"] as? [String: Any])?.count, 0,
-                       "a secure pre-v2 state must decode but cannot authorize replacement")
-        let legacyRequests = try XCTUnwrap(json["legacyStateRequests"] as? [[String: Any]])
-        XCTAssertEqual(legacyRequests.count, 1)
-        XCTAssertEqual(legacyRequests.first?["recordSavings"] as? Bool, true)
+                      "rc_configure must relay the host `system_prompt` into session state (undefined keeps the SDK default empty prompt)")
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {

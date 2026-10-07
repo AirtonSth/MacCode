@@ -329,7 +329,6 @@ final class WebSocketDeltaMergeBenchmarkTests: XCTestCase {
                     "body_append": token,
                     "summary": index % 17 == 0 ? "working-\(index)" : NSNull(),
                     "progress": Double(index) / Double(workload.frameCount),
-                    "distill_applied": index == 0,
                 ] as [String: Any],
             ] as [String: Any])
         }

@@ -779,8 +779,7 @@ public final class DistillACPClient: @unchecked Sendable {
             ?? AgentSkillInstaller.resolveServiceBinary()?.path
             ?? ComputerUseMCPAdmit.fallbackCommand
         // Both providers use ACP's stdio MCP server format and preserve the
-        // current host-authoritative bot grants. Token Saver's librarian MCP
-        // keeps its separate admission gate.
+        // current host-authoritative bot grants.
         let withSelfConfig = BotSelfConfigMCPAdmit.admitGrokACP(
             existing: existing,
             command: resolved,
@@ -803,20 +802,13 @@ public final class DistillACPClient: @unchecked Sendable {
                 environment: environment
             )
             : withBrowser
-        let withDistill = DistillMCPAdmit.isEnabled(environment: environment)
-            ? DistillMCPAdmit.admitGrokACP(
+        let withComputer = isBotRun
+            ? BotComputerMCPAdmit.admitGrokACP(
                 existing: withWeb,
                 command: resolved,
                 environment: environment
             )
             : withWeb
-        let withComputer = isBotRun
-            ? BotComputerMCPAdmit.admitGrokACP(
-                existing: withDistill,
-                command: resolved,
-                environment: environment
-            )
-            : withDistill
         guard environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" else {
             return withComputer
         }

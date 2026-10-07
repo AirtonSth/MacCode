@@ -30,7 +30,7 @@ final class ProviderCorpusFixtureTests: XCTestCase {
         XCTAssertEqual(state.tokenUsage?.outputTokens, 27)
         XCTAssertEqual(state.tokenUsage?.uncachedInputTokens, 516)
         XCTAssertEqual(state.tokenUsage?.cacheCreationInputTokens, 30_842,
-                       "real modelUsage cache buckets must feed Token Saver instead of being flattened or dropped")
+                       "real modelUsage cache buckets must feed usage instead of being flattened or dropped")
         XCTAssertTrue(allEvents.contains {
             if case .itemStarted(let item) = $0 {
                 return item.type == .tool && item.summary == "Claude rate limit"

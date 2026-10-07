@@ -80,7 +80,7 @@ final class AgentAccountUsageGetTests: XCTestCase {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let weeklyReset = now.addingTimeInterval(3 * 86_400)
         let sessionReset = now.addingTimeInterval(2 * 3_600)
-        _ = try TokenSaverUsageStore(appSupportDirectory: root, now: { now }).recordAccountUsage(
+        _ = try ProviderUsageStore(appSupportDirectory: root, now: { now }).recordAccountUsage(
             provider: .claude,
             weeklyUsedPercent: 42,
             weeklyWindowDurationMinutes: 10_080,
@@ -109,7 +109,7 @@ final class AgentAccountUsageGetTests: XCTestCase {
     /// (null), exactly like the Mac sidebar, instead of showing pre-reset usage.
     func test_expiredWindowsDoNotPaintPreResetUsage() throws {
         let recordedAt = Date(timeIntervalSince1970: 1_800_000_000)
-        _ = try TokenSaverUsageStore(appSupportDirectory: root, now: { recordedAt }).recordAccountUsage(
+        _ = try ProviderUsageStore(appSupportDirectory: root, now: { recordedAt }).recordAccountUsage(
             provider: .codex,
             weeklyUsedPercent: 88,
             weeklyResetsAt: recordedAt.addingTimeInterval(3_600),

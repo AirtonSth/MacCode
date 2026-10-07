@@ -113,7 +113,6 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertTrue(request.prompt.contains(Self.soulMarker), "prompt carries the compiled bot instructions")
         XCTAssertTrue(request.prompt.contains("hello bot"))
         XCTAssertEqual(request.userMessageContent, "hello bot", "transcript keeps the raw user text")
-        XCTAssertTrue(request.tokenSaverCompressesPrompt)
 
         let stored = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
         XCTAssertEqual(stored.actor, .bot(f.bot.id))
@@ -234,7 +233,6 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertEqual(r.environment["ACTOR_TEST_ENV"], "kept")
         XCTAssertNil(r.environment["RC_REMOTE_CODE_BOT_ID"], "no bot identity leaks into a plain thread")
         XCTAssertTrue(r.extraArgs.isEmpty)
-        XCTAssertFalse(r.tokenSaverCompressesPrompt)
         XCTAssertEqual(r.runAsUser, AgentRunAsUser.current())
         let stored = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
         XCTAssertEqual(stored.actor, .none)

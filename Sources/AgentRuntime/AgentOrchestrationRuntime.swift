@@ -2959,34 +2959,16 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         Auto is on. Run $\(skill) controller-only, token-efficient:
         - FIRST: Micro chat bypass — if the request is only conversational (who are you, hi, which model/LLM, trivial status) and does not ask for code/files/commands/PR/deploy/repo change → answer on the controller in one short reply; no workers, no DAG, no validator, no matrix load.
         - Otherwise classify T0–T3 + certainty (absolute|high|medium|low); pick Micro/Single/Multi/Critical.
-        - Progressive disclosure: load only the skill sections needed for that mode; requested/returned skill content must stay complete (never Distill skill bodies).
+        - Progressive disclosure: load only the skill sections needed for that mode; requested/returned skill content must stay complete.
         - Controller stays LIGHT; escalate workers only after capability failure.
         - Fan-out default 2 / hard cap 3; skip REVIEWER on micro absolute/high certainty when rules allow.
         - Thin prompts (slice-only); cheap proof (scope diff + one focused command); lean table report.
-        - Distill applies only to eligible ordinary tool/command output when Token Saver is active; never Distill skill content; do not require every worker prompt to restate Distill rules.
 
         \(hostBlock)
 
         User request:
         \(userPrompt)
         """
-    }
-
-    /// Preserves the Auto controller contract inside a typed RCW1 request.
-    /// The semantic encoder only sees the human-authored prompt; Swift appends
-    /// this exact host-owned constraint after provider admission.
-    public static func autoOrchestrateProviderWirePrompt(
-        wirePrompt: String,
-        admittedRoute route: AgentOrchestrationRoute
-    ) throws -> String {
-        let host = orchestrateHostKey(for: route.provider)
-        let control = """
-        Run $\(orchestrateSkillInvocationName) controller-only. Auto is on. Follow the complete installed orchestration skill. Host runtime receipt is authoritative: active_host=\(host); provider=\(route.provider.rawValue); provider_instance_id=\(route.providerInstanceId); controller_model=\(route.selection.effectiveModel); controller_effort=\(route.selection.reasoningEffort.rawValue). Bind workers and reviewers only from the host-runtime-matrix row for active_host=\(host). Treat the G, C, K, and X records in this frame as the user request. Distill applies only to eligible ordinary tool output when Token Saver is active, never to skill content.
-        """
-        return try RCWireProtocol.addingRequestRecords(
-            [RCWireRecord(kind: .constraint, value: control)],
-            to: wirePrompt
-        )
     }
 
     public static func promptAlreadyInvokesOrchestrateSkill(_ prompt: String) -> Bool {

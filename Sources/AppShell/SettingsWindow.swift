@@ -3,7 +3,6 @@ import AppKit
 import SwiftUI
 import CoreImage
 import CoreModel
-import DistillCore
 import Persistence
 import AgentRuntime
 import AppLifecycleSupport
@@ -55,20 +54,7 @@ public struct AppSettingsKeys {
         "insomniaAllowDisplaySleep",
         "insomniaAllowSystemSleepWhenDisplayClosed",
         "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
-        "tokenSaverEnabled",
-        "tokenSaverModelSource",
-        "tokenSaverAPIBaseURL",
-        "tokenSaverAPIModel",
-        "tokenSaverAPIToken",
-        "tokenSaverSaveTrainingPrompts",
         "terminalFontSize",
-        "sessionLearnEnabled",
-        "historyCompactionEnabled",
-        "graphifyEnabled",
-        "graphifyBinaryPath",
-        "graphifyAutoEnsure",
-        "graphifyPinnedRoots",
-        "graphifyWriteInRepo",
         "petEnabled",
         "petAnimationsEnabled",
         "petReadyCounterEnabled",
@@ -82,39 +68,6 @@ public struct AppSettingsKeys {
         "botsAutonomyEnabled",
         "botsChannelsEnabled",
     ]
-}
-
-public enum TokenSaverSettingsCopy {
-    public static func overview(source: TokenSaverModelSource) -> String {
-        source == .openaiCompat
-            ? "Compresses large tool output using your OpenAI-compatible API so fewer tokens reach the remote provider."
-            : "Compresses large tool output using the local MLX model so fewer tokens reach the remote provider."
-    }
-
-    public static func sourceDescription(source: TokenSaverModelSource) -> String {
-        source == .openaiCompat
-            ? "Catalog generate and Distill both use the configured API endpoint and model."
-            : "Default: 1.7B on 16 GiB or less, E4B when RAM is greater than 16 GiB. Catalog generate and Distill both use this choice."
-    }
-
-    public static func trainingDescription(source: TokenSaverModelSource) -> String {
-        source == .openaiCompat
-            ? "When on, every API-backed Distill generate (CLI, HTTP, MCP, catalog) writes ChatML JSONL under TokenSaver/training."
-            : "When on, every local Distill generate (CLI, HTTP, MCP, catalog) writes ChatML JSONL under TokenSaver/training."
-    }
-
-    public static let apiProbeHint = "Sends a short request to the configured OpenAI-compatible API."
-
-    public static func apiProbeProgress(baseURL: String) -> String {
-        guard let host = TokenSaverGenerateTarget.parseAPIBaseURL(baseURL)?.host?
-            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            .lowercased() else {
-            return "Waiting for the API…"
-        }
-        return host == "localhost" || host == "127.0.0.1" || host == "::1"
-            ? "Waiting for the local API…"
-            : "Waiting for the API…"
-    }
 }
 
 // MARK: - Devices panel pure formatters
@@ -306,31 +259,6 @@ public enum RemoteAccessStatus: Equatable {
     }
 }
 
-/// Surfaced status of the managed `distill` skill install (mirrors AppContext's
-/// last reconcile) so a failure is visible in Settings instead of NSLog-only.
-public enum DistillInstallStatus: Equatable {
-    case inactive
-    case installed
-    case failed(String)
-
-    /// A reconcile error wins (so a failure is never hidden as "off"); otherwise
-    /// `installed` only while Token Saver is enabled and the Distill package is present.
-    /// Token economy is paid — Distill integration tracks the Token Saver toggle.
-    public static func from(error: String?, enabled: Bool, installedCount: Int) -> DistillInstallStatus {
-        if let error { return .failed(error) }
-        if enabled, installedCount > 0 { return .installed }
-        return .inactive
-    }
-}
-
-/// Settings-only status for the OpenAI-compatible Distill API test button.
-public enum TokenSaverAPIProbeStatus: Equatable {
-    case idle
-    case testing
-    case ok(String)
-    case failed(String)
-}
-
 @MainActor
 public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
@@ -364,16 +292,6 @@ public final class SettingsViewModel: ObservableObject {
     /// to the current toggle attempt and gates toggle-revert. This list is
     /// always-visible, additive, and idempotent (read-only from AppDelegate).
     @Published public var serverStartupFailures: [(server: String, reason: String)] = []
-    /// Managed-distill skill install status, surfaced so an install failure is
-    /// visible instead of NSLog-only (mirrors serverStartupFailures). Refreshed from
-    /// AppContext on every reload (Settings open / notifications) and after a retry.
-    @Published public var distillInstallStatus: DistillInstallStatus = .inactive
-    @Published public var tokenSaverAPIProbeStatus: TokenSaverAPIProbeStatus = .idle
-    /// Injected so Settings tests can prove success/failure without a live server.
-    public var tokenSaverAPIProbe: @Sendable (String, String, String) async -> TokenSaverOpenAICompatibleProbe.Outcome = {
-        baseURL, model, token in
-        await TokenSaverOpenAICompatibleProbe.run(baseURL: baseURL, model: model, token: token)
-    }
     @Published public var appSettings: AppSettings = AppSettings()
     /// True while this VM is mid-post for rc2RemoteAccessSettingChanged so the
     /// observer can skip the redundant self-triggered reload (L91 perf fix).
@@ -697,7 +615,6 @@ public final class SettingsViewModel: ObservableObject {
             serverStartupFailures = delegate.serverStartupFailures
         }
         appSettings = settingsStore.reload()
-        refreshDistillInstallStatus()
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
         grokPath = cliPath(key: "cli.grok.path", fallback: "grok")
@@ -824,183 +741,10 @@ public final class SettingsViewModel: ObservableObject {
         settingsStore.update { $0.insomniaAllowScreenSaverAfter45MinutesOfInactivity = on }
     }
 
-    public func setTokenSaverEnabled(_ on: Bool) {
-        let outcome = context.applyTokenSaverLifecycle(
-            requestedEnabled: on,
-            persistPreference: true
-        )
-        appSettings = settingsStore.reload()
-        appSettings.tokenSaverEnabled = outcome.isEnabled
-        context.tokenSaverConfigurationDidChange()
-        refreshDistillInstallStatus()
-    }
-
-    public func setTokenSaverModelSource(_ source: TokenSaverModelSource) {
-        appSettings.tokenSaverModelSource = source
-        settingsStore.update { $0.tokenSaverModelSource = source }
-        resetTokenSaverAPIProbe()
-        context.tokenSaverConfigurationDidChange()
-        context.restartTokenSaverDistillIfRunning()
-    }
-
-    public func setTokenSaverAPIBaseURL(_ value: String) {
-        appSettings.tokenSaverAPIBaseURL = value
-        settingsStore.update { $0.tokenSaverAPIBaseURL = value }
-        resetTokenSaverAPIProbe()
-        context.tokenSaverConfigurationDidChange()
-        scheduleTokenSaverDistillRestart()
-    }
-
-    public func setTokenSaverAPIModel(_ value: String) {
-        appSettings.tokenSaverAPIModel = value
-        settingsStore.update { $0.tokenSaverAPIModel = value }
-        resetTokenSaverAPIProbe()
-        context.tokenSaverConfigurationDidChange()
-        scheduleTokenSaverDistillRestart()
-    }
-
-    public func setTokenSaverAPIToken(_ value: String) {
-        appSettings.tokenSaverAPIToken = value
-        settingsStore.update { $0.tokenSaverAPIToken = value }
-        resetTokenSaverAPIProbe()
-        context.tokenSaverConfigurationDidChange()
-        scheduleTokenSaverDistillRestart()
-    }
-
-    public var canTestTokenSaverAPI: Bool {
-        appSettings.tokenSaverModelSource == .openaiCompat
-            && tokenSaverAPIProbeStatus != .testing
-            && TokenSaverGenerateTarget.parseAPIBaseURL(appSettings.tokenSaverAPIBaseURL) != nil
-            && !appSettings.tokenSaverAPIModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    public func testTokenSaverAPI() {
-        guard appSettings.tokenSaverModelSource == .openaiCompat else { return }
-        guard tokenSaverAPIProbeStatus != .testing else { return }
-        guard TokenSaverGenerateTarget.parseAPIBaseURL(appSettings.tokenSaverAPIBaseURL) != nil else {
-            tokenSaverAPIProbeStatus = .failed("Enter a URL like http://127.0.0.1:8000/v1")
-            return
-        }
-        guard !appSettings.tokenSaverAPIModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            tokenSaverAPIProbeStatus = .failed(
-                "Enter the API model id used by your OpenAI-compatible server"
-            )
-            return
-        }
-        tokenSaverAPIProbeStatus = .testing
-        let base = appSettings.tokenSaverAPIBaseURL
-        let model = appSettings.tokenSaverAPIModel
-        let token = appSettings.tokenSaverAPIToken
-        let probe = tokenSaverAPIProbe
-        tokenSaverAPIProbeTask?.cancel()
-        tokenSaverAPIProbeTask = Task { @MainActor in
-            let outcome = await probe(base, model, token)
-            guard !Task.isCancelled else { return }
-            switch outcome {
-            case .ok:
-                tokenSaverAPIProbeStatus = .ok(outcome.message)
-            case .failed(let reason):
-                tokenSaverAPIProbeStatus = .failed(reason)
-            }
-        }
-    }
-
-    public func setTokenSaverSaveTrainingPrompts(_ on: Bool) {
-        appSettings.tokenSaverSaveTrainingPrompts = on
-        settingsStore.update { $0.tokenSaverSaveTrainingPrompts = on }
-        context.restartTokenSaverDistillIfRunning()
-    }
-
-    public func revealTokenSaverTrainingFolder() {
-        let root = TokenSaverTrainingDatasetWriter.defaultRoot(appSupportDirectory: context.appSupportDirectory)
-        NSWorkspace.shared.activateFileViewerSelecting([root])
-    }
-
-    private var tokenSaverRestartTask: Task<Void, Never>?
-    private var tokenSaverAPIProbeTask: Task<Void, Never>?
-
-    private func resetTokenSaverAPIProbe() {
-        tokenSaverAPIProbeTask?.cancel()
-        tokenSaverAPIProbeTask = nil
-        if tokenSaverAPIProbeStatus != .idle {
-            tokenSaverAPIProbeStatus = .idle
-        }
-    }
-
-    private func scheduleTokenSaverDistillRestart() {
-        tokenSaverRestartTask?.cancel()
-        tokenSaverRestartTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 400_000_000)
-            guard !Task.isCancelled else { return }
-            context.restartTokenSaverDistillIfRunning()
-        }
-    }
-
-    /// Mirrors AppContext's last managed-distill reconcile into a published status
-    /// so the Settings UI can show installed / failed / inactive distinctly.
-    public func refreshDistillInstallStatus() {
-        distillInstallStatus = DistillInstallStatus.from(
-            error: context.managedDistillSkillInstallError,
-            enabled: appSettings.tokenSaverEnabled,
-            installedCount: context.managedDistillSkillInstallResults.count
-        )
-    }
-
-    /// Re-run the managed-distill install (idempotent) and refresh the surfaced
-    /// status — the recovery action shown next to an install failure.
-    public func retryDistillInstall() {
-        _ = context.applyTokenSaverLifecycle(
-            requestedEnabled: appSettings.tokenSaverEnabled,
-            persistPreference: true
-        )
-        appSettings = settingsStore.reload()
-        refreshDistillInstallStatus()
-    }
-
     public func setTerminalFontSize(_ size: Double) {
         let normalized = TerminalFontSizeSetting.normalized(size)
         appSettings.terminalFontSize = normalized
         settingsStore.update { $0.terminalFontSize = normalized }
-    }
-
-    public func setSessionLearnEnabled(_ on: Bool) {
-        appSettings.sessionLearnEnabled = on
-        settingsStore.update { $0.sessionLearnEnabled = on }
-    }
-
-    public func setHistoryCompactionEnabled(_ on: Bool) {
-        appSettings.historyCompactionEnabled = on
-        settingsStore.update { $0.historyCompactionEnabled = on }
-    }
-
-    public func setGraphifyEnabled(_ on: Bool) {
-        appSettings.graphifyEnabled = on
-        settingsStore.update { $0.graphifyEnabled = on }
-        context.reconcileGraphifyHost(settings: appSettings)
-    }
-
-    public func setGraphifyBinaryPath(_ path: String) {
-        appSettings.graphifyBinaryPath = path
-        settingsStore.update { $0.graphifyBinaryPath = path }
-        context.reconcileGraphifyHost(settings: appSettings)
-    }
-
-    public func setGraphifyAutoEnsure(_ on: Bool) {
-        appSettings.graphifyAutoEnsure = on
-        settingsStore.update { $0.graphifyAutoEnsure = on }
-        context.reconcileGraphifyHost(settings: appSettings)
-    }
-
-    public func setGraphifyPinnedRoots(_ roots: [String]) {
-        appSettings.graphifyPinnedRoots = roots
-        settingsStore.update { $0.graphifyPinnedRoots = roots }
-        context.reconcileGraphifyHost(settings: appSettings)
-    }
-
-    public func setGraphifyWriteInRepo(_ on: Bool) {
-        appSettings.graphifyWriteInRepo = on
-        settingsStore.update { $0.graphifyWriteInRepo = on }
-        context.reconcileGraphifyHost(settings: appSettings)
     }
 
     public func setPetEnabled(_ on: Bool) {
@@ -1678,7 +1422,6 @@ public struct SettingsView: View {
                     insomniaSection
                     botsSection
                     keybindingsSection
-                    advancedSection
                     storageSection
                     customModelsSection
                     trustedDevicesSection
@@ -2035,112 +1778,6 @@ public struct SettingsView: View {
         .dsPanel(padding: DS.Space.lg)
     }
 
-    private var tokenSaverSection: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeaderG("Token Saver")
-            settingRow("Enable Token Saver (requires subscription)") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.tokenSaverEnabled },
-                    set: { vm.setTokenSaverEnabled($0) }
-                ))
-                .labelsHidden()
-                .accessibilityIdentifier("settings.tokenSaver.enabled.toggle")
-            }
-            Text(TokenSaverSettingsCopy.overview(source: vm.appSettings.tokenSaverModelSource))
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-            settingRow("Distill model") {
-                Picker("", selection: Binding(
-                    get: { vm.appSettings.tokenSaverModelSource },
-                    set: { vm.setTokenSaverModelSource($0) }
-                )) {
-                    Text("Automatic (RAM)").tag(TokenSaverModelSource.automatic)
-                    Text("Distill 1.7B").tag(TokenSaverModelSource.distill17b)
-                    Text("Distill E4B").tag(TokenSaverModelSource.distillE4B)
-                    Text("OpenAI-compatible API").tag(TokenSaverModelSource.openaiCompat)
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(maxWidth: 260)
-                .accessibilityIdentifier("settings.tokenSaver.modelSource.picker")
-            }
-            Text(TokenSaverSettingsCopy.sourceDescription(source: vm.appSettings.tokenSaverModelSource))
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-            if vm.appSettings.tokenSaverModelSource == .openaiCompat {
-                settingRow("API base URL") {
-                    TextField("http://127.0.0.1:8000/v1", text: Binding(
-                        get: { vm.appSettings.tokenSaverAPIBaseURL },
-                        set: { vm.setTokenSaverAPIBaseURL($0) }
-                    ))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 320)
-                    .accessibilityIdentifier("settings.tokenSaver.apiBaseURL.field")
-                }
-                settingRow("API model") {
-                    TextField("model id", text: Binding(
-                        get: { vm.appSettings.tokenSaverAPIModel },
-                        set: { vm.setTokenSaverAPIModel($0) }
-                    ))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 320)
-                    .accessibilityIdentifier("settings.tokenSaver.apiModel.field")
-                }
-                settingRow("API token") {
-                    SecureField("optional", text: Binding(
-                        get: { vm.appSettings.tokenSaverAPIToken },
-                        set: { vm.setTokenSaverAPIToken($0) }
-                    ))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 320)
-                    .accessibilityIdentifier("settings.tokenSaver.apiToken.field")
-                }
-                settingRow("Connection") {
-                    Button {
-                        vm.testTokenSaverAPI()
-                    } label: {
-                        HStack(spacing: DS.Space.sm) {
-                            if case .testing = vm.tokenSaverAPIProbeStatus {
-                                ProgressView()
-                                    .controlSize(.small)
-                                Text("Testing…")
-                            } else {
-                                Text("Test API")
-                            }
-                        }
-                        .frame(minWidth: 108, minHeight: 22)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .disabled(!vm.canTestTokenSaverAPI)
-                    .accessibilityLabel(vm.tokenSaverAPIProbeStatus == .testing ? "Testing API" : "Test API")
-                    .accessibilityHint(TokenSaverSettingsCopy.apiProbeHint)
-                    .accessibilityIdentifier("settings.tokenSaver.testAPI.button")
-                }
-                tokenSaverAPIProbeStatusRow
-            }
-            settingRow("Save training datasets") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.tokenSaverSaveTrainingPrompts },
-                    set: { vm.setTokenSaverSaveTrainingPrompts($0) }
-                ))
-                .labelsHidden()
-                .disabled(!vm.appSettings.tokenSaverEnabled)
-                .accessibilityIdentifier("settings.tokenSaver.saveTrainingPrompts.toggle")
-            }
-            Text(TokenSaverSettingsCopy.trainingDescription(source: vm.appSettings.tokenSaverModelSource))
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-            Button("Show training folder") {
-                vm.revealTokenSaverTrainingFolder()
-            }
-            .disabled(!vm.appSettings.tokenSaverEnabled)
-            .accessibilityIdentifier("settings.tokenSaver.showTrainingFolder.button")
-            distillInstallStatusRow
-        }
-        .dsPanel(padding: DS.Space.lg)
-    }
-
     private var botsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             DSSectionHeaderG("Bots")
@@ -2208,154 +1845,11 @@ public struct SettingsView: View {
         .accessibilityIdentifier("settings.section.bots")
     }
 
-    @ViewBuilder
-    private var tokenSaverAPIProbeStatusRow: some View {
-        switch vm.tokenSaverAPIProbeStatus {
-        case .idle:
-            Text("Sends a one-token chat request. Nothing is saved to training.")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityIdentifier("settings.tokenSaver.testAPI.idle")
-        case .testing:
-            Text(TokenSaverSettingsCopy.apiProbeProgress(baseURL: vm.appSettings.tokenSaverAPIBaseURL))
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityIdentifier("settings.tokenSaver.testAPI.testing")
-        case .ok(let message):
-            HStack(alignment: .top, spacing: DS.Space.sm) {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundColor(DS.Palette.success)
-                    .accessibilityHidden(true)
-                Text(message)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("API test succeeded. \(message)")
-            .accessibilityIdentifier("settings.tokenSaver.testAPI.ok")
-        case .failed(let message):
-            HStack(alignment: .top, spacing: DS.Space.sm) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(DS.Palette.danger)
-                    .accessibilityHidden(true)
-                Text(message)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.danger)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("API test failed. \(message)")
-            .accessibilityIdentifier("settings.tokenSaver.testAPI.failed")
-        }
-    }
-
-    @ViewBuilder
-    private var distillInstallStatusRow: some View {
-        switch vm.distillInstallStatus {
-        case .inactive:
-            EmptyView()
-        case .installed:
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: "checkmark.seal.fill")
-                    .foregroundColor(DS.Palette.success)
-                Text("Distill skill installed for Claude + Codex")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-            }
-            .accessibilityIdentifier("settings.tokenSaver.distillInstall.ok")
-        case .failed(let reason):
-            HStack(alignment: .top, spacing: DS.Space.sm) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(DS.Palette.danger)
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    Text("Distill skill install failed: \(reason)")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.danger)
-                        .textSelection(.enabled)
-                    Button("Retry install") { vm.retryDistillInstall() }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                }
-            }
-            .accessibilityIdentifier("settings.tokenSaver.distillInstall.failed")
-        }
-    }
-
     // todo/macos-app.md :142 - Keybindings editor pane (list parsed bindings +
     // warnings, conflict detection vs the static menu map, record-a-shortcut,
     // live-reload watcher). Heavy view code lives in KeybindingsSettingsPane.swift.
     private var keybindingsSection: some View {
         KeybindingsSettingsPane()
-    }
-
-    private var advancedSection: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeaderG("Advanced")
-            settingRow("Session Learn (writes to CLAUDE.md / AGENTS.md)") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.sessionLearnEnabled },
-                    set: { vm.setSessionLearnEnabled($0) }
-                ))
-                .labelsHidden()
-                .accessibilityIdentifier("settings.advanced.sessionLearn.toggle")
-            }
-            settingRow("History compaction (lossy-recoverable storage)") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.historyCompactionEnabled },
-                    set: { vm.setHistoryCompactionEnabled($0) }
-                ))
-                .labelsHidden()
-                .accessibilityIdentifier("settings.advanced.historyCompaction.toggle")
-            }
-            settingRow("Graphify (requires Token Saver)") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.graphifyEnabled },
-                    set: { vm.setGraphifyEnabled($0) }
-                ))
-                .labelsHidden()
-                .disabled(!vm.appSettings.tokenSaverEnabled)
-                .accessibilityIdentifier("settings.advanced.graphify.enabled.toggle")
-            }
-            settingRow("Graphify auto-ensure on agent resolve") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.graphifyAutoEnsure },
-                    set: { vm.setGraphifyAutoEnsure($0) }
-                ))
-                .labelsHidden()
-                .disabled(!vm.appSettings.isGraphifyRuntimeActive)
-                .accessibilityIdentifier("settings.advanced.graphify.autoEnsure.toggle")
-            }
-            settingRow("Write graphify-out/ inside the project (opt-in)") {
-                Toggle("", isOn: Binding(
-                    get: { vm.appSettings.graphifyWriteInRepo },
-                    set: { vm.setGraphifyWriteInRepo($0) }
-                ))
-                .labelsHidden()
-                .disabled(!vm.appSettings.isGraphifyRuntimeActive)
-                .accessibilityIdentifier("settings.advanced.graphify.writeInRepo.toggle")
-            }
-            VStack(alignment: .leading, spacing: DS.Space.xs) {
-                Text("Graphify binary path (optional absolute path)")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-                TextField("/Users/…/.local/bin/graphify", text: Binding(
-                    get: { vm.appSettings.graphifyBinaryPath },
-                    set: { vm.setGraphifyBinaryPath($0) }
-                ))
-                .textFieldStyle(.roundedBorder)
-                .disabled(!vm.appSettings.isGraphifyRuntimeActive)
-                .accessibilityIdentifier("settings.advanced.graphify.binaryPath.field")
-            }
-            Text("Session Learn mines correction rules from failed runs into managed instructions. History Compaction stores large tool output in a structure-preserving compressed form. Graphify is a Token Saver capability: it only preflights, ensures, and injects query-first prompts while Token Saver is on (and the Graphify preference is on). Graphs store under Application Support by default. Enable “Write graphify-out/ inside the project” only if you want the team-committed graphify-out layout.")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-        }
-        .dsPanel(padding: DS.Space.lg)
     }
 
     private var storageSection: some View {

@@ -507,7 +507,6 @@ final class ManualActionRemoteTests: XCTestCase {
         XCTAssertEqual(mac.cwd, phone.cwd)
         XCTAssertTrue(mac.prompt.contains(Self.soulMarker))
         XCTAssertTrue(mac.prompt.contains(BotStandingInstructions.vmThreadRules))
-        XCTAssertEqual(mac.tokenSaverCompressesPrompt, phone.tokenSaverCompressesPrompt)
         f.runner.finish(runID: mac.runId, status: .completed, reply: "ok")
         _ = await waitUntil { BotVMRunRegistry.shared.active(botID: f.bot.id) == nil }
     }

@@ -28,9 +28,9 @@ final class DSSectionHeaderGenericTests: XCTestCase {
         XCTAssertEqual(DSSectionHeaderG<EmptyView>.displayTitle(for: ""), "")
     }
 
-    // Mixed-case input (real-world: "Token Saver") must be fully uppercased.
+    // Mixed-case input (real-world: "Account Usage") must be fully uppercased.
     func testDisplayTitleMixedCase() {
-        XCTAssertEqual(DSSectionHeaderG<EmptyView>.displayTitle(for: "Token Saver"), "TOKEN SAVER")
+        XCTAssertEqual(DSSectionHeaderG<EmptyView>.displayTitle(for: "Account Usage"), "ACCOUNT USAGE")
     }
 
     // MARK: - Generic type parameter (compile-level: no AnyView in concrete type)
