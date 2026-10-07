@@ -225,6 +225,18 @@ final class HostConnectionThreadReadBotSplitTests: XCTestCase {
         XCTAssertTrue(vm.queuedFollowUpsForTesting(botID: bot.id).isEmpty, "reads must not reload the desk's queue")
     }
 
+    /// `bot.conversation.list` resolves each row's desk routing through a
+    /// callback that reads MainActor-owned `BotsViewModel` state, so it must
+    /// never run in the detached off-main read path.
+    func test_pairedConversationList_runsOnMainActor_becauseDeskRoutingReadsViewModelState() {
+        XCTAssertTrue(AppCommandRouter.pairedBotMainActorReadMethods.contains("bot.conversation.list"))
+        XCTAssertFalse(AppCommandRouter.pairedBotOffMainReadMethods.contains("bot.conversation.list"))
+        XCTAssertTrue(
+            AppCommandRouter.pairedBotOffMainReadMethods.isDisjoint(with: AppCommandRouter.pairedBotMainActorReadMethods),
+            "a read is either off-main or MainActor-bound, never both"
+        )
+    }
+
     /// A write reloads only its own bot's queue, not the fleet.
     func test_pairedBotWrite_reloadsOnlyTheAffectedBot() async throws {
         let context = try makeContext()

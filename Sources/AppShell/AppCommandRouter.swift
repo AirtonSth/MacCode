@@ -3575,13 +3575,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// and SQLite (no MainActor callback, no queue write). They run off
     /// MainActor and never reload the desk's queued follow-ups.
     /// `bot.attention.list` stays on MainActor: its delegated-attention
-    /// snapshot callback reads router state.
+    /// snapshot callback reads router state. `bot.conversation.list` stays on
+    /// MainActor too: each row's `desk_routing` comes from the
+    /// `onConversationRouting` callback, which reads `BotsViewModel` state.
     nonisolated static let pairedBotOffMainReadMethods: Set<String> = [
         "bot.list",
         "bot.get",
         "bot.settings.get",
         "bot.queue.list",
-        "bot.conversation.list",
         "bot.attachment.list",
         "bot.routine.list",
         "bot.files.list",
@@ -3591,6 +3592,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ]
     nonisolated static let pairedBotMainActorReadMethods: Set<String> = [
         "bot.attention.list",
+        "bot.conversation.list",
         "bot.reserved.probe",
     ]
 
