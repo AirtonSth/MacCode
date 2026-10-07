@@ -283,12 +283,19 @@ final class AgentRunCoordinatorPassiveRecoveryFirewallTests: XCTestCase {
             providerAdapters: [.claude: adapter]
         )
 
-        let events = try await coordinator.readThread(threadId: thread.id)
+        _ = try await coordinator.readThread(threadId: thread.id)
+        // The Agent App open path (gatherThreadOpenBundle) paints from the
+        // coordinator's durable stream window, not from the adapter replay.
+        let events = coordinator.latestStreamEvents(threadId: thread.id)
 
         XCTAssertEqual(adapter.recoverCalls, 0,
                        "completed terminal history must be served from durable stream events without live recovery")
         XCTAssertFalse(events.isEmpty,
                        "bounded durable history must still hydrate the recent stream window")
+        XCTAssertTrue(events.contains { event in
+            if case .turnCompleted(_, let finalMessage) = event { return finalMessage == "historical answer" }
+            return false
+        }, "the durable window must carry the persisted historical answer")
     }
 
     // MARK: - Recovery epoch A cannot finalize after foreground B starts

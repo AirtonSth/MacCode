@@ -184,9 +184,12 @@ private final class TerminalOutcomeRunner: AgentProviderRunner, @unchecked Senda
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws -> AgentRunHandle {
         let status = status
+        // A `.completed` run with no assistant output is reclassified as failed
+        // by ProviderStderrClassifier, so a genuine success carries a final reply.
+        let finalMessage: String? = status == .completed ? "done" : nil
         Task.detached {
             try? await Task.sleep(nanoseconds: 20_000_000)
-            onEvent(.finished(status, finalMessage: nil, providerThreadId: "provider-thread"))
+            onEvent(.finished(status, finalMessage: finalMessage, providerThreadId: "provider-thread"))
         }
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }
