@@ -13,8 +13,9 @@ public enum AgentAttachmentGetWire {
     public static let unavailableCode = -32068
 
     /// Ceiling for the returned bytes (before base64), and the default
-    /// `max_bytes`. Keeps one response well inside the paired socket's
-    /// outbound budget (1 MiB cold start).
+    /// `max_bytes`. RPC replies go over HTTP POST /v1/rpc, which does not cap
+    /// a response (nor the sum of an `rpc.batch` reply); this keeps each
+    /// item small so a batch of thumbnails stays a bounded download on a phone.
     public static let maxBytesCeiling = 256 * 1_024
     public static let defaultThumbnailMaxPixels = 512
     public static let thumbnailMaxPixelsRange = 64...2_048
@@ -80,6 +81,11 @@ public enum AgentAttachmentGetWire {
         }), let reference = AgentAttachmentReference(attachment) else {
             throw notFound("attachment")
         }
+        // A full-size read already known to be over the cap is refused before
+        // the blob is read and hashed (up to 25 MiB under the store lock).
+        if request.thumbnailMaxPixels == nil, reference.sizeBytes > request.maxBytes {
+            throw tooLarge(dataSizeBytes: reference.sizeBytes, request: request)
+        }
         let original: Data
         do {
             original = try store.containedData(for: attachment)
@@ -104,17 +110,7 @@ public enum AgentAttachmentGetWire {
             dimensions = attachment.kind == .image ? pixelSize(original) : nil
         }
         guard bytes.count <= request.maxBytes else {
-            throw JSONRPCError(
-                code: tooLargeCode,
-                message: "Attachment is larger than max_bytes.",
-                data: .object([
-                    "domain": .string("attachment"),
-                    "kind": .string("too_large"),
-                    "data_size_bytes": .number(Double(bytes.count)),
-                    "max_bytes": .number(Double(request.maxBytes)),
-                    "thumbnail": .bool(request.thumbnailMaxPixels != nil),
-                ])
-            )
+            throw tooLarge(dataSizeBytes: bytes.count, request: request)
         }
         var result: [String: JSONValue] = [
             "thread_id": .string(request.threadID.value.uuidString),
@@ -133,6 +129,20 @@ public enum AgentAttachmentGetWire {
         result["width"] = dimensions.map { .number(Double($0.width)) } ?? .null
         result["height"] = dimensions.map { .number(Double($0.height)) } ?? .null
         return .object(result)
+    }
+
+    static func tooLarge(dataSizeBytes: Int, request: Request) -> JSONRPCError {
+        JSONRPCError(
+            code: tooLargeCode,
+            message: "Attachment is larger than max_bytes.",
+            data: .object([
+                "domain": .string("attachment"),
+                "kind": .string("too_large"),
+                "data_size_bytes": .number(Double(dataSizeBytes)),
+                "max_bytes": .number(Double(request.maxBytes)),
+                "thumbnail": .bool(request.thumbnailMaxPixels != nil),
+            ])
+        )
     }
 
     static func notFound(_ what: String) -> JSONRPCError {

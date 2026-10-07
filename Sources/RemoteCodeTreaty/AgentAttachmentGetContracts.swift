@@ -6,12 +6,20 @@ import Foundation
 //   `agent.message.appended` (assistant row, content "📷 <reason>", one
 //   `kind: image`, `mimeType: image/jpeg` attachment reference), like any
 //   other appended message.
-// - Read: `agent.attachment.get` (read scope, batchable) returns one
-//   attachment of one message as base64. Ask for `thumbnail: true` for a list
-//   thumbnail (a JPEG whose long edge is at most `thumbnail_max_pixels`,
-//   default 512, clamped to 64...2048; images only). Send one full-size or
-//   large request per call rather than batching them: every response is
-//   capped at `max_bytes` (default and ceiling 262144 bytes before base64).
+// - Read: `agent.attachment.get` (batchable) returns one attachment of one
+//   message as base64. Ask for `thumbnail: true` for a list thumbnail (a JPEG
+//   whose long edge is at most `thumbnail_max_pixels`, default 512, clamped
+//   to 64...2048; images only). Each result is capped at `max_bytes` (default
+//   and ceiling 262144 bytes before base64, about 350 KiB of base64).
+// - Scope: it needs the `read` device capability, not `file`. A read-only
+//   device can therefore download the bytes of every attachment on threads it
+//   can read, including workspace files a user attached; it still cannot read
+//   any other host file (that stays `fs.*` under `file`).
+// - Batching: an `rpc.batch` reply is one HTTP POST /v1/rpc response whose
+//   total size the host does not cap, so it grows with every item. Put at most
+//   8 `agent.attachment.get` items in one batch (about 2.8 MiB of base64 at
+//   the ceiling), keep batches for thumbnails, and fetch full-size bytes one
+//   call at a time.
 // - Containment: the message must be on `thread_id`, the attachment must be
 //   on that message (match its `id` as listed in the message's
 //   `attachments`), and the bytes must still be the host-owned blob with the
@@ -24,6 +32,11 @@ import Foundation
 // `reason` `missing` when the stored bytes are gone or changed, `not_image`
 // when a thumbnail was asked for a non-image or an undecodable image).
 // Malformed params are -32602.
+//
+// Inside `rpc.batch` an error item carries only `code` and `message` (no
+// `data`): branch on the code (`RemoteCodeError.kind` maps the three codes
+// by themselves) and repeat the call on its own when you need `missing`,
+// `reason` or `data_size_bytes`.
 
 public enum AgentAttachmentGet: RemoteCodeRPCContract {
     public static let method = "agent.attachment.get"

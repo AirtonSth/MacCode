@@ -244,6 +244,67 @@ final class AgentAttachmentGetRemoteTests: XCTestCase {
         XCTAssertNil(thumbnail.error, "the thumbnail is the way to show an image over the cap")
     }
 
+    /// A full-size read whose recorded size is already over the cap is
+    /// refused from the reference alone, so it never reads or hashes the blob
+    /// (shown here by the blob being gone: the answer is still too_large).
+    func test_sizeCap_refusesKnownOversizeBeforeReadingTheBlob() async throws {
+        let f = try makeFixture()
+        let shot = try jpeg(width: 200, height: 200)
+        let (message, attachment) = try appendImageMessage(f, data: shot, thread: f.thread.id)
+        try FileManager.default.removeItem(atPath: attachment.path)
+        let id = try XCTUnwrap(attachment.id)
+
+        let refused = await get(f, thread: f.thread.id, message: message.id, attachmentID: id,
+                                extra: ["max_bytes": .number(Double(shot.count - 1))])
+        XCTAssertEqual(errorKind(refused), "too_large")
+        XCTAssertEqual(refused.error?.data?.objectValue?["data_size_bytes"]?.intValue, shot.count)
+
+        let fits = await get(f, thread: f.thread.id, message: message.id, attachmentID: id)
+        XCTAssertEqual(errorKind(fits), "unavailable", "within the cap the missing blob is still reported honestly")
+    }
+
+    /// Thumbnails are fetched in `rpc.batch`; a batched error item carries no
+    /// `data`, so the phone must still decode the attachment kind from it.
+    func test_batch_errorItemsDecodeToAttachmentKinds() async throws {
+        let f = try makeFixture()
+        let shot = try jpeg(width: 200, height: 200)
+        let (message, attachment) = try appendImageMessage(f, data: shot, thread: f.thread.id)
+        let id = try XCTUnwrap(attachment.id)
+        func call(_ thread: AgentThreadID, _ extra: [String: JSONValue]) -> JSONValue {
+            var params: [String: JSONValue] = [
+                "thread_id": .string(thread.value.uuidString),
+                "message_id": .string(message.id.value.uuidString),
+                "attachment_id": .string(id),
+            ]
+            params.merge(extra) { _, new in new }
+            return .object(["method": .string("agent.attachment.get"), "params": .object(params)])
+        }
+        let response = await f.dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "rpc.batch", params: ["calls": .array([
+                call(f.thread.id, ["thumbnail": .bool(true), "thumbnail_max_pixels": .number(64)]),
+                call(f.thread.id, ["max_bytes": .number(Double(shot.count - 1))]),
+                call(f.otherThread.id, ["thumbnail": .bool(true)]),
+            ])]
+        ))
+        XCTAssertNil(response.error)
+        let items = try XCTUnwrap(response.result?.arrayValue)
+        XCTAssertEqual(items.count, 3)
+
+        let thumbnail = try decode(AgentAttachmentGet.Result.self, items[0])
+        XCTAssertTrue(thumbnail.thumbnail)
+
+        func treatyKind(_ item: JSONValue) throws -> RemoteCodeError.Kind {
+            let error = try XCTUnwrap(item.objectValue?["error"]?.objectValue)
+            return RemoteCodeError(
+                code: try XCTUnwrap(error["code"]?.intValue),
+                message: error["message"]?.stringValue ?? "",
+                data: try error["data"].map { try decode(RemoteCodeJSONValue.self, $0) }
+            ).kind
+        }
+        XCTAssertEqual(try treatyKind(items[1]), .attachmentTooLarge)
+        XCTAssertEqual(try treatyKind(items[2]), .attachmentNotFound, "another thread's message is not found, even batched")
+    }
+
     // MARK: - Containment
 
     /// Knowing an attachment id is not enough: the message must be on the

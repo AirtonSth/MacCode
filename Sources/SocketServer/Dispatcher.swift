@@ -4958,6 +4958,9 @@ public final class JSONRPCDispatcher {
     ///     *.read / *.status / *.get, system.*, events.recent, settings.get.
     ///     Also HTTP-only read methods that are intentionally excluded from
     ///     `readOnlyBatchMethods` (e.g. `agent.checkpoint.list`).
+    ///     `agent.attachment.get` is deliberately `read`: a read device can
+    ///     download the bytes of attachments on threads it can read (including
+    ///     imported workspace files), but no other host file.
     ///   - "write": every other known (mutating) method.
     ///   - "device-admin": HTTP device list/revoke only; not an RPC method
     ///     grant. `write`/`file`/`read` must not inherit it.

@@ -139,6 +139,12 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case -32095: return .commandOutcomeUnknown
         case -32096: return .commandInProgress
         case -32098: return .authenticatedHostMismatch
+        // `rpc.batch` error items carry only `code` and `message` (no
+        // `data`), so the attachment codes, used by nothing else, also map
+        // on their own.
+        case -32066: return .attachmentNotFound
+        case -32067: return .attachmentTooLarge
+        case -32068: return .attachmentUnavailable
         default: return .unknown(code)
         }
     }

@@ -13,6 +13,15 @@ final class AgentAttachmentGetRPCAdmissionTests: XCTestCase {
         XCTAssertEqual(AgentAttachmentGet.method, "agent.attachment.get")
     }
 
+    /// Deliberate scope decision: a read-only device may download attachment
+    /// bytes (screenshots and files on threads it can already read) without
+    /// `file`, while every other host file stays behind `file`.
+    func test_readScopeIncludesAttachmentBytesButNotHostFiles() {
+        XCTAssertTrue(JSONRPCDispatcher.isAuthorized(method: "agent.attachment.get", grantedCapabilities: "read"))
+        XCTAssertFalse(JSONRPCDispatcher.isAuthorized(method: "agent.attachment.get", grantedCapabilities: "file"))
+        XCTAssertFalse(JSONRPCDispatcher.isAuthorized(method: "fs.workspace.read", grantedCapabilities: "read"))
+    }
+
     @MainActor
     func test_capabilitiesAdvertiseAttachmentGetOnBothAuthorities() async throws {
         let payload = DirectHTTPServer.capabilitiesProjection(loopbackOnly: false)
@@ -49,6 +58,17 @@ final class AgentAttachmentGetRPCAdmissionTests: XCTestCase {
         XCTAssertEqual(kind(AgentAttachmentGetWire.notFoundCode, "not_found"), .attachmentNotFound)
         XCTAssertEqual(kind(AgentAttachmentGetWire.tooLargeCode, "too_large"), .attachmentTooLarge)
         XCTAssertEqual(kind(AgentAttachmentGetWire.unavailableCode, "unavailable"), .attachmentUnavailable)
+    }
+
+    /// An `rpc.batch` error item has no `data`, so the code alone must still
+    /// tell the phone "too large" apart from "gone" for a batched thumbnail.
+    func test_errorKindsMapFromCodeAloneWithoutData() {
+        func kind(_ code: Int) -> RemoteCodeError.Kind {
+            RemoteCodeError(code: code, message: "", data: nil).kind
+        }
+        XCTAssertEqual(kind(AgentAttachmentGetWire.notFoundCode), .attachmentNotFound)
+        XCTAssertEqual(kind(AgentAttachmentGetWire.tooLargeCode), .attachmentTooLarge)
+        XCTAssertEqual(kind(AgentAttachmentGetWire.unavailableCode), .attachmentUnavailable)
     }
 
     func test_paramsClampToCeilingAndPixelRange() throws {

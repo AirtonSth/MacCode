@@ -443,7 +443,11 @@ public final class AgentAttachmentStore: @unchecked Sendable {
     /// resolved) whose bytes still match the recorded SHA-256 and size is
     /// returned; anything else throws `notReadableFile`.
     public func containedData(for attachment: AgentAttachment) throws -> Data {
-        try AgentAttachmentStorageSynchronization.withLock(root: root) {
+        // Only the containment check and the (mapped) open hold the store
+        // lock, which `stage` also takes on the main actor; hashing up to
+        // 25 MiB happens after it is released. Blobs are only ever replaced
+        // by rename and removed by unlink, so a mapping stays valid.
+        let (candidate, data) = try AgentAttachmentStorageSynchronization.withLock(root: root) {
             let candidate = URL(fileURLWithPath: attachment.path).standardizedFileURL.resolvingSymlinksInPath()
             let managedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
             let prefix = managedRoot.path.hasSuffix("/") ? managedRoot.path : managedRoot.path + "/"
@@ -453,15 +457,16 @@ public final class AgentAttachmentStore: @unchecked Sendable {
                   let data = try? Data(contentsOf: candidate, options: .mappedIfSafe) else {
                 throw AgentAttachmentResolverError.notReadableFile(attachment.displayName)
             }
-            let digest = Self.digest(data)
-            // The blob name is its digest; a recorded sha256 must agree with both.
-            guard candidate.lastPathComponent == digest,
-                  attachment.sha256 == nil || attachment.sha256?.lowercased() == digest,
-                  attachment.sizeBytes == nil || attachment.sizeBytes == data.count else {
-                throw AgentAttachmentResolverError.notReadableFile(attachment.displayName)
-            }
-            return data
+            return (candidate, data)
         }
+        let digest = Self.digest(data)
+        // The blob name is its digest; a recorded sha256 must agree with both.
+        guard candidate.lastPathComponent == digest,
+              attachment.sha256 == nil || attachment.sha256?.lowercased() == digest,
+              attachment.sizeBytes == nil || attachment.sizeBytes == data.count else {
+            throw AgentAttachmentResolverError.notReadableFile(attachment.displayName)
+        }
+        return data
     }
 
     private var metadataRoot: URL {
