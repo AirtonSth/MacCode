@@ -50,6 +50,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
     /// Docker up and the bot's container provisioned; nil on success. Tests
     /// replace it so no Docker is needed.
     var vmPreflight: ((BotID) async -> String?)?
+    /// Every published turn change, after its event (group attention).
+    var onTurnPublished: ((BotGroupTurn) -> Void)?
     /// Groups whose pump loop is running; a second pump call is a no-op
     /// because the running loop re-reads the turns after every await.
     private var pumpingGroups: Set<BotGroupID> = []
@@ -256,8 +258,10 @@ final class BotGroupOrchestrator: AgentRunObserver {
     // MARK: - Stop
 
     /// Cancels every unstarted turn of the group and stops the running one.
-    func stop(groupID: BotGroupID) {
-        guard let group = try? botStore.group(id: groupID) else { return }
+    /// Returns the turns it cancelled.
+    @discardableResult
+    func stop(groupID: BotGroupID) -> [BotGroupTurn] {
+        guard let group = try? botStore.group(id: groupID) else { return [] }
         let roomThreadID = group.roomThreadID
         let pending = (try? botStore.listGroupTurns(groupID: groupID, states: BotGroupTurn.State.pending)) ?? []
         let rows = Dictionary(
@@ -277,17 +281,19 @@ final class BotGroupOrchestrator: AgentRunObserver {
             if let row = rows[turn.id] { publishRow(row) }
             publishTurn(turn, roomThreadID: roomThreadID)
         }
+        var stopped = cancelled
         let running = (try? botStore.listGroupTurns(groupID: groupID, states: [.running])) ?? []
         for turn in running {
             guard let runID = turn.memberRunID,
-                  move(
+                  let moved = move(
                     turn,
                     from: [.running],
                     to: .cancelled,
                     expectedMemberRunID: runID,
                     roomThreadID: roomThreadID,
                     outcome: .note(Self.stoppedNote)
-                  ) != nil else { continue }
+                  ) else { continue }
+            stopped.append(moved)
             ownedRunIDs.remove(runID)
             coordinator.stopRun(runID)
             if let memberThread = memberThreadID(groupID: groupID, botID: turn.botID) {
@@ -295,6 +301,36 @@ final class BotGroupOrchestrator: AgentRunObserver {
                 coordinator.stopRun(threadId: memberThread)
             }
         }
+        return stopped
+    }
+
+    // MARK: - Retry
+
+    /// Puts a failed or interrupted turn back in the queue: its room row
+    /// shows waiting again and the turn runs when the group is free.
+    @discardableResult
+    func retry(turnID: BotGroupTurnID, groupID: BotGroupID) throws -> BotGroupTurn {
+        guard let turn = try botStore.groupTurn(id: turnID), turn.groupID == groupID,
+              let group = try botStore.group(id: groupID) else { throw BotStoreError.notFound }
+        guard turn.state == .failed || turn.state == .interrupted else {
+            throw SendError.rejected("Only a failed or interrupted turn can be retried.")
+        }
+        guard try activeParticipantBots(groupID: groupID).contains(where: { $0.id == turn.botID }) else {
+            throw SendError.rejected("That bot is no longer in this group.")
+        }
+        guard let moved = move(
+            turn,
+            from: [.failed, .interrupted],
+            to: .planned,
+            clearMemberRunID: true,
+            clearError: true,
+            roomThreadID: group.roomThreadID,
+            outcome: .waiting
+        ) else {
+            throw SendError.rejected("This turn changed on the Mac. Refresh and try again.")
+        }
+        schedulePump(groupID)
+        return moved
     }
 
     // MARK: - Relaunch
@@ -345,7 +381,11 @@ final class BotGroupOrchestrator: AgentRunObserver {
     // MARK: - Turn loop
 
     private func schedulePump(_ groupID: BotGroupID) {
-        Task { @MainActor [weak self] in await self?.pump(groupID) }
+        // The turns run after the send's reply: their events are lifecycle,
+        // never part of the receipt of the RPC that scheduled them.
+        EventBus.outsideMutationCapture {
+            Task { @MainActor [weak self] in await self?.pump(groupID) }
+        }
     }
 
     /// Starts the group's next turn when none is running. Turns are strictly
@@ -739,6 +779,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
         case reply(String)
         case needsAttention
         case note(String)
+        case waiting
     }
 
     static let stoppedNote = "stopped before answering."
@@ -792,6 +833,19 @@ final class BotGroupOrchestrator: AgentRunObserver {
     /// (`cancelledTurnIDs`): their rows settle here. Its running turn stops;
     /// the rest of each group goes on.
     func botWasDeleted(_ botID: BotID, cancelledTurnIDs: [BotGroupTurnID]) {
+        settleRemovedBots(cancelledTurnIDs: cancelledTurnIDs) { $0.botID == botID }
+    }
+
+    /// Bots left one group (participants edited). Their unstarted turns
+    /// there were cancelled by the edit (`cancelledTurnIDs`); their running
+    /// turn in that group stops.
+    func participantsWereRemoved(groupID: BotGroupID, botIDs: Set<BotID>, cancelledTurnIDs: [BotGroupTurnID]) {
+        settleRemovedBots(cancelledTurnIDs: cancelledTurnIDs) {
+            $0.groupID == groupID && botIDs.contains($0.botID)
+        }
+    }
+
+    private func settleRemovedBots(cancelledTurnIDs: [BotGroupTurnID], running isRemoved: (BotGroupTurn) -> Bool) {
         var groups = Set<BotGroupID>()
         for turnID in cancelledTurnIDs {
             guard let turn = try? botStore.groupTurn(id: turnID), turn.state == .cancelled,
@@ -806,7 +860,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
             publishTurn(turn, roomThreadID: group.roomThreadID)
         }
         let running = ((try? botStore.listGroupTurns(groupID: nil, states: [.running])) ?? [])
-            .filter { $0.botID == botID }
+            .filter(isRemoved)
         for turn in running {
             guard let runID = turn.memberRunID,
                   let group = try? botStore.group(id: turn.groupID) else { continue }
@@ -842,6 +896,9 @@ final class BotGroupOrchestrator: AgentRunObserver {
         case .note(let text):
             content = "\(identity.name) (\(BotPeerTranscript.handleLabel(identity.handle))) \(text)"
             role = .system
+        case .waiting:
+            content = BotPeerTranscript.encodeActivity(peer: identity, phase: .waiting)
+            role = .assistant
         }
         return AgentMessage(
             id: turn.roomMessageID,
@@ -904,6 +961,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
 
     private func publishTurn(_ turn: BotGroupTurn, roomThreadID: AgentThreadID) {
         EventBus.shared.publish(kind: .botGroupTurnUpdated, payload: Self.turnPayload(turn, roomThreadID: roomThreadID))
+        onTurnPublished?(turn)
     }
 
     nonisolated static func turnPayload(_ turn: BotGroupTurn, roomThreadID: AgentThreadID) -> JSONValue {

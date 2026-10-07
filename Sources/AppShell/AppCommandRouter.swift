@@ -3319,6 +3319,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+        if BotTeamGroupService.handles(method) {
+            guard let ctx = context, ctx.hostsBotGroupConversations else {
+                throw JSONRPCError(code: -32091, message: "Bot runtime is unavailable.")
+            }
+            return try await ctx.botTeamGroupService.dispatchRemote(method: method, params: params)
+        }
         let authority = try pairedBotAuthority()
         let foundation = Self.foundationObject(params)
         do {

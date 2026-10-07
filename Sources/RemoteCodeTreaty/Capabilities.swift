@@ -82,13 +82,29 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
 
     public struct Bot: Codable, Equatable, Sendable {
         public let queueControls: [String]
+        /// `bot.team.*` RPCs and `bot.team.updated` events.
+        public let teamsV1: Bool
+        /// `bot.group.*` RPCs, `bot.group.updated` / `bot.group.turn.updated`
+        /// events and `kind: "group"` items in `bot.attention.list`.
+        public let groupsV1: Bool
 
-        public init(queueControls: [String]) {
+        public init(queueControls: [String], teamsV1: Bool = false, groupsV1: Bool = false) {
             self.queueControls = queueControls
+            self.teamsV1 = teamsV1
+            self.groupsV1 = groupsV1
         }
 
         private enum CodingKeys: String, CodingKey {
             case queueControls = "queue_controls"
+            case teamsV1 = "teams_v1"
+            case groupsV1 = "groups_v1"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            queueControls = try container.decode([String].self, forKey: .queueControls)
+            teamsV1 = try container.decodeIfPresent(Bool.self, forKey: .teamsV1) ?? false
+            groupsV1 = try container.decodeIfPresent(Bool.self, forKey: .groupsV1) ?? false
         }
     }
 

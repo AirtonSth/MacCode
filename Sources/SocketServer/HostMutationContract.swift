@@ -160,6 +160,19 @@ public enum HostMutationContract {
     bot.attention.ack
     bot.self_config
     bot.scheduler.tick
+    bot.team.create
+    bot.team.update
+    bot.team.set_members
+    bot.team.delete
+    bot.team.reorder
+    bot.group.create
+    bot.group.update
+    bot.group.set_participants
+    bot.group.send
+    bot.group.stop
+    bot.group.retry_turn
+    bot.group.select
+    bot.group.delete
     """.split(separator: "\n").map(String.init))
 
     struct PreflightProbe {
@@ -181,6 +194,8 @@ public enum HostMutationContract {
         case stringEnum(String, Set<String>)
         case surfaceType(String)
         case uuidArrayWithAtLeastOne(String)
+        /// An array of UUID strings; may be empty.
+        case uuidArray(String)
         case surfaceSplitTarget
         case requiredSSHProfile
         case optionalSSHProfile
@@ -251,6 +266,11 @@ public enum HostMutationContract {
             guard params[key]?.stringValue.map(values.contains) == true else { throw JSONRPCError.invalidParams }
         case .surfaceType(let key):
             guard params[key]?.stringValue.map(isSurfaceType) == true else { throw JSONRPCError.invalidParams }
+        case .uuidArray(let key):
+            guard let values = params[key]?.arrayValue,
+                  values.allSatisfy({ $0.stringValue.flatMap(UUID.init) != nil }) else {
+                throw JSONRPCError.invalidParams
+            }
         case .uuidArrayWithAtLeastOne(let key):
             guard let values = params[key]?.arrayValue,
                   values.contains(where: { $0.stringValue.flatMap(UUID.init) != nil }) else {
@@ -370,6 +390,28 @@ public enum HostMutationContract {
                     .uuid("bot_id"),
                     .string("task_id", nonempty: true), .object("runtime"),
                 ]
+            case "bot.team.create":
+                return [.string("name", nonempty: true)]
+            case "bot.team.update":
+                return [.uuid("team_id"), .int("expected_revision")]
+            case "bot.team.set_members":
+                return [.uuid("team_id"), .int("expected_revision"), .uuidArray("bot_ids")]
+            case "bot.team.delete":
+                return [.uuid("team_id")]
+            case "bot.team.reorder":
+                return [.uuidArray("team_ids")]
+            case "bot.group.create":
+                return [.string("title", nonempty: true), .uuidArrayWithAtLeastOne("participant_bot_ids")]
+            case "bot.group.update":
+                return [.uuid("group_id"), .int("expected_revision")]
+            case "bot.group.set_participants":
+                return [.uuid("group_id"), .int("expected_revision"), .uuidArrayWithAtLeastOne("bot_ids")]
+            case "bot.group.send":
+                return [.uuid("group_id"), .string("text", nonempty: true), .string("submit_key", nonempty: true)]
+            case "bot.group.stop", "bot.group.select", "bot.group.delete":
+                return [.uuid("group_id")]
+            case "bot.group.retry_turn":
+                return [.uuid("group_id"), .uuid("turn_id")]
             default:
                 return [.uuid("bot_id")]
             }
@@ -485,6 +527,7 @@ public enum HostMutationContract {
         case .stringEnum(let key, let values): params[key] = .string(values.sorted()[0])
         case .surfaceType(let key): params[key] = .string("terminal")
         case .uuidArrayWithAtLeastOne(let key): params[key] = .array([.string(probeUUID)])
+        case .uuidArray(let key): params[key] = .array([.string(probeUUID)])
         case .surfaceSplitTarget: params["type"] = .string("terminal")
         case .requiredSSHProfile: params["destination"] = .string("host.example")
         case .optionalSSHProfile: break
@@ -558,6 +601,10 @@ public enum HostMutationContract {
             add("\(key).missing") { $0.removeValue(forKey: key) }
             add("\(key).type") { $0[key] = .bool(true) }
             add("\(key).enum") { $0[key] = .string("invalid-surface") }
+        case .uuidArray(let key):
+            add("\(key).missing") { $0.removeValue(forKey: key) }
+            add("\(key).type") { $0[key] = .bool(true) }
+            add("\(key).uuid") { $0[key] = .array([.string("not-a-uuid")]) }
         case .uuidArrayWithAtLeastOne(let key):
             add("\(key).missing") { $0.removeValue(forKey: key) }
             add("\(key).type") { $0[key] = .bool(true) }

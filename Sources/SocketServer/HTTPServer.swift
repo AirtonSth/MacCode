@@ -1353,7 +1353,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             ],
             "bot": [
                 "queue_controls": ["remove", "update", "reorder", "force_now"],
-                "linked_thread_v1": true
+                "linked_thread_v1": true,
+                "teams_v1": true,
+                "groups_v1": true
             ],
             "git": [
                 "read_only": false,

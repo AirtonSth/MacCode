@@ -311,6 +311,25 @@ extension BotStore {
         }
     }
 
+    /// Host bookkeeping (attention, unread) that must not invalidate a user's
+    /// pending compare-and-set edit: the revision stays, `updated_at` moves.
+    @discardableResult
+    public func setGroupAttention(
+        id: BotGroupID,
+        attentionState: BotAttentionState,
+        unread: Bool,
+        now: Date = Date()
+    ) throws -> BotGroupConversation {
+        try db.transaction {
+            guard var group = try loadGroup(id: id, database: db) else { throw BotStoreError.notFound }
+            group.attentionState = attentionState
+            group.unread = unread
+            group.updatedAt = now
+            try writeGroupLocked(group)
+            return group
+        }
+    }
+
     /// Replaces the active participant set (order = `botIDs` order). Removed
     /// bots get `left_at` and their planned/waiting turns in this group are
     /// cancelled; a returning bot reuses its member conversation.

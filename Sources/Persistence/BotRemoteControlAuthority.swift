@@ -219,7 +219,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "attention.list":
             try synchronizeDurableNeedsAttention()
             try synchronizeDelegatedAttention()
-            return ["items": attention.values.map { canonicalAttentionItem($0) }]
+            return ["items": attention.values.map { canonicalAttentionItem($0) } + groupAttentionItems()]
         case "reserved.probe":
             throw Error.reserved
         default:
@@ -351,6 +351,64 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard !NSDictionary(dictionary: attention).isEqual(to: next) else { return }
         attention = next
         persistSidecar()
+    }
+
+    /// One `kind: "group"` item per visible group whose attention is set,
+    /// anchored on the turn that set it (its id is the item id). Cleared by
+    /// `bot.group.select`. A read failure drops only the group rows.
+    private func groupAttentionItems() -> [[String: Any]] {
+        let groups: [BotGroupConversation]
+        do {
+            groups = try store.listGroups()
+        } catch {
+            botRemoteControlLog.error(
+                "bot.attention.group_projection_failed error=\(String(describing: error), privacy: .public)"
+            )
+            return []
+        }
+        func key(_ uuid: UUID) -> String { uuid.uuidString.lowercased() }
+        return groups.compactMap { group in
+            let state: String
+            let detail: String
+            let anchor: BotGroupTurn?
+            let turns = (try? store.listGroupTurns(groupID: group.id)) ?? []
+            switch group.attentionState {
+            case .none:
+                return nil
+            case .working:
+                state = "working"
+                detail = "Bots are answering"
+                anchor = turns.first { !$0.state.isTerminal }
+            case .needsAttention:
+                state = "needs_attention"
+                detail = "A bot could not answer"
+                anchor = turns.last { $0.state == .failed || $0.state == .interrupted }
+            case .unreadActivity:
+                state = "finished"
+                detail = "New replies"
+                anchor = turns.last { $0.state == .completed }
+            }
+            guard let anchor else { return nil }
+            return canonicalAttentionItem([
+                "id": key(anchor.id.value),
+                "kind": "group",
+                "group_id": key(group.id.value),
+                "thread_id": key(group.roomThreadID.value),
+                "turn_id": key(anchor.id.value),
+                "bot_id": key(anchor.botID.value),
+                "run_id": anchor.memberRunID.map { key($0.value) as Any } ?? NSNull(),
+                "state": state,
+                "title": group.title,
+                "detail": detail,
+                "source": "bot_group",
+                "ownership": "primary",
+                "primary": true,
+                "delegated": false,
+                "created_at": anchor.createdAt.timeIntervalSince1970,
+                "updated_at": group.updatedAt.timeIntervalSince1970,
+                "finished_at": state == "working" ? NSNull() : anchor.updatedAt.timeIntervalSince1970 as Any,
+            ])
+        }
     }
 
     private func validatedDelegatedAttention(_ raw: [String: Any]) throws -> [String: Any] {

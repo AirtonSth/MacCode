@@ -434,6 +434,8 @@ public final class AppContext {
         coordinator: coordinator,
         appSupportDirectory: appSupportDirectory
     )
+    /// Teams and groups for the Mac UI and paired devices (one event source).
+    lazy var botTeamGroupService = BotTeamGroupService(botStore: botStore, orchestrator: botGroupOrchestrator)
     private var tokenSaverCodexAdapter: CodexAppServerAdapter
     /// False for a background helper sharing this SQLite (Scheduled Task
     /// Agent): it never owns group conversation turns, so it never
@@ -444,9 +446,14 @@ public final class AppContext {
             botPeerHandoffAuthority.router = router
             if hostsBotGroupConversations {
                 botGroupOrchestrator.router = router
+                _ = botTeamGroupService // installs the group attention hook
                 botStore.onBotDeleted = { [weak self] botID, cancelledTurnIDs in
-                    Task { @MainActor [weak self] in
-                        self?.botGroupOrchestrator.botWasDeleted(botID, cancelledTurnIDs: cancelledTurnIDs)
+                    // A bot.delete RPC may be capturing events for its receipt;
+                    // these settle later and must publish on their own.
+                    EventBus.outsideMutationCapture {
+                        Task { @MainActor [weak self] in
+                            self?.botTeamGroupService.botWasDeleted(botID, cancelledTurnIDs: cancelledTurnIDs)
+                        }
                     }
                 }
             }

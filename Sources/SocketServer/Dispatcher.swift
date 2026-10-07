@@ -886,6 +886,19 @@ public final class JSONRPCDispatcher {
         "bot.attention.ack",
         "bot.self_config",
         "bot.scheduler.tick",
+        "bot.team.create",
+        "bot.team.update",
+        "bot.team.set_members",
+        "bot.team.delete",
+        "bot.team.reorder",
+        "bot.group.create",
+        "bot.group.update",
+        "bot.group.set_participants",
+        "bot.group.send",
+        "bot.group.stop",
+        "bot.group.retry_turn",
+        "bot.group.select",
+        "bot.group.delete",
         "agent.thread.create",
         "agent.thread.prepare_pr",
         "agent.thread.rollback",
@@ -952,7 +965,11 @@ public final class JSONRPCDispatcher {
         "agent.attachment.upload",
         "agent.attachment.import",
         "agent.provider.update",
-    ]).union(durableSynchronousMutationMethods.filter { $0.hasPrefix("bot.") })
+    ]).union(durableSynchronousMutationMethods.filter {
+        // Team and group mutations publish their own events from the shared
+        // service; those are captured into the receipt, not re-derived here.
+        $0.hasPrefix("bot.") && !$0.hasPrefix("bot.team.") && !$0.hasPrefix("bot.group.")
+    })
     public init(
         router: CommandRouting,
         commandReceiptMetrics: CommandReceiptMetrics = CommandReceiptMetrics(),
@@ -4754,6 +4771,7 @@ public final class JSONRPCDispatcher {
         "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list", "bot.attachment.list",
         "bot.routine.list", "bot.files.list", "bot.browser.state", "bot.guest.state",
         "bot.receipt.status", "bot.peer.receipt.status", "bot.attention.list",
+        "bot.team.list", "bot.group.list", "bot.group.get",
         "browser.url.get", "browser.snapshot", "browser.wait",
         "notification.list",
         "pane.list", "pane.surfaces", "mirror.snapshot",
