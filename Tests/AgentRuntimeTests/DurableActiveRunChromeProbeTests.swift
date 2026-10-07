@@ -27,10 +27,16 @@ final class DurableActiveRunChromeProbeTests: XCTestCase {
             contentsOf: root.appendingPathComponent("Sources/AgentRuntime/AgentRunCoordinator.swift"),
             encoding: .utf8
         )
+        // Token Saver removal deleted the respondToUserInput caller; Stop
+        // targeting is the remaining coordinator chrome caller.
         XCTAssertGreaterThanOrEqual(
             coord.components(separatedBy: "durableActiveRunChrome(threadId: threadId)").count - 1,
-            2
+            1
         )
+        let stop = try XCTUnwrap(coord.range(of: "public func stopAndAwaitTermination(threadId:"))
+        let stopBody = String(coord[stop.lowerBound...].prefix(2400))
+        XCTAssertTrue(stopBody.contains("durableActiveRunChrome(threadId: threadId)"))
+        XCTAssertFalse(stopBody.contains("durableActiveRun(threadId: threadId)"))
 
         let router = try String(
             contentsOf: root.appendingPathComponent("Sources/AppShell/AppCommandRouter.swift"),
