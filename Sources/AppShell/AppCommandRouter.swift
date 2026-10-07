@@ -2926,8 +2926,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             BotVMRunRegistry.shared.tryBegin(botID: botID, entry: entry)
         }
         viewModel.botReleaseVM = { [weak self] runID in self?.releaseBotVMRun(runID) }
+        // iOS parity: the composer's bot lock and "Rodar esta thread no Mac"
+        // reach paired devices from the Desk too, as from Agent App tabs.
+        viewModel.onThreadConfigPersisted = { [weak self] thread in
+            self?.publishAgentThreadUpdated(thread)
+        }
         viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
-            _ = await self?.resolveMacExecution(thread: threadID, approve: approve)
+            // A store failure keeps the request open and puts the banner back.
+            _ = try? await self?.resolveMacExecution(thread: threadID, approve: approve)
         }
         viewModel.botVMPreflight = { [weak self] botID, workspace in
             await self?.botVMPreflight(botID, workspace: workspace)
@@ -4529,6 +4535,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 id: thread,
                 providerThreadId: t.providerThreadId,
                 at: now
+            )
+        }
+        // A thread locked to a bot before its first send (agent.thread.actor.set)
+        // gets its provider here: its guest marker follows, as at the lock.
+        if before.actorLockedAt != nil, before.provider != t.provider || before.runAsUser != t.runAsUser {
+            try AgentAppViewModel.resyncGuestRuntimeMarker(
+                threadID: thread, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo
             )
         }
         t.updatedAt = now

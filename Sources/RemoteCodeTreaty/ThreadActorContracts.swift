@@ -5,11 +5,20 @@ import Foundation
 // or on the Mac, and a VM bot can ask to run on the Mac, which only the user
 // approves.
 //
-// - Every agent thread payload (`agent.thread.list`, `agent.thread.created/
-//   updated/...` events, `sync.snapshot` `agent_threads` rows and the results
-//   below) carries `AgentThreadActorFields`: `actor`, `actor_locked_at`,
-//   `execution_target`, `guest_runtime`, `runs_in_guest` and
-//   `pending_mac_execution`.
+// - Every full agent thread payload (`agent.thread.list` rows,
+//   `agent.thread.created`, `sync.snapshot` `agent_threads` rows, the results
+//   below and every `agent.thread.updated` that carries `actor`) carries
+//   `AgentThreadActorFields`: `actor`, `actor_locked_at`, `execution_target`,
+//   `guest_runtime`, `runs_in_guest` and `pending_mac_execution`. Some
+//   `agent.thread.updated` events are partial (`set_pinned`, `set_color`,
+//   `mark_read`) and leave these keys out: a missing key
+//   means "unchanged", never null. Merge partial updates into the stored row;
+//   decode `AgentThreadActorFields` only when `actor` is present.
+// - `guest_runtime` can stay set on a thread moved to the Mac
+//   (`execution_target` `mac`) until its first Mac run starts; that run clears
+//   it without an event of its own (the next list, snapshot or
+//   `agent.thread.updated` shows null). Placement is `runs_in_guest`, which is
+//   false as soon as the target is `mac`.
 // - Write: `agent.thread.actor.set` (receipt ledger, needs
 //   `client_request_id`). Same lock rules as the Mac composer's actor chip:
 //   only a thread with no messages, no locked actor and no run starting or
@@ -19,15 +28,24 @@ import Foundation
 //   send): the thread is linked to the bot, gets its target (the bot's
 //   default when `execution_target` is absent: `vm` for a Docker desktop,
 //   else `mac`) and, for a Distill thread on the VM, the guest runtime marker.
-//   `vm` for a bot without a VM is -32064 `target_unavailable`. `none` on an
-//   unlocked thread changes nothing. Later sends to a bot-locked thread
-//   (`agent.message.send`) run as that bot, like the Mac's.
+//   `vm` for a bot without a VM is -32064 `target_unavailable`. A Distill
+//   thread run as another macOS user gets no guest marker (it runs on the
+//   Mac). The marker follows a later provider or run-as-user change before
+//   the first message (`agent.thread.configure` or the first
+//   `agent.message.send`). `none` on a thread whose actor is not locked is a
+//   no-op success; on a locked bot thread it is -32063. A lock set by another
+//   device or the Mac while this call ran is never overwritten (-32063).
+//   Later sends to a bot-locked thread (`agent.message.send`) run as that
+//   bot, like the Mac's. Mac-side locks (first bot send, "run on the Mac")
+//   publish `agent.thread.updated` with the full actor fields.
 // - Write: `agent.mac_execution.resolve` (receipt ledger). Single winner
 //   across the Mac banner, every device and parallel calls: the winner moves
 //   the thread to the Mac (`approve: true`; actor and lock kept) or leaves the
 //   target alone (`false`), and the bot gets exactly one follow-up message
 //   (`follow_up`, same shape as `agent.manual_action.resolve`). Losers get
-//   -32065 `not_pending`; nothing changes.
+//   -32065 `not_pending`; nothing changes. When the answer cannot be saved
+//   the call fails with -32000 `store_unavailable` and the request stays
+//   pending (answer again).
 // - Event: `agent.mac_execution.requested` (`AgentMacExecutionRequestedEvent`)
 //   when a bot asks. The answer (from the Mac or a device) arrives as
 //   `agent.thread.updated` with `pending_mac_execution: null` and the new
@@ -39,7 +57,7 @@ import Foundation
 // Errors carry `data: {"domain": "thread_actor" | "mac_execution", "kind": ...}`:
 // `not_found` (-32060: unknown thread or bot), `locked` (-32063),
 // `target_unavailable` (-32064), `not_pending` (-32065), or
-// `bots_unavailable` (-32000, nothing changed).
+// `bots_unavailable` / `store_unavailable` (-32000, nothing changed).
 
 public struct AgentThreadActor: Codable, Equatable, Sendable {
     /// `none` or `bot`.

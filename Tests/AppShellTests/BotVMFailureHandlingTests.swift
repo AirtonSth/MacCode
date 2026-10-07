@@ -125,7 +125,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertEqual(f.router.pendingMacExecution[f.thread.id], "preciso do Xcode")
         XCTAssertEqual(try f.ctx.threadRepo.get(id: f.thread.id)?.executionTarget, .vm, "request alone never switches")
 
-        await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
+        try await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
         let after = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
         XCTAssertEqual(after.executionTarget, .mac)
         XCTAssertEqual(after.actor, before.actor)
@@ -140,7 +140,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         let f = try makeFixture()
         try lockOnVM(f)
         await requestMacExecution(f)
-        await f.router.resolveMacExecution(thread: f.thread.id, approve: false)
+        try await f.router.resolveMacExecution(thread: f.thread.id, approve: false)
         XCTAssertEqual(try f.ctx.threadRepo.get(id: f.thread.id)?.executionTarget, .vm)
         let sent = await waitUntil { f.runner.requests.count == 1 }
         XCTAssertTrue(sent)
@@ -152,7 +152,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
             f.runner.requests.first?.prompt.contains(BotStandingInstructions.vmThreadRules), true,
             "the follow-up is a bot turn: without its VM rules the bot does not know its tools"
         )
-        await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
+        try await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
         XCTAssertEqual(try f.ctx.threadRepo.get(id: f.thread.id)?.executionTarget, .vm, "no pending request, no switch")
     }
 
@@ -215,7 +215,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         let f = try makeFixture()
         try makeGuestThreadWithHistory(f, guestSession: "guest-session-1")
         await requestMacExecution(f)
-        await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
+        try await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
         let sent = await waitUntil { f.runner.requests.count == 1 }
         XCTAssertTrue(sent)
         let followUp = try XCTUnwrap(f.runner.requests.last)
@@ -242,7 +242,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         // The guest turn that asked for the Mac is still running.
         try f.ctx.threadRepo.updateStatus(id: f.thread.id, status: .running, hasUnread: false)
         await requestMacExecution(f)
-        await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
+        try await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
         XCTAssertEqual(try f.ctx.queuedMessageRepo.list(threadId: f.thread.id).count, 1, "the follow-up waits")
         XCTAssertTrue(f.runner.requests.isEmpty)
         // The guest turn ends after the approval and persists its session.
@@ -265,7 +265,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         try lockOnVM(f)
         try f.ctx.threadRepo.updateProviderThreadId(id: f.thread.id, providerThreadId: "mac-session-1")
         await requestMacExecution(f)
-        await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
+        try await f.router.resolveMacExecution(thread: f.thread.id, approve: true)
         let sent = await waitUntil { f.runner.requests.count == 1 }
         XCTAssertTrue(sent)
         let followUp = try XCTUnwrap(f.runner.requests.first)

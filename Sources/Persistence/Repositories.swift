@@ -2291,6 +2291,32 @@ public final class AgentThreadRepository {
         return try changes.step() && changes.columnInt64(0) == 1
     }
 
+    /// First actor lock only: writes like `setActor` but only on a row whose
+    /// actor is not locked yet. False when the row is gone or already locked,
+    /// so two writers racing for one thread get one winner.
+    public func lockActorIfUnlocked(
+        id: AgentThreadID,
+        actor: RunActor,
+        lockedAt: Date,
+        executionTarget: ExecutionTarget?
+    ) throws -> Bool {
+        Self.bumpIdentityRevision()
+        let st = try db.prepare("""
+            UPDATE agent_threads
+            SET actor_json = ?,
+                actor_locked_at = ?,
+                execution_target = ?
+            WHERE id = ? AND actor_locked_at IS NULL;
+            """)
+        try st.bind(1, encodeRunActor(actor))
+        try st.bind(2, iso.string(from: lockedAt))
+        try st.bind(3, executionTarget?.rawValue)
+        try st.bind(4, id.value.uuidString)
+        _ = try st.step()
+        let changes = try db.prepare("SELECT changes();")
+        return try changes.step() && changes.columnInt64(0) == 1
+    }
+
     /// Guest runtime marker only (`BotGuestRuntime`); nil clears it. Neither
     /// `upsert` nor `setActor` writes this column. Missing rows return false.
     @discardableResult

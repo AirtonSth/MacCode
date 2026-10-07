@@ -24,9 +24,11 @@ extension AppCommandRouter {
         guard let ctx = context, let stored = try ctx.threadRepo.get(id: thread) else {
             throw actorRefusal(code: ManualActionWire.notFoundCode, kind: "not_found", message: "Agent thread not found.")
         }
-        // Asking for what the thread already is changes nothing.
+        // Asking for what the thread already is changes nothing, and so does
+        // `none` on a thread whose actor is not locked (the Mac chip's choice
+        // only counts at the first send).
         switch actor {
-        case .none where stored.actor == .none:
+        case .none where stored.actor == .none || stored.actorLockedAt == nil:
             return stored
         case .bot(let id) where stored.actorLockedAt != nil && stored.actor == .bot(id)
             && (requestedTarget == nil || requestedTarget == stored.executionTarget):
@@ -72,14 +74,22 @@ extension AppCommandRouter {
             throw actorRefusal(code: -32000, kind: "bots_unavailable", message: "Bots are not available on this Mac right now.")
         }
         let target = requestedTarget ?? defaultTarget
-        let lockedAt = try AgentAppViewModel.lockThreadToBot(
-            botID: botID,
-            threadID: thread,
-            target: target,
-            composerProvider: nil,
-            threadRepo: ctx.threadRepo,
-            linker: hooks.link
-        )
+        let lockedAt: Date
+        do {
+            lockedAt = try AgentAppViewModel.lockThreadToBot(
+                botID: botID,
+                threadID: thread,
+                target: target,
+                composerProvider: nil,
+                threadRepo: ctx.threadRepo,
+                linker: hooks.link
+            )
+        } catch is ThreadActorAlreadyLockedError {
+            throw actorRefusal(
+                code: ThreadActorWire.lockedCode, kind: "locked",
+                message: "This thread's actor is fixed after the first message. Start a new thread to run as a different actor."
+            )
+        }
         for viewModel in botThreadViewModels {
             viewModel.mirrorActorLock(actor, lockedAt: lockedAt, target: target, thread: thread)
         }
@@ -95,7 +105,14 @@ extension AppCommandRouter {
         guard let ctx = context, try ctx.threadRepo.get(id: thread) != nil else {
             throw macExecutionRefusal(code: ManualActionWire.notFoundCode, kind: "not_found", message: "Agent thread not found.")
         }
-        if let outcome = await resolveMacExecution(thread: thread, approve: approve) { return outcome }
+        do {
+            if let outcome = try await resolveMacExecution(thread: thread, approve: approve) { return outcome }
+        } catch let failure as MacExecutionStoreError {
+            throw macExecutionRefusal(
+                code: -32000, kind: "store_unavailable",
+                message: "The answer could not be saved; the request is still open: \(failure.underlying.localizedDescription)"
+            )
+        }
         guard try ctx.threadRepo.get(id: thread) != nil else {
             throw macExecutionRefusal(code: ManualActionWire.notFoundCode, kind: "not_found", message: "Agent thread not found.")
         }

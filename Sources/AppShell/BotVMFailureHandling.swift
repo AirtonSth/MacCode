@@ -4,6 +4,12 @@ import CoreModel
 import SocketServer
 import Surfaces
 
+/// The answer to a bot's "run on the Mac?" request could not be saved;
+/// the request stays pending.
+struct MacExecutionStoreError: Error {
+    let underlying: Error
+}
+
 /// A desk, peer or hop send found the bot's VM busy in another thread. Nothing
 /// was written: the caller keeps its text and shows the notice.
 struct BotVMBusyError: LocalizedError, CustomStringConvertible {
@@ -129,17 +135,36 @@ extension AppCommandRouter {
     /// A guest thread keeps its marker: its next run (this follow-up, once a
     /// still-finishing guest turn ends) starts a new Mac session with a
     /// handoff summary (`AgentRunCoordinator.pendingMacHandoff`).
+    /// The request is consumed only once the target is saved: a store failure
+    /// throws `MacExecutionStoreError` and leaves the request and every banner open.
     @discardableResult
-    func resolveMacExecution(thread: AgentThreadID, approve: Bool) async -> MacExecutionResolveOutcome? {
-        guard pendingMacExecution.removeValue(forKey: thread) != nil else { return nil }
+    func resolveMacExecution(thread: AgentThreadID, approve: Bool) async throws -> MacExecutionResolveOutcome? {
+        // No await from here to the removal below: one answer wins.
+        guard let reason = pendingMacExecution[thread] else { return nil }
+        var stored: AgentThread?
+        do {
+            stored = try context?.threadRepo.get(id: thread)
+            if approve, let row = stored, try context?.threadRepo.setActor(
+                id: thread, actor: row.actor, lockedAt: row.actorLockedAt, executionTarget: .mac
+            ) != true {
+                stored = nil
+            }
+        } catch {
+            for viewModel in botThreadViewModels {
+                viewModel.pendingMacExecutionByThread[thread] = reason
+                if viewModel.selectedThreadId == thread {
+                    viewModel.statusMessage = "Não foi possível salvar a resposta: \(error.localizedDescription)"
+                }
+            }
+            throw MacExecutionStoreError(underlying: error)
+        }
+        pendingMacExecution[thread] = nil
         for viewModel in botThreadViewModels {
             viewModel.pendingMacExecutionByThread[thread] = nil
         }
-        guard var stored = try? context?.threadRepo.get(id: thread) else { return nil }
+        // The thread is gone: nothing to move and no bot to tell.
+        guard var stored else { return nil }
         if approve {
-            guard (try? context?.threadRepo.setActor(
-                id: thread, actor: stored.actor, lockedAt: stored.actorLockedAt, executionTarget: .mac
-            )) == true else { return nil }
             stored.executionTarget = .mac
             for viewModel in botThreadViewModels {
                 viewModel.mirrorExecutionTarget(.mac, thread: thread)

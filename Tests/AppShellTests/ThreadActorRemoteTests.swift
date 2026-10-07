@@ -485,4 +485,215 @@ final class ThreadActorRemoteTests: XCTestCase {
         try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertEqual(f.runner.requests.count, 0)
     }
+
+    // MARK: - Review fixes (P3)
+
+    /// WHY (plan A): a phone locks first and picks Distill at its first send.
+    /// The guest marker must follow the provider, or a Distill thread of a
+    /// Docker bot runs on the Mac host with `execution_target` vm.
+    func test_remoteLockThenProviderChange_keepsThePlacementRule() async throws {
+        let f = try makeFixture()
+        let (log, subscription) = recordEvents()
+        defer { EventBus.shared.unsubscribe(subscription) }
+        do { let response = await setActor(f, bot: f.vmBot.id); XCTAssertNil(response.error) }
+        XCTAssertEqual(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.runsInGuest, false,
+                       "a Codex thread is not a guest thread")
+
+        // agent.message.send forwards the phone's picker into configure.
+        _ = try f.router.configureAgentThread(
+            thread: f.thread.id, provider: .distill, model: "claude/claude-sonnet-4-5",
+            permissionMode: nil, reasoningEffort: nil
+        )
+        XCTAssertEqual(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.guestRuntime, BotGuestRuntime.distillV1)
+        XCTAssertEqual(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.runsInGuest, true,
+                       "Distill on the bot's VM runs inside its guest")
+
+        // Back to Codex through the device RPC: the marker goes, and the event says so.
+        let back = await JSONRPCDispatcher(router: f.router).dispatch(mutation("agent.thread.configure", [
+            "thread_id": .string(f.thread.id.value.uuidString),
+            "provider": .string("codex"),
+            "model": .string("fake-model"),
+        ]), mutationContext: context("phone"))
+        XCTAssertNil(back.error)
+        XCTAssertNil(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.guestRuntime,
+                     "a guest-marked Codex thread would fail closed on every send")
+        let event = try XCTUnwrap(log.payloads("agent.thread.updated", thread: f.thread.id).last)
+        let fields = try decode(AgentThreadActorFields.self, .object(event))
+        XCTAssertEqual(fields.executionTarget, "vm")
+        XCTAssertNil(fields.guestRuntime)
+        XCTAssertFalse(fields.runsInGuest)
+    }
+
+    /// WHY (M9): the guest only gets the app user's own accounts, so a thread
+    /// run as another macOS user must never get the marker: the guest
+    /// resolver would refuse every send of a thread that can no longer change.
+    func test_remoteLockOfADistillThreadRunAsAnotherUser_getsNoGuestMarker() async throws {
+        let f = try makeFixture()
+        let distill = try newThread(f.router, workspace: f.workspace.id, title: "Other user", provider: .distill)
+        let other = AgentRunAsUser(
+            generatedUID: UUID().uuidString, shortName: "someoneelse",
+            uid: getuid() &+ 4242, gid: getgid(), homePath: "/Users/someoneelse"
+        )
+        XCTAssertTrue(try f.ctx.threadRepo.setPickerConfig(
+            of: distill.id, provider: .distill, providerInstanceId: "distill", runAsUser: other,
+            model: distill.model, permissionMode: distill.permissionMode, reasoningEffort: distill.reasoningEffort,
+            serviceTier: distill.serviceTier, modelSelection: distill.modelSelection,
+            interactionMode: distill.effectiveInteractionMode, reasoningModel: distill.reasoningModel
+        ))
+
+        let response = await setActor(f, thread: distill.id, bot: f.vmBot.id)
+
+        XCTAssertNil(response.error)
+        let fields = try decode(AgentThreadActorSet.Result.self, try XCTUnwrap(response.result)).fields
+        XCTAssertEqual(fields.executionTarget, "vm")
+        XCTAssertNil(fields.guestRuntime)
+        XCTAssertFalse(fields.runsInGuest)
+    }
+
+    /// WHY: a Mac bot send awaits the VM preflight before it locks. A phone
+    /// that locks the thread to another bot meanwhile must win alone: the Mac
+    /// never overwrites it, never runs as its own bot, and keeps the prompt.
+    func test_phoneLockDuringAMacBotSendPreflight_hasOneWinner() async throws {
+        let f = try makeFixture()
+        let vm = macSurface(f)
+        var phoneResponse: JSONRPCResponse?
+        vm.botVMPreflight = { _, _ in
+            phoneResponse = await self.setActor(f, bot: f.macBot.id)
+            return nil
+        }
+        vm.setRunActor(.bot(f.vmBot.id))
+        vm.prompt = "corrida"
+
+        await vm.send()
+
+        XCTAssertNil(phoneResponse?.error, "the phone's lock landed first")
+        let stored = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
+        XCTAssertEqual(stored.actor, .bot(f.macBot.id), "the Mac did not overwrite the phone's lock")
+        XCTAssertEqual(stored.executionTarget, .mac)
+        XCTAssertEqual(try f.ctx.botStore.conversationLinked(to: f.thread.id)?.botID, f.macBot.id)
+        XCTAssertNil(BotVMRunRegistry.shared.active(botID: f.vmBot.id), "no run claimed the losing bot's VM")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(f.runner.requests.isEmpty, "nothing ran as the losing bot")
+        XCTAssertEqual(vm.selectedRunActor, .bot(f.macBot.id), "the Mac chip shows the winner")
+        XCTAssertEqual(vm.prompt, "corrida", "the Mac user keeps the text to send again")
+        XCTAssertFalse(vm.statusMessage.isEmpty)
+    }
+
+    /// The lock itself refuses a thread locked elsewhere, so no caller can
+    /// overwrite it even without the composer's check.
+    func test_lockThreadToBot_refusesAThreadLockedElsewhere() async throws {
+        let f = try makeFixture()
+        do { let response = await setActor(f, bot: f.macBot.id); XCTAssertNil(response.error) }
+        let hooks = try XCTUnwrap(f.router.botWorkspaceRunHooks)
+        XCTAssertThrowsError(try AgentAppViewModel.lockThreadToBot(
+            botID: f.vmBot.id, threadID: f.thread.id, target: .vm, composerProvider: .distill,
+            threadRepo: f.ctx.threadRepo, linker: hooks.link
+        )) { XCTAssertTrue($0 is ThreadActorAlreadyLockedError) }
+        let stored = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
+        XCTAssertEqual(stored.actor, .bot(f.macBot.id))
+        XCTAssertNil(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.guestRuntime)
+    }
+
+    /// WHY (iOS parity): the Mac's first bot send and "Rodar esta thread no
+    /// Mac" change the actor and target; paired devices must see it without
+    /// refetching the list.
+    func test_macComposerLockAndMoveToMac_publishTheFullActorFields() async throws {
+        let f = try makeFixture()
+        let vm = macSurface(f)
+        let (log, subscription) = recordEvents()
+        defer { EventBus.shared.unsubscribe(subscription) }
+        vm.botVMPreflight = { _, _ in "Docker parado" }
+        vm.setRunActor(.bot(f.vmBot.id))
+        vm.prompt = "primeira"
+        await vm.send()
+        XCTAssertTrue(vm.statusMessage.contains("VM indisponível"), vm.statusMessage)
+
+        // The VM is down: the user chooses the Mac for this thread.
+        vm.runSelectedThreadOnMac()
+
+        let stored = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
+        XCTAssertEqual(stored.executionTarget, .mac)
+        let moved = try XCTUnwrap(log.payloads("agent.thread.updated", thread: f.thread.id).last {
+            $0["actor"] != nil
+        })
+        let movedFields = try decode(AgentThreadActorFields.self, .object(moved))
+        XCTAssertEqual(movedFields.actor, .bot(f.vmBot.id.value.uuidString.lowercased()))
+        XCTAssertEqual(movedFields.executionTarget, "mac")
+        XCTAssertNotNil(movedFields.actorLockedAt)
+
+        // First bot send on a fresh thread locks it on the Mac composer.
+        let fresh = try newThread(f.router, workspace: f.workspace.id, title: "Fresh")
+        vm.reloadThreads()
+        vm.selectThread(fresh.id)
+        vm.setRunActor(.bot(f.macBot.id))
+        vm.prompt = "relatório"
+        await vm.send()
+        let lockedRow = try XCTUnwrap(try f.ctx.threadRepo.get(id: fresh.id))
+        XCTAssertEqual(lockedRow.actor, .bot(f.macBot.id))
+        let published = await waitUntil {
+            log.payloads("agent.thread.updated", thread: fresh.id).contains {
+                $0["actor"]?.objectValue?["kind"]?.stringValue == "bot"
+            }
+        }
+        XCTAssertTrue(published, "the first bot send's lock reaches paired devices")
+        let event = try XCTUnwrap(log.payloads("agent.thread.updated", thread: fresh.id).first {
+            $0["actor"]?.objectValue?["kind"]?.stringValue == "bot"
+        })
+        let fields = try decode(AgentThreadActorFields.self, .object(event))
+        XCTAssertEqual(fields.actor, .bot(f.macBot.id.value.uuidString.lowercased()))
+        XCTAssertEqual(fields.executionTarget, "mac")
+        XCTAssertEqual(try XCTUnwrap(fields.actorLockedAt), try XCTUnwrap(lockedRow.actorLockedAt).timeIntervalSince1970,
+                       accuracy: 0.001)
+        if let request = f.runner.requests.first { f.runner.finish(runID: request.runId, status: .completed, reply: "ok") }
+    }
+
+    /// WHY: an answer that could not be saved must not be reported as
+    /// "already answered" nor consume the request: nobody could answer again
+    /// and the bot would never learn the outcome.
+    func test_macExecutionAnswerThatCannotBeSaved_keepsTheRequestOpen() async throws {
+        let f = try makeFixture()
+        let vm = macSurface(f)
+        do { let response = await setActor(f, bot: f.vmBot.id); XCTAssertNil(response.error) }
+        await requestMacExecution(f)
+        _ = await waitUntil { vm.pendingMacExecutionReason != nil }
+
+        // The target write fails (the receipt ledger shares the database, so
+        // the router call is made directly).
+        try f.ctx.db.execute("PRAGMA query_only = ON;")
+        var refusal: JSONRPCError?
+        do {
+            _ = try await f.router.resolveMacExecutionRemote(thread: f.thread.id, approve: true)
+        } catch let rejection as DefiniteMutationRejection {
+            refusal = rejection.underlying as? JSONRPCError
+        }
+        try f.ctx.db.execute("PRAGMA query_only = OFF;")
+
+        XCTAssertEqual(refusal?.code, -32000)
+        XCTAssertEqual(refusal?.data?.objectValue?["kind"]?.stringValue, "store_unavailable")
+        XCTAssertEqual(refusal?.data?.objectValue?["domain"]?.stringValue, "mac_execution")
+        XCTAssertEqual(f.router.pendingMacExecution[f.thread.id], "preciso do Xcode", "still pending")
+        XCTAssertEqual(vm.pendingMacExecutionReason, "preciso do Xcode", "the Mac banner stays")
+        XCTAssertEqual(try f.ctx.threadRepo.get(id: f.thread.id)?.executionTarget, .vm)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(f.runner.requests.isEmpty, "the bot hears nothing for an unsaved answer")
+
+        // Eventual completion: the next answer wins normally, once.
+        let retried = await resolveMac(f, approve: true)
+        XCTAssertNil(retried.error)
+        XCTAssertEqual(try f.ctx.threadRepo.get(id: f.thread.id)?.executionTarget, .mac)
+        _ = await waitUntil { f.runner.requests.count >= 1 }
+        XCTAssertEqual(f.runner.requests.first?.userMessageContent, AppCommandRouter.macExecutionApprovedFollowUp)
+    }
+
+    /// `none` on a thread whose actor is not locked is the documented no-op.
+    func test_actorSetNone_onAnUnlockedBotThread_isANoOp() async throws {
+        let f = try makeFixture()
+        XCTAssertTrue(try f.ctx.threadRepo.setActor(
+            id: f.thread.id, actor: .bot(f.macBot.id), lockedAt: nil, executionTarget: nil
+        ))
+        let response = await setActor(f, bot: nil)
+        XCTAssertNil(response.error)
+        let stored = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
+        XCTAssertNil(stored.actorLockedAt, "nothing changed")
+    }
 }

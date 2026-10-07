@@ -326,6 +326,14 @@ private struct BotRunUnavailableError: LocalizedError {
     var errorDescription: String? { "Bot indisponível." }
 }
 
+/// `AgentAppViewModel.lockThreadToBot` found the thread's actor already
+/// locked (another device or window locked it first). Nothing was written.
+public struct ThreadActorAlreadyLockedError: LocalizedError {
+    public var errorDescription: String? {
+        "Esta conversa já foi definida para outro ator. Revise o ator e envie de novo."
+    }
+}
+
 /// Opt-in hooks for hosting one fixed thread (e.g. the bot desk) in Agent App.
 public struct AgentAppEmbedding {
     public let pinnedThreadId: AgentThreadID
@@ -6426,49 +6434,68 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
         let target = botExecutionTargetProvider(botID)
         // The composer's provider belongs to the selected thread only.
-        let lockedAt = try Self.lockThreadToBot(
-            botID: botID,
-            threadID: tid,
-            target: target,
-            composerProvider: selectedThreadId == tid ? provider : nil,
-            threadRepo: threadRepo,
-            linker: linker
-        )
+        let lockedAt: Date
+        do {
+            lockedAt = try Self.lockThreadToBot(
+                botID: botID,
+                threadID: tid,
+                target: target,
+                composerProvider: selectedThreadId == tid ? provider : nil,
+                composerRunAsUser: selectedThreadId == tid ? runAsUser : nil,
+                threadRepo: threadRepo,
+                linker: linker
+            )
+        } catch let error as ThreadActorAlreadyLockedError {
+            // Another device locked it first: show its lock, never overwrite it.
+            if let stored = try? threadRepo.get(id: tid) {
+                mirrorActorLock(stored.actor, lockedAt: stored.actorLockedAt, target: stored.executionTarget, thread: tid)
+            }
+            throw error
+        }
         if let index = threads.firstIndex(where: { $0.id == tid }) {
             threads[index].actor = .bot(botID)
             threads[index].actorLockedAt = lockedAt
             threads[index].executionTarget = target
+            // iOS parity: paired devices show the lock without a refetch.
+            onThreadConfigPersisted?(threads[index])
         }
     }
 
     /// Links the thread to the bot, writes the guest runtime marker and locks
     /// the thread's actor and execution target. Shared by the composer's first
     /// bot send and `agent.thread.actor.set` from a paired device. Returns the
-    /// lock date. `composerProvider` is the provider the composer will run the
-    /// thread with; nil reads the thread's own.
+    /// lock date. `composerProvider` and `composerRunAsUser` are what the
+    /// composer will run the thread with; nil reads the thread's own. Throws
+    /// `ThreadActorAlreadyLockedError` when the thread is already locked.
     @MainActor
     public static func lockThreadToBot(
         botID: BotID,
         threadID tid: AgentThreadID,
         target: ExecutionTarget,
         composerProvider: AgentProvider?,
+        composerRunAsUser: AgentRunAsUser? = nil,
         threadRepo: AgentThreadRepository,
         linker: @MainActor (BotID, AgentThreadID) throws -> Void
     ) throws -> Date {
-        try linker(botID, tid)
-        let lockedAt = Date()
-        // Plan A: a new Distill conversation of a Docker-desktop bot runs
-        // inside the bot's Linux guest. One that already has a Mac Distill
-        // session keeps running on the Mac (D5). Written before the lock: on
-        // its own (no `.vm` target yet) the marker routes nothing.
         let thread = try threadRepo.get(id: tid)
-        let hasMacDistillSession = thread?.provider == .distill && thread?.providerThreadId?.isEmpty == false
-        let threadProvider = composerProvider ?? thread?.provider
-        let runsInGuest = target == .vm && threadProvider == .distill && !hasMacDistillSession
-        try threadRepo.setGuestRuntime(id: tid, runsInGuest ? BotGuestRuntime.distillV1 : nil)
-        guard try threadRepo.setActor(
+        // Checked before any write: a lock set elsewhere is never overwritten.
+        guard thread?.actorLockedAt == nil else { throw ThreadActorAlreadyLockedError() }
+        try linker(botID, tid)
+        let lockedAt = storedLockDate()
+        // Written before the lock: on its own (no `.vm` target yet) the marker routes nothing.
+        let previousMarker = try threadRepo.guestPlacement(of: tid)?.guestRuntime
+        let marker = guestRuntimeMarker(
+            target: target,
+            provider: composerProvider ?? thread?.provider,
+            runAsUser: composerProvider != nil ? composerRunAsUser : thread?.runAsUser,
+            hasMacDistillSession: thread?.provider == .distill && thread?.providerThreadId?.isEmpty == false
+        )
+        try threadRepo.setGuestRuntime(id: tid, marker)
+        guard try threadRepo.lockActorIfUnlocked(
             id: tid, actor: .bot(botID), lockedAt: lockedAt, executionTarget: target
         ) else {
+            try? threadRepo.setGuestRuntime(id: tid, previousMarker)
+            if try threadRepo.get(id: tid) != nil { throw ThreadActorAlreadyLockedError() }
             throw NSError(
                 domain: "RemoteCode.AgentAppViewModel",
                 code: 404,
@@ -6476,6 +6503,53 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
         }
         return lockedAt
+    }
+
+    /// Now, at the precision `agent_threads.actor_locked_at` keeps (whole
+    /// seconds), so the painted row and its event match what a reload reads.
+    public nonisolated static func storedLockDate() -> Date {
+        Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+    }
+
+    /// Plan A placement rule, one for every bot lock and for later provider or
+    /// run-as-user changes: a Distill thread of a bot on the VM runs inside the
+    /// bot's Linux guest, unless it already has a Mac Distill session (D5) or
+    /// runs as another macOS user (M9: the guest only gets the app user's own
+    /// accounts and the guest resolver refuses such a run).
+    public nonisolated static func guestRuntimeMarker(
+        target: ExecutionTarget?,
+        provider: AgentProvider?,
+        runAsUser: AgentRunAsUser?,
+        hasMacDistillSession: Bool
+    ) -> String? {
+        guard target == .vm, provider == .distill, !hasMacDistillSession,
+              (runAsUser?.uid ?? getuid()) == getuid() else { return nil }
+        return BotGuestRuntime.distillV1
+    }
+
+    /// A provider or run-as-user change on a bot-locked thread that has not
+    /// started re-derives its guest marker with the lock's rule: a paired
+    /// device locks the actor first and picks the provider at its first send.
+    /// A started thread keeps its marker (its session lives where it ran).
+    /// Returns true when the marker changed.
+    @MainActor
+    @discardableResult
+    public static func resyncGuestRuntimeMarker(
+        threadID tid: AgentThreadID,
+        threadRepo: AgentThreadRepository,
+        messageRepo: AgentMessageRepository
+    ) throws -> Bool {
+        guard let thread = try threadRepo.get(id: tid), thread.actorLockedAt != nil,
+              case .bot = thread.actor, !(try messageRepo.hasAny(threadId: tid)) else { return false }
+        let marker = guestRuntimeMarker(
+            target: thread.executionTarget,
+            provider: thread.provider,
+            runAsUser: thread.runAsUser,
+            hasMacDistillSession: thread.provider == .distill && thread.providerThreadId?.isEmpty == false
+        )
+        guard try threadRepo.guestPlacement(of: tid)?.guestRuntime != marker else { return false }
+        try threadRepo.setGuestRuntime(id: tid, marker)
+        return true
     }
 
     /// Updates the painted row and, on the selected thread, the actor chip.
@@ -6506,7 +6580,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let botID = vmUnavailableBotID, let tid = selectedThreadId,
               let thread = threads.first(where: { $0.id == tid }) else { return }
         do {
-            let lockedAt = thread.actorLockedAt ?? Date()
+            let lockedAt = thread.actorLockedAt ?? Self.storedLockDate()
             if thread.actorLockedAt == nil {
                 guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
                 try linker(botID, tid)
@@ -6517,6 +6591,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threads[index].actor = actor
                 threads[index].actorLockedAt = lockedAt
                 threads[index].executionTarget = .mac
+                // iOS parity: paired devices see the move to the Mac at once.
+                onThreadConfigPersisted?(threads[index])
             }
             vmUnavailableBotID = nil
             statusMessage = ""
@@ -7031,6 +7107,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threadId: id,
                 expectedRevision: routingBase.revision
             )
+            // A thread a paired device locked to a bot gets its provider here.
+            if let painted, painted.actorLockedAt != nil,
+               painted.provider != provider || painted.runAsUser != runAsUser {
+                try Self.resyncGuestRuntimeMarker(threadID: id, threadRepo: threadRepo, messageRepo: messageRepo)
+            }
             if let i = threads.firstIndex(where: { $0.id == id }) {
                 threads[i].provider = provider
                 threads[i].providerInstanceId = providerInstanceId
@@ -9288,6 +9369,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if case .bot(let botID) = runActor,
            embedding == nil || (actorThread?.actorLockedAt != nil && actorThread?.executionTarget == .vm),
            await botVMGateBlocksRun(botID: botID, thread: actorThread) {
+            return nil
+        }
+        // A paired device can lock the thread while the VM preflight above
+        // awaits, or before this composer mirrored it: the stored lock wins and
+        // this send stops with its prompt kept. Two columns; no full row read.
+        if actorThread?.actorLockedAt == nil,
+           (try? threadRepo.lockedBotActor(of: tid)) != nil,
+           let stored = try? threadRepo.get(id: tid) {
+            mirrorActorLock(stored.actor, lockedAt: stored.actorLockedAt, target: stored.executionTarget, thread: tid)
+            statusMessage = ThreadActorAlreadyLockedError().errorDescription ?? ""
             return nil
         }
         // D12: claim the bot's VM before any visible start effect. When another

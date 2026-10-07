@@ -3331,6 +3331,8 @@ public final class JSONRPCDispatcher {
                 payload["providerLocked"] = .bool(providerLocked(t))
                 appendFlatModelSelection(t, to: &payload)
                 appendRouting(t.effectiveRoutingConfiguration, to: &payload)
+                // A provider change can move a bot-locked thread's guest marker.
+                appendThreadActor(t, guestRuntime: router.threadGuestRuntime(thread: t.id), to: &payload)
                 EventBus.shared.publish(kind: .agentThreadUpdated, payload: .object(payload))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.execution.configure":
