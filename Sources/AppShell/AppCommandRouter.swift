@@ -6004,6 +6004,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ? (modelSelection?.distillMainEffortSelection ?? t.modelSelection.distillMainEffortSelection) : nil,
             distillReasoningEffortSelection: prov == .distill
                 ? (modelSelection?.distillReasoningEffortSelection ?? t.modelSelection.distillReasoningEffortSelection) : nil,
+            distillUltracode: prov == .distill
+                ? (modelSelection?.distillUltracode ?? t.modelSelection.distillUltracode) : false,
             serviceTier: t.serviceTier,
             interactionMode: interactionMode ?? .default,
             providerBinary: autoRoutingActive ? nil : providerBinary(provider: prov, instanceId: t.providerInstanceId),

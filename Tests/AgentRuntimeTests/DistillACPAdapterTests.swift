@@ -77,7 +77,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         workerResult: String,
         sessionModels: String = #"{"currentModelId":"main"}"#,
         setModelResult: String? = nil,
-        sessionOpenJSON: String? = nil
+        sessionOpenJSON: String? = nil,
+        ultracodeReplyJSON: String = #"{"jsonrpc":"2.0","id":message["id"],"result":{"enabled":params.get("enabled")}}"#
     ) throws -> (harness: URL, requests: URL) {
         let requestsURL = root.appendingPathComponent("requests.jsonl")
         let harnessURL = root.appendingPathComponent("distill-agent")
@@ -104,6 +105,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 send({"jsonrpc":"2.0", "id":message["id"], "result":result})
             elif method == "_x.ai/session/worker_model/set":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":\(workerResult)})
+            elif method == "_x.ai/session/ultracode/set":
+                send(\(ultracodeReplyJSON))
             elif method in ("session/set_mode", "session/set_config_option"):
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
             elif method == "session/prompt":
@@ -458,6 +461,94 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let methods = try recordedRequests(requestsURL).compactMap { $0["method"] as? String }
         XCTAssertFalse(methods.contains(DistillACPClient.workerModelSetMethod))
         XCTAssertTrue(methods.contains("session/set_model"), "Auto main effort binds through set_model without a capability flag")
+    }
+
+    private func ultracodeSets(_ url: URL) throws -> [Bool] {
+        try recordedRequests(url)
+            .filter { $0["method"] as? String == DistillACPClient.ultracodeSetMethod }
+            .compactMap { ($0["params"] as? [String: Any])?["enabled"] as? Bool }
+    }
+
+    func test_ultracodeIsAppliedOnlyOnChange_becauseTurnsMustNotResendUnchangedMode() async throws {
+        // WHY: Ultracode is session state in Distill; the host sends it only when the thread flag differs from the ACP session.
+        let root = try makeTempRoot("distill-acp-ultracode")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root, initializeCapabilities: "{}", workerResult: "{}")
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let threadID = AgentThreadID()
+        func request(_ ultracode: Bool, providerThreadId: String? = nil) -> AgentRunRequest {
+            AgentRunRequest(
+                threadId: threadID, provider: .distill, model: "grok-4.6", cwd: root.path, prompt: "Go",
+                providerThreadId: providerThreadId, distillUltracode: ultracode
+            )
+        }
+        let first = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(request(false)) { first.append($0) }
+        let firstFinished = try await first.waitForFinish()
+        XCTAssertEqual(try ultracodeSets(requestsURL), [], "off on a fresh session sends nothing")
+
+        var last = firstFinished.providerThreadId
+        for flag in [true, true, false, false] {
+            let box = DistillACPAdapterEventBox()
+            _ = try await adapter.sendTurn(request(flag, providerThreadId: last)) { box.append($0) }
+            last = try await box.waitForFinish().providerThreadId
+        }
+        XCTAssertEqual(try ultracodeSets(requestsURL), [true, false])
+    }
+
+    func test_ultracodeOnFreshSessionIsSentBeforePrompt() async throws {
+        let root = try makeTempRoot("distill-acp-ultracode-first")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root, initializeCapabilities: "{}", workerResult: "{}")
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: root.path,
+                            prompt: "Go", distillUltracode: true)
+        ) { events.append($0) }
+        _ = try await events.waitForFinish()
+        let methods = try recordedRequests(requestsURL).compactMap { $0["method"] as? String }
+        XCTAssertEqual(try ultracodeSets(requestsURL), [true])
+        let setIndex = try XCTUnwrap(methods.firstIndex(of: DistillACPClient.ultracodeSetMethod))
+        let promptIndex = try XCTUnwrap(methods.firstIndex(of: "session/prompt"))
+        XCTAssertLessThan(setIndex, promptIndex)
+    }
+
+    func test_ultracodeMethodNotFoundDoesNotFailTurn_becauseOlderDistillLacksIt() async throws {
+        let root = try makeTempRoot("distill-acp-ultracode-old")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root, initializeCapabilities: "{}", workerResult: "{}",
+            ultracodeReplyJSON: #"{"jsonrpc":"2.0","id":message["id"],"error":{"code":-32601,"message":"method not found"}}"#
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: root.path,
+                            prompt: "Go", distillUltracode: true)
+        ) { events.append($0) }
+        let finished = try await events.waitForFinish()
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertEqual(try ultracodeSets(requestsURL), [true])
+    }
+
+    func test_clientSetUltracodeSendsSessionAndEnabled() async throws {
+        let root = try makeTempRoot("distill-acp-ultracode-wire")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root, initializeCapabilities: "{}", workerResult: "{}")
+        let client = try DistillACPClient(binary: harness.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        let on = try await client.setUltracode(sessionId: "s1", enabled: true)
+        XCTAssertTrue(on)
+        let params = try recordedRequests(requestsURL)
+            .filter { $0["method"] as? String == "_x.ai/session/ultracode/set" }
+            .compactMap { $0["params"] as? [String: Any] }
+        XCTAssertEqual(params.first?["sessionId"] as? String, "s1")
+        XCTAssertEqual(params.first?["enabled"] as? Bool, true)
     }
 
     func test_selectedModelRunsTurnsAndResumesOnTheSameACPThread() async throws {

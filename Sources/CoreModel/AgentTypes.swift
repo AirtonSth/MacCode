@@ -432,6 +432,8 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
     public var distillMainEffortSelection: AgentEffortSelection?
     /// Nil means Auto for a selected Reasoning model and Off when no model is selected.
     public var distillReasoningEffortSelection: AgentEffortSelection?
+    /// Distill session-level Ultracode orchestration mode; independent of effort.
+    public var distillUltracode: Bool
 
     public var effectiveModel: String {
         let custom = customModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -445,7 +447,8 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
         reasoningEffort: AgentReasoningEffort = .medium,
         serviceTier: AgentServiceTier = .auto,
         distillMainEffortSelection: AgentEffortSelection? = nil,
-        distillReasoningEffortSelection: AgentEffortSelection? = nil
+        distillReasoningEffortSelection: AgentEffortSelection? = nil,
+        distillUltracode: Bool = false
     ) {
         self.provider = provider
         self.modelId = modelId
@@ -454,6 +457,24 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
         self.serviceTier = serviceTier
         self.distillMainEffortSelection = distillMainEffortSelection
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
+        self.distillUltracode = distillUltracode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case provider, modelId, customModelId, reasoningEffort, serviceTier
+        case distillMainEffortSelection, distillReasoningEffortSelection, distillUltracode
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try c.decode(AgentProvider.self, forKey: .provider)
+        modelId = try c.decode(String.self, forKey: .modelId)
+        customModelId = try c.decodeIfPresent(String.self, forKey: .customModelId)
+        reasoningEffort = try c.decode(AgentReasoningEffort.self, forKey: .reasoningEffort)
+        serviceTier = try c.decode(AgentServiceTier.self, forKey: .serviceTier)
+        distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
+        distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
+        distillUltracode = try c.decodeIfPresent(Bool.self, forKey: .distillUltracode) ?? false
     }
 }
 
@@ -699,6 +720,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     /// Distill role-specific effort choices. Nil preserves legacy request behavior.
     public let distillMainEffortSelection: AgentEffortSelection?
     public let distillReasoningEffortSelection: AgentEffortSelection?
+    /// Distill Ultracode mode for this turn's session.
+    public let distillUltracode: Bool
     public let serviceTier: AgentServiceTier
     public let interactionMode: AgentInteractionMode
     public let providerBinary: String?
@@ -742,6 +765,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         reasoningModel: String? = nil,
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
+        distillUltracode: Bool = false,
         serviceTier: AgentServiceTier = .auto,
         interactionMode: AgentInteractionMode = .default,
         providerBinary: String? = nil,
@@ -767,6 +791,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.reasoningModel = reasoningModel
         self.distillMainEffortSelection = distillMainEffortSelection
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
+        self.distillUltracode = distillUltracode
         self.serviceTier = serviceTier
         self.interactionMode = interactionMode
         self.providerBinary = providerBinary
@@ -779,7 +804,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, reasoningModel, distillMainEffortSelection, distillReasoningEffortSelection, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
+        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, reasoningModel, distillMainEffortSelection, distillReasoningEffortSelection, distillUltracode, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
     }
 
     public init(from decoder: Decoder) throws {
@@ -799,6 +824,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         reasoningModel = try c.decodeIfPresent(String.self, forKey: .reasoningModel)
         distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
+        distillUltracode = try c.decodeIfPresent(Bool.self, forKey: .distillUltracode) ?? false
         serviceTier = try c.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         interactionMode = try c.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode) ?? .default
         providerBinary = try c.decodeIfPresent(String.self, forKey: .providerBinary)
@@ -824,6 +850,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
             && lhs.reasoningModel == rhs.reasoningModel
             && lhs.distillMainEffortSelection == rhs.distillMainEffortSelection
             && lhs.distillReasoningEffortSelection == rhs.distillReasoningEffortSelection
+            && lhs.distillUltracode == rhs.distillUltracode
             && lhs.serviceTier == rhs.serviceTier
             && lhs.interactionMode == rhs.interactionMode
             && lhs.providerBinary == rhs.providerBinary
