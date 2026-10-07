@@ -266,55 +266,56 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(suggestions.first?.subtitle, "Grok Team skill")
     }
 
-    func test_grokProviderSnapshotUsesACPNegotiatedModesAndCapabilities() async throws {
+    func test_distillProviderSnapshotUsesACPNegotiatedModesAndCapabilities() async throws {
+        // WHY: the Source picker must offer exactly what the signed-in harness
+        // negotiated over ACP (models, Plan, permission modes), not the static
+        // catalog. Distill is the only shipped provider; Grok's snapshot now
+        // uses the static catalog, so this contract is pinned on Distill.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let fakeGrok = dir.appendingPathComponent("fake-grok")
+        let fakeDistill = dir.appendingPathComponent("fake-distill")
         try #"""
         #!/bin/sh
         if [ "$1" = "--version" ]; then
-          printf 'grok 9.9.9\n'
+          printf 'distill 9.9.9\n'
           exit 0
         fi
-        if [ "$1" = "models" ]; then
-          printf 'You are logged in with test\n'
-          exit 0
-        fi
-        if [ "$1" = "agent" ] && [ "$2" = "stdio" ]; then
+        if [ "$1" = "agent" ]; then
           while IFS= read -r line; do
             id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
             if printf '%s' "$line" | grep -q '"method":"initialize"'; then
               printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"sessionCapabilities":{}}}}\n' "$id"
             elif printf '%s' "$line" | grep -q '"method":"session.*new"'; then
-              printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"snapshot-session","models":{"currentModelId":"grok-negotiated","availableModels":[{"modelId":"grok-negotiated","name":"Grok Negotiated"}]},"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"},{"id":"bypassPermissions","name":"Full access"}]}}}\n' "$id"
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"snapshot-session","models":{"currentModelId":"distill-negotiated","availableModels":[{"modelId":"distill-negotiated","name":"Distill Negotiated"}]},"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"},{"id":"bypassPermissions","name":"Full access"}]}}}\n' "$id"
             fi
           done
           exit 0
         fi
         exit 1
-        """#.write(to: fakeGrok, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeGrok.path)
+        """#.write(to: fakeDistill, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeDistill.path)
 
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
-        try ctx.settingsRepo.set("cli.grok.path", fakeGrok.path)
+        try ctx.settingsRepo.set("cli.distill.path", fakeDistill.path)
 
         let snapshots = await router.listAgentProviderSnapshots()
-        let grok = try XCTUnwrap(snapshots.first { $0.provider == .grok })
+        let distill = try XCTUnwrap(snapshots.first { $0.provider == .distill })
 
-        XCTAssertEqual(grok.models.map(\.id), ["grok-negotiated"])
-        XCTAssertEqual(grok.interactionModes, [.default, .plan])
-        XCTAssertEqual(grok.effectivePermissionModes, [.supervised, .fullAccess])
-        XCTAssertTrue(grok.effectiveCapabilities.supportsPlanReview)
-        XCTAssertTrue(grok.effectiveCapabilities.supportsAttachments)
-        XCTAssertTrue(grok.effectiveCapabilities.supportsApprovals)
-        XCTAssertFalse(grok.effectiveCapabilities.supportsUserInput)
-        XCTAssertTrue(grok.slashCommands.contains("/plan"))
-        XCTAssertEqual(grok.modelDiscoverySource, .live)
-        XCTAssertFalse(grok.modelListIsFallback)
-        XCTAssertNotNil(grok.modelDiscoveryCacheKey,
+        XCTAssertEqual(distill.models.map(\.id), ["distill-negotiated"])
+        XCTAssertEqual(distill.interactionModes, [.default, .plan])
+        XCTAssertEqual(distill.effectivePermissionModes, [.supervised, .fullAccess],
+                       "only the negotiated permission modes may be offered (acceptEdits was not advertised)")
+        XCTAssertTrue(distill.effectiveCapabilities.supportsPlanReview)
+        XCTAssertTrue(distill.effectiveCapabilities.supportsAttachments)
+        XCTAssertTrue(distill.effectiveCapabilities.supportsApprovals)
+        XCTAssertFalse(distill.effectiveCapabilities.supportsUserInput)
+        XCTAssertTrue(distill.slashCommands.contains("/plan"))
+        XCTAssertEqual(distill.modelDiscoverySource, .live)
+        XCTAssertFalse(distill.modelListIsFallback)
+        XCTAssertNotNil(distill.modelDiscoveryCacheKey,
                         "the snapshot must retain the opaque binary/account discovery identity")
     }
 
@@ -1990,7 +1991,10 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         // WHY: a host terminal callback can run before a follow-up is enqueued
         // while the native provider session remains live. The enqueue path must
         // arm the one waiter that the earlier empty-queue callback skipped.
-        for provider in AgentProvider.allCases {
+        // Distill is the only shipped provider. Its adapter keeps the session
+        // live until the provider acknowledges the Stop, and it names its
+        // thread when the prompt is accepted; the fixture models both.
+        for provider in [AgentProvider.distill] {
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -2006,8 +2010,13 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
             let router = AppCommandRouter(context: ctx)
             ctx.router = router
-            let runner = DelayedCancelQueueRunner(provider: provider, cancellationDelay: nil)
-            ctx.coordinator.replaceProvider(provider, runner: runner)
+            rememberSignedInSnapshot(provider, router: router)
+            let runner = DelayedCancelQueueRunner(
+                provider: provider,
+                cancellationDelay: nil,
+                reportsProviderThreadAtStart: true
+            )
+            ctx.coordinator.replaceProviderAdapter(provider, adapter: TerminalRetiringOneShotAdapter(runner: runner))
             let workspace = try router.createWorkspace(
                 name: "late-enqueue-\(provider.rawValue)",
                 cwd: workspaceDir.path
@@ -2066,6 +2075,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             await failures.waitForCount(1)
             XCTAssertEqual(failures.count, 1,
                            "\(provider.rawValue) one waiter may publish only one delayed-idle status")
+            XCTAssertTrue(failures.failureMessages.allSatisfy { $0.hasPrefix("Provider is still stopping.") },
+                          "the one failure must be the delayed-stop status, not a dispatch error: \(failures.failureMessages)")
             runner.finishRun(ordinal: 1, status: .cancelled)
             await runner.waitForStartCount(2)
             await drained.waitForCount(1)
@@ -3866,7 +3877,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
     func test_hundredLateIdleWaitersScheduleOneDeadlineAndZeroPeriodicPolls() async throws {
         // WHY: queue recovery is provider-idle driven. One hundred live threads
         // may each own one warning deadline, but must schedule zero periodic
-        // MainActor/SQLite poll wakeups.
+        // MainActor/SQLite poll wakeups. Distill is the only shipped provider.
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -3880,17 +3891,22 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         ctx.queueDrainProviderIdleTimeout = 1_000
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
-        let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
-        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let runner = DelayedCancelQueueRunner(provider: .distill, cancellationDelay: nil)
+        ctx.coordinator.replaceProvider(.distill, runner: runner)
         let sleeper = QueueDrainTestSleeper()
         ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
-        let workspace = try router.createWorkspace(name: "causal-idle-scale", cwd: workspaceDir.path)
+        // A workspace holds at most maxThreadsPerWorkspace (20) threads, so the
+        // hundred live threads are spread over workspaces of that size.
+        var workspace = try router.createWorkspace(name: "causal-idle-scale-0", cwd: workspaceDir.path)
         var threads: [AgentThread] = []
         for index in 1...100 {
+            if (index - 1) % AgentThreadRepository.maxThreadsPerWorkspace == 0, index > 1 {
+                workspace = try router.createWorkspace(name: "causal-idle-scale-\(index)", cwd: workspaceDir.path)
+            }
             let thread = try router.createAgentThread(
                 workspace: workspace.id,
                 title: "causal \(index)",
-                provider: .claude,
+                provider: .distill,
                 model: "test-model",
                 permissionMode: .supervised,
                 reasoningEffort: .medium
@@ -3898,7 +3914,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             threads.append(thread)
             _ = try await ctx.coordinator.startRun(AgentRunRequest(
                 threadId: thread.id,
-                provider: .claude,
+                provider: .distill,
                 model: "test-model",
                 cwd: workspaceDir.path,
                 prompt: "long turn \(index)"
@@ -5857,6 +5873,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         // WHY: a failed terminal transaction is not provenance forever. Its
         // exact attempt marker must retire on the failure return, allowing a
         // separately durable terminal row to release ownership exactly once.
+        // Distill is the only shipped provider; a signed-in snapshot lets the
+        // send reach the fixture runner.
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("t005-terminal-attempt-marker-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -5866,14 +5884,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let context = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: context)
         context.router = router
-        let runner = ControlledBotHandoffRunner(provider: .codex)
-        context.coordinator.replaceProvider(.codex, runner: runner)
+        rememberSignedInSnapshot(.distill, router: router)
+        let runner = ControlledBotHandoffRunner(provider: .distill)
+        context.coordinator.replaceProvider(.distill, runner: runner)
         let workspace = try router.createWorkspace(name: "t005 terminal marker", cwd: workspaceDirectory.path)
         let thread = try router.createAgentThread(
             workspace: workspace.id,
             title: "T005 terminal marker",
-            provider: .codex,
-            model: "gpt-5.5",
+            provider: .distill,
+            model: "test-model",
             permissionMode: .supervised,
             reasoningEffort: .medium
         )
@@ -5889,9 +5908,11 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let finishes = T005RunFinishRecorder(targetRunID: runID)
         context.coordinator.addObserver(finishes)
         defer { context.coordinator.removeObserver(finishes) }
+        // The terminal graph stamps the existing run row (`stampTerminal`
+        // UPDATE), so the forced failure and the step gate target that write.
         try context.db.execute("""
             CREATE TRIGGER fail_t005_terminal_graph
-            BEFORE INSERT ON agent_runs
+            BEFORE UPDATE OF status ON agent_runs
             WHEN NEW.id = '\(runID.value.uuidString)' AND NEW.status = 'completed'
             BEGIN
                 SELECT RAISE(ABORT, 'forced terminal graph failure');
@@ -5901,7 +5922,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
         let writeGate = T005SynchronousStepGate()
         context.db.beforeStatementStepForTesting = { sql in
-            guard sql.contains("INSERT INTO agent_runs") else { return }
+            guard sql.contains("UPDATE agent_runs"), sql.contains("terminal_reason") else { return }
             writeGate.enterAndWait()
         }
         defer {
