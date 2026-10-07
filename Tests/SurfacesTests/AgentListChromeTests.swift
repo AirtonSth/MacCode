@@ -74,7 +74,8 @@ final class AgentListChromeTests: XCTestCase {
         XCTAssertTrue(dest.contains("bots.scheduleTasks.globalActive"))
 
         let destProvider = try XCTUnwrap(dest.range(of: "bots.scheduleTasks.editor.provider"))
-        let destAuto = try XCTUnwrap(dest.range(of: "if spec.routingMode == .auto"))
+        // Distill routes manually, so the dest Auto model row is gated on a non-Distill provider.
+        let destAuto = try XCTUnwrap(dest.range(of: "if spec.provider != .distill && spec.routingMode == .auto"))
         XCTAssertLessThan(destProvider.lowerBound, destAuto.lowerBound)
 
         let agentProvider = try XCTUnwrap(agent.range(of: "scheduledTasks.editor.provider"))
