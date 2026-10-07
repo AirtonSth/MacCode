@@ -1166,9 +1166,6 @@ public enum Schema {
                OR state = 'compensated'
                OR state = 'abandoned';
         """),
-        SchemaStep(84, """
-        ALTER TABLE agent_threads ADD COLUMN reasoning_model TEXT;
-        """),
         // Durable human -> RCW1 disclosure belongs to the retained user message,
         // not the evictable provider stream. The FK keeps storage bounded by the
         // existing 100-message transcript window and removes rows on prune/delete.
@@ -1793,6 +1790,9 @@ public enum Schema {
         SchemaStep(83, """
         CREATE INDEX IF NOT EXISTS idx_agent_threads_workspace_updated
             ON agent_threads(workspace_id, updated_at DESC, id DESC);
+        """),
+        SchemaStep(84, """
+        ALTER TABLE agent_threads ADD COLUMN reasoning_model TEXT;
         """),
         SchemaStep(scheduledTaskModelColumnsSchemaVersion, scheduledTaskModelColumnsMigrationSQL),
         SchemaStep(threadActorSchemaVersion, """

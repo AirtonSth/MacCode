@@ -171,6 +171,30 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         _ = try st.step()
     }
 
+    /// Pre-v84 databases have no agent_threads.reasoning_model (nor the v86
+    /// actor columns), so the head `AgentThreadRepository.upsert` cannot seed
+    /// them. Insert only the columns an old-version schema already owns.
+    private func insertPreReasoningModelThread(_ db: SQLiteDB, _ thread: AgentThread) throws {
+        let st = try db.prepare("""
+            INSERT INTO agent_threads(
+                id, project_id, workspace_id, title, provider, provider_instance_id,
+                model, provider_thread_id, status, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """)
+        try st.bind(1, thread.id.value.uuidString)
+        try st.bind(2, thread.projectId?.value.uuidString)
+        try st.bind(3, thread.workspaceId?.value.uuidString)
+        try st.bind(4, thread.title)
+        try st.bind(5, thread.provider.rawValue)
+        try st.bind(6, thread.providerInstanceId ?? thread.provider.rawValue)
+        try st.bind(7, thread.model)
+        try st.bind(8, thread.providerThreadId)
+        try st.bind(9, thread.status.rawValue)
+        try st.bind(10, ISO8601DateFormatter().string(from: thread.createdAt))
+        try st.bind(11, ISO8601DateFormatter().string(from: thread.updatedAt))
+        _ = try st.step()
+    }
+
     /// Build a DB that looks like "the app was at version n" by applying only the
     /// first n steps, then migrate to head and return the DB.
     private func migrateFromVersion(n: Int) throws -> SQLiteDB {
@@ -462,8 +486,8 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         // support (61), bounded maintenance lookup support (62), the
         // durable RCW1 request/response/display rows (67-69), Bot
         // control-plane identity (70-71), content-free request
-        // selection receipts (72-74), and Bot context receipts (75).
-        // Versions 63-66 are retired.
+        // selection receipts (72-74), Bot context receipts (75), and the
+        // later steps through head (76-89). Versions 63-66 are retired.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
@@ -490,9 +514,15 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             80,
             81,
             82,
-            83
+            83,
+            84,
+            85,
+            86,
+            87,
+            88,
+            89
         ])
-        XCTAssertEqual(Schema.currentVersion, 83)
+        XCTAssertEqual(Schema.currentVersion, 89)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
@@ -508,7 +538,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 71 })
         XCTAssertEqual(try maxVersion(db), 71)
         let thread = AgentThread(title: "v71-receipts", provider: .codex, model: "gpt-test")
-        try AgentThreadRepository(db: db).upsert(thread)
+        try insertPreReasoningModelThread(db, thread)
         let run = AgentRun(
             threadId: thread.id,
             provider: .codex,
@@ -519,7 +549,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
 
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(Schema.currentVersion, 83)
+        XCTAssertEqual(Schema.currentVersion, 89)
 
         XCTAssertEqual(try rowCount(db, table: "token_saver_run_winner_receipts"), 0,
                        "v72 must not backfill historical winners")
@@ -600,10 +630,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.steps.filter { $0.version == 71 }.count, 1,
             "HEAD/origin production last published step is 71"
         )
-        XCTAssertEqual(Schema.currentVersion, 83)
+        XCTAssertEqual(Schema.currentVersion, 89)
         XCTAssertEqual(
-            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83],
-            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs; v82 indexes audit_log(action, id); v83 indexes agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list"
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89],
+            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs; v82 indexes audit_log(action, id); v83 indexes agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list; v84 adds agent_threads.reasoning_model; v85 adds scheduled-task model fields; v86 adds thread actor/execution target; v87 adds thread guest_runtime; v88 adds Bot teams and group conversations; v89 adds bot_conversation_routing"
         )
         let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
         XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))
@@ -614,7 +644,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 71 })
         XCTAssertEqual(try maxVersion(db), 71, "HEAD/origin production baseline must stop at 71")
         let thread = AgentThread(title: "v72-rcs1-contract", provider: .codex, model: "gpt-test")
-        try AgentThreadRepository(db: db).upsert(thread)
+        try insertPreReasoningModelThread(db, thread)
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
         try insertPreTerminalReasonRun(db, run)
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 72 })
@@ -672,7 +702,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 72 })
         XCTAssertEqual(try maxVersion(db), 72)
         let thread = AgentThread(title: "v73-rcs1", provider: .codex, model: "gpt-test")
-        try AgentThreadRepository(db: db).upsert(thread)
+        try insertPreReasoningModelThread(db, thread)
         let humanRun = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
         let rcw1Run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
         try insertPreTerminalReasonRun(db, humanRun)
@@ -772,7 +802,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 73 })
         XCTAssertEqual(try maxVersion(db), 73)
         let thread = AgentThread(title: "v74-context", provider: .codex, model: "gpt-test")
-        try AgentThreadRepository(db: db).upsert(thread)
+        try insertPreReasoningModelThread(db, thread)
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test", status: .pending)
         try insertPreTerminalReasonRun(db, run)
         try db.execute("""
@@ -1408,7 +1438,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         let workspaceID = WorkspaceID()
         let repo = AgentThreadRepository(db: db)
         for index in 0..<64 {
-            try repo.upsert(AgentThread(
+            try insertPreReasoningModelThread(db, AgentThread(
                 workspaceId: workspaceID,
                 title: "rail-\(index)",
                 provider: .codex,
@@ -1661,7 +1691,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 76 })
         XCTAssertEqual(try maxVersion(db), 76)
         let thread = AgentThread(title: "v77-reason", provider: .codex, model: "gpt-test")
-        try AgentThreadRepository(db: db).upsert(thread)
+        try insertPreReasoningModelThread(db, thread)
         let runId = UUID().uuidString
         try db.execute("""
             INSERT INTO agent_runs(id, thread_id, provider, model, status, started_at, finished_at)
@@ -1736,7 +1766,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 78 })
         XCTAssertEqual(try maxVersion(db), 78)
         let thread = AgentThread(title: "v79-host-proof", provider: .codex, model: "gpt-test")
-        try AgentThreadRepository(db: db).upsert(thread)
+        try insertPreReasoningModelThread(db, thread)
         let run = AgentRun(threadId: thread.id, provider: .codex, model: "gpt-test")
         try AgentRunRepository(db: db).upsert(run)
         let proof = AssistantItemHostAttestation(
