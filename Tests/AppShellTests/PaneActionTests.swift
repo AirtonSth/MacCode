@@ -1737,9 +1737,11 @@ final class PaneActionTests: XCTestCase {
         vm.setDiffIgnoreWhitespace(true)
         vm.setCodexPath("/usr/bin/env")
         vm.setClaudePath("/usr/bin/env")
-        AgentCustomModelStore(repo: ctx.settingsRepo).add("gpt-5.5-experimental", provider: .codex)
+        // Custom model IDs are edited only for selectable providers (Distill-only);
+        // legacy providers are read-only and no longer listed in Settings.
+        AgentCustomModelStore(repo: ctx.settingsRepo).add("distill-experimental", provider: .distill)
         vm.reload()
-        vm.setCustomModel(provider: .codex, index: 0, value: "gpt-5.5-custom")
+        vm.setCustomModel(provider: .distill, index: 0, value: "distill-custom")
 
         let reloaded = SettingsViewModel(context: ctx)
         XCTAssertTrue(reloaded.appSettings.diffWordWrap,
@@ -1752,11 +1754,11 @@ final class PaneActionTests: XCTestCase {
                        "Settings must expose and persist the executable path used to launch Claude")
         XCTAssertTrue(reloaded.codexAvailable && reloaded.claudeAvailable,
                       "valid configured CLI paths must be reflected in diagnostics")
-        XCTAssertEqual(reloaded.customModelsByProvider[.codex], ["gpt-5.5-custom"],
+        XCTAssertEqual(reloaded.customModelsByProvider[.distill], ["distill-custom"],
                        "Settings must edit custom model IDs saved from the Agent model menu so they persist until explicitly removed")
 
-        reloaded.removeCustomModel(provider: .codex, index: 0)
-        XCTAssertEqual(SettingsViewModel(context: ctx).customModelsByProvider[.codex], [],
+        reloaded.removeCustomModel(provider: .distill, index: 0)
+        XCTAssertEqual(SettingsViewModel(context: ctx).customModelsByProvider[.distill], [],
                        "Settings must remove custom model IDs instead of leaving stale rows in future Agent model menus")
     }
 
