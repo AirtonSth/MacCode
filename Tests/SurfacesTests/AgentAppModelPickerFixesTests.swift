@@ -59,10 +59,6 @@ final class AgentAppModelPickerFixesTests: XCTestCase {
                              supportsCustomModel: true)
     }
 
-    private var claudeAliasTrio: [AgentModelDescriptor] {
-        [claudeModel("opus"), claudeModel("sonnet"), claudeModel("haiku")]
-    }
-
     // MARK: F8 + F33 — loadModels must not rewrite a pin against a fallback list
 
     func test_loadModels_fallbackListNeverRewritesPinnedModel() async throws {
@@ -124,22 +120,35 @@ final class AgentAppModelPickerFixesTests: XCTestCase {
     }
 
     // MARK: F9 — snapshot apply keeps the pin and explains it
+    // Distill is the selectable provider, and its snapshots are applied as
+    // delivered (no live catalog re-probe), so these stay hermetic.
+
+    private func distillModel(_ id: String) -> AgentModelDescriptor {
+        AgentModelDescriptor(id: id, label: id, provider: .distill,
+                             supportsReasoning: true, supportsCustomModel: true)
+    }
+
+    private var distillFallbackTrio: [AgentModelDescriptor] {
+        [distillModel("grok-4.6"), distillModel("grok-4.5"), distillModel("grok-code-fast")]
+    }
 
     func test_snapshotApply_keepsPinnedModelAndSurfacesUnavailableNotice() async throws {
-        // F9: relaunch offline — the alias-only fallback snapshot replaces the
+        // F9: relaunch offline — the built-in fallback snapshot replaces the
         // live list. The thread's pinned model must survive (it would be
         // persisted and run otherwise) and the mismatch must be explained.
         let vm = try makeVM()
-        vm.provider = .claude
-        vm.providerInstanceId = "claude-cli"
-        vm.model = "claude-fable-5"
-        let trio = claudeAliasTrio
-        vm.providerSnapshotLoader = { [AgentProviderSnapshotFactory.snapshot(provider: .claude, models: trio)] }
+        vm.provider = .distill
+        vm.providerInstanceId = "distill-acp"
+        vm.model = "claude/claude-fable-5"
+        let trio = distillFallbackTrio
+        vm.providerSnapshotLoader = { [AgentProviderSnapshotFactory.snapshot(
+            provider: .distill, models: trio, modelDiscoverySource: .builtInFallback
+        )] }
         await vm.loadProviderSnapshots()
 
-        XCTAssertEqual(vm.model, "claude-fable-5",
-                       "F9: applying an alias-only fallback snapshot must not swap the pinned model to the first alias")
-        XCTAssertEqual(vm.selectedModelUnavailableNotice, "claude-fable-5 is not in the current model list",
+        XCTAssertEqual(vm.model, "claude/claude-fable-5",
+                       "F9: applying a fallback snapshot must not swap the pinned model to the first listed model")
+        XCTAssertEqual(vm.selectedModelUnavailableNotice, "claude/claude-fable-5 is not in the current model list",
                        "the kept pin must be surfaced as missing from the current list, not silently unchecked")
     }
 
@@ -147,13 +156,13 @@ final class AgentAppModelPickerFixesTests: XCTestCase {
         // The one legitimate reset: a provider switch clears the model, and
         // the next snapshot apply must fill in a valid selection.
         let vm = try makeVM()
-        vm.setProvider(.claude)
+        vm.setProvider(.distill)
         XCTAssertEqual(vm.model, "", "setProvider clears the model before lists load")
-        let trio = claudeAliasTrio
-        vm.providerSnapshotLoader = { [AgentProviderSnapshotFactory.snapshot(provider: .claude, models: trio)] }
+        let trio = distillFallbackTrio
+        vm.providerSnapshotLoader = { [AgentProviderSnapshotFactory.snapshot(provider: .distill, models: trio)] }
         await vm.loadProviderSnapshots()
 
-        XCTAssertEqual(vm.model, "opus",
+        XCTAssertEqual(vm.model, "grok-4.6",
                        "an empty selection (post provider switch) must be filled from the snapshot list")
         XCTAssertNil(vm.selectedModelUnavailableNotice,
                      "a selection taken from the list needs no unavailable notice")
@@ -163,17 +172,21 @@ final class AgentAppModelPickerFixesTests: XCTestCase {
         // B8 backstop on the snapshot path: an id that another provider's
         // snapshot proves belongs elsewhere must be replaced, not kept.
         let vm = try makeVM()
-        vm.provider = .claude
-        vm.providerInstanceId = "claude-cli"
+        vm.provider = .distill
+        vm.providerInstanceId = "distill-acp"
         vm.model = "gpt-5.5"
-        let trio = claudeAliasTrio
-        let codexSnapshot = AgentProviderSnapshotFactory.snapshot(provider: .codex, models: [codexModel("gpt-5.5")])
+        let trio = distillFallbackTrio
+        // Declare the source so catalog verification never probes a real codex binary.
+        let codexSnapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex, models: [codexModel("gpt-5.5")], modelDiscoverySource: .live
+        )
         vm.providerSnapshotLoader = {
-            [AgentProviderSnapshotFactory.snapshot(provider: .claude, models: trio), codexSnapshot]
+            [AgentProviderSnapshotFactory.snapshot(provider: .distill, models: trio), codexSnapshot]
         }
         await vm.loadProviderSnapshots()
 
-        XCTAssertEqual(vm.model, "opus",
+        XCTAssertEqual(vm.provider, .distill, "the Distill selection must stay put")
+        XCTAssertEqual(vm.model, "grok-4.6",
                        "B8: an id that provably belongs to another provider must not survive the snapshot apply")
     }
 
@@ -182,16 +195,24 @@ final class AgentAppModelPickerFixesTests: XCTestCase {
     func test_startupSnapshotPath_populatesFallbackSignal() async throws {
         // F10: the snapshot pipeline drops the live/fallback signal, so before
         // the fix the "Using built-in defaults" warning and its Refresh row
-        // could never appear on the normal startup path.
+        // could never appear on the normal startup path. The Distill fetch
+        // must come from Distill discovery: an unreachable binary falls back
+        // to DistillRunner's built-in list, which is exactly the snapshot shown.
         let vm = try makeVM()
-        let hardcoded = await CodexRunner().listModels()
-        vm.providerSnapshotLoader = { [AgentProviderSnapshotFactory.snapshot(provider: .codex, models: hardcoded)] }
+        vm.provider = .distill
+        vm.providerInstanceId = "distill-acp"
+        let missingBinary = NSTemporaryDirectory() + "rc2-missing-distill-" + UUID().uuidString
+        vm.providerLaunchConfig = { _, _ in (binary: missingBinary, environment: [:]) }
+        let builtIn = DistillRunner.listModels(installedVersion: nil)
+        vm.providerSnapshotLoader = { [AgentProviderSnapshotFactory.snapshot(provider: .distill, models: builtIn)] }
 
         vm.refreshProviderSnapshotsInBackground()
 
         await waitAsync("startup path surfaces the built-in-defaults signal") {
-            vm.availableModelsAreFallback && vm.displayedModelListIsFallback
+            vm.provider == .distill && vm.availableModelsAreFallback && vm.displayedModelListIsFallback
         }
+        XCTAssertTrue(vm.availableModels.allSatisfy { $0.provider == .distill },
+                      "the Distill VM fetch must never be replaced by another provider's catalog")
     }
 
     func test_fallbackNotice_hiddenWhenSnapshotBringsDifferentLiveList() async throws {

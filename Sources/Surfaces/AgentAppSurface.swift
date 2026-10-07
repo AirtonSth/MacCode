@@ -5069,6 +5069,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 ).listModelsResult()
                 m = result.models
                 isFallback = result.isFallback
+            } else if provider == .distill {
+                // Distill owns its catalog: falling through to Codex discovery
+                // replaced the Distill fetch with Codex ids and let an installed
+                // Codex CLI decide the Distill built-in-defaults signal.
+                let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
+                let result = await DistillACPAdapter(
+                    binaryNameOverride: launchConfig?.binary,
+                    discoveryCwd: cwd,
+                    discoveryEnvironment: launchConfig?.environment ?? [:],
+                    discoveryRunAsUser: runAsUser
+                ).listModelsResult()
+                m = result.models
+                isFallback = result.isFallback
             } else {
                 let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
                 let result = await CodexAppServerModelDiscovery.listModelsResult(
