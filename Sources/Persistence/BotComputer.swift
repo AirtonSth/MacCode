@@ -38,11 +38,6 @@ public enum BotComputerCatalog: Sendable {
         [observe, act, exec, rebuild, requestUserAction, postScreenshot, requestMacExecution]
     }
 
-    /// Read-only content tools whose (large) results are safe to route through
-    /// the Token Saver distill lane. `observe`/`act` results carry coordinates
-    /// and screen state the bot acts on verbatim — never compressed.
-    public static var distillableToolNames: Set<String> { [exec] }
-
     public static func toolCatalog() -> [[String: Any]] {
         toolNames.map { name in
             [
@@ -58,7 +53,9 @@ public enum BotComputerCatalog: Sendable {
         case observe:
             return "Screenshot the Docker Linux desktop on 127.0.0.1. Returns a PNG. Do not use macos-harness."
         case act:
-            return "Click, type, or press a key on the Docker Linux desktop. Batch at most 24 steps."
+            return "Click, drag, type, or press a key on the Docker Linux desktop "
+                + "(\(BotComputerGuestSpec.screenWidth)x\(BotComputerGuestSpec.screenHeight) pixels). "
+                + "Batch at most 24 steps."
         case exec:
             return "Run a command inside this bot's Linux container. Use this to install packages (apt-get) or edit files. Do not run host docker."
         case rebuild:
@@ -134,13 +131,19 @@ public enum BotComputerCatalog: Sendable {
                 "properties": botID.merging([
                     "steps": [
                         "type": "array",
-                        "description": "Ordered click/type/key steps.",
+                        "description": "Ordered click/drag/type/key steps.",
                         "items": [
                             "type": "object",
                             "properties": [
-                                "action": ["type": "string", "description": "click, type, or key"],
-                                "x": ["type": "integer"],
-                                "y": ["type": "integer"],
+                                "action": [
+                                    "type": "string",
+                                    "enum": ["click", "drag", "type", "key"],
+                                    "description": "click (x, y), drag (x, y to toX, toY), type (text), or key (key).",
+                                ],
+                                "x": ["type": "integer", "description": "Pixels from the left, 0..<\(BotComputerGuestSpec.screenWidth)."],
+                                "y": ["type": "integer", "description": "Pixels from the top, 0..<\(BotComputerGuestSpec.screenHeight)."],
+                                "toX": ["type": "integer", "description": "Drag end x."],
+                                "toY": ["type": "integer", "description": "Drag end y."],
                                 "text": ["type": "string"],
                                 "key": ["type": "string"],
                             ],
@@ -167,6 +170,9 @@ public struct BotComputerPendingAction: Codable, Equatable, Sendable {
     public var reason: String
     /// Manual-action kind or screenshot kind, depending on `kind`.
     public var subkind: String
+    /// When the MCP caller stops waiting for the result. The host refuses to
+    /// apply the action after it, and an exec sizes its guest limit to it.
+    public var deadline: Date?
 
     public init(
         id: String,
@@ -176,7 +182,8 @@ public struct BotComputerPendingAction: Codable, Equatable, Sendable {
         command: String = "",
         threadID: String? = nil,
         reason: String = "",
-        subkind: String = ""
+        subkind: String = "",
+        deadline: Date? = nil
     ) {
         self.id = id
         self.botID = botID
@@ -186,10 +193,11 @@ public struct BotComputerPendingAction: Codable, Equatable, Sendable {
         self.threadID = threadID
         self.reason = reason
         self.subkind = subkind
+        self.deadline = deadline
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, botID, kind, steps, command, threadID, reason, subkind
+        case id, botID, kind, steps, command, threadID, reason, subkind, deadline
     }
 
     public init(from decoder: Decoder) throws {
@@ -202,6 +210,7 @@ public struct BotComputerPendingAction: Codable, Equatable, Sendable {
         threadID = try container.decodeIfPresent(String.self, forKey: .threadID)
         reason = try container.decodeIfPresent(String.self, forKey: .reason) ?? ""
         subkind = try container.decodeIfPresent(String.self, forKey: .subkind) ?? ""
+        deadline = try container.decodeIfPresent(Date.self, forKey: .deadline)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -214,6 +223,7 @@ public struct BotComputerPendingAction: Codable, Equatable, Sendable {
         try container.encodeIfPresent(threadID, forKey: .threadID)
         try container.encode(reason, forKey: .reason)
         try container.encode(subkind, forKey: .subkind)
+        try container.encodeIfPresent(deadline, forKey: .deadline)
     }
 }
 
@@ -372,33 +382,95 @@ public enum BotComputerHost: Sendable {
         notify(pendingNotification)
     }
 
+    public static let expiredMessage =
+        "Not run: the caller had already stopped waiting for this bot computer action."
+
+    /// Applies every pending action in order on the calling thread.
     public static func applyPending(
         store: BotComputerStore,
+        now: () -> Date = Date.init,
         apply: (BotComputerPendingAction) throws -> [String: Any]
     ) throws -> Int {
         var applied = 0
         for item in try store.takePending() {
             applied += 1
-            do {
-                let object = try apply(item)
-                let payload = (try? JSONSerialization.data(withJSONObject: object)).flatMap {
-                    String(data: $0, encoding: .utf8)
-                } ?? "{}"
-                try store.writeResult(
-                    BotComputerActionResult(id: item.id, botID: item.botID, payload: payload, error: "")
-                )
-            } catch {
-                try store.writeResult(
-                    BotComputerActionResult(
-                        id: item.id,
-                        botID: item.botID,
-                        payload: "",
-                        error: String(describing: error)
-                    )
-                )
-            }
+            try applyOne(item, store: store, now: now, apply: apply)
         }
         return applied
+    }
+
+    /// Hands each pending action to its bot's serial lane and returns at once,
+    /// so one bot's long exec or rebuild never holds another bot's actions.
+    public static func dispatchPending(
+        store: BotComputerStore,
+        lanes: BotComputerActionLanes,
+        apply: @escaping @Sendable (BotComputerPendingAction) throws -> [String: Any]
+    ) throws -> Int {
+        let items = try store.takePending()
+        for item in items {
+            lanes.async(botID: item.botID) {
+                try? applyOne(item, store: store, now: Date.init, apply: apply)
+            }
+        }
+        return items.count
+    }
+
+    /// Writes the action's result. An action whose caller already stopped
+    /// waiting is answered with `expiredMessage` and never applied: a click or
+    /// command the agent was told had failed must not land on the desktop later.
+    public static func applyOne(
+        _ item: BotComputerPendingAction,
+        store: BotComputerStore,
+        now: () -> Date = Date.init,
+        apply: (BotComputerPendingAction) throws -> [String: Any]
+    ) throws {
+        if let deadline = item.deadline, now() >= deadline {
+            try store.writeResult(
+                BotComputerActionResult(id: item.id, botID: item.botID, payload: "", error: expiredMessage)
+            )
+            return
+        }
+        do {
+            let object = try apply(item)
+            let payload = (try? JSONSerialization.data(withJSONObject: object)).flatMap {
+                String(data: $0, encoding: .utf8)
+            } ?? "{}"
+            try store.writeResult(
+                BotComputerActionResult(id: item.id, botID: item.botID, payload: payload, error: "")
+            )
+        } catch {
+            try store.writeResult(
+                BotComputerActionResult(
+                    id: item.id,
+                    botID: item.botID,
+                    payload: "",
+                    error: String(describing: error)
+                )
+            )
+        }
+    }
+}
+
+/// One serial queue per bot. A bot's actions keep their order and never race
+/// each other over the bot's single container (provision, rebuild), while
+/// different bots run independently.
+public final class BotComputerActionLanes: @unchecked Sendable {
+    private let label: String
+    private let lock = NSLock()
+    private var queues: [String: DispatchQueue] = [:]
+
+    public init(label: String) {
+        self.label = label
+    }
+
+    public func async(botID: String, _ work: @escaping @Sendable () -> Void) {
+        let queue = lock.withLock {
+            if let existing = queues[botID] { return existing }
+            let created = DispatchQueue(label: "\(label).\(botID)", qos: .utility)
+            queues[botID] = created
+            return created
+        }
+        queue.async(execute: work)
     }
 }
 
@@ -429,6 +501,19 @@ public struct BotComputerService: Sendable {
             store: store,
             callerThreadID: (thread?.isEmpty == false) ? thread : nil
         )
+    }
+
+    /// How long the caller waits for the host to answer an action of `kind`.
+    public func resultWaitSeconds(kind: String) -> TimeInterval {
+        let callerSeconds = timeoutMS / 1000
+        switch kind {
+        case BotComputerCatalog.exec:
+            return max(callerSeconds, BotComputerGuestSpec.execResultWaitSeconds)
+        case BotComputerCatalog.rebuild:
+            return max(callerSeconds, BotComputerGuestSpec.rebuildResultWaitSeconds)
+        default:
+            return callerSeconds
+        }
     }
 
     public func call(name: String, arguments: [String: Any]) throws -> [String: Any] {
@@ -489,6 +574,8 @@ public struct BotComputerService: Sendable {
                 action: action,
                 x: item["x"] as? Int,
                 y: item["y"] as? Int,
+                toX: item["toX"] as? Int,
+                toY: item["toY"] as? Int,
                 text: item["text"] as? String,
                 key: item["key"] as? String
             )
@@ -504,9 +591,7 @@ public struct BotComputerService: Sendable {
         reason: String = "",
         subkind: String = ""
     ) throws -> [String: Any] {
-        let waitMS = (kind == BotComputerCatalog.exec || kind == BotComputerCatalog.rebuild)
-            ? max(timeoutMS, 180_000)
-            : timeoutMS
+        let deadline = Date().addingTimeInterval(max(0.2, resultWaitSeconds(kind: kind)))
         let pending = BotComputerPendingAction(
             id: UUID().uuidString.lowercased(),
             botID: callerBotID.value.uuidString.lowercased(),
@@ -515,10 +600,10 @@ public struct BotComputerService: Sendable {
             command: command,
             threadID: callerThreadID,
             reason: reason,
-            subkind: subkind
+            subkind: subkind,
+            deadline: deadline
         )
         try BotComputerHost.request(store: store, action: pending)
-        let deadline = Date().addingTimeInterval(max(0.2, waitMS / 1000))
         while Date() < deadline {
             if let result = try store.takeResult(id: pending.id) {
                 if !result.error.isEmpty {

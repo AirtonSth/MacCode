@@ -20,6 +20,88 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertThrowsError(try unknown.containerExists(name: "remotecode-bot-exact"))
     }
 
+    func test_inspectReadsTheHomeBindSource_soAContainerOfAnotherAppIsToldApart() throws {
+        // WHY: the launch sweep kills in-guest agents; the installed app and a
+        // debug sandbox share one Docker daemon, and the guest-home bind (in
+        // each app's own Application Support) is what proves a container is
+        // this app's. The path holds spaces, so it rides JSON-quoted on its
+        // own line without disturbing the fields before it.
+        let home = "/Users/a/Library/Application Support/RemoteCode/bot-guests/b/home"
+        var formats: [String] = []
+        let cli = BotComputerDockerCLI { args in
+            formats.append(args[2])
+            return Data(("true sha256:abc 36385 net-a, {\"remotecode.botId\":\"b\"}\n\"\(home)\"\n").utf8)
+        }
+        let inspect = try cli.inspect(name: "remotecode-bot-b")
+        XCTAssertEqual(inspect, BotComputerContainerInspect(
+            running: true, imageID: "sha256:abc", hostPort: 36385, networkNames: ["net-a"],
+            labels: ["remotecode.botId": "b"], homeSource: home
+        ))
+        XCTAssertTrue(formats.first?.contains("eq .Destination \"/home/remotecode\"") == true)
+
+        let noHome = BotComputerDockerCLI { _ in Data("false sha256:abc 0  {}\n\n".utf8) }
+        XCTAssertNil(try noHome.inspect(name: "x").homeSource, "a container without a home bind proves nothing")
+    }
+
+    func test_buildLabelsTheImageWithTheDigestOfTheRecipeItWasBuiltFrom() throws {
+        // WHY: the app reuses a base image only when this label matches its own
+        // recipe; an image from another recipe under the same tag and revision
+        // must be told apart. Any recipe file edit must change the digest.
+        let context = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-digest-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: context, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: context) }
+        for name in BotComputerGuestSpec.recipeFileNames {
+            try Data(name.utf8).write(to: context.appendingPathComponent(name))
+        }
+        var calls: [[String]] = []
+        let cli = BotComputerDockerCLI { args in
+            calls.append(args)
+            return Data()
+        }
+
+        try cli.build(context: context, tag: "remotecode/computer:test")
+
+        let digest = BotComputerGuestSpec.recipeDigest(context: context)
+        XCTAssertEqual(calls, [[
+            "build", "-t", "remotecode/computer:test",
+            "--label", "\(BotComputerGuestSpec.recipeLabelKey)=\(BotComputerGuestSpec.recipeRevision)",
+            "--label", "\(BotComputerGuestSpec.recipeDigestLabelKey)=\(digest)",
+            context.path,
+        ]])
+        try Data("start.sh edited".utf8).write(to: context.appendingPathComponent("start.sh"))
+        XCTAssertNotEqual(BotComputerGuestSpec.recipeDigest(context: context), digest)
+        try FileManager.default.removeItem(at: context.appendingPathComponent("embed.html"))
+        XCTAssertNotEqual(BotComputerGuestSpec.recipeDigest(context: context), digest)
+    }
+
+    func test_createPassesInitHostAliasAndTheReadOnlyAgentKitBind() throws {
+        // WHY: create options only matter if they reach `docker create`; without
+        // --init the agent's orphans are never reaped, without --add-host the
+        // guest cannot name the host, and a writable kit bind would let the guest
+        // rewrite the agent binary it runs.
+        var calls: [[String]] = []
+        let cli = BotComputerDockerCLI { args in
+            calls.append(args)
+            return Data("cid\n".utf8)
+        }
+        let botID = BotID()
+        let support = URL(fileURLWithPath: "/tmp/rc-docker-create-args")
+        let options = try BotComputerGuestSpec.containerCreateOptions(
+            botID: botID,
+            guestHome: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: botID).path,
+            appSupport: support,
+            viewerToken: String(repeating: "a", count: 32)
+        )
+        XCTAssertEqual(try cli.create(options: options), "cid")
+        let args = try XCTUnwrap(calls.first)
+        XCTAssertTrue(args.contains("--init"))
+        let host = try XCTUnwrap(args.firstIndex(of: "--add-host"))
+        XCTAssertEqual(args[host + 1], "host.docker.internal:host-gateway")
+        XCTAssertTrue(args.contains("/tmp/rc-docker-create-args/guest-tools:/opt/remotecode-agent:ro"))
+        XCTAssertEqual(args.last, BotComputerGuestSpec.imageTag, "the image stays the final argument")
+    }
+
     func test_runProcessReturnsOutputLargerThanPipeCapacity() throws {
         // WHY: a real guest PNG is often larger than the OS pipe capacity, so
         // the runner must consume all bytes while the child is still writing.
@@ -497,6 +579,87 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: ["info"]), .probeTimedOut)
         XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: ["build"]), .provisioningFailed)
         XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: ["start"]), .provisioningFailed)
+    }
+
+    func test_agentExecGetsTheGuestDeadlineWhileShortDockerCommandsStayShort() {
+        // WHY: bot_computer_exec runs apt-get/builds that take minutes. A 15 s host
+        // timeout failed them as "could not start the desktop". The host deadline
+        // must cover the guest deadline yet stay under the MCP child's wait, so the
+        // host reports the timeout instead of the child timing out blind.
+        let wrapped = BotComputerGuestSpec.deadlineExecCommand("apt-get install -y sl")
+        let agentExec = ["exec", "-u", "0", "remotecode-bot-x"] + wrapped
+        let workspaceExec = ["exec", "-u", "501:20", "-w", "/Users/ada/repo",
+                             "-e", "GIT_AUTHOR_NAME=Ada", "remotecode-bot-x"] + wrapped
+        let hostDeadline = BotComputerGuestSpec.execHostDeadlineSeconds
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(agentExec), hostDeadline)
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(workspaceExec), hostDeadline)
+        XCTAssertGreaterThan(
+            hostDeadline,
+            TimeInterval(BotComputerGuestSpec.execGuestDeadlineSeconds + BotComputerGuestSpec.execGuestKillGraceSeconds),
+            "the guest `timeout` must fire (and kill) before the host abandons docker exec"
+        )
+        XCTAssertLessThan(hostDeadline, BotComputerGuestSpec.execResultWaitSeconds)
+
+        // Screenshot/act execs and other docker commands keep failing fast.
+        let observe = ["exec", "remotecode-bot-x", "env", "DISPLAY=:1", "import", "-window", "root", "png:-"]
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(observe), 15)
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(["ps", "-aq", "--filter", "name=x"]), 15)
+        XCTAssertEqual(BotComputerDockerCLI.timeoutForArguments(["info"]), 5)
+        XCTAssertEqual(
+            BotComputerDockerCLI.timeoutForArguments(["build", "."]),
+            BotComputerGuestSpec.imageBuildDeadlineSeconds
+        )
+        // A bare `bash -lc` exec (unbounded in the guest) gets no long host deadline.
+        XCTAssertEqual(
+            BotComputerDockerCLI.timeoutForArguments(["exec", "remotecode-bot-x", "bash", "-lc", "sleep 60"]),
+            15
+        )
+    }
+
+    func test_shortenedGuestBudgetShortensTheHostDeadlineToMatch() {
+        // WHY: an exec that waited for provisioning gets a smaller guest limit;
+        // the host docker deadline must follow that limit, not the full one, or
+        // the host would still be waiting after the MCP caller gave up.
+        let agentExec = ["exec", "remotecode-bot-x"]
+            + BotComputerGuestSpec.deadlineExecCommand("make", guestSeconds: 40)
+        XCTAssertEqual(
+            BotComputerDockerCLI.timeoutForArguments(agentExec),
+            BotComputerGuestSpec.execHostDeadline(guestSeconds: 40)
+        )
+        XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: agentExec), .guestCommandTimedOut(seconds: 40))
+    }
+
+    func test_agentExecTimeoutIsReportedAsACommandTimeoutNotADesktopFailure() {
+        // WHY: "Could not start the Linux desktop" sends the agent chasing Docker
+        // when its own command simply ran too long.
+        let full = BotComputerGuestSpec.execGuestDeadlineSeconds
+        let agentExec = ["exec", "remotecode-bot-x"] + BotComputerGuestSpec.deadlineExecCommand("make")
+        let ranTheFullLimit = TimeInterval(full) + 0.4
+        XCTAssertEqual(BotComputerDockerCLI.timeoutError(for: agentExec), .guestCommandTimedOut(seconds: full))
+        XCTAssertTrue(
+            BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 124, elapsed: ranTheFullLimit),
+            "timeout sent TERM"
+        )
+        XCTAssertTrue(
+            BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 137, elapsed: ranTheFullLimit),
+            "timeout had to KILL"
+        )
+        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 1, elapsed: ranTheFullLimit))
+        XCTAssertFalse(
+            BotComputerDockerCLI.isGuestDeadlineExit(["exec", "x", "false"], status: 124, elapsed: ranTheFullLimit)
+        )
+        let message = BotComputerDockerError.guestCommandTimedOut(seconds: full).description
+        XCTAssertTrue(message.contains("\(full) s"))
+        XCTAssertNotEqual(message, BotComputerDockerError.provisioningFailed.description)
+    }
+
+    func test_ownTimeoutOrOOMExitBeforeTheGuestLimitIsNotReportedAsTheGuestDeadline() {
+        // WHY: agents run `timeout 10 curl ...` (exit 124 after 10 s) and an
+        // OOM-killed command exits 137 within seconds. Telling the agent "ran
+        // longer than 165 s and was stopped" for those is false.
+        let agentExec = ["exec", "remotecode-bot-x"] + BotComputerGuestSpec.deadlineExecCommand("timeout 10 curl x")
+        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 124, elapsed: 10.2))
+        XCTAssertFalse(BotComputerDockerCLI.isGuestDeadlineExit(agentExec, status: 137, elapsed: 3))
     }
 }
 

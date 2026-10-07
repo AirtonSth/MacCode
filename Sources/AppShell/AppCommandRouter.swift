@@ -117,6 +117,132 @@ public final class CommandReceiptPersistenceGateway: @unchecked Sendable {
         }
         return try queue.sync(execute: work)
     }
+
+    /// Runs `work` on the receipt queue and resumes the caller when it has
+    /// landed. The awaiting actor (MainActor for the dispatcher) is suspended,
+    /// not blocked, while SQLite runs.
+    public func perform<T>(_ work: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result { try work() })
+            }
+        }
+    }
+}
+
+/// C6: the dispatcher's off-MainActor receipt writer. Claim and commit await
+/// the receipt queue; finalize builds the transaction `EventBus` runs on its
+/// delivery lane. Encoding uses sorted keys, like the router's synchronous
+/// methods, so stored result and payload bytes are unchanged.
+struct CommandReceiptOffMainWriter: CommandReceiptOffMainWriting {
+    private final class RepositoryBox: @unchecked Sendable {
+        let repo: CommandReceiptRepository
+        init(_ repo: CommandReceiptRepository) { self.repo = repo }
+    }
+
+    private let box: RepositoryBox
+    private let gateway: CommandReceiptPersistenceGateway
+
+    init(repo: CommandReceiptRepository, gateway: CommandReceiptPersistenceGateway = .shared) {
+        self.box = RepositoryBox(repo)
+        self.gateway = gateway
+    }
+
+    private static func sortedJSON<T: Encodable>(_ value: T) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let json = String(data: try encoder.encode(value), encoding: .utf8) else {
+            throw JSONRPCError.internalError
+        }
+        return json
+    }
+
+    func claim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) async throws -> CommandReceiptClaimResult {
+        let box = box
+        return try await gateway.perform {
+            let signposter = PerfSwitchMetrics.signposter
+            let interval = signposter.beginInterval("receipt_claim", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("receipt_claim", interval) }
+            return try box.repo.claim(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash
+            )
+        }
+    }
+
+    func commit(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue
+    ) async throws {
+        let box = box
+        try await gateway.perform {
+            try box.repo.commit(
+                method: method,
+                clientRequestId: clientRequestId,
+                ownerFingerprint: ownerFingerprint,
+                paramsHash: paramsHash,
+                resultJSON: try Self.sortedJSON(result)
+            )
+        }
+    }
+
+    func finalizeTransaction(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue,
+        events: [EventBus.MutationEventIntent]
+    ) -> @Sendable (Int64) throws -> [EventBus.Event] {
+        let box = box
+        let gateway = gateway
+        return { minimumEventSequence in
+            let signposter = PerfSwitchMetrics.signposter
+            let interval = signposter.beginInterval("receipt_finalize", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("receipt_finalize", interval) }
+            let resultJSON = try Self.sortedJSON(result)
+            let intents = try events.map { event in
+                CommandReceiptEventIntent(
+                    kind: event.kind.rawValue,
+                    payloadJSON: try Self.sortedJSON(event.payload),
+                    createdAt: event.createdAt
+                )
+            }
+            let persisted = try gateway.syncThrowing {
+                try box.repo.finalize(
+                    method: method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: ownerFingerprint,
+                    paramsHash: paramsHash,
+                    resultJSON: resultJSON,
+                    events: intents,
+                    minimumEventSequence: minimumEventSequence
+                )
+            }
+            return try persisted.map { event in
+                guard let payloadData = event.payloadJSON.data(using: .utf8),
+                      let payload = JSONValue.decode(from: payloadData) else {
+                    throw JSONRPCError.internalError
+                }
+                return EventBus.Event(
+                    seq: event.seq,
+                    kind: event.kind,
+                    payload: payload,
+                    ts: event.createdAt.timeIntervalSince1970
+                )
+            }
+        }
+    }
 }
 
 /// Off-MainActor owner for Agent App refresh/read RPC persistence work.
@@ -143,33 +269,47 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         readOffMainActorCountForTesting = 0
     }
 
-    private let db: SQLiteDB
+    /// WAL reader. Every gateway method is a pure read, so paired-device
+    /// list/page reads never wait on the writer connection's operation gate.
+    private let readDB: SQLiteDB
     private let queue: DispatchQueue
     // PERF: listPendingCallbacks allocated JSONDecoder per off-MainActor poll.
     // Gateway work is serial on `queue`, so one instance decoder is safe and
     // avoids per-call codec construction while decode behavior is unchanged.
     private let pendingCallbackDecoder = JSONDecoder()
 
-    public init(db: SQLiteDB) {
-        self.db = db
+    public init(db: SQLiteDB, readDB: SQLiteDB? = nil) {
+        self.readDB = readDB ?? db
         self.queue = DispatchQueue(label: Self.queueLabel, qos: .userInitiated)
     }
 
     public func listThreads(workspaceId: WorkspaceID?) async throws -> [AgentThread] {
         try await execute {
-            try AgentThreadRepository(db: self.db).list(workspaceId: workspaceId)
+            try AgentThreadRepository(db: self.readDB).list(workspaceId: workspaceId)
+        }
+    }
+
+    public func message(id: AgentMessageID) async throws -> AgentMessage? {
+        try await execute {
+            try AgentMessageRepository(db: self.readDB).get(id: id)
         }
     }
 
     public func threadIdsWithMessages() async throws -> Set<AgentThreadID> {
         try await execute {
-            try AgentMessageRepository(db: self.db).threadIdsWithMessages()
+            try AgentMessageRepository(db: self.readDB).threadIdsWithMessages()
+        }
+    }
+
+    public func guestRuntimesByThread() async throws -> [AgentThreadID: String] {
+        try await execute {
+            try AgentThreadRepository(db: self.readDB).guestRuntimesByThread()
         }
     }
 
     public func listMessages(threadId: AgentThreadID, limit: Int) async throws -> [AgentMessage] {
         try await execute {
-            try AgentMessageRepository(db: self.db).listRecent(
+            try AgentMessageRepository(db: self.readDB).listRecent(
                 threadId: threadId,
                 limit: max(0, min(limit, 500))
             )
@@ -183,7 +323,7 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         after: AgentMessageCursor?
     ) async throws -> AgentMessagePage {
         try await execute {
-            try AgentMessageRepository(db: self.db).listPage(
+            try AgentMessageRepository(db: self.readDB).listPage(
                 threadId: threadId,
                 limit: max(0, min(limit, 500)),
                 before: before,
@@ -201,7 +341,7 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         contentLimit: Int
     ) async throws -> AgentMessageBodyBudgetResult {
         try await execute {
-            try AgentMessageRepository(db: self.db).listPageWithinBodyBudget(
+            try AgentMessageRepository(db: self.readDB).listPageWithinBodyBudget(
                 threadId: threadId,
                 limit: max(1, min(limit, 500)),
                 before: before,
@@ -217,14 +357,14 @@ public final class AgentAppReadGateway: @unchecked Sendable {
 
     public func listQueuedMessages(threadId: AgentThreadID) async throws -> [AgentQueuedMessage] {
         try await execute {
-            try AgentQueuedMessageRepository(db: self.db).list(threadId: threadId)
+            try AgentQueuedMessageRepository(db: self.readDB).list(threadId: threadId)
         }
     }
 
     public func listPendingCallbacks(threadId: AgentThreadID) async throws -> AssistantPendingCallbacksSnapshot {
         try await execute {
             PendingCallbackSnapshotMapper.snapshot(
-                from: try ProviderPendingCallbackRepository(db: self.db).listVisible(threadId: threadId),
+                from: try ProviderPendingCallbackRepository(db: self.readDB).listVisible(threadId: threadId),
                 decoder: self.pendingCallbackDecoder
             )
         }
@@ -246,10 +386,10 @@ public final class AgentAppReadGateway: @unchecked Sendable {
                 }
                 do {
                     // The queue keeps the work off MainActor; performSync also
-                    // takes SQLiteDB's operation gate for the complete
-                    // statement/decode sequence so this gateway cannot race
-                    // existing readers or writers on the shared handle.
-                    let result = try self.db.performSync { _ in try work() }
+                    // takes the read connection's operation gate for the complete
+                    // statement/decode sequence and resets its statements after,
+                    // so no WAL read snapshot outlives the call.
+                    let result = try self.readDB.performSync { _ in try work() }
                     continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
@@ -384,6 +524,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return AnyView(DistillAccountsPanelHost(controller: controller))
     }
     public weak var windowController: MainWindowController?
+    /// H3: throttles terminal OSC title commits (persist + surface.renamed) per surface.
+    let terminalTitleCoalescer = TerminalTitleCoalescer()
     public weak var botsViewModel: BotsViewModel?
     private let botComputerReconciliationQueue = DispatchQueue(
         label: "io.remotecode.bot-computer-reconciliation",
@@ -499,7 +641,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         self.sshPasswordStore = sshPasswordStore
         self.sshCommandRunner = sshCommandRunner
         self.botSecretStore = secretStore
-        self.agentAppReadGateway = AgentAppReadGateway(db: context.db)
+        self.agentAppReadGateway = AgentAppReadGateway(db: context.db, readDB: context.readDB)
         installBotHostObservers()
     }
 
@@ -523,6 +665,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest else { return }
             Task { @MainActor [weak self] in self?.handleManualActionRequested(request) }
         })
+        // Synchronous on the poster's thread: an agent.manual_action.resolve call posts on the
+        // main actor, so its event is published inside the call and lands in the receipt.
+        botHostObservers.append(center.addObserver(forName: .manualActionStateChanged, object: nil, queue: nil) { [weak self] note in
+            guard let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest,
+                  let threadID = request.threadID else { return }
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.publishManualActionUpdated(thread: threadID, requestID: request.id) }
+            } else {
+                Task { @MainActor [weak self] in self?.publishManualActionUpdated(thread: threadID, requestID: request.id) }
+            }
+        })
+        // Hops even on the main thread: `bot.guest.control` changes control under the
+        // paired authority's lock, and the event reads that authority.
+        botHostObservers.append(center.addObserver(forName: .botComputerControlChanged, object: nil, queue: nil) { [weak self] note in
+            guard let source = note.object as? BotComputerControl,
+                  let botID = note.userInfo?[BotHostNotificationKey.botID] as? BotID else { return }
+            Task { @MainActor [weak self] in
+                guard let self, source === self.botComputerControl else { return }
+                self.publishGuestControlChanged(botID: botID)
+            }
+        })
         botHostObservers.append(center.addObserver(forName: .botMacExecutionRequested, object: nil, queue: nil) { [weak self] note in
             guard let info = note.userInfo,
                   let threadID = info[BotHostNotificationKey.threadID] as? AgentThreadID else { return }
@@ -536,15 +699,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let reason = info[BotHostNotificationKey.reason] as? String ?? ""
             Task { @MainActor [weak self] in self?.handleBotScreenshotPosted(threadID: threadID, jpeg: jpeg, reason: reason) }
         })
+        // Same drain a finished run triggers (AppContext.onRunFinished) for the send that queued behind a rebuild.
+        botHostObservers.append(center.addObserver(forName: .botVMRebuildReleased, object: nil, queue: nil) { [weak self] note in
+            guard let threadID = note.userInfo?[BotHostNotificationKey.threadID] as? AgentThreadID,
+                  let botID = note.userInfo?[BotHostNotificationKey.botID] as? BotID else { return }
+            Task { @MainActor [weak self] in await self?.handOffBotVM(botID: botID, to: threadID) }
+        })
     }
 
     private func handleManualActionRequested(_ request: ManualActionRequest) {
         guard let threadID = request.threadID else { return }
-        // A late main-actor hop must not overwrite a request the user already resolved.
-        guard !manualActionStore.all(threadID: threadID).contains(where: { $0.id == request.id }) else { return }
-        do { try manualActionStore.upsert(request) } catch {
-            NSLog("RemoteCode: manual action request could not be saved: \(error)")
+        // A late main-actor hop must not overwrite or re-announce a request the user already
+        // resolved. A Mac card that saved it first (its observer can run before this hop)
+        // still gets its event and push here, once.
+        if let existing = manualActionStore.all(threadID: threadID).first(where: { $0.id == request.id }) {
+            guard existing.state.isOpen else { return }
+        } else {
+            do { try manualActionStore.upsert(request) } catch {
+                NSLog("RemoteCode: manual action request could not be saved: \(error)")
+            }
         }
+        publishManualActionUpdated(thread: threadID, requestID: request.id)
         guard let ctx = context else { return }
         // The pausing turn may already have ended; a fresh run id still passes the nested-worker check.
         let runID = (try? ctx.runRepo.latestActive(for: threadID))?.id ?? AgentRunID()
@@ -562,14 +737,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let attachment = try agentAttachmentStore().stage(
                 data: jpeg, displayName: "screenshot.jpg", kind: .image, mimeType: "image/jpeg"
             )
-            try ctx.messageRepo.append(AgentMessage(
+            let message = AgentMessage(
                 threadId: threadID, role: .assistant, content: "📷 \(reason)", attachments: [attachment]
-            ))
+            )
+            try ctx.messageRepo.append(message)
+            // Paired devices see the screenshot row now, not on their next reload.
+            EventBus.shared.publish(
+                kind: .agentMessageAppended,
+                payload: AgentMessageTransport.appendedEventPayload(from: message)
+            )
             refreshAgentSurfaces(thread: threadID, reloadTranscriptIfSelected: true)
-        } catch {}
+        } catch {
+            NSLog("RemoteCode: bot screenshot could not be saved: \(error)")
+        }
     }
 
-    private func publishAgentThreadUpdated(_ thread: AgentThread) {
+    func publishAgentThreadUpdated(_ thread: AgentThread) {
         EventBus.shared.publish(kind: .agentThreadUpdated, payload: agentThreadPayload(thread))
     }
 
@@ -628,6 +811,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         payload["sort_order"] = .number(Double(thread.sortOrder))
         appendAgentRouting(thread.effectiveRoutingConfiguration, to: &payload)
         appendAgentActiveRun(to: &payload, thread: thread.id)
+        payload["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualActions(for: [thread])[thread.id])
+        // Same shape as Dispatcher.threadPayload.
+        ThreadActorWire.append(
+            thread: thread,
+            guestRuntime: threadGuestRuntime(thread: thread.id),
+            pendingMacExecutionReason: pendingMacExecution[thread.id],
+            to: &payload
+        )
         return .object(payload)
     }
 
@@ -711,7 +902,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         publishAgentThreadLifecycle(.deleted(ids))
     }
 
-    private func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage) {
+    func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage) {
         guard let eventKind = RemoteCodeEventKind(rawValue: kind) else {
             assertionFailure("Unknown productive Agent queue event kind: \(kind)")
             return
@@ -736,6 +927,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // reorder republishes every queued row.
         if let workspaceId = try? context?.threadRepo.workspaceId(of: message.threadId) {
             payload["workspace_id"] = .string(workspaceId.value.uuidString)
+        }
+        // iOS parity: the reason a queued message is not starting (D12).
+        if let wait = BotVMRunRegistry.shared.waitingHolder(threadID: message.threadId) {
+            payload["waiting_for_bot_vm"] = .object([
+                "bot_id": .string(wait.botID.value.uuidString),
+                "holder_thread_id": .string(wait.holder.threadID.value.uuidString),
+                "holder_title": .string(wait.holder.title),
+                "notice": .string(Self.botVMBusyNotice(holderTitle: wait.holder.title))
+            ])
         }
         EventBus.shared.publish(kind: eventKind, payload: .object(payload))
     }
@@ -974,6 +1174,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         agent.viewModel.onThreadLifecycle = { [weak self] event in
                             self?.publishAgentThreadLifecycle(event)
                         }
+                        agent.viewModel.onThreadChromeWritten = { write in
+                            write.publish()
+                        }
                         agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
                             ctx?.retireDeletedAgentThreads(
                                 ids,
@@ -983,7 +1186,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                         wireQueueDrainControl(on: agent.viewModel, context: ctx)
                         wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
-                        Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
                         configureAgentAppBotMentions(agent)
                         agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                             self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
@@ -1157,8 +1359,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 filesStates: []
             )
         }
+        let signposter = PerfSwitchMetrics.signposter
+        let captureInterval = signposter.beginInterval(
+            "connection_snapshot_capture",
+            id: signposter.makeSignpostID()
+        )
         let workspaceIDs = ctx.state.window.workspaces
         let workspaces = workspaceIDs.compactMap { ctx.state.workspaces[$0] }
+        let selectedWorkspaceId = ctx.state.window.selectedWorkspaceID?.value.uuidString
         // Capture all MainActor-owned layout/surface inputs before suspending for
         // SQLite. Otherwise a local persistence/layout callback can run during
         // the await and mix two host-state versions in one snapshot.
@@ -1175,8 +1383,44 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     ?? ""
             }
         }
+        let openManualActions = manualActionStore.openByThread()
+        let pendingMacExecutions = pendingMacExecution
+        signposter.endInterval("connection_snapshot_capture", captureInterval)
         // SQLite list/decode must never run on MainActor (Dispatcher is @MainActor).
         let threads = try await ctx.agentThreadListGateway.list(workspaceId: nil)
+        let guestRuntimes = await threadGuestRuntimesOffMain()
+        let manualActionsByThread = pendingManualActions(for: threads, open: openManualActions)
+        // Grouping and the per-row JSON round trip are pure work on the
+        // captured values: run them detached so MainActor stays free.
+        return await Task.detached(priority: .userInitiated) {
+            let encodeInterval = signposter.beginInterval(
+                "connection_snapshot_encode",
+                id: signposter.makeSignpostID()
+            )
+            defer { signposter.endInterval("connection_snapshot_encode", encodeInterval) }
+            return Self.connectionSnapshotState(
+                selectedWorkspaceId: selectedWorkspaceId,
+                workspaces: workspaces,
+                descriptorsByWorkspace: descriptorsByWorkspace,
+                browserURLs: browserURLs,
+                threads: threads,
+                manualActionsByThread: manualActionsByThread,
+                guestRuntimes: guestRuntimes,
+                pendingMacExecutions: pendingMacExecutions
+            )
+        }.value
+    }
+
+    nonisolated private static func connectionSnapshotState(
+        selectedWorkspaceId: String?,
+        workspaces: [Workspace],
+        descriptorsByWorkspace: [String: [SurfaceDescriptor]],
+        browserURLs: [String: String],
+        threads: [AgentThread],
+        manualActionsByThread: [AgentThreadID: ManualActionSnapshot],
+        guestRuntimes: [AgentThreadID: String],
+        pendingMacExecutions: [AgentThreadID: String]
+    ) -> ConnectionSnapshotReadState {
         var surfaceGroups: [ConnectionSnapshotWorkspaceItems] = []
         var threadGroups: [ConnectionSnapshotWorkspaceItems] = []
         var browserStates: [ConnectionSnapshotSurfaceState] = []
@@ -1198,7 +1442,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ))
             threadGroups.append(ConnectionSnapshotWorkspaceItems(
                 workspaceId: workspace.id.value.uuidString,
-                items: workspaceThreads.map(Self.connectionSnapshotThread)
+                items: workspaceThreads.map {
+                    Self.connectionSnapshotThread(
+                        $0,
+                        pendingManualAction: manualActionsByThread[$0.id],
+                        guestRuntime: guestRuntimes[$0.id],
+                        pendingMacExecutionReason: pendingMacExecutions[$0.id]
+                    )
+                }
             ))
 
             for descriptor in descriptors {
@@ -1213,7 +1464,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         state: .object(["url": .string(url)])
                     ))
                 case .files:
-                    let stored = decodeFilesState(descriptor.metadata["files_state"])
+                    let stored = Self.decodeFilesState(descriptor.metadata["files_state"])
                     let stableState = stored ?? [
                         "surface_id": .string(descriptor.id.value.uuidString),
                         "workspace_id": .string(workspace.id.value.uuidString),
@@ -1234,7 +1485,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
 
         return ConnectionSnapshotReadState(
-            selectedWorkspaceId: ctx.state.window.selectedWorkspaceID?.value.uuidString,
+            selectedWorkspaceId: selectedWorkspaceId,
             workspaces: workspaces.map(Self.connectionSnapshotWorkspace),
             surfaces: surfaceGroups,
             agentThreads: threadGroups,
@@ -1283,12 +1534,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return .object(object)
     }
 
-    nonisolated private static func connectionSnapshotThread(_ thread: AgentThread) -> JSONValue {
+    nonisolated private static func connectionSnapshotThread(
+        _ thread: AgentThread,
+        pendingManualAction: ManualActionSnapshot?,
+        guestRuntime: String?,
+        pendingMacExecutionReason: String?
+    ) -> JSONValue {
         guard case .object(var object) = connectionSnapshotJSON(thread) else { return .null }
         object["id"] = .string(thread.id.value.uuidString)
         object["workspaceId"] = thread.workspaceId
             .map { .string($0.value.uuidString) }
             ?? .null
+        object["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualAction)
+        ThreadActorWire.append(
+            thread: thread,
+            guestRuntime: guestRuntime,
+            pendingMacExecutionReason: pendingMacExecutionReason,
+            to: &object
+        )
         return .object(object)
     }
 
@@ -1566,6 +1829,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func renameSurface(_ wid: WorkspaceID, _ sid: SurfaceID, _ title: String) throws {
+        // H3: an explicit rename is newer than any OSC title still pending.
+        terminalTitleCoalescer.dropPending(sid)
         try context?.apply(.renameSurface(wid, sid, title))
         windowController?.refreshFromState()
     }
@@ -2564,9 +2829,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
-        let descriptor = try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
-        softGraphifyPreflight(workspace: workspace)
-        return descriptor
+        try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
     }
 
     /// Legacy helper: open + focus an Agent App tab for a workspace.
@@ -2765,13 +3028,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         destinationWindowIsKeyForTests?(window) ?? window.isKeyWindow
     }
 
+    /// `token_saver.digest.get` stays until iOS bumps its treaty pin. Token
+    /// Saver is gone, so it answers `enabled: false` plus the cached account
+    /// usage the iOS rings still read.
     public func tokenSaverDigest() -> JSONValue? {
         guard let context else { return nil }
-        // Rebuild from durable disk state before returning so RPC never serves
-        // a stale process cache after usage writes.
-        context.publishTokenSaverWidgetDigestFromDisk()
-        guard let body = TokenSaverWidgetDigest.lastCachedBody() else { return nil }
-        return .object(body)
+        // Refresh from durable disk state so the RPC never keeps serving a
+        // stale process cache after usage writes.
+        context.publishAccountUsageDigestFromDisk()
+        return .object(AccountUsageWidgetDigest.lastCachedBody() ?? ["enabled": .bool(false)])
     }
 
     public func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread] {
@@ -2807,11 +3072,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         agent.viewModel.mentionableBotsRevisionProvider = { [weak self] in
             self?.context?.botStore.botsListRevision ?? 0
         }
-        agent.viewModel.botExecutionTargetProvider = { [weak self] botID in
-            guard let store = self?.context?.botStore else { return .mac }
-            let revision = (try? store.get(id: botID))?.currentRevisionID.flatMap { try? store.getRevision(id: $0) }
-            return BotExecutionDefault.target(for: revision ?? nil)
-        }
+        configureBotVMHooks(on: agent.viewModel)
         agent.viewModel.botIsAvailable = { [weak self] botID in
             guard let store = self?.context?.botStore else { return false }
             if ((try? store.listCached()) ?? []).contains(where: { $0.id == botID }) { return true }
@@ -2830,37 +3091,47 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let hooks = self?.botWorkspaceRunHooks else { throw BotWorkspaceRunUnavailable() }
             return try await hooks.promptTransform(botID, text, threadID, runID)
         }
-        agent.viewModel.botRunStarted = { [weak self, weak viewModel = agent.viewModel] botID, runID, threadID in
+        // The VM claim (D12) is taken before the start (`botClaimVM`).
+        agent.viewModel.botRunStarted = { [weak self] botID, runID, threadID in
             self?.botWorkspaceRunHooks?.runStarted(botID, runID, threadID)
-            if let viewModel,
-               let thread = viewModel.threads.first(where: { $0.id == threadID }),
-               thread.executionTarget == .vm {
-                _ = BotVMRunRegistry.shared.tryBegin(
-                    botID: botID,
-                    entry: BotVMRunRegistry.Entry(
-                        threadID: threadID,
-                        runID: runID,
-                        title: thread.title,
-                        workspace: thread.worktreePath ?? viewModel.cwd
-                    )
-                )
-            }
-        }
-        agent.viewModel.botBusyMessage = { botID, threadID in
-            BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID)
-        }
-        agent.viewModel.botWaitForVM = { botID, threadID in
-            BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: threadID)
-        }
-        agent.viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
-            await self?.resolveMacExecution(thread: threadID, approve: approve)
         }
         agent.viewModel.openBotScreen = { [weak self] botID in self?.openBotGuestDesktopInNewWindow(botID) }
-        agent.viewModel.botVMPreflight = { [weak self] botID, workspace in
+    }
+
+    /// The bot VM hooks every Agent App that runs bot threads shares (Agent
+    /// App tabs and the embedded Bots Desk): target default, one-run-per-VM
+    /// queue, Mac-execution approvals, and the VM gate behind the D11 banner.
+    func configureBotVMHooks(on viewModel: AgentAppViewModel) {
+        viewModel.botExecutionTargetProvider = { [weak self] botID in
+            guard let store = self?.context?.botStore else { return .mac }
+            let revision = (try? store.get(id: botID))?.currentRevisionID.flatMap { try? store.getRevision(id: $0) }
+            return BotExecutionDefault.target(for: revision ?? nil)
+        }
+        viewModel.botBusyMessage = { botID, threadID in
+            BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID)
+        }
+        viewModel.botWaitForVM = { [weak self] botID, threadID in
+            BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: threadID)
+            self?.publishBotVMWait(thread: threadID)
+        }
+        viewModel.botClaimVM = { botID, entry in
+            BotVMRunRegistry.shared.tryBegin(botID: botID, entry: entry)
+        }
+        viewModel.botReleaseVM = { [weak self] runID in self?.releaseBotVMRun(runID) }
+        // iOS parity: the composer's bot lock and "Rodar esta thread no Mac"
+        // reach paired devices from the Desk too, as from Agent App tabs.
+        viewModel.onThreadConfigPersisted = { [weak self] thread in
+            self?.publishAgentThreadUpdated(thread)
+        }
+        viewModel.botMacExecutionResolver = { [weak self] threadID, approve in
+            // A store failure keeps the request open and puts the banner back.
+            _ = try? await self?.resolveMacExecution(thread: threadID, approve: approve)
+        }
+        viewModel.botVMPreflight = { [weak self] botID, workspace in
             await self?.botVMPreflight(botID, workspace: workspace)
         }
-        agent.viewModel.botVMProvision = { [weak self] botID in await self?.provisionBotVM(botID) }
-        agent.viewModel.pendingMacExecutionByThread = pendingMacExecution
+        viewModel.botVMProvision = { [weak self] botID in await self?.provisionBotVM(botID) }
+        viewModel.pendingMacExecutionByThread = pendingMacExecution
     }
 
     private struct BotWorkspaceRunUnavailable: LocalizedError {
@@ -2934,6 +3205,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             mutation: false,
             method: "bot.peer.ask"
         )
+        // A peer's agent runs on the Mac. A caller inside its bot's Linux VM
+        // reaches the Mac only through the user-approved Mac-execution request,
+        // never through a peer.
+        if try ctx.threadRepo.guestPlacement(of: callerThread)?.runsInGuest == true {
+            throw JSONRPCError(
+                code: -32052,
+                message: "bot_ask_peer is not available inside the bot's Linux VM: the other Bot would run on the Mac. Ask the user to run this conversation on the Mac, or use bot_request_mac_execution."
+            )
+        }
         guard let normalizedHandle = BotHandle.normalize(handle),
               let peer = try ctx.botStore.list().first(where: { $0.handle == normalizedHandle }) else {
             throw JSONRPCError(code: -32044, message: "RemoteCode Bot @\(handle) was not found.")
@@ -3290,6 +3570,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private var pairedBotRemote: BotRemoteControlAuthority?
+    private var pairedGuestObserver: BotGuestObserveCoordinator?
     private var pairedBotSettlementWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
     private lazy var botRuntimeEvidenceProjector = BotRuntimeEvidenceProjector { [weak self] terminal in
         _ = self?.pairedBotRemote?.settleRuntime(
@@ -3299,10 +3580,60 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    /// Paired-device `bot.*` reads that touch only the authority's own state
+    /// and SQLite (no MainActor callback, no queue write). They run off
+    /// MainActor and never reload the desk's queued follow-ups.
+    /// `bot.attention.list` stays on MainActor: its delegated-attention
+    /// snapshot callback reads router state. `bot.conversation.list` stays on
+    /// MainActor too: each row's `desk_routing` comes from the
+    /// `onConversationRouting` callback, which reads `BotsViewModel` state.
+    nonisolated static let pairedBotOffMainReadMethods: Set<String> = [
+        "bot.list",
+        "bot.get",
+        "bot.settings.get",
+        "bot.queue.list",
+        "bot.attachment.list",
+        "bot.routine.list",
+        "bot.files.list",
+        "bot.browser.state",
+        "bot.guest.state",
+        "bot.receipt.status",
+    ]
+    nonisolated static let pairedBotMainActorReadMethods: Set<String> = [
+        "bot.attention.list",
+        "bot.conversation.list",
+        "bot.reserved.probe",
+    ]
+
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+        if BotTeamGroupService.handles(method) {
+            guard let ctx = context, ctx.hostsBotGroupConversations else {
+                // Nothing changed: a definite refusal, told apart from a
+                // receipt failure by its data.
+                throw DefiniteMutationRejection(JSONRPCError(
+                    code: -32091,
+                    message: "Bot runtime is unavailable.",
+                    data: .object(["domain": .string("bot_group"), "kind": .string("runtime_unavailable")])
+                ))
+            }
+            return try await ctx.botTeamGroupService.dispatchRemote(method: method, params: params)
+        }
         let authority = try pairedBotAuthority()
         let foundation = Self.foundationObject(params)
+        // An observing `bot.guest.state` goes through the observe coordinator,
+        // never the plain off-main read.
+        let observesGuest = method == "bot.guest.state" && foundation["observe"] as? Bool == true
+        if !observesGuest, Self.pairedBotOffMainReadMethods.contains(method) {
+            return try await dispatchPairedBotRead(authority: authority, method: method, params: foundation)
+        }
         do {
+            if observesGuest {
+                let observed = try await pairedGuestObserveCoordinator(authority).state(params: foundation)
+                return JSONValue.from(observed)
+            }
+            if Self.pairedBotMainActorReadMethods.contains(method) {
+                return JSONValue.from(try authority.dispatch(method: method, params: foundation))
+            }
             var result = try authority.dispatch(method: method, params: foundation)
             if method == "bot.stop" || method == "bot.force_stop",
                result["status"] as? String == BotRemoteControlAuthority.Status.accepted.rawValue,
@@ -3313,8 +3644,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     params: ["client_request_id": requestID]
                 )
             }
-            botsViewModel?.reloadQueuedFollowUpsFromStore()
-            if method == "bot.get" || method == "bot.send" {
+            reloadPairedBotQueue(params: foundation)
+            if method == "bot.send" {
                 result = enrichPairedBotAssistant(params: foundation, result: result)
             }
             if method == "bot.send" {
@@ -3331,6 +3662,52 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 return JSONValue.from(failed)
             }
             throw JSONRPCError(code: error.code, message: error.message)
+        }
+    }
+
+    /// A write can change only its own bot's persisted queue; reload that bot
+    /// (and publish only if its rows changed). Writes that name no bot keep the
+    /// fleet-wide reload.
+    private func reloadPairedBotQueue(params: [String: Any]) {
+        guard let botsViewModel else { return }
+        if let raw = params["bot_id"] as? String, let uuid = UUID(uuidString: raw) {
+            botsViewModel.reloadQueuedFollowUpsFromStore(botID: BotID(uuid))
+        } else {
+            botsViewModel.reloadQueuedFollowUpsFromStore()
+        }
+    }
+
+    private func dispatchPairedBotRead(
+        authority: BotRemoteControlAuthority,
+        method: String,
+        params: [String: Any]
+    ) async throws -> JSONValue {
+        let request = PairedBotReadRequest(authority: authority, method: method, params: params)
+        let outcome: PairedBotReadOutcome = await Task.detached(priority: .userInitiated) {
+            do {
+                return .value(try request.authority.dispatch(method: request.method, params: request.params))
+            } catch {
+                return .failure(error)
+            }
+        }.value
+        switch outcome {
+        case .value(let result):
+            guard method == "bot.get" else { return JSONValue.from(result) }
+            return JSONValue.from(enrichPairedBotAssistant(params: params, result: result))
+        case .failure(let error as BotRemoteControlAuthority.Error):
+            // Same contract as the write path: a request id whose receipt
+            // already failed answers with that receipt.
+            if let requestID = params["client_request_id"] as? String,
+               let failed = try? authority.dispatch(
+                   method: "bot.receipt.status",
+                   params: ["client_request_id": requestID]
+               ),
+               failed["status"] as? String == BotRemoteControlAuthority.Status.failed.rawValue {
+                return JSONValue.from(failed)
+            }
+            throw JSONRPCError(code: error.code, message: error.message)
+        case .failure(let error):
+            throw error
         }
     }
 
@@ -3461,6 +3838,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
             }
         }
+        created.computerControl = botComputerControl
+        created.onGuestControlChanged = { [weak self] id, took in
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.syncManualActionsAfterGuestControl(botID: id, took: took) }
+            } else {
+                Task { @MainActor [weak self] in self?.syncManualActionsAfterGuestControl(botID: id, took: took) }
+            }
+        }
         created.onDockerClear = { [weak self] id in
             guard let service = self?.botsViewModel?.computerGuestService else {
                 throw BotRemoteControlAuthority.Error(
@@ -3477,16 +3862,42 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     message: "Bot runtime is unavailable."
                 )
             }
-            let routing = try Self.pairedBotDeskRouting(routingValues)
+            let routing = try routingValues.map(Self.pairedBotDeskRouting)
             let attachments = try self.resolveInboundAgentAttachments(attachmentReferences)
+            // A receipt route becomes the conversation's desk route, unless an
+            // older client sent a legacy provider: that route was reset to
+            // Distill defaults and runs for this send only, never over the
+            // Main/Worker saved on the Mac.
             let result = try vm.enqueueHostMessage(
                 botID: id,
                 text: text,
                 conversationID: conversationID,
                 attachments: attachments,
-                routing: routing
+                routing: routing,
+                adoptAsDeskRoute: routingValues.map(Self.pairedRouteKeepsItsProvider) ?? false
             )
             return Self.foundationObject(result.objectValue ?? [:])
+        }
+        created.onConversationRoutingSet = { [weak self] id, conversationID, routingValues in
+            guard let vm = self?.botsViewModel else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32091,
+                    message: "Bot runtime is unavailable."
+                )
+            }
+            // A conversation's desk route is never a legacy-provider reset.
+            guard Self.pairedRouteKeepsItsProvider(routingValues) else {
+                throw BotRemoteControlAuthority.Error.invalidParams
+            }
+            let routing = try Self.pairedBotDeskRouting(routingValues)
+            let adopted = try vm.adoptRemoteDeskRouting(routing, botID: id, conversationID: conversationID)
+            return Self.foundationObject(adopted.remoteWireObject)
+        }
+        created.onConversationRouting = { [weak self] conversation in
+            guard let routing = self?.botsViewModel?.effectiveDeskRouting(for: conversation) else {
+                return nil
+            }
+            return Self.foundationObject(routing.remoteWireObject)
         }
         created.onForceQueuedFollowUp = { [weak self] id, itemID in
             guard let vm = self?.botsViewModel else {
@@ -3524,6 +3935,114 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         pairedBotRemote = created
         return created
+    }
+
+    private func pairedGuestObserveCoordinator(
+        _ authority: BotRemoteControlAuthority
+    ) -> BotGuestObserveCoordinator {
+        if let pairedGuestObserver { return pairedGuestObserver }
+        let created = BotGuestObserveCoordinator(
+            authority: authority,
+            capture: { [weak self] botID in
+                guard let service = self?.botsViewModel?.computerGuestService else {
+                    throw BotRemoteControlAuthority.Error(code: -32091, message: "Bot guest is unavailable.")
+                }
+                // One screenshot attempt: an observing viewer must not wait out the start retries.
+                return try await Task.detached(priority: .userInitiated) { [service] in
+                    let evidence = try service.remoteFrame(botID: botID, attempts: 1)
+                    return BotRemoteControlAuthority.ObservedGuestFrame(
+                        containerID: evidence.containerID,
+                        viewerPath: evidence.viewerPath,
+                        pixelWidth: evidence.pixelWidth,
+                        pixelHeight: evidence.pixelHeight,
+                        pngBase64: evidence.png.base64EncodedString(),
+                        pngHash: evidence.pngHash
+                    )
+                }.value
+            },
+            isContainerRunning: { [weak self] botID in
+                guard let service = self?.botsViewModel?.computerGuestService else { return false }
+                return await Task.detached(priority: .userInitiated) { [service] in
+                    service.isContainerRunning(botID: botID)
+                }.value
+            },
+            onStopped: { [weak self] botID, hostID in
+                self?.publishGuestObservedStopped(botID: botID, hostID: hostID)
+            }
+        )
+        pairedGuestObserver = created
+        return created
+    }
+
+    /// `bot.guest.updated` with `reason: "agent_step"` after the bot acted on
+    /// its guest, sent only while a paired viewer is watching that bot (it then
+    /// re-observes). Carries no frame: the next `bot.guest.state` observe does.
+    func publishGuestAgentStep(botID: BotID, step: String) {
+        guard let pairedGuestObserver, pairedGuestObserver.isWatching(botID) else { return }
+        var payload: [String: JSONValue] = [
+            "bot_id": .string(botID.value.uuidString.lowercased()),
+            "reason": .string("agent_step"),
+            "step": .string(step),
+            "frame_stale": .bool(true),
+            "controlled_by_user": .bool(botComputerControl.isControlledByUser(botID)),
+        ]
+        if let hostID = pairedBotRemote?.guestHostID(botID: botID) {
+            payload["host_id"] = .string(hostID)
+        }
+        EventBus.shared.publish(kind: .botGuestUpdated, payload: .object(payload))
+    }
+
+    /// An observe saw the watched container gone and ended its grant as
+    /// `stopped`: every paired client learns it, not only the one that polled.
+    func publishGuestObservedStopped(botID: BotID, hostID: String) {
+        EventBus.shared.publish(kind: .botGuestUpdated, payload: .object([
+            "bot_id": .string(botID.value.uuidString.lowercased()),
+            "host_id": .string(hostID),
+            "method": .string("bot.guest.state"),
+            "reason": .string("observe_stopped"),
+            "status": .string("stopped"),
+            "grant_invalidated": .bool(true),
+            "controlled_by_user": .bool(botComputerControl.isControlledByUser(botID)),
+        ]))
+    }
+
+    /// `bot.guest.updated` with `reason: "control"` whenever who drives the
+    /// bot's computer changed, from the Mac (card, screen toggle) or a paired device.
+    func publishGuestControlChanged(botID: BotID) {
+        var payload: [String: JSONValue] = [
+            "bot_id": .string(botID.value.uuidString.lowercased()),
+            "reason": .string("control"),
+            "controlled_by_user": .bool(botComputerControl.isControlledByUser(botID)),
+        ]
+        if let hostID = pairedBotRemote?.guestHostID(botID: botID) {
+            payload["host_id"] = .string(hostID)
+        }
+        EventBus.shared.publish(kind: .botGuestUpdated, payload: .object(payload))
+    }
+
+    /// `bot.guest.control take` also takes the bot's open manual action, as the
+    /// Mac card's Take does (never on a thread that runs on the Mac). `release`
+    /// hands a taken request back to the bot as `open`, unanswered (the Mac
+    /// card's Devolver continues it instead). Every Mac card refreshes its toggle.
+    private func syncManualActionsAfterGuestControl(botID: BotID, took: Bool) {
+        let threads = context?.threadRepo
+        for request in manualActionStore.openByThread().values where request.botID == botID {
+            if took, request.state == .open {
+                guard let threadID = request.threadID,
+                      let thread = try? threads?.get(id: threadID),
+                      thread.executionTarget != .mac else { continue }
+                if let taken = try? manualActionStore.take(id: request.id, control: botComputerControl) {
+                    ManualActionRequestStore.postStateChanged(taken)
+                }
+            } else if !took, request.state == .taken {
+                var reopened = request
+                reopened.state = .open
+                if (try? manualActionStore.upsert(reopened)) != nil {
+                    ManualActionRequestStore.postStateChanged(reopened)
+                }
+            }
+        }
+        NotificationCenter.default.post(name: .manualActionStateChanged, object: nil)
     }
 
     /// Settle after `dispatch` returns. `mutate` overwrites in-flight settle,
@@ -3768,6 +4287,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return value
     }
 
+    /// False when the paired route names a provider RemoteCode no longer
+    /// runs; `BotDeskRouting` resets such a route to Distill defaults.
+    private static func pairedRouteKeepsItsProvider(_ values: [String: Any]) -> Bool {
+        (values["provider"] as? String).flatMap(AgentProvider.init(rawValue:))?.isSelectable == true
+    }
+
     private static func pairedBotDeskRouting(
         _ values: [String: Any]
     ) throws -> BotDeskRouting {
@@ -3788,7 +4313,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         else {
             throw BotRemoteControlAuthority.Error.invalidParams
         }
-        return BotDeskRouting(
+        var routing = BotDeskRouting(
             provider: provider,
             providerInstanceID: providerInstanceID,
             model: values["model"] as? String ?? "",
@@ -3799,6 +4324,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 .flatMap(AgentServiceTier.init(rawValue:)) ?? .auto,
             runAsUser: runAsUser
         )
+        // Only a Distill route carries a Worker; a legacy route was already
+        // reset to Distill defaults by the initializer.
+        if routing.provider == provider {
+            do {
+                try routing.applyRemoteWorkerFields(values)
+            } catch {
+                throw BotRemoteControlAuthority.Error.invalidParams
+            }
+        }
+        return routing
     }
 
     private static func foundationObject(_ params: [String: JSONValue]) -> [String: Any] {
@@ -3959,31 +4494,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 terminalStatus: terminalStatus
             )
         }
-    }
-
-    /// Bind the cumulative Token Saver "saved in this thread" footer to the shared ledger.
-    static func wireTokenSaverThreadFooter(on viewModel: AgentAppViewModel, context: AppContext) {
-        let savingsRepo = context.tokenSaverSavingsRepo
-        let db = context.db
-        let settingsRepo = context.settingsRepo
-        viewModel.bindTokenSaverThreadFooter(
-            savingsRepo: savingsRepo,
-            isEligible: {
-                // B-6: match sidebar paid claims — enabled AND subscribed.
-                // No teaser footer for free/lapsed accounts.
-                let settings = SettingsStore(db: db).load()
-                guard settings.tokenSaverEnabled else { return false }
-                return PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
-            },
-            isGraphifyActive: {
-                SettingsStore(db: db).load().isGraphifyRuntimeActive
-            },
-            graphifySignalCount: {
-                TokenSaverThreadFooterReload.currentDayGraphifySignalCount(
-                    repo: context.graphifyUsageRepo
-                )
-            }
-        )
     }
 
     private func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
@@ -4149,7 +4659,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // subscribers (including Agent App surfaces that listen for thread.*)
         // see scheduled / RPC-created threads immediately.
         EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(t))
-        softGraphifyPreflight(workspace: resolvedWorkspace)
         return t
     }
 
@@ -4404,6 +4913,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 at: now
             )
         }
+        // A thread locked to a bot before its first send (agent.thread.actor.set)
+        // gets its provider here: its guest marker follows, as at the lock.
+        if before.actorLockedAt != nil, before.provider != t.provider || before.runAsUser != t.runAsUser {
+            try AgentAppViewModel.resyncGuestRuntimeMarker(
+                threadID: thread, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo
+            )
+        }
         t.updatedAt = now
         t.routingConfiguration = try ctx.threadRepo.routingConfiguration(of: thread)
         for s in SurfaceRegistry.shared.all() {
@@ -4638,6 +5154,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func threadIdsWithMessagesOffMain() async throws -> Set<AgentThreadID> {
         try await agentAppReadGateway.threadIdsWithMessages()
+    }
+
+    /// Off the main actor; an unreadable table reads as no markers.
+    public func threadGuestRuntimesOffMain() async -> [AgentThreadID: String] {
+        (try? await agentAppReadGateway.guestRuntimesByThread()) ?? [:]
     }
 
     public func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor? = nil) throws -> AgentMessagePage {
@@ -5034,7 +5555,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             requestedRunID: requestedRunID,
             orchestrationRoutingSnapshot: orchestrationRoutingSnapshot,
             executionCwdOverride: executionCwdOverride,
-            allowProviderCatalogListingDuringPreflight: allowProviderCatalogListingDuringPreflight
+            allowProviderCatalogListingDuringPreflight: allowProviderCatalogListingDuringPreflight,
+            // Desk, peer and hop callers send an already compiled bot prompt:
+            // queued, it would show as the user's message and compile again at drain.
+            queueBehindBusyBotVM: false
+        )
+    }
+
+    /// A follow-up the host sends for the user (manual-action answers,
+    /// Mac-execution approvals). On a bot thread it is a bot turn like the Mac
+    /// card's: compiled brain, VM/guest rules, bot-home cwd and the desk's run
+    /// bookkeeping. Any other thread gets the plain text.
+    func sendBotThreadFollowUp(thread: AgentThreadID, text: String) async throws -> AgentMessageSendResult {
+        try await sendAgentMessage(
+            thread: thread,
+            text: text,
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            interactionMode: nil,
+            modelSelection: nil,
+            providerInstanceId: nil,
+            attachments: [],
+            queueMessageId: nil,
+            compilesBotPrompt: true
         )
     }
 
@@ -5108,7 +5654,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             queueMessageId: nil,
             routingConfiguration: storedRouting,
             nestedRunContext: nestedRunContext,
-            preflightRejectionIsDefinite: true
+            preflightRejectionIsDefinite: true,
+            // A thread locked to a bot runs as that bot, as the Mac composer's
+            // sends do (a paired device may have locked it with agent.thread.actor.set).
+            compilesBotPrompt: try ctx.threadRepo.lockedBotActor(of: thread) != nil
         )
     }
 
@@ -5159,13 +5708,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true, compilesBotPrompt: Bool = false) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         // Status + permission + provider identity only. A leftover 26-column
         // + routing `get` hitchs every send before configureAgentThread loads
         // the row again for mutate.
         guard let admission = try ctx.threadRepo.sendAdmission(of: thread) else {
             throw LayoutError.workspaceNotFound
+        }
+        // A group room never runs a provider: its bots answer on their own threads.
+        if try ctx.botStore.group(roomThreadID: thread) != nil {
+            throw JSONRPCError(code: -32000, message: "This is a group conversation. Send to it with bot.group.send.")
         }
         let effectiveRouting: AgentRoutingConfiguration?
         if let passed = orchestrationRoutingSnapshot?.configuration
@@ -5201,12 +5754,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if Task.isCancelled {
             throw CancellationError()
         }
-        if admission.status == .running
-            || ctx.coordinator.hasPendingProviderStart(threadId: thread)
-            || ctx.coordinator.hasProviderSession(threadId: thread) {
-            if queueMessageId != nil {
-                throw JSONRPCError(code: -32000, message: "Thread became active before queued dispatch started.")
-            }
+        func enqueueBehindActiveRun() throws -> AgentMessageSendResult {
             let queued = try ctx.queuedMessageRepo.enqueue(
                 id: requestedRunID.map { AgentQueuedMessageID($0.value) },
                 threadId: thread,
@@ -5222,6 +5770,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             refreshAgentSurfaces(thread: thread)
             ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread)
             return AgentMessageSendResult(status: .queued, runId: requestedRunID, queuedMessage: queued)
+        }
+        if admission.status == .running
+            || ctx.coordinator.hasPendingProviderStart(threadId: thread)
+            || ctx.coordinator.hasProviderSession(threadId: thread) {
+            if queueMessageId != nil {
+                throw JSONRPCError(code: -32000, message: "Thread became active before queued dispatch started.")
+            }
+            return try enqueueBehindActiveRun()
+        }
+        // D12: one run per bot VM. A VM busy in another thread queues this send
+        // behind that run (its run-finished drain starts it); a queued dispatch
+        // was already claimed by the drain. Unstarted claims are freed below.
+        let startRunID = requestedRunID ?? queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID()
+        let vmClaim = claimBotVMRun(thread: thread, runID: startRunID, firstMessage: text)
+        if let vmClaim, let holder = vmClaim.holder {
+            // Nothing was written: the caller keeps its text and shows the notice.
+            guard queueBehindBusyBotVM else { throw BotVMBusyError(holder: holder) }
+            let notice = waitForBotVM(botID: vmClaim.botID, thread: thread, holder: holder)
+            if queueMessageId != nil { throw JSONRPCError(code: -32000, message: notice) }
+            return try enqueueBehindActiveRun()
+        }
+        var vmRunStarted = false
+        defer {
+            if vmClaim != nil, !vmRunStarted { releaseBotVMRun(startRunID) }
         }
         // A message-send is not a provider-change gesture. The provider INSTANCE
         // is immutable once the thread has started (A1 parity), so never forward it
@@ -5266,23 +5838,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } else {
             cwd = try prepareAgentExecutionCwd(thread: &t)
         }
-        // Provider-instance + host Token Saver injects for the Source provider.
-        // Same-host Auto never switches provider. The previous empty Auto base
-        // dropped instance config (HOME/CODEX_HOME/GROK_HOME, custom env) from the
-        // request shell; Token Saver receipt/DISTILL_HINT still arrived later via
-        // runEnvironmentProvider, but nested CLI children could miss instance
-        // homes and any early host injects. Always stamp the full base here.
-        let hostTokenSaverBase = providerEnvironment(
+        // Provider-instance host environment for the Source provider. Same-host
+        // Auto never switches provider. The previous empty Auto base dropped
+        // instance config (HOME/CODEX_HOME/GROK_HOME, custom env) from the
+        // request shell, so nested CLI children could miss instance homes.
+        // Always stamp the full base here.
+        let hostProviderBase = providerEnvironment(
             provider: prov,
             instanceId: t.providerInstanceId,
             threadId: thread
-        )
-        // Graphify: authoritative resolve after cwd is known. Fail-open; never blocks the run.
-        let graphifyEnv = await applyGraphifyOnSend(
-            thread: t,
-            cwd: cwd,
-            attachments: resolvedAttachments,
-            baseEnvironment: hostTokenSaverBase
         )
         let acceptancePermit = queueMessageId.map { _ in
             queueAcceptancePermit ?? AgentRunAcceptancePermit()
@@ -5295,7 +5859,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ctx.unregisterQueueDispatchAcceptancePermit(acceptancePermit, threadId: thread)
             }
         }
-        var providerRunEnvironment = graphifyEnv
+        var providerRunEnvironment = hostProviderBase
         providerRunEnvironment.removeValue(
             forKey: AgentAppRuntimeProfile.environmentKey
         )
@@ -5310,7 +5874,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             providerRunEnvironment[AgentAppRuntimeProfile.environmentKey] =
                 runtimeProfile.rawValue
         }
-        let requestedRunID = requestedRunID ?? queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID()
+        let requestedRunID = startRunID
         // Prefer a full orchestration snapshot (scheduled Path B / Auto admit)
         // so launch binary+catalog match preflight. Queued messages only carry
         // the lightweight admission fields and refill provider snapshots at start.
@@ -5373,15 +5937,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     childCapability: childCapability,
                     requestedPermissionMode: t.permissionMode
                 )
-                // Rebuild host Token Saver for the *child* thread so every
-                // orchestrated worker gets the full technique surface (receipt,
-                // DISTILL_HINT, managed PATH wrappers, Distill state, Graphify)
-                // — not a thinned parent/Auto shell.
-                providerRunEnvironment = await completeOrchestratedWorkerEnvironment(
+                // Rebuild the host environment for the *child* thread so every
+                // orchestrated worker gets the full surface, not a thinned
+                // parent/Auto shell.
+                providerRunEnvironment = completeOrchestratedWorkerEnvironment(
                     thread: t,
                     provider: prov,
-                    cwd: cwd,
-                    attachments: resolvedAttachments,
                     childCapability: childCapability,
                     runtimeProfile: nestedRunContext.runtimeProfile
                 )
@@ -5418,14 +5979,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var runPrompt = text
         var runCwd = cwd
         var botPromptApplied = false
-        if queueMessageId != nil,
+        if queueMessageId != nil || compilesBotPrompt,
            let transform = botThreadPromptTransform,
            let transformed = try await transform(thread, text, requestedRunID) {
             runPrompt = transformed.prompt
             if let botCwd = transformed.cwd { runCwd = GrokACPClient.resolvedSessionCwd(botCwd) }
             botPromptApplied = true
         }
-        var req = AgentRunRequest(
+        let req = AgentRunRequest(
             runId: requestedRunID,
             threadId: thread,
             provider: prov,
@@ -5450,10 +6011,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             runAsUser: t.runAsUser,
             acceptancePermit: acceptancePermit
         )
-        req.tokenSaverCompressesPrompt = botPromptApplied
         let runId: AgentRunID
         do {
             runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
+            vmRunStarted = true
         } catch {
             if nestedReceiptRegistered {
                 try? ctx.orchestrationRuntime.finalizeReceipt(
@@ -5480,16 +6041,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func drainNextQueuedAgentMessage(
         thread: AgentThreadID,
-        recoverPreparedFromPriorProcess: Bool = false
+        recoverPreparedFromPriorProcess: Bool = false,
+        botVMHandOff: Bool = false
     ) async throws {
         // This gate only needs durable run-state. A full 26-column + routing
         // `get` hitchs MainActor before the next queued follow-up can start.
+        // A D12 hand-off also drains a thread that never ran (still `.pending`
+        // by default) when no start is in flight: its first send queued
+        // behind the bot's VM. Launch recovery does the same for a VM-bot
+        // thread, whose in-memory wait did not survive the relaunch.
         guard let ctx = context,
               ctx.queueDrainAllowsWork(threadId: thread),
               !Task.isCancelled,
               let status = try ctx.threadRepo.status(of: thread),
               status != .running,
-              status != .pending,
+              try status != .pending || (
+                  (botVMHandOff || (recoverPreparedFromPriorProcess && botIDOfVMThread(thread) != nil))
+                  && !ctx.coordinator.hasPendingProviderStart(threadId: thread)
+                  && ctx.runRepo.latestActive(for: thread) == nil),
               !ctx.coordinator.hasProviderSession(threadId: thread) else { return }
         if let head = try ctx.queuedMessageRepo.first(threadId: thread),
            let dispatch = try ctx.queuedMessageRepo.dispatch(id: head.id),
@@ -5537,6 +6106,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let queued = lease.message
         let dispatchRunId = AgentRunID(queued.id.value)
+        // D12: a VM busy in another thread keeps the message queued; the
+        // holder's run-finished drain starts it. A claim whose run never
+        // started is freed on every exit.
+        let vmClaim = claimBotVMRun(thread: thread, runID: dispatchRunId)
+        if let vmClaim, let holder = vmClaim.holder {
+            _ = try? ctx.queuedMessageRepo.release(lease)
+            waitForBotVM(botID: vmClaim.botID, thread: thread, holder: holder)
+            return
+        }
+        defer {
+            if vmClaim != nil {
+                let runStatus = (try? ctx.runRepo.status(of: dispatchRunId)) ?? nil
+                if runStatus != .running, runStatus != .pending { releaseBotVMRun(dispatchRunId) }
+            }
+        }
         guard try ctx.queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId) else {
             _ = try? ctx.queuedMessageRepo.release(lease)
             throw JSONRPCError(code: -32000, message: "Queued message dispatch could not be prepared.")
@@ -5785,86 +6369,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
-    /// Soft Graphify preflight on Agent App open / create.
-    /// Single-repo: ensure that root. Multi-repo: sticky/pin/auto-bootstrap one child (never parent).
-    private func softGraphifyPreflight(workspace: WorkspaceID?) {
-        guard let ctx = context, let workspace else { return }
-        let settings = SettingsStore(db: ctx.db).load()
-        // Token Saver is the paid gate; Graphify is a sub-capability under it.
-        guard ctx.isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return }
-        configureGraphifyService(from: settings)
-        let cwd = ctx.state.workspaces[workspace]?.cwd ?? FileManager.default.currentDirectoryPath
-        let pinnedRoots = settings.graphifyPinnedRoots
-        // Thread creation is an acknowledgement boundary for local RPC. Binary
-        // ensure and repository probing can take seconds and must not hold the
-        // MainActor or the Unix request open after the thread is durable.
-        Task.detached(priority: .utility) { [weak self] in
-            let set = GraphifyWorkspaceService.shared.softPreflight(
-                workspaceCwd: cwd,
-                pinnedRoots: pinnedRoots
-            )
-            await MainActor.run {
-                self?.publishGraphifyWorkingSet(set, threadId: nil)
-            }
-        }
-    }
-
-    private func configureGraphifyService(from settings: AppSettings) {
-        let svc = GraphifyWorkspaceService.shared
-        let active = context?.isTokenSaverRuntimeActive(settings: settings) == true
-            && settings.isGraphifyRuntimeActive
-        let wasActive = svc.enabled
-        svc.enabled = active
-        svc.autoEnsure = active && settings.graphifyAutoEnsure
-        svc.writeInRepo = settings.graphifyWriteInRepo
-        svc.pinnedRoots = settings.graphifyPinnedRoots
-        let path = settings.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        svc.binaryPathOverride = path.isEmpty ? nil : path
-        if !active {
-            svc.stopWatchingAll()
-        } else if !wasActive {
-            // Transition-only: inactive → active. Do not dirty every hot send.
-            svc.resumeAfterDisable()
-        }
-    }
-
     /// Full host environment for an orchestrated Agent App worker (nested child).
     ///
-    /// Product rule: every worker / orchestrated agent must receive the same Token
-    /// Saver technique surface as a user-started primary turn — execution receipt,
-    /// `RC_TOKEN_SAVER_DISTILL_HINT`, managed PATH wrappers (`| distill` / proxies),
-    /// Distill state path (Claude PostToolUse), Graphify when active, and Subagents
-    /// lifecycle keys. Rebuilds from the child thread identity after nested
-    /// admission so cross-provider children are not stuck with a parent-only or
-    /// Auto-thinned shell.
+    /// Every worker gets the same host environment as a user-started primary
+    /// turn (instance homes, managed PATH proxies, Subagents lifecycle keys).
+    /// Rebuilds from the child thread identity after nested admission so
+    /// cross-provider children are not stuck with a parent-only or Auto-thinned
+    /// shell.
     private func completeOrchestratedWorkerEnvironment(
         thread: AgentThread,
         provider: AgentProvider,
-        cwd: String,
-        attachments: [AgentAttachment],
         childCapability: String,
         runtimeProfile: AgentAppRuntimeProfile?
-    ) async -> [String: String] {
-        let hostBase = providerEnvironment(
+    ) -> [String: String] {
+        var env = providerEnvironment(
             provider: provider,
             instanceId: thread.providerInstanceId,
             threadId: thread.id
-        )
-        var env = await applyGraphifyOnSend(
-            thread: thread,
-            cwd: cwd,
-            attachments: attachments,
-            baseEnvironment: hostBase
         )
         env.removeValue(forKey: AgentAppRuntimeProfile.environmentKey)
         if let runtimeProfile {
             env[AgentAppRuntimeProfile.environmentKey] = runtimeProfile.rawValue
         }
         env[AgentDelegationCapabilityTransport.environmentKey] = childCapability
-        // providerEnvironment already stamped Token Saver when admitted. Re-assert
-        // managed wrappers first so nested PATH proxies stay in front after any
-        // Graphify merge.
+        // Re-assert managed wrappers first so nested PATH proxies stay in front.
         if let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !managedBin.isEmpty,
@@ -5875,67 +6403,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
         }
         return env
-    }
-
-    /// Authoritative Graphify resolve on send (RPC path). Agent App UI uses the same
-    /// `GraphifyWorkspaceService.applyToAgentEnvironment` from AgentAppSurface.
-    private func applyGraphifyOnSend(
-        thread: AgentThread,
-        cwd: String,
-        attachments: [AgentAttachment],
-        baseEnvironment: [String: String]
-    ) async -> [String: String] {
-        guard let ctx = context else { return baseEnvironment }
-        let settings = SettingsStore(db: ctx.db).load()
-        guard ctx.isTokenSaverRuntimeActive(settings: settings),
-              settings.isGraphifyRuntimeActive else { return baseEnvironment }
-        // Bots Desk is workspace-less Local. Walking process cwd is the
-        // git-rev-parse beachball Agent App already pulled off send.
-        guard thread.workspaceId != nil else {
-            return GraphifyWorkspaceService.stripGraphifyKeys(from: baseEnvironment)
-        }
-        configureGraphifyService(from: settings)
-
-        let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? cwd
-        // Root resolution blocks on `git rev-parse` subprocesses (two per
-        // candidate directory, whole-tree walk when the workspace root is not a
-        // repo). Must not run on the MainActor — same beachball the Agent App
-        // composer path had. Awaited, so the run environment is unchanged.
-        let graphifyThreadId = thread.id.value
-        let graphifyWorktreePath = thread.worktreePath
-        let graphifyAttachmentPaths = attachments.map(\.path)
-        let applied = await Task.detached(priority: .userInitiated) {
-            GraphifyWorkspaceService.shared.applyToAgentEnvironment(
-                base: baseEnvironment,
-                threadId: graphifyThreadId,
-                threadCwd: cwd,
-                worktreePath: graphifyWorktreePath,
-                workspaceCwd: workspaceCwd,
-                attachmentPaths: graphifyAttachmentPaths
-            )
-        }.value
-        publishGraphifyWorkingSet(applied.workingSet, threadId: thread.id)
-        return applied.environment
-    }
-
-    private func publishGraphifyWorkingSet(_ set: GraphifyThreadWorkingSet, threadId: AgentThreadID?) {
-        var payload: [String: JSONValue] = [
-            "workspace_kind": .string(set.workspaceKind),
-            "ambiguous": .bool(set.ambiguous),
-            "roots": .array(set.roots.map { binding in
-                .object([
-                    "display_root": .string(binding.checkout.displayRoot),
-                    "common_dir": .string(binding.checkout.key.commonDir),
-                    "status": .string(binding.status.rawValue),
-                    "reason": .string(binding.reason),
-                    "artifact_root": binding.artifactRoot.map { .string($0) } ?? .null
-                ])
-            })
-        ]
-        if let threadId {
-            payload["thread_id"] = .string(threadId.value.uuidString)
-        }
-        EventBus.shared.publish(kind: .graphifyThreadRoots, payload: .object(payload))
     }
 
     func effectiveAgentExecutionCwd(for thread: AgentThread) throws -> String {
@@ -6158,45 +6625,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         minimumEventSequence: Int64
     ) throws -> [EventBus.Event] {
         guard let context else { throw LayoutError.workspaceNotFound }
-        let resultData = try commandReceiptSortedEncoder.encode(result)
-        guard let resultJSON = String(data: resultData, encoding: .utf8) else {
-            throw JSONRPCError.internalError
-        }
-        let intents = try events.map { event -> CommandReceiptEventIntent in
-            let payloadData = try commandReceiptSortedEncoder.encode(event.payload)
-            guard let payloadJSON = String(data: payloadData, encoding: .utf8) else {
-                throw JSONRPCError.internalError
-            }
-            return CommandReceiptEventIntent(
-                kind: event.kind.rawValue,
-                payloadJSON: payloadJSON,
-                createdAt: event.createdAt
-            )
-        }
-        let repo = context.commandReceiptRepo
-        let persisted = try CommandReceiptPersistenceGateway.shared.syncThrowing {
-            try repo.finalize(
-                method: method,
-                clientRequestId: clientRequestId,
-                ownerFingerprint: ownerFingerprint,
-                paramsHash: paramsHash,
-                resultJSON: resultJSON,
-                events: intents,
-                minimumEventSequence: minimumEventSequence
-            )
-        }
-        return try persisted.map { event in
-            guard let payloadData = event.payloadJSON.data(using: .utf8),
-                  let payload = JSONValue.decode(from: payloadData) else {
-                throw JSONRPCError.internalError
-            }
-            return EventBus.Event(
-                seq: event.seq,
-                kind: event.kind,
-                payload: payload,
-                ts: event.createdAt.timeIntervalSince1970
-            )
-        }
+        return try CommandReceiptOffMainWriter(repo: context.commandReceiptRepo).finalizeTransaction(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash,
+            result: result,
+            events: events
+        )(minimumEventSequence)
+    }
+
+    public var commandReceiptOffMainWriter: (any CommandReceiptOffMainWriting)? {
+        guard let context else { return nil }
+        return CommandReceiptOffMainWriter(repo: context.commandReceiptRepo)
     }
 
     public func markCommandReceiptUnknown(
@@ -6341,26 +6782,35 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ) async throws -> AgentThreadMirrorSnapshot {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         // v1: metadata-first length inspection + decode only the selected suffix.
+        // Runs off MainActor: the barrier waits on this thread's mirror lock
+        // (a long stream flush) and the selection reads SQLite, neither of
+        // which may stall the UI or other paired-device RPCs.
         if let eventRowLimit, let maxPayloadBytes {
-            return try ctx.coordinator.withMirrorEventSnapshotForThreadReadV1(
-                threadId: thread,
-                eventLimit: eventRowLimit,
-                maxPayloadBytes: maxPayloadBytes
-            ) { selection in
-                let blocked = selection.blockedNewest.map {
-                    AgentThreadMirrorSnapshot.BlockedMirrorEvent(
-                        id: $0.id,
-                        payloadBytes: $0.payloadBytes,
-                        reason: $0.reason
+            let coordinator = ctx.coordinator
+            return try await Task.detached(priority: .userInitiated) {
+                let signposter = PerfSwitchMetrics.signposter
+                let interval = signposter.beginInterval("thread_read_v1_snapshot", id: signposter.makeSignpostID())
+                defer { signposter.endInterval("thread_read_v1_snapshot", interval) }
+                return try coordinator.withMirrorEventSnapshotForThreadReadV1(
+                    threadId: thread,
+                    eventLimit: eventRowLimit,
+                    maxPayloadBytes: maxPayloadBytes
+                ) { selection in
+                    let blocked = selection.blockedNewest.map {
+                        AgentThreadMirrorSnapshot.BlockedMirrorEvent(
+                            id: $0.id,
+                            payloadBytes: $0.payloadBytes,
+                            reason: $0.reason
+                        )
+                    }
+                    return AgentThreadMirrorSnapshot(
+                        events: selection.events,
+                        eventWatermark: EventBus.shared.currentSeq,
+                        sourceHadOlderEvents: selection.hasMoreOlder,
+                        blockedEvent: blocked
                     )
                 }
-                return AgentThreadMirrorSnapshot(
-                    events: selection.events,
-                    eventWatermark: EventBus.shared.currentSeq,
-                    sourceHadOlderEvents: selection.hasMoreOlder,
-                    blockedEvent: blocked
-                )
-            }
+            }.value
         }
         // Legacy: unbounded (or optional count-only) decode path.
         let sqlLimit = eventRowLimit.map { max(1, $0) + 1 } ?? Int.max
@@ -7389,9 +7839,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 env["DISTILL_HOME"] = env["DISTILL_HOME"] ?? home
             }
         }
-        // VITAL for the savings report: tag the agent's environment with the provider so the
-        // local `distill` CLI attributes command-output savings to claude/codex/grok
-        // instead of "unknown". Set unconditionally — even with no instance config.
+        // Tag the agent's environment with the provider so child tooling (provider
+        // proxies, subagent telemetry) attributes work to claude/codex/grok instead
+        // of "unknown". Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
         if let context, let threadId {
             let telemetryEnv = context.subagentTelemetryEnvironment(
@@ -7400,40 +7850,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 baseEnvironment: env
             )
             env.merge(telemetryEnv) { _, new in new }
-            // Nested provider proxies (`grok`/`claude`/`codex` in managed bin) must resolve
-            // for every thread-scoped provider environment — not only when Token Saver is on.
-            // Token Saver command-compression wrappers remain gated by admission below.
+            // Nested provider proxies (`grok`/`claude`/`codex` in managed bin) must
+            // resolve for every thread-scoped provider environment.
             let managedBin = env["RC_REMOTE_CODE_MANAGED_BIN"]
                 ?? AgentSkillInstaller.defaultManagedCLIBinDirectory().path
             let basePath = env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
-            env["PATH"] = Self.providerPathWithManagedWrappers(
-                currentPath: basePath,
+            // Drop any optimization keys an older build left in the inherited
+            // environment, then put managed bin back first on PATH so nested
+            // provider proxies + Subagents telemetry work.
+            var cleaned = Self.scrubProviderEnvironment(env)
+            cleaned["PATH"] = Self.providerPathWithManagedWrappers(
+                currentPath: cleaned["PATH"] ?? basePath,
                 managedBin: managedBin
             )
-            // task-08: Token Saver PATH/hint only when same-user admission allows.
-            let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
-            if tokenSaverEnv.isEmpty {
-                // Cross-user / raw-only: scrub Token Saver optimization keys, but keep
-                // managed bin on PATH so nested provider proxies + Subagents telemetry work.
-                var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
-                cleaned["PATH"] = Self.providerPathWithManagedWrappers(
-                    currentPath: cleaned["PATH"] ?? basePath,
-                    managedBin: managedBin
-                )
-                return applyDesktopChildEnvironment(cleaned, threadId: threadId, context: context)
-            }
-            env.merge(tokenSaverEnv) { _, new in new }
-            // Re-assert managed bin first after any Token Saver PATH rewrite.
-            if let path = env["PATH"] {
-                env["PATH"] = Self.providerPathWithManagedWrappers(
-                    currentPath: path,
-                    managedBin: managedBin
-                )
-            }
-            return applyDesktopChildEnvironment(env, threadId: threadId, context: context)
+            return applyDesktopChildEnvironment(cleaned, threadId: threadId, context: context)
         } else {
-            // No thread context: keep provider tag only; scrub any residual TS keys.
-            return Self.scrubTokenSaverEnvironment(env)
+            // No thread context: keep provider tag only; no managed bin on PATH.
+            return Self.scrubProviderEnvironment(env)
         }
     }
 
@@ -7460,27 +7893,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
-    /// Removes Token Saver env keys. For no-thread contexts also drops managed bin from
-    /// PATH (no nested provider interception without thread scope). Thread-scoped paths
-    /// re-apply managed bin after scrub so provider proxies stay available.
-    nonisolated static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
-        var cleaned = TokenSaverExecutionReceiptSeam.scrub(env)
-        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-        if let path = cleaned["PATH"] {
-            // PERF: single pass avoids the map + filter intermediates on the
-            // scrub path; joined PATH identical.
-            var kept: [String] = []
-            for part in path.split(separator: ":") where part != managedBin {
-                kept.append(String(part))
-            }
-            cleaned["PATH"] = kept.joined(separator: ":")
-        }
-        return cleaned
+    /// Drops the keys the removed Token Saver / Graphify / Distill compression
+    /// lanes read (nothing sets them any more, but a value inherited from an
+    /// older build's environment must never reach a provider) and the managed
+    /// bin from PATH. No-thread contexts use it as is (no nested provider
+    /// interception without thread scope); thread-scoped paths put managed bin
+    /// back first so provider proxies stay available.
+    nonisolated static func scrubProviderEnvironment(_ env: [String: String]) -> [String: String] {
+        AgentHostEnvironmentMerge.scrubLegacyOptimizationKeys(env)
     }
 
     /// Prepends the managed CLI bin (`~/.remote-code/bin`) so nested provider proxies
-    /// and (when Token Saver is on) command-compression wrappers win PATH lookup inside
-    /// the provider process. Host top-level launches use absolute binaries via
+    /// win PATH lookup inside the provider process. Host top-level launches use absolute binaries via
     /// `ProcessLocator` and skip provider proxy shims.
     static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
         let trimmed = managedBin.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -7583,6 +8007,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let insertionPath = (try? Self.composerInsertionPath(for: attachment, store: agentAttachmentStore()))
             ?? attachment.path
         return AgentAttachmentUploadResult(reference, composerInsertionText: insertionPath)
+    }
+
+    /// Message lookup and file/image work both run off the main actor.
+    public func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue {
+        let store = try agentAttachmentStore()
+        let message = try await agentAppReadGateway.message(id: request.messageID)
+        return try await Task.detached(priority: .userInitiated) {
+            try AgentAttachmentGetWire.load(request, message: message, store: store)
+        }.value
+    }
+
+    /// Reads the stored usage file off the main actor; never probes a provider.
+    public func getAgentAccountUsage() async throws -> JSONValue {
+        guard let directory = context?.appSupportDirectory else {
+            throw JSONRPCError.notSupported("agent.account.usage.get")
+        }
+        return await Task.detached(priority: .userInitiated) {
+            AgentAccountUsageWire.load(appSupportDirectory: directory)
+        }.value
     }
 
     public func importAgentAttachment(workspace: WorkspaceID, relativePath: String) throws -> AgentAttachmentUploadResult {
@@ -7847,23 +8290,47 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         terminal.onTitleChange = { [weak self, weak terminal] title in
             guard let self, let terminal else { return }
             let surfaceID = terminal.descriptor.id
-            do {
-                try self.renameSurface(workspace, surfaceID, title)
-            } catch {
-                NSLog(
-                    "RemoteCode terminal title persistence failed surface=%@ error=%@",
-                    surfaceID.value.uuidString,
-                    String(describing: error)
-                )
-                return
+            self.terminalTitleCoalescer.submit(surfaceID, title: title) { [weak self] latest in
+                self?.commitTerminalTitle(workspace: workspace, surfaceID: surfaceID, title: latest)
             }
-            EventBus.shared.publish(kind: .surfaceRenamed, payload: .object([
-                "workspace_id": .string(workspace.value.uuidString),
-                "id": .string(surfaceID.value.uuidString),
-                "title": .string(title)
-            ]))
         }
         return terminal
+    }
+
+    /// H3: commits terminal titles still inside the throttle window, so the
+    /// final snapshot before quit or update holds the newest title.
+    func flushPendingTerminalTitles() {
+        terminalTitleCoalescer.flushAll()
+    }
+
+    /// H3: a normalized terminal title change. Persists through one layout apply
+    /// (one debounced snapshot save) and patches only the tab label -- no window
+    /// refresh. Unchanged titles and surfaces that closed meanwhile are dropped.
+    private func commitTerminalTitle(workspace: WorkspaceID, surfaceID: SurfaceID, title: String) {
+        guard SurfaceRegistry.shared.surface(surfaceID) != nil else {
+            terminalTitleCoalescer.cancel(surfaceID)
+            return
+        }
+        if let layout = context?.state.workspaces[workspace]?.layout,
+           findSurface(surfaceID, in: layout)?.title == title {
+            return
+        }
+        do {
+            try context?.apply(.renameSurface(workspace, surfaceID, title))
+        } catch {
+            NSLog(
+                "RemoteCode terminal title persistence failed surface=%@ error=%@",
+                surfaceID.value.uuidString,
+                String(describing: error)
+            )
+            return
+        }
+        windowController?.updateSurfaceTabTitle(surfaceID, title: title)
+        EventBus.shared.publish(kind: .surfaceRenamed, payload: .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "id": .string(surfaceID.value.uuidString),
+            "title": .string(title)
+        ]))
     }
 
     private func restoredBrowserURL(from descriptor: SurfaceDescriptor) -> URL? {
@@ -8099,7 +8566,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let beforeAct = botBrowserBeforeBridgeActForTesting
         // Guest provisioning (docker CLI) and child-process IO must never run
         // on MainActor — hop to a utility queue and await the result.
-        return try await withCheckedThrowingContinuation { continuation in
+        let payload: String = try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 do {
                     try ensureGuest?()
@@ -8127,6 +8594,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
             }
         }
+        if action.kind == BotBrowserCatalog.act, route == .playwrightGuest, payload != Self.botBrowserRefusalPayload {
+            publishGuestAgentStep(botID: botID, step: "browser_act")
+        }
+        return payload
     }
 
     /// Drain MCP pending guest observe/act through the app-process Docker CLI.
@@ -8136,8 +8607,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         botComputerReconciliationScheduled = true
         let appSupport = ctx.appSupportDirectory
         let botStore = ctx.botStore
+        // The worker and its step hops live for one drain pass only (no cycle).
         let worker = botComputerReconciliationWorkerForTesting ?? {
-            Self.reconcileBotComputerActions(appSupport: appSupport, botStore: botStore)
+            Self.reconcileBotComputerActions(appSupport: appSupport, botStore: botStore) { botID, step in
+                Task { @MainActor in self.publishGuestAgentStep(botID: botID, step: step) }
+            }
         }
         botComputerReconciliationQueue.async { [weak self] in
             worker()
@@ -8151,15 +8625,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    nonisolated private static func reconcileBotComputerActions(appSupport: URL, botStore: BotStore) {
+    nonisolated private static let botComputerActionLanes = BotComputerActionLanes(
+        label: "io.remotecode.bot-computer-action"
+    )
+
+    nonisolated private static func reconcileBotComputerActions(
+        appSupport: URL,
+        botStore: BotStore,
+        onGuestStep: @escaping @Sendable (BotID, String) -> Void
+    ) {
         let store = BotComputerStore(appSupportDirectory: appSupport)
         let service = BotComputerGuestService(
             appSupport: appSupport,
             docker: BotComputerDockerCLI(),
             recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
+        // The drain only hands actions to per-bot lanes and returns; a bot's
+        // long exec or rebuild runs on that bot's lane alone.
         while true {
-            let count = (try? BotComputerHost.applyPending(store: store) { action in
+            let count = (try? BotComputerHost.dispatchPending(store: store, lanes: botComputerActionLanes) { action in
                 guard let uuid = UUID(uuidString: action.botID) else {
                     throw BotComputerError.invalid("Invalid bot id.")
                 }
@@ -8170,7 +8654,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                       BotDesktopAdmission.forPublished(revision.desktopKind).allowsGuestComputer else {
                     throw BotComputerError.notDockerDesktop
                 }
-                return try service.apply(action)
+                let result = try service.apply(action)
+                if result["refusal"] == nil {
+                    switch action.kind {
+                    case BotComputerCatalog.act: onGuestStep(botID, "act")
+                    case BotComputerCatalog.exec: onGuestStep(botID, "exec")
+                    default: break
+                    }
+                }
+                return result
             }) ?? 0
             guard count > 0 else { return }
         }
@@ -8597,6 +9089,41 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    /// Reads on the WAL reader so a reconnect's unchanged push token never waits
+    /// behind a long writer transaction. Any read failure answers false and the
+    /// request takes the full durable path.
+    public func privatePushRegistrationIsCurrent(_ probe: PrivatePushRegistrationProbe) -> Bool {
+        guard let ctx = context else { return false }
+        let store = PrivatePushTargetStore(repo: SettingsRepository(db: ctx.readDB))
+        guard store.legacyTargetMatches(
+            pushToken: probe.pushToken,
+            pushTokenType: probe.pushTokenType,
+            liveActivityToken: probe.liveActivityToken,
+            deviceId: probe.deviceID
+        ) else { return false }
+        if let alert = probe.alert {
+            guard let deviceID = probe.deviceID,
+                  let environment = PrivatePushEnvironment(rawValue: alert.environment),
+                  store.containsCurrentRecord(PrivatePushTargetRecord(
+                      deviceId: deviceID,
+                      serverId: alert.serverID,
+                      purpose: .alert,
+                      environment: environment,
+                      token: probe.pushToken,
+                      contractVersion: alert.contractVersion,
+                      capabilities: alert.capabilities
+                  )) else { return false }
+        }
+        if let binding = probe.profileBinding {
+            guard BotAttentionPushBindingStore(db: ctx.readDB).contains(
+                profileID: binding.profileID,
+                hostID: binding.hostID,
+                deviceID: binding.deviceID
+            ) else { return false }
+        }
+        return true
+    }
+
     public func settingsGet(keys: [String]) throws -> [String: String] {
         guard let ctx = context else { return [:] }
         var values: [String: String] = [:]
@@ -8646,7 +9173,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func filesStateGet(surface: SurfaceID) throws -> JSONValue {
         let located = try locateSurface(surface)
         let root = try workspaceCwd(located.workspaceID)
-        let state = decodeFilesState(located.descriptor.metadata["files_state"])
+        let state = Self.decodeFilesState(located.descriptor.metadata["files_state"])
             ?? defaultFilesState(surface: surface, workspace: located.workspaceID, root: root, descriptor: located.descriptor)
         return .object(state)
     }
@@ -8654,7 +9181,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func filesStateUpdate(surface: SurfaceID, patch: [String: JSONValue], baseRevision: Int?, deviceID: String?) throws -> JSONValue {
         let located = try locateSurface(surface)
         let root = try workspaceCwd(located.workspaceID)
-        var state = decodeFilesState(located.descriptor.metadata["files_state"])
+        var state = Self.decodeFilesState(located.descriptor.metadata["files_state"])
             ?? defaultFilesState(surface: surface, workspace: located.workspaceID, root: root, descriptor: located.descriptor)
         let currentRevision = state["revision"]?.intValue ?? 0
         if let baseRevision, baseRevision != currentRevision {
@@ -8888,6 +9415,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 agent.viewModel.onThreadLifecycle = { [weak self] event in
                     self?.publishAgentThreadLifecycle(event)
                 }
+                agent.viewModel.onThreadChromeWritten = { write in
+                    write.publish()
+                }
                 agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
                     ctx?.retireDeletedAgentThreads(
                         ids,
@@ -8897,7 +9427,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                 wireQueueDrainControl(on: agent.viewModel, context: ctx)
                 wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
-                Self.wireTokenSaverThreadFooter(on: agent.viewModel, context: ctx)
                 configureAgentAppBotMentions(agent)
                 agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                     self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
@@ -9548,7 +10077,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ]
     }
 
-    private func decodeFilesState(_ raw: String?) -> [String: JSONValue]? {
+    nonisolated private static func decodeFilesState(_ raw: String?) -> [String: JSONValue]? {
         guard let raw, let data = raw.data(using: .utf8),
               case .object(let state) = JSONValue.decode(from: data) else {
             return nil
@@ -9815,4 +10344,18 @@ struct KeychainSSHPasswordStore: SSHPasswordStoring {
     func delete(account: String) {
         SecItemDelete(Self.baseQuery(account: account) as CFDictionary)
     }
+}
+
+/// Carries a paired `bot.*` read across the detached hop. The authority
+/// serializes every dispatch under its own lock; the params dictionary is
+/// built from JSON values and is never mutated after hand-off.
+private struct PairedBotReadRequest: @unchecked Sendable {
+    let authority: BotRemoteControlAuthority
+    let method: String
+    let params: [String: Any]
+}
+
+private enum PairedBotReadOutcome: @unchecked Sendable {
+    case value([String: Any])
+    case failure(Error)
 }

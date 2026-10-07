@@ -3,11 +3,6 @@ import XCTest
 import CoreModel
 
 final class GrokACPAdapterTests: ProviderProcessTestCase {
-    override func tearDown() {
-        TokenSaverCensusSeam.sharedStore = TokenSaverCensusStore()
-        super.tearDown()
-    }
-
     func test_newSessionStreamsPermissionAndSettlesApprovedTurn() async throws {
         let peer = try FakeGrokACPPeer(mode: .permission)
         defer { peer.remove() }
@@ -93,6 +88,8 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(finished.finalMessage, "**COMPLETE** residual note")
         XCTAssertTrue(box.hasWatchdogSynthesizedMarker,
                       "inferred terminals must carry a distinct runtime marker for forensics")
+        XCTAssertEqual(adapter.listSessions().first { $0.threadId == request.threadId }?.toolsMayStillRun, false,
+                       "no tool call was open, so nothing keeps the session from the idle reaper")
         // Late real prompt results must not double-emit (generation + turnTerminalEmitted).
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(box.finishedCount, 1,
@@ -149,6 +146,9 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(box.hasWatchdogSynthesizedMarker)
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(box.finishedCount, 1)
+        // The prompt never returned, so the open tool may still be running in
+        // this process tree: the idle reaper reads this to keep the session.
+        XCTAssertEqual(adapter.listSessions().first { $0.threadId == request.threadId }?.toolsMayStillRun, true)
     }
 
     /// WHY: crash 2026-08-06 — fire→emit→refresh re-entered fire mid-synthesis
@@ -172,37 +172,6 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)
         XCTAssertEqual(box.finishedCount, 1,
                        "emit during synthesis must not re-enter fire / double-terminate")
-    }
-
-    func test_foreignRunAsDoesNotRecordTokenSaverCensus() async throws {
-        let peer = try FakeGrokACPPeer(mode: .permission)
-        defer { peer.remove() }
-        let census = TokenSaverCensusStore()
-        TokenSaverCensusSeam.sharedStore = census
-        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.05)
-        let foreign = AgentRunAsUser(
-            generatedUID: "foreign",
-            shortName: "foreign",
-            uid: getuid() &+ 1,
-            gid: getgid(),
-            homePath: "/tmp"
-        )
-        let censusAllowed = GrokACPAdapter.tokenSaverCensusAllowed(runAsUser: foreign)
-        XCTAssertFalse(censusAllowed)
-        // Exercise the actual ACP census gate without invoking sudo or relying
-        // on a second local account existing on the CI machine.
-        adapter.tokenSaverCensusAllowedOverrideForTesting = censusAllowed
-        let request = makeRequest()
-        let box = GrokACPEventBox()
-        _ = try await adapter.startSession(request) { box.append($0) }
-        let pending = try await box.waitForRequest(timeout: 3)
-        try await adapter.respondToRequest(
-            threadId: request.threadId,
-            requestId: pending.id,
-            response: .approve
-        )
-        _ = try await box.waitFinished(timeout: 3)
-        XCTAssertTrue(census.snapshot().isEmpty)
     }
 
     func test_cancelUsesACPNotificationAndReturnsProviderIdentity() async throws {

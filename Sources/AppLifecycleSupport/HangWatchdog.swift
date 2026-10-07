@@ -53,20 +53,21 @@ public enum HangWatchdogClassifier {
 
 /// Side-context pack captured on hang breach (allowlisted, no secrets).
 public struct HangWatchdogSideContext: Sendable, Equatable {
-    public var providerProcessCount: Int
+    /// Active agent threads (not OS provider processes; heartbeats report those).
+    public var activeAgentThreadCount: Int
     public var recoveryInFlight: Bool
     public var bootId: String
     public var pid: Int32
     public var sampleCountRequested: Int
 
     public init(
-        providerProcessCount: Int = 0,
+        activeAgentThreadCount: Int = 0,
         recoveryInFlight: Bool = false,
         bootId: String = "",
         pid: Int32 = ProcessInfo.processInfo.processIdentifier,
         sampleCountRequested: Int = 3
     ) {
-        self.providerProcessCount = providerProcessCount
+        self.activeAgentThreadCount = activeAgentThreadCount
         self.recoveryInFlight = recoveryInFlight
         self.bootId = bootId
         self.pid = pid
@@ -76,7 +77,7 @@ public struct HangWatchdogSideContext: Sendable, Equatable {
     public var lifecycleLine: String {
         [
             "hang_breach",
-            "providerProcesses=\(providerProcessCount)",
+            "activeAgentThreads=\(activeAgentThreadCount)",
             "recoveryInFlight=\(recoveryInFlight ? 1 : 0)",
             "bootId=\(bootId)",
             "pid=\(pid)",
@@ -124,6 +125,9 @@ public final class HangWatchdog: @unchecked Sendable {
     public typealias AwakeProvider = () -> HangWatchdogAwakeState
     public typealias SideContextProvider = () -> HangWatchdogSideContext
     public typealias BreachHandler = (HangWatchdogBreach) -> Void
+    /// Called on the watchdog queue every tick with the current gap, its kind,
+    /// and the last acknowledgement (constant for the whole hang episode).
+    public typealias GapObserver = (_ gapSeconds: TimeInterval, _ kind: HangWatchdogGapKind, _ episodeStart: Date) -> Void
 
     private let pingInterval: TimeInterval
     private let hangThreshold: TimeInterval
@@ -131,6 +135,7 @@ public final class HangWatchdog: @unchecked Sendable {
     private let awakeProvider: AwakeProvider
     private let sideContextProvider: SideContextProvider
     private let onBreach: BreachHandler
+    private let gapObserver: GapObserver?
     private let queue: DispatchQueue
 
     private var timer: DispatchSourceTimer?
@@ -150,7 +155,8 @@ public final class HangWatchdog: @unchecked Sendable {
         },
         awakeProvider: @escaping AwakeProvider = { .unknown },
         sideContextProvider: @escaping SideContextProvider = { HangWatchdogSideContext() },
-        onBreach: @escaping BreachHandler = { _ in }
+        onBreach: @escaping BreachHandler = { _ in },
+        gapObserver: GapObserver? = nil
     ) {
         self.pingInterval = max(0.2, pingInterval)
         self.hangThreshold = max(pingInterval, hangThreshold)
@@ -160,6 +166,7 @@ public final class HangWatchdog: @unchecked Sendable {
         self.awakeProvider = awakeProvider
         self.sideContextProvider = sideContextProvider
         self.onBreach = onBreach
+        self.gapObserver = gapObserver
     }
 
     public func start() {
@@ -201,6 +208,10 @@ public final class HangWatchdog: @unchecked Sendable {
         if let breach = evaluate(now: now) {
             onBreach(breach)
         }
+        if let gapObserver {
+            let gap = classify(now: now)
+            gapObserver(gap.wallGap, gap.kind, lastAck)
+        }
         // Schedule main ping; acknowledgement updates lastAck off the main path.
         mainPinger { [weak self] in
             guard let self else { return }
@@ -216,17 +227,10 @@ public final class HangWatchdog: @unchecked Sendable {
         wallGapOverride: TimeInterval? = nil,
         uptimeGapOverride: TimeInterval? = nil
     ) -> HangWatchdogBreach? {
-        let wallGap = wallGapOverride ?? now.timeIntervalSince(lastAck)
-        let uptimeGap = uptimeGapOverride ?? max(0, ProcessInfo.processInfo.systemUptime - lastAckUptime)
-        // Wall clock advances during sleep; uptime does not. Large wall≫uptime ⇒ sleep.
-        var awake = awakeProvider()
-        if wallGap >= hangThreshold, wallGap > uptimeGap + max(1.0, hangThreshold) {
-            awake = .displaySleep
-        }
-        let kind = HangWatchdogClassifier.classifyGap(
-            gapSeconds: wallGap,
-            hangThresholdSeconds: hangThreshold,
-            awake: awake
+        let (wallGap, awake, kind) = classify(
+            now: now,
+            wallGapOverride: wallGapOverride,
+            uptimeGapOverride: uptimeGapOverride
         )
         // Record sleep gaps too (distinct kind) so the sleep branch leaves evidence.
         guard kind == .hangLikely || kind == .suspendedOrSleep else { return nil }
@@ -243,6 +247,26 @@ public final class HangWatchdog: @unchecked Sendable {
             sideContext: sideContextProvider(),
             at: now
         )
+    }
+
+    private func classify(
+        now: Date,
+        wallGapOverride: TimeInterval? = nil,
+        uptimeGapOverride: TimeInterval? = nil
+    ) -> (wallGap: TimeInterval, awake: HangWatchdogAwakeState, kind: HangWatchdogGapKind) {
+        let wallGap = wallGapOverride ?? now.timeIntervalSince(lastAck)
+        let uptimeGap = uptimeGapOverride ?? max(0, ProcessInfo.processInfo.systemUptime - lastAckUptime)
+        // Wall clock advances during sleep; uptime does not. Large wall≫uptime ⇒ sleep.
+        var awake = awakeProvider()
+        if wallGap >= hangThreshold, wallGap > uptimeGap + max(1.0, hangThreshold) {
+            awake = .displaySleep
+        }
+        let kind = HangWatchdogClassifier.classifyGap(
+            gapSeconds: wallGap,
+            hangThresholdSeconds: hangThreshold,
+            awake: awake
+        )
+        return (wallGap, awake, kind)
     }
 }
 

@@ -170,6 +170,14 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: GrokACPHistoryRetention
         var pendingPermissions: [String: PendingPermission] = [:]
+        /// Provider failure text from `x.ai/session/prompt_complete`
+        /// (`stopReason: "error"`) for `generation`. Fallback for peers that
+        /// answer the failed `session/prompt` with a bare "Internal error".
+        var promptFailureDetail: (generation: UInt64, text: String)?
+        /// The inactivity watchdog ended this prompt generation while a tool call
+        /// was still open: the tool (a long silent build, say) may still be
+        /// running in this process tree until that prompt's response arrives.
+        var abandonedOpenToolsGeneration: UInt64?
 
         init(
             threadId: AgentThreadID,
@@ -235,7 +243,6 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private static var sharedDiscoveryCache: [String: (result: GrokACPDiscoveryResult, fetchedAt: Date)] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
     private var promptWriteAcceptanceCountForTestingStorage = 0
-    var tokenSaverCensusAllowedOverrideForTesting: Bool?
     var beforePromptWriteForTesting: (() -> Void)?
     var beforePhysicalPromptWriteForTesting: (() -> Void)?
     var afterPromptWriteForTesting: (() -> Void)?
@@ -273,13 +280,6 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         self.modelCacheTTL = max(0, modelCacheTTL)
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.maxReadableBytes = max(1, maxReadableBytes)
-    }
-
-    static func tokenSaverCensusAllowed(
-        runAsUser: AgentRunAsUser?,
-        currentUID: uid_t = getuid()
-    ) -> Bool {
-        runAsUser?.uid == nil || runAsUser?.uid == currentUID
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -674,7 +674,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 threadId: $0.threadId,
                 provider: .grok,
                 status: $0.status,
-                providerThreadId: $0.providerThreadId
+                providerThreadId: $0.providerThreadId,
+                toolsMayStillRun: $0.abandonedOpenToolsGeneration != nil
             )
         }
     }
@@ -756,9 +757,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 askpassPath: askpass,
                 notificationHandler: { method, params in
                     bufferedNotifications.append(method: method, params: params)
-                },
-                tokenSaverCensusAllowed: tokenSaverCensusAllowedOverrideForTesting
-                    ?? Self.tokenSaverCensusAllowed(runAsUser: request.runAsUser)
+                }
             )
         } catch {
             throw GrokACPFailureTaxonomy.normalize(
@@ -922,6 +921,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             session.forceKillWorkItem?.cancel()
             session.forceKillWorkItem = nil
             session.promptGeneration &+= 1
+            session.promptFailureDetail = nil
             session.onEvent = onEvent
             cancelTurnWatchdogLocked(session: session)
             return session.promptGeneration
@@ -1023,8 +1023,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                                 acceptance.settle(.success(()))
                             }
                         )
+                        self.clearAbandonedOpenTools(session: session, generation: promptGeneration)
                         self.handlePromptResponse(response, session: session, generation: promptGeneration)
                     } catch {
+                        self.clearAbandonedOpenTools(session: session, generation: promptGeneration)
                         acceptance.settle(.failure(error))
                         self.finishTransportFailure(session: session, error: error, forced: false)
                     }
@@ -1055,6 +1057,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                     method: method,
                     params: params
                 )
+                if let failure = ACPRPCErrorPayload.promptCompleteFailure(
+                    method: resolvedMethod,
+                    payload: resolvedPayload,
+                    sessionId: session.providerThreadId
+                ) {
+                    synchronized { session.promptFailureDetail = (session.promptGeneration, failure) }
+                }
                 emit(Self.runtimeEvent(method: resolvedMethod, payload: resolvedPayload), session: session)
             }
             return
@@ -1174,8 +1183,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         for event in session.mapper.finishTurn(stopReason: stopReason, usage: usage) { emit(event, session: session) }
         let status = GrokACPTerminalClassifier.status(stopReason: stopReason)
         if status == .failed {
+            let detail = currentPromptFailureDetail(session: session).map { ": \($0)" } ?? ""
             session.onEvent?(.error(GrokACPFailureTaxonomy.normalize(
-                diagnostic: "Grok ACP stopped: \(stopReason)",
+                diagnostic: "Grok ACP stopped: \(stopReason)\(detail)",
                 context: .turn
             ).message))
         }
@@ -1235,12 +1245,33 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         lock.unlock()
         guard active else { return }
         if terminal == .failed {
-            session.onEvent?(.error(GrokACPFailureTaxonomy.normalize(error, context: .turn).message))
+            session.onEvent?(.error(GrokACPFailureTaxonomy.normalize(
+                Self.addingPromptFailureDetail(currentPromptFailureDetail(session: session), to: error),
+                context: .turn
+            ).message))
         }
         for event in session.mapper.finishTurn(stopReason: terminal == .cancelled ? "cancelled" : "failed", usage: nil) {
             emit(event, session: session)
         }
         finishTurn(session: session, status: terminal)
+    }
+
+    /// `prompt_complete` failure text captured for the turn now in flight.
+    private func currentPromptFailureDetail(session: Session) -> String? {
+        synchronized {
+            guard let captured = session.promptFailureDetail,
+                  captured.generation == session.promptGeneration else { return nil }
+            return captured.text
+        }
+    }
+
+    /// A bare "Internal error" RPC failure borrows the provider text Grok
+    /// already sent as `prompt_complete.agentResult` for the same prompt.
+    static func addingPromptFailureDetail(_ detail: String?, to error: Error) -> Error {
+        guard let detail,
+              case let GrokACPError.rpcError(code, message, existing, httpStatus) = error,
+              existing == nil else { return error }
+        return GrokACPError.rpcError(code: code, message: message, detail: detail, httpStatus: httpStatus)
     }
 
     private func finishTurn(session: Session, status: AgentRunStatus) {
@@ -1341,6 +1372,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         // host does not paint a green completed goal mid long silent shell/CI.
         // Speakable text alone is only enough when no tool_call is still open.
         let hasOpenTools = session.mapper.hasOpenToolCalls
+        if hasOpenTools {
+            synchronized { session.abandonedOpenToolsGeneration = generation }
+        }
         let hasFinal = session.mapper.hasSpeakableFinalContent
         let status: AgentRunStatus
         let stopReason: String
@@ -1504,6 +1538,15 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             payloadJSON: String(data: data, encoding: .utf8) ?? "{}",
             receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
         ))
+    }
+
+    /// The abandoned prompt returned (or failed): its tools are no longer running.
+    private func clearAbandonedOpenTools(session: Session, generation: UInt64) {
+        synchronized {
+            if session.abandonedOpenToolsGeneration == generation {
+                session.abandonedOpenToolsGeneration = nil
+            }
+        }
     }
 
     private func synchronized<T>(_ body: () throws -> T) rethrows -> T {

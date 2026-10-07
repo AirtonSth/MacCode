@@ -97,8 +97,18 @@ final class BootstrapCorruptionRecoveryTests: XCTestCase {
         let dbPath = (tmp as NSString).appendingPathComponent("remotecode.sqlite")
 
         try autoreleasepool {
-            _ = try Bootstrap(channel: .debug, dbPathOverride: dbPath).run()
+            let (_, db) = try Bootstrap(channel: .debug, dbPathOverride: dbPath).run()
+            // The DB runs in WAL mode, so a fresh bootstrap leaves page 1 (and
+            // its header) in the -wal file. Fold the WAL into the main file so
+            // the header bytes corrupted below are the ones the reopen reads.
+            let checkpoint = try db.prepare("PRAGMA wal_checkpoint(TRUNCATE);")
+            XCTAssertTrue(try checkpoint.step())
+            XCTAssertEqual(checkpoint.columnInt64(0), 0, "TRUNCATE checkpoint must not be blocked")
         }
+        let walPath = dbPath + "-wal"
+        let walSize = (try? FileManager.default.attributesOfItem(atPath: walPath)[.size] as? NSNumber)?.intValue ?? 0
+        XCTAssertEqual(walSize, 0,
+                       "precondition: the main file, not the WAL, must serve the header page")
 
         // Corrupt ONLY the schema-format number (bytes 44-47): magic string,
         // page size, and read-version stay valid, so sqlite3_open succeeds.

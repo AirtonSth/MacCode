@@ -1,0 +1,13 @@
+Vendored from https://github.com/samuelfaj/linux-use
+commit ee0231ce80c56bbeec2daa68363c9e4477a4a923
+upstream server.py sha256 7a9ca52161ab0355ee27568c4cfe2b590a062067436888166ec83f64f6c9ae3a
+server.py sha256 68b54c6e033765288f08c2505309d693d6784afebcf28ecbb45725208810adf5
+Only server.py is vendored: the Chrome extension and its native-messaging host
+are not part of the guest kit.
+
+Modified (every change is marked "RemoteCode guest kit" in server.py): with no
+extension in the guest, browser_open, browser_snapshot, browser_act,
+browser_close, browser_status and jev_decide could only fail, so they are
+removed from BASE_TOOLS (tools/list and doctor) and tools/call refuses any
+name outside BASE_TOOLS as an unknown tool. The initialize instructions keep
+only upstream's native X11 sentences (no skill, Chrome or Jev references).

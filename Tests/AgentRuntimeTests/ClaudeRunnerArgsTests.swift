@@ -1,7 +1,6 @@
 import XCTest
 @testable import AgentRuntime
 import CoreModel
-import DistillCore
 import Persistence
 
 /// Regression: `claude --print --output-format stream-json` is rejected by
@@ -103,26 +102,19 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             XCTAssertEqual(
                 allowed,
                 Set(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools),
-                "without Token Saver, supervised mode must allow only the exact managed delegation/settings tools"
+                "supervised mode must allow only the exact managed delegation/settings tools"
             )
         }
     }
 
-    func test_liveClaudeRoutesAdmitDistillLibrarianMCPOnlyWithTokenSaver() throws {
-        // WHY: the distill skill instructs every provider to use the librarian
-        // MCP tools (rc_stats/rc_search/rc_catalog/rc_ask/rc_retrieve/rc_compress — the
-        // 01-catalogo.html surface), but Claude never saw the server: it was
-        // installed into ~/.claude/settings.json, which Claude Code does not read
-        // for mcpServers (proven live: the entry never spawned and `claude mcp
-        // list` omits it). Codex reads it from config.toml and Grok admits it per
-        // ACP session — all gated on Token Saver, the paid feature that also
-        // injects the usage policy. Both Claude routes must admit it per spawn
-        // under the same gate: hint on → server + rc_* allowlist; off → neither.
+    func test_liveClaudeRoutesNeverAdmitTheRemovedLibrarianMCP() throws {
+        // WHY: Token Saver and its librarian MCP were removed. An environment an
+        // older build left behind (the legacy hint) must not bring the server or
+        // its rc_* allowlist back on either Claude route or the SDK engine.
         let environment = [
-            DistillMCPAdmit.tokenSaverHintEnvironmentKey: "1",
+            "RC_TOKEN_SAVER_DISTILL_HINT": "1",
             "RC_TOKEN_SAVER_THREAD_ID": "11111111-2222-3333-4444-555555555555",
             "REMOTE_CODE_AGENT_PROVIDER": "claude",
-            "UNRELATED_SECRET": "must-not-be-forwarded",
         ]
         let request = AgentRunRequest(
             threadId: AgentThreadID(),
@@ -137,71 +129,18 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             let data = Data(args[args.index(after: index)].utf8)
             let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
             let servers = try XCTUnwrap(root["mcpServers"] as? [String: Any])
-            let librarian = try XCTUnwrap(
-                servers[DistillMCPAdmit.serverName] as? [String: Any],
-                "every Token Saver Claude turn must carry the librarian MCP server"
-            )
-            XCTAssertEqual(librarian["args"] as? [String], ["mcp"])
-            let forwarded = try XCTUnwrap(librarian["env"] as? [String: String])
-            XCTAssertEqual(forwarded["RC_TOKEN_SAVER_THREAD_ID"], "11111111-2222-3333-4444-555555555555")
-            XCTAssertNil(forwarded["UNRELATED_SECRET"],
-                         "only recovery-scope keys may be forwarded to the librarian server")
-            XCTAssertNotNil(servers[BotSelfConfigMCPAdmit.serverName],
-                            "the librarian must supplement, never replace, the bot peer server")
+            XCTAssertNil(servers["remotecode-distill"], "the removed librarian server must never be admitted")
+            XCTAssertNotNil(servers[BotSelfConfigMCPAdmit.serverName], "the bot peer server stays")
             let allowedIndex = try XCTUnwrap(args.firstIndex(of: "--allowedTools"))
-            let allowed = Set(args[args.index(after: allowedIndex)].split(separator: ",").map(String.init))
             XCTAssertEqual(
-                allowed,
-                Set(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools
-                    + DistillMCPAdmit.claudeAutomaticallyAllowedTools),
-                "Token Saver on must auto-allow the librarian tools so supervised runs use them without a prompt"
+                Set(args[args.index(after: allowedIndex)].split(separator: ",").map(String.init)),
+                Set(BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools),
+                "no librarian tool may be pre-authorized"
             )
-        }
-
-        // SDK bridge engine parity: same server, same gate.
-        let sdkServers = ClaudeAgentSDKBridgeAdapter.botPeerMCPServers(environment: environment)
-        XCTAssertNotNil(sdkServers[DistillMCPAdmit.serverName] as? [String: Any],
-                        "the opt-in SDK engine must admit the librarian server too, or the engines drift")
-
-        // Token Saver off → no librarian server and no rc_* allowlist anywhere.
-        let offRequest = AgentRunRequest(
-            threadId: AgentThreadID(),
-            provider: .claude,
-            model: "claude-opus-4-7",
-            cwd: "/tmp",
-            prompt: "hello"
-        )
-        for args in [ClaudeRunner.buildArgs(offRequest), ClaudeRunner.buildStreamingArgs(offRequest)] {
-            let index = try XCTUnwrap(args.firstIndex(of: "--mcp-config"))
-            let data = Data(args[args.index(after: index)].utf8)
-            let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-            let servers = try XCTUnwrap(root["mcpServers"] as? [String: Any])
-            XCTAssertNil(servers[DistillMCPAdmit.serverName],
-                         "Token Saver off must not expose the librarian server to Claude")
-            let allowedIndex = try XCTUnwrap(args.firstIndex(of: "--allowedTools"))
-            XCTAssertFalse(args[args.index(after: allowedIndex)].contains("remotecode-distill"),
-                           "Token Saver off must not pre-authorize librarian tools")
         }
         XCTAssertNil(
-            ClaudeAgentSDKBridgeAdapter.botPeerMCPServers(environment: [:])[DistillMCPAdmit.serverName],
-            "SDK engine must apply the same Token Saver gate"
-        )
-
-        // The allowlisted tool names must match the tools the server actually
-        // serves (ManagedRetrieveMCP), or supervised mode silently prompts.
-        XCTAssertEqual(
-            Set(DistillMCPAdmit.toolNames),
-            Set([
-                ManagedRetrieveMCP.statsToolName,
-                ManagedRetrieveMCP.searchToolName,
-                ManagedRetrieveMCP.catalogToolName,
-                ManagedRetrieveMCP.askToolName,
-                ManagedRetrieveMCP.extractToolName,
-                ManagedRetrieveMCP.digestToolName,
-                ManagedRetrieveMCP.pickToolName,
-                ManagedRetrieveMCP.toolName,
-                ManagedRetrieveMCP.compressToolName]),
-            "CoreModel cannot import DistillCore, so the duplicated tool-name list must be pinned to the real server surface"
+            ClaudeAgentSDKBridgeAdapter.botPeerMCPServers(environment: environment)["remotecode-distill"],
+            "the SDK engine must not admit the removed librarian server either"
         )
     }
 
@@ -225,8 +164,9 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                      "resumed Claude streaming sessions must not also request a new session id")
     }
 
-    func test_streamingAppendsBackgroundAwaitAlwaysAndDistillOnlyWithTokenSaver() {
-        // Background-await always; Distill only with Token Saver hint.
+    func test_streamingAppendsBackgroundAwaitAndNeverDistillEvenWithALegacyHint() {
+        // Background-await always; Distill never (Token Saver was removed), even
+        // when an older build's hint is still in the environment.
         let turnContext = "REMOTE CODE RESOLVED IDENTITY ONLY: @quinn is Quinn"
         let on = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                  model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi",
@@ -244,16 +184,10 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertTrue(promptOn.contains(BotPeerDelegation.providerDirective))
         XCTAssertTrue(promptOn.contains(turnContext),
                       "Claude CLI must receive this turn's identity-only Bot context")
-        XCTAssertTrue(promptOn.contains("| distill"),
-                      "Token Saver on injects the `| distill` piping rule")
-        XCTAssertEqual(promptOn.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
-                       "Claude CLI runtime context must carry the safety ABI exactly once without disk instructions")
-        XCTAssertEqual(
-            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + promptOn)
-                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
-            1,
-            "Claude CLI effective disk plus runtime context must carry the safety ABI exactly once"
-        )
+        XCTAssertFalse(promptOn.contains("| distill"),
+                       "the legacy hint must not bring back the `| distill` piping rule")
+        XCTAssertFalse(promptOn.contains("TOKEN_SAVER_SAFETY_ABI"),
+                       "the legacy hint must not bring back the Token Saver safety ABI")
 
         let emptyEnv = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                   model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi")
@@ -266,9 +200,9 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                       "the background-await rule must be present on every Claude call")
         XCTAssertTrue(promptEmpty.contains(BotPeerDelegation.providerDirective))
         XCTAssertFalse(promptEmpty.contains("| distill"),
-                       "Token Saver off must not inject Distill")
-        XCTAssertFalse(promptEmpty.contains(TokenSaverProviderSafetyABI.block),
-                       "Token Saver off must not inject safety ABI")
+                       "no Distill rule is ever injected")
+        XCTAssertFalse(promptEmpty.contains("TOKEN_SAVER_SAFETY_ABI"),
+                       "no Token Saver safety ABI is ever injected")
     }
 
     func test_mcpAvailabilityDirectiveRidesBothLiveClaudeRoutes() {
@@ -401,8 +335,13 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let sonnetEfforts = sonnet?.supportedReasoningEfforts ?? []
         XCTAssertTrue(sonnetEfforts.contains(.xhigh) && sonnetEfforts.contains(.max),
                        "the Sonnet 5 alias supports xhigh and max")
-        XCTAssertEqual(models.first { $0.id == "haiku" || $0.id.contains("haiku") }?.supportedReasoningEfforts, [],
-                       "Haiku has no configurable thinking effort")
+        // Live Claude Code 2.1.293 resolves the `haiku` alias to Haiku 5.5, which
+        // advertises efforts; the dated Haiku 4.5 entry still advertises none.
+        // The static fallback lists only the alias, also without efforts.
+        let effortlessHaiku = models.first { $0.id.hasPrefix("claude-haiku-4") }
+            ?? models.first { $0.id == "haiku" }
+        XCTAssertEqual(effortlessHaiku?.supportedReasoningEfforts, [],
+                       "Haiku 4.5 has no configurable thinking effort")
         XCTAssertFalse(models.contains { $0.supportsServiceTier == true },
                        "Claude models must not expose Codex-only fast service-tier controls")
         XCTAssertEqual(fable?.supportsCustomModel, true)
@@ -729,7 +668,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         }
     }
 
-    // MARK: - Token Saver CLI PostToolUse hook registration
+    // MARK: - Single settings payload (the Token Saver PostToolUse hook was removed)
 
     private func isolatedClaudeHome() -> String {
         let url = FileManager.default.temporaryDirectory
@@ -747,7 +686,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
     ) -> AgentRunRequest {
         var environment: [String: String] = ["HOME": home ?? isolatedClaudeHome()]
         if postToolUse {
-            environment[ClaudeRunner.tokenSaverPostToolUseEnvKey] = "1"
+            // The flag an older build set to register the Distill hook.
+            environment["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
         }
         return AgentRunRequest(
             threadId: threadId,
@@ -779,15 +719,9 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         args.filter { $0 == "--settings" }.count
     }
 
-    private func expectedDistillHookCommand() -> String {
-        AgentSkillInstaller.defaultManagedCLIBinDirectory()
-            .appendingPathComponent("distill")
-            .path + " hook post-tool-use"
-    }
-
-    /// (a) Flag absent + non-ultracode → thinking still has one settings payload;
-    /// enabling the hook only replaces that payload rather than appending another.
-    func test_postToolUseFlagAbsent_nonUltracodeKeepsSingleThinkingSettingsPayload() throws {
+    /// Thinking always rides one settings payload, and the legacy PostToolUse
+    /// flag neither adds a second payload nor brings back the Distill hooks.
+    func test_settingsPayloadIsSingleAndHookFreeEvenWithTheLegacyPostToolUseFlag() throws {
         // Stable thread id so --session-id does not confound byte comparison.
         let threadId = AgentThreadID(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!)
         let baselineReq = postToolUseReq(effort: .high, postToolUse: false, threadId: threadId)
@@ -804,119 +738,33 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let withFlag = ClaudeRunner.buildStreamingArgs(
             postToolUseReq(effort: .high, postToolUse: true, threadId: threadId)
         )
-        XCTAssertEqual(settingsFlagCount(withFlag), 1,
-                       "PostToolUse must merge into the existing thinking settings payload")
+        XCTAssertEqual(settingsFlagCount(withFlag), 1)
+        XCTAssertNil(try parsedSettingsObject(withFlag)["hooks"],
+                     "the legacy flag must not register the removed Distill hooks")
+        XCTAssertEqual(withFlag, baseline, "the legacy flag changes nothing")
     }
 
-    /// (b) Flag present + non-ultracode → exactly one --settings JSON with the
-    /// PostToolUse command hook (resolved managed distill path + timeout 45).
-    func test_postToolUseFlagPresent_nonUltracodeRegistersSingleSettingsHook() throws {
-        let args = ClaudeRunner.buildStreamingArgs(postToolUseReq(effort: .high, postToolUse: true))
-        XCTAssertEqual(settingsFlagCount(args), 1,
-                       "must emit exactly one --settings (never two)")
-        let settings = try parsedSettingsObject(args)
-        XCTAssertEqual(settings["alwaysThinkingEnabled"] as? Bool, true)
-        XCTAssertEqual(settings["showThinkingSummaries"] as? Bool, true)
-        XCTAssertNil(settings["ultracode"],
-                     "non-ultracode effort must not inject ultracode keys")
-        XCTAssertNil(settings["enableWorkflows"],
-                     "non-ultracode effort must not inject enableWorkflows")
-
-        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any],
-                                  "settings must register hooks")
-        let postToolUse = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]],
-                                        "must register PostToolUse")
-        XCTAssertEqual(postToolUse.count, 1)
-        XCTAssertEqual(postToolUse[0]["matcher"] as? String, "*")
-        let commandHooks = try XCTUnwrap(postToolUse[0]["hooks"] as? [[String: Any]])
-        XCTAssertEqual(commandHooks.count, 1)
-        XCTAssertEqual(commandHooks[0]["type"] as? String, "command")
-        XCTAssertEqual(commandHooks[0]["command"] as? String, expectedDistillHookCommand(),
-                       "hook command must be managed distill path + hook post-tool-use args")
-        // JSONSerialization may box Int as NSNumber; accept numeric 45.
-        let timeout = commandHooks[0]["timeout"] as? NSNumber
-        XCTAssertEqual(timeout?.intValue, 45,
-                       "PostToolUse command hook timeout must be 45 seconds for nested large tools")
-
-        let preToolUse = try XCTUnwrap(hooks["PreToolUse"] as? [[String: Any]],
-                                       "Token Saver must also register Bash PreToolUse auto-pipe")
-        XCTAssertEqual(preToolUse[0]["matcher"] as? String, "Bash")
-        let preHooks = try XCTUnwrap(preToolUse[0]["hooks"] as? [[String: Any]])
-        XCTAssertEqual(
-            preHooks[0]["command"] as? String,
-            AgentSkillInstaller.defaultManagedCLIBinDirectory()
-                .appendingPathComponent("distill").path + " hook pre-tool-pipe"
-        )
-    }
-
-    /// (c) Flag present AND engine .ultracode → exactly one --settings containing
-    /// BOTH the PostToolUse hook and the existing ultracode keys.
-    func test_postToolUseFlagPresent_ultracodeMergesHookAndUltracodeKeys() throws {
+    /// Ultracode effort → exactly one --settings carrying the ultracode keys.
+    func test_ultracodeSettingsArePresentInTheSinglePayload() throws {
         let request = postToolUseReq(effort: .ultracode, postToolUse: true)
         let args = ClaudeRunner.buildStreamingArgs(request)
         XCTAssertEqual(settingsFlagCount(args), 1,
-                       "ultracode + PostToolUse must merge into a single --settings payload")
+                       "ultracode must ride the single --settings payload")
         let settings = try parsedSettingsObject(args)
-        XCTAssertEqual(settings["ultracode"] as? Bool, true,
-                       "ultracode key must survive the merge")
+        XCTAssertEqual(settings["ultracode"] as? Bool, true)
         XCTAssertEqual(settings["enableWorkflows"] as? Bool, true,
-                       "enableWorkflows must survive the merge so the Workflow tool stays exposed")
-
-        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
-        let postToolUse = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]])
-        let commandHooks = try XCTUnwrap(postToolUse[0]["hooks"] as? [[String: Any]])
-        XCTAssertEqual(commandHooks[0]["command"] as? String, expectedDistillHookCommand())
-        XCTAssertEqual((commandHooks[0]["timeout"] as? NSNumber)?.intValue, 45)
+                       "enableWorkflows keeps the Workflow tool exposed")
+        XCTAssertNil(settings["hooks"])
 
         // SDK bridge takes .last of ultracodeSettingsArgs — still the JSON string.
         let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(
             .ultracode,
-            environment: request.environment,
-            cwd: request.cwd
+            environment: request.environment
         )
         XCTAssertEqual(settingsArgs.first, "--settings")
         XCTAssertEqual(settingsArgs.last, settingsValue(args),
                        "`.last` must remain the JSON payload so ClaudeAgentSDKBridgeAdapter keeps working")
         XCTAssertEqual(settingsArgs.count, 2)
-    }
-
-    func test_postToolUseMergesFilesystemHooksInsteadOfReplacingThem() throws {
-        let home = isolatedClaudeHome()
-        let cwd = FileManager.default.temporaryDirectory
-            .appendingPathComponent("rc-claude-cwd-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
-        let claudeDir = cwd.appendingPathComponent(".claude", isDirectory: true)
-        try FileManager.default.createDirectory(at: claudeDir, withIntermediateDirectories: true)
-        let projectSettings: [String: Any] = [
-            "hooks": [
-                "Stop": [[
-                    "matcher": "*",
-                    "hooks": [[
-                        "type": "command",
-                        "command": "/tmp/project-stop"
-                    ]]
-                ]]
-            ]
-        ]
-        let data = try JSONSerialization.data(withJSONObject: projectSettings, options: [.sortedKeys])
-        try data.write(to: claudeDir.appendingPathComponent("settings.json"))
-
-        let args = ClaudeRunner.buildStreamingArgs(
-            postToolUseReq(effort: .high, postToolUse: true, cwd: cwd.path, home: home)
-        )
-        let settings = try parsedSettingsObject(args)
-        let hooks = try XCTUnwrap(settings["hooks"] as? [String: Any])
-        let stop = try XCTUnwrap(hooks["Stop"] as? [[String: Any]])
-        XCTAssertEqual(stop.count, 1, "filesystem Stop hooks must survive Token Saver --settings")
-        let stopCommands = stop.flatMap { entry -> [String] in
-            (entry["hooks"] as? [[String: Any]] ?? []).compactMap { $0["command"] as? String }
-        }
-        XCTAssertTrue(stopCommands.contains("/tmp/project-stop"))
-        let post = try XCTUnwrap(hooks["PostToolUse"] as? [[String: Any]])
-        let postCommands = post.flatMap { entry -> [String] in
-            (entry["hooks"] as? [[String: Any]] ?? []).compactMap { $0["command"] as? String }
-        }
-        XCTAssertTrue(postCommands.contains { $0.contains("distill hook post-tool-use") })
     }
 
     func test_buildForkArgsAndStreamingForkFromSource() {

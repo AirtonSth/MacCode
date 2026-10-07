@@ -77,7 +77,7 @@ final class AppShellResourceBundleTests: XCTestCase {
 
     func test_computerGuestRecipeURL_findsDockerfile() throws {
         // WHY: BotsViewModel must pass this URL into proveReady so Studio
-        // can build remotecode/computer:local without Bundle.module.
+        // can build the base image without Bundle.module.
         let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: recipe.appendingPathComponent("Dockerfile").path)

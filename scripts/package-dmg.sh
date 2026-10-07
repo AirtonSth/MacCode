@@ -59,7 +59,6 @@ sign_nested_runtime "$APP_BUNDLE/Contents/Resources/RemoteCodeScheduledTaskAgent
 sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/RemoteCodeRunAsUserHelper"
 sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/rc2"
 sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/RemoteCodeDistillService"
-sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/mlx.metallib"
 sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/RemoteCode"
 
 # Outer bundle last (no --deep: nested code already signed with correct options).
@@ -97,7 +96,6 @@ assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/RemoteCode"
 assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/RemoteCodeDistillService"
 assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/RemoteCodeRunAsUserHelper"
 assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/rc2"
-assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/mlx.metallib"
 assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/Current/Autoupdate"
 assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/Current/Updater.app"

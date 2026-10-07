@@ -14,7 +14,6 @@ final class AgentChatTextSelectionAuditTests: XCTestCase {
             "Sources/Surfaces/AgentMessageMarkdown.swift",
             "Sources/Surfaces/AgentChatLiveTurnChrome.swift",
             "Sources/Surfaces/AgentChatTranscriptChrome.swift",
-            "Sources/Surfaces/AgentChatTokenSaverChrome.swift",
             "Sources/Surfaces/DiffPanelSurface.swift",
             "Sources/AppShell/BotsWindow.swift",
         ]

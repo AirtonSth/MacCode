@@ -210,13 +210,15 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
     }
 
     func test_dispatcherSnapshotRead_stateMutationDuringEveryAttemptStillFailsFenceRetryably() async throws {
-        // WHY (C17): the fence still guards real snapshot-domain mutations. A
-        // rename landing inside every read could be applied twice on replay,
-        // so the host must keep returning the retryable -32012 for it.
+        // WHY (C17): the fence still guards structural snapshot mutations. A
+        // close landing inside every read leaves no stable state to return, so
+        // the host must keep returning the retryable -32012 for it. (Absolute
+        // value kinds such as surface.renamed are tolerated since C7; see
+        // ConnectionSnapshotJoinFenceTests.)
         let router = await MainActor.run {
             let router = Phase3SnapshotFakeRouter()
             router.offMainDelayNanoseconds = 1_000_000
-            router.publishKindsDuringRead = ["surface.renamed"]
+            router.publishKindsDuringRead = ["surface.closed"]
             return router
         }
 
@@ -274,7 +276,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
         XCTAssertLessThan(
             HTTPRequestPhaseMetrics.elapsedMilliseconds(since: secondStarted),
             50,
-            "a stale physical read must not make later callers wait or spawn another read"
+            "a later caller joins the stale physical read and waits only for its own deadline"
         )
 
         try await Task.sleep(nanoseconds: 250_000_000)
@@ -855,6 +857,121 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
             XCTAssertEqual(bus.snapshotMetadata().domainRevisions, testCase.expected,
                            "unexpected domain revision intent for \(testCase.kind)")
         }
+    }
+
+    /// H4: a streaming agent publishes deltas/progress/runtime frames and
+    /// usage telemetry many times a second, but none of them changes an
+    /// `agentThreads` snapshot row. If they advanced the revision, every
+    /// `knownDomainRevisions` reconnect would resend the full thread list.
+    func test_domainRevision_agentStreamAndUsageEventsDoNotAdvanceAgentThreads() {
+        let bus = EventBus()
+        bus.publishRawForTesting(kind: "agent.thread.updated", payload: .object([:]))
+        let known = bus.snapshotMetadata().domainRevisions
+        XCTAssertEqual(known.agentThreads, 1)
+
+        for kind in [
+            "agent.item.delta",
+            "agent.item.progress",
+            "agent.provider_runtime.event",
+            "agent.thread.token_usage",
+            "agent.account.usage",
+            "agent.account.usage.refresh",
+        ] {
+            bus.publishRawForTesting(kind: kind, payload: .object([:]))
+            XCTAssertEqual(bus.snapshotMetadata().domainRevisions, known,
+                           "\(kind) must not advance any snapshot domain")
+        }
+        XCTAssertEqual(bus.snapshotMetadata().domainRevisions.domainsChanged(since: known), [],
+                       "a reconnect after only stream/usage traffic must omit agentThreads")
+
+        // A state kind after the burst still advances agentThreads to its own seq.
+        bus.publishRawForTesting(kind: "agent.run.completed", payload: .object([:]))
+        let after = bus.snapshotMetadata().domainRevisions
+        XCTAssertEqual(after.agentThreads, 8)
+        XCTAssertEqual(after.domainsChanged(since: known), ["agentThreads"])
+    }
+
+    func test_domainRevision_agentStateKindsStillAdvanceAgentThreads() {
+        for kind in [
+            "agent.thread.created", "agent.thread.updated", "agent.thread.renamed",
+            "agent.thread.deleted", "agent.thread.read", "agent.run.started",
+            "agent.run.finished", "agent.item.started", "agent.item.completed",
+            "agent.message.queued",
+        ] {
+            let bus = EventBus()
+            bus.publishRawForTesting(kind: kind, payload: .object([:]))
+            XCTAssertEqual(bus.snapshotMetadata().domainRevisions.agentThreads, 1,
+                           "\(kind) changes thread rows and must advance agentThreads")
+        }
+    }
+
+    /// Snapshot surface rows carry the time-derived `busy` flag, so terminal
+    /// output and health still refresh `surfaces` on the next partial snapshot.
+    func test_domainRevision_surfaceOutputAndHealthStillAdvanceSurfaces() {
+        for kind in ["surface.output", "surface.health"] {
+            let bus = EventBus()
+            bus.publishRawForTesting(kind: kind, payload: .object([:]))
+            XCTAssertEqual(bus.snapshotMetadata().domainRevisions,
+                           .init(shell: 0, surfaces: 1, agentThreads: 0, browser: 0, files: 0),
+                           "unexpected domain revision intent for \(kind)")
+        }
+    }
+
+    func test_domainRevision_persistenceReloadSkipsAgentStreamAndUsageKinds() {
+        let bus = EventBus()
+        bus.reloadFromPersistence(lastSeq: 3, recent: [
+            EventBus.Event(seq: 1, kind: "agent.thread.updated", payload: .object([:]), ts: 0),
+            EventBus.Event(seq: 2, kind: "agent.thread.token_usage", payload: .object([:]), ts: 0),
+            EventBus.Event(seq: 3, kind: "agent.account.usage", payload: .object([:]), ts: 0),
+        ])
+        XCTAssertEqual(bus.snapshotMetadata().domainRevisions.agentThreads, 1)
+    }
+
+    /// Wire-level: after stream/usage traffic a `knownDomainRevisions` snapshot
+    /// is a revisions-only partial; after a thread state change it includes
+    /// `agentThreads` again with the real rows.
+    @MainActor
+    func test_syncSnapshot_knownRevisionsOmitAgentThreadsAfterOnlyStreamAndUsageEvents() async throws {
+        let router = Phase3SnapshotFakeRouter()
+        let port = UInt16.random(in: 33_000...44_000)
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: router),
+            serverId: "phase3-host",
+            bootEpoch: 73
+        )
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        EventBus.shared.publishRawForTesting(kind: "agent.thread.updated", payload: .object([:]))
+        let full = try await rpc(port: port, id: "full", params: ["supportedStateVersion": 3])
+        let fullState = try XCTUnwrap((full["result"] as? [String: Any])?["state"] as? [String: Any])
+        let known = try XCTUnwrap(fullState["domainRevisions"] as? [String: Any])
+        XCTAssertNil(fullState["partial"])
+
+        for kind in ["agent.item.delta", "agent.item.progress", "agent.provider_runtime.event",
+                     "agent.thread.token_usage", "agent.account.usage", "agent.account.usage.refresh"] {
+            EventBus.shared.publishRawForTesting(kind: kind, payload: .object([:]))
+        }
+        let quiet = try await rpc(port: port, id: "quiet", params: [
+            "supportedStateVersion": 3, "knownDomainRevisions": known,
+        ])
+        let quietState = try XCTUnwrap((quiet["result"] as? [String: Any])?["state"] as? [String: Any])
+        XCTAssertEqual(quietState["partial"] as? Bool, true)
+        XCTAssertEqual(quietState["includedDomains"] as? [String], [])
+        XCTAssertNil(quietState["agentThreads"])
+
+        EventBus.shared.publishRawForTesting(kind: "agent.run.completed", payload: .object([:]))
+        let changed = try await rpc(port: port, id: "changed", params: [
+            "supportedStateVersion": 3, "knownDomainRevisions": known,
+        ])
+        let changedState = try XCTUnwrap((changed["result"] as? [String: Any])?["state"] as? [String: Any])
+        XCTAssertEqual(changedState["includedDomains"] as? [String], ["agentThreads"])
+        let groups = try XCTUnwrap(changedState["agentThreads"] as? [[String: Any]])
+        let threadIDs = groups.flatMap { ($0["items"] as? [[String: Any]]) ?? [] }.compactMap { $0["id"] as? String }
+        XCTAssertEqual(threadIDs, [router.threadID])
     }
 
     func test_domainRevision_neverMovesBackwardDuringPersistenceReload() {

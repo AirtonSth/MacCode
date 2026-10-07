@@ -235,7 +235,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
             XCTAssertEqual(forwarded[BotPeerDelegation.socketEnvironmentKey], "/tmp/remote-code.sock")
             XCTAssertEqual(command["allowed_tools"] as? [String],
                            BotSelfConfigMCPAdmit.claudeAutomaticallyAllowedTools,
-                           "without the Token Saver hint, only bot peer tools are pre-authorized")
+                           "only bot peer tools are pre-authorized")
         }
     }
 
@@ -737,6 +737,7 @@ final class ClaudeAgentSDKBridgeEffortAndErrorTests: ProviderProcessTestCase {
     }
 
     func test_closedStdinInvalidatesEveryMutableBridgeControlBoundary() async throws {
+        try skipUnlessLegacyClaudeIsSelectable()
         guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
         let boundaries = ["turn", "model", "permission", "user_input", "cancel_input"]
 

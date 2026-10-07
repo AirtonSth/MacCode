@@ -118,10 +118,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var providerSessionReaperTimer: Timer?
     private var ccrRetentionTimer: Timer?
     private var diagnosticsHeartbeatTimer: Timer?
-    private var tokenSaverAccountUsageRefreshTimer: Timer?
+    private var accountUsageRefreshTimer: Timer?
     private var lifecycleRecorder: AppLifecycleRecorder?
     /// Forensic-only hang detector (plan-final W0). Never mutates run status.
     private var hangWatchdog: HangWatchdog?
+    /// S-F4a: reclaims hidden terminals when the OS reports memory pressure.
+    private var memoryPressureMonitor: MemoryPressureMonitor?
     /// Sleep-aware awake state for HangWatchdog (updated from NSWorkspace sleep/wake).
     private let hangWatchdogAwakeState = HangWatchdogAwakeBox(initial: .unknown)
     /// Distributed-notification observer: schedule store commits → rail reload.
@@ -132,7 +134,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Menu items whose keyEquivalent is controlled by keybindings.json.
     /// Populated by installMainMenu(); refreshed by reapplyKeybindingOverrides().
     private var keybindableMenuItems: [(item: NSMenuItem, command: String)] = []
-    public static let tokenSaverAccountUsageRefreshInterval: TimeInterval = 60
+    public static let accountUsageRefreshInterval: TimeInterval = 60
 
     /// Accumulates server startup failures so Settings can show a status
     /// row rather than relying on NSLog alone (UX-MAC_SOCKET_SERVER-P1).
@@ -172,6 +174,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let appSupportDirectory = AppPaths.appSupportDirectory(
             for: channel,
             override: appSupportOverride
+        )
+        // First, before anything can start GhosttyKit: its init deletes the
+        // previous run's crash files.
+        let harvestedGhosttyCrashFiles = GhosttyCrashHarvester.harvest(
+            from: GhosttyCrashHarvester.defaultSourceDirectories(),
+            into: appSupportDirectory.appendingPathComponent("diagnostics/ghostty-crash", isDirectory: true)
         )
         ProviderProcessOwnership.shared.configure(
             fileURL: appSupportDirectory
@@ -232,10 +240,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             }
         }
 
-        installLifecycleRecorder()
+        installLifecycleRecorder(harvestedGhosttyCrashFiles: harvestedGhosttyCrashFiles)
+        startMemoryPressureMonitor()
         // PERF (cold launch): the orphan provider sweep is a process scan and
         // the event-log decode + PTY restore are heavy. StartupPlan defers them
         // past the first frame; see runDeferredStartup().
+        // `context.router` builds the bot peer authority, whose restore
+        // reconcile commits thread chrome before the event log is wired below.
+        context.holdsBotPeerThreadChromeUntilEventLogReady = true
         router = AppCommandRouter(context: context)
         context.router = router
         context.distillAccountsController.ensureDistillInstalled()
@@ -246,9 +258,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         Self.wireEventPersistence(context: context)
         do {
             EventBus.shared.reloadFromPersistence(lastSeq: try context.eventLog.lastSeq(), recent: [])
+            // C8: a clean previous quit lets its cursors resume from the log.
+            DurableReplayResumeRecord.restore(
+                eventBus: .shared,
+                settings: context.settingsRepo,
+                bootEpoch: context.liveActivityHostIdentity.bootEpoch
+            )
         } catch {
             appLifecycleLog.error("event_log.sequence_init_failed error=\(error.localizedDescription, privacy: .public)")
         }
+        // The bus is wired and past the durable head: restored chrome now gets
+        // a persisted seq that counts toward agentThreads and C8 replay.
+        context.botPeerHandoffAuthority.publishRestoredThreadChrome()
+        // After the event log: the reconcile's events must be persisted and
+        // sequenced after everything a client already saw.
+        context.reconcileBotGroupsAfterLaunch()
         updater = SparkleAppUpdater.defaultIfConfigured()
         updater?.onWillInstallUpdate = { [weak self] in
             self?.persistRestorableStateBeforeUpdate()
@@ -393,7 +417,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         windowController.show()
         // Do not fire multi-provider account-usage probes (claude /usage, grok
         // models, …) on the first paint. Defer until the UI is interactive.
-        startTokenSaverAccountUsageRefreshLoop()
+        startAccountUsageRefreshLoop()
         startDiagnosticsHeartbeat()
         logDiagnosticsHeartbeat(reason: "launch")
         checkForUpdatesAfterOpeningApp()
@@ -408,10 +432,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             self?.presentHostFileAccessOnboardingIfNeeded()
             self?.runDeferredStartup()
         }
-        // Token Saver % rings: wait ~8s so boot probes do not pile on top of
+        // Account usage % rings: wait ~8s so boot probes do not pile on top of
         // workspace restore / first Agent surface open.
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-            self?.refreshTokenSaverAccountUsageOnLaunch()
+            self?.refreshAccountUsageOnLaunch()
         }
     }
 
@@ -461,7 +485,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // Off MainActor: process scan + optional SIGTERM grace sleeps must not
         // hitch the first interactive frame after cold launch.
         scheduleOrphanRuntimeSweep(reason: "launch")
-        router?.scanBotVMOrphansOnLaunch()
 
         if let log = context?.eventLog {
             do {
@@ -605,25 +628,26 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         stopInProcessScheduledTaskScheduler()
         removeScheduledTaskStoreObserver()
         disableInsomniaForAppClose()
-        // Always stop the Distill MLX server on quit — multi-GB model must not linger.
-        // On terminate, reconcile Distill with the Token Saver toggle (install only when
-        // enabled; otherwise scrub legacy homes + uninstall CLI/wrappers). The MLX
-        // sidecar is stopped separately.
-        stopTokenSaverDistillServiceForAppTermination()
-        let tokenSaverEnabled = context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
+        // Token Saver was removed, so quit only purges what older builds
+        // installed (and reinstalls the always-on routing); it never installs
+        // anything Token Saver owned.
         if ProcessInfo.processInfo.environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] == "1" {
             appLifecycleLog.info("app.will_terminate distill_integration=unchanged isolated_process=true")
         } else {
-            appLifecycleLog.info("app.will_terminate distill_integration=app_private_retained distill_server=stopped token_saver=\(tokenSaverEnabled ? "enabled" : "disabled")")
-            context?.prepareTokenSaverLifecycleForTermination()
+            appLifecycleLog.info("app.will_terminate distill_integration=legacy_purged")
+            context?.reconcileManagedIntegration()
         }
         persistRestorableStateBeforeUpdate()
         stopPetController()
         stopLiveRuntimesForAppTermination()
+        // After the provider sessions: also ends guest runs whose turn was
+        // still ending, and deletes their sign-in copies before exit.
+        context?.botGuestRunResolver?.endRunsForAppTermination()
         // Runtime shutdown publishes final lifecycle events after the snapshot
         // barrier above. Drain them before the process exits.
         context?.flushEventPersistence()
         socketServer?.stop()
+        context?.botGuestMCPGateway.stop()
         directAccessSupervisor?.shutdown()
         directAccessSupervisor = nil
         let tailcat = tailcatSupervisor
@@ -632,27 +656,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         providerSessionReaperTimer?.invalidate()
         ccrRetentionTimer?.invalidate()
         diagnosticsHeartbeatTimer?.invalidate()
-        tokenSaverAccountUsageRefreshTimer?.invalidate()
+        accountUsageRefreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
-    }
-
-    /// Quit contract: stop the controller-owned sidecar and reap any foreign
-    /// Distill MLX servers so only zero servers remain after RemoteCode exits.
-    private func stopTokenSaverDistillServiceForAppTermination() {
-        guard Self.shouldStopDistillServerOnTerminate(
-            tokenSaverEnabled: context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
-        ) else { return }
-        context?.tokenSaverDistillServiceController.stop()
-    }
-
-    /// Pure quit policy: Distill MLX server always stops on terminate regardless
-    /// of Token Saver toggle (skills/PATH may still be retained when enabled).
-    nonisolated static func shouldStopDistillServerOnTerminate(tokenSaverEnabled: Bool) -> Bool {
-        // tokenSaverEnabled is accepted for call-site clarity / future gating;
-        // the process always dies with the app.
-        _ = tokenSaverEnabled
-        return true
+        // C8: last, after the servers stopped: flush, then record what the
+        // next boot needs to resume this boot's cursors from the event log.
+        if let context {
+            context.flushEventPersistence()
+            DurableReplayResumeRecord.write(
+                eventBus: .shared,
+                settings: context.settingsRepo,
+                bootEpoch: context.liveActivityHostIdentity.bootEpoch
+            )
+        }
     }
 
     private func disableInsomniaForAppClose() {
@@ -663,6 +679,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func persistRestorableStateBeforeUpdate() {
+        router?.flushPendingTerminalTitles()
         context?.saveSnapshot()
         // Sparkle may relaunch immediately after this hook returns. Make every
         // previously published event durable before handing control back.
@@ -728,21 +745,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
-    private func refreshTokenSaverAccountUsageOnLaunch() {
-        context?.refreshTokenSaverAccountUsage(reason: "launch")
+    private func refreshAccountUsageOnLaunch() {
+        context?.refreshAccountUsage(reason: "launch")
     }
 
-    private func startTokenSaverAccountUsageRefreshLoop() {
-        tokenSaverAccountUsageRefreshTimer?.invalidate()
-        tokenSaverAccountUsageRefreshTimer = Timer.scheduledTimer(
-            withTimeInterval: Self.tokenSaverAccountUsageRefreshInterval,
+    private func startAccountUsageRefreshLoop() {
+        accountUsageRefreshTimer?.invalidate()
+        accountUsageRefreshTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.accountUsageRefreshInterval,
             repeats: true
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
                 // Grok stays independent from slow Claude/Codex probes, but the
                 // combined operation issues only one Grok credits request.
-                self.context?.refreshPeriodicTokenSaverAccountUsage()
+                self.context?.refreshPeriodicAccountUsage()
             }
         }
     }
@@ -807,39 +824,76 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         )
     }
 
-    private func installLifecycleRecorder() {
+    private func installLifecycleRecorder(harvestedGhosttyCrashFiles: [URL]) {
         let directory = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride)
             .appendingPathComponent("diagnostics", isDirectory: true)
         let recorder = AppLifecycleRecorder(directory: directory)
-        if let stale = recorder.consumeStaleRunMarker() {
+        let staleMarkers = recorder.consumeStaleRunMarkerRecords()
+        for stale in staleMarkers.map(\.contents) {
             // The previous run never reached applicationWillTerminate: it was
             // killed (SIGTERM/SIGKILL) or died abruptly with no crash report.
             // This is the on-disk evidence for the "app silently vanished" report.
             appLifecycleLog.fault("app.previous_run_unclean \(stale, privacy: .public)")
             recorder.record("previous_run_ended_uncleanly \(stale)")
         }
+        // The Ghostty folders are shared with Ghostty.app, so a harvested dump
+        // is not necessarily RemoteCode's own crash.
+        for file in harvestedGhosttyCrashFiles {
+            appLifecycleLog.info("app.ghostty_crash_harvested source=shared-ghostty file=\(file.lastPathComponent, privacy: .public)")
+            recorder.record("ghostty_crash_harvested source=shared-ghostty file=\(file.lastPathComponent)")
+        }
         recorder.beginRun()
         recorder.installSignalHandlers()
         recorder.installExitHandler()
         lifecycleRecorder = recorder
-        startHangWatchdog(recorder: recorder)
+        // How each unclean run ended comes from launchd's log, which takes a
+        // second or more to query, so it is recorded off the launch path.
+        let uncleanRuns = staleMarkers.compactMap { marker in marker.pid.map { ($0, marker.lastAlive) } }
+        if !uncleanRuns.isEmpty {
+            let bundleIdentifier = Bundle.main.bundleIdentifier
+            DispatchQueue.global(qos: .utility).async {
+                for (pid, lastAlive) in uncleanRuns {
+                    recorder.record(PreviousRunExitStatus.lifecycleLine(
+                        pid: pid,
+                        lastAlive: lastAlive,
+                        bundleIdentifier: bundleIdentifier
+                    ))
+                }
+            }
+        }
+        startHangWatchdog(recorder: recorder, diagnosticsDirectory: directory)
     }
 
-    private func startHangWatchdog(recorder: AppLifecycleRecorder) {
+    private func startMemoryPressureMonitor() {
+        let monitor = MemoryPressureMonitor(log: { [weak self] line in
+            appLifecycleLog.info("app.\(line, privacy: .public)")
+            self?.lifecycleRecorder?.record(line)
+        })
+        memoryPressureMonitor = monitor
+        monitor.start()
+    }
+
+    private func startHangWatchdog(recorder: AppLifecycleRecorder, diagnosticsDirectory: URL) {
         hangWatchdog?.stop()
         hangWatchdogAwakeState.value = .awake
         let bootId = HostBootIdentity.currentBootId()
         let awakeBox = hangWatchdogAwakeState
+        // S-F5: a hang that lasts 5 s gets one `sample` stack per episode.
+        let stackCapture = HangStackCapture(
+            directory: diagnosticsDirectory,
+            log: { [weak recorder] line in recorder?.record(line) }
+        )
         let watchdog = HangWatchdog(
             pingInterval: 1.0,
             hangThreshold: 2.0,
             awakeProvider: { awakeBox.value },
             sideContextProvider: { [weak self] in
                 HangWatchdogSideContext(
-                    providerProcessCount: self?.context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
+                    activeAgentThreadCount: self?.context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
                     recoveryInFlight: false,
                     bootId: bootId,
-                    // Spindump capture is residual; do not claim samples were taken.
+                    // The breach fires at 2 s; HangStackCapture logs its own
+                    // hang_stack_* line once a sample is actually taken.
                     sampleCountRequested: 0
                 )
             },
@@ -848,6 +902,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 recorder?.record(
                     "\(breach.sideContext.lifecycleLine) gapSec=\(Int(breach.gapSeconds)) kind=\(breach.kind.rawValue) awake=\(breach.awake.rawValue)"
                 )
+            },
+            gapObserver: { gapSeconds, kind, episodeStart in
+                stackCapture.observe(gapSeconds: gapSeconds, kind: kind, episodeStart: episodeStart)
             }
         )
         hangWatchdog = watchdog
@@ -989,16 +1046,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         windowController?.repairSelectedTerminalFocus(reason: "app_active")
     }
 
+    /// S-F6: the scan, the DB writes and the process teardown run on the
+    /// reaper queue; the main thread only logs the outcome.
     private func reapIdleProviderSessions() {
-        do {
-            let result = try context.reapIdleProviderSessions(
-                idleAge: managedProcessMemoryProfile.idleReleaseAge
-            )
-            if !result.stoppedThreadIds.isEmpty {
-                NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s).")
+        context.reapIdleProviderSessionsOffMain(
+            idleAge: managedProcessMemoryProfile.idleReleaseAge
+        ) { outcome in
+            switch outcome {
+            case .success(let result):
+                if !result.stoppedThreadIds.isEmpty || !result.cappedThreadIds.isEmpty {
+                    NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s); released \(result.cappedThreadIds.count) over the resident cap of \(ProviderSessionReaper.providerRootCap).")
+                }
+            case .failure(let error):
+                NSLog("Failed to reap idle provider sessions: \(error)")
             }
-        } catch {
-            NSLog("Failed to reap idle provider sessions: \(error)")
         }
     }
 
@@ -1381,13 +1442,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         petItem.keyEquivalentModifierMask = [.command, .option]
         petItem.target = self
         viewMenu.addItem(petItem)
-        // UX-MAC_APPSHELL-TOKENSAVER-KEYBOARD: keyboard-reachable Token Saver toggle
-        // (Cmd+Shift+S). Posts rc2TokenSaverToggle; SidebarViewModel observes and
-        // calls setTokenSaverEnabled(!current). Cmd+Shift+S is unused in this menu map.
-        let tokenSaverToggleItem = NSMenuItem(title: "Toggle Token Saver", action: #selector(toggleTokenSaverFromMenu), keyEquivalent: "s")
-        tokenSaverToggleItem.keyEquivalentModifierMask = [.command, .shift]
-        tokenSaverToggleItem.target = self
-        viewMenu.addItem(tokenSaverToggleItem)
         viewMenu.addItem(.separator())
         let revealDiagnostics = NSMenuItem(title: "Reveal Diagnostics in Finder", action: #selector(revealDiagnosticsInFinder), keyEquivalent: "")
         revealDiagnostics.target = self
@@ -1738,10 +1792,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     @objc private func togglePalette() {
         palette?.toggle()
-    }
-
-    @objc private func toggleTokenSaverFromMenu() {
-        NotificationCenter.default.post(name: .rc2TokenSaverToggle, object: nil)
     }
 
     @objc private func togglePetPopoverFromMenu() {

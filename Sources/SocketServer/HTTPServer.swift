@@ -973,6 +973,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxAttachmentUploadRequestBodyBytes = 36 * 1024 * 1024
     static let maxClientFramePayloadBytes = WebSocketClientFrameAssembler.maxFragmentedMessageBytes
     public static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
+    /// C8: one durable-replay slice; the next waits until the outbound queue
+    /// is back under it (a quarter of the queue, so live frames keep room).
+    static let durableReplaySliceBytes = maxWebSocketOutboundQueuedBytes / 4
 
     /// Baseline welcome capabilities required by old and new peers. Optional
     /// negotiated controls (e.g. `stream.interest.v1`) are appended only when
@@ -982,6 +985,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         "snapshot.incremental", "resume.v1",
         SnapshotChunkCapability.wireName,
         sequenceOmissionsCapability,
+        ConnectionSnapshotThreadWindow.capability,
+        DurableReplayContract.capability,
     ]
 
     /// Every WS filter (including the default `.full`) may skip sequences:
@@ -1279,22 +1284,48 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
         func publicPayload() -> [String: Any] { capabilities }
 
+        private var treatyPayload: [String: Any] {
+            [
+                "current": [
+                    "major": treaty.current.major,
+                    "minor": treaty.current.minor,
+                ],
+                "supported_majors": treaty.supportedMajors,
+            ]
+        }
+
+        /// C-W: lowercase SHA-256 hex over sorted-key JSON of the API version,
+        /// treaty and capabilities. Identity is excluded (it travels beside the
+        /// digest), so an unchanged capability set keeps its digest across
+        /// host restarts and a changed one always gets a new digest.
+        var digest: String {
+            let material: [String: Any] = [
+                "api_version": DirectHTTPServer.hostAPIVersion,
+                "treaty": treatyPayload,
+                "capabilities": capabilities,
+            ]
+            let data = (try? JSONSerialization.data(
+                withJSONObject: material,
+                options: [.sortedKeys]
+            )) ?? Data()
+            return DirectHTTPServer.hexDigest(SHA256.hash(data: data))
+        }
+
         func authenticatedPayload(serverID: String, bootEpoch: UInt64) -> [String: Any] {
             [
                 "authenticated": true,
                 "server_id": serverID,
                 "boot_epoch": Int64(bootEpoch),
-                "treaty": [
-                    "current": [
-                        "major": treaty.current.major,
-                        "minor": treaty.current.minor,
-                    ],
-                    "supported_majors": treaty.supportedMajors,
-                ],
+                "treaty": treatyPayload,
                 "capabilities": capabilities,
+                // C-W: same value as welcome `capabilitiesDigest`.
+                "capabilities_digest": digest,
             ]
         }
     }
+
+    /// Host API version (discovery `api_version`, welcome `apiVersion`).
+    static let hostAPIVersion = "2"
 
     nonisolated static func capabilitiesProjection(
         loopbackOnly: Bool,
@@ -1319,6 +1350,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Always present while PlanNotesProjectionV1 is compiled in this
             // target (v1 get + digest-CAS save). Single helper with system.capabilities.
             "plan_notes": PlanNotesProjectionV1.CapabilityAdvertisement.foundationObject,
+            // agent.manual_action.list/resolve, agent.manual_action.updated and
+            // pending_manual_action on thread payloads.
+            "manual_actions_v1": true,
+            // actor/actor_locked_at/execution_target/guest_runtime/pending_mac_execution
+            // on thread payloads, agent.thread.actor.set, agent.mac_execution.resolve
+            // and agent.mac_execution.requested.
+            "thread_actor_v1": true,
+            // recovery_action (+ display message) on agent.run.error,
+            // agent.run.failed and replayed agent.thread.read error rows.
+            "run_recovery_action_v1": true,
+            // agent.attachment.get (read-only bytes or JPEG thumbnail of one
+            // message attachment) and agent.message.appended for bot screenshots.
+            "attachment_get_v1": true,
+            // agent.account.usage.get (stored per-provider account usage, no probe).
+            "account_usage_get_v1": true,
         ]
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject
@@ -1353,7 +1399,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
             ],
             "bot": [
                 "queue_controls": ["remove", "update", "reorder", "force_now"],
-                "linked_thread_v1": true
+                "linked_thread_v1": true,
+                "teams_v1": true,
+                "groups_v1": true,
+                // bot.guest.state observe:true (rate-limited fresh frame),
+                // controlled_by_user, bot.guest.control take|release and
+                // bot.guest.updated reason "agent_step".
+                "guest_observe_v1": true
             ],
             "git": [
                 "read_only": false,
@@ -1512,6 +1564,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     /// Live connection-level metrics surfaced via /v1/health.
     let wsTracker = WSConnectionTracker()
+    /// Per-reason `/v1/ws` close counters (/v1/health) and the rate-limited
+    /// `diagnostic.ws_connection_closed` event.
+    public let wsCloseDiagnostics = WebSocketCloseDiagnostics()
+    /// C8: durable-replay resume outcomes (/v1/health `durable_replay`).
+    public let durableReplayMetrics = DurableReplayMetrics()
     /// Secret-free HTTP/RPC phase aggregates (admit/read/encode/write).
     public let requestPhaseMetrics = HTTPRequestPhaseMetrics()
     private let activeWebSocketConnections = ActiveWebSocketConnectionRegistry()
@@ -2468,6 +2525,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             && path == "/v1/rpc"
             && headers["x-remotecode-attachment-upload"] == "1"
         var requestBearerVerified = false
+        var requestBearerAttempted = false
         var requestRPCPrincipal: DirectRPCPrincipal?
         let largeBodyAuthorized: Bool
         if requestedAttachmentUpload,
@@ -2484,6 +2542,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 requestRPCPrincipal = principal
                 largeBodyAuthorized = true
                 requestBearerVerified = true
+                requestBearerAttempted = true
             } else {
                 largeBodyAuthorized = false
             }
@@ -2570,19 +2629,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // receive terminal output, agent messages, and file-edit contents.
             // Loopback-only mode stays open, matching the HTTP gate (loopback is
             // trusted) and preserving the loopbackOnly: true test harness.
+            var verifiedWebSocketOwner: String?
             if Self.wsUpgradeRequiresToken(
                 loopbackOnly: bindLoopbackOnly,
                 hasAuthProvider: auth != nil,
                 remoteAuthenticated: remoteAuthenticated
             ),
                let auth = auth {
-                guard let token = presentedBearerToken, auth.verify(token: token) else {
+                guard let token = presentedBearerToken,
+                      let owner = auth.authorizedOwnerFingerprint(token: token) else {
                     send(fd: fd, status: 401, contentType: "text/plain",
                          body: Self.unauthorizedBody,
                          additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
                 }
+                verifiedWebSocketOwner = owner
             }
-            let webSocketOwnerFingerprint = presentedBearerToken.flatMap { token in
+            // The gate's owner is reused so the upgrade verifies its bearer once.
+            let webSocketOwnerFingerprint = verifiedWebSocketOwner ?? presentedBearerToken.flatMap { token in
                 auth?.authorizedOwnerFingerprint(token: token)
             } ?? Self.connectionOwnerFingerprint(
                 token: presentedBearerToken
@@ -2653,15 +2716,80 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let requestedResumeBootEpoch = headers["x-rc2-resume-boot-epoch"]
                 .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
-            let wsSinceSeq = Self.acceptedResumeSequence(
-                requestedSinceSequence: requestedSinceSequence,
-                requestedResumeHost: requestedResumeHost,
-                requestedResumeBootEpoch: requestedResumeBootEpoch,
-                serverId: serverId,
-                bootEpoch: Int64(bootEpoch),
-                currentSequence: eventSnapshot.sequence
+            // C8: opt-in durable replay (event log + stream gaps, previous-boot
+            // cursors). Without the header nothing below changes.
+            let durableReplayRequested = DurableReplayContract.isRequested(
+                header: headers[DurableReplayContract.header]
             )
+            let wsSinceSeq: Int64
+            var durablePreviousBoot = false
+            var durableEventLog = false
+            if durableReplayRequested {
+                (wsSinceSeq, durablePreviousBoot, durableEventLog) = DurableReplayContract.acceptedResume(
+                    requestedSinceSequence: requestedSinceSequence,
+                    requestedResumeHost: requestedResumeHost,
+                    requestedResumeBootEpoch: requestedResumeBootEpoch,
+                    serverId: serverId,
+                    bootEpoch: Int64(bootEpoch),
+                    currentSequence: eventSnapshot.sequence,
+                    previousBoot: EventBus.shared.previousBootReplay
+                )
+            } else {
+                wsSinceSeq = Self.acceptedResumeSequence(
+                    requestedSinceSequence: requestedSinceSequence,
+                    requestedResumeHost: requestedResumeHost,
+                    requestedResumeBootEpoch: requestedResumeBootEpoch,
+                    serverId: serverId,
+                    bootEpoch: Int64(bootEpoch),
+                    currentSequence: eventSnapshot.sequence
+                )
+            }
+            // Subscribed before the welcome: live events buffer until the
+            // backlog is out, and the welcome reports the plan it got.
+            let durableSubscription = durableReplayRequested
+                ? EventBus.shared.subscribeDurableReplay(
+                    since: wsSinceSeq,
+                    previousBoot: durablePreviousBoot,
+                    allowEventLog: durableEventLog,
+                    filter: wsFilter
+                )
+                : nil
+            if let durableSubscription { subID = durableSubscription.id }
+            var durableFirstPage: EventBus.DurableReplayPage?
+            var durableNeedsBaseline = durableSubscription.map { subscription in
+                subscription.plan.outcome == .baselineRequired
+                    || EventBus.shared.durableReplayExceedsBudget(
+                        subscription.plan,
+                        maxBytes: DurableReplayContract.maximumReplayBytes
+                    )
+            } ?? false
+            if !durableNeedsBaseline,
+               let plan = durableSubscription?.plan,
+               plan.outcome == .replay,
+               plan.durableThrough > plan.since {
+                // Proves the event log still reaches the cursor before the
+                // welcome promises a replay.
+                durableFirstPage = EventBus.shared.readDurableReplayPage(
+                    after: plan.since,
+                    through: plan.durableThrough,
+                    maxBytes: Self.durableReplaySliceBytes
+                )
+                durableNeedsBaseline = durableFirstPage == nil
+            }
+            let welcomeCurrentSequence = durableSubscription?.plan.head ?? eventSnapshot.sequence
+            let welcomeOldestReplaySequence: Int64 = {
+                guard let plan = durableSubscription?.plan else {
+                    return eventSnapshot.oldestReplaySequence
+                }
+                return durableNeedsBaseline
+                    ? plan.metadata.oldestReplaySequence
+                    : min(plan.since + 1, plan.head)
+            }()
             let sequenceWatermark = ConnectionSequenceWatermark(initialSequence: wsSinceSeq)
+            // C-W: only a client that asks gets the extra welcome fields.
+            let welcomeIdentityRequested = ConnectionWelcomeIdentity.isRequested(
+                header: headers[ConnectionWelcomeIdentity.header]
+            )
             let welcome = ConnectionTransportFrame.welcome(ConnectionWelcomeFrame(
                 protocolVersion: ConnectionTransportFrame.protocolVersion,
                 type: "welcome",
@@ -2672,13 +2800,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 heartbeatIntervalMs: heartbeat.intervalMs,
                 heartbeatTimeoutMs: heartbeat.timeoutMs,
                 snapshotTimeoutMs: snapshotTimeoutMs,
-                currentSequence: eventSnapshot.sequence,
-                oldestReplaySequence: eventSnapshot.oldestReplaySequence,
+                currentSequence: welcomeCurrentSequence,
+                oldestReplaySequence: welcomeOldestReplaySequence,
                 // Snapshot deltas and replay are advertised independently of
                 // the event-only WebSocket transport.
                 // stream.interest.v1 only when the host applies rc2.interest
                 // (see welcomeCapabilities); old peers ignore unknown caps.
-                capabilities: Self.welcomeCapabilities()
+                capabilities: Self.welcomeCapabilities(),
+                apiVersion: welcomeIdentityRequested ? Self.hostAPIVersion : nil,
+                capabilitiesDigest: welcomeIdentityRequested
+                    ? Self.capabilitiesProjection(
+                        loopbackOnly: bindLoopbackOnly,
+                        attachmentUpload: dispatcher.agentAttachmentUploadCapability
+                    ).digest
+                    : nil,
+                replayFromSequence: durableSubscription.map { subscription in
+                    durableNeedsBaseline ? subscription.plan.head : subscription.plan.since
+                }
             ))
             activeWebSocketConnections.insert(
                 connectionId,
@@ -2693,6 +2831,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             afterWelcomeWriteForTests?(connectionId)
             let subIDBox = LockedSubscriberID()
+            let closeRecord = WebSocketCloseRecord(sinceSequence: wsSinceSeq)
             let writeFailureClosing = connectionClosingData(
                 connectionId: connectionId,
                 reason: "write_failed",
@@ -2715,6 +2854,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 },
                 writeFailureClosingData: writeFailureClosing,
                 onTerminal: { [weak self] reason in
+                    closeRecord.recordTerminal(reason)
                     // C-04: queue_full no longer terminates. Only true write
                     // failures close the socket.
                     guard reason == "write_failed" else { return }
@@ -2834,7 +2974,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                             reason: "eventGap_\(expected)_\(received)",
                             code: 1012,
                             retryable: true,
-                            retryAfterMs: 0
+                            // Jittered so clients that lost the same burst do
+                            // not all reconnect in the same instant.
+                            retryAfterMs: WebSocketCloseDiagnostics.eventGapRetryAfterMilliseconds()
                         ),
                         reason: "event_gap"
                     )
@@ -2863,6 +3005,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     let outcome = outbound.degrade()
                     if outcome.freedFrames > 0 {
                         wsTracker.recordFramesRejectedOrEvicted(outcome.freedFrames)
+                        closeRecord.recordFramesShed(outcome.freedFrames)
                         sampleOutboundQueuedBytes()
                     }
                     if outcome.needsBaselineRequired {
@@ -2872,6 +3015,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     if WebSocketOutboundQueue.isSheddableKind(frame.event.kind.rawValue) {
                         sequenceWatermark.recordFilteredEvent(sequence: frame.event.seq)
                         wsTracker.recordFramesRejectedOrEvicted(1)
+                        closeRecord.recordFramesShed(1)
                         emitPressureBaseline()
                         return
                     }
@@ -2884,6 +3028,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         // watermark accounting; socket stays open.
                         sequenceWatermark.recordFilteredEvent(sequence: frame.event.seq)
                         wsTracker.recordFramesRejectedOrEvicted(1)
+                        closeRecord.recordFramesShed(1)
                         emitPressureBaseline()
                     case .closed:
                         break
@@ -2917,55 +3062,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     for sequence in lostSequences {
                         sequenceWatermark.recordFilteredEvent(sequence: sequence)
                     }
+                    closeRecord.recordFramesShed(lostSequences.count)
                     emitPressureBaseline()
                 },
                 sendKnownEvent: { frame in
                     enqueueEventOrDegrade(frame)
                 }
             )
-            // PERF-MAC_SOCKET-:110 -- honor the client's last-seen seq so a
-            // reconnect receives only the delta (events after that seq), not the
-            // full retained backlog (~4 MiB on a busy session).
-            // Slice boundary: EventBus.subscribe delivers event.seq > since, so
-            // the first event the client receives is the first it has NOT yet seen.
-            // A missing or non-numeric header falls back to 0 (full backlog) so
-            // first-connect and legacy clients continue to work correctly.
-            let id = EventBus.shared.subscribeDetectingReplayExpiry(
-                since: wsSinceSeq,
-                filter: wsFilter,
-                onReplayExpired: { metadata in
-                    // The delivery cursor re-anchored to the live head
-                    // (metadata.sequence); the gap watermark must follow BEFORE
-                    // any live event is enqueued, or the first event after
-                    // baselineRequired reads as a gap and closes 1012.
-                    sequenceWatermark.reanchorForExpiredReplay(
-                        sequence: metadata.sequence
-                    )
-                    guard let data = self.connectionBaselineRequiredData(
-                        connectionId: connectionId,
-                        requestedAfterSequence: wsSinceSeq,
-                        currentSequence: metadata.sequence
-                    ) else { return }
-                    // C-04: never close for queue pressure; degrade and retry.
-                    switch outbound.enqueueApplication(data) {
-                    case .accepted:
-                        break
-                    case .queueFull:
-                        _ = outbound.degrade()
-                        if outbound.enqueueApplication(data) == .queueFull {
-                            emitPressureBaseline()
-                        }
-                    case .closed:
-                        break
-                    }
-                },
-                onFilteredEvent: { sequence in
-                    // A seq dropped by this connection's negotiated filter is
-                    // not a gap; account for it so the next delivered event
-                    // stays contiguous instead of closing 1012.
-                    sequenceWatermark.recordFilteredEvent(sequence: sequence)
-                }
-            ) { ev in
+            // Live delivery of one event; durable replay feeds its backlog
+            // through the same path so frames and gap accounting match.
+            let deliverEvent: (EventBus.Event) -> Void = { ev in
                 if let knownEvent = ev.knownEvent {
                     batcher.enqueue(KnownConnectionEventFrame(
                         event: knownEvent,
@@ -3025,11 +3131,161 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         sampleOutboundQueuedBytes()
                     } else {
                         sequenceWatermark.recordFilteredEvent(sequence: ev.seq)
+                        closeRecord.recordFramesShed(1)
                         emitPressureBaseline()
                     }
                 case .closed:
                     break
                 }
+            }
+            let deliverFiltered: (Int64) -> Void = { sequence in
+                // A seq dropped by this connection's negotiated filter is
+                // not a gap; account for it so the next delivered event
+                // stays contiguous instead of closing 1012.
+                sequenceWatermark.recordFilteredEvent(sequence: sequence)
+            }
+            let requireBaseline: (Int64) -> Void = { head in
+                closeRecord.markReplayExpired()
+                // The delivery cursor re-anchored to the live head; the gap
+                // watermark must follow BEFORE any live event is enqueued, or
+                // the first event after baselineRequired reads as a gap and
+                // closes 1012.
+                sequenceWatermark.reanchorForExpiredReplay(sequence: head)
+                guard let data = self.connectionBaselineRequiredData(
+                    connectionId: connectionId,
+                    requestedAfterSequence: wsSinceSeq,
+                    currentSequence: head
+                ) else { return }
+                // C-04: never close for queue pressure; degrade and retry.
+                switch outbound.enqueueApplication(data) {
+                case .accepted:
+                    break
+                case .queueFull:
+                    _ = outbound.degrade()
+                    if outbound.enqueueApplication(data) == .queueFull {
+                        emitPressureBaseline()
+                    }
+                case .closed:
+                    break
+                }
+            }
+            let id: UUID
+            if let durableSubscription {
+                // C8: stream the backlog off this thread and off the EventBus
+                // delivery queue; live events wait in the subscription.
+                id = durableSubscription.id
+                let driver = DurableReplayDriver(
+                    sliceBytes: Self.durableReplaySliceBytes,
+                    firstPage: durableFirstPage,
+                    readPage: { after, through, maxBytes in
+                        EventBus.shared.readDurableReplayPage(
+                            after: after, through: through, maxBytes: maxBytes
+                        )
+                    },
+                    deliverEvent: deliverEvent,
+                    deliverFiltered: deliverFiltered,
+                    advanceWatermark: { sequence in
+                        batcher.flush()
+                        sequenceWatermark.reanchorForExpiredReplay(sequence: sequence)
+                    },
+                    isOpen: { outbound.isOpen },
+                    waitForRoom: { limit, timeout in
+                        switch outbound.waitForRoom(atMost: limit, timeout: timeout) {
+                        case .room: return .ready
+                        case .closed: return .closed
+                        case .timedOut: return .stalled
+                        }
+                    },
+                    sendGap: { gap in
+                        guard let data = DurableReplayContract.streamGapData(
+                            connectionId: connectionId,
+                            hostId: self.serverId,
+                            bootEpoch: self.bootEpoch,
+                            gap: gap
+                        ) else { return false }
+                        switch outbound.enqueueApplication(data) {
+                        case .accepted:
+                            return true
+                        case .queueFull:
+                            _ = outbound.degrade()
+                            return outbound.enqueueApplication(data) == .accepted
+                        case .closed:
+                            return false
+                        }
+                    },
+                    requireBaseline: { head in
+                        batcher.flush()
+                        requireBaseline(head)
+                    }
+                )
+                let needsBaseline = durableNeedsBaseline
+                let metrics = durableReplayMetrics
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let started = DispatchTime.now()
+                    let plan = durableSubscription.plan
+                    let outcome: DurableReplayDriver.Outcome
+                    if needsBaseline {
+                        requireBaseline(plan.head)
+                        outcome = .baselineRequired
+                    } else if plan.outcome == .replay {
+                        outcome = driver.run(subscription: durableSubscription)
+                    } else {
+                        outcome = .completed(eventsReplayed: 0, gapsSent: 0)
+                    }
+                    metrics.record(outcome)
+                    NSLog(
+                        "[RC2.WS] durable replay since=%lld head=%lld outcome=%@ ms=%.1f",
+                        plan.since,
+                        plan.head,
+                        String(describing: outcome),
+                        Double(DispatchTime.now().uptimeNanoseconds &- started.uptimeNanoseconds) / 1_000_000
+                    )
+                    guard outcome != .closed else { return }
+                    batcher.flush()
+                    if case .completed = outcome,
+                       let complete = DurableReplayContract.replayCompleteData(
+                           connectionId: connectionId,
+                           hostId: self.serverId,
+                           bootEpoch: self.bootEpoch,
+                           throughSequence: plan.head
+                       ),
+                       outbound.enqueueApplication(complete) != .accepted {
+                        // Without the end marker the client cannot finish
+                        // catch-up; fall back to the baseline it handles anyway.
+                        _ = outbound.degrade()
+                        if outbound.enqueueApplication(complete) != .accepted {
+                            requireBaseline(plan.head)
+                        }
+                    }
+                    durableSubscription.goLive(
+                        deliver: { item in
+                            switch item {
+                            case .event(let event): deliverEvent(event)
+                            case .filtered(let sequence): deliverFiltered(sequence)
+                            }
+                        },
+                        onOverflow: { lastSequence in
+                            batcher.flush()
+                            metrics.recordOverflow()
+                            requireBaseline(lastSequence)
+                        }
+                    )
+                }
+            } else {
+                // PERF-MAC_SOCKET-:110 -- honor the client's last-seen seq so a
+                // reconnect receives only the delta (events after that seq), not the
+                // full retained backlog (~4 MiB on a busy session).
+                // Slice boundary: EventBus.subscribe delivers event.seq > since, so
+                // the first event the client receives is the first it has NOT yet seen.
+                // A missing or non-numeric header falls back to 0 (full backlog) so
+                // first-connect and legacy clients continue to work correctly.
+                id = EventBus.shared.subscribeDetectingReplayExpiry(
+                    since: wsSinceSeq,
+                    filter: wsFilter,
+                    onReplayExpired: { metadata in requireBaseline(metadata.sequence) },
+                    onFilteredEvent: deliverFiltered,
+                    deliverEvent
+                )
             }
             subIDBox.value = id
             subID = id
@@ -3129,7 +3385,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 ownerFingerprint: webSocketOwnerFingerprint,
                 subscriberIDBox: subIDBox,
                 initialFilter: wsFilter,
-                initialBuffer: leftoverBuffer
+                initialBuffer: leftoverBuffer,
+                closeRecord: closeRecord
             )
             heartbeatTimer.cancel()
             batcher.stop()
@@ -3139,6 +3396,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Remove this connection's last sampled contribution (not post-close
             // residual) so total_queued_bytes stays non-negative and accurate.
             wsTracker.clientDisconnected(queuedBytes: queuedBytesSample.value)
+            let closeSummary = closeRecord.summary()
+            NSLog(
+                "[RC2.WS] connection closed reason=%@ code=%@ duration_ms=%lld since_seq=%lld replay_expired=%d frames_shed=%ld",
+                closeSummary.reason,
+                closeSummary.code.map(String.init) ?? "-",
+                closeSummary.durationMilliseconds,
+                closeSummary.sinceSequence,
+                closeSummary.replayExpired ? 1 : 0,
+                closeSummary.framesShed
+            )
+            wsCloseDiagnostics.record(closeSummary)
             return
         }
 
@@ -3178,15 +3446,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let authenticated: Bool
             if requestBearerVerified {
                 authenticated = true
-            } else if path == "/v1/rpc",
-                      let token = presentedBearerToken,
-                      let principal = auth.authorizedRPCPrincipal(token: token) {
-                requestRPCPrincipal = principal
-                requestBearerVerified = true
-                authenticated = true
-            } else if let token = presentedBearerToken, auth.verify(token: token) {
-                requestBearerVerified = true
-                authenticated = true
+            } else if let token = presentedBearerToken {
+                // One resolution per request: the principal carries the owner
+                // fingerprint reused below, so the bearer is never verified twice.
+                requestBearerAttempted = true
+                let authStarted = DispatchTime.now().uptimeNanoseconds
+                requestRPCPrincipal = auth.authorizedRPCPrincipal(token: token)
+                requestPhaseMetrics.record(
+                    .auth,
+                    latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: authStarted)
+                )
+                requestBearerVerified = requestRPCPrincipal != nil
+                authenticated = requestBearerVerified
             } else {
                 authenticated = false
             }
@@ -3213,18 +3484,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let requestOwnerFingerprint = Self.connectionOwnerFingerprint(
             token: presentedBearerToken
         )
-        if let token = presentedBearerToken,
-           let owner = auth?.authorizedOwnerFingerprint(token: token) {
-            activeHTTPOwnerConnections.bind(fd, ownerFingerprint: owner)
-        }
         // A valid bearer on a trusted loopback connection still carries its
         // persisted scopes. Tokenless/invalid-token loopback remains the
-        // existing trusted-local full-access path.
-        if path == "/v1/rpc",
-           requestRPCPrincipal == nil,
+        // existing trusted-local full-access path. Resolve at most once.
+        if requestRPCPrincipal == nil,
+           !requestBearerAttempted,
            let auth,
            let token = presentedBearerToken {
+            requestBearerAttempted = true
+            let authStarted = DispatchTime.now().uptimeNanoseconds
             requestRPCPrincipal = auth.authorizedRPCPrincipal(token: token)
+            requestPhaseMetrics.record(
+                .auth,
+                latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: authStarted)
+            )
+        }
+        if let owner = requestRPCPrincipal?.ownerFingerprint {
+            activeHTTPOwnerConnections.bind(fd, ownerFingerprint: owner)
         }
         let effectiveRPCPrincipal = requestRPCPrincipal
             ?? DirectRPCPrincipal(
@@ -3333,9 +3609,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     framesRejectedOrEvicted: wsTracker.framesRejectedOrEvicted,
                     outboundQueueWait: wsTracker.outboundQueueWaitMetrics
                 ),
+                "connection_closes": wsCloseDiagnostics.healthJSON(),
+                "durable_replay": durableReplayMetrics.healthJSON(),
                 "request_phases": Self.requestPhaseMetricsJSON(phaseMetrics),
                 "command_receipts": [
                     "claims_total": receiptMetrics.claimsTotal,
+                    "push_token_unchanged_skips_total": receiptMetrics.pushTokenUnchangedSkipsTotal,
                     "new_claims_total": receiptMetrics.newClaimsTotal,
                     "claim_failures_total": receiptMetrics.claimFailuresTotal,
                     "duplicates": [
@@ -3412,24 +3691,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         principal: effectiveRPCPrincipal
                     )
                 }
-                let watchdog = Task {
-                    while !Task.isCancelled {
-                        if !registry.isActive(fd) || !Self.isRPCPeerConnected(fd: fd) {
-                            ownerRegistry.unbind(fd)
-                            registry.close(fd)
-                            work.cancel()
-                            return
-                        }
-                        do {
-                            try await Task.sleep(nanoseconds: 5_000_000)
-                        } catch {
-                            return
-                        }
-                    }
+                // C9: the kernel wakes the watchdog on FIN/RST/shutdown instead
+                // of a 5 ms MSG_PEEK poll per in-flight RPC.
+                let watchdog = RPCPeerDisconnectWatchdog(fd: fd, isOwned: { registry.isActive(fd) }) {
+                    ownerRegistry.unbind(fd)
+                    registry.close(fd)
+                    work.cancel()
                 }
                 let respData = await work.value
-                watchdog.cancel()
-                _ = await watchdog.result
+                // The watchdog already released this fd. The accept loop may
+                // have handed the same number to another peer, which
+                // isActive(fd) cannot tell apart, so never touch it again.
+                if await watchdog.stop() {
+                    self.requestPhaseMetrics.recordCancelled()
+                    return
+                }
                 guard registry.isActive(fd) else {
                     self.requestPhaseMetrics.recordCancelled()
                     ownerRegistry.unbind(fd)
@@ -3734,6 +4010,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             ]
         }
         return [
+            "auth_ms": lane(metrics.auth),
             "admit_ms": lane(metrics.admit),
             "snapshot_read_ms": lane(metrics.snapshotRead),
             "snapshot_encode_ms": lane(metrics.snapshotEncode),
@@ -3742,20 +4019,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "timed_out_total": metrics.timedOutTotal,
             "fence_retry_total": metrics.fenceRetryTotal,
             "fence_exhausted_total": metrics.fenceExhaustedTotal,
+            "fence_tolerated_total": metrics.fenceToleratedTotal,
+            "snapshot_joined_total": metrics.joinedTotal,
             "write_aborted_total": metrics.writeAbortedTotal,
         ]
-    }
-
-    /// Non-consuming peer probe for the handed-off RPC socket. Registry state
-    /// alone cannot observe a remote FIN while no request reader owns the fd.
-    nonisolated static func isRPCPeerConnected(fd: Int32) -> Bool {
-        var byte: UInt8 = 0
-        let result = withUnsafeMutableBytes(of: &byte) { buffer in
-            Darwin.recv(fd, buffer.baseAddress, 1, MSG_PEEK | MSG_DONTWAIT)
-        }
-        if result > 0 { return true }
-        if result == 0 { return false }
-        return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
     }
 
     /// QA-003: pure async request/response seam — decode → dispatch →
@@ -4168,6 +4435,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return rpcErrorObject(.internalError, id: wireID)
     }
 
+    /// Parses the opt-in `ConnectionSnapshotThreadWindow.parameter`.
+    /// `recentPerWorkspace` nil means the full thread list.
+    private static func snapshotThreadWindow(
+        _ rawParams: [String: Any]
+    ) -> (valid: Bool, recentPerWorkspace: Int?) {
+        guard rawParams.keys.contains(ConnectionSnapshotThreadWindow.parameter) else {
+            return (true, nil)
+        }
+        let value = ConnectionSnapshotThreadWindow.parse(
+            rawParams[ConnectionSnapshotThreadWindow.parameter]
+        )
+        return (value != nil, value)
+    }
+
     private func encodeSyncSnapshotResponse(
         rawParams: [String: Any],
         wireID: Any,
@@ -4181,12 +4462,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
         _ = ownerFingerprint
         let allowedKeys: Set<String> = [
             "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
-            "knownDomainRevisions",
+            "knownDomainRevisions", ConnectionSnapshotThreadWindow.parameter,
         ]
         guard Set(rawParams.keys).isSubset(of: allowedKeys),
               rawParams.keys.contains("supportedStateVersion"),
               let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
               supportedStateVersion == 3 else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+        let threadWindow = Self.snapshotThreadWindow(rawParams)
+        guard threadWindow.valid else {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
 
@@ -4215,7 +4500,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             } else {
                 includeDomains = nil
             }
-            let state = snapshot.state.jsonValue(
+            let readState = threadWindow.recentPerWorkspace.map {
+                snapshot.state.boundingAgentThreads(recentPerWorkspace: $0)
+            } ?? snapshot.state
+            let state = readState.jsonValue(
                 domainRevisions: hostRevisions,
                 includeDomains: includeDomains
             )
@@ -4330,12 +4618,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // ignored noise of any JSON type — never parsed for auth or storage.
         let allowedKeys: Set<String> = [
             "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
-            "knownDomainRevisions", "preferredChunkBytes",
+            "knownDomainRevisions", "preferredChunkBytes", ConnectionSnapshotThreadWindow.parameter,
         ]
         guard Set(rawParams.keys).isSubset(of: allowedKeys),
               rawParams.keys.contains("supportedStateVersion"),
               let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
               supportedStateVersion == 3 else {
+            return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
+        }
+        let threadWindow = Self.snapshotThreadWindow(rawParams)
+        guard threadWindow.valid else {
             return rpcJSONData(rpcErrorObject(.invalidParams, id: wireID))
         }
 
@@ -4378,7 +4670,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             } else {
                 includeDomains = nil
             }
-            let state = snapshot.state.jsonValue(
+            let readState = threadWindow.recentPerWorkspace.map {
+                snapshot.state.boundingAgentThreads(recentPerWorkspace: $0)
+            } ?? snapshot.state
+            let state = readState.jsonValue(
                 domainRevisions: hostRevisions,
                 includeDomains: includeDomains
             )
@@ -4404,7 +4699,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 .snapshotEncode,
                 latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: encodeStarted)
             )
-            guard frameBytes.count <= ConnectionTransportFrame.maximumEncodedBytes else {
+            guard frameBytes.count <= SnapshotChunkSizePolicy.maximumTotalBytes else {
                 return rpcJSONData(rpcErrorObject(.internalError, id: wireID))
             }
             let inserted = try snapshotChunkTransfers.insert(
@@ -5799,8 +6094,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
         ownerFingerprint: String,
         subscriberIDBox: LockedSubscriberID? = nil,
         initialFilter: EventStreamFilter = .full,
-        initialBuffer: Data = Data()
+        initialBuffer: Data = Data(),
+        closeRecord: WebSocketCloseRecord? = nil
     ) {
+        // Reads that end without a close frame record RFC 6455's 1006. A host
+        // terminate recorded earlier wins (first reason is kept).
+        defer { closeRecord?.recordClose(reason: "socketReleased", code: 1006) }
         // PERF-009: keep a contiguous [UInt8] buffer with a read offset
         // instead of Data + removeFirst(consumed). removeFirst is O(n) per
         // frame (shifting the whole buffer), which is quadratic under
@@ -5834,15 +6133,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 if n > 0 {
                     // continue below
                 } else if n == 0 {
+                    closeRecord?.recordClose(reason: "peerEOF", code: 1006)
                     return
                 } else {
                     let err = errno
                     if err == EAGAIN || err == EWOULDBLOCK {
                         if !Self.waitForReadable(fd: fd, timeout: Self.wsSocketReadTimeout) {
+                            closeRecord?.recordClose(reason: "readTimeout", code: 1006)
                             return
                         }
                         continue
                     }
+                    closeRecord?.recordClose(reason: "readError", code: 1006)
                     return
                 }
                 // Any bytes from the peer prove the path is live (C-06 traffic liveness).
@@ -5866,6 +6168,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     return
                 case .mustClose(let closeCode):
                     offset += consumed
+                    closeRecord?.recordClose(reason: "protocolError", code: Int(closeCode))
                     _ = outbound.terminate(
                         errorData: nil,
                         closingData: connectionClosingData(

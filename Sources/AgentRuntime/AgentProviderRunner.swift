@@ -32,8 +32,10 @@ public struct ProviderProcessStartIdentity: Codable, Sendable, Equatable {
 
 public enum ManagedProcessKind: String, Codable, Sendable, Equatable {
     case provider
+    /// Decode-only: older builds tagged Distill sidecar and Graphify CLI
+    /// children with these. The ledger decodes the whole tag array, so the
+    /// cases stay to keep old rows readable and their orphans reapable.
     case sidecar
-    /// Host Graphify CLI child (S9 ownership ledger).
     case graphify
 }
 
@@ -313,12 +315,22 @@ public struct AgentProviderSessionSummary: Sendable, Equatable {
     public let provider: AgentProvider
     public let status: AgentRunStatus
     public let providerThreadId: String?
+    /// A turn was ended by the host while a tool call was still open, so the
+    /// tool may still be running in this session's process tree.
+    public let toolsMayStillRun: Bool
 
-    public init(threadId: AgentThreadID, provider: AgentProvider, status: AgentRunStatus, providerThreadId: String?) {
+    public init(
+        threadId: AgentThreadID,
+        provider: AgentProvider,
+        status: AgentRunStatus,
+        providerThreadId: String?,
+        toolsMayStillRun: Bool = false
+    ) {
         self.threadId = threadId
         self.provider = provider
         self.status = status
         self.providerThreadId = providerThreadId
+        self.toolsMayStillRun = toolsMayStillRun
     }
 }
 
@@ -504,6 +516,18 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
     }
 
     public func stopSession(threadId: AgentThreadID) throws {
+        // A resident session whose turn already finished has no handle; stopping
+        // it retires the session, like the streaming adapters do. A running
+        // session without a handle is still starting and keeps throwing, so the
+        // coordinator's pending stop cancels it once the handle registers.
+        lock.lock()
+        let finishedResident = handles[threadId] == nil
+            && sessions[threadId].map { $0.status != .running && $0.status != .pending } == true
+        if finishedResident {
+            sessions.removeValue(forKey: threadId)
+        }
+        lock.unlock()
+        if finishedResident { return }
         try interruptTurn(threadId: threadId)
         lock.lock()
         sessions.removeValue(forKey: threadId)
@@ -765,7 +789,7 @@ enum ProcessTerminator {
         childPIDProvider.directChildren(of: root).flatMap(processTreePIDs(root:)) + [root]
     }
 
-    /// After the root has been signalled, multiprocessing helpers (Graphify's
+    /// After the root has been signalled, multiprocessing helpers (for example a
     /// Python resource_tracker) can remain. Recapture the tree and keep only
     /// still-alive non-root PIDs so a timeout cannot leak them.
     static func unreapedDescendants(

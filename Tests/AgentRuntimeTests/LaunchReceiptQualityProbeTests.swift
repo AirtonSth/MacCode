@@ -120,7 +120,12 @@ final class LaunchReceiptQualityProbeTests: XCTestCase {
             encoding: .utf8
         )
         let range = try XCTUnwrap(source.range(of: "try orchestrationRuntime?.reconcileReceipts("))
-        let end = try XCTUnwrap(source.range(of: "for thread in try threadRepo.list() where thread.status == .running {"))
+        // The per-thread `threadRepo.list()` loop that used to follow the receipt
+        // reconcile became a single status-only `threadRepo.reconcileRunningOnLaunch`.
+        let end = try XCTUnwrap(source.range(
+            of: "try threadRepo.reconcileRunningOnLaunch(",
+            range: range.upperBound..<source.endIndex
+        ))
         let body = String(source[range.lowerBound..<end.lowerBound])
         XCTAssertTrue(body.contains("runRepo.threadId(of: runId)"))
         XCTAssertTrue(body.contains("messageRepo.hasNonEmptyAssistantMessage(threadId: threadId)"))

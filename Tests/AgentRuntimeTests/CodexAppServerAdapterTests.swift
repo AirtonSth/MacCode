@@ -4265,7 +4265,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Codex rate limit" && item.output?.contains("hard") == true && item.output?.contains("primary") == true } else { return false } },
                       "rate-limit notifications should become visible diagnostics before a long run appears frozen without marking a successful turn as failed")
         XCTAssertTrue(events.contains { if case .accountUsage(let usage) = $0 { return usage.provider == .codex && usage.weeklyUsedPercent == 33 && usage.weeklyWindowDurationMinutes == 10_080 } else { return false } },
-                      "Codex account/rateLimits/updated must feed Token Saver weekly account usage instead of showing fake 100% remaining")
+                      "Codex account/rateLimits/updated must feed weekly account usage instead of showing fake 100% remaining")
         XCTAssertFalse(events.contains { if case .error(let message, _) = $0 { return message.contains("config warning") || message.contains("risky command") || message.contains("bad config") || message.contains("old flag") || message.contains("primary") } else { return false } },
                        "recoverable Codex warnings must not publish agent.run.error when the turn can still succeed")
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Thread status changed" && item.output?.contains("waitingOnApproval") == true } else { return false } })
@@ -4490,7 +4490,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
 
         // A later turn must produce a DIFFERENT goal item id: item ids are
         // unique across turns (invariant relied on by the reducer's
-        // newest-first item lookup and Token Saver translation eviction).
+        // newest-first item lookup and legacy SR1 translation eviction).
         client.notificationHandler?("turn/started", ["threadId": "codex-thread-1", "turnId": "turn-app-server-2"])
         client.notificationHandler?("thread/goal/updated", goalPayload)
         let secondTurnGoal = try XCTUnwrap(goalItems(summary: "Goal updated").last)

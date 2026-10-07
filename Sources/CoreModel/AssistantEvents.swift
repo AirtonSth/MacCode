@@ -35,7 +35,8 @@ public struct AssistantItem: Codable, Sendable, Equatable, Identifiable {
     /// Private action target. Normal transcript rendering must show only a safe display name.
     public var resourcePath: String?
     public var progress: Double?
-    /// Host-attested Token Saver result. Provider/parser-owned item payloads are
+    /// Decode-only host-attested result of the removed Token Saver (old
+    /// transcripts). Provider/parser-owned item payloads are
     /// never trusted to set this; `AssistantTimelineState` only admits `true`
     /// through `AssistantEvent.itemHostMetadata`.
     public internal(set) var distillApplied: Bool?
@@ -74,7 +75,8 @@ public struct AssistantContentFingerprint: Codable, Sendable, Equatable {
     }
 }
 
-/// Host-only proof binding a Token Saver badge to the complete provider bytes.
+/// Decode-only host proof that bound a (removed) Token Saver badge to the
+/// complete provider bytes.
 /// Optional on the wire so historical persisted metadata remains decodable.
 public struct AssistantItemHostAttestation: Codable, Sendable, Equatable {
     public let itemType: AssistantItemType
@@ -114,8 +116,8 @@ public struct AssistantSR1Translation: Codable, Sendable, Equatable {
     }
 }
 
-/// Persisted metadata for an RCW1 request or provider response. The historical
-/// SR1 type remains decode-only so existing transcripts keep rendering.
+/// Decode-only: RCW1 request/response metadata written by Token Saver
+/// (removed). Kept, like the SR1 type, so existing transcripts keep decoding.
 public struct AssistantWireTranslation: Codable, Sendable, Equatable {
     public var itemId: String?
     public var messageId: String?
@@ -130,7 +132,7 @@ public struct AssistantWireTranslation: Codable, Sendable, Equatable {
         messageId: String? = nil,
         originalText: String,
         rewrittenText: String,
-        protocolVersion: String = RCWireProtocol.version,
+        protocolVersion: String = "RCW1",
         fallbackReason: String? = nil,
         wireRequestText: String? = nil
     ) {
@@ -414,7 +416,7 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
     ///   a known per-request occupancy).
     /// - Billing totals (`totalTokens` / cache split / cost): the larger
     ///   `totalTokens` wins so a small per-request payload cannot wipe
-    ///   session-cumulative modelUsage figures used by Token Saver.
+    ///   session-cumulative modelUsage billing figures.
     public static func merging(_ existing: AssistantTokenUsage, with incoming: AssistantTokenUsage) -> AssistantTokenUsage {
         let preferIncomingBilling = incoming.totalTokens >= existing.totalTokens
         let billing = preferIncomingBilling ? incoming : existing
@@ -714,6 +716,13 @@ public struct ProviderRuntimeEvent: Codable, Sendable, Equatable, Identifiable {
         return fromJSONObject(obj, provider: provider, source: source, receivedAtMs: receivedAtMs)
     }
 
+    /// Host bookkeeping from the Distill adapter: `{sessionId, acceptedModel}` when a
+    /// Distill session accepts a prompt, `{sessionId, historyRejected: true}` when
+    /// the provider rejected that session's history. The coordinator persists it in
+    /// the provider session runtime payload so a restart knows the session's model
+    /// family and never re-loads a rejected session.
+    public static let distillSessionStateMethod = "remotecode.distill.session_state"
+
     /// Token-stream methods already render as Thought / answer prose. Emitting them
     /// into the Work log rewrites a strip *above* the user message on every token
     /// (Grok `thought`/`text`, Claude `content_block_delta`, …).
@@ -722,7 +731,8 @@ public struct ProviderRuntimeEvent: Codable, Sendable, Equatable, Identifiable {
         case "thought", "text",
              "content_block_delta", "content_block_start", "content_block_stop",
              "message_start", "message_delta", "message_stop",
-             "ping", "input_json_delta":
+             "ping", "input_json_delta",
+             Self.distillSessionStateMethod:
             return false
         default:
             return true
@@ -1055,16 +1065,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// New RCW1 events are adapted into these presentation-only maps.
     public var sr1TranslationsByItemId: [String: AssistantSR1Translation]
     public var sr1TranslationsByMessageId: [String: AssistantSR1Translation]
-    public var tokenSaverTranslationsByItemId: [String: AssistantSR1Translation] {
-        sr1TranslationsByItemId
-    }
-    public var tokenSaverTranslationsByMessageId: [String: AssistantSR1Translation] {
-        sr1TranslationsByMessageId
-    }
 
     /// Injective identity for an evictable provider item inside one turn.
     /// Provider item IDs may repeat after a turn boundary.
-    public static func tokenSaverTimelineItemTranslationKey(
+    public static func sr1TimelineItemTranslationKey(
         turnId: String,
         itemId: String
     ) -> String {
@@ -1809,14 +1813,14 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 wireRequestText: translation.wireRequestText
             )
             if let itemId = translation.itemId, !itemId.isEmpty {
-                indexTokenSaverTranslation(compatibility, itemId: itemId)
+                indexSR1Translation(compatibility, itemId: itemId)
             }
             if let messageId = translation.messageId, !messageId.isEmpty {
                 sr1TranslationsByMessageId[messageId] = compatibility
             }
         case .sr1Translation(let translation):
             if let itemId = translation.itemId, !itemId.isEmpty {
-                indexTokenSaverTranslation(translation, itemId: itemId)
+                indexSR1Translation(translation, itemId: itemId)
             }
             if let messageId = translation.messageId, !messageId.isEmpty {
                 sr1TranslationsByMessageId[messageId] = translation
@@ -1882,7 +1886,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// Translation events follow their item event in provider streams. Resolve
     /// newest-first so a reused provider item ID is attached to the current turn,
     /// while retaining the legacy item-only entry for old snapshots/readers.
-    private mutating func indexTokenSaverTranslation(
+    private mutating func indexSR1Translation(
         _ translation: AssistantSR1Translation,
         itemId: String
     ) {
@@ -1890,7 +1894,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         guard let turnId = turns.reversed().first(where: { turn in
             turn.items.contains(where: { $0.id == itemId })
         })?.turnId else { return }
-        sr1TranslationsByItemId[Self.tokenSaverTimelineItemTranslationKey(
+        sr1TranslationsByItemId[Self.sr1TimelineItemTranslationKey(
             turnId: turnId,
             itemId: itemId
         )] = translation
@@ -1899,7 +1903,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     private mutating func trimTurns() {
         guard turns.count > Self.liveTurnLimit else { return }
         let dropCount = turns.count - Self.liveTurnLimit
-        // F10: evicted turns' items are gone, so drop any Token Saver translations keyed on
+        // F10: evicted turns' items are gone, so drop any legacy SR1 translations keyed on
         // those item ids — otherwise the maps retain pre-translation text for turns
         // that no longer exist. Item ids are unique per turn, so retained turns keep
         // their translations. (messageId translations map to persisted messages
@@ -1908,7 +1912,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             for turn in turns.prefix(dropCount) {
                 for item in turn.items {
                     sr1TranslationsByItemId.removeValue(forKey: item.id)
-                    sr1TranslationsByItemId.removeValue(forKey: Self.tokenSaverTimelineItemTranslationKey(
+                    sr1TranslationsByItemId.removeValue(forKey: Self.sr1TimelineItemTranslationKey(
                         turnId: turn.turnId,
                         itemId: item.id
                     ))
@@ -1932,7 +1936,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             if !sr1TranslationsByItemId.isEmpty {
                 for item in turns[idx].items[1..<(1 + dropFromRest)] {
                     sr1TranslationsByItemId.removeValue(forKey: item.id)
-                    sr1TranslationsByItemId.removeValue(forKey: Self.tokenSaverTimelineItemTranslationKey(
+                    sr1TranslationsByItemId.removeValue(forKey: Self.sr1TimelineItemTranslationKey(
                         turnId: turns[idx].turnId,
                         itemId: item.id
                     ))

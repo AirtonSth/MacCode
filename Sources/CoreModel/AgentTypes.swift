@@ -601,21 +601,44 @@ public final class AgentRunAcceptancePermit: @unchecked Sendable {
 
     private let lock = NSLock()
     private var state: State = .pending
+    private var invalidationHandlers: [@Sendable () -> Void] = []
 
     public init() {}
 
     @discardableResult
     public func invalidate() -> AgentRunAcceptanceAttempt? {
-        lock.withLock {
+        let (attempt, handlers) = lock.withLock { () -> (AgentRunAcceptanceAttempt?, [@Sendable () -> Void]) in
             if case .pending = state {
                 state = .invalidated
-                return nil
+                defer { invalidationHandlers = [] }
+                return (nil, invalidationHandlers)
             }
             if case .claimed(let attempt) = state {
-                return attempt
+                return (attempt, [])
             }
-            return nil
+            return (nil, [])
         }
+        handlers.forEach { $0() }
+        return attempt
+    }
+
+    /// Runs `handler` once if the permit is invalidated before anything claims
+    /// it (Stop while the start is still preparing), at once when it already
+    /// is. Never runs once a prompt write claimed or was accepted: work that
+    /// must stop with the start (a long launch preparation) cancels itself here.
+    public func onInvalidate(_ handler: @escaping @Sendable () -> Void) {
+        let runNow = lock.withLock { () -> Bool in
+            switch state {
+            case .pending:
+                invalidationHandlers.append(handler)
+                return false
+            case .invalidated:
+                return true
+            case .claimed, .accepted, .unknown:
+                return false
+            }
+        }
+        if runNow { handler() }
     }
 
     public var outcome: AgentRunAcceptanceOutcome {
@@ -641,6 +664,7 @@ public final class AgentRunAcceptancePermit: @unchecked Sendable {
             }
             let attempt = AgentRunAcceptanceAttempt()
             state = .claimed(attempt)
+            invalidationHandlers = []
             return attempt
         }
         defer { attempt.complete() }
@@ -684,13 +708,23 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     /// Runtime-only queue dispatch gate. Intentionally excluded from Codable and
     /// value equality; it has no meaning outside the current host process.
     public var acceptancePermit: AgentRunAcceptancePermit?
-    /// Runtime-only. True when `prompt` is a host-built envelope (bot brain) that
-    /// Token Saver must compress while `userMessageContent` stays the display text.
-    public var tokenSaverCompressesPrompt: Bool = false
     /// Canonical prior conversation captured before provider start. Runtime-only.
-    public var contextSnapshot: TokenSaverCanonicalConversationSnapshot?
+    public var contextSnapshot: ConversationContextSnapshot?
     /// Prepared RCSEED1 document for a confirmed fresh-fallback destination.
-    public var preparedContextSeed: TokenSaverPreparedContextSeed?
+    public var preparedContextSeed: PreparedConversationContextSeed?
+    /// Main model of the last prompt the persisted provider session
+    /// (`providerThreadId`) accepted. Runtime-only. Lets Distill detect a
+    /// cross-family Main switch when it must `session/load` that session after
+    /// an app restart.
+    public var priorProviderSessionModel: String?
+    /// The provider rejected the persisted session's history. Runtime-only.
+    /// Distill opens a new session instead of loading it, after a restart too.
+    public var priorProviderSessionRetired: Bool = false
+    /// Newest prior user/assistant messages, oldest first, excluding the current
+    /// prompt. Runtime-only. Set only when Distill must replace the provider
+    /// session; unlike `contextSnapshot` it has no all-or-nothing size limit, so
+    /// a long thread still hands its most recent context to the new session.
+    public var priorConversationTail: [AgentMessage]?
 
     public init(
         runId: AgentRunID = AgentRunID(),
@@ -715,8 +749,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         extraArgs: [String] = [],
         runAsUser: AgentRunAsUser? = nil,
         acceptancePermit: AgentRunAcceptancePermit? = nil,
-        contextSnapshot: TokenSaverCanonicalConversationSnapshot? = nil,
-        preparedContextSeed: TokenSaverPreparedContextSeed? = nil
+        contextSnapshot: ConversationContextSnapshot? = nil,
+        preparedContextSeed: PreparedConversationContextSeed? = nil
     ) {
         self.runId = runId
         self.threadId = threadId
@@ -803,8 +837,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     }
 
     public func attachingContext(
-        snapshot: TokenSaverCanonicalConversationSnapshot? = nil,
-        seed: TokenSaverPreparedContextSeed? = nil
+        snapshot: ConversationContextSnapshot? = nil,
+        seed: PreparedConversationContextSeed? = nil
     ) -> AgentRunRequest {
         var copy = self
         if let snapshot {
@@ -827,9 +861,7 @@ public enum AgentProviderInstructionText {
         """
     }
 
-    /// The base mode instruction Codex receives every turn as `developer_instructions`. The Token
-    /// Saver distill spec is composed on top of this in `CodexAppServerClient` (it owns the full
-    /// distill body, which lives in the AgentRuntime layer); this stays a focused, mode-only base.
+    /// The base mode instruction Codex receives every turn as `developer_instructions`.
     public static func developerInstructions(for mode: AgentInteractionMode) -> String {
         switch mode {
         case .default:

@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import Persistence
 import CoreModel
+import AgentRuntime
 
 public enum HostMutationContract {
     public static let transportParamKeys: Set<String> = [
@@ -58,6 +59,9 @@ public enum HostMutationContract {
     agent.run.stop
     agent.request.respond
     agent.user_input.respond
+    agent.manual_action.resolve
+    agent.thread.actor.set
+    agent.mac_execution.resolve
     agent.plan.implement
     agent.plan.save
     agent.plan.notes.save
@@ -150,6 +154,7 @@ public enum HostMutationContract {
     bot.guest.stop
     bot.guest.rebuild
     bot.guest.revoke
+    bot.guest.control
     bot.docker.clear
     bot.notify.set
     bot.desktop.set
@@ -160,6 +165,19 @@ public enum HostMutationContract {
     bot.attention.ack
     bot.self_config
     bot.scheduler.tick
+    bot.team.create
+    bot.team.update
+    bot.team.set_members
+    bot.team.delete
+    bot.team.reorder
+    bot.group.create
+    bot.group.update
+    bot.group.set_participants
+    bot.group.send
+    bot.group.stop
+    bot.group.retry_turn
+    bot.group.select
+    bot.group.delete
     """.split(separator: "\n").map(String.init))
 
     struct PreflightProbe {
@@ -170,6 +188,8 @@ public enum HostMutationContract {
     private enum SyntaxRule {
         case uuid(String)
         case optionalUUID(String)
+        /// Absent, null or a string; any other type is invalid params.
+        case optionalString(String)
         case anyUUID([String])
         case string(String, nonempty: Bool = false)
         case anyString([String], nonempty: Bool = false)
@@ -181,10 +201,15 @@ public enum HostMutationContract {
         case stringEnum(String, Set<String>)
         case surfaceType(String)
         case uuidArrayWithAtLeastOne(String)
+        /// An array of UUID strings; may be empty.
+        case uuidArray(String)
         case surfaceSplitTarget
         case requiredSSHProfile
         case optionalSSHProfile
         case pushTokenContract
+        /// `actor` `{"kind":"none"}` or `{"kind":"bot","bot_id":<uuid>}`, and an
+        /// optional `execution_target` `vm` / `mac` (absent or null for the default).
+        case threadActor
     }
 
     /// Private managed-provider mutations reuse the same syntactic and durable
@@ -225,6 +250,10 @@ public enum HostMutationContract {
             guard params[key] == nil || params[key]?.stringValue.flatMap(UUID.init) != nil else {
                 throw JSONRPCError.invalidParams
             }
+        case .optionalString(let key):
+            guard params[key] == nil || params[key] == .null || params[key]?.stringValue != nil else {
+                throw JSONRPCError.invalidParams
+            }
         case .anyUUID(let keys):
             guard keys.contains(where: { params[$0]?.stringValue.flatMap(UUID.init) != nil }) else {
                 throw JSONRPCError.invalidParams
@@ -251,6 +280,11 @@ public enum HostMutationContract {
             guard params[key]?.stringValue.map(values.contains) == true else { throw JSONRPCError.invalidParams }
         case .surfaceType(let key):
             guard params[key]?.stringValue.map(isSurfaceType) == true else { throw JSONRPCError.invalidParams }
+        case .uuidArray(let key):
+            guard let values = params[key]?.arrayValue,
+                  values.allSatisfy({ $0.stringValue.flatMap(UUID.init) != nil }) else {
+                throw JSONRPCError.invalidParams
+            }
         case .uuidArrayWithAtLeastOne(let key):
             guard let values = params[key]?.arrayValue,
                   values.contains(where: { $0.stringValue.flatMap(UUID.init) != nil }) else {
@@ -268,6 +302,13 @@ public enum HostMutationContract {
             }
         case .pushTokenContract:
             try validatePushToken(params)
+        case .threadActor:
+            guard ThreadActorWire.parseActor(params["actor"]) != nil else { throw JSONRPCError.invalidParams }
+            let target = params["execution_target"]
+            guard target == nil || target == .null
+                || target?.stringValue.flatMap(ExecutionTarget.init(rawValue:)) != nil else {
+                throw JSONRPCError.invalidParams
+            }
         }
     }
 
@@ -370,6 +411,30 @@ public enum HostMutationContract {
                     .uuid("bot_id"),
                     .string("task_id", nonempty: true), .object("runtime"),
                 ]
+            case "bot.guest.control":
+                return [.uuid("bot_id"), .stringEnum("action", ["take", "release"])]
+            case "bot.team.create":
+                return [.string("name", nonempty: true)]
+            case "bot.team.update":
+                return [.uuid("team_id"), .int("expected_revision")]
+            case "bot.team.set_members":
+                return [.uuid("team_id"), .int("expected_revision"), .uuidArray("bot_ids")]
+            case "bot.team.delete":
+                return [.uuid("team_id")]
+            case "bot.team.reorder":
+                return [.uuidArray("team_ids")]
+            case "bot.group.create":
+                return [.string("title", nonempty: true), .uuidArrayWithAtLeastOne("participant_bot_ids")]
+            case "bot.group.update":
+                return [.uuid("group_id"), .int("expected_revision")]
+            case "bot.group.set_participants":
+                return [.uuid("group_id"), .int("expected_revision"), .uuidArrayWithAtLeastOne("bot_ids")]
+            case "bot.group.send":
+                return [.uuid("group_id"), .string("text", nonempty: true), .string("submit_key", nonempty: true)]
+            case "bot.group.stop", "bot.group.select", "bot.group.delete":
+                return [.uuid("group_id")]
+            case "bot.group.retry_turn":
+                return [.uuid("group_id"), .uuid("turn_id")]
             default:
                 return [.uuid("bot_id")]
             }
@@ -408,6 +473,9 @@ public enum HostMutationContract {
         case "agent.message.queue.reorder": return [.uuid("thread_id"), .anyUUID(["queued_message_id", "id"]), .int("position")]
         case "agent.request.respond": return [.uuid("thread_id"), .string("request_id"), .stringEnum("decision", ["approve", "approve_for_session", "approveForSession", "decline", "cancel"])]
         case "agent.user_input.respond": return [.uuid("thread_id"), .string("request_id"), .string("text")]
+        case "agent.thread.actor.set": return [.uuid("thread_id"), .threadActor]
+        case "agent.mac_execution.resolve": return [.uuid("thread_id"), .bool("approve")]
+        case "agent.manual_action.resolve": return [.uuid("thread_id"), .uuid("manual_action_id"), .stringEnum("action", ["take", "continue", "decline"]), .optionalString("note")]
         case "agent.plan.implement", "agent.plan.save": return [.uuid("thread_id"), .string("plan_id")]
         case "agent.plan.notes.save": return [.uuid("thread_id"), .string("notes")]
         case "agent.checkpoint.revert": return [.uuid("thread_id"), .firstPresentInt(["turn_count", "checkpoint_turn_count"])]
@@ -444,11 +512,13 @@ public enum HostMutationContract {
         case "settings.set": return [.string("key"), .string("value")]
         case "project.run_script": return [.uuid("workspace_id"), .string("name")]
         case "private.push_token.update": return [.pushTokenContract]
+        case "distill.accounts.login", "distill.accounts.logout": return [.stringEnum("provider", distillAccountProviders)]
         default: return []
         }
     }
 
     private static let directions: Set<String> = ["right", "down", "left", "up"]
+    private static let distillAccountProviders = Set(DistillAccountProvider.allCases.map(\.rawValue))
 
     private static func isSurfaceType(_ value: String) -> Bool {
         let lower = value.lowercased()
@@ -470,6 +540,7 @@ public enum HostMutationContract {
         switch rule {
         case .uuid(let key): params[key] = .string(probeUUID)
         case .optionalUUID: break
+        case .optionalString: break
         case .anyUUID(let keys): params[keys[0]] = .string(probeUUID)
         case .string(let key, _): params[key] = .string("value")
         case .anyString(let keys, _): params[keys[0]] = .string("value")
@@ -485,12 +556,15 @@ public enum HostMutationContract {
         case .stringEnum(let key, let values): params[key] = .string(values.sorted()[0])
         case .surfaceType(let key): params[key] = .string("terminal")
         case .uuidArrayWithAtLeastOne(let key): params[key] = .array([.string(probeUUID)])
+        case .uuidArray(let key): params[key] = .array([.string(probeUUID)])
         case .surfaceSplitTarget: params["type"] = .string("terminal")
         case .requiredSSHProfile: params["destination"] = .string("host.example")
         case .optionalSSHProfile: break
         case .pushTokenContract:
             params["push_token"] = .string("token")
             params["push_token_type"] = .string("apns")
+        case .threadActor:
+            params["actor"] = .object(["kind": .string("bot"), "bot_id": .string(probeUUID)])
         }
     }
 
@@ -512,6 +586,8 @@ public enum HostMutationContract {
         case .optionalUUID(let key):
             add("\(key).type") { $0[key] = .bool(true) }
             add("\(key).uuid") { $0[key] = .string("not-a-uuid") }
+        case .optionalString(let key):
+            add("\(key).type") { $0[key] = .number(1) }
         case .anyUUID(let keys):
             add("\(keys.joined(separator: "/")).missing") { params in keys.forEach { params.removeValue(forKey: $0) } }
             add("\(keys.joined(separator: "/")).type") { params in keys.forEach { params[$0] = .bool(true) } }
@@ -558,6 +634,10 @@ public enum HostMutationContract {
             add("\(key).missing") { $0.removeValue(forKey: key) }
             add("\(key).type") { $0[key] = .bool(true) }
             add("\(key).enum") { $0[key] = .string("invalid-surface") }
+        case .uuidArray(let key):
+            add("\(key).missing") { $0.removeValue(forKey: key) }
+            add("\(key).type") { $0[key] = .bool(true) }
+            add("\(key).uuid") { $0[key] = .array([.string("not-a-uuid")]) }
         case .uuidArrayWithAtLeastOne(let key):
             add("\(key).missing") { $0.removeValue(forKey: key) }
             add("\(key).type") { $0[key] = .bool(true) }
@@ -575,6 +655,14 @@ public enum HostMutationContract {
             add("profile.object.destination") { $0["profile"] = .object([:]) }
         case .pushTokenContract:
             appendPushTokenProbes(valid: valid, to: &probes)
+        case .threadActor:
+            add("actor.missing") { $0.removeValue(forKey: "actor") }
+            add("actor.type") { $0["actor"] = .string("bot") }
+            add("actor.kind.enum") { $0["actor"] = .object(["kind": .string("user")]) }
+            add("actor.bot_id.missing") { $0["actor"] = .object(["kind": .string("bot")]) }
+            add("actor.bot_id.uuid") { $0["actor"] = .object(["kind": .string("bot"), "bot_id": .string("not-a-uuid")]) }
+            add("execution_target.type") { $0["execution_target"] = .bool(true) }
+            add("execution_target.enum") { $0["execution_target"] = .string("cloud") }
         }
         return probes
     }
@@ -755,4 +843,42 @@ public protocol CommandReceiptStateRouting: AnyObject {
         clientRequestId: String,
         ownerFingerprint: String
     ) throws -> CommandReceiptStatusResult
+    /// C6: when non-nil, the dispatcher claims, commits and finalizes through
+    /// this writer so receipt SQLite never runs on MainActor. Routers without
+    /// one keep the synchronous methods above.
+    var commandReceiptOffMainWriter: (any CommandReceiptOffMainWriting)? { get }
+}
+
+extension CommandReceiptStateRouting {
+    public var commandReceiptOffMainWriter: (any CommandReceiptOffMainWriting)? { nil }
+}
+
+/// Durable receipt store that is safe to use off MainActor (C6).
+///
+/// `claim` and `commit` resume when their transaction has landed.
+/// `finalizeTransaction` only builds the receipt + event transaction; the
+/// caller hands it to `EventBus.enqueuePersistedCommit`, which runs it exactly
+/// once on the delivery lane with the reserved sequence floor.
+public protocol CommandReceiptOffMainWriting: Sendable {
+    func claim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) async throws -> CommandReceiptClaimResult
+    func commit(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue
+    ) async throws
+    func finalizeTransaction(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue,
+        events: [EventBus.MutationEventIntent]
+    ) -> @Sendable (_ minimumEventSequence: Int64) throws -> [EventBus.Event]
 }

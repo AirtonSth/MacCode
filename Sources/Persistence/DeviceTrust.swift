@@ -234,6 +234,159 @@ public final class DeviceTrustRepository {
 
     private let iso = LockedISO8601Formatter(ISO8601DateFormatter())
 
+    // MARK: - Principal cache (request auth)
+
+    /// How long a verified token stays valid in memory without re-reading
+    /// device_trust. In-process trust changes (revoke, pair, delete, always-allow)
+    /// invalidate immediately through `trustGeneration`; the TTL only bounds how
+    /// long a change made by another process can go unseen.
+    public static let principalCacheTTL: TimeInterval = 60
+    static let principalCacheCapacity = 64
+
+    /// Process-wide device_trust mutation counter. Every repository instance on
+    /// any connection bumps it after a trust write commits, so a revoke issued
+    /// from Settings (its own repository) invalidates the HTTP auth cache too.
+    private static let trustGenerationLock = NSLock()
+    nonisolated(unsafe) private static var trustGenerationValue: UInt64 = 0
+    public static var trustGeneration: UInt64 {
+        trustGenerationLock.lock()
+        defer { trustGenerationLock.unlock() }
+        return trustGenerationValue
+    }
+
+    /// Call only after the trust write has committed: a lookup that read the old
+    /// row captured the old generation before its SELECT, so its entry can never
+    /// match the bumped value.
+    static func bumpTrustGeneration() {
+        trustGenerationLock.lock()
+        trustGenerationValue &+= 1
+        trustGenerationLock.unlock()
+    }
+
+    private struct CachedPrincipal {
+        let trust: DeviceTrust
+        let generation: UInt64
+        let cachedAt: Date
+        /// Latest last_seen_at written or scheduled for this device.
+        var lastSeenAt: Date?
+    }
+
+    private let principalCacheLock = NSLock()
+    private var principalCache: [String: CachedPrincipal] = [:]
+    private var principalCacheHits = 0
+    private var principalCacheMisses = 0
+    /// last_seen_at is telemetry: it is written after the request has been
+    /// authorized, on its own queue, at most once per `threshold` per device.
+    private let lastSeenQueue = DispatchQueue(
+        label: "io.remotecode.device-trust.last-seen",
+        qos: .utility
+    )
+
+    public var principalCacheHitCountForTesting: Int {
+        principalCacheLock.lock()
+        defer { principalCacheLock.unlock() }
+        return principalCacheHits
+    }
+
+    public var principalCacheMissCountForTesting: Int {
+        principalCacheLock.lock()
+        defer { principalCacheLock.unlock() }
+        return principalCacheMisses
+    }
+
+    /// Blocks until every scheduled last_seen_at write has run.
+    public func drainLastSeenWritesForTesting() {
+        lastSeenQueue.sync {}
+    }
+
+    /// Request-path verify. A token verified within `principalCacheTTL` and
+    /// before any later trust write returns from memory with zero SQLite work.
+    /// A miss runs one SELECT. Revoked or unknown tokens are never cached.
+    /// last_seen_at keeps the `verify` debounce (`threshold`) but is written
+    /// off the caller's thread, so a held write lock never delays the request.
+    public func verifyCached(
+        token: String,
+        threshold: TimeInterval = 60,
+        now: Date = Date()
+    ) throws -> DeviceTrust? {
+        let hash = DeviceTrustRepository.hash(token)
+        let generation = Self.trustGeneration
+        principalCacheLock.lock()
+        if var entry = principalCache[hash] {
+            let age = now.timeIntervalSince(entry.cachedAt)
+            if entry.generation == generation, age >= 0, age < Self.principalCacheTTL {
+                principalCacheHits += 1
+                let touch = Self.shouldUpdateLastSeen(prev: entry.lastSeenAt, now: now, threshold: threshold)
+                if touch {
+                    entry.lastSeenAt = now
+                    principalCache[hash] = entry
+                }
+                principalCacheLock.unlock()
+                if touch { scheduleLastSeenWrite(id: entry.trust.id, at: now) }
+                return entry.trust
+            }
+            principalCache[hash] = nil
+        }
+        principalCacheMisses += 1
+        principalCacheLock.unlock()
+
+        guard let trust = try lookupActiveTrust(tokenHash: hash) else { return nil }
+        let touch = Self.shouldUpdateLastSeen(prev: trust.lastSeenAt, now: now, threshold: threshold)
+        principalCacheLock.lock()
+        if principalCache.count >= Self.principalCacheCapacity {
+            principalCache = principalCache.filter {
+                $0.value.generation == generation
+                    && now.timeIntervalSince($0.value.cachedAt) < Self.principalCacheTTL
+            }
+            if principalCache.count >= Self.principalCacheCapacity { principalCache.removeAll() }
+        }
+        principalCache[hash] = CachedPrincipal(
+            trust: trust,
+            generation: generation,
+            cachedAt: now,
+            lastSeenAt: touch ? now : trust.lastSeenAt
+        )
+        principalCacheLock.unlock()
+        if touch { scheduleLastSeenWrite(id: trust.id, at: now) }
+        return trust
+    }
+
+    private func lookupActiveTrust(tokenHash hash: String) throws -> DeviceTrust? {
+        let st = try db.prepare(
+            "SELECT id, display_name, created_at, last_seen_at, revoked_at, capabilities, client_device_id, always_allow_pairing FROM device_trust WHERE token_hash = ? AND revoked_at IS NULL;"
+        )
+        // Reset so this connection does not keep a WAL read snapshot after a
+        // single-row lookup.
+        defer { st.reset() }
+        try st.bind(1, hash)
+        guard try st.step() else { return nil }
+        return DeviceTrust(
+            id: st.columnText(0) ?? "",
+            displayName: st.columnText(1) ?? "",
+            tokenHash: hash,
+            createdAt: iso.date(from: st.columnText(2) ?? "") ?? Date(),
+            lastSeenAt: (st.columnText(3)).flatMap { iso.date(from: $0) },
+            revokedAt: (st.columnText(4)).flatMap { iso.date(from: $0) },
+            capabilities: st.columnText(5) ?? "*",
+            clientDeviceID: st.columnText(6),
+            alwaysAllowPairing: st.columnInt64(7) != 0
+        )
+    }
+
+    private func scheduleLastSeenWrite(id: String, at now: Date) {
+        let stamp = iso.string(from: now)
+        lastSeenQueue.async { [db] in
+            // Best-effort telemetry, same as the synchronous verify path: the
+            // request was already authorized, so a locked or read-only DB must
+            // never de-authorize the device.
+            do {
+                let touch = try db.prepare("UPDATE device_trust SET last_seen_at = ? WHERE id = ?;")
+                try touch.bind(1, stamp); try touch.bind(2, id)
+                _ = try touch.step()
+            } catch {}
+        }
+    }
+
     /// Pure predicate: returns `true` when the stored `last_seen_at` is old
     /// enough that a new write is warranted, avoiding a WAL write on every
     /// authenticated request when the stored value is already fresh.
@@ -345,6 +498,7 @@ public final class DeviceTrustRepository {
 
                 return DeviceTrust(id: deviceId, displayName: deviceName, tokenHash: hash, createdAt: now)
             }
+            Self.bumpTrustGeneration()
             return (trust, token: token)
         } catch is PairingConflict {
             return nil
@@ -448,6 +602,7 @@ public final class DeviceTrustRepository {
                     alwaysAllowPairing: persistedAlwaysAllow
                 )
             }
+            Self.bumpTrustGeneration()
             return (trust, token: token)
         } catch is PairingConflict {
             return nil
@@ -581,12 +736,14 @@ public final class DeviceTrustRepository {
         try st.bind(1, enabled)
         try st.bind(2, id)
         _ = try st.step()
+        Self.bumpTrustGeneration()
     }
 
     public func revoke(id: String) throws {
         let st = try db.prepare("UPDATE device_trust SET revoked_at = ? WHERE id = ?;")
         try st.bind(1, iso.string(from: Date())); try st.bind(2, id)
         _ = try st.step()
+        Self.bumpTrustGeneration()
     }
 
     /// Delete all device_trust rows that have been revoked (revoked_at IS NOT NULL).
@@ -594,6 +751,7 @@ public final class DeviceTrustRepository {
     public func deleteRevoked() throws {
         let st = try db.prepare("DELETE FROM device_trust WHERE revoked_at IS NOT NULL;")
         _ = try st.step()
+        Self.bumpTrustGeneration()
     }
 
     public func audit(actor: String?, action: String, detail: String?, at now: Date = Date()) throws {

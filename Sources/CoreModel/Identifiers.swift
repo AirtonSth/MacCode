@@ -96,6 +96,30 @@ public struct BotAttentionItemID: Hashable, Codable, Sendable, CustomStringConve
     public var description: String { value.uuidString }
 }
 
+public struct BotTeamID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
+public struct BotGroupID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
+public struct BotGroupRoundID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
+public struct BotGroupTurnID: Hashable, Codable, Sendable, CustomStringConvertible {
+    public let value: UUID
+    public init(_ value: UUID = UUID()) { self.value = value }
+    public var description: String { value.uuidString }
+}
+
 /// Normalized unique handle (`piper`). Leading `@` is never stored.
 public struct BotHandle: Hashable, Codable, Sendable, CustomStringConvertible {
     public let value: String

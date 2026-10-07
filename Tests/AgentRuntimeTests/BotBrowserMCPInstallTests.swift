@@ -39,12 +39,19 @@ final class BotBrowserMCPInstallTests: XCTestCase {
         )
 
         let leftover: [Any] = [["name": "user-slack", "command": "npx"]]
+        // Bot runs get the per-session ACP entry; non-bot runs must not (every
+        // bot_browser_* call fails with callerMissing without a bot id).
         let grok = GrokACPClient.sessionMCPServers(
             existing: leftover,
             command: binary.path,
-            environment: [:]
+            environment: [BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof"]
         )
         XCTAssertTrue(BotBrowserMCPAdmit.containsAdmittedGrokACP(grok))
+        XCTAssertFalse(BotBrowserMCPAdmit.containsAdmittedGrokACP(GrokACPClient.sessionMCPServers(
+            existing: leftover,
+            command: binary.path,
+            environment: [:]
+        )))
         let names = grok.compactMap { ($0 as? [String: Any])?["name"] as? String }
         XCTAssertTrue(names.contains("user-slack"))
     }

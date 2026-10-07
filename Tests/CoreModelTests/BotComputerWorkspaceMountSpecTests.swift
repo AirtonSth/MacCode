@@ -26,9 +26,11 @@ final class BotComputerWorkspaceMountSpecTests: XCTestCase {
         // WHY: the agent's absolute paths must resolve identically on the Mac and in the VM.
         let botID = BotID()
         let result = try options(botID, workspaces: ["/Users/tester/code/app"], registered: ["/Users/tester/code/app"])
-        XCTAssertEqual(result.binds.count, 2)
+        // The only other bind is the read-only agent kit, which exposes no Mac paths.
+        XCTAssertEqual(result.binds.count, 3)
         XCTAssertTrue(result.binds[0].hasSuffix(":\(BotComputerGuestSpec.guestUserHome)"))
         XCTAssertEqual(result.binds[1], "/Users/tester/code/app:/Users/tester/code/app")
+        XCTAssertEqual(result.binds[2], "/tmp/rc-app-support-ws/guest-tools:\(BotComputerGuestSpec.agentKitMountPoint):ro")
     }
 
     func test_invalidWorkspacePathsAreRejected() {

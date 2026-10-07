@@ -74,8 +74,22 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onStopGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onRebuildGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onGuestInput: ((BotID, [String: Any], String, [String: Any]) throws -> Void)?
+    /// Who drives each bot computer. `bot.guest.control` takes or releases it
+    /// and `bot.guest.state` reports it as `controlled_by_user`.
+    public var computerControl: BotComputerControl = .shared
+    /// After `bot.guest.control` changed who drives (true: the user took it).
+    /// Runs under the authority lock, so it must not call back into this authority.
+    public var onGuestControlChanged: ((BotID, Bool) -> Void)?
     public var onDockerClear: ((BotID) throws -> Void)?
-    public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]) throws -> [String: Any])?
+    /// Routing is nil when the send carries no routing receipt: the host then
+    /// runs the conversation's own desk route (or the resolved Distill default)
+    /// and reports it back as `effective_routing`.
+    public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]?) throws -> [String: Any])?
+    /// `bot.routing.set` with `conversation_id`: the host adopts the route as
+    /// that conversation's desk route and returns the resolved route.
+    public var onConversationRoutingSet: ((BotID, BotConversationID, [String: Any]) throws -> [String: Any])?
+    /// The route the next send to a desk conversation runs, for `bot.conversation.list`.
+    public var onConversationRouting: ((BotConversation) -> [String: Any]?)?
     public var onForceQueuedFollowUp: ((BotID, String) throws -> [String: Any])?
     public var onDelegatedAttentionSnapshot: (() throws -> [[String: Any]])?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
@@ -89,6 +103,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var files: [String: [String: Any]] = [:]
     private var browser: [String: [String: Any]] = [:]
     private var guest: [String: [String: Any]] = [:]
+    /// Frames an observing viewer replaced, per bot and runtime grant (newest
+    /// last). Input aimed at one of them is still on the screen the user saw,
+    /// until an input settles a new frame.
+    private var guestRecentFrames: [String: (grantID: String, frames: [RecentGuestFrame])] = [:]
     private var liveRuns: [String: [String: Any]] = [:]
     private var attention: [String: [String: Any]] = [:]
     private var peerReceipts: [String: [String: Any]] = [:]
@@ -162,7 +180,24 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             if let botID = existing["bot_id"] as? String,
                var current = guest[botID],
                readback["viewer_path"] != nil || readback["viewer"] != nil {
+                let shownFrame = current["frame"] as? [String: Any]
                 for (key, value) in readback { current[key] = value }
+                // An observing viewer may have replaced the frame this result
+                // was built on: keep frame sequences strictly increasing.
+                if var settledFrame = current["frame"] as? [String: Any],
+                   let shownSequence = shownFrame?["sequence"] as? Int,
+                   let settledSequence = settledFrame["sequence"] as? Int,
+                   settledSequence <= shownSequence,
+                   settledFrame["frame_id"] as? String != shownFrame?["frame_id"] as? String {
+                    settledFrame["sequence"] = shownSequence + 1
+                    current["frame"] = settledFrame
+                }
+                // A settled frame shows the screen after the input: frames an
+                // observe replaced before it no longer match what is there.
+                if (current["frame"] as? [String: Any])?["frame_id"] as? String
+                    != shownFrame?["frame_id"] as? String {
+                    guestRecentFrames[botID] = nil
+                }
                 current["viewer"] = "/vnc.html"
                 current["viewer_path"] = "/vnc.html"
                 current["security"] = Self.guestSecurity
@@ -219,7 +254,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "attention.list":
             try synchronizeDurableNeedsAttention()
             try synchronizeDelegatedAttention()
-            return ["items": attention.values.map { canonicalAttentionItem($0) }]
+            // Group items are opt-in (`include_kinds: ["group"]`): a client
+            // without groups would show one as the bot's own attention and
+            // could never clear it (bot.attention.ack is per bot).
+            let kinds = (params["include_kinds"] as? [Any])?.compactMap { $0 as? String } ?? []
+            let groups = kinds.contains("group") ? groupAttentionItems(hostID: string(params, "host_id")) : []
+            return ["items": attention.values.map { canonicalAttentionItem($0) } + groups]
         case "reserved.probe":
             throw Error.reserved
         default:
@@ -351,6 +391,67 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard !NSDictionary(dictionary: attention).isEqual(to: next) else { return }
         attention = next
         persistSidecar()
+    }
+
+    /// One `kind: "group"` item per visible group whose attention is set,
+    /// anchored on the turn that set it (its id is the item id). Cleared by
+    /// `bot.group.select`. A read failure drops only the group rows. Only the
+    /// turns that can anchor the item are read, never the group's history.
+    private func groupAttentionItems(hostID: String?) -> [[String: Any]] {
+        let groups: [BotGroupConversation]
+        do {
+            groups = try store.listGroups()
+        } catch {
+            botRemoteControlLog.error(
+                "bot.attention.group_projection_failed error=\(String(describing: error), privacy: .public)"
+            )
+            return []
+        }
+        func key(_ uuid: UUID) -> String { uuid.uuidString.lowercased() }
+        return groups.compactMap { group in
+            let state: String
+            let detail: String
+            let anchor: BotGroupTurn?
+            switch group.attentionState {
+            case .none:
+                return nil
+            case .working:
+                state = "working"
+                detail = "Bots are answering"
+                anchor = (try? store.listGroupTurns(
+                    groupID: group.id,
+                    states: BotGroupTurn.State.pending + [.running]
+                ))?.first
+            case .needsAttention:
+                state = "needs_attention"
+                detail = "A bot could not answer"
+                anchor = (try? store.latestGroupTurn(groupID: group.id, states: [.failed, .interrupted])) ?? nil
+            case .unreadActivity:
+                state = "finished"
+                detail = "New replies"
+                anchor = (try? store.latestGroupTurn(groupID: group.id, states: [.completed])) ?? nil
+            }
+            guard let anchor else { return nil }
+            return canonicalAttentionItem([
+                "id": key(anchor.id.value),
+                "kind": "group",
+                "group_id": key(group.id.value),
+                "thread_id": key(group.roomThreadID.value),
+                "turn_id": key(anchor.id.value),
+                "bot_id": key(anchor.botID.value),
+                "run_id": anchor.memberRunID.map { key($0.value) as Any } ?? NSNull(),
+                "state": state,
+                "title": group.title,
+                "detail": detail,
+                "source": "bot_group",
+                "ownership": "primary",
+                "primary": true,
+                "delegated": false,
+                "created_at": anchor.createdAt.timeIntervalSince1970,
+                "updated_at": group.updatedAt.timeIntervalSince1970,
+                "finished_at": state == "working" ? NSNull() : anchor.updatedAt.timeIntervalSince1970 as Any,
+            ], hostID: hostID)
+        }
     }
 
     private func validatedDelegatedAttention(_ raw: [String: Any]) throws -> [String: Any] {
@@ -537,6 +638,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             } else if let threadID = conversation.linkedAgentThreadID {
                 row["linked_agent_thread_id"] = threadID.value.uuidString.lowercased()
             }
+            if let routing = onConversationRouting?(conversation) {
+                row["desk_routing"] = routing
+            }
             return row
         }
         return [
@@ -582,13 +686,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         let botID = id(bot)
         let hostID = try requireGuestHost(params)
+        var state: [String: Any]
         if let existing = guest[botID] {
             guard existing["host_id"] as? String == hostID else { throw Error.guestConflict }
-            return existing
+            state = existing
+        } else {
+            state = makeStoppedGuestState(botID: botID, hostID: hostID)
+            guest[botID] = state
+            persistSidecar()
         }
-        let state = makeStoppedGuestState(botID: botID, hostID: hostID)
-        guest[botID] = state
-        persistSidecar()
+        // Live, never stored: control is in-memory and a relaunch hands it back to the bot.
+        state["controlled_by_user"] = computerControl.isControlledByUser(bot.id)
         return state
     }
 
@@ -715,6 +823,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try linkOpen(params: params, requestID: requestID)
         case "guest.input", "guest.start", "guest.stop", "guest.rebuild", "guest.revoke":
             return try guestCommand(name: name, params: params, requestID: requestID)
+        case "guest.control":
+            return try guestControl(params: params, requestID: requestID)
         case "docker.clear":
             return try dockerClear(params: params, requestID: requestID)
         case "notify.set":
@@ -806,6 +916,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     ) throws -> [String: Any] {
         let botID = id(bot)
         let quarantined = quarantineBotState(botID: botID)
+        // A Docker bot's container is also started by its runs (desk and
+        // group turns), not only by `bot.guest.start`, so the remote guest
+        // state alone does not say whether one exists.
+        let ownsGuestRuntime = quarantined.guest != nil
+            || ((try? bot.currentRevisionID.flatMap { try store.getRevision(id: $0) }) ?? nil)?
+                .desktopKind == .dockerDesktop
         do {
             try store.delete(id: bot.id, now: now)
         } catch {
@@ -814,12 +930,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         try? store.deleteQueuedFollowUps(botID: bot.id)
         BotComputerControl.shared.forget(bot.id)
-        do { try ManualActionRequestStore(appSupportDirectory: appSupport).closeAll(botID: bot.id) } catch {
+        do {
+            // Another store instance: the router's re-reads the file it replaced.
+            try ManualActionRequestStore(appSupportDirectory: appSupport).closeAll(botID: bot.id)
+                .forEach(ManualActionRequestStore.postStateChanged)
+        } catch {
             NSLog("RemoteCode: manual actions of deleted bot could not be closed: \(error)")
         }
 
         var residuals: [String] = []
-        if quarantined.guest != nil {
+        if ownsGuestRuntime {
             if let onDockerClear {
                 do {
                     try onDockerClear(bot.id)
@@ -1012,7 +1132,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                   let stored = try store.conversation(id: BotConversationID(uuid)) else {
                 throw Error.conversationGone
             }
-            guard stored.botID == bot.id else { throw Error.crossTarget }
+            // Group member conversations are reached only through the group RPCs.
+            guard stored.botID == bot.id, stored.groupID == nil else { throw Error.crossTarget }
             conversation = stored.id
         } else {
             conversation = nil
@@ -1070,7 +1191,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             if let conversationID = requestedConversationID ?? selectedConversation[botID] {
                 payload["conversation_id"] = conversationID
             }
-            payload["routing"] = routing
+            if let routing { payload["routing"] = routing }
             payload["client_request_id"] = requestID
             let payloadJSON = jsonString(payload) ?? "{}"
             let stored = try store.enqueueQueuedFollowUp(
@@ -1083,7 +1204,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 )
             )
             consumeAttachments(attachmentIDs)
-            if let routingReceiptID = routing["routing_receipt_id"] as? String {
+            if let routingReceiptID = routing?["routing_receipt_id"] as? String {
                 consumedRoutingReceipts.insert(routingReceiptID)
             }
             let conversationID = requestedConversationID ?? selectedConversation[botID]
@@ -1098,8 +1219,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     "enqueued": true,
                     "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
                     "id": stored.id,
-                    "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
-                    "effective_routing": routing,
+                    "routing_receipt_id": routing?["routing_receipt_id"] ?? NSNull(),
+                    "effective_routing": routing ?? NSNull(),
                 ]
             )
         }
@@ -1130,6 +1251,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             ]
         }
         consumeAttachments(attachmentIDs)
+        // The route that ran: the host's resolved route over the stored
+        // receipt route, so a receipt-bound send keeps `routing_receipt_id`,
+        // `host_id` and `bot_id` and both paths report one shape.
+        let ranRouting = authoritativeSend["effective_routing"] as? [String: Any]
+        let effectiveRouting: Any
+        if let routing {
+            effectiveRouting = routing.merging(ranRouting ?? [:]) { _, ran in ran }
+        } else {
+            effectiveRouting = ranRouting ?? NSNull()
+        }
         let runID = authoritativeSend["run_id"] as? String
             ?? UUID().uuidString.lowercased()
         let conversationID = authoritativeSend["conversation_id"] as? String
@@ -1149,8 +1280,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                     "enqueued": true,
                     "id": authoritativeSend["id"] ?? NSNull(),
                     "queue": encodeQueue(try store.listQueuedFollowUps(botID: bot.id)),
-                    "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
-                    "effective_routing": routing,
+                    "routing_receipt_id": routing?["routing_receipt_id"] ?? NSNull(),
+                    "effective_routing": effectiveRouting,
                 ]
             )
         }
@@ -1164,7 +1295,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "started_at": now.timeIntervalSince1970,
             "run_id": runID,
             "conversation_id": conversationID ?? NSNull(),
-            "routing": routing,
+            "routing": effectiveRouting,
         ]
         if let threadID = authoritativeSend["thread_id"] as? String, !threadID.isEmpty {
             liveRun["thread_id"] = threadID
@@ -1184,7 +1315,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "detail": text,
             "source": "bot",
         ], hostID: string(params, "host_id"))
-        if let routingReceiptID = routing["routing_receipt_id"] as? String {
+        if let routingReceiptID = routing?["routing_receipt_id"] as? String {
             consumedRoutingReceipts.insert(routingReceiptID)
         }
         return runtimeReceipt(
@@ -1197,8 +1328,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 "enqueued": false,
                 "run": liveRuns[botID] as Any,
                 "workspace": NSNull(),
-                "routing_receipt_id": routing["routing_receipt_id"] ?? NSNull(),
-                "effective_routing": routing,
+                "routing_receipt_id": routing?["routing_receipt_id"] ?? NSNull(),
+                "effective_routing": effectiveRouting,
             ]
         )
     }
@@ -1373,7 +1504,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let conversationID = string(params, "conversation_id") ?? ""
         guard let uuid = UUID(uuidString: conversationID),
               let conversation = try store.conversation(id: BotConversationID(uuid)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         let normalizedID = conversation.id.value.uuidString.lowercased()
         selectedConversation[id(bot)] = normalizedID
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
@@ -1582,7 +1713,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
               let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         guard let attachmentID = string(params, "attachment_id"), !attachmentID.isEmpty,
               let filename = string(params, "filename"), !filename.isEmpty,
               let rawKind = string(params, "kind"), AgentAttachmentKind(rawValue: rawKind) != nil,
@@ -1608,7 +1739,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
               let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         let hostID = try requireFileHost(params: params, botID: id(bot))
         let rootHandle = string(params, "root_handle") ?? ""
         let handle = string(params, "handle") ?? ""
@@ -1687,7 +1818,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
               let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         let botID = id(bot)
         let conversationID = conversation.id.value.uuidString.lowercased()
         let rows = attachments.values.filter {
@@ -1709,7 +1840,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let conversationRaw = string(params, "conversation_id"),
               let conversationUUID = UUID(uuidString: conversationRaw),
               let conversation = try store.conversation(id: BotConversationID(conversationUUID)) else { throw Error.conversationGone }
-        guard conversation.botID == bot.id else { throw Error.crossTarget }
+        guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
         let conversationID = conversation.id.value.uuidString.lowercased()
         let grantID = string(params, "id") ?? ""
         guard let grant = attachments[grantID],
@@ -2259,6 +2390,194 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return receipt(requestID: requestID, status: receiptStatus, botID: botID, readback: state)
     }
 
+    /// `bot.guest.control`: the paired user takes the bot's computer (the bot's
+    /// act and exec steps are refused while they drive) or hands it back.
+    /// Release does not answer an open manual action; `agent.manual_action.resolve` does.
+    private func guestControl(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        let botID = id(bot)
+        let hostID = try requireGuestHost(params)
+        let take: Bool
+        switch string(params, "action") {
+        case "take": take = true
+        case "release": take = false
+        default: throw Error.invalidParams
+        }
+        if guest[botID] == nil {
+            guest[botID] = makeStoppedGuestState(botID: botID, hostID: hostID)
+        }
+        guard var readback = guest[botID], readback["host_id"] as? String == hostID else {
+            throw Error.guestConflict
+        }
+        if take {
+            computerControl.take(bot.id)
+        } else {
+            computerControl.release(bot.id)
+        }
+        onGuestControlChanged?(bot.id, take)
+        // The receipt is stored and replayed: no screenshot in it (bot.guest.state serves the frame).
+        readback["frame"] = nil
+        readback["controlled_by_user"] = computerControl.isControlledByUser(bot.id)
+        readback["control_action"] = take ? "take" : "release"
+        return receipt(requestID: requestID, status: .completed, botID: botID, readback: readback)
+    }
+
+    // MARK: - Guest observe (paired live viewer)
+
+    /// A frame captured for a paired viewer (`bot.guest.state` with `observe: true`).
+    public struct ObservedGuestFrame: Sendable, Equatable {
+        public let containerID: String
+        public let viewerPath: String
+        public let pixelWidth: Int
+        public let pixelHeight: Int
+        public let pngBase64: String
+        public let pngHash: String
+
+        public init(
+            containerID: String,
+            viewerPath: String,
+            pixelWidth: Int,
+            pixelHeight: Int,
+            pngBase64: String,
+            pngHash: String
+        ) {
+            self.containerID = containerID
+            self.viewerPath = viewerPath
+            self.pixelWidth = pixelWidth
+            self.pixelHeight = pixelHeight
+            self.pngBase64 = pngBase64
+            self.pngHash = pngHash
+        }
+    }
+
+    public enum GuestObserveTarget: Equatable, Sendable {
+        /// Running on this runtime grant and showing `frameID` (nil before the first frame).
+        case running(grantID: String, frameID: String?)
+        /// Not running here: if Docker runs the bot's container, a client may
+        /// adopt it with `bot.guest.start` (observe itself never mints a grant).
+        case adoptable
+        /// Starting, stopping, revoked or never read by this host: nothing to capture.
+        case unavailable
+    }
+
+    private static let adoptableGuestStatuses: Set<String> = ["stopped", "failed", "reconnect_required"]
+
+    public func guestObserveTarget(botID: BotID, hostID: String) -> GuestObserveTarget {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let state = guest[botID.value.uuidString.lowercased()],
+              state["host_id"] as? String == hostID,
+              let status = state["status"] as? String else { return .unavailable }
+        if status == "running" {
+            guard state["grant_invalidated"] as? Bool == false,
+                  let grantID = (state["runtime"] as? [String: Any])?["grant_id"] as? String else {
+                return .unavailable
+            }
+            return .running(grantID: grantID, frameID: (state["frame"] as? [String: Any])?["frame_id"] as? String)
+        }
+        return Self.adoptableGuestStatuses.contains(status) ? .adoptable : .unavailable
+    }
+
+    /// Stores a frame captured for an observing viewer. Latest wins: the frame
+    /// is dropped unless the guest still runs on `grantID` and still shows
+    /// `expectedFrameID`. Kept in memory only (a relaunch invalidates grants).
+    @discardableResult
+    public func applyObservedGuestFrame(
+        botID: BotID,
+        grantID: String,
+        expectedFrameID: String?,
+        frame observed: ObservedGuestFrame
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = botID.value.uuidString.lowercased()
+        guard var state = guest[key],
+              state["status"] as? String == "running",
+              state["grant_invalidated"] as? Bool == false,
+              var runtime = state["runtime"] as? [String: Any],
+              runtime["grant_id"] as? String == grantID else { return false }
+        let previous = state["frame"] as? [String: Any]
+        let previousID = previous?["frame_id"] as? String
+        guard previousID == expectedFrameID else { return false }
+        runtime["container_id"] = observed.containerID
+        runtime["viewer_path"] = observed.viewerPath
+        let frameID = UUID().uuidString.lowercased()
+        state["runtime"] = runtime
+        state["frame"] = [
+            "runtime": runtime,
+            "frame_id": frameID,
+            "sequence": (previous?["sequence"] as? Int ?? -1) + 1,
+            "pixel_width": observed.pixelWidth,
+            "pixel_height": observed.pixelHeight,
+            "png_base64": observed.pngBase64,
+            "png_hash": observed.pngHash,
+        ]
+        state["before_frame_id"] = previousID
+        state["after_frame_id"] = frameID
+        if let previousID,
+           let width = previous?["pixel_width"] as? Int,
+           let height = previous?["pixel_height"] as? Int {
+            var recent = guestRecentFrames[key]
+            if recent?.grantID != grantID { recent = (grantID, []) }
+            recent?.frames.append(RecentGuestFrame(id: previousID, width: width, height: height))
+            if let kept = recent?.frames.suffix(Self.recentObservedFrameLimit) {
+                recent?.frames = Array(kept)
+            }
+            guestRecentFrames[key] = recent
+        }
+        guest[key] = state
+        return true
+    }
+
+    /// The container the viewer watched is gone: the grant ends as `stopped`.
+    @discardableResult
+    public func markObservedGuestStopped(botID: BotID, grantID: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = botID.value.uuidString.lowercased()
+        guard var state = guest[key],
+              state["status"] as? String == "running",
+              (state["runtime"] as? [String: Any])?["grant_id"] as? String == grantID else { return false }
+        invalidateGuestGrant(state: &state, status: "stopped")
+        guest[key] = state
+        persistSidecar()
+        return true
+    }
+
+    /// The paired host binding of the bot's guest state, nil before any client read it.
+    public func guestHostID(botID: BotID) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return guest[botID.value.uuidString.lowercased()]?["host_id"] as? String
+    }
+
+    /// Frames a viewer saw a moment ago stay valid input targets: at 1-2 fps an
+    /// observe can replace the frame between the user's tap and its arrival.
+    private static let recentObservedFrameLimit = 4
+
+    private struct RecentGuestFrame {
+        let id: String
+        let width: Int
+        let height: Int
+    }
+
+    /// Only a recent frame of the current frame's size: input coordinates are
+    /// in the named frame's pixels and run on the screen as it is now.
+    private func isRecentObservedFrame(
+        _ frameID: String?,
+        state: [String: Any],
+        width: Int,
+        height: Int
+    ) -> Bool {
+        guard let frameID,
+              let botID = state["bot_id"] as? String,
+              let grantID = (state["runtime"] as? [String: Any])?["grant_id"] as? String,
+              let recent = guestRecentFrames[botID],
+              recent.grantID == grantID,
+              let named = recent.frames.last(where: { $0.id == frameID }) else { return false }
+        return named.width == width && named.height == height
+    }
+
     private func requireGuestHost(_ params: [String: Any]) throws -> String {
         let hostID = string(params, "host_id")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !hostID.isEmpty, hostID.count <= 256 else { throw Error.guestConflict }
@@ -2384,11 +2703,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         state: [String: Any]
     ) throws {
         try requireGuestRuntime(params: params, state: state)
+        let beforeFrameID = string(params, "before_frame_id")
         guard let frame = state["frame"] as? [String: Any],
               let frameID = frame["frame_id"] as? String,
-              frameID == string(params, "before_frame_id"),
               let width = frame["pixel_width"] as? Int,
               let height = frame["pixel_height"] as? Int,
+              frameID == beforeFrameID
+                || isRecentObservedFrame(beforeFrameID, state: state, width: width, height: height),
               let input = params["input"] as? [String: Any],
               let kind = input["kind"] as? String,
               kind == task["axis"] as? String else { throw Error.guestConflict }
@@ -2617,12 +2938,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func routingSet(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
-        let provider = string(params, "provider") ?? "grok"
+        let provider = string(params, "provider") ?? AgentProvider.defaultProvider.rawValue
         let providerInstanceID = string(params, "provider_instance_id") ?? provider
         let routingReceiptID = UUID().uuidString.lowercased()
         let runAsUser = params["run_as_user"] ?? Self.runAsUserObject(AgentRunAsUser.current())
         var pref: [String: Any] = [
-            "provider": string(params, "provider") ?? "grok",
+            "provider": provider,
             "provider_instance_id": providerInstanceID,
             "model": string(params, "model") ?? "",
             "routing_mode": string(params, "routing_mode") ?? "auto",
@@ -2634,6 +2955,30 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "host_id": string(params, "host_id") ?? "",
             "bot_id": id(bot),
         ]
+        for key in Self.workerRoutingKeys where params[key] != nil {
+            guard let value = string(params, key) else { throw Error.invalidParams }
+            if key != "worker_model", value != "auto", AgentReasoningEffort(rawValue: value) == nil {
+                throw Error.invalidParams
+            }
+            pref[key] = value
+        }
+        if let rawConversationID = string(params, "conversation_id") {
+            guard let uuid = UUID(uuidString: rawConversationID),
+                  let conversation = try store.conversation(id: BotConversationID(uuid)) else {
+                throw Error.conversationGone
+            }
+            guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
+            pref["conversation_id"] = conversation.id.value.uuidString.lowercased()
+            if let onConversationRoutingSet {
+                // The receipt is the resolved desk route (an empty Main
+                // resolves like the Mac desk), so the device echoes and the
+                // send runs exactly this route. Receipt keys stay.
+                let resolved = try onConversationRoutingSet(bot.id, conversation.id, pref)
+                for key in ["model"] + Self.workerRoutingKeys {
+                    if let value = resolved[key] { pref[key] = value }
+                }
+            }
+        }
         pref["effective"] = pref
         routingPref[id(bot)] = pref
         return receipt(
@@ -2644,6 +2989,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             receiptID: routingReceiptID
         )
     }
+
+    /// Optional Distill Worker/effort route fields, shared by `bot.routing.set`
+    /// and the receipt check in `bot.send`.
+    private static let workerRoutingKeys = ["worker_model", "worker_effort", "distill_main_effort"]
 
     private func attentionAck(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
@@ -2903,50 +3252,15 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return exactReceipt
     }
 
+    /// Nil without a routing receipt: the host runs the conversation's own
+    /// desk route. A receipt pins the exact route `bot.routing.set` admitted.
     private func effectiveRouting(
         botID: String,
         params: [String: Any]
-    ) throws -> [String: Any] {
-        let requestedReceipt = string(params, "routing_receipt_id")
-        // 1.1: fallback must come from the Bot's published revision when
-        // available, not a hardcoded grok constant — otherwise a claude/opus
-        // Bot runs as grok-4.6 when the mirror omits routing.
-        let publishedRoutingFallback: [String: Any]? = {
-            guard let uuid = UUID(uuidString: botID),
-                  let bot = try? store.get(id: BotID(uuid)),
-                  let revID = bot.currentRevisionID,
-                  let rev = try? store.getRevision(id: revID) else { return nil }
-            // Current BotRevision no longer carries provider/model; keep the
-            // permission/desktop as contextual fallback and defer provider to
-            // the desk's frozen routing when possible. The hard grok default
-            // remains only when no revision context exists at all.
-            return [
-                "provider": "grok",
-                "provider_instance_id": "grok",
-                "model": "",
-                "routing_mode": "auto",
-                "permission_mode": rev.permissionMode.rawValue,
-                "reasoning_effort": "medium",
-                "service_tier": "auto",
-                "run_as_user": Self.runAsUserObject(AgentRunAsUser.current()),
-                "host_id": string(params, "host_id") ?? "",
-                "bot_id": botID,
-            ]
-        }()
-        var routing = routingPref[botID] ?? publishedRoutingFallback ?? [
-            "provider": "grok",
-            "provider_instance_id": "grok",
-            "model": "",
-            "routing_mode": "auto",
-            "permission_mode": "supervised",
-            "reasoning_effort": "medium",
-            "service_tier": "auto",
-            "run_as_user": Self.runAsUserObject(AgentRunAsUser.current()),
-            "host_id": string(params, "host_id") ?? "",
-            "bot_id": botID,
-        ]
-        guard let requestedReceipt else { return routing }
-        guard !requestedReceipt.isEmpty,
+    ) throws -> [String: Any]? {
+        guard let requestedReceipt = string(params, "routing_receipt_id") else { return nil }
+        guard var routing = routingPref[botID],
+              !requestedReceipt.isEmpty,
               !consumedRoutingReceipts.contains(requestedReceipt),
               routing["routing_receipt_id"] as? String == requestedReceipt,
               routing["host_id"] as? String == string(params, "host_id"),
@@ -2961,6 +3275,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                   requested == routing[key] as? String else {
                 throw Error.crossTarget
             }
+        }
+        for key in Self.workerRoutingKeys where routing[key] != nil || params[key] != nil {
+            guard params[key] as? String == routing[key] as? String else { throw Error.crossTarget }
+        }
+        if let scoped = routing["conversation_id"] as? String,
+           string(params, "conversation_id") != scoped {
+            throw Error.crossTarget
         }
         if let requestedRunAs = params["run_as_user"],
            !Self.jsonObjectsEqual(requestedRunAs, routing["run_as_user"]) {

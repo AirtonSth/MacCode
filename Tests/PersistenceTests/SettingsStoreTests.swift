@@ -46,9 +46,6 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(d.insomniaAllowDisplaySleep)
         XCTAssertFalse(d.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertTrue(d.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
-        XCTAssertFalse(d.tokenSaverEnabled)
-        XCTAssertTrue(d.graphifyEnabled, "Graphify must default ON so Agent App indexes without user opt-in")
-        XCTAssertFalse(d.graphifyWriteInRepo, "Graphs must default to App Support only (no repo pollution)")
         XCTAssertEqual(d.terminalFontSize, 0)
         XCTAssertTrue(d.petEnabled, "a fresh install must show the pet without requiring setup")
         XCTAssertTrue(d.petAnimationsEnabled)
@@ -77,7 +74,6 @@ final class SettingsStoreTests: XCTestCase {
             insomniaAllowDisplaySleep: false,
             insomniaAllowSystemSleepWhenDisplayClosed: true,
             insomniaAllowScreenSaverAfter45MinutesOfInactivity: false,
-            tokenSaverEnabled: true,
             terminalFontSize: 16,
             petEnabled: true,
             petAnimationsEnabled: false,
@@ -94,7 +90,6 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(r.insomniaAllowDisplaySleep)
         XCTAssertTrue(r.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertFalse(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
-        XCTAssertTrue(r.tokenSaverEnabled)
         XCTAssertEqual(r.terminalFontSize, 16, "terminalFontSize must round-trip so new terminals keep the chosen base font")
         XCTAssertTrue(r.petEnabled)
         XCTAssertFalse(r.petAnimationsEnabled)
@@ -107,13 +102,49 @@ final class SettingsStoreTests: XCTestCase {
 
     func test_updatePreservesOtherFields() throws {
         let (s, _) = try store()
-        s.save(AppSettings(diffWordWrap: true, diffIgnoreWhitespace: false, sidebarSort: "created", tokenSaverEnabled: true))
+        s.save(AppSettings(diffWordWrap: true, diffIgnoreWhitespace: false, sidebarSort: "created", terminalFontSize: 14))
         s.update { $0.diffIgnoreWhitespace = true }
         let r = s.load()
         XCTAssertTrue(r.diffIgnoreWhitespace, "the updated field changes")
         XCTAssertTrue(r.diffWordWrap, "siblings must survive a partial update")
         XCTAssertEqual(r.sidebarSort, "created")
-        XCTAssertTrue(r.tokenSaverEnabled, "Token Saver enablement must survive unrelated settings updates")
+        XCTAssertEqual(r.terminalFontSize, 14, "unrelated fields must survive a partial update")
+    }
+
+    func test_blobWithRemovedTokenSaverKeysStillLoadsTheOtherSettings() throws {
+        // WHY: blobs written while Token Saver existed carry its keys. They must
+        // still load, or every upgraded user would fall back to defaults.
+        let (s, db) = try store()
+        try SettingsRepository(db: db).set(
+            "app_settings",
+            #"{"diffWordWrap":true,"tokenSaverEnabled":true,"tokenSaverAPIToken":"sk-legacy","tokenSaverModelSource":"api","graphifyPinnedRoots":["/r"],"terminalFontSize":13}"#
+        )
+        let r = s.load()
+        XCTAssertTrue(r.diffWordWrap)
+        XCTAssertEqual(r.terminalFontSize, 13)
+    }
+
+    func test_dropRemovedLegacyKeysRewritesTheBlobOnlyWhenThoseKeysArePresent() throws {
+        // WHY: the old Token Saver API token is a secret for a feature that no
+        // longer exists. Nothing else rewrites the blob, so the cleanup must,
+        // without touching the user's other settings.
+        let (s, db) = try store()
+        let repo = SettingsRepository(db: db)
+        try repo.set(
+            "app_settings",
+            #"{"sidebarSort":"manual","tokenSaverEnabled":true,"tokenSaverAPIToken":"sk-legacy","sessionLearnEnabled":true,"graphifyEnabled":true}"#
+        )
+
+        XCTAssertTrue(s.dropRemovedLegacyKeys())
+        let stored = try XCTUnwrap(repo.get("app_settings"))
+        for key in SettingsStore.removedLegacyKeys {
+            XCTAssertFalse(stored.contains("\"\(key)\""), key)
+        }
+        XCTAssertFalse(stored.contains("sk-legacy"))
+        XCTAssertEqual(s.reload().sidebarSort, "manual")
+
+        XCTAssertFalse(s.dropRemovedLegacyKeys(), "a clean blob is not rewritten")
+        XCTAssertEqual(try repo.get("app_settings"), stored)
     }
 
     func test_olderBlobWithoutInsomniaFieldsKeepsExistingSettings() throws {
@@ -126,7 +157,6 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(r.insomniaAllowDisplaySleep)
         XCTAssertFalse(r.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertTrue(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
-        XCTAssertFalse(r.tokenSaverEnabled)
         XCTAssertEqual(r.terminalFontSize, 0, "older settings blobs must default terminal font size to Ghostty default")
         XCTAssertTrue(r.petEnabled, "settings created before the pet existed must receive the current pet default")
         XCTAssertTrue(r.petAnimationsEnabled)

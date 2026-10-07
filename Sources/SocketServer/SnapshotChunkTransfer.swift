@@ -16,12 +16,15 @@ public enum SnapshotChunkSizePolicy {
     public static let minimumBytes = 8_192
     public static let maximumBytes = 256 * 1_024
     public static let defaultBytes = 64 * 1_024
-    /// Hard ceiling on assembled frame bytes (matches transport frame limit).
-    public static let maximumTotalBytes = ConnectionTransportFrame.maximumEncodedBytes
+    /// Hard ceiling on assembled frame bytes. Four times the single-frame
+    /// transport limit: chunks are separate HTTP responses, so a host with
+    /// many threads is not cut off at 1 MiB. Clients still enforce their own
+    /// ceiling on the manifest.
+    public static let maximumTotalBytes = 4 * ConnectionTransportFrame.maximumEncodedBytes
     public static let maximumChunkCount = 128
     /// Process-wide cache budget so concurrent transfers cannot unbounded-grow.
     public static let maximumCachedTransfers = 8
-    public static let maximumCachedBytes = 8 * 1_024 * 1_024
+    public static let maximumCachedBytes = 16 * 1_024 * 1_024
     public static let defaultTTLNanoseconds: UInt64 = 120_000_000_000
     /// Mirrors client adaptive step sizes so host negotiation stays aligned.
     public static let increaseStepBytes = 16 * 1_024
@@ -298,7 +301,13 @@ public final class SnapshotChunkTransferCache: @unchecked Sendable {
               frameBytes.count <= SnapshotChunkSizePolicy.maximumTotalBytes else {
             throw SnapshotChunkTransferFailure.payloadTooLarge
         }
-        let chunkBytes = SnapshotChunkSizePolicy.negotiate(preferredChunkBytes: preferredChunkBytes)
+        // A frame above maximumChunkCount x the preferred size gets bigger
+        // chunks instead of failing (at most 4 MiB / 128 = 32 KiB per chunk).
+        let chunkBytes = max(
+            SnapshotChunkSizePolicy.negotiate(preferredChunkBytes: preferredChunkBytes),
+            (frameBytes.count + SnapshotChunkSizePolicy.maximumChunkCount - 1)
+                / SnapshotChunkSizePolicy.maximumChunkCount
+        )
         let chunks = SnapshotChunkCodec.split(frameBytes, chunkBytes: chunkBytes)
         guard chunks.count <= SnapshotChunkSizePolicy.maximumChunkCount else {
             throw SnapshotChunkTransferFailure.payloadTooLarge

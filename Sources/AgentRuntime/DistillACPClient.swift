@@ -6,7 +6,9 @@ public enum DistillACPError: Error, CustomStringConvertible {
     case missingBinary(String)
     case spawnFailed(String)
     case invalidJSON(String)
-    case rpcError(code: Int?, message: String)
+    /// `detail` / `httpStatus` come from JSON-RPC `error.data`, where the peer puts
+    /// the provider's real failure behind a generic `-32603 Internal error`.
+    case rpcError(code: Int?, message: String, detail: String? = nil, httpStatus: Int? = nil)
     case processExited(reason: Process.TerminationReason, status: Int32, stderrTail: String)
     case responseTypeMismatch(String)
     case unsupported(String)
@@ -17,7 +19,8 @@ public enum DistillACPError: Error, CustomStringConvertible {
         case .missingBinary(let binary): return "Distill ACP binary not found: \(binary)"
         case .spawnFailed(let message): return "Failed to spawn Distill ACP: \(message)"
         case .invalidJSON(let line): return "Distill ACP emitted invalid JSON: \(line)"
-        case .rpcError(_, let message): return "Distill ACP RPC error: \(message)"
+        case .rpcError(_, let message, let detail, _):
+            return "Distill ACP RPC error: \(ACPRPCErrorPayload.describe(message: message, detail: detail))"
         case .processExited(let reason, let status, let stderr):
             let suffix = stderr.isEmpty ? "" : ": \(stderr)"
             return "Distill ACP process exited (\(reason == .exit ? "exit" : "signal") \(status))\(suffix)"
@@ -40,6 +43,11 @@ enum DistillACPFailureCategory: String, Sendable {
     case network
     case timeout
     case invalidResume
+    /// The provider rejected the session's own history (e.g. unsigned reasoning
+    /// from another model family replayed to Anthropic as a `thinking` block).
+    /// Re-sending into the same Distill session fails identically, so the
+    /// adapter retires it and the next turn opens a fresh session.
+    case incompatibleHistory
     case nonRecoverable
 }
 
@@ -57,6 +65,13 @@ enum DistillACPFailureTaxonomy {
     static let networkMarker = "[retryable:network]"
     static let timeoutMarker = "[retryable:timeout]"
     static let invalidResumeMarker = "[start-fresh:invalid-resume]"
+    /// Retry is safe because the adapter replaces the poisoned session; the
+    /// thread (and any bot desk link) is kept.
+    static let incompatibleHistoryMarker = "[fresh-session:incompatible-history]"
+    static let incompatibleHistoryMarkers = [
+        "invalid `signature` in `thinking` block", "invalid signature in thinking block",
+        "encrypted_content", "history is incompatible", "history incompatible"
+    ]
 
     static func normalize(_ error: Error, context: DistillACPFailureContext) -> DistillACPFailure {
         if let failure = error as? DistillACPFailure { return failure }
@@ -90,6 +105,8 @@ enum DistillACPFailureTaxonomy {
             prefix = "\(timeoutMarker) Distill request timed out"
         case .invalidResume:
             prefix = "\(invalidResumeMarker) Distill invalid resume"
+        case .incompatibleHistory:
+            prefix = "\(incompatibleHistoryMarker) The model rejected this Distill session's history; Retry starts a new Distill session"
         case .nonRecoverable:
             prefix = "Distill ACP failure"
         }
@@ -104,10 +121,17 @@ enum DistillACPFailureTaxonomy {
             switch error {
             case .requestTimedOut:
                 return .timeout
-            case .rpcError(let code, let message):
-                if code == 401 || code == 403 { return .authRequired }
-                if code == 429 { return .rateLimited }
-                return category(forDiagnostic: message, context: context)
+            case .rpcError(let code, let message, let detail, let httpStatus):
+                // The JSON-RPC code is -32603 for every provider failure; the
+                // provider's HTTP status rides in error.data.http_status.
+                for status in [httpStatus, code].compactMap({ $0 }) {
+                    if status == 401 || status == 403 { return .authRequired }
+                    if status == 429 { return .rateLimited }
+                }
+                return category(
+                    forDiagnostic: ACPRPCErrorPayload.describe(message: message, detail: detail),
+                    context: context
+                )
             default:
                 break
             }
@@ -120,11 +144,13 @@ enum DistillACPFailureTaxonomy {
         context: DistillACPFailureContext
     ) -> DistillACPFailureCategory {
         let normalized = diagnostic.lowercased()
+        if normalized.contains(incompatibleHistoryMarker) { return .incompatibleHistory }
         if normalized.contains(invalidResumeMarker) { return .invalidResume }
         if normalized.contains(authRequiredMarker) { return .authRequired }
         if normalized.contains(rateLimitedMarker) { return .rateLimited }
         if normalized.contains(timeoutMarker) { return .timeout }
         if normalized.contains(networkMarker) { return .network }
+        if incompatibleHistoryMarkers.contains(where: normalized.contains) { return .incompatibleHistory }
         let invalidResumeMarkers = [
             "invalid resume", "invalid_resume", "invalid-resume", "resume invalid",
             "resume is invalid", "resume cursor", "failed to resume",
@@ -419,8 +445,15 @@ struct DistillACPSessionOpenResult {
 
     /// Live catalog efforts for one model; the static policy only knows a few ids.
     func catalogEfforts(for modelId: String?) -> [AgentReasoningEffort] {
-        let id = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return models.first { $0.id == id }?.supportedReasoningEfforts ?? []
+        DistillACPClient.advertisedEfforts(
+            for: modelId,
+            catalog: Dictionary(
+                models.map { ($0.id, $0.supportedReasoningEfforts) },
+                uniquingKeysWith: { first, _ in first }
+            ),
+            currentModelId: currentModelId,
+            currentModelEfforts: advertisedReasoningEffortIds.compactMap(AgentReasoningEffort.init(rawValue:))
+        )
     }
 
     /// True when session/new|load advertised a selectable `reasoning_effort` option.
@@ -515,8 +548,13 @@ public final class DistillACPClient: @unchecked Sendable {
     private var pending: [Int: Pending] = [:]
     private var stderrBuffer = Data()
     private var stopped = false
+    /// Set on `writeQueue` once stdin is closed; later writes fail instead of
+    /// reaching a descriptor number the system may have reused.
+    private var inputClosed = false
     private let foreignUserUID: uid_t?
     private let mcpEnvironment: [String: String]
+    /// Set when this client drives an in-guest run through `docker exec`.
+    private let guest: DistillGuestLaunchPlan?
     private static let stderrLimit = 8_192
 
     public var notificationHandler: NotificationHandler?
@@ -581,7 +619,7 @@ public final class DistillACPClient: @unchecked Sendable {
         ]
     }
 
-    public init(
+    public convenience init(
         binary: String = DistillProvisioner.binaryName,
         cwd: String,
         environment: [String: String] = [:],
@@ -598,24 +636,71 @@ public final class DistillACPClient: @unchecked Sendable {
         guard let path = ProcessLocator.resolveDistillAgentForRunAsUser(resolved, runAsUser: runAsUser) else {
             throw DistillACPError.missingBinary(resolved)
         }
-        self.notificationHandler = notificationHandler
-        self.serverRequestHandler = serverRequestHandler
-        self.foreignUserUID = runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid }
-        self.mcpEnvironment = environment
-        parseQueue.setSpecific(key: parseQueueKey, value: 1)
+        let process: Process
         do {
-            self.process = try ProviderSubprocessLauncher.makeProcess(
+            process = try ProviderSubprocessLauncher.makeProcess(
                 provider: .distill,
                 executablePath: path,
                 arguments: launchArguments,
                 currentDirectory: cwd,
-                environment: environment,
+                environment: Self.launchEnvironment(environment),
                 runAsUser: runAsUser,
                 askpassPath: askpassPath
             )
         } catch {
             throw DistillACPError.spawnFailed(error.localizedDescription)
         }
+        try self.init(
+            process: process,
+            foreignUserUID: runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid },
+            mcpEnvironment: environment,
+            guest: nil,
+            tagProcess: tagProcess,
+            notificationHandler: notificationHandler,
+            serverRequestHandler: serverRequestHandler
+        )
+    }
+
+    /// In-guest run: the child is the docker CLI (`plan.dockerArguments`), a
+    /// same-user process with the app's own environment, which the CLI needs to
+    /// reach the daemon. The run's environment is only in the env file.
+    public convenience init(
+        guest plan: DistillGuestLaunchPlan,
+        notificationHandler: NotificationHandler? = nil,
+        serverRequestHandler: ServerRequestHandler? = nil
+    ) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: plan.dockerExecutable)
+        process.arguments = plan.dockerArguments
+        process.currentDirectoryURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        process.environment = ProcessInfo.processInfo.environment
+        try self.init(
+            process: process,
+            foreignUserUID: nil,
+            mcpEnvironment: [:],
+            guest: plan,
+            tagProcess: true,
+            notificationHandler: notificationHandler,
+            serverRequestHandler: serverRequestHandler
+        )
+    }
+
+    private init(
+        process: Process,
+        foreignUserUID: uid_t?,
+        mcpEnvironment: [String: String],
+        guest: DistillGuestLaunchPlan?,
+        tagProcess: Bool,
+        notificationHandler: NotificationHandler?,
+        serverRequestHandler: ServerRequestHandler?
+    ) throws {
+        self.process = process
+        self.notificationHandler = notificationHandler
+        self.serverRequestHandler = serverRequestHandler
+        self.foreignUserUID = foreignUserUID
+        self.mcpEnvironment = mcpEnvironment
+        self.guest = guest
+        parseQueue.setSpecific(key: parseQueueKey, value: 1)
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -664,6 +749,21 @@ public final class DistillACPClient: @unchecked Sendable {
 
     deinit { stop() }
 
+    /// A bot's computer is its guest (bot-computer/-browser MCPs), not this
+    /// Mac, so a bot run must not import the user's Mac-only MCPs (cua,
+    /// cua-driver, computer-use-mcp from `~/.claude.json`, plus Cursor's).
+    /// Non-bot runs keep the user's MCPs untouched.
+    ///
+    /// Known gap: MCPs declared in `~/.distill/config.toml` (mac-use,
+    /// playwright, ...) still load on this Mac-side launch path; no env toggle
+    /// or GROK_CONFIG overlay disables them. They go away with the guest-only
+    /// DISTILL_HOME planned for in-VM execution, not a per-bot home here
+    /// (that would copy the user's provider credentials).
+    static func launchEnvironment(_ environment: [String: String]) -> [String: String] {
+        guard BotRunMCPAdmission.isBotRun(environment: environment) else { return environment }
+        return environment.merging(BotRunMCPAdmission.distillUserMCPImportOffEnvironment) { _, off in off }
+    }
+
     public static func initializeParams(clientVersion: String) -> JSONObject {
         [
             "protocolVersion": 1,
@@ -686,35 +786,36 @@ public final class DistillACPClient: @unchecked Sendable {
             ?? AgentSkillInstaller.resolveServiceBinary()?.path
             ?? ComputerUseMCPAdmit.fallbackCommand
         // Both providers use ACP's stdio MCP server format and preserve the
-        // current host-authoritative bot grants. Token Saver's librarian MCP
-        // keeps its separate admission gate.
+        // current host-authoritative bot grants.
         let withSelfConfig = BotSelfConfigMCPAdmit.admitGrokACP(
             existing: existing,
             command: resolved,
             environment: environment
         )
-        let withBrowser = BotBrowserMCPAdmit.admitGrokACP(
-            existing: withSelfConfig,
-            command: resolved,
-            environment: environment
-        )
-        let withWeb = BotWebMCPAdmit.admitGrokACP(
-            existing: withBrowser,
-            command: resolved,
-            environment: environment
-        )
-        let withDistill = DistillMCPAdmit.isEnabled(environment: environment)
-            ? DistillMCPAdmit.admitGrokACP(
+        // bot-computer/-browser/-web only work for a bot caller; a non-bot
+        // Agent App session must not be offered tools that always fail.
+        let isBotRun = BotRunMCPAdmission.isBotRun(environment: environment)
+        let withBrowser = isBotRun
+            ? BotBrowserMCPAdmit.admitGrokACP(
+                existing: withSelfConfig,
+                command: resolved,
+                environment: environment
+            )
+            : withSelfConfig
+        let withWeb = isBotRun
+            ? BotWebMCPAdmit.admitGrokACP(
+                existing: withBrowser,
+                command: resolved,
+                environment: environment
+            )
+            : withBrowser
+        let withComputer = isBotRun
+            ? BotComputerMCPAdmit.admitGrokACP(
                 existing: withWeb,
                 command: resolved,
                 environment: environment
             )
             : withWeb
-        let withComputer = BotComputerMCPAdmit.admitGrokACP(
-            existing: withDistill,
-            command: resolved,
-            environment: environment
-        )
         guard environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" else {
             return withComputer
         }
@@ -735,6 +836,19 @@ public final class DistillACPClient: @unchecked Sendable {
             return trimmed
         }
         return home
+    }
+
+    /// A guest run's cwd is a guest path (checked by the resolver against the
+    /// guest's mounts); the Mac `fileExists` fallback would turn it into the
+    /// Mac home.
+    private func sessionCwd(_ cwd: String) -> String {
+        guest?.guestCwd ?? Self.resolvedSessionCwd(cwd)
+    }
+
+    /// A guest run's MCP servers are its `config.toml` (in-guest tools and the
+    /// host gateway); the Mac stdio servers cannot run inside the guest.
+    private func sessionMCPServers() -> [Any] {
+        guest == nil ? Self.sessionMCPServers(environment: mcpEnvironment) : []
     }
 
     /// Prefix-aware sam-grok-worker admission: grok-4.5 and grok-4.6 only,
@@ -801,8 +915,8 @@ public final class DistillACPClient: @unchecked Sendable {
         let result = try await requestJSONObject(
             method: "session/new",
             params: Self.sessionOpenParams(
-                cwd: Self.resolvedSessionCwd(cwd),
-                mcpServers: Self.sessionMCPServers(environment: mcpEnvironment),
+                cwd: sessionCwd(cwd),
+                mcpServers: sessionMCPServers(),
                 yoloMode: yoloMode,
                 modelId: modelId,
                 reasoningEffort: reasoningEffort
@@ -866,8 +980,8 @@ public final class DistillACPClient: @unchecked Sendable {
         reasoningModelSelectionSupported: Bool = true
     ) async throws -> DistillACPSessionOpenResult {
         let params = Self.sessionOpenParams(
-            cwd: Self.resolvedSessionCwd(cwd),
-            mcpServers: Self.sessionMCPServers(environment: mcpEnvironment),
+            cwd: sessionCwd(cwd),
+            mcpServers: sessionMCPServers(),
             sessionId: sessionId,
             yoloMode: yoloMode,
             noReplay: noReplay,
@@ -916,6 +1030,37 @@ public final class DistillACPClient: @unchecked Sendable {
             }
         }
         return opened
+    }
+
+    /// Efforts the live session advertises for `modelId`: its catalog entry
+    /// (exact id, else the one canonical/alias match — the catalog says
+    /// `chatgpt/gpt-6-luna` while set_model acks `gpt-6-luna`), plus the
+    /// session `reasoning_effort` option when `modelId` is the session's
+    /// current model (some builds advertise efforts only there).
+    static func advertisedEfforts(
+        for modelId: String?,
+        catalog: [String: [AgentReasoningEffort]],
+        currentModelId: String?,
+        currentModelEfforts: [AgentReasoningEffort]
+    ) -> [AgentReasoningEffort] {
+        let id = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !id.isEmpty else { return [] }
+        var efforts = catalog[id] ?? {
+            let aliases = catalog.filter { modelIdsMatch($0.key, id) }
+            return aliases.count == 1 ? aliases.first?.value ?? [] : []
+        }()
+        if let currentModelId, modelIdsMatch(currentModelId, id) {
+            efforts += currentModelEfforts.filter { !efforts.contains($0) }
+        }
+        return efforts
+    }
+
+    /// Same model when equal or when one is the other's provider-qualified form.
+    static func modelIdsMatch(_ lhs: String, _ rhs: String) -> Bool {
+        let a = lhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = rhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        return a == b || a.hasSuffix("/" + b) || b.hasSuffix("/" + a)
     }
 
     /// Model-aware ACP value. Nil means the selected model does not advertise
@@ -1135,12 +1280,18 @@ public final class DistillACPClient: @unchecked Sendable {
         request: AgentRunRequest,
         capabilities: DistillACPInitializeResult,
         writePermit: AgentRunAcceptancePermit,
+        contextHandoff: String? = nil,
         beforeWrite: @escaping @Sendable () -> Void,
         onAccepted: @escaping @Sendable () throws -> Void
     ) async throws -> JSONObject {
         try await requestJSONObject(
             method: "session/prompt",
-            params: ["sessionId": sessionId, "prompt": try Self.promptBlocks(for: request, capabilities: capabilities)],
+            params: ["sessionId": sessionId, "prompt": try Self.promptBlocks(
+                for: request,
+                capabilities: capabilities,
+                contextHandoff: contextHandoff,
+                guest: guest != nil
+            )],
             timeout: nil,
             acceptancePermit: request.acceptancePermit,
             writePermit: writePermit,
@@ -1188,6 +1339,29 @@ public final class DistillACPClient: @unchecked Sendable {
                 foreignUserUID: foreignUserUID
             )
         }
+        // The guest process outlives its docker exec client.
+        if let guest {
+            Task.detached { await guest.killGuest() }
+        }
+    }
+
+    /// Ends the ACP stream with EOF and waits up to `timeout` for the process
+    /// to exit by itself. Distill then runs its normal session shutdown, which
+    /// flushes the session's durable records; `stop()` (TERM) skips it.
+    /// Returns whether the process exited in time.
+    @discardableResult
+    func closeInputAndWaitForExit(timeout: TimeInterval) async -> Bool {
+        writeQueue.sync {
+            guard !inputClosed else { return }
+            inputClosed = true
+            try? stdinPipe.fileHandleForWriting.close()
+        }
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while process.isRunning {
+            guard Date() < deadline else { return false }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return true
     }
 
     public func stopImmediatelyForAppTermination() {
@@ -1204,10 +1378,22 @@ public final class DistillACPClient: @unchecked Sendable {
                 foreignUserUID: foreignUserUID
             )
         }
+        guest?.killGuestDetached()
     }
 
-    public static func promptBlocks(for request: AgentRunRequest, capabilities: DistillACPInitializeResult) throws -> [JSONObject] {
+    /// `contextHandoff` seeds the first prompt of a replacement session with the
+    /// app's own record of the earlier conversation. It rides in its own block so
+    /// a `/command` prompt stays the first block Distill parses.
+    /// A `guest` run gets no RemoteCode host-catalog paragraph: the guest
+    /// gateway does not offer the `rc_*` tools it names.
+    public static func promptBlocks(
+        for request: AgentRunRequest,
+        capabilities: DistillACPInitializeResult,
+        contextHandoff: String? = nil,
+        guest: Bool = false
+    ) throws -> [JSONObject] {
         var blocks: [JSONObject] = []
+        let handoff = contextHandoff?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // Distill owns mode semantics natively; send human text without generic provider prose.
         let providerPrompt = request.prompt
         // Additive: background-await self-declare marker so shell-detached
@@ -1216,15 +1402,17 @@ public final class DistillACPClient: @unchecked Sendable {
         // are Claude-CLI-specific).
         let alwaysOn = BotPeerDelegation.appendingTurnContext(
             to: BackgroundAwaitContinuation.systemPromptDirective
-                + "\n\n" + BotPeerDelegation.providerDirective,
+                + "\n\n" + (guest ? BotPeerDelegation.peerDirective : BotPeerDelegation.providerDirective),
             environment: request.environment
         )
         if providerPrompt.drop(while: { $0.isWhitespace }).hasPrefix("/") {
             // Distill parses `/name args` from the FIRST text block only, so the
             // directive rides in its own following block to keep args exact.
             blocks.append(["type": "text", "text": providerPrompt])
+            if !handoff.isEmpty { blocks.append(["type": "text", "text": handoff]) }
             if !alwaysOn.isEmpty { blocks.append(["type": "text", "text": alwaysOn]) }
         } else {
+            if !handoff.isEmpty { blocks.append(["type": "text", "text": handoff]) }
             let composed = providerPrompt.isEmpty
                 ? alwaysOn
                 : providerPrompt + "\n\n" + alwaysOn
@@ -1441,9 +1629,12 @@ public final class DistillACPClient: @unchecked Sendable {
         }
         if let id = object["id"] as? Int, object["method"] as? String == nil {
             if let error = object["error"] as? JSONObject {
+                let parsed = ACPRPCErrorPayload.parse(error, defaultMessage: "Unknown Distill ACP error")
                 completePending(id: id, result: .failure(DistillACPError.rpcError(
-                    code: error["code"] as? Int,
-                    message: error["message"] as? String ?? "Unknown Distill ACP error"
+                    code: parsed.code,
+                    message: parsed.message,
+                    detail: parsed.detail,
+                    httpStatus: parsed.httpStatus
                 )))
             } else {
                 completePending(id: id, result: .success(object["result"]))
@@ -1500,6 +1691,9 @@ public final class DistillACPClient: @unchecked Sendable {
         line.append(0x0A)
         let toWrite = line
         return try writeQueue.sync {
+            guard !inputClosed else {
+                throw DistillACPError.processExited(reason: .exit, status: -1, stderrTail: "")
+            }
             guard admittedBy?() ?? true else { return false }
             try GuardedStdinWrite.write(
                 toWrite, to: stdinPipe.fileHandleForWriting, process: process,

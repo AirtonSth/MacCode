@@ -2,7 +2,7 @@ import XCTest
 @testable import AgentRuntime
 
 final class RemoteCodeOrchestrateInstallTests: XCTestCase {
-    func testWorkerPromptContractProtectsSkillContentAndOrdinaryDistillOnly() throws {
+    func testWorkerPromptContractKeepsSkillContentCompleteWithoutTokenSaverPolicy() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -20,34 +20,28 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertTrue(promptContract.contains("Distill:"))
-        XCTAssertTrue(promptContract.contains("never Distill skill content")
-                      || promptContract.contains("Never Distill skill"),
-                      "prompt contract must protect skill bodies")
-        XCTAssertTrue(promptContract.contains("must stay complete")
-                      || promptContract.contains("skill content must stay complete"),
-                      "requested/returned skill content must be complete")
-        XCTAssertTrue(promptContract.contains("do not require every worker")
-                      || promptContract.contains("Do not require every worker"),
-                      "workers must not restate Distill rules")
-        XCTAssertFalse(promptContract.contains("repeat this rule in every descendant prompt"),
-                       "removed: requiring Distill restatement in every descendant")
-
-        XCTAssertTrue(skill.contains("Never Distill skill content")
-                      || skill.contains("never Distill skill content"))
-        XCTAssertTrue(skill.contains("stay complete"),
-                      "SKILL.md must require complete skill bodies")
+        // WHY: workers act on skill bodies verbatim; a summarized skill silently drops rules.
+        XCTAssertTrue(promptContract.contains("skill content must stay complete"),
+                      "prompt contract must protect requested/returned skill content")
         XCTAssertTrue(skill.contains("requested/returned skill bodies")
-                      || skill.contains("requested/returned skill content"),
-                      "SKILL.md must cover requested and returned skill content")
-        XCTAssertFalse(skill.contains("Put the Distill rule in every worker/reviewer prompt"))
+                      && skill.contains("must stay complete"),
+                      "SKILL.md must require complete requested and returned skill bodies")
+
+        // WHY: Token Saver was removed on 2026-10-06; the shipped skill must not tell
+        // workers to pipe through `distill` or reason about Token Saver admission.
+        for (name, text) in [("prompt-contract.md", promptContract), ("SKILL.md", skill)] {
+            XCTAssertFalse(text.contains("Token Saver"), "\(name) must not carry Token Saver policy")
+            XCTAssertFalse(text.contains("Distill"), "\(name) must not carry Distill policy")
+            XCTAssertFalse(text.contains("RC_TOKEN_SAVER"), "\(name) must not reference Token Saver receipts")
+        }
+        // WHY: a bare `distill` now resolves to the Distill agent harness, not the telemetry bridge.
+        XCTAssertFalse(skill.contains(":-distill"),
+                       "subagent telemetry must not fall back to a bare `distill` command")
+        XCTAssertTrue(skill.contains("\"$REMOTE_CODE_SUBAGENT_TELEMETRY_COMMAND\" subagent begin"),
+                      "nested workers must call the co-located telemetry command directly")
         XCTAssertTrue(
             skill.contains("remote-code agent-app <codex|claude|grok>"),
             "controlled provider workers must use the full Agent App middleware"
-        )
-        XCTAssertTrue(
-            skill.contains("telemetry alone is not evidence of token savings"),
-            "raw compatibility paths must not be reported as measured Token Saver savings"
         )
         XCTAssertTrue(
             skill.contains("The exact `sam-grok-worker` one-shot")
@@ -86,8 +80,8 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
 
         XCTAssertEqual(package.skillID, "remote-code-orchestrate")
         XCTAssertEqual(package.sourceRevision, "2c77fa48431bc20e5dc841652079594a3ea918c9")
-        XCTAssertEqual(package.localVersion, "9")
-        XCTAssertEqual(package.sourceTreeSHA256, "9d0d615bae2bca280edebfe0ca15bcaf02f2758fbcb8ebd07ee633a988e180b7")
+        XCTAssertEqual(package.localVersion, "10")
+        XCTAssertEqual(package.sourceTreeSHA256, "7819153677e56c9bb9533c5eaa6d6bb420a162bac95267e9bff2fd0a9af907c8")
         XCTAssertEqual(package.allowedPaths, [
             "SKILL.md",
             "agents/openai.yaml",

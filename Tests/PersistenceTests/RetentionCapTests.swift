@@ -235,9 +235,17 @@ final class RetentionCapTests: XCTestCase {
             try chunkRepo.append(surfaceID: surfaceID, workspaceID: nil, chunkIndex: Int64(i), data: Data("0123456789".utf8))
         }
 
-        // Pre-condition: everything is over budget before pruning.
-        XCTAssertGreaterThan(try runs.countProviderEventLogs(threadId: thread.id), providerCap)
-        XCTAssertGreaterThan(try runs.countStreamEvents(threadId: thread.id), streamCap)
+        // Provider event logs and stream events are capped on the write path (the
+        // rolling production window), so `heavy` appends never exceed the cap even
+        // before an explicit prune. Terminal chunks are only bounded by the prune.
+        XCTAssertGreaterThan(heavy, AgentEventRetentionPolicy.production.providerLogCountPerThread)
+        XCTAssertGreaterThan(heavy, AgentEventRetentionPolicy.production.streamEventCountPerThread)
+        XCTAssertLessThanOrEqual(try runs.countProviderEventLogs(threadId: thread.id),
+                                 AgentEventRetentionPolicy.production.providerLogCountPerThread,
+                                 "provider event logs must be bounded at write time during a heavy session")
+        XCTAssertLessThanOrEqual(try runs.countStreamEvents(threadId: thread.id),
+                                 AgentEventRetentionPolicy.production.streamEventCountPerThread,
+                                 "stream events must be bounded at write time during a heavy session")
         XCTAssertGreaterThan(try chunkRepo.totalBytes(surfaceID: surfaceID), terminalByteCap)
 
         // Apply every retention cap, as the coordinator does on the write path.

@@ -220,8 +220,8 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
                 eligible: AgentProvider.allCases,
                 preferred: .claude
             ),
-            [.claude, .codex, .grok],
-            "Auto must try the Source picker host before allCases order (codex-first)."
+            [.claude, .codex, .grok, .distill],
+            "Auto must try the Source picker host before allCases order (codex-first), keeping every other case including .distill."
         )
         XCTAssertEqual(
             AgentOrchestrationRuntime.orderedEligibleProviders(
@@ -442,6 +442,52 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertTrue(wrapped.contains("Quem é você?"))
         XCTAssertFalse(wrapped.contains("active_host: codex"),
                        "Host receipt must match the admitted route, not allCases default.")
+    }
+
+    func testReceiptLockHeldByStuckPeerFailsOpenAfterAboutTwoSeconds() throws {
+        // WHY (S-F7): the orchestration lock is shared with the Distill
+        // sidecars and wrapped the SQLite transaction with an unbounded
+        // F_SETLKW, so a stuck sidecar could hang admission forever. Database
+        // storage fails open after 2 s because BEGIN IMMEDIATE still serializes
+        // writers, so the receipt must persist exactly once anyway.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let databaseURL = URL(fileURLWithPath: db.path).standardizedFileURL
+        let lockPath = databaseURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(databaseURL.lastPathComponent).orchestration.lock").path
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { Date(timeIntervalSince1970: 42) }
+        )
+        let holder = try CrossProcessFileLockHolder(path: lockPath)
+        defer { holder.release() }
+
+        let readStart = Date()
+        XCTAssertTrue(try repository.receipts().isEmpty)
+        let readTime = Date().timeIntervalSince(readStart)
+        XCTAssertGreaterThanOrEqual(readTime, 1.9)
+        XCTAssertLessThan(readTime, 3.0, "one call must not wait for the 30 s holder")
+
+        let runId = AgentRunID()
+        let admitStart = Date()
+        let admission = try runtime.admit(
+            runId: runId,
+            threadId: AgentThreadID(),
+            configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(),
+            interactionMode: .default,
+            permissionMode: .supervised,
+            attachments: []
+        )
+        let admitTime = Date().timeIntervalSince(admitStart)
+        print("orchestration admit under held lock: \(admitTime)s")
+        XCTAssertLessThan(admitTime, 6,
+                          "admission must finish well before the holder lets go")
+        holder.release()
+        XCTAssertEqual(try repository.receipts().map(\.id), [admission.receipt.id])
     }
 
     func testAdmissionSelectsLiveEligibleProviderAndPersistsAuditableReceipt() throws {
@@ -2738,14 +2784,10 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         let wrapped = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(userPrompt: "fix the bug")
         XCTAssertTrue(wrapped.hasPrefix("$remote-code-orchestrate"))
         XCTAssertTrue(wrapped.contains("fix the bug"))
-        XCTAssertTrue(wrapped.contains("skill content must stay complete")
-                      || wrapped.contains("never Distill skill"),
+        XCTAssertTrue(wrapped.contains("skill content must stay complete"),
                       "Auto wrap must protect complete skill content")
-        XCTAssertTrue(wrapped.contains("Distill applies only to eligible ordinary")
-                      || wrapped.contains("do not require every worker prompt to restate Distill"),
-                      "Auto wrap must not force Distill restatement in every worker")
-        XCTAssertFalse(wrapped.contains("EVERY worker/reviewer prompt must require explicit `| distill`"),
-                       "removed: requiring Distill restatement in every worker prompt")
+        XCTAssertFalse(wrapped.contains("Distill"),
+                       "Token Saver was removed: the Auto wrap must not carry Distill tool-output policy")
         XCTAssertTrue(AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(wrapped))
 
         let already = "$remote-code-orchestrate\n\ndo the thing"

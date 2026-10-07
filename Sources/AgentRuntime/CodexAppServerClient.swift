@@ -421,7 +421,6 @@ public final class CodexAppServerClient: @unchecked Sendable {
     private var serverRequestHandler: ServerRequestHandler?
     private var stderrBuffer = Data()
     private let requestTimeout: TimeInterval
-    private let tokenSaverCensusAllowed: Bool
     private let foreignUserUID: uid_t?
     public let forkProtocolSupport: CodexForkProtocolSupport
     // Only the stderr tail is ever surfaced (termination diagnostics), so cap
@@ -439,7 +438,6 @@ public final class CodexAppServerClient: @unchecked Sendable {
         notificationHandler: NotificationHandler? = nil,
         serverRequestHandler: ServerRequestHandler? = nil,
         requestTimeout: TimeInterval = 30,
-        tokenSaverCensusAllowed: Bool = false,
         forkProtocolSupportOverride: CodexForkProtocolSupport? = nil
     ) throws {
         let resolvedBinary = binary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "codex" : binary
@@ -453,7 +451,6 @@ public final class CodexAppServerClient: @unchecked Sendable {
         self.notificationHandler = notificationHandler
         self.serverRequestHandler = serverRequestHandler
         self.requestTimeout = max(0.001, requestTimeout)
-        self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
         self.foreignUserUID = runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid }
         if let forkProtocolSupportOverride {
             self.forkProtocolSupport = forkProtocolSupportOverride
@@ -967,27 +964,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
         let data = try JSONSerialization.data(withJSONObject: object)
         var line = data
         line.append(0x0A)
-        let toWrite: Data
-        if tokenSaverCensusAllowed, object["method"] as? String == "turn/start" {
-            let binding = TokenSaverCensusSeam.defaultBinding(
-                trigger: "provider_outbound_user",
-                provider: "codex",
-                providerAdapterVersion: "app-server",
-                toolShape: "turn_start_json_line"
-            )
-            toWrite = TokenSaverCensusSeam.observeProviderVisiblePayload(
-                line,
-                binding: binding,
-                control: .noChange,
-                streamKind: .completedTranscript,
-                toolKind: .builtin,
-                isSameUser: true
-            )
-        } else {
-            toWrite = line
-        }
         try writeQueue.sync {
-            try GuardedStdinWrite.write(toWrite,
+            try GuardedStdinWrite.write(line,
                                         to: stdinPipe.fileHandleForWriting,
                                         process: process,
                                         notFound: { CodexAppServerError.processExited(stderrTail: "") })
@@ -1056,18 +1034,13 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
 
         let model = normalizedModel(request.model)
-        // Provider-neutral "Token Saver is admitted for this run" signal (same gate the
-        // Claude PostToolUse hook and the Grok/Codex distill prompt hint use) — applies
-        // uniformly whether this is a primary run, a same-provider subagent, or a
-        // cross-provider nested run, per AGENTS.md.
-        let tokenSaverActive = request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
         // Live 0.157 TurnStartParams still lists approvalPolicy; Distill/plan
         // text belongs on thread/start developerInstructions, not collaborationMode.
         var params: JSONObject = [
             "threadId": providerThreadId,
             "input": input,
             "approvalPolicy": approvalPolicy(for: request.permissionMode),
-            "sandboxPolicy": sandboxPolicy(for: request.permissionMode, tokenSaverActive: tokenSaverActive)
+            "sandboxPolicy": sandboxPolicy(for: request.permissionMode)
         ]
         if let model { params["model"] = model }
         if request.serviceTier == .fast { params["serviceTier"] = "fast" }
@@ -1226,24 +1199,20 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     /// Complete Codex 0.146 SandboxPolicy objects for turn/start and
-    /// thread/settings/update. Token Saver only flips `networkAccess` so the
-    /// local ledger POST is not blocked; filesystem restrictions of the mode
-    /// are unchanged. Full Access stays `{type: dangerFullAccess}` only.
-    /// Applies uniformly to every Codex run (primary, subagent, or nested) —
-    /// see AGENTS.md Token Saver rules. When Token Saver is off,
-    /// `networkAccess` is explicitly `false` (fail-open: no network lift).
-    private static func sandboxPolicy(for mode: AgentPermissionMode, tokenSaverActive: Bool = false) -> JSONObject {
+    /// thread/settings/update. `networkAccess` is explicitly `false` for the
+    /// sandboxed modes; Full Access stays `{type: dangerFullAccess}` only.
+    private static func sandboxPolicy(for mode: AgentPermissionMode) -> JSONObject {
         switch mode {
         case .supervised:
             return [
                 "type": "readOnly",
-                "networkAccess": tokenSaverActive
+                "networkAccess": false
             ]
         case .autoAcceptEdits:
             return [
                 "type": "workspaceWrite",
                 "writableRoots": [String](),
-                "networkAccess": tokenSaverActive,
+                "networkAccess": false,
                 "excludeTmpdirEnvVar": false,
                 "excludeSlashTmp": false
             ]
@@ -1270,8 +1239,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         effort == .minimal ? .low : (effort ?? .medium)
     }
 
-    /// Codex per-turn `developer_instructions`: base mode + Distill (Token Saver) +
-    /// Graphify query-first rules when the host set `RC_GRAPHIFY_ENABLED=1` +
+    /// Codex per-turn `developer_instructions`: base mode + nested-agent routing +
     /// background-await self-declare marker (so shell-detached orchestration
     /// stalls reach the host's [[RC_AWAITING]] recovery path).
     private static func developerInstructions(
@@ -1279,8 +1247,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         environment: [String: String]
     ) -> String {
         let base = AgentProviderInstructionText.developerInstructions(for: mode)
-        // tokenSaverProviderPrompt also chains graphifyProviderPrompt.
-        let withTokenSaver = AgentSkillInstaller.tokenSaverProviderPrompt(base, environment: environment)
+        let routed = AgentSkillInstaller.nestedAgentProviderPrompt(base, environment: environment)
         // Additive only: systemPromptDirective (NOT alwaysOnClaudeDirectives —
         // those carry Claude-CLI-only MCP rules).
         let alwaysOn = BotPeerDelegation.appendingTurnContext(
@@ -1288,7 +1255,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
                 + "\n\n" + BotPeerDelegation.providerDirective,
             environment: environment
         )
-        if withTokenSaver.isEmpty { return alwaysOn }
-        return withTokenSaver + "\n\n" + alwaysOn
+        if routed.isEmpty { return alwaysOn }
+        return routed + "\n\n" + alwaysOn
     }
 }

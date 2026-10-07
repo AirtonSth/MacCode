@@ -282,7 +282,11 @@ final class FakeRunnerTests: XCTestCase {
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
             let checkpoints = (try? checkpointRepo.list(threadId: thread.id)) ?? []
-            if let checkpoint = checkpoints.first {
+            // The coordinator first persists a minimal identity row (status
+            // .missing, no error) on the terminal path and enriches it with the
+            // git diff asynchronously; assert on the enriched row only.
+            if let checkpoint = checkpoints.first,
+               checkpoint.status != .missing || checkpoint.errorMessage != nil {
                 XCTAssertEqual(checkpoint.runId, runId)
                 XCTAssertFalse(checkpoint.turnId.isEmpty)
                 XCTAssertEqual(checkpoint.checkpointTurnCount, 1)
@@ -322,7 +326,10 @@ final class FakeRunnerTests: XCTestCase {
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
             let checkpoints = (try? checkpointRepo.list(threadId: thread.id)) ?? []
-            if let checkpoint = checkpoints.first {
+            // Skip the minimal identity row (status .missing, no error) the
+            // terminal path writes before the async git enrichment lands.
+            if let checkpoint = checkpoints.first,
+               checkpoint.status != .missing || checkpoint.errorMessage != nil {
                 XCTAssertEqual(checkpoint.status, .missing)
                 XCTAssertEqual(checkpoint.errorMessage, "Not a git repository.",
                                "completed turns outside a git repo must leave an explicit missing checkpoint status instead of pretending recovery exists")
@@ -606,7 +613,9 @@ final class FakeRunnerTests: XCTestCase {
         XCTFail("coordinator must write a recoverable provider session runtime row")
     }
 
-    func test_coordinatorPersistsTrustedWireCapabilityForFollowUpAdmission() async throws {
+    func test_coordinatorNeverPersistsAWireProtocolVersionEvenWithALegacyCapabilityKey() async throws {
+        // WHY: Token Saver's RCW1 wire protocol was removed. A capability key an
+        // older build left in the environment must not mark a new session as wire.
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-wire-capability-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -626,7 +635,7 @@ final class FakeRunnerTests: XCTestCase {
         )
         coordinator.runEnvironmentProvider = { _, _, base in
             var environment = base
-            environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] = "1"
+            environment["RC_TOKEN_SAVER_WIRE_CAPABILITY"] = "1"
             return environment
         }
 
@@ -638,10 +647,11 @@ final class FakeRunnerTests: XCTestCase {
             prompt: "short plaintext seed"
         ))
 
-        try await waitUntil("trusted wire capability persisted for a later follow-up") {
+        try await waitUntil("the provider turn completes without a wire protocol version") {
             guard let session = try? sessionRepo.get(threadId: thread.id),
+                  session.status == .completed,
                   let payload = Self.runtimePayload(session.runtimePayloadJSON) else { return false }
-            return payload["wireProtocolVersion"] as? String == RCWireProtocol.version
+            return payload["wireProtocolVersion"] == nil
         }
     }
 
@@ -674,7 +684,7 @@ final class FakeRunnerTests: XCTestCase {
         )
         coordinator.runEnvironmentProvider = { _, _, base in
             var environment = base
-            environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] = "1"
+            environment["RC_TOKEN_SAVER_WIRE_CAPABILITY"] = "1"
             return environment
         }
 
@@ -915,7 +925,10 @@ final class FakeRunnerTests: XCTestCase {
         let sessionRepo = ProviderSessionRuntimeRepository(db: db)
         let thread = AgentThread(title: "codex continuity", provider: .codex, model: "gpt-5.5")
         try threadRepo.upsert(thread)
-        let adapter = SpyProviderAdapter(provider: .codex)
+        // A completed turn with no assistant output is reclassified as failed
+        // (ProviderStderrClassifier.resolveTerminal), and a failed session is not
+        // resumable; the spy must answer like a real provider turn.
+        let adapter = SpyProviderAdapter(provider: .codex, finalMessage: "done")
         let coordinator = AgentRunCoordinator(runRepo: runRepo,
                                               messageRepo: messageRepo,
                                               threadRepo: threadRepo,
@@ -1197,6 +1210,10 @@ final class FakeRunnerTests: XCTestCase {
                        "recovery must carry the active provider turn id so Codex app-server can interrupt the exact running turn")
         XCTAssertEqual(adapter.interruptTurnCallCount, 1,
                        "stop after app restart must call provider-native interrupt instead of only queuing a local cancellation")
+        // stopRun drives recovery from a `[weak self]` Task; in the app the
+        // coordinator is owned by AppContext for the process lifetime. Without
+        // this, ARC may free it after its last use above and the Task no-ops.
+        withExtendedLifetime(coordinator) {}
     }
 
     func test_coordinator_emitsVisibleErrorWhenLifecyclePersistenceFails() async throws {
@@ -2622,6 +2639,7 @@ private final class ScriptedClaudeRunner: AgentProviderRunner, @unchecked Sendab
 private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendable {
     let provider: AgentProvider
     let finishImmediately: Bool
+    let finalMessage: String?
     private let lock = NSLock()
     private var _sendTurnCount = 0
     private var _cancelCount = 0
@@ -2703,9 +2721,10 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
         return _lastRecoveredExtraArgs
     }
 
-    init(provider: AgentProvider, finishImmediately: Bool = true) {
+    init(provider: AgentProvider, finishImmediately: Bool = true, finalMessage: String? = nil) {
         self.provider = provider
         self.finishImmediately = finishImmediately
+        self.finalMessage = finalMessage
     }
 
     func listModels() async -> [AgentModelDescriptor] { [] }
@@ -2724,10 +2743,11 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
         _lastInteractionMode = request.interactionMode
         lock.unlock()
         if finishImmediately {
+            let finalMessage = self.finalMessage
             Task.detached {
                 let providerThreadId = request.providerThreadId ?? UUID().uuidString
                 onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
-                onEvent(.finished(.completed, finalMessage: nil, providerThreadId: providerThreadId))
+                onEvent(.finished(.completed, finalMessage: finalMessage, providerThreadId: providerThreadId))
             }
         }
         return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in

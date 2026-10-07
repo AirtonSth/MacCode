@@ -27,7 +27,7 @@ final class ReorderThreadWorkspaceIdProbeTests: XCTestCase {
             permissionMode: .supervised,
             reasoningEffort: .medium
         )
-        _ = try router.createAgentThread(
+        let second = try router.createAgentThread(
             workspace: workspace.id,
             title: "two",
             provider: .codex,
@@ -49,8 +49,11 @@ final class ReorderThreadWorkspaceIdProbeTests: XCTestCase {
             getsBefore,
             "rail reorder must not compile a leftover 26-column get"
         )
+        // Rail order is pure last activity (`list` sorts by updated_at, not
+        // sort_order), so two threads created in the same second tie on
+        // updated_at and order by id. Check membership, not position.
         XCTAssertEqual(list.count, 2)
-        XCTAssertEqual(list[1].id, first.id)
+        XCTAssertEqual(Set(list.map(\.id)), [first.id, second.id])
     }
 
     func test_reorderAgentThread_sourceUsesWorkspaceIdProbe() throws {

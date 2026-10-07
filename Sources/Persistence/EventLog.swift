@@ -134,6 +134,81 @@ public final class EventLogRepository {
         return rows
     }
 
+    public struct ReplayPage: Equatable {
+        /// Rows with seq in `(after, through]`, oldest first.
+        public let rows: [Row]
+        /// True when a row with seq <= `after` is still stored, which proves
+        /// retention has not pruned anything after `after`.
+        public let anchored: Bool
+    }
+
+    /// C8 durable replay read: one statement (one read snapshot) returns the
+    /// newest row at or below `after` as the anchor plus up to `limit` rows
+    /// in `(after, through]`.
+    public func readReplayPage(after: Int64, through: Int64, limit: Int) throws -> ReplayPage {
+        let st = try db.prepare("""
+            SELECT seq, kind, payload_json, created_at FROM events
+            WHERE seq >= COALESCE((SELECT MAX(seq) FROM events WHERE seq <= ?), ? + 1)
+              AND seq <= ?
+            ORDER BY seq ASC LIMIT ?;
+        """)
+        try st.bind(1, after)
+        try st.bind(2, after)
+        try st.bind(3, through)
+        try st.bind(4, Int64(max(0, limit)) + 1)
+        var rows: [Row] = []
+        var anchored = false
+        while try st.step() {
+            let row = Row(
+                seq: st.columnInt64(0),
+                kind: st.columnText(1) ?? "",
+                payloadJSON: st.columnText(2) ?? "",
+                createdAt: st.columnText(3) ?? ""
+            )
+            if row.seq <= after {
+                anchored = true
+            } else {
+                rows.append(row)
+            }
+        }
+        if rows.count > limit { rows.removeLast(rows.count - limit) }
+        return ReplayPage(rows: rows, anchored: anchored)
+    }
+
+    /// The oldest rows in `(after, through]` (at most `rowLimit`) and their
+    /// kind + payload bytes, for the durable-replay budget. `anchored` is
+    /// false when no row at or below `after` is left (retention may have
+    /// pruned past it); the sum is then skipped. Both reads are bounded: an
+    /// index seek and at most `rowLimit` rows, whatever the range.
+    public func estimateReplay(
+        after: Int64,
+        through: Int64,
+        rowLimit: Int
+    ) throws -> (rows: Int, bytes: Int, anchored: Bool) {
+        let anchor = try db.prepare("SELECT 1 FROM events WHERE seq <= ? LIMIT 1;")
+        try anchor.bind(1, after)
+        guard try anchor.step() else { return (0, 0, false) }
+        let st = try db.prepare("""
+            SELECT COUNT(*),
+                   COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB)) + LENGTH(CAST(kind AS BLOB))), 0)
+            FROM (
+                SELECT payload_json, kind FROM events
+                WHERE seq > ? AND seq <= ?
+                ORDER BY seq ASC LIMIT ?
+            );
+        """)
+        try st.bind(1, after)
+        try st.bind(2, through)
+        try st.bind(3, Int64(max(0, rowLimit)))
+        guard try st.step() else { return (0, 0, true) }
+        return (Int(st.columnInt64(0)), Int(st.columnInt64(1)), true)
+    }
+
+    /// Parses `created_at` (written by `appendBatch`) back to a Date.
+    public static func createdAtDate(_ value: String) -> Date? {
+        iso.date(from: value)
+    }
+
     public func lastSeq() throws -> Int64 {
         let st = try db.prepare("SELECT COALESCE(MAX(seq), 0) FROM events;")
         if try st.step() { return st.columnInt64(0) }

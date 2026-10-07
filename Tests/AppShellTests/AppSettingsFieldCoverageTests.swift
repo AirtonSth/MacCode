@@ -32,20 +32,7 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
             "insomniaAllowDisplaySleep",
             "insomniaAllowSystemSleepWhenDisplayClosed",
             "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
-            "tokenSaverEnabled",
-            "tokenSaverModelSource",
-            "tokenSaverAPIBaseURL",
-            "tokenSaverAPIModel",
-            "tokenSaverAPIToken",
-            "tokenSaverSaveTrainingPrompts",
             "terminalFontSize",
-            "sessionLearnEnabled",
-            "historyCompactionEnabled",
-            "graphifyEnabled",
-            "graphifyBinaryPath",
-            "graphifyAutoEnsure",
-            "graphifyPinnedRoots",
-            "graphifyWriteInRepo",
             "petEnabled",
             "petAnimationsEnabled",
             "petReadyCounterEnabled",
@@ -97,27 +84,6 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
                        "setSidebarSort must update appSettings immediately")
         XCTAssertEqual(SettingsStore(db: ctx.db).load().sidebarSort, "created",
                        "setSidebarSort must persist the value so reload() sees it")
-
-        // Session Learn
-        vm.setSessionLearnEnabled(true)
-        XCTAssertTrue(vm.appSettings.sessionLearnEnabled,
-                      "setSessionLearnEnabled(true) must update appSettings immediately")
-        XCTAssertTrue(SettingsStore(db: ctx.db).load().sessionLearnEnabled,
-                      "setSessionLearnEnabled must persist so AppContext.runSessionLearn() can observe it")
-
-        // History compaction
-        vm.setHistoryCompactionEnabled(true)
-        XCTAssertTrue(vm.appSettings.historyCompactionEnabled,
-                      "setHistoryCompactionEnabled(true) must update appSettings immediately")
-        XCTAssertTrue(SettingsStore(db: ctx.db).load().historyCompactionEnabled,
-                      "setHistoryCompactionEnabled must persist so AppContext uses the correct mode on launch")
-
-        // Token Saver flag (direct store write; sidebar has the full activation logic)
-        vm.setTokenSaverEnabled(false)
-        XCTAssertFalse(vm.appSettings.tokenSaverEnabled,
-                       "setTokenSaverEnabled(false) must update appSettings immediately")
-        XCTAssertFalse(SettingsStore(db: ctx.db).load().tokenSaverEnabled,
-                       "setTokenSaverEnabled must persist the value")
 
         // Terminal base font
         vm.setTerminalFontSize(16)
@@ -178,10 +144,10 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let store = SettingsStore(db: ctx.db)
         store.save(AppSettings(
+            diffWordWrap: true,
             sidebarSort: "manual",
             terminalFontSize: 18,
-            sessionLearnEnabled: true,
-            historyCompactionEnabled: true
+            petReduceMotion: true
         ))
 
         let vm = SettingsViewModel(context: ctx)
@@ -189,10 +155,10 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
 
         XCTAssertEqual(vm.appSettings.sidebarSort, "manual",
                        "reload() must restore sidebarSort from the persisted store")
-        XCTAssertTrue(vm.appSettings.sessionLearnEnabled,
-                      "reload() must restore sessionLearnEnabled from the persisted store")
-        XCTAssertTrue(vm.appSettings.historyCompactionEnabled,
-                      "reload() must restore historyCompactionEnabled from the persisted store")
+        XCTAssertTrue(vm.appSettings.diffWordWrap,
+                      "reload() must restore diffWordWrap from the persisted store")
+        XCTAssertTrue(vm.appSettings.petReduceMotion,
+                      "reload() must restore petReduceMotion from the persisted store")
         XCTAssertEqual(vm.appSettings.terminalFontSize, 18,
                        "reload() must restore terminalFontSize from the persisted store")
     }

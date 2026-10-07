@@ -355,10 +355,10 @@ final class ConnectionSnapshotRouterPhase3Tests: XCTestCase {
         XCTAssertEqual(messagePayload["content"], .string("persisted response"))
         XCTAssertEqual(queuedPayload["text"], .string("queued prompt"))
         XCTAssertEqual(requestPayload["id"], .string("approval-1"))
-        XCTAssertEqual(AgentAppReadGateway.readCallCountForTesting, 5,
-                       "thread.list performs one thread read plus one locked-thread batch read")
+        XCTAssertEqual(AgentAppReadGateway.readCallCountForTesting, 6,
+                       "thread.list performs one thread read, one locked-thread batch read and one guest-runtime read")
         XCTAssertEqual(AgentAppReadGateway.readOnMainActorCountForTesting, 0)
-        XCTAssertEqual(AgentAppReadGateway.readOffMainActorCountForTesting, 5)
+        XCTAssertEqual(AgentAppReadGateway.readOffMainActorCountForTesting, 6)
         XCTAssertGreaterThan(heartbeats, 20,
                              "MainActor must keep pumping while all four RPC reads are delayed")
     }

@@ -408,14 +408,12 @@ final class CellularDataOptimizationTests: XCTestCase {
                 "text": "quoted: \\\"",
                 "summary": "starting",
                 "progress": 0.1,
-                "distill_applied": true,
             ]) { _, new in new }),
             frame(seq: 21, payload: identity.merging([
                 "body_append": "",
                 "output_append": "beta ",
                 "text": "line\\n",
                 "progress": 0.4,
-                "distill_applied": false,
             ]) { _, new in new }),
             frame(seq: 22, payload: identity.merging([
                 "body_append": "B\\\\",
@@ -509,14 +507,14 @@ final class CellularDataOptimizationTests: XCTestCase {
         )
     }
 
-    func test_C16_agentItemDeltaMerge_requiresSameThreadAndOrsDistillApplied() throws {
-        // WHY: coalescing is lossy if a later nil/false receipt bit erases a
-        // trusted true, and unsafe if equal item IDs from different threads mix.
+    func test_C16_agentItemDeltaMerge_requiresSameThreadAndTurn() throws {
+        // WHY: coalescing is lossy if an append-only frame erases the latest
+        // summary/progress, and unsafe if equal item IDs from different threads
+        // or turns mix.
         func frame(
             seq: Int64,
             threadId: String?,
             body: String,
-            distillApplied: Bool?,
             turnId: String? = nil,
             summary: String? = nil,
             progress: Double? = nil
@@ -527,7 +525,6 @@ final class CellularDataOptimizationTests: XCTestCase {
             ]
             if let threadId { payload["thread_id"] = threadId }
             if let turnId { payload["turn_id"] = turnId }
-            if let distillApplied { payload["distill_applied"] = distillApplied }
             if let summary { payload["summary"] = summary }
             if let progress { payload["progress"] = progress }
             return try JSONSerialization.data(withJSONObject: [
@@ -542,7 +539,6 @@ final class CellularDataOptimizationTests: XCTestCase {
             seq: 1,
             threadId: "thread-a",
             body: "A",
-            distillApplied: true,
             turnId: "turn-a",
             summary: "working",
             progress: 0.25
@@ -551,7 +547,6 @@ final class CellularDataOptimizationTests: XCTestCase {
             seq: 2,
             threadId: "thread-a",
             body: "B",
-            distillApplied: false,
             turnId: "turn-a"
         )
         let merged = try XCTUnwrap(
@@ -562,8 +557,6 @@ final class CellularDataOptimizationTests: XCTestCase {
         )
         let mergedPayload = try XCTUnwrap(mergedObject["payload"] as? [String: Any])
         XCTAssertEqual(mergedPayload["body_append"] as? String, "AB")
-        XCTAssertEqual(mergedPayload["distill_applied"] as? Bool, true,
-                       "trusted distillation metadata must be monotonic across append coalescing")
         XCTAssertEqual(mergedPayload["summary"] as? String, "working")
         XCTAssertEqual(mergedPayload["progress"] as? Double, 0.25,
                        "an append-only frame must not erase the latest progress update")
@@ -572,7 +565,6 @@ final class CellularDataOptimizationTests: XCTestCase {
             seq: 3,
             threadId: "thread-a",
             body: "C",
-            distillApplied: nil,
             turnId: "turn-a",
             summary: "done",
             progress: 1
@@ -587,13 +579,11 @@ final class CellularDataOptimizationTests: XCTestCase {
         XCTAssertEqual(completedPayload["summary"] as? String, "done")
         XCTAssertEqual(completedPayload["progress"] as? Double, 1,
                        "the latest explicit progress value remains last-write-wins")
-        XCTAssertEqual(completedPayload["distill_applied"] as? Bool, true)
 
         let otherThread = try frame(
             seq: 4,
             threadId: "thread-b",
             body: "X",
-            distillApplied: nil,
             turnId: "turn-a"
         )
         XCTAssertNil(
@@ -601,7 +591,7 @@ final class CellularDataOptimizationTests: XCTestCase {
             "matching item_id values from different threads must never merge"
         )
 
-        let missingThread = try frame(seq: 5, threadId: nil, body: "legacy", distillApplied: true)
+        let missingThread = try frame(seq: 5, threadId: nil, body: "legacy")
         XCTAssertNil(
             WebSocketEventBatcher.mergeAgentItemDeltaFrames(trusted, missingThread),
             "a missing thread_id must fail safe and remain independently deliverable"
@@ -610,12 +600,11 @@ final class CellularDataOptimizationTests: XCTestCase {
         let missingTurn = try frame(
             seq: 6,
             threadId: "thread-a",
-            body: "later turn",
-            distillApplied: nil
+            body: "later turn"
         )
         XCTAssertNil(
             WebSocketEventBatcher.mergeAgentItemDeltaFrames(trusted, missingTurn),
-            "turn-scoped host truth must remain a separate frame from ordinary deltas"
+            "a turn-scoped delta must remain a separate frame from ordinary deltas"
         )
     }
 

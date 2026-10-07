@@ -9,6 +9,7 @@ final class ClaudeAgentSDKBridgeLifecycleOwnershipTests: ProviderProcessTestCase
 
     /// Cancel A / start B / grace-fire must not let run A's timer kill run B.
     func test_interruptGrace_doesNotKillNewerRunGeneration() async throws {
+        try skipUnlessLegacyClaudeIsSelectable()
         guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
         let tmp = try Self.makeTempDir(prefix: "rc2-sdk-interrupt-gen")
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -109,6 +110,7 @@ final class ClaudeAgentSDKBridgeLifecycleOwnershipTests: ProviderProcessTestCase
     /// When the bridge emits CLI-shaped task lifecycle records, early result
     /// defers; empty snapshot alone does not finish; later foreground result does.
     func test_backgroundTaskLifecycleOwnershipMatchesCLI() async throws {
+        try skipUnlessLegacyClaudeIsSelectable()
         guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
         let tmp = try Self.makeTempDir(prefix: "rc2-sdk-bg-lifecycle")
         defer { try? FileManager.default.removeItem(at: tmp) }

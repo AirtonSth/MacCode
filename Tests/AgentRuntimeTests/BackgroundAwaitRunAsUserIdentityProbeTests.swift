@@ -34,6 +34,7 @@ final class BackgroundAwaitRunAsUserIdentityProbeTests: XCTestCase {
             title: "await",
             provider: .codex,
             model: "fake-model",
+            reasoningModel: "fake-reasoner",
             runAsUser: runAsUser
         )
         try threadRepo.upsert(thread)
@@ -47,6 +48,9 @@ final class BackgroundAwaitRunAsUserIdentityProbeTests: XCTestCase {
         let probesBefore = threadRepo.identityProbeCountForTesting
         let request = coordinator.incompleteTurnContinuationRequestForTesting(threadId: thread.id)
         XCTAssertEqual(request.runAsUser, runAsUser)
+        // The continuation must keep the thread's chosen reasoning model; the
+        // narrow probe carries it so the request does not need the full get.
+        XCTAssertEqual(request.reasoningModel, "fake-reasoner")
         XCTAssertEqual(request.permissionMode, .fullAccess)
         XCTAssertEqual(
             threadRepo.identityProbeCountForTesting,
@@ -61,6 +65,7 @@ final class BackgroundAwaitRunAsUserIdentityProbeTests: XCTestCase {
 
         let missing = coordinator.incompleteTurnContinuationRequestForTesting(threadId: AgentThreadID())
         XCTAssertNil(missing.runAsUser)
+        XCTAssertNil(missing.reasoningModel)
         XCTAssertEqual(threadRepo.identityProbeCountForTesting, probesBefore + 2)
         XCTAssertEqual(threadRepo.durableGetCountForTesting, getsBefore)
     }

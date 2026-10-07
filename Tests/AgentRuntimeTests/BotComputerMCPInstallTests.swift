@@ -37,11 +37,18 @@ final class BotComputerMCPInstallTests: XCTestCase {
             "Codex bot catalog MCP must not persist in the user-global config.toml that ChatGPT.app shares"
         )
 
+        // Bot runs get the per-session ACP entry; non-bot runs must not (every
+        // bot_computer_* call fails with callerMissing without a bot id).
         let grok = GrokACPClient.sessionMCPServers(
             existing: [["name": "user-slack", "command": "npx"]],
             command: binary.path,
-            environment: [:]
+            environment: [BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof"]
         )
         XCTAssertTrue(BotComputerMCPAdmit.containsAdmittedGrokACP(grok))
+        XCTAssertFalse(BotComputerMCPAdmit.containsAdmittedGrokACP(GrokACPClient.sessionMCPServers(
+            existing: [],
+            command: binary.path,
+            environment: [:]
+        )))
     }
 }

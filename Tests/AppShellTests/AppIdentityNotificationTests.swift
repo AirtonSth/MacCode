@@ -50,7 +50,7 @@ final class AppIdentityNotificationTests: XCTestCase {
                       "dragging a Finder folder onto the Dock app icon must route that folder to NSApplication open-file handling")
         XCTAssertTrue(script.contains("AppIcon.icns"))
         XCTAssertTrue(script.contains("DISTILL_SERVICE=\"$BIN_DIR/RemoteCodeDistillService\""),
-                      "packaging must require the Token Saver sidecar executable")
+                      "packaging must require the RemoteCodeDistillService executable")
         XCTAssertTrue(script.contains("Contents/MacOS/RemoteCodeDistillService"),
                       "RemoteCode.app must contain the sidecar so Bundle.main can resolve it without global installs")
         XCTAssertTrue(script.contains("SCHEDULED_TASK_AGENT=\"$BIN_DIR/RemoteCodeScheduledTaskAgent\""),
@@ -1277,7 +1277,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         var events: [EventBus.Event] = []
         let token = EventBus.shared.subscribe(since: startSeq) { event in
             guard event.kind.hasPrefix("agent.run."),
-                  event.payload.objectValue?["thread_id"]?.stringValue == thread.id.value.uuidString else { return }
+                  event.payload.objectValue?["thread_id"]?.stringValue?.lowercased() == thread.id.value.uuidString.lowercased() else { return }
             events.append(event)
         }
         defer { EventBus.shared.unsubscribe(token) }
@@ -1309,7 +1309,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         var events: [EventBus.Event] = []
         let token = EventBus.shared.subscribe(since: startSeq) { event in
             guard (event.kind == "agent.run.started" || event.kind == "agent.run.finished"),
-                  event.payload.objectValue?["thread_id"]?.stringValue == thread.id.value.uuidString else { return }
+                  event.payload.objectValue?["thread_id"]?.stringValue?.lowercased() == thread.id.value.uuidString.lowercased() else { return }
             events.append(event)
         }
         defer { EventBus.shared.unsubscribe(token) }
@@ -1329,13 +1329,13 @@ final class AppIdentityNotificationTests: XCTestCase {
         let persisted = try XCTUnwrap(ctx.runRepo.get(id: runId))
         let expectedStartedAtMs = Int64(persisted.startedAt.timeIntervalSince1970 * 1000)
         let startedPayload = try XCTUnwrap(events.first { $0.kind == "agent.run.started" }?.payload.objectValue)
-        XCTAssertEqual(startedPayload["run_id"]?.stringValue, runId.value.uuidString,
+        XCTAssertEqual(startedPayload["run_id"]?.stringValue?.lowercased(), runId.value.uuidString.lowercased(),
                        "mirrors need run_id to tie lifecycle events to the host run row")
         XCTAssertEqual(startedPayload["started_at_ms"]?.intValue.map(Int64.init), expectedStartedAtMs,
                        "started_at_ms must come from the persisted run row so iOS and macOS Working timers share one clock")
 
         let finishedPayload = try XCTUnwrap(events.first { $0.kind == "agent.run.finished" }?.payload.objectValue)
-        XCTAssertEqual(finishedPayload["run_id"]?.stringValue, runId.value.uuidString)
+        XCTAssertEqual(finishedPayload["run_id"]?.stringValue?.lowercased(), runId.value.uuidString.lowercased())
         XCTAssertNotNil(finishedPayload["duration_ms"]?.intValue,
                         "finished events must carry host duration metadata for mirrored completed-work UI")
     }

@@ -532,10 +532,6 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         for field in ["summary", "progress"] where payload[field] == nil {
             payload[field] = earlier.event.payload[field]
         }
-        if earlier.event.payload["distill_applied"] == .bool(true)
-            || later.event.payload["distill_applied"] == .bool(true) {
-            payload["distill_applied"] = .bool(true)
-        }
         return later.replacingPayload(payload)
     }
 
@@ -596,10 +592,6 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         for field in ["summary", "progress"] where rightPayload[field] == nil {
             rightPayload[field] = leftPayload[field]
         }
-        if leftPayload["distill_applied"] as? Bool == true
-            || rightPayload["distill_applied"] as? Bool == true {
-            rightPayload["distill_applied"] = true
-        }
         // summary / progress: latest present value wins (non-append semantics).
         right["payload"] = rightPayload
         // Keep the later (higher) sequence / eventId so the client watermark
@@ -636,7 +628,6 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         private var textSegments: [String]
         private var summary: Any?
         private var progress: Any?
-        private var distillApplied: Bool
 
         var absorbed: ArraySlice<Data> { rawFrames.dropLast() }
 
@@ -650,7 +641,6 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             textSegments = Self.initialSegments(frame.payload, field: "text")
             summary = frame.payload["summary"]
             progress = frame.payload["progress"]
-            distillApplied = frame.payload["distill_applied"] as? Bool == true
         }
 
         mutating func append(_ frame: ParsedAgentItemDelta) -> Bool {
@@ -666,8 +656,6 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             Self.appendString(frame.payload, field: "text", to: &textSegments)
             if let value = frame.payload["summary"] { summary = value }
             if let value = frame.payload["progress"] { progress = value }
-            distillApplied = distillApplied
-                || frame.payload["distill_applied"] as? Bool == true
             return true
         }
 
@@ -683,7 +671,6 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             if payload["progress"] == nil, let progress {
                 payload["progress"] = progress
             }
-            if distillApplied { payload["distill_applied"] = true }
             var object = latestObject
             object["payload"] = payload
             onEncode?()

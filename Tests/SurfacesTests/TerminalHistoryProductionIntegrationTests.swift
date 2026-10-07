@@ -314,17 +314,16 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     let path = directory.appendingPathComponent("history.sqlite").path
     let database = try SQLiteDB(path: path)
     try Schema.migrate(database)
-    try database.execute("PRAGMA busy_timeout=25;")
+    // This test pins the coordinator's own retry chain against its finalizing
+    // deadline. SQLiteDB layers its own bounded wait under every call (the
+    // busy handler plus up to 8 transient-lock attempts per transaction,
+    // covered by SQLiteBusyRetryTests), which the coordinator deadline cannot
+    // interrupt. Make each SQLite call one immediate attempt so the timing
+    // below measures the coordinator, not SQLite's busy waits.
+    try database.execute("PRAGMA busy_timeout=0;")
+    database.busyRetryMaxAttemptsForTesting = 1
     let lockDatabase = try SQLiteDB(path: path)
     let repository = TerminalOutputRepository(db: database)
-    let attempts = LockedCounter()
-    database.beforeStatementStepForTesting = { sql in
-      if sql.contains("INSERT INTO terminal_output_chunks")
-          || sql.contains("INSERT INTO settings") {
-        _ = attempts.increment()
-      }
-    }
-    defer { database.beforeStatementStepForTesting = nil }
     let surfaceID = SurfaceID().value.uuidString
     let coordinator = TerminalHistoryCoordinator(
       repository: repository,
@@ -333,6 +332,22 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     )
     coordinator.prepare(restored: false)
     try waitForPreparation(coordinator, expected: .ready(nextChunkIndex: 1))
+    // Every history write is a BEGIN IMMEDIATE transaction, and under the lock
+    // it fails before any INSERT steps, so count transaction attempts. The
+    // unresolved-failure marker fallback deliberately keeps retrying on its own
+    // queue until the partial marker is durable; it does not occupy the history
+    // queue and is not part of the payload retry chain this test bounds.
+    let attempts = LockedCounter()
+    database.beforeExecuteForTesting = { sql in
+      guard sql.hasPrefix("BEGIN IMMEDIATE") else { return }
+      let fromUnresolvedFallback = Thread.callStackSymbols.contains {
+        $0.contains("scheduleUnresolvedFailureRetry")
+      }
+      if !fromUnresolvedFallback {
+        _ = attempts.increment()
+      }
+    }
+    defer { database.beforeExecuteForTesting = nil }
     try lockDatabase.execute("BEGIN IMMEDIATE;")
     var lockHeld = true
     defer {
@@ -362,10 +377,22 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     let attemptsAfterBarrier = attempts.value
     RunLoop.main.run(until: Date().addingTimeInterval(0.25))
 
-    XCTAssertLessThan(elapsed, 0.8)
+    XCTAssertLessThan(
+      elapsed,
+      0.8,
+      "the final barrier must resolve shortly after the 0.18 s finalizing deadline"
+    )
     XCTAssertGreaterThan(attemptsAfterBarrier, 0)
-    XCTAssertLessThanOrEqual(attemptsAfterBarrier, 4)
-    XCTAssertEqual(attempts.value, attemptsAfterBarrier)
+    // prepareRetryDelays starts [0.05, 0.1, 0.2, ...]: inside 0.18 s the payload
+    // gets at most three append attempts (t = 0, 0.05, 0.15). The failure path
+    // then makes one partial-marker attempt and one retention check before the
+    // barrier, all on the serial history queue.
+    XCTAssertLessThanOrEqual(attemptsAfterBarrier, 5)
+    XCTAssertEqual(
+      attempts.value,
+      attemptsAfterBarrier,
+      "no history-queue write may retry after the finalizing barrier resolved"
+    )
     XCTAssertEqual(coordinator.outstandingBytes, 0)
     XCTAssertGreaterThan(coordinator.writeFailures, 0)
     XCTAssertEqual(try repository.totalBytes(surfaceID: surfaceID), 0)
@@ -384,7 +411,13 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     let path = directory.appendingPathComponent("history.sqlite").path
     var database: SQLiteDB? = try SQLiteDB(path: path)
     try Schema.migrate(try XCTUnwrap(database))
-    try database?.execute("PRAGMA busy_timeout=25;")
+    // SQLiteDB layers its own transient-lock retry (up to 8 attempts per
+    // transaction, covered by SQLiteBusyRetryTests) under every call, which the
+    // coordinator's 0.18 s finalizing deadline cannot interrupt; under the held
+    // lock each call then takes about 1 s and the backlog cannot drain in this
+    // test's window. One immediate attempt per call pins the coordinator path.
+    try database?.execute("PRAGMA busy_timeout=0;")
+    database?.busyRetryMaxAttemptsForTesting = 1
     let lockDatabase = try SQLiteDB(path: path)
     var repository: TerminalOutputRepository? = TerminalOutputRepository(
       db: try XCTUnwrap(database)
@@ -1820,14 +1853,19 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       allowRead.signal()
       database.beforeStatementStepForTesting = nil
       surface.closeAndDeletePersistedHistory()
-      let cleanupBarrier = TerminalHistoryCoordinator.pendingFinalDeleteBarrier()
-      XCTAssertNotNil(
-        cleanupBarrier,
-        "close must publish durable final-delete ownership before returning"
-      )
-      XCTAssertTrue(
-        cleanupBarrier?.wait(until: .now() + 2) ?? false,
-        "fixture cleanup must quiesce replay-overflow persistence before removing its database"
+      // Close registers the final delete synchronously, but the delete can
+      // finish and drain the registry before this line runs. A nil barrier
+      // then means "already done", so prove completion by the deleted rows.
+      if let cleanupBarrier = TerminalHistoryCoordinator.pendingFinalDeleteBarrier() {
+        XCTAssertTrue(
+          cleanupBarrier.wait(until: .now() + 2),
+          "fixture cleanup must quiesce replay-overflow persistence before removing its database"
+        )
+      }
+      XCTAssertEqual(
+        try? repository.totalBytes(surfaceID: surfaceID.value.uuidString),
+        0,
+        "close must run its final delete before the fixture removes the database"
       )
       XCTAssertNil(
         TerminalHistoryCoordinator.pendingFinalDeleteBarrier(),
@@ -1844,8 +1882,16 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       "the test must hold the real persisted-history read before producing live output"
     )
 
+    // 4 MiB of live output in handoff-sized slices (256 KiB). A single larger
+    // payload streams through the system-output lease, which pauses while the
+    // replay owns the renderer, so it could never overflow the merge during
+    // the blocked read; handoff slices take the synchronous live path that
+    // records replay-time live bytes.
     let liveLine = String(repeating: "L", count: 63) + "\n"
-    surface.appendSystemText(String(repeating: liveLine, count: 65_536))
+    let handoffSlice = String(repeating: liveLine, count: 4_096)
+    for _ in 0..<16 {
+      XCTAssertTrue(surface.appendSystemText(handoffSlice))
+    }
     let newestMarker = "RC2_REPLAY_NEWEST_TAIL_\(UUID().uuidString)"
     surface.appendSystemText(newestMarker + "\n")
     XCTAssertTrue(
@@ -1900,13 +1946,25 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       if lockIsHeld { try? lockDatabase.execute("ROLLBACK;") }
     }
 
-    let oneMiB = String(repeating: "x", count: 1024 * 1024)
-    let rejectedMarker = "RC2_OUTPUT_AFTER_HISTORY_CAP_\(UUID().uuidString)"
+    // Payloads above one PTY handoff (256 KiB) stream through a single
+    // system-output lease and a concurrent one is refused as
+    // `system_output_busy` before history sees it. Handoff-sized slices take the
+    // synchronous live write path, which is the layer this test pins.
+    // The backlog admits newest-first: crossing the cap evicts the oldest
+    // buffered bytes (423c0f9c5). Mark an early slice (not the first, whose
+    // first chunk may already be the one in-flight write blocked on the lock)
+    // and push 5 MiB so that slice is evicted while the newest tail is kept.
+    let handoffSlice = String(repeating: "x", count: 256 * 1024)
+    let evictedMarker = "RC2_OUTPUT_EVICTED_BY_HISTORY_CAP_\(UUID().uuidString)"
+    let newestMarker = "RC2_OUTPUT_AFTER_HISTORY_CAP_\(UUID().uuidString)"
     let startedAt = ProcessInfo.processInfo.systemUptime
-    for _ in 0..<4 {
-      surface.appendSystemText(oneMiB)
+    for index in 0..<20 {
+      let slice = index == 1
+        ? evictedMarker + String(handoffSlice.dropFirst(evictedMarker.utf8.count))
+        : handoffSlice
+      XCTAssertTrue(surface.appendSystemText(slice))
     }
-    surface.appendSystemText(rejectedMarker)
+    surface.appendSystemText(newestMarker)
     let appendElapsed = ProcessInfo.processInfo.systemUptime - startedAt
     bus.flushNow(surface.descriptor.id)
 
@@ -1932,8 +1990,12 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       "the mirror snapshot must expose why history is partial while live output continues"
     )
     XCTAssertTrue(
-      collector.data(for: surface.descriptor.id).contains(Data(rejectedMarker.utf8)),
+      collector.data(for: surface.descriptor.id).contains(Data(evictedMarker.utf8)),
       "history backpressure must not suppress the same bytes from the real-time mirror stream"
+    )
+    XCTAssertTrue(
+      collector.data(for: surface.descriptor.id).contains(Data(newestMarker.utf8)),
+      "live output past the history cap must keep reaching the real-time mirror stream"
     )
     print(
       "TerminalLockedHistory appendElapsed=\(appendElapsed) "
@@ -1956,8 +2018,12 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     ).text
 
     XCTAssertFalse(
-      persisted.contains(rejectedMarker),
-      "bytes rejected at the explicit memory cap must not be misrepresented as durable"
+      persisted.contains(evictedMarker),
+      "bytes evicted at the explicit memory cap must not be misrepresented as durable"
+    )
+    XCTAssertTrue(
+      persisted.contains(newestMarker),
+      "the cap evicts oldest bytes first, so the newest output admitted under the lock must persist"
     )
     XCTAssertTrue(
       persisted.contains(recoveryMarker),
@@ -1979,10 +2045,13 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       surface.flushPersistedHistory()
       surface.close()
     }
-    let oneMiB = String(repeating: "x", count: 1024 * 1024)
+    // Handoff-sized slices (256 KiB) take the synchronous live write path;
+    // larger payloads stream through one system-output lease and a concurrent
+    // one is refused as `system_output_busy` before reaching history.
+    let handoffSlice = String(repeating: "x", count: 256 * 1024)
 
-    for _ in 0..<8 {
-      surface.appendSystemText(oneMiB)
+    for _ in 0..<32 {
+      XCTAssertTrue(surface.appendSystemText(handoffSlice))
     }
 
     XCTAssertLessThanOrEqual(
@@ -1998,7 +2067,7 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     XCTAssertTrue(surface.runtimeHealth().outputPartial)
   }
 
-  func testWeeksOfHighVolumeLiveWritesStayBoundedAndRetainNewestBytes() throws {
+  func testWeeksOfHighVolumeLiveWritesStayBoundedAndRetainNewestBytes() async throws {
     let db = try SQLiteDB(path: ":memory:")
     try Schema.migrate(db)
     let repository = TerminalOutputRepository(db: db)
@@ -2015,12 +2084,24 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
 
     // Model more than a month of daily 1 MiB bursts without a restart. The
     // storage ceiling must depend on the rolling window, not session age.
+    // Each burst is fed as four handoff-sized slices (256 KiB): a single
+    // larger payload streams through the one system-output lease, and the next
+    // burst would be refused as `system_output_busy` before history sees it.
+    let handoffBytes = 256 * 1024
     for index in 0..<34 {
       let marker = String(format: "RC2_HISTORY_%03d|", index)
-      surface.appendSystemText(
-        marker + String(repeating: "x", count: payloadBytes - marker.utf8.count))
-      surface.flushPersistedHistory()
-      RunLoop.main.run(until: Date().addingTimeInterval(0.002))
+      let burst = marker + String(repeating: "x", count: payloadBytes - marker.utf8.count)
+      var offset = burst.startIndex
+      while offset < burst.endIndex {
+        let end = burst.index(offset, offsetBy: handoffBytes, limitedBy: burst.endIndex) ?? burst.endIndex
+        XCTAssertTrue(surface.appendSystemText(String(burst[offset..<end])))
+        offset = end
+      }
+      // Bytes parked behind the one in-flight SQLite write drain on the main
+      // actor, so a blocking main-thread wait cannot see them land; await the
+      // barrier the way the app's quit flush does.
+      let flushed = await surface.flushPersistedHistoryAsync(timeout: 10)
+      XCTAssertTrue(flushed, "burst \(index) must be durable before the next one")
     }
 
     XCTAssertLessThanOrEqual(

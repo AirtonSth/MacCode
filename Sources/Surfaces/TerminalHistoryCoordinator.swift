@@ -224,7 +224,16 @@ private final class TerminalHistoryPendingDeleteRegistry: @unchecked Sendable {
     }
 
     func resetForTesting() {
+        // A lock-bound attempt can still be inside its retry window when the
+        // quit deadline expires (late dispatch under load). Simulated process
+        // exit waits for it to end instead of racing it into the precondition.
+        let quiescenceDeadline = Date().addingTimeInterval(10)
         lock.lock()
+        while entries.values.contains(where: { $0.isRunning }), Date() < quiescenceDeadline {
+            lock.unlock()
+            Thread.sleep(forTimeInterval: 0.01)
+            lock.lock()
+        }
         precondition(
             entries.values.allSatisfy { !$0.isRunning },
             "pending delete attempts must be quiescent before simulating process exit"
@@ -474,10 +483,10 @@ private final class TerminalHistoryQueueState: @unchecked Sendable {
     private var retryDeadline = Date.distantFuture
     private var retriesCancelled = false
 
-    func beginFlushIfPermitted() -> Bool {
+    func beginFlushIfPermitted(bypassingInFlightCap: Bool = false) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        guard TerminalHistoryFlushBackpressure.shouldEnqueueWrite(
+        guard bypassingInFlightCap || TerminalHistoryFlushBackpressure.shouldEnqueueWrite(
             inFlightCount: inFlightFlushCount
         ) else { return false }
         inFlightFlushCount += 1
@@ -488,6 +497,12 @@ private final class TerminalHistoryQueueState: @unchecked Sendable {
         condition.lock()
         inFlightFlushCount = max(0, inFlightFlushCount - 1)
         condition.unlock()
+    }
+
+    func hasInFlightFlush() -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return inFlightFlushCount > 0
     }
 
     func recordFailure() {
@@ -822,6 +837,14 @@ final class TerminalHistoryCoordinator {
     private var preparationState: PreparationState = .idle
     private var deferredOperations: [DeferredOperation] = []
     private var deferredBarrier: (state: TerminalHistoryBarrierState, failureGeneration: UInt64)?
+    /// Barriers requested while accepted bytes were still parked behind the one
+    /// in-flight SQLite write. They are queued once the drain hands the last
+    /// parked byte to the serial history queue.
+    private var drainBarriers: [(
+        state: TerminalHistoryBarrierState,
+        failureGeneration: UInt64,
+        cancelRetriesOnCompletion: Bool
+    )] = []
     private var finalBarrier: TerminalHistoryBarrierState?
     private var prepareStartedAt: Date?
     private var activeReadOperation: TerminalHistoryReadOperation?
@@ -919,6 +942,13 @@ final class TerminalHistoryCoordinator {
             globalRetentionByteCapForTesting ?? Self.maxGlobalPersistedBytes
         )
         self.bytesSinceRetentionCheck = self.effectiveRetentionCheckInterval
+    }
+
+    deinit {
+        // Parked bytes die with the coordinator; never leave a waiter hanging.
+        for barrier in drainBarriers {
+            barrier.state.complete(success: false)
+        }
     }
 
     /// - Parameters:
@@ -1355,6 +1385,9 @@ final class TerminalHistoryCoordinator {
             ingestReadyData(extra)
         }
         flushReadyPending()
+        if pendingData.isEmpty, deferredReadyData.isEmpty {
+            releaseDrainBarriers()
+        }
     }
 
     private func ingestReadyData(_ data: Data) {
@@ -1459,7 +1492,11 @@ final class TerminalHistoryCoordinator {
         }
         let failureGeneration = queueState.currentFailureGeneration()
         if case .ready = preparationState {
-            flushReadyPending()
+            if finalizing {
+                handParkedBytesToWriterQueueForFinalization()
+            } else {
+                flushReadyPending()
+            }
             schedulePendingRetentionCheckIfNeeded()
             scheduleBarrier(
                 state,
@@ -1470,6 +1507,24 @@ final class TerminalHistoryCoordinator {
             deferredBarrier = (state, failureGeneration)
         }
         return state.surfaceBarrier()
+    }
+
+    /// Quit waits for the finalizing barrier synchronously on the main thread,
+    /// while parked bytes normally drain through a main-queue hop after each
+    /// finished write. Queue every parked chunk on the serial writer now so the
+    /// barrier lands behind them without the main thread. Writes stay serial,
+    /// and the backlog is bounded because finalizing already stopped accepting.
+    private func handParkedBytesToWriterQueueForFinalization() {
+        while true {
+            flushReadyPending(bypassingInFlightCap: true)
+            guard pendingData.isEmpty, !deferredReadyData.isEmpty else { break }
+            let take = min(Self.maxChunkBytes, deferredReadyData.count)
+            pendingData = Data(deferredReadyData.prefix(take))
+            deferredReadyData.removeFirst(take)
+        }
+        if pendingData.isEmpty, deferredReadyData.isEmpty {
+            releaseDrainBarriers()
+        }
     }
 
     func readPersistedWindow(
@@ -1504,13 +1559,15 @@ final class TerminalHistoryCoordinator {
         return try await operation.value(timeout: timeout)
     }
 
-    private func flushReadyPending() {
+    private func flushReadyPending(bypassingInFlightCap: Bool = false) {
         guard let repository,
               case .ready = preparationState,
               let chunkIndex = nextChunkIndex,
               let writerGeneration,
               !pendingData.isEmpty else { return }
-        guard queueState.beginFlushIfPermitted() else { return }
+        guard queueState.beginFlushIfPermitted(
+            bypassingInFlightCap: bypassingInFlightCap
+        ) else { return }
 
         let data = pendingData
         pendingData = Data()
@@ -1785,6 +1842,9 @@ final class TerminalHistoryCoordinator {
                 self,
                 didEncounter: staleWriter ? .staleWriterGeneration : .persistenceFailure
             )
+            // The failure generation already moved, so a parked barrier can
+            // only resolve false; do not hold it behind the remaining drain.
+            releaseDrainBarriers()
         } else {
             outstandingBytes = max(0, outstandingBytes - byteCount)
             if outstandingBytes == 0 {
@@ -2309,6 +2369,41 @@ final class TerminalHistoryCoordinator {
         failureGeneration: UInt64,
         cancelRetriesOnCompletion: Bool = false
     ) {
+        // Only one SQLite write is in flight at a time; later accepted bytes
+        // wait in pendingData/deferredReadyData and drain one chunk per finished
+        // write. Queued now, the barrier would run before them and report bytes
+        // that were never written as durable.
+        if !pendingData.isEmpty || !deferredReadyData.isEmpty,
+           queueState.hasInFlightFlush() {
+            drainBarriers.append((state, failureGeneration, cancelRetriesOnCompletion))
+            return
+        }
+        enqueueBarrier(
+            state,
+            failureGeneration: failureGeneration,
+            cancelRetriesOnCompletion: cancelRetriesOnCompletion
+        )
+    }
+
+    private func releaseDrainBarriers() {
+        guard !drainBarriers.isEmpty else { return }
+        let barriers = drainBarriers
+        drainBarriers.removeAll()
+        schedulePendingRetentionCheckIfNeeded()
+        for barrier in barriers {
+            enqueueBarrier(
+                barrier.state,
+                failureGeneration: barrier.failureGeneration,
+                cancelRetriesOnCompletion: barrier.cancelRetriesOnCompletion
+            )
+        }
+    }
+
+    private func enqueueBarrier(
+        _ state: TerminalHistoryBarrierState,
+        failureGeneration: UInt64,
+        cancelRetriesOnCompletion: Bool
+    ) {
         let queueState = queueState
         queue.async {
             let currentFailureGeneration = queueState.currentFailureGeneration()
@@ -2606,6 +2701,10 @@ final class TerminalHistoryCoordinator {
             barrier.state.complete(success: false)
             deferredBarrier = nil
         }
+        for barrier in drainBarriers {
+            barrier.state.complete(success: false)
+        }
+        drainBarriers.removeAll()
         for operation in deferredOperations {
             switch operation {
             case .read(let operation, _, _, _):

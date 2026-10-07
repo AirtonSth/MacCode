@@ -9,25 +9,6 @@ import AgentRuntime
 /// Regression pins for TODO.md F2 (2026-09-14): work in the Agent App transcript
 /// that grew with the number of turns / items / streamed text per frame.
 final class TranscriptGrowthPerfTests: XCTestCase {
-    // MARK: AA-24
-
-    func test_timelineItemStructureKey_changesOnlyWhenTheItemSetChanges() {
-        // WHY: the Token Saver per-item translation index walked every item of
-        // the thread on every stream quantum. It is rebuilt only when this key
-        // (or the translations) change; body deltas must not move it.
-        var s = AssistantTimelineState()
-        s.apply(.turnStarted(turnId: "t1"))
-        s.apply(.itemStarted(item: AssistantItem(id: "a", turnId: "t1", type: .assistantMessage, startedAtMs: 1)))
-        let before = AgentAppViewModel.timelineItemStructureKey(s.turns)
-        s.apply(.itemDelta(itemId: "a", bodyAppend: "more text", outputAppend: nil, summary: nil))
-        XCTAssertEqual(AgentAppViewModel.timelineItemStructureKey(s.turns), before, "a body delta is not a structural change")
-        s.apply(.itemStarted(item: AssistantItem(id: "b", turnId: "t1", type: .tool, startedAtMs: 2)))
-        XCTAssertNotEqual(AgentAppViewModel.timelineItemStructureKey(s.turns), before, "a new item must invalidate the index")
-        let afterItem = AgentAppViewModel.timelineItemStructureKey(s.turns)
-        s.apply(.turnStarted(turnId: "t2"))
-        XCTAssertNotEqual(AgentAppViewModel.timelineItemStructureKey(s.turns), afterItem, "a new turn must invalidate the index")
-    }
-
     // MARK: AA-28
 
     func test_updatePlan_contentFingerprintsMakeEqualRowsNoOpWithoutDeepCompare() {

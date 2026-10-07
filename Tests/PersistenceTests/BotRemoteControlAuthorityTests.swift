@@ -1267,8 +1267,8 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             XCTAssertEqual(callbackText, "Use this exact route")
             XCTAssertNil(callbackConversationID,
                          "the first send must let the host create and return the authoritative conversation")
-            XCTAssertEqual(callbackRouting["routing_receipt_id"] as? String, routingReceiptID)
-            XCTAssertEqual(callbackRouting["run_as_user"] as? NSDictionary, runAs as NSDictionary)
+            XCTAssertEqual(callbackRouting?["routing_receipt_id"] as? String, routingReceiptID)
+            XCTAssertEqual(callbackRouting?["run_as_user"] as? NSDictionary, runAs as NSDictionary)
             return [
                 "bot_id": botID,
                 "conversation_id": conversationID,
@@ -2664,6 +2664,36 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             FileManager.default.fileExists(atPath: BotGuestHome.url(appSupport: supportDir, botID: BotID(botUUID)).path),
             "container teardown failure must not skip the independent Bot Home wipe"
         )
+    }
+
+    func test_deleteDockerBotWhoseGuestARunStarted_tearsDownItsContainer() throws {
+        // WHY: in the sandbox E2E a group turn started a Docker bot's
+        // container (no `bot.guest.start`, so no remote guest state). A paired
+        // device's `bot.delete` then reported cleanup_complete while the
+        // container kept running. A Logical-space bot must not pay a teardown.
+        let docker = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "docker-create", "name": "Docker A",
+        ])
+        let dockerID = try XCTUnwrap(docker["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.desktop.set", params: [
+            "client_request_id": "docker-desktop", "bot_id": dockerID, "kind": "dockerDesktop",
+        ])
+        let logical = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "logical-create", "name": "Logical B",
+        ])
+        let logicalID = try XCTUnwrap(logical["bot_id"] as? String)
+        var cleared: [BotID] = []
+        authority.onDockerClear = { cleared.append($0) }
+
+        let deleted = try authority.dispatch(method: "bot.delete", params: [
+            "client_request_id": "docker-delete", "bot_id": dockerID, "confirm": "delete",
+        ])
+        _ = try authority.dispatch(method: "bot.delete", params: [
+            "client_request_id": "logical-delete", "bot_id": logicalID, "confirm": "delete",
+        ])
+
+        XCTAssertEqual(cleared, [BotID(try XCTUnwrap(UUID(uuidString: dockerID)))])
+        XCTAssertEqual(deleted["status"] as? String, "completed")
     }
 
     func test_deleteSidecarFailureIsPartialAndRelaunchPrunesLegacyAuthority() throws {

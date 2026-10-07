@@ -472,8 +472,8 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
     }
 
     func test_coalesceApplicationFrames_agentDeltaUsesThreadItemTupleAndMonotonicReceipt() throws {
-        // WHY: provider item IDs can repeat across threads, while a trusted
-        // distill_applied bit must survive later nil/false append frames.
+        // WHY: provider item IDs can repeat across threads, so only deltas that
+        // share both thread_id and item_id may concatenate.
         let trustedA = try eventJSON(
             seq: 1,
             kind: "agent.item.delta",
@@ -482,7 +482,6 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
                 "turn_id": "turn-a",
                 "item_id": "shared",
                 "text": "A",
-                "distill_applied": true,
             ]
         )
         let threadB = try eventJSON(
@@ -493,7 +492,6 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
                 "turn_id": "turn-b",
                 "item_id": "shared",
                 "text": "X",
-                "distill_applied": false,
             ]
         )
         let laterA = try eventJSON(
@@ -504,7 +502,6 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
                 "turn_id": "turn-a",
                 "item_id": "shared",
                 "text": "B",
-                "distill_applied": false,
             ]
         )
         let legacyWithoutThread = try eventJSON(
@@ -530,8 +527,6 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         }
         XCTAssertEqual(payloads[0]["thread_id"] as? String, "thread-a")
         XCTAssertEqual(payloads[0]["text"] as? String, "AB")
-        XCTAssertEqual(payloads[0]["distill_applied"] as? Bool, true,
-                       "false from a later delta must not erase trusted true")
         XCTAssertEqual(payloads[1]["thread_id"] as? String, "thread-b")
         XCTAssertEqual(payloads[1]["text"] as? String, "X")
         XCTAssertNil(payloads[2]["thread_id"],
@@ -539,10 +534,10 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
         XCTAssertEqual(payloads[2]["text"] as? String, "legacy")
     }
 
-    func test_coalesceApplicationFrames_keepsTurnScopedDistillTruthSeparateFromReusedItemID() throws {
-        // WHY: a provider may reuse an item id in another turn. The host-only
-        // attestation must remain its own turn-scoped reducer frame instead of
-        // being OR-carried onto ordinary or later-turn content.
+    func test_coalesceApplicationFrames_keepsTurnScopedDeltasSeparateFromReusedItemID() throws {
+        // WHY: a provider may reuse an item id in another turn. Each turn's
+        // delta must stay its own frame instead of being concatenated onto
+        // ordinary or later-turn content.
         let trusted = try eventJSON(
             seq: 1,
             kind: "agent.item.delta",
@@ -550,7 +545,7 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
                 "thread_id": "thread-a",
                 "turn_id": "turn-a",
                 "item_id": "shared",
-                "distill_applied": true,
+                "text": "turn a content",
             ]
         )
         let ordinary = try eventJSON(
@@ -569,7 +564,7 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
                 "thread_id": "thread-a",
                 "turn_id": "turn-b",
                 "item_id": "shared",
-                "distill_applied": false,
+                "text": "turn b content",
             ]
         )
 
@@ -587,10 +582,10 @@ final class ParserAndSequenceAuthorityTests: XCTestCase {
             return try XCTUnwrap(object["payload"] as? [String: Any])
         }
         XCTAssertEqual(payloads[0]["turn_id"] as? String, "turn-a")
-        XCTAssertEqual(payloads[0]["distill_applied"] as? Bool, true)
-        XCTAssertNil(payloads[1]["distill_applied"])
+        XCTAssertEqual(payloads[0]["text"] as? String, "turn a content")
         XCTAssertEqual(payloads[1]["text"] as? String, "new turn content")
         XCTAssertEqual(payloads[2]["turn_id"] as? String, "turn-b")
+        XCTAssertEqual(payloads[2]["text"] as? String, "turn b content")
     }
 
     func test_coalesceApplicationFrames_doesNotCrossNewTurnStartForUnscopedDeltas() throws {

@@ -66,8 +66,6 @@ public struct CapacityWorkloadSpec: Sendable, Codable, Equatable {
     public var terminalCount: Int
     public var clientCount: Int
     public var faultKinds: [String]
-    public var tokenSaverMode: String
-    public var graphifyMode: String
 
     public init(
         roots: Int,
@@ -83,9 +81,7 @@ public struct CapacityWorkloadSpec: Sendable, Codable, Equatable {
         byteRatePerSecond: Double,
         terminalCount: Int,
         clientCount: Int,
-        faultKinds: [String],
-        tokenSaverMode: String,
-        graphifyMode: String
+        faultKinds: [String]
     ) {
         self.roots = roots
         self.nestedNodes = nestedNodes
@@ -101,8 +97,6 @@ public struct CapacityWorkloadSpec: Sendable, Codable, Equatable {
         self.terminalCount = terminalCount
         self.clientCount = clientCount
         self.faultKinds = faultKinds
-        self.tokenSaverMode = tokenSaverMode
-        self.graphifyMode = graphifyMode
     }
 }
 
@@ -255,9 +249,7 @@ public struct CapacityQualificationManifest: Sendable, Codable, Equatable {
                 byteRatePerSecond: 2_000_000,
                 terminalCount: 8,
                 clientCount: 4,
-                faultKinds: ["malformed_frame", "reorder", "pipe_pressure", "stop_race", "resume"],
-                tokenSaverMode: "on_and_off",
-                graphifyMode: "on_and_off"
+                faultKinds: ["malformed_frame", "reorder", "pipe_pressure", "stop_race", "resume"]
             ),
             estimator: CapacityEstimatorSpec(
                 minWarmedSamples: 3,

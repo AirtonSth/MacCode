@@ -44,6 +44,7 @@ final class BotComputerWorkspaceMountTests: XCTestCase {
     private func makeService(
         _ scripted: ScriptedDocker,
         stored: [String] = [],
+        vmRuns: BotVMRunRegistry = BotVMRunRegistry(),
         workspacesWriter: @escaping @Sendable (Data, URL) throws -> Void = { try $0.write(to: $1, options: .atomic) }
     ) throws -> (BotComputerGuestService, BotID, URL) {
         let support = FileManager.default.temporaryDirectory
@@ -54,6 +55,7 @@ final class BotComputerWorkspaceMountTests: XCTestCase {
             docker: BotComputerDockerCLI(run: { try scripted.run($0) }),
             observeAttempts: 1,
             observeDelay: 0,
+            vmRuns: vmRuns,
             workspacesWriter: workspacesWriter
         )
         if !stored.isEmpty {
@@ -67,11 +69,42 @@ final class BotComputerWorkspaceMountTests: XCTestCase {
     func test_sameLabelDoesNotRecreateContainer() throws {
         // WHY: recreating a running container would kill the bot's browser session for nothing.
         let label = BotComputerGuestSpec.workspacesLabel([workspace])
-        let scripted = ScriptedDocker(canonicalLabels: [BotComputerGuestSpec.workspacesLabelKey: label])
+        let scripted = ScriptedDocker(canonicalLabels: [
+            BotComputerGuestSpec.workspacesLabelKey: label,
+            BotComputerGuestSpec.runtimeLabelKey: BotComputerGuestSpec.runtimeRevision,
+        ])
         let (service, botID, _) = try makeService(scripted, stored: [workspace])
         try service.ensureWorkspaceMounted(botID: botID, workspace: workspace, registered: [workspace])
         XCTAssertFalse(scripted.verbs.contains("create"))
         XCTAssertEqual(scripted.verbs, [])
+    }
+
+    func test_staleRuntimeLabelSwapsInCurrentCreateOptionsOnlyWhileTheBotIsIdle() throws {
+        // WHY: a container made with older create options lacks the agent-kit
+        // bind, --init and the host alias, so it must be replaced, through the
+        // same backup swap. But while a run holds the bot that container is the
+        // run's machine: replacing it would kill what the run has inside.
+        let labels = [BotComputerGuestSpec.workspacesLabelKey: BotComputerGuestSpec.workspacesLabel([workspace])]
+
+        let idle = ScriptedDocker(canonicalLabels: labels)
+        let (idleService, idleBot, support) = try makeService(idle, stored: [workspace])
+        try idleService.ensureWorkspaceMounted(botID: idleBot, workspace: workspace, registered: [workspace])
+        XCTAssertEqual(idle.verbs, ["stop", "rename", "create", "start", "rm"])
+        let create = try XCTUnwrap(idle.calls.first { $0.first == "create" })
+        XCTAssertTrue(create.contains("\(BotComputerGuestSpec.runtimeLabelKey)=\(BotComputerGuestSpec.runtimeRevision)"))
+        XCTAssertTrue(create.contains("--init"))
+        XCTAssertTrue(create.contains(
+            "\(BotComputerGuestSpec.guestToolsURL(appSupport: support).path):\(BotComputerGuestSpec.agentKitMountPoint):ro"
+        ))
+
+        let busy = ScriptedDocker(canonicalLabels: labels)
+        let registry = BotVMRunRegistry()
+        let (busyService, busyBot, _) = try makeService(busy, stored: [workspace], vmRuns: registry)
+        registry.begin(botID: busyBot, entry: .init(
+            threadID: AgentThreadID(), runID: AgentRunID(), title: "Fix CI", workspace: workspace
+        ))
+        try busyService.ensureWorkspaceMounted(botID: busyBot, workspace: workspace, registered: [workspace])
+        XCTAssertEqual(busy.verbs, [], "an active run keeps its container until it finishes")
     }
 
     func test_differentLabelSwapsAtomically() throws {

@@ -3,9 +3,10 @@ import Darwin
 @testable import AgentRuntime
 
 final class ChildProcessPipeDeadlockTests: XCTestCase {
-    func test_gitProbeSurvivesStderrFlood_becauseAnUndrainedStderrPipeBlocksStdoutForever() throws {
-        // WHY: the probe read stdout to EOF while stderr sat in a second, undrained
-        // pipe. A git that warns > 64 KiB before printing blocks both processes forever.
+    func test_gitHelperSurvivesStderrFlood_becauseAnUndrainedStderrPipeBlocksStdoutForever() throws {
+        // WHY: a helper that reads stdout to EOF while stderr sits in a second,
+        // undrained pipe hangs forever: a git that warns > 64 KiB before
+        // printing blocks both processes.
         let shimDir = NSTemporaryDirectory() + "rc2-git-shim-" + UUID().uuidString
         try FileManager.default.createDirectory(atPath: shimDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: shimDir) }
@@ -16,8 +17,8 @@ final class ChildProcessPipeDeadlockTests: XCTestCase {
         #!/bin/sh
         head -c 200000 /dev/zero | tr '\\0' w >&2
         case "$*" in
-          *--show-toplevel*) echo "\(repo)" ;;
-          *--git-common-dir*) echo ".git" ;;
+          *--is-inside-work-tree*) echo "true" ;;
+          *--abbrev-ref*) echo "main" ;;
         esac
         """.write(toFile: shim, atomically: true, encoding: .utf8)
         chmod(shim, 0o755)
@@ -25,13 +26,13 @@ final class ChildProcessPipeDeadlockTests: XCTestCase {
         setenv("PATH", shimDir + ":" + originalPath, 1)
         defer { setenv("PATH", originalPath, 1) }
 
-        let finished = expectation(description: "probe returns")
-        var identity: GraphifyGitProbe.RepoIdentity?
+        let finished = expectation(description: "git helper returns")
+        var branches: GitBranches?
         DispatchQueue.global(qos: .userInitiated).async {
-            identity = GraphifyGitProbe.identity(at: repo)
+            branches = GitDiff.branches(in: repo)
             finished.fulfill()
         }
         wait(for: [finished], timeout: 10)
-        XCTAssertEqual(identity?.toplevel, repo)
+        XCTAssertEqual(branches?.current, "main")
     }
 }

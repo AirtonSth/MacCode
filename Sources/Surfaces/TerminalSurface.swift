@@ -614,11 +614,23 @@ private final class TerminalReaderWillPublishHook: @unchecked Sendable {
 final class TerminalMemoryBudgetAuthority {
     static let shared = TerminalMemoryBudgetAuthority(maxRetainedBytes: 64 * 1024 * 1024)
 
+    /// What OS memory-pressure relief may do with an owner. Only the normal
+    /// budget (`enforceBudget`) may take an already compacted owner further,
+    /// to dormant; pressure relief stops at the compact stage.
+    enum PressureState {
+        case reclaimable
+        /// A program is running in the foreground. Spared on a warning.
+        case liveForegroundJob
+        /// Already compacted or dormant. Never reclaimed again by pressure.
+        case compacted
+    }
+
     private final class Entry {
         weak var owner: AnyObject?
         let retainedBytes: () -> Int
         let priority: () -> Int
         let reclaim: () -> Void
+        let pressureState: () -> PressureState
         var lastTouched: UInt64
 
         init(
@@ -626,12 +638,14 @@ final class TerminalMemoryBudgetAuthority {
             retainedBytes: @escaping () -> Int,
             priority: @escaping () -> Int,
             reclaim: @escaping () -> Void,
+            pressureState: @escaping () -> PressureState,
             lastTouched: UInt64
         ) {
             self.owner = owner
             self.retainedBytes = retainedBytes
             self.priority = priority
             self.reclaim = reclaim
+            self.pressureState = pressureState
             self.lastTouched = lastTouched
         }
     }
@@ -649,7 +663,8 @@ final class TerminalMemoryBudgetAuthority {
         owner: AnyObject,
         retainedBytes: @escaping () -> Int,
         priority: @escaping () -> Int,
-        reclaim: @escaping () -> Void
+        reclaim: @escaping () -> Void,
+        pressureState: @escaping () -> PressureState = { .reclaimable }
     ) -> UUID {
         purgeReleasedOwners()
         clock &+= 1
@@ -659,6 +674,7 @@ final class TerminalMemoryBudgetAuthority {
             retainedBytes: retainedBytes,
             priority: priority,
             reclaim: reclaim,
+            pressureState: pressureState,
             lastTouched: clock
         )
         return token
@@ -705,6 +721,39 @@ final class TerminalMemoryBudgetAuthority {
                 attempted.removeAll(keepingCapacity: true)
             }
         }
+    }
+
+    /// OS memory-pressure relief. Reclaims owners whose priority is at most
+    /// `maxPriority`, least recently used first, until retained bytes are at or
+    /// below `ceiling`. Unlike `enforceBudget`, it only ever takes the compact
+    /// step: owners already compacted are skipped, on this event and on every
+    /// later one, so repeated warnings or criticals never make a hidden
+    /// terminal dormant and blank its mirror. With `spareLiveForegroundJobs`,
+    /// owners running a foreground program are skipped too. Returns how many
+    /// owners actually shrank.
+    @discardableResult
+    func relieveMemoryPressure(ceiling: Int, maxPriority: Int, spareLiveForegroundJobs: Bool) -> Int {
+        purgeReleasedOwners()
+        let candidates = entries.values
+            .filter { $0.owner != nil && $0.priority() <= maxPriority }
+            .sorted { $0.lastTouched < $1.lastTouched }
+        var reclaimed = 0
+        for entry in candidates {
+            guard retainedBytesForTesting > max(0, ceiling) else { break }
+            guard entry.owner != nil else { continue }
+            switch entry.pressureState() {
+            case .compacted:
+                continue
+            case .liveForegroundJob where spareLiveForegroundJobs:
+                continue
+            case .reclaimable, .liveForegroundJob:
+                break
+            }
+            let before = max(0, entry.retainedBytes())
+            entry.reclaim()
+            if max(0, entry.retainedBytes()) < before { reclaimed += 1 }
+        }
+        return reclaimed
     }
 
     var retainedBytesForTesting: Int {
@@ -1086,6 +1135,11 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         return view.window?.firstResponder === ghosttyView ? 2 : 1
     }
 
+    private var terminalMemoryPressureState: TerminalMemoryBudgetAuthority.PressureState {
+        if terminalMemoryWasReclaimed || terminalMemoryIsDormant { return .compacted }
+        return foregroundJobAlive ? .liveForegroundJob : .reclaimable
+    }
+
     /// Reclaims a terminal according to its visibility. Hidden terminals can
     /// release the native surface entirely. Visible terminals retain their PTY
     /// and current frame, but rebuild Ghostty from that bounded frame so old
@@ -1336,10 +1390,24 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         return (0x2800...0x28FF).contains(scalar.value)
     }
 
-    /// `title` without its leading braille spinner run and the " - " that follows it.
+    /// Glyphs TUIs animate or park at the start of the OSC title: braille spinners,
+    /// ◐◑◒◓ / ◴◵◶◷ quarter circles, and Claude Code's ·✢✳✶✻✽ stars (✳ is its idle mark).
+    nonisolated static func isTitleSpinnerGlyph(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { scalar in
+            switch scalar.value {
+            case 0x2800...0x28FF, 0x25D0...0x25D3, 0x25F4...0x25F7,
+                 0x00B7, 0x2722, 0x2733, 0x2736, 0x273B, 0x273D, 0xFE0E, 0xFE0F:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    /// `title` without its leading spinner-glyph run and the " - " that follows it.
     nonisolated static func stableTitle(_ title: String) -> String {
-        guard hasSpinnerTitle(title) else { return title }
-        var rest = Substring(title).drop { $0.unicodeScalars.allSatisfy { (0x2800...0x28FF).contains($0.value) } }
+        guard let first = title.first, isTitleSpinnerGlyph(first) else { return title }
+        var rest = Substring(title).drop(while: isTitleSpinnerGlyph)
         rest = rest.drop { $0.isWhitespace }
         if rest.first == "-" { rest = rest.dropFirst().drop { $0.isWhitespace } }
         return String(rest)
@@ -1917,7 +1985,8 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             owner: self,
             retainedBytes: { [weak self] in self?.terminalMemoryRetainedBytes ?? 0 },
             priority: { [weak self] in self?.terminalMemoryReclaimPriority ?? 0 },
-            reclaim: { [weak self] in self?.reclaimTerminalMemoryUnderPressure() }
+            reclaim: { [weak self] in self?.reclaimTerminalMemoryUnderPressure() },
+            pressureState: { [weak self] in self?.terminalMemoryPressureState ?? .compacted }
         )
         applyTerminalSize(TerminalViewportGeometry.fallbackSize, sendToPTY: false, force: true)
         replayPersistedHistoryIfNeeded()

@@ -238,5 +238,20 @@ final class AgentComposerChromeTests: XCTestCase {
             bots.contains("Auto-accept edits"),
             "Desk must use AgentPermissionMode.displayName, not a second permission string"
         )
+        // An unlinked (empty) conversation has no embedded Agent App yet. Its
+        // composer must mount the Agent App's own Distill Main/Worker pills,
+        // bound to deskRouting, so the first message can choose its model.
+        XCTAssertTrue(agent.contains("AgentDistillModelPills("))
+        let unlinked = try XCTUnwrap(
+            bots.range(of: "private func deskUnlinkedComposer").map { String(bots[$0.lowerBound...]) },
+            "Desk keeps a composer for conversations with no linked thread"
+        )
+        let unlinkedComposer = unlinked.components(separatedBy: "private func deskDesktopPane").first ?? ""
+        XCTAssertTrue(unlinkedComposer.contains("leadingControls:"),
+                      "the empty-thread composer must not be a bare bar without model chips")
+        XCTAssertTrue(unlinkedComposer.contains("AgentDistillModelPills("),
+                      "the empty-thread Main/Worker chips must be the shared Agent App component")
+        XCTAssertTrue(unlinkedComposer.contains("onSelectMainModel: vm.setDeskModel"),
+                      "the Main pick must write deskRouting, which the first send freezes")
     }
 }

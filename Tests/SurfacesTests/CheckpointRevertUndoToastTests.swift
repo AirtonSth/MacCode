@@ -63,7 +63,10 @@ final class CheckpointRevertUndoToastTests: XCTestCase {
         let messageRepo = AgentMessageRepository(db: db)
         let runRepo = AgentRunRepository(db: db)
         let checkpointRepo = AgentTurnCheckpointRepository(db: db)
-        let thread = AgentThread(title: "revert-undo", provider: .codex, model: "fake-model")
+        // selectThread refuses a persisted thread from another workspace (a nil
+        // workspace included), so the fixture thread must belong to the VM's.
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "revert-undo", provider: .codex, model: "fake-model")
         let runOne = AgentRunID()
         let runTwo = AgentRunID()
         let assistantOne = AgentMessage(threadId: thread.id, role: .assistant, content: "turn one")
@@ -94,10 +97,11 @@ final class CheckpointRevertUndoToastTests: XCTestCase {
         let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
                                               threadRepo: threadRepo, checkpointRepo: checkpointRepo,
                                               providerAdapters: [.codex: StubRollbackAdapter(provider: .codex)])
-        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: repoDir,
+        let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: repoDir,
                                    coordinator: coordinator, threadRepo: threadRepo,
                                    messageRepo: messageRepo, checkpointRepo: checkpointRepo)
         vm.selectThread(thread.id)
+        XCTAssertEqual(vm.selectedThreadId, thread.id, "revert acts on the selected thread")
         vm.providerSnapshots = [
             AgentProviderSnapshotFactory.snapshot(
                 provider: .codex,

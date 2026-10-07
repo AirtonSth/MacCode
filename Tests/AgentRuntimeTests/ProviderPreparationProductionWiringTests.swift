@@ -682,7 +682,7 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
     }
 
     /// RPC-style stopRun during reservation-only preflight must cancel the run
-    /// so a late startRun cannot spawn (Graphify await window).
+    /// so a late startRun cannot spawn (preparation await window).
     func test_stopRun_cancelsReservedPreflight_beforePendingRegister() async throws {
         let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-rpc-stop")
         let thread = AgentThread(title: "prep-rpc-stop", provider: .codex, model: "fake-model")
@@ -698,7 +698,7 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
 
         let runId = AgentRunID()
         coordinator.reserveProviderStart(threadId: thread.id, runId: runId)
-        // No durable pending/active yet — pure Graphify preflight reservation.
+        // No durable pending/active yet — pure preflight reservation.
         coordinator.stopRun(threadId: thread.id)
 
         do {
@@ -761,7 +761,7 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
             providers: [.codex: runner]
         )
 
-        // Graphify-only cancel: no reserve, no pending start.
+        // Preparation-only cancel: no reserve, no pending start.
         coordinator.cancelPreparation(threadId: thread.id)
 
         let runId = try await coordinator.startRun(AgentRunRequest(

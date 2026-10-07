@@ -180,16 +180,9 @@ final class LoginShellEnvironmentTests: XCTestCase {
             "LOGIN_ONLY": "login-only-token",
         ]
         LoginShellEnvironment.setForTesting(loginInherited)
-        let receipt = TokenSaverExecutionReceiptSeam.admit(
-            tokenSaverEnabled: true,
-            sameUser: true,
-            sidecarAvailable: true,
-            provider: .codex,
-            threadId: "10000000-0000-0000-0000-000000000001",
-            rootRunId: "40000000-0000-0000-0000-000000000004",
-            attemptId: "50000000-0000-0000-0000-000000000005"
-        )
-        var exactOverrides = TokenSaverExecutionReceiptSeam.environment(from: receipt)
+        var exactOverrides = [
+            "RC_REMOTE_CODE_SUBAGENT_THREAD_ID": "10000000-0000-0000-0000-000000000001"
+        ]
         exactOverrides[BotSecretEnvironment.botIDEnvironmentKey] = botB
         exactOverrides[BotSecretEnvironment.secretNamesEnvironmentKey] = "SERVICE_TOKEN"
         exactOverrides["SERVICE_TOKEN"] = "bot-b-token"
@@ -205,6 +198,6 @@ final class LoginShellEnvironmentTests: XCTestCase {
         XCTAssertEqual(env["SERVICE_TOKEN"], "bot-b-token")
         XCTAssertNil(env["GUI_ONLY"])
         XCTAssertNil(env["LOGIN_ONLY"])
-        XCTAssertEqual(env["RC_TOKEN_SAVER_THREAD_ID"], "10000000-0000-0000-0000-000000000001")
+        XCTAssertEqual(env["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"], "10000000-0000-0000-0000-000000000001")
     }
 }

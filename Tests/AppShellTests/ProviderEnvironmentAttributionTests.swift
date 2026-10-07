@@ -5,11 +5,10 @@ import Persistence
 import SocketServer
 @testable import AppShell
 
-/// Regression for the Token Saver savings-attribution bug: command-output savings from the
-/// agent's `cmd | distill` were recorded under provider "unknown" because the agent's
-/// environment lacked REMOTE_CODE_AGENT_PROVIDER. The source of every agent run's
-/// environment is providerEnvironment(provider:instanceId:); it must ALWAYS tag the provider,
-/// even when there is no instance config (the path that previously returned an empty env).
+/// The source of every agent run's environment is providerEnvironment(provider:instanceId:).
+/// It must ALWAYS tag the provider (REMOTE_CODE_AGENT_PROVIDER), even when there is no
+/// instance config (the path that once returned an empty env and attributed child work
+/// to "unknown"), and it must never carry the removed Token Saver keys.
 final class ProviderEnvironmentAttributionTests: XCTestCase {
     @MainActor
     private func admittedThread(in context: AppContext, provider: AgentProvider) throws -> AgentThread {
@@ -18,40 +17,24 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             provider: provider, model: "test", status: .completed
         )
         try context.threadRepo.upsert(thread)
-        try context.tokenSaverLaneStateRepo.upsert(.init(
-            projectID: thread.projectId!.value.uuidString,
-            lane: "deterministic_wrapper",
-            state: "promoted",
-            reason: "test",
-            evidenceLevel: "provider_usage",
-            ownerRole: "Operations Owner:test",
-            permissionBoundary: "project",
-            retentionDays: 30,
-            optedOut: false,
-            killSwitchActive: false,
-            attributionJoined: true,
-            reconciliationPassed: true,
-            usageSemanticsAvailable: true,
-            scorecardID: "test-scorecard"
-        ))
         return thread
     }
 
     @MainActor
-    func test_autoAndNestedWorkerEnvironmentsCarryFullTokenSaverTechniqueSurface() async throws {
-        // WHY: product rule — every Auto/orchestrate controller and every
-        // orchestrated worker must receive the full Token Saver technique set
-        // (receipt, DISTILL_HINT, managed PATH, Distill state for Claude,
-        // Subagents lifecycle). providerEnvironment is the building block for
-        // the Auto send base and completeOrchestratedWorkerEnvironment; if it
-        // drops any of these keys, workers inherit a thinned host surface.
+    func test_autoAndNestedWorkerEnvironmentsCarryHostProviderSurface() async throws {
+        // WHY: every Auto/orchestrate controller and every orchestrated worker
+        // must receive the same host surface (provider tag, Subagents lifecycle,
+        // managed PATH for nested provider proxies). providerEnvironment is the
+        // building block for the Auto send base and
+        // completeOrchestratedWorkerEnvironment; if it drops any of these keys,
+        // workers inherit a thinned host surface. Token Saver was removed, so a
+        // preference an older build left ON must add none of its keys.
         let appSupport = NSTemporaryDirectory() + "RC2AutoWorkerTS-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         let router = AppCommandRouter(context: context)
         let workspace = try router.createWorkspace(name: "auto-ts", cwd: NSTemporaryDirectory())
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        try seedLegacyTokenSaverOn(context.settingsRepo)
 
         for provider in [AgentProvider.claude, .codex, .grok] {
             let thread = try admittedThread(in: context, provider: provider)
@@ -65,13 +48,9 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
                 instanceId: bound.providerInstanceId,
                 threadId: bound.id
             )
-            XCTAssertEqual(
-                env["RC_TOKEN_SAVER_DISTILL_HINT"], "1",
-                "\(provider) primary/Auto controller must admit distill"
-            )
-            XCTAssertNotNil(
-                env[TokenSaverExecutionReceipt.envKey],
-                "\(provider) must carry execution receipt for nested inheritance"
+            XCTAssertTrue(
+                env.keys.filter { $0.hasPrefix("RC_TOKEN_SAVER_") }.isEmpty,
+                "\(provider) must carry no Token Saver keys"
             )
             XCTAssertEqual(env["REMOTE_CODE_AGENT_PROVIDER"], provider.rawValue)
             XCTAssertEqual(
@@ -84,28 +63,17 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             XCTAssertFalse(managed.isEmpty, "\(provider) managed bin")
             XCTAssertTrue(
                 path.hasPrefix(managed + ":") || path == managed,
-                "\(provider) PATH must front managed wrappers for | distill / proxies: \(path)"
+                "\(provider) PATH must front managed bin for nested provider proxies: \(path)"
             )
-            if provider == .claude {
-                XCTAssertEqual(env["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
-                XCTAssertNotNil(env["REMOTE_CODE_DISTILL_STATE_PATH"])
-            }
-            let dialect = AgentSkillInstaller.tokenSaverProviderPrompt(
-                "orchestrate work",
-                environment: env
-            )
-            XCTAssertTrue(
-                dialect.contains("| distill"),
-                "\(provider) dialect must require | distill when admitted"
-            )
+            XCTAssertNil(env["REMOTE_CODE_DISTILL_STATE_PATH"])
         }
     }
 
     @MainActor
-    func test_nestedAgentAppInheritsProjectScopeAndTokenSaverAdmission() async throws {
+    func test_nestedAgentAppInheritsProjectScope() async throws {
         // WHY: a cross-provider child must keep the host-validated project
-        // scope of its active parent; otherwise the same Token Saver lanes that
-        // protect the main Agent App silently turn off for the subagent.
+        // scope (and workspace, run-as user, execution mode) of its active
+        // parent; otherwise the subagent runs outside the parent's scope.
         let appSupport = NSTemporaryDirectory() + "RC2NestedProject-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
@@ -121,22 +89,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             permissionMode: .fullAccess
         )
         try context.threadRepo.upsert(parentThread)
-        try context.tokenSaverLaneStateRepo.upsert(.init(
-            projectID: projectID.value.uuidString,
-            lane: "deterministic_wrapper",
-            state: "promoted",
-            reason: "test",
-            evidenceLevel: "provider_usage",
-            ownerRole: "Operations Owner:test",
-            permissionBoundary: "project",
-            retentionDays: 30,
-            optedOut: false,
-            killSwitchActive: false,
-            attributionJoined: true,
-            reconciliationPassed: true,
-            usageSemanticsAvailable: true,
-            scorecardID: "nested-project"
-        ))
         let parentRunID = AgentRunID()
         let parentCapability = AgentDelegationCapability.issue()
         _ = try context.orchestrationRuntime.recordExternalRoot(
@@ -150,8 +102,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
                 parentCapability
             )
         )
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        try seedLegacyTokenSaverOn(context.settingsRepo)
 
         let child = try await router.createAgentThreadRouting(
             workspace: workspace.id,
@@ -178,13 +129,12 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertEqual(child.workspaceId, parentThread.workspaceId)
         XCTAssertEqual(child.runAsUser, parentThread.runAsUser)
         XCTAssertEqual(child.executionMode, parentThread.executionMode)
-        XCTAssertEqual(
+        XCTAssertNil(
             router.providerEnvironment(
                 provider: .grok,
                 instanceId: child.providerInstanceId,
                 threadId: child.id
-            )["RC_TOKEN_SAVER_DISTILL_HINT"],
-            "1"
+            )["RC_TOKEN_SAVER_DISTILL_HINT"]
         )
     }
 
@@ -272,7 +222,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertEqual(
             router.providerEnvironment(provider: .claude, instanceId: nil)["REMOTE_CODE_AGENT_PROVIDER"],
             "claude",
-            "the agent environment must tag the provider so `| distill` savings attribute to claude, not unknown"
+            "the agent environment must tag the provider so child work attributes to claude, not unknown"
         )
         XCTAssertEqual(
             router.providerEnvironment(provider: .codex, instanceId: nil)["REMOTE_CODE_AGENT_PROVIDER"],
@@ -301,10 +251,10 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertNil(grok["DISTILL_HOME"])
     }
 
-    /// Token economy is paid: with Token Saver off, no distill hint / PostToolUse.
-    /// With Token Saver on, every provider gets the distill hint; Claude also gets PostToolUse.
+    /// Token Saver was removed: no provider gets the distill hint or Claude's
+    /// PostToolUse hook, even when an older build left the preference ON.
     @MainActor
-    func test_providerEnvironment_emitsDistillHintOnlyWhenTokenSaverEnabled() throws {
+    func test_providerEnvironment_neverEmitsTokenSaverKeys_evenWithLegacyPreferenceOn() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ProvEnvHint-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
         let router = AppCommandRouter(context: ctx)
@@ -312,7 +262,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
         let grokThread = try admittedThread(in: ctx, provider: .grok)
 
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        ctx.reconcileManagedIntegration()
         XCTAssertNil(
             router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"]
         )
@@ -320,32 +270,27 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_POST_TOOL_USE"]
         )
 
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        try seedLegacyTokenSaverOn(ctx.settingsRepo)
 
-        XCTAssertEqual(
-            router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"],
-            "1"
+        XCTAssertNil(
+            router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"]
         )
-        XCTAssertEqual(
-            router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"],
-            "1"
+        XCTAssertNil(
+            router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"]
         )
-        XCTAssertEqual(
-            router.providerEnvironment(provider: .grok, instanceId: nil, threadId: grokThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"],
-            "1"
+        XCTAssertNil(
+            router.providerEnvironment(provider: .grok, instanceId: nil, threadId: grokThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"]
         )
-        XCTAssertEqual(
+        XCTAssertNil(
             router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_POST_TOOL_USE"],
-            "1",
-            "Claude's PostToolUse compression hook is Token Saver only"
+            "a legacy ON preference must not bring back Claude's PostToolUse compression hook"
         )
     }
 
     @MainActor
     func test_providerEnvironment_alwaysCarriesSubagentTelemetryScope_withoutTokenSaverLanes() throws {
-        // WHY: Subagents activity is user-visible even when Token Saver is off;
-        // telemetry must remain scoped without accidentally enabling compression.
+        // WHY: Subagents activity is user-visible; telemetry must stay scoped
+        // without enabling any compression lane.
         let appSupport = NSTemporaryDirectory() + "RC2SubagentTelemetryEnv-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
         let router = AppCommandRouter(context: ctx)
@@ -366,177 +311,12 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         }
     }
 
-    /// The Token Saver env is built in ONE place (AppContext.tokenSaverAgentEnvironment) and shared
-    /// by both the normal run path (providerEnvironment) and the recovered-session path (the
-    /// coordinator rebuilds its own request env, bypassing providerEnvironment). Before this was
-    /// shared, recovered sessions silently dropped the distill hint and stopped piping/speaking
-    /// distill on resume even with Token Saver on. Codex must get the distill hint only; Claude
-    /// additionally gets the PostToolUse compression vars.
+    /// Nested provider proxies only resolve inside Codex/Claude provider shells if the
+    /// managed bin directory wins PATH lookup inside the provider process.
     @MainActor
-    func test_tokenSaverAgentEnvironment_isSharedAndProviderScoped() throws {
-        let appSupport = NSTemporaryDirectory() + "RC2TSEnv-" + UUID().uuidString
+    func test_providerEnvironmentPrependsManagedBinToProviderPath() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2ProvEnvPath-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        let codexThread = try admittedThread(in: ctx, provider: .codex)
-        let claudeThread = try admittedThread(in: ctx, provider: .claude)
-
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
-
-        // Token Saver off → no token-economy env.
-        let codexOff = ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: codexThread.id)
-        XCTAssertTrue(codexOff.isEmpty, "Token Saver off must not emit distill/hint env")
-        XCTAssertNil(codexOff["RC_TOKEN_SAVER_POST_TOOL_USE"])
-
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
-
-        let codex = ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: codexThread.id)
-        XCTAssertEqual(codex["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
-        XCTAssertEqual(codex["RC_TOKEN_SAVER_WORKSPACE_ID"], codexThread.workspaceId?.value.uuidString)
-        XCTAssertEqual(codex["RC_TOKEN_SAVER_PROJECT_ID"], codexThread.projectId?.value.uuidString)
-        XCTAssertEqual(codex["RC_TOKEN_SAVER_THREAD_ID"], codexThread.id.value.uuidString)
-        XCTAssertNil(codex["RC_TOKEN_SAVER_ATTEMPT_ID"], "the coordinator binds a fresh attempt per run")
-        XCTAssertNil(codex["RC_TOKEN_SAVER_POST_TOOL_USE"],
-                     "PostToolUse auto-compression is Claude-SDK-only; Codex must not carry it")
-        XCTAssertNotNil(codex["REMOTE_CODE_DISTILL_STATE_PATH"],
-                        "Codex PATH wrappers need the same sidecar lease as explicit distill")
-
-        let claude = ctx.tokenSaverAgentEnvironment(provider: .claude, threadId: claudeThread.id)
-        XCTAssertEqual(claude["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
-        XCTAssertEqual(claude["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
-        XCTAssertNotNil(claude["REMOTE_CODE_DISTILL_STATE_PATH"])
-    }
-
-    /// WHY: one wrapper pass enumerates every PATH directory, stats the catalog
-    /// candidates and walks every managed link — thousands of syscalls on the
-    /// MainActor before each admitted run, and a second run of the same turn
-    /// redid all of it for a system that had not changed. The pass must still run
-    /// when the system changes (a command installed into a PATH directory is
-    /// wrapped, a link removed from the managed bin comes back), so the reuse is
-    /// keyed on the exact inputs of the pass, not on a session flag.
-    @MainActor
-    func test_commandWrapperPass_reusesUnchangedPathsAndRepeatsWhenTheyChange() throws {
-        let root = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("RC2WrapperReuse-" + UUID().uuidString, isDirectory: true)
-        let pathDirectory = root.appendingPathComponent("pathdir", isDirectory: true)
-        // The managed bin stays the user's own: the installer resolves its service
-        // binary from the running bundle, and the Token Saver runtime gate refuses
-        // to admit a home override. Only the effective PATH is synthetic.
-        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory()
-        try FileManager.default.createDirectory(at: pathDirectory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        try Self.writeExecutableProbe(at: pathDirectory.appendingPathComponent("rcprobe-one"))
-        try Self.writeExecutableProbe(at: pathDirectory.appendingPathComponent("rcprobe-two"))
-
-        let context = try AppContext(
-            channel: .debug,
-            appSupportOverride: root.appendingPathComponent("support", isDirectory: true).path
-        )
-        let thread = try admittedThread(in: context, provider: .codex)
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
-        let base = ["PATH": pathDirectory.path]
-
-        // First admitted turn: the pass runs and wraps what the effective PATH offers.
-        _ = context.tokenSaverAgentEnvironment(
-            provider: .codex, threadId: thread.id, baseEnvironment: base
-        )
-        XCTAssertEqual(context.commandWrapperRefreshCountForTesting, 1)
-        XCTAssertTrue(
-            FileManager.default.fileExists(
-                atPath: managedBin.appendingPathComponent("rcprobe-one").path
-            ),
-            "a command that only exists in the effective PATH must be wrapped"
-        )
-
-        // Second run, unchanged system: reuse the last pass instead of re-enumerating.
-        _ = context.tokenSaverAgentEnvironment(
-            provider: .codex, threadId: thread.id, baseEnvironment: base
-        )
-        XCTAssertEqual(
-            context.commandWrapperRefreshCountForTesting, 1,
-            "an unchanged PATH, binary and managed bin must not re-enumerate every directory"
-        )
-
-        // A command installed into a PATH directory changes that directory: new pass.
-        try Self.writeExecutableProbe(at: pathDirectory.appendingPathComponent("rcprobe-three"))
-        _ = context.tokenSaverAgentEnvironment(
-            provider: .codex, threadId: thread.id, baseEnvironment: base
-        )
-        XCTAssertEqual(
-            context.commandWrapperRefreshCountForTesting, 2,
-            "a newly installed command must still get its wrapper"
-        )
-        XCTAssertTrue(
-            FileManager.default.fileExists(
-                atPath: managedBin.appendingPathComponent("rcprobe-three").path
-            )
-        )
-
-        // A link removed from the managed bin changes the managed bin itself.
-        try FileManager.default.removeItem(at: managedBin.appendingPathComponent("rcprobe-two"))
-        _ = context.tokenSaverAgentEnvironment(
-            provider: .codex, threadId: thread.id, baseEnvironment: base
-        )
-        XCTAssertEqual(context.commandWrapperRefreshCountForTesting, 3)
-        XCTAssertTrue(
-            FileManager.default.fileExists(
-                atPath: managedBin.appendingPathComponent("rcprobe-two").path
-            ),
-            "a wrapper removed under us must be repaired"
-        )
-
-        // And the reuse holds again once the system settles.
-        _ = context.tokenSaverAgentEnvironment(
-            provider: .codex, threadId: thread.id, baseEnvironment: base
-        )
-        XCTAssertEqual(context.commandWrapperRefreshCountForTesting, 3)
-    }
-
-    private static func writeExecutableProbe(at url: URL) throws {
-        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: url)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
-    }
-
-    /// WHY: production threads are often projectless (project_id nil). Previously
-    /// recovery headers required full project admission, so PATH distill never got
-    /// scope and store-before-loss forced every compression to verbatim.
-    @MainActor
-    func test_tokenSaverAgentEnvironment_injectsWorkspaceFallbackScopeForProjectlessThread() throws {
-        let appSupport = NSTemporaryDirectory() + "RC2TSEnvProjectless-" + UUID().uuidString
-        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
-        let workspaceID = WorkspaceID()
-        let thread = AgentThread(
-            projectId: nil,
-            workspaceId: workspaceID,
-            title: "projectless",
-            provider: .codex,
-            model: "test",
-            status: .completed
-        )
-        try ctx.threadRepo.upsert(thread)
-
-        let env = ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: thread.id)
-        XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
-        XCTAssertEqual(env["RC_TOKEN_SAVER_WORKSPACE_ID"], workspaceID.value.uuidString)
-        XCTAssertEqual(
-            env["RC_TOKEN_SAVER_PROJECT_ID"],
-            workspaceID.value.uuidString,
-            "projectless threads must use workspace id as recovery project key"
-        )
-        XCTAssertEqual(env["RC_TOKEN_SAVER_THREAD_ID"], thread.id.value.uuidString)
-    }
-
-    /// Transparent command wrappers only help Codex/Claude provider shells if the managed bin
-    /// directory wins PATH lookup inside the provider process. With Token Saver on,
-    /// providerEnvironment prepends managed bin so `| distill` and wrappers resolve.
-    @MainActor
-    func test_providerEnvironmentPrependsManagedWrapperBinToProviderPath() throws {
-        let appSupport = NSTemporaryDirectory() + "RC2TSEnvPath-" + UUID().uuidString
-        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         let router = AppCommandRouter(context: ctx)
         let codexThread = try admittedThread(in: ctx, provider: .codex)
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
@@ -545,15 +325,15 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let codexPath = try XCTUnwrap(router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["PATH"])
         let claudePath = try XCTUnwrap(router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["PATH"])
 
-        XCTAssertTrue(codexPath.hasPrefix(managedBin + ":"), "Codex provider shell must resolve wrapped commands through managed bin first")
-        XCTAssertTrue(claudePath.hasPrefix(managedBin + ":"), "Claude provider shell must resolve wrapped commands through managed bin first")
+        XCTAssertTrue(codexPath.hasPrefix(managedBin + ":"), "Codex provider shell must resolve nested provider proxies through managed bin first")
+        XCTAssertTrue(claudePath.hasPrefix(managedBin + ":"), "Claude provider shell must resolve nested provider proxies through managed bin first")
     }
 
-    /// Nested provider proxies must resolve even when Token Saver is off: Subagents
-    /// telemetry is always-on, and bare `grok`/`claude`/`codex` shell calls need the
-    /// managed PATH controller without any distillation lane.
+    /// Nested provider proxies must always resolve: Subagents telemetry is always-on,
+    /// and bare `grok`/`claude`/`codex` shell calls need the managed PATH controller
+    /// without any distillation lane.
     @MainActor
-    func test_providerEnvironmentPrependsManagedBin_whenTokenSaverOff() throws {
+    func test_providerEnvironmentPrependsManagedBinForEveryProvider() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ProvProxyPathOff-" + UUID().uuidString
         let skillsHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("RC2ProvProxyHome-\(UUID().uuidString)", isDirectory: true)
@@ -563,8 +343,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             appSupportOverride: appSupport,
             agentSkillsHomeOverrideForTesting: skillsHome
         )
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = false }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        ctx.reconcileManagedIntegration()
         let router = AppCommandRouter(context: ctx)
         let managedBin = skillsHome.appendingPathComponent(".remote-code/bin").path
         let shellBridge = skillsHome.appendingPathComponent(".remote-code/shell/zsh").path
@@ -575,7 +354,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             let path = try XCTUnwrap(env["PATH"], "\(provider) must expose PATH with managed bin")
             XCTAssertTrue(
                 path.hasPrefix(managedBin + ":") || path == managedBin,
-                "\(provider): managed bin must lead PATH when Token Saver is off for nested provider proxies"
+                "\(provider): managed bin must lead PATH for nested provider proxies"
             )
             XCTAssertEqual(env["RC_REMOTE_CODE_SUBAGENT_THREAD_ID"], thread.id.value.uuidString)
             XCTAssertEqual(env["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
@@ -636,44 +415,6 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             env["ZDOTDIR"],
             skillsHome.appendingPathComponent(".remote-code/shell/zsh").path
         )
-
-        ctx.tokenSaverEntitlementModelValidationOverrideForTesting = .installed
-        PrivateAccountSessionStore(repo: ctx.settingsRepo).save(.init(
-            accessToken: "test-access",
-            refreshToken: "test-refresh",
-            user: .init(
-                daysRemaing: nil,
-                daysRemaining: 30,
-                email: "paid@example.com",
-                id: "paid",
-                subscribed: true
-            )
-        ))
-        XCTAssertEqual(
-            ctx.applyTokenSaverLifecycle(
-                requestedEnabled: true,
-                modelValidation: .installed,
-                persistPreference: true
-            ),
-            .enabled
-        )
-        // This environment-only test has no packaged sidecar executable. Put
-        // the controller back on the explicit XCTest injected-ready seam after
-        // lifecycle admission so the assertion exercises the emitted runtime
-        // environment rather than a synthetic process-launch failure.
-        ctx.tokenSaverDistillServiceController.stop()
-        let tokenSaverEnv = router.providerEnvironment(
-            provider: .claude,
-            instanceId: "claude-isolated",
-            threadId: thread.id
-        )
-        XCTAssertTrue(
-            tokenSaverEnv["PATH"]?.hasPrefix(
-                skillsHome.appendingPathComponent(".remote-code/bin").path + ":"
-            ) == true,
-            "Token Saver admission must retain the sandboxed managed bin"
-        )
-        XCTAssertEqual(tokenSaverEnv["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
     }
 
     @MainActor
@@ -712,27 +453,26 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
     /// WHY: without the managed PATH here, a resumed parent silently loses the
     /// provider middleware for every nested child even though fresh runs keep it.
     @MainActor
-    func test_recoveryEnvironmentAlwaysCarriesManagedMiddlewarePath_andGatesTokenSaver() async throws {
+    func test_recoveryEnvironmentAlwaysCarriesManagedMiddlewarePath_withoutTokenSaverKeys() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2RecoveryProxyPath-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
         let thread = try admittedThread(in: ctx, provider: .codex)
         let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
         let recoveryEnvironment = try XCTUnwrap(ctx.coordinator.recoveryEnvironmentProvider)
 
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = false }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
-        let disabled = await recoveryEnvironment(.codex, thread.id)
-        let disabledPath = try XCTUnwrap(disabled["PATH"])
-        XCTAssertTrue(disabledPath.hasPrefix(managedBin + ":") || disabledPath == managedBin)
-        XCTAssertEqual(disabled["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
-        XCTAssertNil(disabled["RC_TOKEN_SAVER_DISTILL_HINT"])
+        ctx.reconcileManagedIntegration()
+        let recovered = await recoveryEnvironment(.codex, thread.id)
+        let recoveredPath = try XCTUnwrap(recovered["PATH"])
+        XCTAssertTrue(recoveredPath.hasPrefix(managedBin + ":") || recoveredPath == managedBin)
+        XCTAssertEqual(recovered["RC_REMOTE_CODE_AGENT_APP_MIDDLEWARE"], "1")
+        XCTAssertNil(recovered["RC_TOKEN_SAVER_DISTILL_HINT"])
 
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
-        let enabled = await recoveryEnvironment(.codex, thread.id)
-        let enabledPath = try XCTUnwrap(enabled["PATH"])
-        XCTAssertTrue(enabledPath.hasPrefix(managedBin + ":") || enabledPath == managedBin)
-        XCTAssertEqual(enabled["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        // A preference an older build left ON must not bring the hint back.
+        try seedLegacyTokenSaverOn(ctx.settingsRepo)
+        let legacyOn = await recoveryEnvironment(.codex, thread.id)
+        let legacyOnPath = try XCTUnwrap(legacyOn["PATH"])
+        XCTAssertTrue(legacyOnPath.hasPrefix(managedBin + ":") || legacyOnPath == managedBin)
+        XCTAssertNil(legacyOn["RC_TOKEN_SAVER_DISTILL_HINT"])
     }
 
     /// Without a thread id there is no nested-provider interception scope.

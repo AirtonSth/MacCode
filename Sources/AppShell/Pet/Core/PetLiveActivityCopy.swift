@@ -8,21 +8,15 @@ public enum PetLiveActivityCopy: Sendable {
         public let active: [PetActiveThreadItem]
         public let needsYou: [PetAttentionItem]
         public let completed: [PetAttentionItem]
-        /// One-sentence local-LLM description of what the agent is doing.
-        /// Nil until the on-device model produces one (or forever, when Token
-        /// Saver is off) — the deterministic preview covers that case.
-        public let summary: String?
 
         public init(
             active: [PetActiveThreadItem],
             needsYou: [PetAttentionItem],
-            completed: [PetAttentionItem],
-            summary: String? = nil
+            completed: [PetAttentionItem]
         ) {
             self.active = active
             self.needsYou = needsYou
             self.completed = completed
-            self.summary = summary
         }
 
         public var isEmpty: Bool {
@@ -166,16 +160,12 @@ public enum PetLiveActivityCopy: Sendable {
             let ids: (workspaceId: String?, threadId: String?)
             if hasRedBadges {
                 preview = attentionPreview
-                    ?? input.summary
                     ?? row.lastUpdatePreview
                     ?? row.detail
                     ?? (detailThreadTitle(from: row.detail) ?? row.title)
                 ids = (nil, nil)
             } else {
-                // Real-time progress first; LLM summary only as fallback so a
-                // stale sentence never covers a newer tool/assistant line.
                 preview = row.lastUpdatePreview
-                    ?? input.summary
                     ?? row.detail
                     ?? (detailThreadTitle(from: row.detail) ?? row.title)
                 ids = routeIDs(from: row.route)
@@ -227,7 +217,7 @@ public enum PetLiveActivityCopy: Sendable {
             let head = titles.prefix(2).map { "• \($0)" }.joined(separator: "  · ")
             listPreview = "\(head)  · +\(titles.count - 2) more"
         }
-        let preview = attentionPreview ?? input.summary ?? listPreview
+        let preview = attentionPreview ?? listPreview
 
         return Output(
             title: title,
@@ -299,8 +289,7 @@ public enum PetLiveActivityCopy: Sendable {
         if extra > 0 {
             previewParts.append("+\(extra) more")
         }
-        let preview = input.summary
-            ?? (previewParts.isEmpty ? statusLine : previewParts.joined(separator: " · "))
+        let preview = previewParts.isEmpty ? statusLine : previewParts.joined(separator: " · ")
         let ids = top.map { routeIDs(from: $0.route) } ?? (workspaceId: nil, threadId: nil)
 
         return Output(

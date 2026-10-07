@@ -42,10 +42,17 @@ public enum Schema {
     /// agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list,
     /// v84 adds agent_threads.reasoning_model, and v85 adds scheduled-task
     /// model fields, including repair for databases that already recorded v84,
-    /// and v86 adds agent_threads.actor_json / actor_locked_at / execution_target.
+    /// and v86 adds agent_threads.actor_json / actor_locked_at / execution_target,
+    /// and v87 adds agent_threads.guest_runtime (bot agent runs inside its guest),
+    /// and v88 adds Bot teams and group conversations plus
+    /// bot_conversations.group_id (column added only when missing),
+    /// and v89 adds bot_conversation_routing (per-conversation Bot desk route).
     private static let scheduledTaskModelColumnsSchemaVersion = 85
     private static let threadActorSchemaVersion = 86
-    public static let currentVersion: Int = threadActorSchemaVersion
+    private static let threadGuestRuntimeSchemaVersion = 87
+    static let botTeamsGroupsSchemaVersion = 88
+    static let botConversationRoutingSchemaVersion = 89
+    public static let currentVersion: Int = botConversationRoutingSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1159,9 +1166,6 @@ public enum Schema {
                OR state = 'compensated'
                OR state = 'abandoned';
         """),
-        SchemaStep(84, """
-        ALTER TABLE agent_threads ADD COLUMN reasoning_model TEXT;
-        """),
         // Durable human -> RCW1 disclosure belongs to the retained user message,
         // not the evictable provider stream. The FK keeps storage bounded by the
         // existing 100-message transcript window and removes rows on prune/delete.
@@ -1787,13 +1791,150 @@ public enum Schema {
         CREATE INDEX IF NOT EXISTS idx_agent_threads_workspace_updated
             ON agent_threads(workspace_id, updated_at DESC, id DESC);
         """),
+        SchemaStep(84, """
+        ALTER TABLE agent_threads ADD COLUMN reasoning_model TEXT;
+        """),
         SchemaStep(scheduledTaskModelColumnsSchemaVersion, scheduledTaskModelColumnsMigrationSQL),
         SchemaStep(threadActorSchemaVersion, """
         ALTER TABLE agent_threads ADD COLUMN actor_json TEXT;
         ALTER TABLE agent_threads ADD COLUMN actor_locked_at TEXT;
         ALTER TABLE agent_threads ADD COLUMN execution_target TEXT;
         """),
+        SchemaStep(threadGuestRuntimeSchemaVersion, """
+        ALTER TABLE agent_threads ADD COLUMN guest_runtime TEXT;
+        """),
+        SchemaStep(botTeamsGroupsSchemaVersion, botTeamsGroupsMigrationSQL),
+        SchemaStep(botConversationRoutingSchemaVersion, botConversationRoutingMigrationSQL),
     ]
+
+    /// Additive and idempotent. One row per desk conversation holds the
+    /// encoded Bot desk route (Main/Worker model, efforts, permission, run-as
+    /// user) that the Mac desk and paired `bot.send` both use. Rows go away
+    /// with their conversation.
+    static let botConversationRoutingMigrationSQL: String = """
+        CREATE TABLE IF NOT EXISTS bot_conversation_routing (
+            conversation_id TEXT PRIMARY KEY NOT NULL
+                REFERENCES bot_conversations(id) ON DELETE CASCADE,
+            routing_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+
+    /// Additive and idempotent: every object uses IF NOT EXISTS, and the
+    /// bot_conversations.group_id column is added by `addMissingBotConversationGroupColumn`
+    /// before this SQL runs, so a database that already has it (e.g. from a
+    /// sibling branch) migrates cleanly.
+    static let botTeamsGroupsMigrationSQL: String = """
+        CREATE TABLE IF NOT EXISTS bot_teams (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            avatar_symbol TEXT NOT NULL DEFAULT 'person.3.fill',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_teams_sort
+            ON bot_teams(sort_order, created_at);
+
+        CREATE TABLE IF NOT EXISTS bot_team_members (
+            team_id TEXT NOT NULL,
+            bot_id TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY(team_id, bot_id),
+            FOREIGN KEY(team_id) REFERENCES bot_teams(id) ON DELETE CASCADE,
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_team_members_bot
+            ON bot_team_members(bot_id);
+
+        CREATE TABLE IF NOT EXISTS bot_group_conversations (
+            id TEXT PRIMARY KEY NOT NULL,
+            title TEXT NOT NULL,
+            team_id TEXT,
+            room_thread_id TEXT NOT NULL UNIQUE,
+            policy TEXT NOT NULL DEFAULT 'roundtable'
+                CHECK(policy IN ('roundtable', 'lead', 'mentions_only')),
+            lead_bot_id TEXT,
+            max_auto_hops INTEGER NOT NULL DEFAULT 4
+                CHECK(max_auto_hops BETWEEN 0 AND 8),
+            pinned INTEGER NOT NULL DEFAULT 0,
+            hidden INTEGER NOT NULL DEFAULT 0,
+            unread INTEGER NOT NULL DEFAULT 0,
+            attention_state TEXT NOT NULL DEFAULT 'none',
+            revision INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(team_id) REFERENCES bot_teams(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_group_conversations_updated
+            ON bot_group_conversations(pinned DESC, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS bot_group_participants (
+            group_id TEXT NOT NULL,
+            bot_id TEXT NOT NULL,
+            member_conversation_id TEXT NOT NULL UNIQUE,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            joined_at TEXT NOT NULL,
+            left_at TEXT,
+            seen_room_message_id TEXT,
+            seen_room_created_at TEXT,
+            PRIMARY KEY(group_id, bot_id),
+            FOREIGN KEY(group_id) REFERENCES bot_group_conversations(id) ON DELETE CASCADE,
+            FOREIGN KEY(bot_id) REFERENCES bots(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_group_participants_bot
+            ON bot_group_participants(bot_id);
+
+        CREATE TABLE IF NOT EXISTS bot_group_turns (
+            id TEXT PRIMARY KEY NOT NULL,
+            group_id TEXT NOT NULL,
+            round_id TEXT NOT NULL,
+            trigger_message_id TEXT,
+            bot_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            hop INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL DEFAULT 'planned'
+                CHECK(state IN ('planned', 'waiting_for_bot', 'running', 'completed',
+                                'failed', 'cancelled', 'interrupted', 'skipped')),
+            room_message_id TEXT NOT NULL UNIQUE,
+            member_run_id TEXT,
+            submit_key TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(group_id) REFERENCES bot_group_conversations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_group_turns_group_state
+            ON bot_group_turns(group_id, state, ordinal);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_group_turns_round_bot_hop
+            ON bot_group_turns(round_id, bot_id, hop);
+        CREATE INDEX IF NOT EXISTS idx_bot_group_turns_bot_state
+            ON bot_group_turns(bot_id, state);
+        -- bot.group.send is idempotent by submit_key: a retried send cannot
+        -- insert a second round for the same bots.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_group_turns_submit
+            ON bot_group_turns(group_id, submit_key, bot_id, hop)
+            WHERE submit_key IS NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_bot_conversations_group
+            ON bot_conversations(group_id)
+            WHERE group_id IS NOT NULL;
+        """
+
+    private static func addMissingBotConversationGroupColumn(_ db: SQLiteDB) throws {
+        let statement = try db.prepare("PRAGMA table_info(bot_conversations);")
+        var hasGroupID = false
+        while try statement.step() {
+            if statement.columnText(1) == "group_id" { hasGroupID = true }
+        }
+        statement.reset()
+        if !hasGroupID {
+            try db.execute("ALTER TABLE bot_conversations ADD COLUMN group_id TEXT;")
+        }
+    }
 
     /// Tables that exist in the schema for historical reasons but have no
     /// active repository or call sites in the current codebase.  They are
@@ -1813,6 +1954,35 @@ public enum Schema {
 
     public static func migrate(_ db: SQLiteDB) throws {
         try migrateSteps(db, steps)
+        try healBotTeamsGroupsSchema(db)
+        // Same sibling-branch hazard as teams/groups: a branch that recorded
+        // v89+ first would skip the step. The DDL is idempotent.
+        try db.execute(botConversationRoutingMigrationSQL)
+    }
+
+    /// `migrateSteps` skips by version, not by step. If a sibling branch
+    /// recorded its own step at v88 or later first, the teams/groups step never
+    /// ran. Its objects are additive and idempotent, so re-apply them whenever
+    /// any is missing.
+    static func healBotTeamsGroupsSchema(_ db: SQLiteDB) throws {
+        let probe = try db.prepare("""
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE name IN ('bot_teams', 'bot_team_members', 'bot_group_conversations',
+                           'bot_group_participants', 'bot_group_turns', 'idx_bot_group_turns_submit');
+            """)
+        let objects = try probe.step() ? probe.columnInt64(0) : 0
+        probe.reset()
+        let columns = try db.prepare("PRAGMA table_info(bot_conversations);")
+        var hasGroupID = false
+        while try columns.step() {
+            if columns.columnText(1) == "group_id" { hasGroupID = true }
+        }
+        columns.reset()
+        guard objects < 6 || !hasGroupID else { return }
+        try db.transaction {
+            try addMissingBotConversationGroupColumn(db)
+            try db.execute(botTeamsGroupsMigrationSQL)
+        }
     }
 
     private static func addMissingScheduledTaskModelColumns(_ db: SQLiteDB) throws {
@@ -1861,6 +2031,9 @@ public enum Schema {
                 // Some earlier v84 builds already installed these columns.
                 if step.version == Self.scheduledTaskModelColumnsSchemaVersion {
                     try Self.addMissingScheduledTaskModelColumns(db)
+                } else if step.version == Self.botTeamsGroupsSchemaVersion {
+                    try Self.addMissingBotConversationGroupColumn(db)
+                    try db.execute(step.sql)
                 } else {
                     try db.execute(step.sql)
                 }

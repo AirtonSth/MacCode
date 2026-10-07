@@ -62,17 +62,22 @@ public struct BotComputerActStep: Codable, Equatable, Sendable {
         self.key = key
     }
 
+    /// Pixel coordinates inside the guest Xvfb framebuffer.
+    static func onScreen(_ x: Int, _ y: Int) -> Bool {
+        (0..<BotComputerGuestSpec.screenWidth).contains(x)
+            && (0..<BotComputerGuestSpec.screenHeight).contains(y)
+    }
+
     public func execCommand() throws -> [String] {
         switch action {
         case "click":
-            guard let x, let y, (0...1600).contains(x), (0...1200).contains(y) else {
+            guard let x, let y, Self.onScreen(x, y) else {
                 throw BotComputerGuestError.observeFailed
             }
             return ["env", "DISPLAY=:1", "xdotool", "mousemove", "\(x)", "\(y)", "click", "1"]
         case "drag":
             guard let x, let y, let toX, let toY,
-                  (0...1600).contains(x), (0...1200).contains(y),
-                  (0...1600).contains(toX), (0...1200).contains(toY),
+                  Self.onScreen(x, y), Self.onScreen(toX, toY),
                   x != toX || y != toY else {
                 throw BotComputerGuestError.observeFailed
             }

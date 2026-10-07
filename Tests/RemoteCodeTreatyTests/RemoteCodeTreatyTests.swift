@@ -38,6 +38,31 @@ final class RemoteCodeTreatyTests: XCTestCase {
         XCTAssertNil(object["client_request_id"])
     }
 
+    func testBotSendParamsCarryTheDistillWorkerRoute() throws {
+        // WHY: a paired send must be able to name the exact Worker/efforts the
+        // routing receipt admitted; older clients omit them unchanged.
+        let params = BotSend.Params(
+            botID: "bot-1",
+            text: "hello",
+            submitKey: "return",
+            workerModel: "worker-a",
+            workerEffort: "high",
+            distillMainEffort: "auto"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(params)) as? [String: Any]
+        )
+        XCTAssertEqual(object["worker_model"] as? String, "worker-a")
+        XCTAssertEqual(object["worker_effort"] as? String, "high")
+        XCTAssertEqual(object["distill_main_effort"] as? String, "auto")
+        XCTAssertEqual(try JSONDecoder().decode(BotSend.Params.self, from: encoder.encode(params)), params)
+
+        let legacy = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: encoder.encode(BotSend.Params(botID: "bot-1", text: "hi", submitKey: "return"))
+        ) as? [String: Any])
+        XCTAssertNil(legacy["worker_model"], "absent Worker fields stay off the wire")
+    }
+
     func testBotSendResultDecodesCurrentStartedReceipt() throws {
         let data = Data(#"""
         {
@@ -198,6 +223,25 @@ final class RemoteCodeTreatyTests: XCTestCase {
         )
     }
 
+    /// C-W: the client compares this digest with the welcome's
+    /// `capabilitiesDigest`; hosts that predate it must still decode (nil).
+    func testAuthenticatedCapabilitiesDigestIsOptional() throws {
+        func envelope(_ extra: String) throws -> AuthenticatedCapabilities {
+            try decoder.decode(AuthenticatedCapabilities.self, from: Data(#"""
+            {
+              "authenticated":true,"server_id":"host-1","boot_epoch":42,\#(extra)
+              "capabilities":{"surface_types":["terminal"],
+                "agent":{"providers":["codex"],"supports_stream_events":true,"supports_resume":true}}
+            }
+            """#.utf8))
+        }
+        XCTAssertNil(try envelope("").capabilitiesDigest)
+        XCTAssertEqual(
+            try envelope(#""capabilities_digest":"abc123","#).capabilitiesDigest,
+            "abc123"
+        )
+    }
+
     func testCompatibilityAcceptsLegacyV0V1AndFutureMinorButRejectsIncompatibleMajor() {
         XCTAssertEqual(TreatyCompatibility.evaluate(host: nil), .compatibleLegacyV0)
         XCTAssertEqual(
@@ -252,7 +296,7 @@ final class RemoteCodeTreatyTests: XCTestCase {
     }
 
     func testEveryKnownEventKindHasAnIdentityBearingGoldenEnvelope() throws {
-        XCTAssertEqual(RemoteCodeEventKind.allCases.count, 144)
+        XCTAssertEqual(RemoteCodeEventKind.allCases.count, 150)
         XCTAssertEqual(
             Set(RemoteCodeEventKind.allCases.map(\.rawValue)).count,
             RemoteCodeEventKind.allCases.count

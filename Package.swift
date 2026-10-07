@@ -17,7 +17,6 @@ let package = Package(
         .library(name: "CoreModel", targets: ["CoreModel"]),
         .library(name: "Persistence", targets: ["Persistence"]),
         .library(name: "AgentRuntime", targets: ["AgentRuntime"]),
-        .library(name: "DistillCore", targets: ["DistillCore"]),
         .library(name: "SocketServer", targets: ["SocketServer"]),
         .library(name: "Surfaces", targets: ["Surfaces"]),
         .library(name: "AppLifecycleSupport", targets: ["AppLifecycleSupport"]),
@@ -25,17 +24,7 @@ let package = Package(
         .library(name: "RemoteCodeTreaty", targets: ["RemoteCodeTreaty"])
     ],
     dependencies: [
-        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0"),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
-        // Direct dependency on mlx-swift (already resolved transitively by mlx-swift-lm)
-        // so DistillCore can `import MLX` to bound the Metal buffer cache. Constraint
-        // mirrors mlx-swift-lm's to keep resolution to the same revision.
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
-        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
-        // swift-transformers 1.3.3 still expects Jinja object keys to be String.
-        // Pin the last compatible Jinja release until transformers adopts ObjectKey.
-        .package(url: "https://github.com/huggingface/swift-jinja.git", exact: "2.3.6"),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0")
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.0.0")
     ],
     targets: [
         .binaryTarget(
@@ -86,37 +75,13 @@ let package = Package(
                 .linkedFramework("Security")
             ]
         ),
-        .target(
-            name: "DistillCore",
-            dependencies: [
-                "CoreModel",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXLLM", package: "mlx-swift-lm"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
-                .product(name: "MLXEmbedders", package: "mlx-swift-lm"),
-                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
-                .product(name: "HuggingFace", package: "swift-huggingface"),
-                .product(name: "Tokenizers", package: "swift-transformers")
-            ],
-            path: "Sources/DistillCore",
-            linkerSettings: [
-                // Read-only transcript search over the host database, Vision OCR,
-                // AVFoundation keyframes and the TCC-gated speech recognizer.
-                .linkedLibrary("sqlite3"),
-                .linkedFramework("Vision"),
-                .linkedFramework("AVFoundation"),
-                .linkedFramework("Speech"),
-                .linkedFramework("CoreGraphics"),
-                .linkedFramework("CoreMedia")
-            ]
-        ),
         .executableTarget(
             name: "RemoteCodeScheduledTaskAgent",
             path: "Sources/RemoteCodeScheduledTaskAgent"
         ),
         .executableTarget(
             name: "RemoteCodeDistillService",
-            dependencies: ["DistillCore", "AgentRuntime", "Persistence"],
+            dependencies: ["AgentRuntime", "Persistence"],
             path: "Sources/RemoteCodeDistillService"
         ),
         .executableTarget(
@@ -164,7 +129,6 @@ let package = Package(
                 "CoreModel",
                 "Persistence",
                 "AgentRuntime",
-                "DistillCore",
                 "SocketServer",
                 "RemoteCodeTreaty",
                 "Surfaces",
@@ -177,7 +141,8 @@ let package = Package(
             exclude: ["RemoteCode.entitlements"],
             resources: [
                 .copy("Resources/Pet"),
-                .copy("Resources/ComputerGuest")
+                .copy("Resources/ComputerGuest"),
+                .copy("Resources/GuestAgentKit")
             ],
             linkerSettings: [
                 .linkedFramework("IOKit")
@@ -204,22 +169,11 @@ let package = Package(
         ),
         .testTarget(
             name: "AgentRuntimeTests",
-            // DistillCore: ProviderProxyLifecycleTests imports it directly.
-            dependencies: ["AgentRuntime", "CoreModel", "GitTestSupport", "DistillCore"],
+            dependencies: ["AgentRuntime", "CoreModel", "GitTestSupport"],
             path: "Tests/AgentRuntimeTests",
             resources: [
                 .copy("Fixtures")
             ]
-        ),
-        .testTarget(
-            name: "DistillCoreTests",
-            dependencies: [
-                "DistillCore",
-                "AgentRuntime",
-                "Persistence",
-                .product(name: "MLXLLM", package: "mlx-swift-lm")
-            ],
-            path: "Tests/DistillCoreTests"
         ),
         .testTarget(
             name: "SocketServerTests",
@@ -236,7 +190,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AppShellTests",
-            dependencies: ["AppShell", "AppLifecycleSupport", "CoreModel", "DistillCore", "Persistence", "SocketServer", "Surfaces"],
+            dependencies: ["AppShell", "AppLifecycleSupport", "CoreModel", "Persistence", "RemoteCodeTreaty", "SocketServer", "Surfaces"],
             path: "Tests/AppShellTests"
         ),
         .testTarget(

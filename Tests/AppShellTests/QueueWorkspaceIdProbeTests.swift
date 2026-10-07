@@ -107,10 +107,10 @@ final class QueueWorkspaceIdProbeTests: XCTestCase {
             encoding: .utf8
         )
         let publishRange = try XCTUnwrap(
-            source.range(of: "private func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage)")
+            source.range(of: "func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage)")
         )
         let publishBody = String(source[publishRange.lowerBound...].prefix(1800))
-        XCTAssertTrue(publishBody.contains("threadRepo.workspaceId(of: message.threadId)"))
+        XCTAssertTrue(publishBody.contains("context?.threadRepo.workspaceId(of: message.threadId)"))
         XCTAssertFalse(publishBody.contains("threadRepo.get(id: message.threadId)"))
 
         let refreshRange = try XCTUnwrap(source.range(of: "private func refreshAgentSurfaces("))

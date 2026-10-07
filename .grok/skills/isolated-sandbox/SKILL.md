@@ -31,7 +31,7 @@ Identity, ports, and App Support are defined only in that script. Print them wit
 - `osascript` quit `io.remotecode.desktop`
 - `scripts/run-app.sh` (stable bundle id + quit host). `script/build_and_run.sh` is allowed; it routes to this sandbox.
 - `git checkout production` / reset / commit in the primary worktree
-- Token Saver / `~/.local/bin/distill` install from the sandbox
+- Touching `~/.remote-code/bin` or `~/.local/bin/distill` from the sandbox; keep `RC2_DISABLE_MANAGED_DISTILL_RECONCILE=1`
 - `open dist/RemoteCode.app` (stable packaging)
 
 `RC2_SURFACE_ID` in this shell means you are inside the host app. `isolated-sandbox.sh run` is still allowed; `run-app.sh` is not.

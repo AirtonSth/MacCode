@@ -26,9 +26,4 @@ final class AgentProviderInstructionTextTests: XCTestCase {
         XCTAssertTrue(planInstructions.contains("Plan only"))
         XCTAssertTrue(planInstructions.contains("Do not edit"))
     }
-
-    // The Token Saver distill spec is no longer composed in CoreModel — it now rides on top of
-    // this base inside CodexAppServerClient (which owns the full distill body). The on/off
-    // behavior is verified end-to-end there: see CodexAppServerClientTests
-    // test_tokenSaverHint_drivesFullDistillSpecInDeveloperInstructions.
 }

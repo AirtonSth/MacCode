@@ -6,6 +6,16 @@ import Foundation
 public final class ManualActionRequestStore: @unchecked Sendable {
     private let lock = NSLock()
     private let fileURL: URL
+    /// Thread payloads read this on MainActor for every publish: decode the file
+    /// once per change. The stamp also catches writes from another instance
+    /// (each save is atomic, so it replaces the file's inode).
+    private var cache: (stamp: FileStamp, items: [ManualActionRequest])?
+
+    private struct FileStamp: Equatable {
+        let inode: UInt64
+        let size: UInt64
+        let modified: Date
+    }
 
     public init(appSupportDirectory: URL) {
         fileURL = appSupportDirectory
@@ -77,22 +87,84 @@ public final class ManualActionRequestStore: @unchecked Sendable {
         try resolve(id: id, state: .expired)
     }
 
-    public func closeAll(botID: BotID) throws {
-        try lock.withLock {
-            var items = load()
-            var changed = false
-            for index in items.indices where items[index].botID == botID && items[index].state.isOpen {
-                items[index].state = .expired
-                items[index].resolvedAt = Date()
-                changed = true
+    /// The Mac card and the paired-device RPC both go through this: the store write picks the
+    /// single winner and only the winner takes the bot's computer. nil for unknown, taken or closed ids.
+    @discardableResult
+    public func take(id: UUID, control: BotComputerControl) throws -> ManualActionRequest? {
+        guard let taken = try take(id: id) else { return nil }
+        control.take(taken.botID)
+        return taken
+    }
+
+    /// Continue or decline for the Mac card and the paired-device RPC: only the winner hands control
+    /// back and closes the bot's in-memory request. nil for unknown or already closed ids.
+    @discardableResult
+    public func resolve(
+        id: UUID,
+        state: ManualActionState,
+        note: String?,
+        control: BotComputerControl
+    ) throws -> ManualActionRequest? {
+        guard let resolved = try resolve(id: id, state: state, note: note) else { return nil }
+        control.release(resolved.botID)
+        control.dismiss(resolved.id, as: state, note: note)
+        return resolved
+    }
+
+    /// Every thread's open or taken request (the newest when several), read once.
+    public func openByThread() -> [AgentThreadID: ManualActionRequest] {
+        lock.withLock {
+            var open: [AgentThreadID: ManualActionRequest] = [:]
+            for request in load() where request.state.isOpen {
+                if let threadID = request.threadID { open[threadID] = request }
             }
-            if changed { try save(items) }
+            return open
         }
     }
 
+    /// Expires the bot's open and taken requests and returns them; post each with
+    /// `postStateChanged` so Mac cards and paired devices drop the card.
+    @discardableResult
+    public func closeAll(botID: BotID) throws -> [ManualActionRequest] {
+        try lock.withLock {
+            var items = load()
+            var closed: [ManualActionRequest] = []
+            for index in items.indices where items[index].botID == botID && items[index].state.isOpen {
+                items[index].state = .expired
+                items[index].resolvedAt = Date()
+                closed.append(items[index])
+            }
+            if !closed.isEmpty { try save(items) }
+            return closed
+        }
+    }
+
+    /// Mac cards refresh and the host publishes `agent.manual_action.updated` for paired devices.
+    public static func postStateChanged(_ request: ManualActionRequest) {
+        var info: [String: Any] = [BotHostNotificationKey.request: request]
+        if let threadID = request.threadID { info[BotHostNotificationKey.threadID] = threadID }
+        NotificationCenter.default.post(name: .manualActionStateChanged, object: nil, userInfo: info)
+    }
+
     private func load() -> [ManualActionRequest] {
+        guard let stamp = currentStamp() else {
+            cache = nil
+            return []
+        }
+        if let cache, cache.stamp == stamp { return cache.items }
         guard let data = try? Data(contentsOf: fileURL) else { return [] }
-        return (try? JSONDecoder().decode([ManualActionRequest].self, from: data)) ?? []
+        let items = (try? JSONDecoder().decode([ManualActionRequest].self, from: data)) ?? []
+        cache = (stamp, items)
+        return items
+    }
+
+    private func currentStamp() -> FileStamp? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path) else { return nil }
+        return FileStamp(
+            inode: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0,
+            size: (attributes[.size] as? NSNumber)?.uint64Value ?? 0,
+            modified: attributes[.modificationDate] as? Date ?? .distantPast
+        )
     }
 
     private func save(_ items: [ManualActionRequest]) throws {
@@ -101,5 +173,7 @@ public final class ManualActionRequestStore: @unchecked Sendable {
             at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
         )
         try data.write(to: fileURL, options: .atomic)
+        // Re-read once on the next load: a stamp taken now could already be another writer's.
+        cache = nil
     }
 }

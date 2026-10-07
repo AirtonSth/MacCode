@@ -142,7 +142,8 @@ public protocol CommandRouting: AnyObject {
     func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
-    /// Sticky glanceable Token Saver payload for deterministic iOS pull.
+    /// Sticky account usage digest for deterministic iOS pull (deprecated
+    /// `token_saver.digest.get` name kept until iOS bumps its treaty pin).
     func tokenSaverDigest() -> JSONValue?
     func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread
     func listDistillAccounts() -> JSONValue
@@ -336,6 +337,9 @@ public protocol CommandRouting: AnyObject {
         capabilities: [String]?
     ) throws -> JSONValue
     func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws
+    /// True only when the durable push target and attention binding already
+    /// hold exactly what `probe` would write. Read-only.
+    func privatePushRegistrationIsCurrent(_ probe: PrivatePushRegistrationProbe) -> Bool
     // settings
     func settingsGet(keys: [String]) throws -> [String: String]
     func settingsSet(key: String, value: String) throws
@@ -354,9 +358,59 @@ public protocol CommandRouting: AnyObject {
     func filesEditSave(sessionID: String) throws -> JSONValue
     func filesEditDiscard(sessionID: String) throws -> JSONValue
     func filesEditClose(sessionID: String) throws -> JSONValue
+    // manual actions: a bot paused for the user (login, captcha, 2FA, payment, confirm)
+    /// The thread's requests, oldest first. A taken request whose control was lost reads as open.
+    func listManualActions(thread: AgentThreadID) throws -> [ManualActionSnapshot]
+    /// Each thread's open or taken request, for `pending_manual_action` in thread payloads.
+    func pendingManualActions(for threads: [AgentThread]) -> [AgentThreadID: ManualActionSnapshot]
+    /// Single-winner transition shared with the Mac card; refusals are `DefiniteMutationRejection`.
+    func resolveManualAction(thread: AgentThreadID, id: UUID, resolution: ManualActionResolution, note: String?) async throws -> ManualActionResolveOutcome
+    // thread actor: who runs a thread (a bot), where (VM or Mac), and the bot's "run on the Mac?" request
+    /// The thread's guest runtime marker (`BotGuestRuntime`), nil when none.
+    func threadGuestRuntime(thread: AgentThreadID) -> String?
+    /// Every marked thread's guest runtime, read off the main actor (agent.thread.list).
+    func threadGuestRuntimesOffMain() async -> [AgentThreadID: String]
+    /// The bot's pending "run on the Mac?" reason for this thread, nil when none.
+    func pendingMacExecutionReason(thread: AgentThreadID) -> String?
+    /// Locks the thread to `actor` with the composer's lock rules; refusals are `DefiniteMutationRejection`.
+    func setAgentThreadActor(thread: AgentThreadID, actor: RunActor, executionTarget: ExecutionTarget?) async throws -> AgentThread
+    /// Single-winner answer to the bot's Mac-execution request, shared with the Mac banner.
+    func resolveMacExecutionRemote(thread: AgentThreadID, approve: Bool) async throws -> MacExecutionResolveOutcome
+    /// `message` (display text) and `recovery_action` for a replayed `.error`
+    /// event (host capability `agent.run_recovery_action_v1`), from the same
+    /// classifier as the live `agent.run.error` event. Empty leaves the row as stored.
+    func replayedRunErrorFields(message: String, recoverable: Bool) -> [String: JSONValue]
+    /// `agent.attachment.get`: one message attachment's bytes (or a JPEG
+    /// thumbnail), read off the main actor with `AgentAttachmentGetWire.load`.
+    func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue
+    /// `agent.account.usage.get`: stored provider account usage
+    /// (`AgentAccountUsageWire.load`), read off the main actor, no provider probe.
+    func getAgentAccountUsage() async throws -> JSONValue
 }
 
 public extension CommandRouting {
+    func listManualActions(thread: AgentThreadID) throws -> [ManualActionSnapshot] { [] }
+    func pendingManualActions(for threads: [AgentThread]) -> [AgentThreadID: ManualActionSnapshot] { [:] }
+    func resolveManualAction(thread: AgentThreadID, id: UUID, resolution: ManualActionResolution, note: String?) async throws -> ManualActionResolveOutcome {
+        throw JSONRPCError.notSupported("agent.manual_action.resolve")
+    }
+    func threadGuestRuntime(thread: AgentThreadID) -> String? { nil }
+    func threadGuestRuntimesOffMain() async -> [AgentThreadID: String] { [:] }
+    func pendingMacExecutionReason(thread: AgentThreadID) -> String? { nil }
+    func setAgentThreadActor(thread: AgentThreadID, actor: RunActor, executionTarget: ExecutionTarget?) async throws -> AgentThread {
+        throw JSONRPCError.notSupported("agent.thread.actor.set")
+    }
+    func resolveMacExecutionRemote(thread: AgentThreadID, approve: Bool) async throws -> MacExecutionResolveOutcome {
+        throw JSONRPCError.notSupported("agent.mac_execution.resolve")
+    }
+    func replayedRunErrorFields(message: String, recoverable: Bool) -> [String: JSONValue] { [:] }
+    func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("agent.attachment.get")
+    }
+    func getAgentAccountUsage() async throws -> JSONValue {
+        throw JSONRPCError.notSupported("agent.account.usage.get")
+    }
+
     func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
         try sshTransferUpload(surface: surface, localPath: localPath, remotePath: remotePath)
     }
@@ -367,7 +421,7 @@ public extension CommandRouting {
         try sshFilesRemoteList(surface: surface, path: path)
     }
 
-    /// Test/fake hosts may omit Token Saver entirely.
+    /// Test/fake hosts may omit the account usage digest entirely.
     func tokenSaverDigest() -> JSONValue? { nil }
     func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread { throw JSONRPCError.notSupported("Worker model selection") }
     func listDistillAccounts() -> JSONValue { .object(["accounts": .array([]), "busy_provider": .null, "last_error": .null]) }
@@ -376,6 +430,7 @@ public extension CommandRouting {
     func cancelDistillAccountOperation() throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
 
     func bindBotAttentionProfile(profileID: String, hostID: String, deviceID: String) throws {}
+    func privatePushRegistrationIsCurrent(_ probe: PrivatePushRegistrationProbe) -> Bool { false }
 
     func agentThreadHasMessages(thread: AgentThreadID) throws -> Bool {
         !(try listAgentMessages(thread: thread, limit: 1).isEmpty)
@@ -702,6 +757,20 @@ private final class ConnectionSnapshotReadOutcome: @unchecked Sendable {
     private let lock = NSLock()
     private var completion: Result<Value, Error>?
     private var continuation: CheckedContinuation<Result<Value, Error>, Never>?
+    private var observers: [(Result<Value, Error>) -> Void] = []
+
+    /// Calls `body` once with the completion: now if already resolved,
+    /// otherwise when `resolve` first runs.
+    func observe(_ body: @escaping (Result<Value, Error>) -> Void) {
+        lock.lock()
+        if let completion {
+            lock.unlock()
+            body(completion)
+        } else {
+            observers.append(body)
+            lock.unlock()
+        }
+    }
 
     func wait() async -> Result<Value, Error> {
         await withCheckedContinuation { continuation in
@@ -726,10 +795,21 @@ private final class ConnectionSnapshotReadOutcome: @unchecked Sendable {
         self.completion = completion
         let continuation = self.continuation
         self.continuation = nil
+        let observers = self.observers
+        self.observers = []
         lock.unlock()
         continuation?.resume(returning: completion)
+        observers.forEach { $0(completion) }
         return true
     }
+}
+
+/// One physical `sync.snapshot` state read and the callers waiting on it.
+/// MainActor-owned: `waiters` is read by the read loop between attempts.
+@MainActor
+private final class ConnectionSnapshotSharedRead {
+    let outcome = ConnectionSnapshotReadOutcome()
+    var waiters = 0
 }
 
 @MainActor
@@ -771,10 +851,11 @@ public final class JSONRPCDispatcher {
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
     /// store request payloads or secrets — only owner fingerprint + params hash.
     private var volatileUnknownReceipts = BoundedUnknownReceiptCache()
-    /// At most one physical snapshot state read may outlive a timed-out caller.
-    /// The task is retained until the underlying router continuation finishes,
-    /// preventing repeated timeouts from accumulating unbounded SQLite reads.
-    private var activeConnectionSnapshotRead: (id: UUID, task: Task<Void, Never>)?
+    /// The one physical snapshot state read. Every `sync.snapshot` caller that
+    /// arrives while it runs joins it, and it is retained until the underlying
+    /// router continuation finishes, so callers and timeouts never stack up
+    /// SQLite reads.
+    private var activeConnectionSnapshotRead: ConnectionSnapshotSharedRead?
     public nonisolated static let hostMutationMethods = HostMutationContract.methods
     private nonisolated static let durableSynchronousMutationMethods: Set<String> = [
         "workspace.create",
@@ -876,6 +957,7 @@ public final class JSONRPCDispatcher {
         "bot.guest.stop",
         "bot.guest.rebuild",
         "bot.guest.revoke",
+        "bot.guest.control",
         "bot.docker.clear",
         "bot.notify.set",
         "bot.desktop.set",
@@ -886,6 +968,19 @@ public final class JSONRPCDispatcher {
         "bot.attention.ack",
         "bot.self_config",
         "bot.scheduler.tick",
+        "bot.team.create",
+        "bot.team.update",
+        "bot.team.set_members",
+        "bot.team.delete",
+        "bot.team.reorder",
+        "bot.group.create",
+        "bot.group.update",
+        "bot.group.set_participants",
+        "bot.group.send",
+        "bot.group.stop",
+        "bot.group.retry_turn",
+        "bot.group.select",
+        "bot.group.delete",
         "agent.thread.create",
         "agent.thread.prepare_pr",
         "agent.thread.rollback",
@@ -924,6 +1019,13 @@ public final class JSONRPCDispatcher {
         "agent.run.stop",
         "agent.request.respond",
         "agent.user_input.respond",
+        // Not canonical-immediate: the router publishes agent.manual_action.updated
+        // inside the call, and the ledger captures it into the receipt.
+        "agent.manual_action.resolve",
+        // Not canonical-immediate either: the router publishes agent.thread.updated
+        // inside the call, and the ledger captures it into the receipt.
+        "agent.thread.actor.set",
+        "agent.mac_execution.resolve",
         "agent.plan.implement",
         "agent.plan.save",
         "agent.plan.notes.save",
@@ -952,7 +1054,11 @@ public final class JSONRPCDispatcher {
         "agent.attachment.upload",
         "agent.attachment.import",
         "agent.provider.update",
-    ]).union(durableSynchronousMutationMethods.filter { $0.hasPrefix("bot.") })
+    ]).union(durableSynchronousMutationMethods.filter {
+        // Team and group mutations publish their own events from the shared
+        // service; those are captured into the receipt, not re-derived here.
+        $0.hasPrefix("bot.") && !$0.hasPrefix("bot.team.") && !$0.hasPrefix("bot.group.")
+    })
     public init(
         router: CommandRouting,
         commandReceiptMetrics: CommandReceiptMetrics = CommandReceiptMetrics(),
@@ -1017,64 +1123,41 @@ public final class JSONRPCDispatcher {
         // watermark then remains an honest sequence fence without starving
         // event delivery or HTTP recovery while the snapshot is built.
         //
-        // A deadline races the physical read through a one-shot outcome. The
-        // caller therefore returns even if an off-main continuation ignores
-        // cancellation. One retained task per dispatcher bounds those stale
-        // reads; while it exists, later callers fail fast with the same
-        // retryable timeout rather than waiting behind or spawning another read.
+        // One physical read runs at a time. A caller that arrives while it runs
+        // joins it and gets the same result: its pre-read watermark is honest
+        // for every caller, because the client replays every event after it.
+        // Each caller races the shared result against its own deadline and
+        // cancellation, so one caller timing out or disconnecting never fails
+        // another. The read stops before its next attempt once nobody waits.
         let readStarted = DispatchTime.now().uptimeNanoseconds
         do {
-            guard activeConnectionSnapshotRead == nil else {
-                throw Self.snapshotTimedOut
-            }
-
-            let readID = UUID()
-            let outcome = ConnectionSnapshotReadOutcome()
-            let readTask = Task { @MainActor [weak self] in
-                guard let self else {
-                    outcome.resolve(.failure(Self.snapshotCancelled))
-                    return
-                }
-
-                do {
-                    for attempt in 0..<3 {
-                        try Task.checkCancellation()
-                        let before = EventBus.shared.snapshotMetadata()
-                        let state = try await snapshotRouter.readConnectionSnapshotState()
-                        try Task.checkCancellation()
-                        let after = EventBus.shared.snapshotMetadata()
-                        // Live-only stream events (terminal output, agent
-                        // deltas) cannot change the state read above, so only
-                        // a state revision change forces a retry. Return the
-                        // pre-read watermark: the client applies every event
-                        // after it, including in-window deltas, from the stream.
-                        if before.stateRevision == after.stateRevision {
-                            outcome.resolve(.success(EventBus.SnapshotBarrierResult(
-                                state: state,
-                                metadata: before
-                            )))
-                            self.finishConnectionSnapshotRead(id: readID)
-                            return
-                        }
-                        phaseMetrics?.recordFenceRetry()
-                        if attempt == 2 {
-                            phaseMetrics?.recordFenceExhausted()
-                            throw Self.snapshotSequenceFenceUnstable
-                        }
+            let read: ConnectionSnapshotSharedRead
+            if let active = activeConnectionSnapshotRead {
+                read = active
+                phaseMetrics?.recordJoined()
+            } else {
+                read = ConnectionSnapshotSharedRead()
+                activeConnectionSnapshotRead = read
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        read.outcome.resolve(.failure(Self.snapshotCancelled))
+                        return
                     }
-                    phaseMetrics?.recordFenceExhausted()
-                    throw Self.snapshotSequenceFenceUnstable
-                } catch {
-                    outcome.resolve(.failure(error))
-                    self.finishConnectionSnapshotRead(id: readID)
+                    await self.runConnectionSnapshotRead(
+                        read,
+                        router: snapshotRouter,
+                        phaseMetrics: phaseMetrics
+                    )
                 }
             }
-            activeConnectionSnapshotRead = (readID, readTask)
+            read.waiters += 1
+            defer { read.waiters -= 1 }
 
+            let outcome = ConnectionSnapshotReadOutcome()
+            read.outcome.observe { outcome.resolve($0) }
             let timeoutTask = Task {
                 do {
                     try await Task.sleep(nanoseconds: timeoutNanoseconds)
-                    readTask.cancel()
                     outcome.resolve(.failure(Self.snapshotTimedOut))
                 } catch is CancellationError {
                     // Read/caller completed first; normal deadline teardown.
@@ -1086,7 +1169,6 @@ public final class JSONRPCDispatcher {
             let completion = await withTaskCancellationHandler {
                 await outcome.wait()
             } onCancel: {
-                readTask.cancel()
                 timeoutTask.cancel()
                 outcome.resolve(.failure(Self.snapshotCancelled))
             }
@@ -1125,8 +1207,46 @@ public final class JSONRPCDispatcher {
         }
     }
 
-    private func finishConnectionSnapshotRead(id: UUID) {
-        guard activeConnectionSnapshotRead?.id == id else { return }
+    /// The physical read behind `readConnectionSnapshot`: up to three fenced
+    /// attempts. The fence ignores live-only stream kinds and idempotent
+    /// last-writer-wins kinds (`EventBus.snapshotFenceIdempotentKinds`); the
+    /// pre-read watermark makes the client replay those on top of the state.
+    private func runConnectionSnapshotRead(
+        _ read: ConnectionSnapshotSharedRead,
+        router snapshotRouter: ConnectionSnapshotRouting,
+        phaseMetrics: HTTPRequestPhaseMetrics?
+    ) async {
+        do {
+            for attempt in 0..<3 {
+                guard read.waiters > 0 else { throw Self.snapshotCancelled }
+                let before = EventBus.shared.snapshotMetadata()
+                let state = try await snapshotRouter.readConnectionSnapshotState()
+                let after = EventBus.shared.snapshotMetadata()
+                if before.fenceRevision == after.fenceRevision {
+                    if before.stateRevision != after.stateRevision {
+                        phaseMetrics?.recordFenceTolerated()
+                    }
+                    read.outcome.resolve(.success(EventBus.SnapshotBarrierResult(
+                        state: state,
+                        metadata: before
+                    )))
+                    finishConnectionSnapshotRead(read)
+                    return
+                }
+                phaseMetrics?.recordFenceRetry()
+                if attempt == 2 {
+                    phaseMetrics?.recordFenceExhausted()
+                }
+            }
+            throw Self.snapshotSequenceFenceUnstable
+        } catch {
+            read.outcome.resolve(.failure(error))
+            finishConnectionSnapshotRead(read)
+        }
+    }
+
+    private func finishConnectionSnapshotRead(_ read: ConnectionSnapshotSharedRead) {
+        guard activeConnectionSnapshotRead === read else { return }
         activeConnectionSnapshotRead = nil
     }
 
@@ -1422,7 +1542,8 @@ public final class JSONRPCDispatcher {
                 kind = object["readback"]?.objectValue?["link_kind"]?.stringValue == "file"
                     ? .botFilesOpened
                     : .botBrowserUpdated
-            case "bot.guest.input", "bot.guest.start", "bot.guest.stop", "bot.guest.rebuild", "bot.guest.revoke":
+            case "bot.guest.input", "bot.guest.start", "bot.guest.stop", "bot.guest.rebuild", "bot.guest.revoke",
+                 "bot.guest.control":
                 kind = .botGuestUpdated
             case "bot.docker.clear": kind = .botDockerCleared
             case "bot.attention.ack": kind = .botAttentionUpdated
@@ -1454,6 +1575,7 @@ public final class JSONRPCDispatcher {
                     for key in [
                         "host_id", "viewer_path", "grant_generation", "grant_invalidated",
                         "before_frame_id", "after_frame_id", "status", "error_message",
+                        "controlled_by_user", "control_action",
                     ] {
                         payload[key] = readback[key]
                     }
@@ -1850,6 +1972,15 @@ public final class JSONRPCDispatcher {
                 requiresSnapshot: true
             )
         }
+        // An unchanged alert/legacy push token re-sent on reconnect: the host
+        // already holds this exact registration, so answer before the durable
+        // claim. No receipt, settings write or private.push_token.updated event.
+        if req.method == "private.push_token.update",
+           let probe = PrivatePushRegistrationProbe.make(from: businessParams),
+           router.privatePushRegistrationIsCurrent(probe) {
+            commandReceiptMetrics.recordPushTokenUnchangedSkip()
+            return .init(id: req.id, result: probe.result)
+        }
         // workspace.select: reject a syntactically valid but absent workspace
         // before the durable claim so the failure is a stable domain error and
         // never becomes permanent commandOutcomeUnknown. Skip when a prior
@@ -1878,13 +2009,23 @@ public final class JSONRPCDispatcher {
 
         let claim: CommandReceiptClaimResult
         let claimStarted = DispatchTime.now().uptimeNanoseconds
+        let offMainReceiptWriter = receiptRouter.commandReceiptOffMainWriter
         do {
-            claim = try receiptRouter.claimCommandReceipt(
-                method: req.method,
-                clientRequestId: clientRequestId,
-                ownerFingerprint: context.ownerFingerprint,
-                paramsHash: paramsHash
-            )
+            if let offMainReceiptWriter {
+                claim = try await offMainReceiptWriter.claim(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
+            } else {
+                claim = try receiptRouter.claimCommandReceipt(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash
+                )
+            }
             commandReceiptMetrics.recordClaim(
                 claim,
                 latencyMilliseconds: Self.elapsedMilliseconds(since: claimStarted)
@@ -2078,17 +2219,40 @@ public final class JSONRPCDispatcher {
         do {
             if let eventSink {
                 let events = try eventSink.seal()
-                _ = try EventBus.shared.commitPersistedEvents { minimumEventSequence in
-                    try receiptRouter.finalizeCommandReceipt(
-                        method: req.method,
-                        clientRequestId: clientRequestId,
-                        ownerFingerprint: context.ownerFingerprint,
-                        paramsHash: paramsHash,
-                        result: committedResult,
-                        events: events,
-                        minimumEventSequence: minimumEventSequence
-                    )
+                if let offMainReceiptWriter {
+                    // Queued on the delivery lane before this task suspends, so
+                    // a later MainActor publish still sorts after these events.
+                    _ = try await EventBus.shared.enqueuePersistedCommit(
+                        offMainReceiptWriter.finalizeTransaction(
+                            method: req.method,
+                            clientRequestId: clientRequestId,
+                            ownerFingerprint: context.ownerFingerprint,
+                            paramsHash: paramsHash,
+                            result: committedResult,
+                            events: events
+                        )
+                    ).value()
+                } else {
+                    _ = try EventBus.shared.commitPersistedEvents { minimumEventSequence in
+                        try receiptRouter.finalizeCommandReceipt(
+                            method: req.method,
+                            clientRequestId: clientRequestId,
+                            ownerFingerprint: context.ownerFingerprint,
+                            paramsHash: paramsHash,
+                            result: committedResult,
+                            events: events,
+                            minimumEventSequence: minimumEventSequence
+                        )
+                    }
                 }
+            } else if let offMainReceiptWriter {
+                try await offMainReceiptWriter.commit(
+                    method: req.method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash,
+                    result: committedResult
+                )
             } else {
                 try receiptRouter.commitCommandReceipt(
                     method: req.method,
@@ -2425,7 +2589,17 @@ public final class JSONRPCDispatcher {
                     // this target. Same helper as DirectHTTPServer.capabilitiesPayload
                     // so authorities cannot drift on the old-host negotiation gate.
                     "plan_notes": PlanNotesProjectionV1.CapabilityAdvertisement.jsonValue,
-                    "checkpoint_list": AgentCheckpointListCapabilityV1.jsonValue
+                    "checkpoint_list": AgentCheckpointListCapabilityV1.jsonValue,
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "manual_actions_v1": .bool(true),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "thread_actor_v1": .bool(true),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "run_recovery_action_v1": .bool(true),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "attachment_get_v1": .bool(true),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "account_usage_get_v1": .bool(true)
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {
@@ -2486,7 +2660,70 @@ public final class JSONRPCDispatcher {
             case "events.recent":
                 let sinceSeq = params["since_seq"]?.intValue.map(Int64.init) ?? 0
                 let maxBytes = params["max_bytes"]?.intValue
-                let result = EventBus.shared.recentEvents(since: sinceSeq, maxBytes: maxBytes)
+                // C8: `durable: true` (after the welcome capability
+                // `events.durable_replay_v1`) replays the event log when the
+                // ring no longer reaches the cursor. Absent keeps the old shape.
+                let durable: Bool
+                switch params["durable"] {
+                case nil: durable = false
+                case .bool(let value)?: durable = value
+                default: throw JSONRPCError.invalidParams
+                }
+                let result: EventBus.RecentEventsResult
+                var streamGaps: [EventBus.StreamGap] = []
+                if durable {
+                    // Only a cursor whose boot `resume_host_id` +
+                    // `resume_boot_epoch` prove (this boot, or the clean
+                    // previous one) may replay the event log; without them
+                    // the ring serves it or the caller needs a baseline.
+                    let resumeHost: String?
+                    switch params["resume_host_id"] {
+                    case nil: resumeHost = nil
+                    case .string(let value)?: resumeHost = value
+                    default: throw JSONRPCError.invalidParams
+                    }
+                    let resumeEpoch: Int64?
+                    switch params["resume_boot_epoch"] {
+                    case nil: resumeEpoch = nil
+                    case let value?:
+                        guard let epoch = value.intValue else { throw JSONRPCError.invalidParams }
+                        resumeEpoch = Int64(epoch)
+                    }
+                    let identity = eventIdentity.map { ($0.hostId, Int64($0.bootEpoch)) }
+                    // The event-log read uses the read-only connection, off main.
+                    (result, streamGaps) = await Task.detached(priority: .userInitiated) {
+                        let bus = EventBus.shared
+                        guard resumeHost != nil || resumeEpoch != nil, let identity else {
+                            return bus.durableRecentEvents(
+                                since: sinceSeq, maxBytes: maxBytes, allowEventLog: false
+                            )
+                        }
+                        let accepted = DurableReplayContract.acceptedResume(
+                            requestedSinceSequence: sinceSeq,
+                            requestedResumeHost: resumeHost,
+                            requestedResumeBootEpoch: resumeEpoch,
+                            serverId: identity.0,
+                            bootEpoch: identity.1,
+                            currentSequence: bus.currentSeq,
+                            previousBoot: bus.previousBootReplay
+                        )
+                        guard accepted.eventLog else {
+                            // A cursor from another host or an unrecoverable
+                            // boot: nothing after it can be trusted.
+                            let head = bus.currentSeq
+                            return (EventBus.RecentEventsResult(
+                                lastSeq: head, events: [], truncated: true, requiresBaseline: true
+                            ), [])
+                        }
+                        return bus.durableRecentEvents(
+                            since: accepted.since,
+                            maxBytes: maxBytes,
+                            previousBoot: accepted.previousBoot
+                        )
+                    }.value
+                } else {
+                    result = EventBus.shared.recentEvents(since: sinceSeq, maxBytes: maxBytes)
+                }
                 let arr: [JSONValue] = result.events.map { ev in
                     var envelope: [String: JSONValue] = [
                         "seq": .number(Double(ev.seq)),
@@ -2514,6 +2751,19 @@ public final class JSONRPCDispatcher {
                         "minor": .number(0),
                     ]),
                 ]
+                if durable {
+                    response["stream_gaps"] = .array(streamGaps.map { gap in
+                        var object: [String: JSONValue] = [
+                            "since_seq": .number(Double(gap.sinceSequence)),
+                            "through_seq": .number(Double(gap.throughSequence)),
+                        ]
+                        switch gap.stream {
+                        case .thread(let id): object["thread_id"] = .string(id)
+                        case .surface(let id): object["surface_id"] = .string(id)
+                        }
+                        return .object(object)
+                    })
+                }
                 if let eventIdentity {
                     response["host_id"] = .string(eventIdentity.hostId)
                     response["boot_epoch"] = .number(Double(eventIdentity.bootEpoch))
@@ -3214,7 +3464,13 @@ public final class JSONRPCDispatcher {
                 let threads = try await router.listAgentThreadsOffMain(workspace: wid)
                 // PERF-007: one batch query for all threads instead of N per-thread queries.
                 let lockedThreads = (try? await router.threadIdsWithMessagesOffMain()) ?? []
-                return .init(id: id, result: .array(threads.map { encodeThread($0, lockedThreads: lockedThreads) }))
+                // One store read for every thread's pending_manual_action.
+                let manualActions = router.pendingManualActions(for: threads)
+                // One off-main query for every thread's guest_runtime.
+                let guestRuntimes = await router.threadGuestRuntimesOffMain()
+                return .init(id: id, result: .array(threads.map {
+                    encodeThread($0, lockedThreads: lockedThreads, pendingManualActions: manualActions, guestRuntimes: guestRuntimes)
+                }))
             case "agent.thread.create", "host.agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let title = params["title"]?.stringValue ?? "New thread"
@@ -3264,6 +3520,8 @@ public final class JSONRPCDispatcher {
                 payload["providerLocked"] = .bool(providerLocked(t))
                 appendFlatModelSelection(t, to: &payload)
                 appendRouting(t.effectiveRoutingConfiguration, to: &payload)
+                // A provider change can move a bot-locked thread's guest marker.
+                appendThreadActor(t, guestRuntime: router.threadGuestRuntime(thread: t.id), to: &payload)
                 EventBus.shared.publish(kind: .agentThreadUpdated, payload: .object(payload))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.execution.configure":
@@ -3761,6 +4019,87 @@ public final class JSONRPCDispatcher {
             case "agent.pending_callbacks.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: encode(try await router.listAgentPendingCallbacksOffMain(thread: tid)))
+            case "agent.attachment.get":
+                let request = try AgentAttachmentGetWire.request(from: params)
+                return .init(id: id, result: try await router.getAgentAttachment(request))
+            case "agent.account.usage.get":
+                return .init(id: id, result: try await router.getAgentAccountUsage())
+            case "agent.manual_action.list":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                let actions = try router.listManualActions(thread: tid)
+                return .init(id: id, result: .object([
+                    "thread_id": .string(tid.value.uuidString),
+                    "manual_actions": .array(actions.map(ManualActionWire.row)),
+                    "pending_manual_action": ManualActionWire.pendingRow(actions.last { $0.request.state.isOpen }),
+                ]))
+            case "agent.manual_action.resolve":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let actionID = params["manual_action_id"]?.stringValue.flatMap(UUID.init),
+                      let resolution = params["action"]?.stringValue.flatMap(ManualActionResolution.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let outcome = try await router.resolveManualAction(
+                    thread: tid, id: actionID, resolution: resolution, note: params["note"]?.stringValue
+                )
+                let followUp: JSONValue
+                switch outcome.followUp {
+                case nil:
+                    followUp = .null
+                case .sent(let sent)?:
+                    var object = messageSendResultPayload(sent).objectValue ?? [:]
+                    object["delivered"] = .bool(true)
+                    followUp = .object(object)
+                case .failed(let message)?:
+                    followUp = .object(["delivered": .bool(false), "error": .string(message)])
+                }
+                let result: JSONValue = .object([
+                    "thread_id": .string(tid.value.uuidString),
+                    "manual_action": ManualActionWire.row(outcome.manualAction),
+                    "pending_manual_action": ManualActionWire.pendingRow(outcome.pending),
+                    "follow_up": followUp,
+                ])
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.thread.actor.set":
+                // HostMutationContract preflight already checked the shapes.
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let actor = ThreadActorWire.parseActor(params["actor"]) else { throw JSONRPCError.invalidParams }
+                let target = params["execution_target"]?.stringValue.flatMap(ExecutionTarget.init(rawValue:))
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let t = try await router.setAgentThreadActor(thread: tid, actor: actor, executionTarget: target)
+                let result: JSONValue = .object(threadActorResult(t))
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.mac_execution.resolve":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let approve = params["approve"]?.boolValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let outcome = try await router.resolveMacExecutionRemote(thread: tid, approve: approve)
+                let followUp: JSONValue
+                switch outcome.followUp {
+                case .sent(let sent):
+                    var object = messageSendResultPayload(sent).objectValue ?? [:]
+                    object["delivered"] = .bool(true)
+                    followUp = .object(object)
+                case .failed(let message):
+                    followUp = .object(["delivered": .bool(false), "error": .string(message)])
+                }
+                var resolved = threadActorResult(outcome.thread)
+                resolved["approved"] = .bool(outcome.approved)
+                resolved["follow_up"] = followUp
+                let result: JSONValue = .object(resolved)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.read":
                 // response_version absent → exact legacy shapes (array or watermark object).
                 // response_version present → integral 1 only; validate before repository work.
@@ -3770,33 +4109,28 @@ public final class JSONRPCDispatcher {
                         eventRowLimit: caps.eventLimit,
                         maxPayloadBytes: Int64(caps.maxBytes)
                     )
-                    let encodedEvents = snapshot.events.map { encode($0) }
-                    let blocked = snapshot.blockedEvent.map {
-                        AgentThreadReadV1.BlockedEvent(
-                            id: $0.id,
-                            payloadBytes: $0.payloadBytes,
-                            reason: $0.reason
-                        )
-                    }
-                    let window = AgentThreadReadV1.boundToEnvelope(
-                        events: snapshot.events,
-                        encodedEvents: encodedEvents,
-                        sourceHadOlderEvents: snapshot.sourceHadOlderEvents,
-                        blockedEvent: blocked,
-                        maxBytes: caps.maxBytes,
-                        eventWatermark: snapshot.eventWatermark,
-                        responseId: id,
-                        measureEnvelope: { [self] result in
-                            envelopeUTF8ByteCount(id: id, result: result)
+                    // Run-error decoration needs the router (MainActor); resolve
+                    // it per distinct error row here, then encode and
+                    // envelope-bound off MainActor (up to 128 events,
+                    // ~log2(N) full-envelope measurements per read).
+                    var runErrorFields: [ReplayedRunErrorKey: [String: JSONValue]] = [:]
+                    for event in snapshot.events {
+                        guard case .error(let message, let recoverable) = event else { continue }
+                        let key = ReplayedRunErrorKey(message: message, recoverable: recoverable)
+                        if runErrorFields[key] == nil {
+                            runErrorFields[key] = router.replayedRunErrorFields(message: message, recoverable: recoverable)
                         }
-                    )
-                    return .init(
-                        id: id,
-                        result: AgentThreadReadV1.payload(
-                            window: window,
-                            eventWatermark: snapshot.eventWatermark
+                    }
+                    let maxBytes = caps.maxBytes
+                    let result = await Task.detached(priority: .userInitiated) { [runErrorFields] in
+                        Self.threadReadV1Result(
+                            snapshot: snapshot,
+                            maxBytes: maxBytes,
+                            id: id,
+                            runErrorFields: runErrorFields
                         )
-                    )
+                    }.value
+                    return .init(id: id, result: result)
                 }
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 if params["include_event_watermark"]?.boolValue == true {
@@ -3812,14 +4146,14 @@ public final class JSONRPCDispatcher {
                     let events = eventLimit.map { Array(snapshot.events.suffix($0)) }
                         ?? snapshot.events
                     var payload: [String: JSONValue] = [
-                        "events": encode(events),
+                        "events": decorateReplayedRunErrors(encode(events)),
                         "event_watermark": .number(Double(snapshot.eventWatermark)),
                         "events_truncated": .bool(events.count < snapshot.events.count)
                     ]
                     appendActiveDelegation(to: &payload, thread: tid)
                     return .init(id: id, result: .object(payload))
                 }
-                return .init(id: id, result: encode(try await router.readAgentThreadEvents(thread: tid)))
+                return .init(id: id, result: decorateReplayedRunErrors(encode(try await router.readAgentThreadEvents(thread: tid))))
             case "agent.thread.rollback":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let turnId = params["turn_id"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -4744,7 +5078,8 @@ public final class JSONRPCDispatcher {
         "workspace.list", "workspace.current",
         "surface.health", "surface.read_text", "surface.read_history",
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
-        "agent.message.list", "agent.message.get", "agent.pending_callbacks.list",
+        "agent.message.list", "agent.message.get", "agent.pending_callbacks.list", "agent.manual_action.list",
+        "agent.attachment.get", "agent.account.usage.get",
         // Legacy agent.checkpoint.list remains batch-admitted. Explicit
         // response_version 1 is rejected by preflightTransport before execution.
         "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
@@ -4754,6 +5089,7 @@ public final class JSONRPCDispatcher {
         "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list", "bot.attachment.list",
         "bot.routine.list", "bot.files.list", "bot.browser.state", "bot.guest.state",
         "bot.receipt.status", "bot.peer.receipt.status", "bot.attention.list",
+        "bot.team.list", "bot.group.list", "bot.group.get",
         "browser.url.get", "browser.snapshot", "browser.wait",
         "notification.list",
         "pane.list", "pane.surfaces", "mirror.snapshot",
@@ -4793,6 +5129,9 @@ public final class JSONRPCDispatcher {
     ///     *.read / *.status / *.get, system.*, events.recent, settings.get.
     ///     Also HTTP-only read methods that are intentionally excluded from
     ///     `readOnlyBatchMethods` (e.g. `agent.checkpoint.list`).
+    ///     `agent.attachment.get` is deliberately `read`: a read device can
+    ///     download the bytes of attachments on threads it can read (including
+    ///     imported workspace files), but no other host file.
     ///   - "write": every other known (mutating) method.
     ///   - "device-admin": HTTP device list/revoke only; not an RPC method
     ///     grant. `write`/`file`/`read` must not inherit it.
@@ -4928,11 +5267,81 @@ public final class JSONRPCDispatcher {
         return result
     }
 
-    /// Full JSON-RPC response UTF-8 size (keys, separators, escaping, id).
-    /// PERF: agent.thread.read boundToEnvelope measures ~log2(N) times per read.
-    /// Structural count matches default JSONEncoder length without allocating Data.
-    private func envelopeUTF8ByteCount(id: JSONRPCID?, result: JSONValue) -> Int {
-        EventBus.jsonRPCResponseByteCount(id: id, result: result)
+    /// agent.thread.read: a replayed `{"error": {message, recoverable}}` row gets
+    /// the live event's display `message` and `recovery_action`, so a cold
+    /// open or reconnect shows the same action as `agent.run.error`.
+    func decorateReplayedRunError(_ event: JSONValue) -> JSONValue {
+        Self.decorateReplayedRunError(event) { message, recoverable in
+            router.replayedRunErrorFields(message: message, recoverable: recoverable)
+        }
+    }
+
+    func decorateReplayedRunErrors(_ events: JSONValue) -> JSONValue {
+        guard case .array(let rows) = events else { return events }
+        return .array(rows.map(decorateReplayedRunError))
+    }
+
+    struct ReplayedRunErrorKey: Hashable, Sendable {
+        let message: String
+        let recoverable: Bool
+    }
+
+    nonisolated static func decorateReplayedRunError(
+        _ event: JSONValue,
+        fields fieldsFor: (String, Bool) -> [String: JSONValue]
+    ) -> JSONValue {
+        guard case .object(let outer) = event, outer.count == 1,
+              case .object(var error)? = outer["error"],
+              let message = error["message"]?.stringValue,
+              let recoverable = error["recoverable"]?.boolValue else { return event }
+        let fields = fieldsFor(message, recoverable)
+        guard !fields.isEmpty else { return event }
+        error.merge(fields) { $1 }
+        return .object(["error": .object(error)])
+    }
+
+    /// `agent.thread.read` v1 result: encode each event, then bound the newest
+    /// suffix to the full JSON-RPC envelope. Same bytes as the MainActor path
+    /// (default JSONEncoder → JSONValue); its own coders, so it is safe off main.
+    nonisolated static func threadReadV1Result(
+        snapshot: AgentThreadMirrorSnapshot,
+        maxBytes: Int,
+        id: JSONRPCID?,
+        runErrorFields: [ReplayedRunErrorKey: [String: JSONValue]] = [:]
+    ) -> JSONValue {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let encodedEvents: [JSONValue] = snapshot.events.map { event in
+            guard let data = try? encoder.encode(event),
+                  let value = try? decoder.decode(JSONValue.self, from: data) else {
+                return .null
+            }
+            return decorateReplayedRunError(value) { message, recoverable in
+                runErrorFields[ReplayedRunErrorKey(message: message, recoverable: recoverable)] ?? [:]
+            }
+        }
+        let blocked = snapshot.blockedEvent.map {
+            AgentThreadReadV1.BlockedEvent(
+                id: $0.id,
+                payloadBytes: $0.payloadBytes,
+                reason: $0.reason
+            )
+        }
+        let window = AgentThreadReadV1.boundToEnvelope(
+            events: snapshot.events,
+            encodedEvents: encodedEvents,
+            sourceHadOlderEvents: snapshot.sourceHadOlderEvents,
+            blockedEvent: blocked,
+            maxBytes: maxBytes,
+            eventWatermark: snapshot.eventWatermark,
+            responseId: id,
+            // Full JSON-RPC response UTF-8 size, measured structurally (~log2(N)
+            // times per read) without allocating Data.
+            measureEnvelope: { result in
+                EventBus.jsonRPCResponseByteCount(id: id, result: result)
+            }
+        )
+        return AgentThreadReadV1.payload(window: window, eventWatermark: snapshot.eventWatermark)
     }
 
     private func workspaceID(from params: [String: JSONValue]) throws -> WorkspaceID {
@@ -4991,12 +5400,19 @@ public final class JSONRPCDispatcher {
         object["provider_locked"] = .bool(locked)
         appendRouting(thread.effectiveRoutingConfiguration, to: &object)
         appendActiveRun(to: &object, thread: thread.id)
+        object["pending_manual_action"] = ManualActionWire.pendingRow(router.pendingManualActions(for: [thread])[thread.id])
+        appendThreadActor(thread, guestRuntime: router.threadGuestRuntime(thread: thread.id), to: &object)
         return .object(object)
     }
 
     /// Batch overload used by agent.thread.list (PERF-007): caller pre-fetches
     /// the locked set once; no additional query is issued per thread.
-    private func encodeThread(_ thread: AgentThread, lockedThreads: Set<AgentThreadID>) -> JSONValue {
+    private func encodeThread(
+        _ thread: AgentThread,
+        lockedThreads: Set<AgentThreadID>,
+        pendingManualActions: [AgentThreadID: ManualActionSnapshot],
+        guestRuntimes: [AgentThreadID: String]
+    ) -> JSONValue {
         guard case .object(var object) = encode(thread) else { return .null }
         let display = AgentThreadTitle.display(thread.title)
         object["displayTitle"] = .string(display)
@@ -5016,7 +5432,28 @@ public final class JSONRPCDispatcher {
         object["provider_locked"] = .bool(locked)
         appendRouting(thread.effectiveRoutingConfiguration, to: &object)
         appendActiveRun(to: &object, thread: thread.id)
+        object["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualActions[thread.id])
+        appendThreadActor(thread, guestRuntime: guestRuntimes[thread.id], to: &object)
         return .object(object)
+    }
+
+    /// `agent.thread.actor.set` / `agent.mac_execution.resolve` result: the
+    /// thread's actor fields at the top level plus its full payload as `thread`.
+    private func threadActorResult(_ thread: AgentThread) -> [String: JSONValue] {
+        var result: [String: JSONValue] = ["thread_id": .string(thread.id.value.uuidString)]
+        appendThreadActor(thread, guestRuntime: router.threadGuestRuntime(thread: thread.id), to: &result)
+        result["thread"] = encodeThread(thread)
+        return result
+    }
+
+    /// Same shape as AppCommandRouter.agentThreadPayload (ThreadActorWire).
+    private func appendThreadActor(_ thread: AgentThread, guestRuntime: String?, to object: inout [String: JSONValue]) {
+        ThreadActorWire.append(
+            thread: thread,
+            guestRuntime: guestRuntime,
+            pendingMacExecutionReason: router.pendingMacExecutionReason(thread: thread.id),
+            to: &object
+        )
     }
 
     private func appendFlatModelSelection(_ thread: AgentThread, to object: inout [String: JSONValue]) {
@@ -5459,6 +5896,8 @@ public final class JSONRPCDispatcher {
         payload["pinned"] = .bool(thread.pinned)
         payload["sort_order"] = .number(Double(thread.sortOrder))
         appendRouting(thread.effectiveRoutingConfiguration, to: &payload)
+        payload["pending_manual_action"] = ManualActionWire.pendingRow(router.pendingManualActions(for: [thread])[thread.id])
+        appendThreadActor(thread, guestRuntime: router.threadGuestRuntime(thread: thread.id), to: &payload)
         return .object(payload)
     }
 

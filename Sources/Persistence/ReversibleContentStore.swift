@@ -32,7 +32,7 @@ public final class ReversibleContentStore: @unchecked Sendable {
     }
 
     /// Same handle as `handle(for: Data(text.utf8))` without an intermediate
-    /// `Data` copy — hashes contiguous UTF-8 storage (Token Saver store-before-loss).
+    /// `Data` copy — hashes contiguous UTF-8 storage.
     public static func handle(for text: String) -> String {
         var hasher = SHA256()
         var copy = text

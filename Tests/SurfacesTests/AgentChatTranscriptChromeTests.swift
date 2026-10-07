@@ -415,20 +415,6 @@ final class AgentChatTranscriptChromeTests: XCTestCase {
         }
         XCTAssertFalse(source.contains("private var loadingStatus"))
         XCTAssertFalse(source.contains("private var workingStatus"))
-        XCTAssertTrue(
-            source.contains("AgentChatTokenSaverThreadFooter("),
-            "Agent App must mount the shared Token Saver footer, not a private twin"
-        )
-        XCTAssertTrue(
-            source.contains("presentation: presentation"),
-            "Agent App must pass the shared on/off presentation so the red off-state is not a private twin"
-        )
-        XCTAssertTrue(
-            source.contains("shouldShowTokenSaverThreadFooter("),
-            "the chip must stay in the transcript after history/live rows and hide while the thread is live"
-        )
-        XCTAssertTrue(source.contains("tokenSaverThreadFooter()"))
-        XCTAssertTrue(source.contains("AgentChatTokenSaverDisplayControl("))
         XCTAssertTrue(source.contains("AgentChatTranscriptChrome.displayUserLine("))
     }
 

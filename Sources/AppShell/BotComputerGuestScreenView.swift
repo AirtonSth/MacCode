@@ -170,10 +170,13 @@ struct BotComputerGuestCanvas: View {
                 }
             }
             if let url {
-                // Match the guest framebuffer (start.sh: Xvfb 1280x800) so the
-                // viewer hugs the actual screen instead of letterboxing.
+                // Match the guest framebuffer (start.sh Xvfb size, pinned against
+                // BotComputerGuestSpec) so the viewer hugs the actual screen.
                 BotComputerGuestScreenView(url: url)
-                    .aspectRatio(1280.0 / 800.0, contentMode: .fit)
+                    .aspectRatio(
+                        CGFloat(BotComputerGuestSpec.screenWidth) / CGFloat(BotComputerGuestSpec.screenHeight),
+                        contentMode: .fit
+                    )
                     .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)

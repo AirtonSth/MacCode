@@ -135,6 +135,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         let threadId: AgentThreadID
         let providerThreadId: String
         let client: DistillACPClient
+        /// In-guest run: the session lives for one turn, then the run finishes.
+        let guestPlan: DistillGuestLaunchPlan?
         let capabilities: DistillACPInitializeResult
         let mapper: DistillACPEventMapper
         var model: String
@@ -150,6 +152,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         let advertisedEfforts: [AgentReasoningEffort]
         /// Live catalog efforts per model id from session/new|load; the static policy only knows a few ids.
         let modelEfforts: [String: [AgentReasoningEffort]]
+        /// The session's current model when `advertisedEfforts` was read.
+        let advertisedEffortsModelId: String?
         let availableModeIDs: Set<String>
         let planModeID: String?
         var mode: String?
@@ -176,11 +180,30 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: DistillACPHistoryRetention
         var pendingPermissions: [String: PendingPermission] = [:]
+        /// Provider failure text from `x.ai/session/prompt_complete`
+        /// (`stopReason: "error"`) for `generation`. Fallback for peers that
+        /// answer the failed `session/prompt` with a bare "Internal error".
+        var promptFailureDetail: (generation: UInt64, text: String)?
+        /// The inactivity watchdog ended this prompt generation while a tool call
+        /// was still open: the tool (a long silent build, say) may still be
+        /// running in this process tree until that prompt's response arrives.
+        var abandonedOpenToolsGeneration: UInt64?
+        /// The provider rejected this session's own history; never prompt it again.
+        var historyIncompatible = false
+        /// A replacement session publishes its id (the resume cursor) only once
+        /// a prompt carrying the handoff is accepted. Until then the persisted
+        /// cursor stays on the old session, so a failed switch is retried as a
+        /// switch (with the handoff) instead of resuming an empty session.
+        var holdsThreadStartedUntilPromptAccepted = false
+        var heldThreadStarted = false
+        /// Main model last reported in a session-state event for this session.
+        var reportedAcceptedModel: String?
 
         init(
             threadId: AgentThreadID,
             providerThreadId: String,
             client: DistillACPClient,
+            guestPlan: DistillGuestLaunchPlan? = nil,
             capabilities: DistillACPInitializeResult,
             mapper: DistillACPEventMapper,
             model: String,
@@ -192,6 +215,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             advertisesReasoningEffortConfig: Bool = false,
             advertisedEfforts: [AgentReasoningEffort] = [],
             modelEfforts: [String: [AgentReasoningEffort]] = [:],
+            advertisedEffortsModelId: String? = nil,
             availableModeIDs: Set<String>,
             planModeID: String?,
             mode: String?,
@@ -202,6 +226,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             self.threadId = threadId
             self.providerThreadId = providerThreadId
             self.client = client
+            self.guestPlan = guestPlan
             self.capabilities = capabilities
             self.mapper = mapper
             self.model = model
@@ -213,6 +238,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             self.advertisesReasoningEffortConfig = advertisesReasoningEffortConfig
             self.advertisedEfforts = advertisedEfforts
             self.modelEfforts = modelEfforts
+            self.advertisedEffortsModelId = advertisedEffortsModelId
             self.availableModeIDs = availableModeIDs
             self.planModeID = planModeID
             self.mode = mode
@@ -221,6 +247,17 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 byteLimit: maxReadableBytes
             )
             self.onEvent = onEvent
+        }
+
+        /// Live efforts for `modelId` (catalog by canonical or alias id, plus the
+        /// open-time `reasoning_effort` option for the then-current model).
+        func catalogEfforts(for modelId: String?) -> [AgentReasoningEffort] {
+            DistillACPClient.advertisedEfforts(
+                for: modelId,
+                catalog: modelEfforts,
+                currentModelId: advertisedEffortsModelId,
+                currentModelEfforts: advertisedEfforts
+            )
         }
     }
 
@@ -250,6 +287,12 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private static let discoveryCacheLock = NSLock()
     private static var sharedDiscoveryCache: [String: (result: DistillACPDiscoveryResult, fetchedAt: Date)] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
+    /// Set by AppShell after the adapter is built; nil runs everything on the Mac.
+    private var guestLaunchResolver: DistillGuestLaunchResolving?
+    /// Provider sessions whose history the model rejected. A Retry (or a resume
+    /// after the live process ended) must open a new session instead of
+    /// replaying the same history into the same 400.
+    private var retiredProviderThreadIds: Set<String> = []
     private var promptWriteAcceptanceCountForTestingStorage = 0
     var beforePromptWriteForTesting: (() -> Void)?
     var beforePhysicalPromptWriteForTesting: (() -> Void)?
@@ -288,6 +331,14 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         self.modelCacheTTL = max(0, modelCacheTTL)
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.maxReadableBytes = max(1, maxReadableBytes)
+    }
+
+    public func setGuestLaunchResolver(_ resolver: DistillGuestLaunchResolving?) {
+        synchronized { guestLaunchResolver = resolver }
+    }
+
+    private func isGuestThread(_ threadId: AgentThreadID) -> Bool {
+        synchronized { guestLaunchResolver }?.isGuestThread(threadId) == true
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -495,6 +546,22 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         }
         let existing = synchronized { sessions[request.threadId] }
         guard let existing else {
+            if let resumeId = request.providerThreadId, !resumeId.isEmpty {
+                let retired = request.priorProviderSessionRetired
+                    || synchronized { retiredProviderThreadIds.contains(resumeId) }
+                let previousModel = request.priorProviderSessionModel
+                let reason: FreshSessionReason?
+                if retired {
+                    reason = .incompatibleHistory
+                } else if Self.isCrossModelFamilySwitch(from: previousModel, to: request.model) {
+                    reason = .modelFamilySwitch(from: previousModel ?? "")
+                } else {
+                    reason = nil
+                }
+                if let reason {
+                    return try await openFreshSession(request, reason: reason, onEvent: onEvent)
+                }
+            }
             return try await openSession(
                 request,
                 loadExisting: request.providerThreadId?.isEmpty == false,
@@ -502,8 +569,174 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 startPrompt: true
             )
         }
+        let reason: FreshSessionReason? = synchronized {
+            // An in-flight session is never replaced; startPrompt refuses it.
+            guard !existing.inFlight else { return nil }
+            if existing.historyIncompatible || retiredProviderThreadIds.contains(existing.providerThreadId) {
+                return .incompatibleHistory
+            }
+            let previousModel = existing.mainModelSelection ?? existing.model
+            return Self.isCrossModelFamilySwitch(from: previousModel, to: request.model)
+                ? .modelFamilySwitch(from: previousModel)
+                : nil
+        }
+        if let reason {
+            return try await openFreshSession(request, reason: reason, onEvent: onEvent)
+        }
         try await startPrompt(request, session: existing, onEvent: onEvent)
         return handle(for: request.runId, session: existing)
+    }
+
+    /// Why a turn must run in a new Distill session instead of the thread's one.
+    enum FreshSessionReason: Equatable {
+        /// Main moved between model families. Distill replays the old family's
+        /// reasoning items verbatim (Anthropic receives unsigned `thinking`
+        /// blocks and rejects the whole request), so the old session cannot
+        /// serve the new model.
+        case modelFamilySwitch(from: String)
+        /// The provider already rejected this session's history.
+        case incompatibleHistory
+    }
+
+    enum ModelFamily: Equatable {
+        /// `claude/*` models served through the Anthropic Messages API.
+        case anthropicMessages
+        case other
+    }
+
+    /// Distill has no backend field in its ACP model catalog, so the family is
+    /// derived from the id prefix Distill gives its Anthropic models.
+    static func modelFamily(of modelId: String) -> ModelFamily {
+        let id = modelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return id.hasPrefix("claude/") || id.hasPrefix("anthropic/") ? .anthropicMessages : .other
+    }
+
+    static func isCrossModelFamilySwitch(from previousModel: String?, to nextModel: String) -> Bool {
+        let previous = previousModel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let next = nextModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !previous.isEmpty, !next.isEmpty else { return false }
+        return modelFamily(of: previous) != modelFamily(of: next)
+    }
+
+    struct FreshSessionSeed: Sendable {
+        let handoff: String
+        let notice: String
+    }
+
+    static let modelFamilySwitchNotice = "Switched model family — started a new Distill session"
+    static let incompatibleHistoryNotice = "The model rejected the previous Distill session's history — started a new Distill session"
+    /// Appended to the notice: the new session got a compact summary of the
+    /// conversation (the row renders as a compaction), or nothing at all.
+    static let handoffCarriedNoticeSuffix = " with a summary of this conversation"
+    static let handoffMissingNoticeSuffix = "; the earlier conversation could not be carried over"
+    static let handoffMaxCharacters = 16_000
+    static let handoffMaxItemCharacters = 2_000
+    /// Newest prior messages the coordinator reads for a handoff.
+    static let handoffMaxMessages = 60
+
+    struct HandoffMessage: Equatable {
+        let isUser: Bool
+        let text: String
+    }
+
+    /// Compact handoff of the app's own transcript for the first prompt of a
+    /// replacement session. `history` is oldest first; the newest messages win
+    /// the budget. `olderHistoryExists` says messages before `history` exist.
+    static func freshSessionHandoff(
+        reason: FreshSessionReason,
+        newModel: String,
+        history: [HandoffMessage],
+        olderHistoryExists: Bool = false
+    ) -> String {
+        var header = "[RemoteCode context handoff] This conversation started in an earlier Distill session"
+        switch reason {
+        case .modelFamilySwitch(let previousModel):
+            header += " on \(previousModel). It moved to \(newModel), a different model family, so it continues in a new session."
+        case .incompatibleHistory:
+            header += " whose history \(newModel) rejected, so it continues in a new session."
+        }
+        header += " Earlier tool results and files read are not loaded here; re-read anything you need."
+        let items = history.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !items.isEmpty else {
+            return header + " The earlier conversation is not available; ask the user for any detail you need from it."
+        }
+        var budget = handoffMaxCharacters
+        var kept: [String] = []
+        for item in items.reversed() {
+            let speaker = item.isUser ? "User" : "Assistant"
+            var text = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.count > handoffMaxItemCharacters {
+                text = String(text.prefix(handoffMaxItemCharacters)) + "…"
+            }
+            let line = "\(speaker): \(text)"
+            guard line.count <= budget else { break }
+            budget -= line.count
+            kept.append(line)
+        }
+        var body = header + " Earlier conversation, oldest first:"
+        if olderHistoryExists || kept.count < items.count {
+            body += "\n\n(earlier messages omitted)"
+        }
+        for line in kept.reversed() {
+            body += "\n\n" + line
+        }
+        return body + "\n\n[End of handoff. The user's new message follows.]"
+    }
+
+    /// The coordinator's newest-first tail (no size ceiling) wins; the RCSEED
+    /// snapshot, which is nil for long threads, is only a fallback.
+    static func handoffHistory(for request: AgentRunRequest) -> (messages: [HandoffMessage], olderHistoryExists: Bool) {
+        if let tail = request.priorConversationTail {
+            let messages = tail.compactMap { message -> HandoffMessage? in
+                switch message.role {
+                case .user: return HandoffMessage(isUser: true, text: message.content)
+                case .assistant: return HandoffMessage(isUser: false, text: message.content)
+                case .system: return nil
+                }
+            }
+            return (Array(messages.suffix(handoffMaxMessages)), messages.count > handoffMaxMessages)
+        }
+        let items = request.contextSnapshot?.items ?? []
+        return (items.map { HandoffMessage(isUser: $0.role == .user, text: $0.canonicalText) }, false)
+    }
+
+    private func openFreshSession(
+        _ request: AgentRunRequest,
+        reason: FreshSessionReason,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        let reasonLabel: String
+        let notice: String
+        switch reason {
+        case .modelFamilySwitch:
+            reasonLabel = "model_family_switch"
+            notice = Self.modelFamilySwitchNotice
+        case .incompatibleHistory:
+            reasonLabel = "incompatible_history"
+            notice = Self.incompatibleHistoryNotice
+        }
+        let history = Self.handoffHistory(for: request)
+        let carried = history.messages.contains {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        distillAcpLog.info(
+            "distill.session.fresh thread=\(request.threadId.value.uuidString, privacy: .public) reason=\(reasonLabel, privacy: .public) handoff_messages=\(history.messages.count, privacy: .public)"
+        )
+        return try await openSession(
+            request,
+            loadExisting: false,
+            onEvent: onEvent,
+            startPrompt: true,
+            freshSession: FreshSessionSeed(
+                handoff: Self.freshSessionHandoff(
+                    reason: reason,
+                    newModel: request.model,
+                    history: history.messages,
+                    olderHistoryExists: history.olderHistoryExists
+                ),
+                notice: notice + (carried ? Self.handoffCarriedNoticeSuffix : Self.handoffMissingNoticeSuffix)
+            )
+        )
     }
 
     public func interruptTurn(threadId: AgentThreadID) throws {
@@ -667,6 +900,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         for request in pending {
             request.continuation.resume(throwing: AgentProviderAdapterError.sessionNotFound(threadId))
         }
+        // Before the client stops: its exit would otherwise finish the run first.
+        session.guestPlan?.finish(.cancelled)
         // Hard teardown must never queue behind the cooperative cancel write.
         // The first Stop already enqueued session/cancel; a second Stop owns
         // transport termination and goes straight to the process tree.
@@ -680,6 +915,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("Distill ACP recovery requires providerThreadId")
         }
+        // A guest run holds the bot's guest, credentials and lease; none is
+        // started to reopen a thread. The next send loads the session in the
+        // guest, and the transcript comes from the app's own record.
+        if isGuestThread(request.threadId) { return }
         _ = try await openSession(request, loadExisting: true, onEvent: onEvent, startPrompt: false)
     }
 
@@ -690,7 +929,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 threadId: $0.threadId,
                 provider: .distill,
                 status: $0.status,
-                providerThreadId: $0.providerThreadId
+                providerThreadId: $0.providerThreadId,
+                toolsMayStillRun: $0.abandonedOpenToolsGeneration != nil
             )
         }
     }
@@ -701,10 +941,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     }
 
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
-        try synchronized {
-            guard let session = sessions[threadId] else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
-            return session.history.readableEvents
-        }
+        if let events = synchronized({ sessions[threadId]?.history.readableEvents }) { return events }
+        // recoverSession opens nothing for a guest thread.
+        if isGuestThread(threadId) { return [] }
+        throw AgentProviderAdapterError.sessionNotFound(threadId)
     }
 
     public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
@@ -720,7 +960,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         }
         sessions.removeAll()
         lock.unlock()
-        all.forEach { $0.client.stop() }
+        all.forEach {
+            $0.guestPlan?.finish(.cancelled)
+            $0.client.stop()
+        }
     }
 
     public func stopAllForAppTermination() {
@@ -748,7 +991,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         _ request: AgentRunRequest,
         loadExisting: Bool,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void,
-        startPrompt shouldStartPrompt: Bool
+        startPrompt shouldStartPrompt: Bool,
+        freshSession: FreshSessionSeed? = nil
     ) async throws -> AgentRunHandle {
         guard !request.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AgentProviderAdapterError.unsupported("Select an explicit Distill Main model before running.")
@@ -757,34 +1001,76 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             ? request.providerBinary!
             : (binaryNameOverride ?? DistillProvisioner.binaryName)
         let bufferedNotifications = NotificationBuffer()
+        // Never falls back to the Mac: a guest thread that cannot run in its
+        // guest fails here.
+        let resolver = synchronized { guestLaunchResolver }
+        // Acknowledge a guest send before any guest work: preparing the VM,
+        // the agent binary and the sign-in can take seconds.
+        if resolver?.isGuestThread(request.threadId) == true {
+            onEvent(.event(DistillGuestStage.starting.runtimeEvent))
+        }
+        let guestPlan = try await resolver?.prepare(request, progress: { stage in
+            onEvent(.event(stage.runtimeEvent))
+        })
+        // The resolver's two answers must agree. A guest thread without a plan
+        // would run on the Mac; a plan on an open that sends no prompt would
+        // hold the bot's guest, credentials and lease with no turn to end it.
+        if guestPlan == nil, resolver?.isGuestThread(request.threadId) == true {
+            throw AgentProviderAdapterError.unsupported(
+                "This bot thread runs in its Linux guest, but no guest launch was prepared; it will not run on the Mac."
+            )
+        }
+        if let guestPlan, !shouldStartPrompt {
+            guestPlan.finish(.cancelled)
+            throw AgentProviderAdapterError.unsupported(
+                "A bot guest run was prepared for a session open that sends no prompt."
+            )
+        }
         let client: DistillACPClient
         do {
-            let launchArguments = try DistillACPClient.launchArguments(for: request)
-            let isForeignUser = request.runAsUser.map { $0.uid != getuid() } == true
-            let askpass = isForeignUser
-                ? RunAsUserProcessBootstrap.materializeAskpass(
-                    targetUser: request.runAsUser!.shortName
+            if let guestPlan {
+                client = try DistillACPClient(
+                    guest: guestPlan,
+                    notificationHandler: { method, params in
+                        bufferedNotifications.append(method: method, params: params)
+                    }
                 )
-                : nil
-            client = try DistillACPClient(
-                binary: binary,
-                cwd: request.cwd,
-                environment: request.environment,
-                launchArguments: launchArguments,
-                runAsUser: request.runAsUser,
-                askpassPath: askpass,
-                notificationHandler: { method, params in
-                    bufferedNotifications.append(method: method, params: params)
-                }
-            )
+            } else {
+                let launchArguments = try DistillACPClient.launchArguments(for: request)
+                let isForeignUser = request.runAsUser.map { $0.uid != getuid() } == true
+                let askpass = isForeignUser
+                    ? RunAsUserProcessBootstrap.materializeAskpass(
+                        targetUser: request.runAsUser!.shortName
+                    )
+                    : nil
+                client = try DistillACPClient(
+                    binary: binary,
+                    cwd: request.cwd,
+                    environment: request.environment,
+                    launchArguments: launchArguments,
+                    runAsUser: request.runAsUser,
+                    askpassPath: askpass,
+                    notificationHandler: { method, params in
+                        bufferedNotifications.append(method: method, params: params)
+                    }
+                )
+            }
         } catch {
+            guestPlan?.finish(.failed)
             throw DistillACPFailureTaxonomy.normalize(
                 error,
                 context: loadExisting ? .resume : .start
             )
         }
+        // Stop before the prompt is accepted ends the open now instead of after
+        // initialize/session/new/set_model; the coordinator records the Stop.
+        request.acceptancePermit?.onInvalidate { [weak client] in client?.stop() }
         do {
             let capabilities = try await client.initialize()
+            if let guestPlan {
+                // The docker CLI read it before the guest could answer.
+                unlink(guestPlan.envFileURL.path)
+            }
             let opened: DistillACPSessionOpenResult
             let mainEffort = request.distillMainEffortSelection.map(\.effort) ?? request.reasoningEffort
             if loadExisting {
@@ -817,6 +1103,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     reasoningModelSelectionSupported: capabilities.sessionWorkerModel
                 )
             }
+            // The guest agent is up with its MCP servers: the strip goes back to the turn's own status.
+            if guestPlan != nil { onEvent(.event(DistillGuestStage.ready.runtimeEvent)) }
             let mapper = DistillACPEventMapper(sessionId: opened.sessionId)
             // Seed mode so plan session updates can tell live progress from Plan review.
             let availableModeIDs = Set(opened.availableModes.map(\.id))
@@ -838,6 +1126,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 threadId: request.threadId,
                 providerThreadId: opened.sessionId,
                 client: client,
+                guestPlan: guestPlan,
                 capabilities: capabilities,
                 mapper: mapper,
                 model: opened.currentModelId ?? request.model,
@@ -852,6 +1141,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     opened.models.map { ($0.id, $0.supportedReasoningEfforts) },
                     uniquingKeysWith: { first, _ in first }
                 ),
+                advertisedEffortsModelId: opened.currentModelId,
                 availableModeIDs: availableModeIDs,
                 planModeID: planModeID,
                 mode: opened.currentModeId,
@@ -859,6 +1149,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 maxReadableBytes: maxReadableBytes,
                 onEvent: onEvent
             )
+            session.holdsThreadStartedUntilPromptAccepted = freshSession != nil
             client.notificationHandler = { [weak self, weak session] method, params in
                 guard let self, let session else { return }
                 self.handleNotification(method: method, params: params, session: session)
@@ -914,7 +1205,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             }
             session.mapper.sealHydration()
             if shouldStartPrompt {
-                try await startPrompt(request, session: session, onEvent: onEvent)
+                try await startPrompt(request, session: session, onEvent: onEvent, freshSession: freshSession)
             } else {
                 session.status = .completed
             }
@@ -925,8 +1216,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     sessions.removeValue(forKey: request.threadId)
                 }
             }
+            guestPlan?.finish(.failed)
             client.stop()
-            if error is AgentProviderAdapterError { throw error }
+            if error is AgentProviderAdapterError || error is AgentRunAcceptanceError { throw error }
             throw DistillACPFailureTaxonomy.normalize(
                 error,
                 context: loadExisting ? .resume : .start
@@ -937,7 +1229,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private func startPrompt(
         _ request: AgentRunRequest,
         session: Session,
-        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void,
+        freshSession: FreshSessionSeed? = nil
     ) async throws {
         let promptGeneration: UInt64 = try synchronized {
             guard sessions[request.threadId] === session, session.isLive else {
@@ -956,6 +1249,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             session.forceKillWorkItem?.cancel()
             session.forceKillWorkItem = nil
             session.promptGeneration &+= 1
+            session.promptFailureDetail = nil
             session.onEvent = onEvent
             cancelTurnWatchdogLocked(session: session)
             return session.promptGeneration
@@ -1007,7 +1301,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     sessionId: session.providerThreadId,
                     modelId: normalizedReasoningModel,
                     effortSelection: requestedReasoningEffortSelection,
-                    advertisedEfforts: normalizedReasoningModel.flatMap { session.modelEfforts[$0] } ?? []
+                    advertisedEfforts: session.catalogEfforts(for: normalizedReasoningModel)
                 )
                 let appliedEffortSelection: AgentEffortSelection
                 if normalizedReasoningModel == nil || applied.isAutomatic {
@@ -1047,7 +1341,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                         sessionId: session.providerThreadId,
                         modelId: modelId,
                         reasoningEffort: reasoningEffort,
-                        advertisedEfforts: session.modelEfforts[modelId] ?? []
+                        advertisedEfforts: session.catalogEfforts(for: modelId)
                     )
                     synchronized {
                         session.model = applied.activeModelId
@@ -1065,7 +1359,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     modelId: modelForEffort,
                     reasoningEffort: mainEffortSelection.effort,
                     reasoningEffortAuto: mainEffortSelection.isAutomatic,
-                    advertisedEfforts: session.modelEfforts[modelForEffort] ?? []
+                    advertisedEfforts: session.catalogEfforts(for: modelForEffort)
                 )
                 guard applied.canonicalModelId == modelForEffort,
                       applied.canonicalModelId != normalizedReasoningModel,
@@ -1087,7 +1381,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     sessionId: session.providerThreadId,
                     modelId: normalizedReasoningModel,
                     effortSelection: requestedReasoningEffortSelection,
-                    advertisedEfforts: normalizedReasoningModel.flatMap { session.modelEfforts[$0] } ?? []
+                    advertisedEfforts: session.catalogEfforts(for: normalizedReasoningModel)
                 )
                 let appliedEffortSelection: AgentEffortSelection
                 if normalizedReasoningModel == nil || applied.isAutomatic {
@@ -1144,6 +1438,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                             request: request,
                             capabilities: session.capabilities,
                             writePermit: session.promptWritePermit,
+                            contextHandoff: freshSession?.handoff,
                             beforeWrite: { [weak self] in
                                 self?.beforePhysicalPromptWriteForTesting?()
                             },
@@ -1151,7 +1446,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                                 guard let self, let session else {
                                     throw AgentProviderAdapterError.sessionNotFound(request.threadId)
                                 }
-                                try self.synchronized {
+                                let (releaseThreadStarted, reportModel) = try self.synchronized {
                                     guard self.sessions[request.threadId] === session,
                                           session.isLive else {
                                         throw AgentProviderAdapterError.sessionNotFound(request.threadId)
@@ -1159,17 +1454,41 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                                     session.promptAccepted = true
                                     session.status = .running
                                     self.promptWriteAcceptanceCountForTestingStorage += 1
+                                    let release = session.heldThreadStarted
+                                    session.holdsThreadStartedUntilPromptAccepted = false
+                                    session.heldThreadStarted = false
+                                    let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    let report = !model.isEmpty && session.reportedAcceptedModel != model
+                                    if report { session.reportedAcceptedModel = model }
+                                    return (release, report ? model : nil)
+                                }
+                                if releaseThreadStarted {
+                                    self.emit(
+                                        .threadStarted(threadId: session.providerThreadId, providerThreadId: session.providerThreadId),
+                                        session: session
+                                    )
                                 }
                                 for event in session.mapper.beginTurn() {
                                     self.emit(event, session: session)
+                                }
+                                if let reportModel {
+                                    self.emit(Self.sessionStateEvent([
+                                        "sessionId": session.providerThreadId,
+                                        "acceptedModel": reportModel
+                                    ]), session: session)
+                                }
+                                if let notice = freshSession?.notice {
+                                    self.emitFreshSessionNotice(notice, session: session)
                                 }
                                 onEvent(.status(.running))
                                 self.refreshTurnWatchdog(session: session, generation: promptGeneration)
                                 acceptance.settle(.success(()))
                             }
                         )
+                        self.clearAbandonedOpenTools(session: session, generation: promptGeneration)
                         self.handlePromptResponse(response, session: session, generation: promptGeneration)
                     } catch {
+                        self.clearAbandonedOpenTools(session: session, generation: promptGeneration)
                         acceptance.settle(.failure(error))
                         self.finishTransportFailure(session: session, error: error, forced: false)
                     }
@@ -1200,6 +1519,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     method: method,
                     params: params
                 )
+                if let failure = ACPRPCErrorPayload.promptCompleteFailure(
+                    method: resolvedMethod,
+                    payload: resolvedPayload,
+                    sessionId: session.providerThreadId
+                ) {
+                    synchronized { session.promptFailureDetail = (session.promptGeneration, failure) }
+                }
                 emit(Self.runtimeEvent(method: resolvedMethod, payload: resolvedPayload), session: session)
             }
             return
@@ -1319,10 +1645,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         for event in session.mapper.finishTurn(stopReason: stopReason, usage: usage) { emit(event, session: session) }
         let status = DistillACPTerminalClassifier.status(stopReason: stopReason)
         if status == .failed {
-            session.onEvent?(.error(DistillACPFailureTaxonomy.normalize(
-                diagnostic: "Distill ACP stopped: \(stopReason)",
+            let detail = currentPromptFailureDetail(session: session).map { ": \($0)" } ?? ""
+            let failure = DistillACPFailureTaxonomy.normalize(
+                diagnostic: "Distill ACP stopped: \(stopReason)\(detail)",
                 context: .turn
-            ).message))
+            )
+            retireSessionIfHistoryIncompatible(failure, session: session)
+            session.onEvent?(.error(failure.message))
         }
         finishTurn(session: session, status: status)
     }
@@ -1354,6 +1683,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             distillAcpLog.info(
                 "grok.turn.termination.stale thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
             )
+            // No-op when the turn or Stop already finished the run.
+            session.guestPlan?.finish(.failed)
             return
         }
         let terminal = DistillACPTerminalClassifier.status(
@@ -1380,12 +1711,86 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         lock.unlock()
         guard active else { return }
         if terminal == .failed {
-            session.onEvent?(.error(DistillACPFailureTaxonomy.normalize(error, context: .turn).message))
+            let failure = DistillACPFailureTaxonomy.normalize(
+                Self.addingPromptFailureDetail(currentPromptFailureDetail(session: session), to: error),
+                context: .turn
+            )
+            retireSessionIfHistoryIncompatible(failure, session: session)
+            session.onEvent?(.error(failure.message))
         }
         for event in session.mapper.finishTurn(stopReason: terminal == .cancelled ? "cancelled" : "failed", usage: nil) {
             emit(event, session: session)
         }
         finishTurn(session: session, status: terminal)
+    }
+
+    /// `prompt_complete` failure text captured for the turn now in flight.
+    private func currentPromptFailureDetail(session: Session) -> String? {
+        synchronized {
+            guard let captured = session.promptFailureDetail,
+                  captured.generation == session.promptGeneration else { return nil }
+            return captured.text
+        }
+    }
+
+    /// A bare "Internal error" RPC failure borrows the provider text Distill
+    /// already sent as `prompt_complete.agentResult` for the same prompt.
+    static func addingPromptFailureDetail(_ detail: String?, to error: Error) -> Error {
+        guard let detail,
+              case let DistillACPError.rpcError(code, message, existing, httpStatus) = error,
+              existing == nil else { return error }
+        return DistillACPError.rpcError(code: code, message: message, detail: detail, httpStatus: httpStatus)
+    }
+
+    private func retireSessionIfHistoryIncompatible(_ failure: DistillACPFailure, session: Session) {
+        guard failure.category == .incompatibleHistory else { return }
+        synchronized {
+            session.historyIncompatible = true
+            retiredProviderThreadIds.insert(session.providerThreadId)
+        }
+        // Persisted by the coordinator, so Retry after a restart still opens a
+        // new session instead of loading this one into the same 400.
+        emit(Self.sessionStateEvent([
+            "sessionId": session.providerThreadId,
+            "historyRejected": true
+        ]), session: session)
+        distillAcpLog.info(
+            "distill.session.retired thread=\(session.threadId.value.uuidString, privacy: .public) reason=incompatible_history"
+        )
+    }
+
+    /// Visible transcript row for a replacement session (Agent App, bot desk
+    /// and the iOS mirror all render the persisted item). `.contextCompaction`
+    /// is the closest item type both decoders know (a new case would fail the
+    /// iOS mirror's decode); the row's copy says what happened. No
+    /// `.contextCompaction(summary:)` event: the context meter and the iOS
+    /// compaction signal must not report a provider-side compaction.
+    private func emitFreshSessionNotice(_ notice: String, session: Session) {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let itemId = "distill-fresh-session-\(session.providerThreadId)"
+        let turnId = session.mapper.activeTurnId ?? ""
+        emit(.itemStarted(item: AssistantItem(
+            id: itemId,
+            turnId: turnId,
+            type: .contextCompaction,
+            state: .completed,
+            summary: notice,
+            body: notice,
+            startedAtMs: now,
+            finishedAtMs: now
+        )), session: session)
+        emit(.itemCompleted(itemId: itemId, finalState: .completed), session: session)
+    }
+
+    private static func sessionStateEvent(_ state: [String: Any]) -> AssistantEvent {
+        let data = (try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])) ?? Data()
+        return .providerRuntime(ProviderRuntimeEvent(
+            provider: .distill,
+            source: "remotecode.distill",
+            method: ProviderRuntimeEvent.distillSessionStateMethod,
+            payloadJSON: String(data: data, encoding: .utf8) ?? "{}",
+            receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        ))
     }
 
     private func finishTurn(session: Session, status: AgentRunStatus) {
@@ -1399,7 +1804,11 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         session.turnWatchdogSynthesisInProgress = false
         session.inFlight = false
         session.status = status
-        let shouldStopOwnedTree = status == .cancelled && session.cancelRequested
+        // A guest run ends with its turn: no idle guest process keeps the
+        // bot's credentials. The next turn loads the session in a new one.
+        let endsGuestRun = session.guestPlan != nil
+        let stopRequested = status == .cancelled && session.cancelRequested
+        let shouldStopOwnedTree = stopRequested || endsGuestRun
         if shouldStopOwnedTree {
             if sessions[session.threadId] === session {
                 sessions.removeValue(forKey: session.threadId)
@@ -1419,11 +1828,35 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         for request in pending {
             request.continuation.resume(throwing: AgentProviderAdapterError.unsupported("Distill ACP turn ended before permission response"))
         }
+        // Started before the client stops, so this status (not the docker
+        // client's exit) is the run's; teardown runs in the background under
+        // the bot's lease, and the callbacks below are not delayed by it.
+        // A turn that ended on its own closes stdin and lets Distill exit
+        // first: a TERM right after the turn skips the session shutdown that
+        // flushes what the next turn's `session/load` replays. Stop kills now.
+        let gracefulGuestEnd = endsGuestRun && !stopRequested
+        if gracefulGuestEnd, let guestPlan = session.guestPlan {
+            let client = session.client
+            let runID = guestPlan.runID
+            guestPlan.finish(status, exitGracefully: {
+                let exited = await client.closeInputAndWaitForExit(
+                    timeout: DistillGuestLaunchPlan.gracefulExitTimeout
+                )
+                if !exited {
+                    distillAcpLog.error(
+                        "distill.guest.graceful_exit.timeout run=\(runID, privacy: .public)"
+                    )
+                }
+                client.stop()
+            })
+        } else {
+            session.guestPlan?.finish(status)
+        }
         if shouldStopOwnedTree {
             distillAcpLog.info(
-                "distill.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public)"
+                "distill.cancel.ack.tree_stop thread=\(session.threadId.value.uuidString, privacy: .public) guest=\(endsGuestRun, privacy: .public)"
             )
-            session.client.stop()
+            if !gracefulGuestEnd { session.client.stop() }
         }
         callback?(.status(status))
         callback?(.finished(status, finalMessage: final, providerThreadId: providerThreadId))
@@ -1486,6 +1919,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // host does not paint a green completed goal mid long silent shell/CI.
         // Speakable text alone is only enough when no tool_call is still open.
         let hasOpenTools = session.mapper.hasOpenToolCalls
+        if hasOpenTools {
+            synchronized { session.abandonedOpenToolsGeneration = generation }
+        }
         let hasFinal = session.mapper.hasSpeakableFinalContent
         let status: AgentRunStatus
         let stopReason: String
@@ -1537,6 +1973,11 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // events were re-entering the coordinator with a cleared seq counter and
         // colliding on durable seq 1 (servers_updated vs turnStarted).
         if session.turnTerminalEmitted {
+            lock.unlock()
+            return
+        }
+        if session.holdsThreadStartedUntilPromptAccepted, case .threadStarted = event {
+            session.heldThreadStarted = true
             lock.unlock()
             return
         }
@@ -1649,6 +2090,15 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             payloadJSON: String(data: data, encoding: .utf8) ?? "{}",
             receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
         ))
+    }
+
+    /// The abandoned prompt returned (or failed): its tools are no longer running.
+    private func clearAbandonedOpenTools(session: Session, generation: UInt64) {
+        synchronized {
+            if session.abandonedOpenToolsGeneration == generation {
+                session.abandonedOpenToolsGeneration = nil
+            }
+        }
     }
 
     private func synchronized<T>(_ body: () throws -> T) rethrows -> T {

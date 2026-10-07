@@ -31,6 +31,35 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case commandOutcomeUnknown
         case commandInProgress
         case authenticatedHostMismatch
+        /// `bot.team.*` / `bot.group.*`: the team, group or turn is gone
+        /// (code -32044 with `data.domain == "bot_group"`; not a deleted bot).
+        case botGroupNotFound
+        /// `bot.team.*` / `bot.group.*`: `expected_revision` is stale; re-read.
+        case botGroupRevisionConflict
+        /// `bot.team.*` / `bot.group.*`: this host cannot run groups right now.
+        case botGroupRuntimeUnavailable
+        /// `agent.manual_action.resolve`: the request is not one of this thread's.
+        case manualActionNotFound
+        /// `agent.manual_action.resolve`: another resolve won; `data.state` is the current state.
+        case manualActionStateConflict
+        /// `agent.manual_action.resolve` `take` on a thread that runs on the Mac.
+        case manualActionTakeUnavailable
+        /// `agent.thread.actor.set`: unknown thread or bot.
+        case threadActorNotFound
+        /// `agent.thread.actor.set`: the thread is locked (messages, a locked actor or a run).
+        case threadActorLocked
+        /// `agent.thread.actor.set` `execution_target` `vm` for a bot without a VM.
+        case threadActorTargetUnavailable
+        /// `agent.mac_execution.resolve`: unknown thread.
+        case macExecutionNotFound
+        /// `agent.mac_execution.resolve`: nothing pending (already answered).
+        case macExecutionNotPending
+        /// `agent.attachment.get`: the message is not on this thread, or the attachment is not on it.
+        case attachmentNotFound
+        /// `agent.attachment.get`: the bytes exceed `max_bytes`; `data.data_size_bytes` says by how much.
+        case attachmentTooLarge
+        /// `agent.attachment.get`: stored bytes gone or changed, or a thumbnail of a non-image.
+        case attachmentUnavailable
         case unknown(Int)
     }
 
@@ -45,6 +74,47 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
     }
 
     public var kind: Kind {
+        // Team and group refusals reuse some bot codes; their `data` tells
+        // them apart, so a bot handler never drops a bot for a missing group.
+        if case .object(let data)? = data, data["domain"] == .string("bot_group") {
+            switch data["kind"] {
+            case .string("not_found"): return .botGroupNotFound
+            case .string("revision_conflict"): return .botGroupRevisionConflict
+            case .string("runtime_unavailable"): return .botGroupRuntimeUnavailable
+            default: break
+            }
+        }
+        if case .object(let data)? = data, data["domain"] == .string("thread_actor") {
+            switch data["kind"] {
+            case .string("not_found"): return .threadActorNotFound
+            case .string("locked"): return .threadActorLocked
+            case .string("target_unavailable"): return .threadActorTargetUnavailable
+            default: break
+            }
+        }
+        if case .object(let data)? = data, data["domain"] == .string("mac_execution") {
+            switch data["kind"] {
+            case .string("not_found"): return .macExecutionNotFound
+            case .string("not_pending"): return .macExecutionNotPending
+            default: break
+            }
+        }
+        if case .object(let data)? = data, data["domain"] == .string("attachment") {
+            switch data["kind"] {
+            case .string("not_found"): return .attachmentNotFound
+            case .string("too_large"): return .attachmentTooLarge
+            case .string("unavailable"): return .attachmentUnavailable
+            default: break
+            }
+        }
+        if case .object(let data)? = data, data["domain"] == .string("manual_action") {
+            switch data["kind"] {
+            case .string("not_found"): return .manualActionNotFound
+            case .string("state_conflict"): return .manualActionStateConflict
+            case .string("take_unavailable"): return .manualActionTakeUnavailable
+            default: break
+            }
+        }
         switch code {
         case -32700: return .parseError
         case -32600: return .invalidRequest
@@ -69,6 +139,12 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case -32095: return .commandOutcomeUnknown
         case -32096: return .commandInProgress
         case -32098: return .authenticatedHostMismatch
+        // `rpc.batch` error items carry only `code` and `message` (no
+        // `data`), so the attachment codes, used by nothing else, also map
+        // on their own.
+        case -32066: return .attachmentNotFound
+        case -32067: return .attachmentTooLarge
+        case -32068: return .attachmentUnavailable
         default: return .unknown(code)
         }
     }

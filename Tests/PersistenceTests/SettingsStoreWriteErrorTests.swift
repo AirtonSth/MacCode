@@ -89,7 +89,7 @@ final class SettingsStoreWriteErrorTests: XCTestCase {
         store.onWriteError = { capturedError = $0 }
 
         repo.shouldFail = true
-        store.update { $0.tokenSaverEnabled = true }
+        store.update { $0.terminalFontSize = 14 }
 
         XCTAssertNotNil(capturedError,
             "update() internally calls save(); write failures must propagate to the funnel")

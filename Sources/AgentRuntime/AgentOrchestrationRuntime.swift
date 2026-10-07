@@ -1155,22 +1155,37 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
             throw lockError(operation: "fchmod")
         }
 
-        var fileLock = Darwin.flock()
-        fileLock.l_start = 0
-        fileLock.l_len = 0
-        fileLock.l_pid = 0
-        fileLock.l_type = Int16(F_WRLCK)
-        fileLock.l_whence = Int16(SEEK_SET)
-        while Darwin.fcntl(descriptor, F_SETLKW, &fileLock) == -1 {
-            if errno != EINTR {
-                throw lockError(operation: "lock")
+        // The file lock is taken before the SQLite transaction (see
+        // withReceiptMutation/withReceiptRead) and is shared with the Distill
+        // sidecars. Wait at most 2 s: a stuck or suspended peer must not hang
+        // the app. Database storage fails open, because BEGIN IMMEDIATE already
+        // serializes writers across processes; the JSONL file has no other
+        // guard, so it fails instead.
+        switch BoundedFileLock.acquireExclusive(
+            descriptor: descriptor,
+            style: .posixRecord,
+            label: "orchestration-receipts",
+            onTimeout: isDatabaseStorage ? .failOpen : .fail
+        ) {
+        case .acquired:
+            defer { BoundedFileLock.unlock(descriptor: descriptor, style: .posixRecord) }
+            return try body()
+        case .timedOut:
+            guard isDatabaseStorage else {
+                throw AgentOrchestrationAdmissionError.receiptPersistenceFailed(
+                    "lock orchestration lock: timed out"
+                )
             }
+            return try body()
+        case .failed(let code):
+            errno = code
+            throw lockError(operation: "lock")
         }
-        defer {
-            fileLock.l_type = Int16(F_UNLCK)
-            _ = Darwin.fcntl(descriptor, F_SETLK, &fileLock)
-        }
-        return try body()
+    }
+
+    private var isDatabaseStorage: Bool {
+        if case .database = storage { return true }
+        return false
     }
 
     private func lockError(operation: String) -> AgentOrchestrationAdmissionError {
@@ -2944,34 +2959,16 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         Auto is on. Run $\(skill) controller-only, token-efficient:
         - FIRST: Micro chat bypass — if the request is only conversational (who are you, hi, which model/LLM, trivial status) and does not ask for code/files/commands/PR/deploy/repo change → answer on the controller in one short reply; no workers, no DAG, no validator, no matrix load.
         - Otherwise classify T0–T3 + certainty (absolute|high|medium|low); pick Micro/Single/Multi/Critical.
-        - Progressive disclosure: load only the skill sections needed for that mode; requested/returned skill content must stay complete (never Distill skill bodies).
+        - Progressive disclosure: load only the skill sections needed for that mode; requested/returned skill content must stay complete.
         - Controller stays LIGHT; escalate workers only after capability failure.
         - Fan-out default 2 / hard cap 3; skip REVIEWER on micro absolute/high certainty when rules allow.
         - Thin prompts (slice-only); cheap proof (scope diff + one focused command); lean table report.
-        - Distill applies only to eligible ordinary tool/command output when Token Saver is active; never Distill skill content; do not require every worker prompt to restate Distill rules.
 
         \(hostBlock)
 
         User request:
         \(userPrompt)
         """
-    }
-
-    /// Preserves the Auto controller contract inside a typed RCW1 request.
-    /// The semantic encoder only sees the human-authored prompt; Swift appends
-    /// this exact host-owned constraint after provider admission.
-    public static func autoOrchestrateProviderWirePrompt(
-        wirePrompt: String,
-        admittedRoute route: AgentOrchestrationRoute
-    ) throws -> String {
-        let host = orchestrateHostKey(for: route.provider)
-        let control = """
-        Run $\(orchestrateSkillInvocationName) controller-only. Auto is on. Follow the complete installed orchestration skill. Host runtime receipt is authoritative: active_host=\(host); provider=\(route.provider.rawValue); provider_instance_id=\(route.providerInstanceId); controller_model=\(route.selection.effectiveModel); controller_effort=\(route.selection.reasoningEffort.rawValue). Bind workers and reviewers only from the host-runtime-matrix row for active_host=\(host). Treat the G, C, K, and X records in this frame as the user request. Distill applies only to eligible ordinary tool output when Token Saver is active, never to skill content.
-        """
-        return try RCWireProtocol.addingRequestRecords(
-            [RCWireRecord(kind: .constraint, value: control)],
-            to: wirePrompt
-        )
     }
 
     public static func promptAlreadyInvokesOrchestrateSkill(_ prompt: String) -> Bool {

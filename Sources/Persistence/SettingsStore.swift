@@ -40,59 +40,12 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var insomniaAllowDisplaySleep: Bool
     public var insomniaAllowSystemSleepWhenDisplayClosed: Bool
     public var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool
-    public var tokenSaverEnabled: Bool
-    /// Distill generate source. `automatic` follows RAM (≤16 GiB → 1.7B, >16 GiB → E4B).
-    public var tokenSaverModelSource: TokenSaverModelSource
-    public var tokenSaverAPIBaseURL: String
-    public var tokenSaverAPIModel: String
-    public var tokenSaverAPIToken: String
-    /// When true, every local-LLM generate writes ChatML SFT/rejected JSONL.
-    public var tokenSaverSaveTrainingPrompts: Bool
-
-    public var tokenSaverLocalModel: TokenSaverApprovedModel {
-        TokenSaverApprovedModels.resolveLocal(source: tokenSaverModelSource)
-    }
-
-    public var tokenSaverGenerateTarget: TokenSaverGenerateTarget {
-        TokenSaverGenerateTarget.resolve(
-            source: tokenSaverModelSource,
-            apiBaseURL: tokenSaverAPIBaseURL,
-            apiModel: tokenSaverAPIModel,
-            apiToken: tokenSaverAPIToken
-        )
-    }
     /// Global kill switch for automatic scheduled-task occurrences. When false,
     /// due ticks do not claim or run tasks (travel / temporary pause). Per-task
     /// Pause still applies independently. Default true.
     public var scheduledTasksActive: Bool
     /// Base terminal font size in points. 0 means use Ghostty's configured default.
     public var terminalFontSize: Double
-    /// P5 SessionLearn: mine a correction rule from failed/expensive runs into the managed
-    /// instructions region. Off by default — opt-in, since it writes to CLAUDE.md/AGENTS.md.
-    public var sessionLearnEnabled: Bool
-    /// P3: compact large tool output in persisted stream events (CCR-backed, structure-
-    /// preserving). Off by default — opt-in, since it makes stored history lossy-recoverable.
-    public var historyCompactionEnabled: Bool
-
-    /// Graphify host integration (external CLI). Preference on by default, but
-    /// runtime is gated by Token Saver — see `isGraphifyRuntimeActive`.
-    public var graphifyEnabled: Bool
-    /// Absolute path to `graphify` binary (GUI PATH bypass). Empty = auto-resolve.
-    public var graphifyBinaryPath: String
-    /// Fire-and-forget ensure on resolve when Graphify runtime is active.
-    public var graphifyAutoEnsure: Bool
-    /// Absolute paths of pinned multi-repo roots for sticky bootstrap (JSON array stored as joined newlines).
-    public var graphifyPinnedRoots: [String]
-    /// When true, also write `graphify-out/` inside the user's repo. Default false:
-    /// graphs live only under Application Support (no workspace pollution).
-    public var graphifyWriteInRepo: Bool
-
-    /// Host Graphify preflight/ensure/env/prompt injection is a Token Saver
-    /// capability: both toggles must be on. Fail-open when Token Saver is off
-    /// (no RC_GRAPHIFY_*, no ensure, no query-first nudge).
-    public var isGraphifyRuntimeActive: Bool {
-        tokenSaverEnabled && graphifyEnabled
-    }
 
     /// Floating desktop pet. On by default so it is visible without setup.
     public var petEnabled: Bool
@@ -149,21 +102,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 insomniaAllowDisplaySleep: Bool = true,
                 insomniaAllowSystemSleepWhenDisplayClosed: Bool = false,
                 insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true,
-                tokenSaverEnabled: Bool = false,
-                tokenSaverModelSource: TokenSaverModelSource = .automatic,
-                tokenSaverAPIBaseURL: String = "",
-                tokenSaverAPIModel: String = "",
-                tokenSaverAPIToken: String = "",
-                tokenSaverSaveTrainingPrompts: Bool = false,
                 scheduledTasksActive: Bool = true,
                 terminalFontSize: Double = 0,
-                sessionLearnEnabled: Bool = false,
-                historyCompactionEnabled: Bool = false,
-                graphifyEnabled: Bool = true,
-                graphifyBinaryPath: String = "",
-                graphifyAutoEnsure: Bool = true,
-                graphifyPinnedRoots: [String] = [],
-                graphifyWriteInRepo: Bool = false,
                 petEnabled: Bool = true,
                 petAnimationsEnabled: Bool = true,
                 petReadyCounterEnabled: Bool = true,
@@ -185,21 +125,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.insomniaAllowDisplaySleep = insomniaAllowDisplaySleep
         self.insomniaAllowSystemSleepWhenDisplayClosed = insomniaAllowSystemSleepWhenDisplayClosed
         self.insomniaAllowScreenSaverAfter45MinutesOfInactivity = insomniaAllowScreenSaverAfter45MinutesOfInactivity
-        self.tokenSaverEnabled = tokenSaverEnabled
-        self.tokenSaverModelSource = tokenSaverModelSource
-        self.tokenSaverAPIBaseURL = tokenSaverAPIBaseURL
-        self.tokenSaverAPIModel = tokenSaverAPIModel
-        self.tokenSaverAPIToken = tokenSaverAPIToken
-        self.tokenSaverSaveTrainingPrompts = tokenSaverSaveTrainingPrompts
         self.scheduledTasksActive = scheduledTasksActive
         self.terminalFontSize = terminalFontSize
-        self.sessionLearnEnabled = sessionLearnEnabled
-        self.historyCompactionEnabled = historyCompactionEnabled
-        self.graphifyEnabled = graphifyEnabled
-        self.graphifyBinaryPath = graphifyBinaryPath
-        self.graphifyAutoEnsure = graphifyAutoEnsure
-        self.graphifyPinnedRoots = graphifyPinnedRoots
-        self.graphifyWriteInRepo = graphifyWriteInRepo
         self.petEnabled = petEnabled
         self.petAnimationsEnabled = petAnimationsEnabled
         self.petReadyCounterEnabled = petReadyCounterEnabled
@@ -224,21 +151,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case insomniaAllowDisplaySleep
         case insomniaAllowSystemSleepWhenDisplayClosed
         case insomniaAllowScreenSaverAfter45MinutesOfInactivity
-        case tokenSaverEnabled
-        case tokenSaverModelSource
-        case tokenSaverAPIBaseURL
-        case tokenSaverAPIModel
-        case tokenSaverAPIToken
-        case tokenSaverSaveTrainingPrompts
         case scheduledTasksActive
         case terminalFontSize
-        case sessionLearnEnabled
-        case historyCompactionEnabled
-        case graphifyEnabled
-        case graphifyBinaryPath
-        case graphifyAutoEnsure
-        case graphifyPinnedRoots
-        case graphifyWriteInRepo
         case petEnabled
         case petAnimationsEnabled
         case petReadyCounterEnabled
@@ -264,21 +178,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
         insomniaAllowDisplaySleep = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowDisplaySleep) ?? true
         insomniaAllowSystemSleepWhenDisplayClosed = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowSystemSleepWhenDisplayClosed) ?? false
         insomniaAllowScreenSaverAfter45MinutesOfInactivity = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowScreenSaverAfter45MinutesOfInactivity) ?? true
-        tokenSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .tokenSaverEnabled) ?? false
-        tokenSaverModelSource = try c.decodeIfPresent(TokenSaverModelSource.self, forKey: .tokenSaverModelSource) ?? .automatic
-        tokenSaverAPIBaseURL = try c.decodeIfPresent(String.self, forKey: .tokenSaverAPIBaseURL) ?? ""
-        tokenSaverAPIModel = try c.decodeIfPresent(String.self, forKey: .tokenSaverAPIModel) ?? ""
-        tokenSaverAPIToken = try c.decodeIfPresent(String.self, forKey: .tokenSaverAPIToken) ?? ""
-        tokenSaverSaveTrainingPrompts = try c.decodeIfPresent(Bool.self, forKey: .tokenSaverSaveTrainingPrompts) ?? false
         scheduledTasksActive = try c.decodeIfPresent(Bool.self, forKey: .scheduledTasksActive) ?? true
         terminalFontSize = try c.decodeIfPresent(Double.self, forKey: .terminalFontSize) ?? 0
-        sessionLearnEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionLearnEnabled) ?? false
-        historyCompactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyCompactionEnabled) ?? false
-        graphifyEnabled = try c.decodeIfPresent(Bool.self, forKey: .graphifyEnabled) ?? true
-        graphifyBinaryPath = try c.decodeIfPresent(String.self, forKey: .graphifyBinaryPath) ?? ""
-        graphifyAutoEnsure = try c.decodeIfPresent(Bool.self, forKey: .graphifyAutoEnsure) ?? true
-        graphifyPinnedRoots = try c.decodeIfPresent([String].self, forKey: .graphifyPinnedRoots) ?? []
-        graphifyWriteInRepo = try c.decodeIfPresent(Bool.self, forKey: .graphifyWriteInRepo) ?? false
         petEnabled = try c.decodeIfPresent(Bool.self, forKey: .petEnabled) ?? true
         petAnimationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .petAnimationsEnabled) ?? true
         petReadyCounterEnabled = try c.decodeIfPresent(Bool.self, forKey: .petReadyCounterEnabled) ?? true
@@ -398,6 +299,40 @@ public final class SettingsStore {
             // A failed read must not turn into defaults and overwrite valid settings.
             onWriteError?(error)
         }
+    }
+
+    /// Keys older builds wrote for the removed Token Saver and its Graphify,
+    /// Session Learn and history-compaction options. This build never reads them.
+    public static let removedLegacyKeys: Set<String> = [
+        "tokenSaverEnabled",
+        "tokenSaverModelSource",
+        "tokenSaverAPIBaseURL",
+        "tokenSaverAPIModel",
+        "tokenSaverAPIToken",
+        "tokenSaverSaveTrainingPrompts",
+        "sessionLearnEnabled",
+        "historyCompactionEnabled",
+        "graphifyEnabled",
+        "graphifyBinaryPath",
+        "graphifyAutoEnsure",
+        "graphifyPinnedRoots",
+        "graphifyWriteInRepo",
+    ]
+
+    /// Rewrites the stored blob without `removedLegacyKeys`, so the old Token
+    /// Saver API token does not stay on disk. No write when none is present.
+    /// Returns true when it rewrote the blob.
+    @discardableResult
+    public func dropRemovedLegacyKeys() -> Bool {
+        guard let json = try? repo.get(key),
+              let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              !Self.removedLegacyKeys.isDisjoint(with: object.keys) else {
+            return false
+        }
+        // Encoding writes only the keys AppSettings still declares.
+        update { _ in }
+        return true
     }
 }
 

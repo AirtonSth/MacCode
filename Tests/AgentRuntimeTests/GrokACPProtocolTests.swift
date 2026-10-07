@@ -393,6 +393,62 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(result.models.map(\.id), ["grok-4.5"])
     }
 
+    func test_rpcErrorDataCarriesTheProviderFailureAndHTTPStatus() {
+        // WHY: Grok/Distill put the real provider failure in JSON-RPC error.data
+        // behind "-32603 Internal error"; users saw only "Internal error" and a
+        // 429/401 in data never reached the retry / Sign in taxonomy.
+        let parsed = ACPRPCErrorPayload.parse(
+            ["code": -32_603, "message": "Internal error",
+             "data": ["message": "API error (status 429 Too Many Requests): slow down", "http_status": 429]],
+            defaultMessage: "Unknown Grok ACP error"
+        )
+        XCTAssertEqual(parsed, .init(code: -32_603, message: "Internal error",
+                                     detail: "API error (status 429 Too Many Requests): slow down", httpStatus: 429))
+        let stringData = ACPRPCErrorPayload.parse(
+            ["code": -32_603, "message": "Internal error", "data": "invalid-argument: Invalid reasoning effort."],
+            defaultMessage: "Unknown Grok ACP error"
+        )
+        XCTAssertEqual(stringData.detail, "invalid-argument: Invalid reasoning effort.")
+        XCTAssertNil(stringData.httpStatus)
+
+        let error = GrokACPError.rpcError(code: parsed.code, message: parsed.message,
+                                          detail: parsed.detail, httpStatus: parsed.httpStatus)
+        XCTAssertEqual(error.description, "Grok ACP RPC error: API error (status 429 Too Many Requests): slow down",
+                       "a generic RPC message must be replaced by error.data.message")
+        XCTAssertEqual(GrokACPFailureTaxonomy.normalize(error, context: .turn).category, .rateLimited)
+        let auth = GrokACPError.rpcError(code: -32_603, message: "Internal error",
+                                         detail: "upstream rejected the request", httpStatus: 403)
+        XCTAssertEqual(GrokACPFailureTaxonomy.normalize(auth, context: .turn).category, .authRequired,
+                       "HTTP 401/403 in error.data must offer Sign in even though the RPC code is -32603")
+        XCTAssertEqual(
+            GrokACPError.rpcError(code: -32_602, message: "Invalid params", detail: "modelId is required").description,
+            "Grok ACP RPC error: Invalid params: modelId is required",
+            "a specific RPC message keeps its text and gains the detail"
+        )
+    }
+
+    func test_promptCompleteErrorFillsABareInternalErrorOnlyForItsSession() {
+        let payload: [String: Any] = ["sessionId": "s1", "promptId": "p", "stopReason": "error",
+                                      "agentResult": "API error (status 400 Bad Request): This model always engages in thinking"]
+        XCTAssertNil(ACPRPCErrorPayload.promptCompleteFailure(method: "_x.ai/session/prompt_complete", payload: payload, sessionId: "s2"),
+                     "another session's failure must never be shown for this turn")
+        XCTAssertNil(ACPRPCErrorPayload.promptCompleteFailure(
+            method: "_x.ai/session/prompt_complete",
+            payload: ["sessionId": "s1", "stopReason": "end_turn", "agentResult": NSNull()],
+            sessionId: "s1"
+        ))
+        let detail = ACPRPCErrorPayload.promptCompleteFailure(method: "x.ai/session/prompt_complete", payload: payload, sessionId: "s1")
+        let enriched = GrokACPAdapter.addingPromptFailureDetail(
+            detail,
+            to: GrokACPError.rpcError(code: -32_603, message: "Internal error")
+        )
+        XCTAssertEqual(String(describing: enriched),
+                       "Grok ACP RPC error: API error (status 400 Bad Request): This model always engages in thinking")
+        let withData = GrokACPError.rpcError(code: -32_603, message: "Internal error", detail: "from data")
+        XCTAssertEqual(String(describing: GrokACPAdapter.addingPromptFailureDetail(detail, to: withData)),
+                       "Grok ACP RPC error: from data", "error.data stays authoritative when present")
+    }
+
     func test_failureTaxonomyMapsOnlyExplicitRecoveryClassesAndSanitizesDiagnostics() {
         let auth = GrokACPFailureTaxonomy.normalize(
             GrokACPError.rpcError(
@@ -594,43 +650,26 @@ final class GrokACPProtocolTests: XCTestCase {
         )
     }
 
-    func test_promptBlocksInjectTokenSaverSafetyABIExactlyOnceForGrokACP() throws {
-        let request = AgentRunRequest(
-            threadId: AgentThreadID(),
-            provider: .grok,
-            model: "grok-4.5",
-            cwd: "/tmp",
-            prompt: "inspect",
-            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
-        )
-        let blocks = try GrokACPClient.promptBlocks(
-            for: request,
-            capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
-        )
-        let prompt = try XCTUnwrap(blocks.first?["text"] as? String)
-        XCTAssertEqual(prompt.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1)
-        XCTAssertEqual(
-            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + prompt)
-                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
-            1,
-            "Grok ACP effective disk plus runtime context receives the safety ABI exactly once"
-        )
-
-        // Token Saver off → no Distill / safety ABI on Grok ACP.
-        let emptyEnvRequest = AgentRunRequest(
-            threadId: AgentThreadID(),
-            provider: .grok,
-            model: "grok-4.5",
-            cwd: "/tmp",
-            prompt: "inspect"
-        )
-        let emptyEnvBlocks = try GrokACPClient.promptBlocks(
-            for: emptyEnvRequest,
-            capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
-        )
-        let emptyEnvPrompt = try XCTUnwrap(emptyEnvBlocks.first?["text"] as? String)
-        XCTAssertFalse(emptyEnvPrompt.contains(TokenSaverProviderSafetyABI.block))
-        XCTAssertFalse(emptyEnvPrompt.contains("| distill"))
+    func test_promptBlocksNeverInjectDistillOrTheSafetyABIEvenWithALegacyHint() throws {
+        // WHY: Token Saver was removed. A hint an older build left in the
+        // environment must not bring back the Distill rules on Grok ACP.
+        for environment in [[:], ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]] {
+            let request = AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .grok,
+                model: "grok-4.5",
+                cwd: "/tmp",
+                prompt: "inspect",
+                environment: environment
+            )
+            let blocks = try GrokACPClient.promptBlocks(
+                for: request,
+                capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
+            )
+            let prompt = try XCTUnwrap(blocks.first?["text"] as? String)
+            XCTAssertFalse(prompt.contains("TOKEN_SAVER_SAFETY_ABI"))
+            XCTAssertFalse(prompt.contains("| distill"))
+        }
     }
 
     func test_promptBlocksInjectBackgroundAwaitDirectiveNotClaudeMCP() throws {
@@ -1114,7 +1153,7 @@ final class GrokACPProtocolTests: XCTestCase {
 
     /// Live Grok 1.0 session/prompt `_meta.usage` includes `costUsdTicks`
     /// (1 USD = 10^10 ticks). finishTurn must map them into reportedCostMicros
-    /// so Agent App spend / Token Saver rings match the CLI parser path.
+    /// so Agent App spend / usage rings match the CLI parser path.
     func test_finishTurn_mapsCostUsdTicksToReportedCostMicros() {
         let mapper = GrokACPEventMapper(sessionId: "grok-cost-ticks")
         var events: [AssistantEvent] = []
@@ -1935,28 +1974,18 @@ final class GrokACPProtocolTests: XCTestCase {
         )
     }
 
-    /// WHY: the Distill librarian MCP (rc_* / 01-catalogo.html) is Token Saver
-    /// surface. It must ride Grok sessions only while the run carries the Token
-    /// Saver hint — the same gate Claude (--mcp-config) and Codex (config.toml
-    /// lifecycle) apply — instead of unconditionally on every session.
-    func test_sessionMCPServersAdmitDistillLibrarianOnlyWithTokenSaver() {
-        func names(_ environment: [String: String]) -> [String] {
-            GrokACPClient.sessionMCPServers(
-                existing: [],
-                command: "/tmp/RemoteCodeDistillService",
-                environment: environment
-            ).compactMap { ($0 as? [String: Any])?["name"] as? String }
-        }
-
-        let on = names([DistillMCPAdmit.tokenSaverHintEnvironmentKey: "1"])
-        XCTAssertTrue(on.contains(DistillMCPAdmit.serverName),
-                      "Token Saver on must admit the librarian MCP into the Grok session")
-
-        let off = names([:])
-        XCTAssertFalse(off.contains(DistillMCPAdmit.serverName),
-                       "Token Saver off must not expose the librarian MCP to Grok")
-        XCTAssertTrue(off.contains(BotSelfConfigMCPAdmit.serverName),
-                      "the gate is librarian-only: bot servers stay admitted either way")
+    /// WHY: the Token Saver librarian MCP was removed. A hint an older build
+    /// left in the environment must not bring it back into Grok sessions.
+    func test_sessionMCPServersNeverAdmitTheRemovedLibrarian() {
+        let names = GrokACPClient.sessionMCPServers(
+            existing: [],
+            command: "/tmp/RemoteCodeDistillService",
+            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+        ).compactMap { ($0 as? [String: Any])?["name"] as? String }
+        XCTAssertFalse(names.contains("remotecode-distill"),
+                       "the removed librarian MCP must not reach the Grok session")
+        XCTAssertTrue(names.contains(BotSelfConfigMCPAdmit.serverName),
+                      "bot servers stay admitted")
     }
 
     /// WHY: workspace-less bot threads fall through to currentDirectoryPath,

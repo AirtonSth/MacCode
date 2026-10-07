@@ -139,8 +139,7 @@ public enum RemoteCodeOrchestrateInstallError: Error, Sendable, Equatable {
 }
 
 /// Always-on parent identity for the provider-neutral `subagent begin` bridge.
-/// This is lifecycle scope only: resolving it must not depend on Token Saver
-/// admission or enable any paid lane.
+/// This is lifecycle scope only: resolving it must not enable any paid lane.
 public struct RemoteCodeSubagentTelemetryScope: Sendable, Equatable {
     public let threadId: AgentThreadID
     public let parentRunId: AgentRunID?
@@ -175,16 +174,38 @@ public struct RemoteCodeSubagentTelemetryScope: Sendable, Equatable {
 }
 
 public final class AgentSkillInstaller: @unchecked Sendable {
+    /// Names and markers of what the removed Token Saver installed. Only the
+    /// legacy purge (`LegacyTokenSaverPurge`) still uses them, to find and
+    /// remove those leftovers.
     public static let distillSkillID = "distill"
-    public static let distillSourceURL = "remote-code://token-saver/distill-tool-output"
-    public static let distillLocalVersion = "10"
     public static let distillInstructionsBeginMarker = "<!-- distill skill: begin -->"
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
     public static let distillCLIEndMarker = "# RemoteCode managed distill CLI: end"
     public static let mcpBeginMarker = "# RemoteCode managed MCP: begin"
     public static let mcpEndMarker = "# RemoteCode managed MCP: end"
-    public static let retrieveMCPName = DistillMCPAdmit.codexServerName
+    /// The removed librarian MCP's table / server key in the provider configs.
+    public static let retrieveMCPName = "remotecode-distill-retrieve"
+    /// Command basenames the removed Token Saver PATH-wrapped in the managed
+    /// bin (compressible commands, then exact-output ones). The purge removes
+    /// any of these links that still point at the service binary.
+    public static let legacyCommandWrapperBasenames: [String] = [
+        "find", "ls",
+        "git", "gh", "glab",
+        "swift", "xcodebuild",
+        "npm", "yarn", "pnpm", "bun", "bunx", "pip", "pip3", "poetry", "bundle", "composer", "gem", "brew",
+        "make", "cmake", "ninja", "gradle", "mvn", "dotnet", "cargo", "go", "rustc", "tsc", "javac",
+        "pytest", "jest", "mocha", "rspec", "phpunit",
+        "eslint", "pylint", "flake8", "rubocop", "swiftlint", "shellcheck", "golangci-lint", "stylelint", "hadolint",
+        "docker", "kubectl", "helm", "terraform", "terragrunt", "pulumi",
+        "curl", "wget", "aws", "gcloud", "az",
+        "python", "python3",
+        "rg", "grep", "egrep", "fgrep", "ag", "ugrep",
+        "sed", "awk", "gawk", "nawk", "cut", "tr", "paste",
+        "cat", "head", "tail", "nl", "tac",
+        "diff", "cmp", "od", "hexdump", "xxd", "base64",
+        "jq", "yq",
+    ]
     public static let computerUseMCPName = ComputerUseMCPAdmit.serverName
     public static let legacyExternalHostSkillID = "macos-harness"
     /// Environment signal set only for a logical Desktop (This Mac) run. It is
@@ -199,10 +220,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         skillID: "remote-code-orchestrate",
         sourceURL: "https://github.com/samuelfaj/sam-skills/tree/main/sam-orchestrate",
         // Upstream base revision; tree digest is recomputed from the embedded package
-        // after local contract edits (skill content must stay complete / no Distill-in-skills).
+        // after local contract edits (skill content must stay complete).
         sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
-        sourceTreeSHA256: "9d0d615bae2bca280edebfe0ca15bcaf02f2758fbcb8ebd07ee633a988e180b7",
-        localVersion: "9",
+        sourceTreeSHA256: "7819153677e56c9bb9533c5eaa6d6bb420a162bac95267e9bff2fd0a9af907c8",
+        localVersion: "10",
         allowedPaths: [
             "SKILL.md",
             "agents/openai.yaml",
@@ -215,121 +236,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         ]
     )
 
-    public static let distillSkillTemplate = """
-    ---
-    name: distill
-    description: Token Saver policy for compressing noisy command and tool output locally.
-    ---
-
-    # Distill tool output
-
-    Distill is not a conversation mode or user command. It only reduces noisy
-    command/tool output before that output enters provider context.
-
-    Command-output / exploration policy (Token Saver — Claude + Codex + Grok, primary + nested + subagents):
-    - **Coverage first (mandatory for large surveys):** do **not** flood context with native multi-file `read_file` / `grep` / `list_dir` / tree walks. Order:
-      1) When `$RC_GRAPHIFY_ENABLED=1` and `$RC_GRAPHIFY_GRAPH_JSON` is set → `graphify query|path|explain` first.
-      2) Else / after graph → shell via `run_terminal_command` / Bash using PATH-wrapped tools (`git`, `bun`, `npm`, `find`, `ls`, tests, builds, …) and/or end with `| distill "<question>"`.
-      3) Native file tools only for **small, targeted** slices you need byte-exactly (one file, known path, short range).
-    - **Why:** Grok/Codex cannot rewrite native tool output (passive/no `updatedToolOutput`). Claude PostToolUse may compress some tools, but shell wrappers + `| distill` maximize measured savings on all three providers. Prefer shell+compress for noisy builds/tests/logs.
-    - MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary / pass-fail / key lines, you MUST pipe.
-      Applies to: build, test, lint, install, docker, kubectl, terraform, find, ls, git/gh/glab (including `gh api`, merges, status), package managers, python/bun one-shots, curl/aws/cloud CLIs, compound scripts, CI/logs, and **any other ordinary command** not listed under NEVER below.
-      Host PATH wrappers auto-compress **all subcommands** of wrapped binaries (no read-only allowlist) when terminal-to-agent and above threshold — still pipe `| distill` yourself so extraction is explicit. Same policy for primary, nested subagents, and cross-provider orchestration (Claude/Codex/Grok).
-    - NEVER auto-distill raw exact-output when you need every match/slice from: \(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")); or git grep/show/cat-file/blame.
-      Voluntary `rg … | distill "<question>"` (same for grep / git grep) is allowed when the last pipeline command is distill and you want an extractive answer instead of every match line.
-      Also skip: GUI / interactive / TUI apps, non-pipable calls, patches/apply, hash/token copy, or RemoteCodeDistillService unavailable.
-    - NEVER Distill skill content: Skill tool output and requested/returned SKILL.md bodies are a protected verbatim category — return them complete (no summary, recovery handle, truncation, or savings accounting).
-    - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
-    - When you skip `| distill`, state that briefly (e.g. skip: exact sed/rg; skip: GUI; skip: skill). Omitting `| distill` on a non-exact, non-GUI shell command is a policy violation.
-    - Applies to primary agents, same-provider subagents, and cross-provider nested launches (Claude↔Codex↔Grok) whenever Token Saver is admitted.
-    - Host/runtime carries the ordinary-output Distill policy; do not require every worker prompt to restate it.
-    - If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`.
-    - Wait for `distill` before continuing when you did pipe it.
-
-    Local librarian catalog (01-catalogo.html, Token Saver Distill MCP `remotecode-distill` / `remotecode-distill-retrieve`; tools `rc_stats`, `rc_search`, `rc_catalog`, `rc_ask`, `rc_extract`, `rc_digest`, `rc_pick`, `rc_retrieve`, `rc_compress`) — use it by default on every turn, without the user asking, whenever these tools are listed:
-    - Use the FULL tool surface, not just one tool: `rc_search` (find stored handles/blobs BEFORE re-deriving or re-reading), `rc_catalog` (discover enabled catalog operations by id/summary), `rc_ask` (run a discovered op over a handle), `rc_compress` (shrink a large blob before quoting it), `rc_retrieve` (byte-exact original behind `[[rc:handle]]` — whole-blob retrieval is the exception, justify it), `rc_stats` (ledger/handle stats).
-    - `rc_ask.op` is a catalog function id. Use the eight schema hints for common work; query `rc_catalog` just in time for other extract/digest/classify/rank/diff/grep-in-handle/draft operations, then call the returned id (examples: test_verdict, ci_job_failures, handle_grep, retrieve_range, extract_schema, pick_candidates, cite_spans, multi_handle_ask). Doing one manually on handle-backed content is a policy violation, same as skipping `| distill`.
-    - Generate ops run on the Distill model selected in Settings (1.7B / E4B / OpenAI-compatible API).
-    - Host-only catalog ops (screenshot_ocr, doc_text_extract, lsp_query, graphify_query, path_wrappers, …) stay on the Mac; if MCP returns unavailable, do not fake success — read the original natively.
-    - Forbidden catalog ids (apply_patch, extract_secret_values, …) are refused. Never ask Distill to ship code or leak secrets.
-    - Recover `[[rc:handle]]` with `rc_retrieve`.
-
-    Examples:
-    - `graphify query "where is mark-as-completed?" --graph "$RC_GRAPHIFY_GRAPH_JSON"`  # when Graphify active
-    - `bun test 2>&1 | distill "Did tests pass? Return PASS or FAIL, followed by failing test names if any."`
-    - `git log --oneline -50 | distill "Summarize recent commits by theme."`
-    - `python3 script.py 2>&1 | distill "What failed? Key errors only."`
-    - `rg -n "func applyGraphify" Sources`  # skip distill — need every match line
-    - `rg -n "FAIL|error:" .build | distill "Which tests failed? Keep file:line and assertion text."`  # last command is distill — allowed
-    - `sed -n '100,180p' Sources/Foo.swift`  # skip distill — need exact slice
-
-    """
-
-    public static let distillAgentInstructionsTemplate = """
-    <!-- distill skill: begin -->
-    Distill is only for local command/tool-output reduction. It is not a conversation style or user command.
-    Token Saver — Claude/Codex/Grok (primary, nested, subagents): large surveys → Graphify query-first when `$RC_GRAPHIFY_GRAPH_JSON` is set, else shell + PATH wrappers / `| distill`. Avoid flooding native multi-file read_file/grep (Grok/Codex cannot rewrite those; Claude PostToolUse helps but shell coverage is higher). Native reads only for small exact slices.
-    MANDATORY default-pipe: for **every** non-GUI pipable shell command whose full stdout you do **not** need byte-exactly next, end with `| distill "<question>"` (`pipefail` when exit status matters). If you only need summary/pass-fail/key lines, you MUST pipe. Host PATH wrappers auto-compress all subcommands of wrapped binaries (incl. gh api; no read-only allowlist); still pipe yourself for an explicit extraction question. Applies primary + nested + cross-provider (Claude/Codex/Grok) whenever Token Saver is admitted.
-    NEVER auto-distill raw exact-output (need every line): \(WrappedCommandCatalog.exactOutputCommands.joined(separator: ", ")); git grep/show/cat-file/blame. Voluntary `rg … | distill "<question>"` is allowed when the last pipeline command is distill and you want an extractive answer. Also skip patches/hashes/tokens, GUI/interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
-    Uniform JSON arrays may arrive as TOON: a header `[N]{fields}` then one comma-separated row per object (nested groups like `temp{min,max}`). Treat those cells as the JSON fields. If you asked for JSON only, the host keeps JSON.
-    Omitting `| distill` on a non-exact, non-GUI shell command is a policy violation.
-    NEVER Distill skill content: Skill tool output and requested/returned SKILL bodies must stay complete/verbatim (no summary, `[[rc:]]` handle, truncation, or savings accounting).
-    Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
-    Host/runtime carries the ordinary-output Distill policy; do not require every worker prompt to restate it.
-    Distill MCP catalog tools (`rc_stats`, `rc_search`, `rc_catalog`, `rc_ask`, `rc_extract`, `rc_digest`, `rc_pick`, `rc_retrieve`, `rc_compress`) are used BY DEFAULT whenever listed, without the user asking: `rc_search` handles; `rc_catalog` ops; `rc_ask`/`rc_extract`/`rc_digest`/`rc_pick` run them; `rc_compress` blobs; `rc_retrieve` exact bytes. Doing it manually on handle content is a policy violation. Generate uses the Settings model. Host-only may be unavailable — never fake success; forbidden ops are refused. Recover `[[rc:<handle>]]` with `rc_retrieve` or `distill retrieve`. Wait when used.
-    Details and examples live in the managed `distill` SKILL.md.
-    <!-- distill skill: end -->
-    """
-
-    public static let rcWireAgentInstructionsTemplate = """
-    REMOTE_CODE_WIRE_V1
-    Current RCW1 Q:G/C/K=task,X=handle;RCW1 A:O/A/E/R/Q+"." iff full tokens<=45% of semantically identical terse text;else same text. Keep literals/negation/order/approval;tools native
-    """
-
-    public static let compactSpanAgentInstructionsTemplate = """
-    REMOTE_CODE_COMPACT_SPAN_V1
-    Item RCS1/1 then H decoded_utf8_len dict_utf8_len record_count ref_count; one D escaped span; record_count L or R lines; END. Escapes only \\\\ \\n \\r \\t. Decode the complete item before acting. Concatenate L literals and D for each R in order. Preserve decoded literals/negation/order. Tools remain native
-    """
-
-    /// The distill agent instructions with the begin/end HTML markers stripped. The markers
-    /// only matter for the in-place upsert/removal inside CLAUDE.md/AGENTS.md; this marker-free
-    /// body is what gets injected as an authoritative system prompt (Claude SDK bridge), where
-    /// the surrounding CLAUDE.md is easily buried. The runtime adapter appends the safety ABI
-    /// separately so mutable on-disk instructions cannot duplicate that contract.
-    public static var distillAgentInstructionsBody: String {
-        distillAgentInstructionsTemplate
-            .replacingOccurrences(of: distillInstructionsBeginMarker, with: "")
-            .replacingOccurrences(of: distillInstructionsEndMarker, with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// Inject managed Token Saver policies into provider runtime prompts (Claude / Codex / Grok)
-    /// only while Token Saver is active (`RC_TOKEN_SAVER_DISTILL_HINT=1`).
-    /// Token economy is the paid feature: no `| distill` rules, RCW1 ABI, or
-    /// safety ABI when the toggle is off.
-    public static func tokenSaverProviderPrompt(_ base: String, environment: [String: String]) -> String {
-        let routed = nestedAgentProviderPrompt(base, environment: environment)
-        var withDistill: String
-        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-            withDistill = managedDistillProviderPrompt(routed)
-        } else {
-            withDistill = routed
-        }
-        if environment[TokenSaverExecutionReceiptSeam.wireCapabilityEnvKey] == "1",
-           !withDistill.contains(rcWireAgentInstructionsTemplate) {
-            withDistill += "\n\n" + rcWireAgentInstructionsTemplate
-        }
-        if environment[TokenSaverExecutionReceiptSeam.compactSpanCapabilityEnvKey] == "1",
-           environment[TokenSaverExecutionReceiptSeam.compactSpanVersionEnvKey] == "1",
-           !withDistill.contains(compactSpanAgentInstructionsTemplate) {
-            withDistill += "\n\n" + compactSpanAgentInstructionsTemplate
-        }
-        return graphifyProviderPrompt(withDistill, environment: environment)
-    }
-
     /// Always-on host routing for provider-to-provider delegation. This is
-    /// lifecycle plumbing, not a Token Saver lane, so it remains present when
-    /// the paid toggle is off. Explicit skill CLIs keep their exact ABI and are
+    /// lifecycle plumbing. Explicit skill CLIs keep their exact ABI and are
     /// intercepted by provider proxies instead of being silently rewritten.
     public static func nestedAgentProviderPrompt(
         _ base: String,
@@ -357,27 +265,14 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// changing its prompt transport, sandbox, tools, persistence, or output ABI.
     ///
     /// Nested `claude` / `codex` / `grok` launches go through this seam (via
-    /// `ProviderProxyRunner.providerRuntimeArguments`). For Claude, Agent App
-    /// runs already register PostToolUse via `ClaudeRunner.ultracodeSettingsArgs`.
-    /// The raw provider-proxy path must do the same when Token Saver admits
-    /// `RC_TOKEN_SAVER_POST_TOOL_USE=1` — otherwise nested Claude (advisor,
-    /// spawn_subagent, shell `claude`) burns tokens with zero tool-output
-    /// compression while lifecycle still shows Nested - Claude receipts.
+    /// `ProviderProxyRunner.providerRuntimeArguments`).
     public static func providerProxyArguments(
         provider: AgentProvider,
         arguments: [String],
         environment: [String: String]
     ) -> [String] {
-        // Claude PostToolUse is independent of the dialect prompt: nested
-        // advisors use only Read/Glob/Grep, so PATH wrappers never fire and
-        // hooks are the only provider-native rewrite path (Agents.md).
-        let rewritten = ensuringClaudePostToolUseSettings(
-            provider: provider,
-            arguments: arguments,
-            environment: environment
-        )
-
-        let prompt = tokenSaverProviderPrompt("", environment: environment)
+        let rewritten = arguments
+        let prompt = nestedAgentProviderPrompt("", environment: environment)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty,
               isSupportedProviderTurn(provider: provider, arguments: rewritten)
@@ -444,10 +339,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     }
 
     /// Raw nested Codex invocations do not pass through `CodexRunner` or the
-    /// app-server adapter. Admit the same four bot MCPs on the process argv so
+    /// app-server adapter. Admit the same bot MCPs (all four on bot runs,
+    /// bot-self-config only otherwise) on the process argv so
     /// `codex exec resume` and other strict/raw turns retain the host catalog
-    /// without consulting the shared `~/.codex/config.toml`, plus the Token
-    /// Saver librarian (with the run's recovery scope) under its own gate.
+    /// without consulting the shared `~/.codex/config.toml`.
     static func ensuringCodexProcessMCPOverlays(
         provider: AgentProvider,
         arguments: [String],
@@ -488,14 +383,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         guard let subcommandIndex else {
             return arguments
         }
-        let names = [
-            BotSelfConfigMCPAdmit.serverName,
-            BotBrowserMCPAdmit.serverName,
-            BotComputerMCPAdmit.serverName,
-            BotWebMCPAdmit.serverName,
-        ]
-        let callerIsScoped = environment[BotSelfConfigCatalog.callerEnvironmentKey]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let callerIsScoped = BotRunMCPAdmission.isBotRun(environment: environment)
+        let names = [BotSelfConfigMCPAdmit.serverName]
+            + (callerIsScoped ? BotRunMCPAdmission.botOnlyServerNames : [])
         let hasManagedCommand = { (name: String) in
             arguments.contains { $0.contains("mcp_servers.\(name).command=") }
         }
@@ -505,13 +395,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         var overrides: [String] = []
         if names.contains(where: { !hasManagedCommand($0) || (callerIsScoped && !hasScopedBotID($0)) }) {
             overrides += CodexRunner.botCatalogMCPOverrides(environment: environment)
-        }
-        // The librarian keeps its own presence check and its own Token Saver
-        // gate (`distillMCPOverrides` returns [] when the hint is absent), so a
-        // raw argv that already pinned the bot catalog still receives the
-        // librarian overlay, and a Token Saver-off run still receives neither.
-        if !hasManagedCommand(DistillMCPAdmit.codexServerName) {
-            overrides += CodexRunner.distillMCPOverrides(environment: environment)
         }
         guard !overrides.isEmpty else { return arguments }
         switch arguments[subcommandIndex] {
@@ -537,7 +420,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             return arguments
         }
 
-        // `exec` may have global `--config`/Token Saver options in front of
+        // `exec` may have global `--config` options in front of
         // it. Place the overlay before that subcommand so the original skill
         // ABI remains the suffix. A bare app-server/raw exec keeps its
         // subcommand first, which is required by Codex's protocol adapter.
@@ -609,105 +492,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return true
     }
 
-    /// Inject Claude CLI `--settings` PostToolUse hooks on the raw provider-proxy
-    /// path when Token Saver has admitted the Claude PostToolUse lane.
-    ///
-    /// Fail-open rules:
-    /// - Non-Claude providers: unchanged.
-    /// - Flag absent / not admitted: unchanged (byte-identical argv).
-    /// - Administrative / unsupported turns: unchanged.
-    /// - Caller `--settings`: merge in memory; never edit the caller's file.
-    /// - Settings builder fails: leave argv unchanged.
-    static func ensuringClaudePostToolUseSettings(
-        provider: AgentProvider,
-        arguments: [String],
-        environment: [String: String]
-    ) -> [String] {
-        guard provider == .claude else { return arguments }
-        guard environment[ClaudeRunner.tokenSaverPostToolUseEnvKey] == "1" else {
-            return arguments
-        }
-        guard isSupportedProviderTurn(provider: .claude, arguments: arguments) else {
-            return arguments
-        }
-        // Distill-only map so nested proxy merge does not pull filesystem hooks
-        // into the caller argv. Agent App streaming path merges those separately.
-        guard let ptuHooks = ClaudeRunner.tokenSaverDistillHookSettings(environment: environment) else {
-            return arguments
-        }
-        let settingsArgs = ClaudeRunner.ultracodeSettingsArgs(nil, environment: environment)
-        // Merge into the effective (last) inline JSON or JSON settings file.
-        // The caller's file is never edited; path-form becomes an equivalent
-        // inline object at the same argv position. Both `--settings value` and
-        // `--settings=value` are supported by the Claude CLI.
-        enum SettingsLocation {
-            case separate(valueIndex: Int)
-            case inline(argumentIndex: Int)
-        }
-        let boundary = arguments.firstIndex(of: "--") ?? arguments.endIndex
-        var effectiveSettings: (location: SettingsLocation, value: String)?
-        var scanIndex = 0
-        while scanIndex < boundary {
-            let argument = arguments[scanIndex]
-            if argument == "--settings" {
-                guard scanIndex + 1 < boundary else { return arguments }
-                effectiveSettings = (.separate(valueIndex: scanIndex + 1), arguments[scanIndex + 1])
-                scanIndex += 2
-                continue
-            }
-            if argument.hasPrefix("--settings=") {
-                effectiveSettings = (
-                    .inline(argumentIndex: scanIndex),
-                    String(argument.dropFirst("--settings=".count))
-                )
-            }
-            scanIndex += 1
-        }
-        if let effectiveSettings {
-            let existing = effectiveSettings.value
-            let existingData: Data? = {
-                if existing.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") {
-                    return existing.data(using: .utf8)
-                }
-                return FileManager.default.contents(atPath: existing)
-            }()
-            if let existingData,
-               var existingObject = try? JSONSerialization.jsonObject(with: existingData) as? [String: Any] {
-                var hooks = existingObject["hooks"] as? [String: Any] ?? [:]
-                let existingPost = hooks["PostToolUse"] as? [[String: Any]] ?? []
-                let requiredPost = ptuHooks["PostToolUse"] as? [[String: Any]] ?? []
-                let existingJSON = (try? JSONSerialization.data(
-                    withJSONObject: existingPost,
-                    options: [.sortedKeys]
-                )).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                let mergedPost = existingJSON.contains("distill hook post-tool-use")
-                    ? existingPost
-                    : existingPost + requiredPost
-                if !mergedPost.isEmpty {
-                    hooks["PostToolUse"] = mergedPost
-                    existingObject["hooks"] = hooks
-                    if let merged = try? JSONSerialization.data(
-                        withJSONObject: existingObject,
-                        options: [.sortedKeys]
-                    ),
-                       let mergedJSON = String(data: merged, encoding: .utf8) {
-                        var out = arguments
-                        switch effectiveSettings.location {
-                        case .separate(let valueIndex):
-                            out[valueIndex] = mergedJSON
-                        case .inline(let argumentIndex):
-                            out[argumentIndex] = "--settings=" + mergedJSON
-                        }
-                        return out
-                    }
-                }
-            }
-            // Unknown/non-JSON settings remain byte-identical (fail open).
-            return arguments
-        }
-        return settingsArgs + arguments
-    }
-
     private static func mergingCodexDeveloperInstructions(
         _ prompt: String,
         arguments: [String]
@@ -755,9 +539,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
         guard let effectiveOverride else { return arguments }
         let encoded = effectiveOverride.assignment.encoded
-        if encoded.contains("TOKEN_SAVER_SAFETY_ABI_V1") {
-            return arguments
-        }
         let delimiter: String
         if encoded.hasPrefix("\"\"\"") && encoded.hasSuffix("\"\"\"") {
             delimiter = "\"\"\""
@@ -1092,95 +873,20 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return merged
     }
 
-    /// Inject Graphify query-first rules when host set `RC_GRAPHIFY_ENABLED=1`.
-    /// Optional roots/graph path from env help the model call the right CLI without user prompts.
-    public static func graphifyProviderPrompt(_ base: String, environment: [String: String]) -> String {
-        guard environment["RC_GRAPHIFY_ENABLED"] == "1" else { return base }
-        let banner = GraphifyStableSkillText.runtimeStatusBanner(environment: environment) ?? ""
-
-        // Already fully injected (stable body present): still force absolute path banner first.
-        if base.contains(GraphifyStableSkillText.agentInstructionsBody) {
-            if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty, !base.contains(graph) {
-                let note = GraphifyStableSkillText.runtimeStatusBanner(environment: environment) ?? "Graphify runtime: --graph \(graph)"
-                return note + "\n\n" + base
-            }
-            if !banner.isEmpty, !base.contains("HOST GRAPHIFY STATUS") {
-                return banner + "\n\n" + base
-            }
-            return base
-        }
-
-        var block = GraphifyStableSkillText.agentInstructionsBody
-        if let roots = environment["RC_GRAPHIFY_ROOTS"], !roots.isEmpty {
-            block += "\nActive Graphify roots (one per line):\n\(roots)"
-        }
-        if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty {
-            block += "\nPrimary graph JSON (canonical; use --graph with this path): \(graph)"
-        }
-        if let artifact = environment["RC_GRAPHIFY_ARTIFACT_ROOT"], !artifact.isEmpty {
-            block += "\nGraphify artifact root (Application Support; not repo graphify-out/): \(artifact)"
-        }
-        if environment["RC_GRAPHIFY_AMBIGUOUS"] == "1" {
-            block += "\nNote: multi-repo workspace is ambiguous this turn; fail open if unsure which root applies."
-        }
-        if environment["RC_GRAPHIFY_STALE"] == "1" {
-            block += "\nNote: graph is refreshing in the background this turn; fail open for broad search if query results look incomplete."
-        }
-        // Banner FIRST (before user request) so "tem graph?" cannot be answered from repo graphify-out alone.
-        if banner.isEmpty {
-            return base + "\n\n" + block
-        }
-        return banner + "\n\n" + base + "\n\n" + block
-    }
-
-    /// Distill injection for Token-Saver-enabled provider adapters.
-    public static func managedDistillProviderPrompt(_ base: String) -> String {
-        let withDistill = base.contains(distillAgentInstructionsBody)
-            ? base
-            : base + "\n\n" + distillAgentInstructionsBody
-        return TokenSaverProviderSafetyABI.appendingExactlyOnce(to: withDistill, enabled: true)
-    }
-
-    /// App-private Distill package directory (mirrors remote-code-orchestrate layout).
+    /// App-private Distill skill folder an earlier Token Saver build installed.
     public func distillAppPrivateDirectory() -> URL {
         appPrivateSkillsRoot.appendingPathComponent(Self.distillSkillID, isDirectory: true)
     }
 
-    /// Install Distill into RemoteCode Application Support only — never into
-    /// `~/.claude/skills`, `~/.codex/skills`, or `~/.grok/skills`.
+    /// Remove the app-private Distill skill folder an earlier Token Saver build
+    /// installed. The folder lives under RemoteCode's own Application Support
+    /// skills root, so it is always app-owned.
     @discardableResult
-    public func installAppPrivateDistillSkill(
-        sourceRevision: String = "remote-code-native-wire-v1",
-        installedAt: Date = Date()
-    ) throws -> AgentSkillInstallResult {
-        try fileManager.createDirectory(at: appPrivateSkillsRoot, withIntermediateDirectories: true)
+    public func uninstallAppPrivateDistillSkill() throws -> AgentSkillUninstallResult {
         let directory = distillAppPrivateDirectory()
-        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        let skillURL = directory.appendingPathComponent("SKILL.md")
-        let manifestURL = directory.appendingPathComponent("manifest.json")
-        let data = Data(Self.distillSkillTemplate.utf8)
-        let checksum = Self.sha256Hex(data)
-        let manifest = AgentSkillManifest(
-            provider: .claude, // app-private; provider field is historical on the manifest
-            skillID: Self.distillSkillID,
-            sourceURL: Self.distillSourceURL,
-            sourceRevision: sourceRevision,
-            localVersion: Self.distillLocalVersion,
-            sha256: checksum,
-            installPath: skillURL.path,
-            installedAt: installedAt
-        )
-        if let existingData = try? Data(contentsOf: skillURL, options: .mappedIfSafe),
-           Self.sha256Hex(existingData) == checksum,
-           let manifestData = try? Data(contentsOf: manifestURL, options: .mappedIfSafe),
-           let existingManifest = try? decoder.decode(AgentSkillManifest.self, from: manifestData),
-           existingManifest.sourceRevision == sourceRevision,
-           existingManifest.localVersion == Self.distillLocalVersion {
-            return AgentSkillInstallResult(action: .skipped, manifest: existingManifest)
-        }
-        try data.write(to: skillURL, options: .atomic)
-        try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
-        return AgentSkillInstallResult(action: .installed, manifest: manifest)
+        guard fileManager.fileExists(atPath: directory.path) else { return .notPresent }
+        try fileManager.removeItem(at: directory)
+        return .removed
     }
 
     /// Remove legacy Distill copies that used to live in each provider's home skill tree.
@@ -1329,126 +1035,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         AgentOrchestrationRuntime.defaultPackageURL().deletingLastPathComponent()
     }
 
-    /// Legacy provider-home install path. Prefer `installAppPrivateDistillSkill`.
-    /// Kept for tests that exercise the old root; production reconcile no longer
-    /// writes into `~/.claude/skills` / `~/.codex/skills` / `~/.grok/skills`.
-    public func installDistillSkill(
-        for provider: AgentProvider,
-        sourceRevision: String,
-        installedAt: Date = Date()
-    ) throws -> AgentSkillInstallResult {
-        try installSkill(
-            provider: provider,
-            skillID: Self.distillSkillID,
-            skillText: Self.distillSkillTemplate,
-            sourceURL: Self.distillSourceURL,
-            sourceRevision: sourceRevision,
-            localVersion: Self.distillLocalVersion,
-            installedAt: installedAt
-        )
-    }
-
-    public func installDistillInstructions(for provider: AgentProvider) throws {
-        try upsertDistillInstructions(at: instructionsURL(for: provider))
-    }
-
-    /// Install the managed `distill` CLI as a SYMLINK to the native RemoteCodeDistillService
-    /// binary, which runs in CLI mode when invoked via the "distill" basename. A Mach-O
-    /// symlink — not a shebang script — so there is no Python dependency (N1) and the CLI
-    /// is fail-open (writes raw stdin back on any error; see ManagedDistillCLI).
-    /// `serviceBinaryURL` is resolved automatically when not provided (tests inject it).
-    ///
-    /// Idempotent and automatic for any user: repairs missing, dangling, or stale
-    /// links under that user's home (`~/.remote-code/bin` + `~/.local/bin` bridge).
-    @discardableResult
-    public func installDistillCLI(appSupportDirectory: URL, serviceBinaryURL: URL? = nil) throws -> URL {
-        try ensureDistillCLI(serviceBinaryURL: serviceBinaryURL)
-    }
-
-    /// Ensure the managed `distill` basename and PATH bridge exist and point at a
-    /// live `RemoteCodeDistillService`. Safe to call on every Token Saver reconcile
-    /// and before every admitted agent turn — no-ops when already healthy.
-    ///
-    /// Resolution order (works for any macOS user account):
-    /// 1. explicit `serviceBinaryURL` when executable
-    /// 2. `resolveServiceBinary` (app bundle aux, process siblings, SwiftPM)
-    /// 3. recover from any existing healthy managed wrapper in this installer's
-    ///    `cliBinDirectory` (e.g. `git`/`claude` still pointing at the service)
-    @discardableResult
-    public func ensureDistillCLI(serviceBinaryURL: URL? = nil) throws -> URL {
-        try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
-        let binary = try resolveServiceBinaryForManagedInstall(preferred: serviceBinaryURL)
-        let url = distillCLIURL()
-        if distillLinkNeedsRepair(at: url, expectedBinary: binary) {
-            try? fileManager.removeItem(at: url)
-            try fileManager.createSymbolicLink(at: url, withDestinationURL: binary)
-        }
-        linkManagedDistillOntoPath(target: url)
-        // Second path-bridge pass: if ~/.local/bin/distill still missing (first
-        // attempt failed on a race), retry once.
-        if !fileManager.fileExists(atPath: distillPathLinkURL().path) {
-            linkManagedDistillOntoPath(target: url)
-        }
-        guard isHealthyDistillLink(at: url) else {
-            throw AgentSkillCLIError.serviceBinaryUnavailable
-        }
-        return url
-    }
-
-    /// True when managed `distill` exists and resolves to an executable service binary.
-    public func isDistillCLIHealthy() -> Bool {
-        isHealthyDistillLink(at: distillCLIURL())
-    }
-
-    private func resolveServiceBinaryForManagedInstall(preferred: URL?) throws -> URL {
-        if let preferred, fileManager.isExecutableFile(atPath: preferred.path) {
-            return preferred.resolvingSymlinksInPath()
-        }
-        let usesProductionManagedBin = cliBinDirectory.standardizedFileURL.path
-            == Self.defaultManagedCLIBinDirectory().standardizedFileURL.path
-        if usesProductionManagedBin {
-            // A running app bundle is authoritative. Recovering the shared
-            // wrapper first let an older concurrently-running build repoint the
-            // current app back to its stale service binary.
-            if let resolved = Self.resolveServiceBinary(fileManager: fileManager),
-               fileManager.isExecutableFile(atPath: resolved.path) {
-                return resolved.resolvingSymlinksInPath()
-            }
-            if let recovered = recoverServiceBinaryFromManagedWrappers() {
-                return recovered
-            }
-        } else {
-            // Sandboxed/custom homes must not pick up a process-global build.
-            if let recovered = recoverServiceBinaryFromManagedWrappers() {
-                return recovered
-            }
-            if let resolved = Self.resolveServiceBinary(fileManager: fileManager),
-               fileManager.isExecutableFile(atPath: resolved.path) {
-                return resolved.resolvingSymlinksInPath()
-            }
-        }
-        throw AgentSkillCLIError.serviceBinaryUnavailable
-    }
-
-    /// When the app bundle path changed or Bundle.main is wrong, recover the
-    /// service binary from any remaining healthy managed symlink for this user.
-    private func recoverServiceBinaryFromManagedWrappers() -> URL? {
-        var names = ["claude", "codex", "grok", "git", "npm", "remote-code", "ls", "distill"]
-        names.append(contentsOf: WrappedCommandCatalog.commands)
-        var seen = Set<String>()
-        for name in names where seen.insert(name).inserted {
-            let link = cliBinDirectory.appendingPathComponent(name)
-            guard let absolute = resolvedSymlinkTarget(at: link),
-                  fileManager.isExecutableFile(atPath: absolute.path),
-                  absolute.lastPathComponent == "RemoteCodeDistillService"
-                    || absolute.path.contains("RemoteCodeDistillService") else {
-                continue
-            }
-            return absolute
-        }
-        return nil
-    }
-
     private func resolvedSymlinkTarget(at link: URL) -> URL? {
         guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) else {
             return nil
@@ -1459,23 +1045,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return link.deletingLastPathComponent()
             .appendingPathComponent(dest)
             .resolvingSymlinksInPath()
-    }
-
-    private func distillLinkNeedsRepair(at url: URL, expectedBinary: URL) -> Bool {
-        guard let current = resolvedSymlinkTarget(at: url) else {
-            // Missing, or a regular file (legacy script) — always replace.
-            return true
-        }
-        if !fileManager.isExecutableFile(atPath: current.path) {
-            return true
-        }
-        return current.resolvingSymlinksInPath().path
-            != expectedBinary.resolvingSymlinksInPath().path
-    }
-
-    private func isHealthyDistillLink(at url: URL) -> Bool {
-        guard let target = resolvedSymlinkTarget(at: url) else { return false }
-        return fileManager.isExecutableFile(atPath: target.path)
     }
 
     public func uninstallDistillCLI() throws -> AgentSkillUninstallResult {
@@ -1497,72 +1066,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .notPresent
     }
 
-    /// Install the global interceptor symlink for every executable command visible on the
-    /// system PATH in the managed bin dir (`~/.remote-code/bin`, PREPENDED to the agent PATH
-    /// only). Exact-output tools (sed, rg, grep, cat, …) are intercepted but pass through raw
-    /// stdout by policy. Provider basenames and shebang interpreters stay on their native paths.
-    /// Provider basenames (`grok`/`claude`/`codex`) are **not** part of this catalog —
-    /// see `installProviderProxies()`.
-    /// - Parameter searchDirectoriesOverride: effective provider/workspace PATH directories.
-    @discardableResult
-    public func installCommandWrappers(
-        serviceBinaryURL: URL? = nil,
-        searchDirectoriesOverride: [String]? = nil
-    ) throws -> [String] {
-        try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
-        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
-            throw AgentSkillCLIError.serviceBinaryUnavailable
-        }
-        // Drop leftover Distill symlinks that are not catalog wrappers or
-        // always-on controllers. A stray `node` wrapper makes
-        // `#!/usr/bin/env node` (Homebrew Codex) start the sidecar instead.
-        _ = try pruneUnmanagedManagedBinSymlinks(
-            keeping: reservedManagedBinBasenames(includingCommandWrappers: true),
-            serviceBinaryURL: binary
-        )
-        let searchDirectories = (searchDirectoriesOverride ?? systemCommandSearchDirectories())
-            .filter { !$0.isEmpty && $0 != cliBinDirectory.path }
-        var candidates = WrappedCommandCatalog.commands
-        for directory in searchDirectories {
-            let names = (try? fileManager.contentsOfDirectory(atPath: directory)) ?? []
-            candidates.append(contentsOf: names.sorted())
-        }
-        var seen = Set<String>()
-        var installed: [String] = []
-        for command in candidates {
-            guard seen.insert(command).inserted,
-                  !command.isEmpty,
-                  !command.contains("/"),
-                  !WrappedCommandCatalog.isShebangInterpreter(command),
-                  !ProviderProxyCatalog.providerSet.contains(command),
-                  command != "distill",
-                  command != "remote-code",
-                  command != "rc-retrieve-mcp"
-            else { continue }
-            guard commandExistsOnSystem(command, searchDirectories: searchDirectories) else { continue }
-            let link = cliBinDirectory.appendingPathComponent(command)
-            if let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {
-                if dest == binary.path { installed.append(command); continue }
-                try? fileManager.removeItem(at: link) // replace a stale managed symlink
-            } else if fileManager.fileExists(atPath: link.path) {
-                // A real (non-symlink) file we did not create — never clobber it.
-                continue
-            }
-            try fileManager.createSymbolicLink(at: link, withDestinationURL: binary)
-            installed.append(command)
-        }
-        // Always keep the managed `distill` basename next to wrappers for every
-        // user. PostToolUse hooks and voluntary `| distill` resolve this path.
-        _ = try ensureDistillCLI(serviceBinaryURL: binary)
-        if !installed.contains("distill") {
-            installed.append("distill")
-        }
-        return installed
-    }
-
     /// Remove the command-wrapper symlinks — but only those still pointing at our service binary,
     /// so a user's own command on the managed path (unexpected) is never deleted.
-    /// Includes legacy exact-output basenames so Token Saver off cleans old sed/rg wrappers.
+    /// Includes legacy exact-output basenames so old sed/rg wrappers go too.
     /// Does **not** remove nested provider proxies (`installProviderProxies`).
     @discardableResult
     public func uninstallCommandWrappers(
@@ -1570,11 +1076,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     ) throws -> [String] {
         let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager)
         let removedCatalog = try removeManagedWrapperSymlinks(
-            basenames: WrappedCommandCatalog.symlinkBasenamesToRemove,
+            basenames: Self.legacyCommandWrapperBasenames,
             binaryURL: binary
         )
         let removedExtras = try pruneUnmanagedManagedBinSymlinks(
-            keeping: reservedManagedBinBasenames(includingCommandWrappers: false),
+            keeping: reservedManagedBinBasenames(),
             serviceBinaryURL: binary
         )
         var seen = Set<String>()
@@ -1589,8 +1095,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     ///
     /// Ownership-safe and idempotent: never clobbers a user-owned regular file in the
     /// managed bin directory. Only creates a symlink when a real provider executable
-    /// exists outside the managed bin (so we never shadow a missing CLI). Independent
-    /// of Token Saver — available for every thread-scoped provider environment.
+    /// exists outside the managed bin (so we never shadow a missing CLI). Available
+    /// for every thread-scoped provider environment.
     ///
     /// - Parameter searchDirectoriesOverride: test seam; production always discovers
     ///   system PATH minus the managed bin.
@@ -1827,17 +1333,12 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return removed
     }
 
-    /// Basenames that may keep a Distill symlink in the managed bin.
-    func reservedManagedBinBasenames(includingCommandWrappers: Bool) -> Set<String> {
+    /// Basenames that may keep a Distill symlink in the managed bin. `distill`
+    /// and `rc-retrieve-mcp` are not kept: they belonged to the removed Token
+    /// Saver, so the prune removes leftover links with those names too.
+    func reservedManagedBinBasenames() -> Set<String> {
         var names = Set(ProviderProxyCatalog.providers)
         names.insert(Self.agentAppMiddlewareCommand)
-        names.insert("distill")
-        names.insert("rc-retrieve-mcp")
-        if includingCommandWrappers {
-            for command in WrappedCommandCatalog.commands where !WrappedCommandCatalog.isShebangInterpreter(command) {
-                names.insert(command)
-            }
-        }
         return names
     }
 
@@ -1910,26 +1411,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         codexInstructionsURL.deletingLastPathComponent().appendingPathComponent("config.toml")
     }
 
-    /// Install the librarian MCP server (`RemoteCodeDistillService mcp`) into Codex
-    /// config.toml as the file-level fallback. Idempotent; preserves any
-    /// user-authored entries. RemoteCode-spawned Codex turns get the same
-    /// server per process instead (`CodexRunner.distillMCPOverrides`, which
-    /// also carries the run's recovery scope and replaces this table by name);
-    /// Claude does NOT read `mcpServers` from settings.json (an installed entry
-    /// never spawned and `claude mcp list` omits it), so both Claude engines
-    /// admit the server per spawn instead
-    /// (ClaudeRunner.botPeerMCPConfigJSON / ClaudeAgentSDKBridgeAdapter.botPeerMCPServers),
-    /// and Grok admits it per ACP session (GrokACPClient.sessionMCPServers).
-    /// `uninstallRetrieveMCP` still purges the legacy Claude settings.json entry.
-    public func installRetrieveMCP(serviceBinaryURL: URL? = nil) throws {
-        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
-            throw AgentSkillCLIError.serviceBinaryUnavailable
-        }
-        try installCodexRetrieveMCP(binary: binary)
-    }
-
     /// Admit the host-queued computer-use MCP into Claude and Codex configs.
-    /// Idempotent; leftover / user-authored servers stay. Not Token Saver gated.
+    /// Idempotent; leftover / user-authored servers stay.
     public func installComputerUseMCP(serviceBinaryURL: URL? = nil) throws {
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
@@ -2138,7 +1621,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     }
 
     /// Purge the legacy global librarian MCP from the shared configs. Runs on
-    /// every Token Saver lifecycle application with the feature off, so it must
+    /// every launch and quit (`LegacyTokenSaverPurge`), so it must
     /// not rewrite a config it has nothing to delete from: the Claude branch
     /// re-serialized (and reformatted) a `settings.json` that Claude Code owns,
     /// and the Codex branch replaced the `~/.codex/config.toml` that
@@ -2163,26 +1646,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             guard stripped != text else { return }
             try? Data(stripped.utf8).write(to: codex, options: .atomic)
         }
-    }
-
-    private func installCodexRetrieveMCP(binary: URL) throws {
-        let url = codexConfigURL()
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let block = """
-        \(Self.mcpBeginMarker)
-        [mcp_servers.\(Self.retrieveMCPName)]
-        command = \(Self.tomlString(binary.path))
-        args = ["mcp"]
-        \(Self.mcpEndMarker)
-        """
-        let existing = ((try? Data(contentsOf: url, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
-        let migrated = Self.removingTOMLTable(existing, named: "mcp_servers.\(Self.retrieveMCPName)")
-        let next = Self.upsertMarkerBlock(migrated, begin: Self.mcpBeginMarker, end: Self.mcpEndMarker, block: block)
-        try Data(next.utf8).write(to: url, options: .atomic)
-    }
-
-    private static func tomlString(_ s: String) -> String {
-        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 
     static func removingMarkerBlock(_ text: String, begin: String, end: String) -> String {
@@ -2234,16 +1697,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             .replacingOccurrences(of: "\n\n\n", with: "\n\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return normalized.isEmpty ? "" : normalized + "\n"
-    }
-
-    static func upsertMarkerBlock(_ text: String, begin: String, end: String, block: String) -> String {
-        if text.range(of: begin) != nil, text.range(of: end) != nil {
-            let stripped = removingMarkerBlock(text, begin: begin, end: end)
-            let base = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
-            return base.isEmpty ? block + "\n" : base + "\n\n" + block + "\n"
-        }
-        let base = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return base.isEmpty ? block + "\n" : base + "\n\n" + block + "\n"
     }
 
     private static func tomlTableLeaf(_ tableName: String) -> Substring {
@@ -2396,7 +1849,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         // the instance method recoverServiceBinaryFromManagedWrappers).
         let defaultBin = defaultManagedCLIBinDirectory()
         let probeNames = ["claude", "codex", "grok", "git", "npm", "ls", "remote-code"]
-            + WrappedCommandCatalog.commands
+            + legacyCommandWrapperBasenames
         var seen = Set<String>()
         for name in probeNames where seen.insert(name).inserted {
             let link = defaultBin.appendingPathComponent(name)
@@ -2462,36 +1915,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return candidates
     }
 
-    /// Bridge the managed CLI onto the user's `$PATH` (`~/.local/bin/distill`) so `distill`
-    /// runs from any shell without a hand-made shim. RemoteCode owns this symlink: it
-    /// (re)points a missing/stale link at the managed CLI and replaces a recognizable legacy
-    /// distill launcher, but never clobbers an unrelated user file at the same path.
-    /// Best-effort — a failure here never fails the managed-CLI install.
-    private func linkManagedDistillOntoPath(target: URL) {
-        let link = distillPathLinkURL()
-        do {
-            try fileManager.createDirectory(at: pathBinDirectory, withIntermediateDirectories: true)
-            if let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {
-                if dest == target.path { return }
-                try fileManager.removeItem(at: link)
-            } else if fileManager.fileExists(atPath: link.path) {
-                let existing = ((try? Data(contentsOf: link, options: .mappedIfSafe)).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
-                guard existing.contains(Self.distillCLIBeginMarker)
-                    || existing.contains("distill/src/cli")
-                    || existing.contains("dev/distill") else {
-                    NSLog("RemoteCode: leaving non-managed \(link.path) on PATH untouched")
-                    return
-                }
-                try fileManager.removeItem(at: link)
-            }
-            try fileManager.createSymbolicLink(at: link, withDestinationURL: target)
-        } catch {
-            NSLog("RemoteCode managed distill PATH link failed: \(error)")
-        }
-    }
-
     /// Remove the PATH symlink only while it still points at our managed CLI, so a user's
-    /// own `distill` on PATH is never deleted when Token Saver is disabled.
+    /// own `distill` on PATH is never deleted.
     private func unlinkManagedDistillFromPath(target: URL) {
         let link = distillPathLinkURL()
         guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path),
@@ -3073,8 +2498,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         cliBinDirectory.appendingPathComponent("distill")
     }
 
-    /// Managed Grok PreToolUse hook that appends `| distill` on wrap-eligible shells.
-    /// Token Saver reconcile installs this; Token Saver off removes it.
+    /// Grok PreToolUse hook file an earlier Token Saver build installed.
     public static let grokPreToolPipeHookFileName = "remotecode-token-saver-pretool-pipe.json"
 
     public func grokHooksDirectory() -> URL {
@@ -3085,40 +2509,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         grokHooksDirectory().appendingPathComponent(Self.grokPreToolPipeHookFileName)
     }
 
-    public static func grokPreToolPipeHookCommand(distillPath: String) -> String {
-        "\(distillPath) hook pre-tool-pipe"
-    }
-
-    /// Install a trusted global Grok hook (`~/.grok/hooks/…`) so Token-Saver-admitted
-    /// Grok — Agent App, headless, nested, and standalone CLI — actually pipes
-    /// wrap-eligible `run_terminal_command` via PreToolUse `updatedInput`.
-    /// The hook binary re-checks live admission and fail-opens when Token Saver is off.
-    public func installGrokPreToolPipeHook() throws {
-        try fileManager.createDirectory(at: grokHooksDirectory(), withIntermediateDirectories: true)
-        let command = Self.grokPreToolPipeHookCommand(distillPath: distillCLIURL().path)
-        let payload: [String: Any] = [
-            "hooks": [
-                "PreToolUse": [
-                    [
-                        "matcher": "Bash|run_terminal_command|run_terminal_cmd",
-                        "hooks": [
-                            [
-                                "type": "command",
-                                "command": command,
-                                "timeout": 5,
-                            ] as [String: Any],
-                        ],
-                    ] as [String: Any],
-                ],
-            ] as [String: Any],
-        ]
-        let data = try JSONSerialization.data(
-            withJSONObject: payload,
-            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        )
-        try data.write(to: grokPreToolPipeHookURL(), options: .atomic)
-    }
-
     @discardableResult
     public func uninstallGrokPreToolPipeHook() throws -> AgentSkillUninstallResult {
         let url = grokPreToolPipeHookURL()
@@ -3127,54 +2517,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .removed
     }
 
-    /// Managed Grok PostToolUse hook that compresses built-in tool results
-    /// (`read_file` / `list_dir` / `web_fetch`) through `updatedToolOutput`.
-    /// Token Saver reconcile installs this; Token Saver off removes it.
+    /// Grok PostToolUse hook file an earlier Token Saver build installed.
     public static let grokPostToolUseHookFileName = "remotecode-token-saver-posttool.json"
-
-    /// Built-in Grok tools whose replacement shape is verified. Shell
-    /// (`run_terminal_command`) stays on the wrapper/PreToolUse pipe lane, and
-    /// `grep` (search matches) plus mutation tools stay byte-exact.
-    public static let grokPostToolUseHookMatcher = "read_file|list_dir|web_fetch"
 
     public func grokPostToolUseHookURL() -> URL {
         grokHooksDirectory().appendingPathComponent(Self.grokPostToolUseHookFileName)
-    }
-
-    public static func grokPostToolUseHookCommand(distillPath: String) -> String {
-        "\(distillPath) hook post-tool-use-grok"
-    }
-
-    /// Install the trusted global Grok PostToolUse replacement hook
-    /// (`~/.grok/hooks/…`). Grok ≥ 1.0.34 delivers a settings-file hook's
-    /// `updatedToolOutput` to the model after validating it against the ran tool's
-    /// own output shape; the hook binary re-checks live admission and fail-opens
-    /// when Token Saver is off, the sidecar is down, or the shape is not one of the
-    /// verified ones.
-    public func installGrokPostToolUseHook() throws {
-        try fileManager.createDirectory(at: grokHooksDirectory(), withIntermediateDirectories: true)
-        let command = Self.grokPostToolUseHookCommand(distillPath: distillCLIURL().path)
-        let payload: [String: Any] = [
-            "hooks": [
-                "PostToolUse": [
-                    [
-                        "matcher": Self.grokPostToolUseHookMatcher,
-                        "hooks": [
-                            [
-                                "type": "command",
-                                "command": command,
-                                "timeout": 45,
-                            ] as [String: Any],
-                        ],
-                    ] as [String: Any],
-                ],
-            ] as [String: Any],
-        ]
-        let data = try JSONSerialization.data(
-            withJSONObject: payload,
-            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        )
-        try data.write(to: grokPostToolUseHookURL(), options: .atomic)
     }
 
     @discardableResult
@@ -3230,32 +2577,6 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return String(bytes: out, encoding: .utf8) ?? ""
     }
 
-    private func upsertDistillInstructions(at url: URL) throws {
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let current: String
-        if fileManager.fileExists(atPath: url.path) {
-            current = try mappedString(at: url)
-        } else {
-            current = ""
-        }
-
-        let next: String
-        if let range = Self.rangeOfDistillInstructionsBlock(in: current) {
-            let replaced = current.replacingCharacters(
-                in: range,
-                with: "\n\n\(Self.distillAgentInstructionsTemplate)\n\n"
-            )
-            next = "\(replaced.trimmingCharacters(in: .whitespacesAndNewlines))\n"
-        } else {
-            let prefix = current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? ""
-                : "\(current.trimmingTrailingWhitespaceAndNewlines())\n\n"
-            next = "\(prefix)\(Self.distillAgentInstructionsTemplate)\n"
-        }
-
-        try Data(next.utf8).write(to: url, options: .atomic)
-    }
-
     private func removeDistillInstructions(at url: URL) throws -> AgentSkillUninstallResult {
         guard fileManager.fileExists(atPath: url.path) else {
             return .notPresent
@@ -3275,9 +2596,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .removed
     }
 
-    // PERF: upsert/remove distill instructions recompiled the begin/end block
-    // pattern via range(of:options:.regularExpression) on every Token Saver
-    // skill install/uninstall. Compile once; match semantics unchanged.
+    // PERF: removing legacy distill instructions recompiled the begin/end block
+    // pattern via range(of:options:.regularExpression) on every call.
+    // Compile once; match semantics unchanged.
     private static let distillInstructionsBlockRegex: NSRegularExpression = {
         let begin = NSRegularExpression.escapedPattern(for: distillInstructionsBeginMarker)
         let end = NSRegularExpression.escapedPattern(for: distillInstructionsEndMarker)
@@ -3313,14 +2634,5 @@ private extension URL {
             current = parent
         }
         return result
-    }
-}
-
-private extension String {
-    func trimmingTrailingWhitespaceAndNewlines() -> String {
-        guard let last = lastIndex(where: { !$0.isWhitespace }) else {
-            return ""
-        }
-        return String(self[...last])
     }
 }

@@ -37,18 +37,26 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
     private func seedThreadAndLegacyRun(db: SQLiteDB) throws -> (threadId: AgentThreadID, runId: AgentRunID) {
         // WHY: migration fixtures stop at the shared v56 base. They must seed a
         // row using only columns that actually existed then, not today's writer.
-        let thread = AgentThread(title: "t", provider: .codex, model: "m")
-        try AgentThreadRepository(db: db).upsert(thread)
+        let threadID = AgentThreadID(UUID())
+        let now = ISO8601DateFormatter().string(from: Date())
+        let threadInsert = try db.prepare("""
+            INSERT INTO agent_threads(id, title, provider, model, status, created_at, updated_at)
+            VALUES (?, 't', 'codex', 'm', 'pending', ?, ?);
+            """)
+        try threadInsert.bind(1, threadID.value.uuidString)
+        try threadInsert.bind(2, now)
+        try threadInsert.bind(3, now)
+        _ = try threadInsert.step()
         let runID = AgentRunID()
         let insert = try db.prepare("""
             INSERT INTO agent_runs(id, thread_id, provider, model, status, started_at)
             VALUES (?, ?, 'codex', 'm', 'running', ?);
             """)
         try insert.bind(1, runID.value.uuidString)
-        try insert.bind(2, thread.id.value.uuidString)
-        try insert.bind(3, ISO8601DateFormatter().string(from: Date()))
+        try insert.bind(2, threadID.value.uuidString)
+        try insert.bind(3, now)
         _ = try insert.step()
-        return (thread.id, runID)
+        return (threadID, runID)
     }
 
     private func makeCheckpoint(

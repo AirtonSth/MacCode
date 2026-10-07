@@ -16,7 +16,12 @@ final class StartPendingStatusUpdateTests: XCTestCase {
             encoding: .utf8
         )
         let start = try XCTUnwrap(source.range(of: "// persist run"))
-        let end = try XCTUnwrap(source.range(of: "let existingProviderSession = try providerSessionRepo"))
+        // The provider-session block that follows the thread status write
+        // now reads only the runtime payload JSON (9df3c782b).
+        let end = try XCTUnwrap(source.range(
+            of: "let existingPayload = try repo.runtimePayloadJSON(of: effectiveRequest.threadId)",
+            range: start.upperBound..<source.endIndex
+        ))
         let body = String(source[start.lowerBound..<end.lowerBound])
         XCTAssertTrue(body.contains("threadRepo.updateStatus("))
         XCTAssertFalse(body.contains("threadRepo.get(id: effectiveRequest.threadId)"))

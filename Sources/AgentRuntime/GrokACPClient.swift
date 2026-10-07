@@ -6,7 +6,9 @@ public enum GrokACPError: Error, CustomStringConvertible {
     case missingBinary(String)
     case spawnFailed(String)
     case invalidJSON(String)
-    case rpcError(code: Int?, message: String)
+    /// `detail` / `httpStatus` come from JSON-RPC `error.data`, where the peer puts
+    /// the provider's real failure behind a generic `-32603 Internal error`.
+    case rpcError(code: Int?, message: String, detail: String? = nil, httpStatus: Int? = nil)
     case processExited(reason: Process.TerminationReason, status: Int32, stderrTail: String)
     case responseTypeMismatch(String)
     case unsupported(String)
@@ -17,7 +19,8 @@ public enum GrokACPError: Error, CustomStringConvertible {
         case .missingBinary(let binary): return "Grok ACP binary not found: \(binary)"
         case .spawnFailed(let message): return "Failed to spawn Grok ACP: \(message)"
         case .invalidJSON(let line): return "Grok ACP emitted invalid JSON: \(line)"
-        case .rpcError(_, let message): return "Grok ACP RPC error: \(message)"
+        case .rpcError(_, let message, let detail, _):
+            return "Grok ACP RPC error: \(ACPRPCErrorPayload.describe(message: message, detail: detail))"
         case .processExited(let reason, let status, let stderr):
             let suffix = stderr.isEmpty ? "" : ": \(stderr)"
             return "Grok ACP process exited (\(reason == .exit ? "exit" : "signal") \(status))\(suffix)"
@@ -104,10 +107,17 @@ enum GrokACPFailureTaxonomy {
             switch error {
             case .requestTimedOut:
                 return .timeout
-            case .rpcError(let code, let message):
-                if code == 401 || code == 403 { return .authRequired }
-                if code == 429 { return .rateLimited }
-                return category(forDiagnostic: message, context: context)
+            case .rpcError(let code, let message, let detail, let httpStatus):
+                // The JSON-RPC code is -32603 for every provider failure; the
+                // provider's HTTP status rides in error.data.http_status.
+                for status in [httpStatus, code].compactMap({ $0 }) {
+                    if status == 401 || status == 403 { return .authRequired }
+                    if status == 429 { return .rateLimited }
+                }
+                return category(
+                    forDiagnostic: ACPRPCErrorPayload.describe(message: message, detail: detail),
+                    context: context
+                )
             default:
                 break
             }
@@ -490,7 +500,6 @@ public final class GrokACPClient: @unchecked Sendable {
     private var pending: [Int: Pending] = [:]
     private var stderrBuffer = Data()
     private var stopped = false
-    private let tokenSaverCensusAllowed: Bool
     private let foreignUserUID: uid_t?
     private let mcpEnvironment: [String: String]
     private static let stderrLimit = 8_192
@@ -566,14 +575,12 @@ public final class GrokACPClient: @unchecked Sendable {
         askpassPath: String? = nil,
         tagProcess: Bool = true,
         notificationHandler: NotificationHandler? = nil,
-        serverRequestHandler: ServerRequestHandler? = nil,
-        tokenSaverCensusAllowed: Bool = false
+        serverRequestHandler: ServerRequestHandler? = nil
     ) throws {
         let resolved = binary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "grok" : binary
         guard let path = ProcessLocator.resolve(resolved) else { throw GrokACPError.missingBinary(resolved) }
         self.notificationHandler = notificationHandler
         self.serverRequestHandler = serverRequestHandler
-        self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
         self.foreignUserUID = runAsUser.flatMap { $0.uid == getuid() ? nil : $0.uid }
         self.mcpEnvironment = environment
         parseQueue.setSpecific(key: parseQueueKey, value: 1)
@@ -664,31 +671,30 @@ public final class GrokACPClient: @unchecked Sendable {
             command: resolved,
             environment: environment
         )
-        let withBrowser = BotBrowserMCPAdmit.admitGrokACP(
-            existing: withSelfConfig,
-            command: resolved,
-            environment: environment
-        )
-        let withWeb = BotWebMCPAdmit.admitGrokACP(
-            existing: withBrowser,
-            command: resolved,
-            environment: environment
-        )
-        // The librarian MCP is Token Saver surface: admitted only while the
-        // run carries the Token Saver hint, matching Claude (--mcp-config /
-        // SDK mcp_servers) and Codex (-c mcp_servers.<name>.* per process).
-        let withDistill = DistillMCPAdmit.isEnabled(environment: environment)
-            ? DistillMCPAdmit.admitGrokACP(
+        // bot-computer/-browser/-web only work for a bot caller; a non-bot
+        // Agent App session must not be offered tools that always fail.
+        let isBotRun = BotRunMCPAdmission.isBotRun(environment: environment)
+        let withBrowser = isBotRun
+            ? BotBrowserMCPAdmit.admitGrokACP(
+                existing: withSelfConfig,
+                command: resolved,
+                environment: environment
+            )
+            : withSelfConfig
+        let withWeb = isBotRun
+            ? BotWebMCPAdmit.admitGrokACP(
+                existing: withBrowser,
+                command: resolved,
+                environment: environment
+            )
+            : withBrowser
+        let withComputer = isBotRun
+            ? BotComputerMCPAdmit.admitGrokACP(
                 existing: withWeb,
                 command: resolved,
                 environment: environment
             )
             : withWeb
-        let withComputer = BotComputerMCPAdmit.admitGrokACP(
-            existing: withDistill,
-            command: resolved,
-            environment: environment
-        )
         guard environment[AgentSkillInstaller.computerUseHostAdmissionEnvironmentKey] == "1" else {
             return withComputer
         }
@@ -998,7 +1004,7 @@ public final class GrokACPClient: @unchecked Sendable {
 
     public static func promptBlocks(for request: AgentRunRequest, capabilities: GrokACPInitializeResult) throws -> [JSONObject] {
         var blocks: [JSONObject] = []
-        let providerPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+        let providerPrompt = AgentSkillInstaller.nestedAgentProviderPrompt(
             request.providerPrompt,
             environment: request.environment
         )
@@ -1226,9 +1232,12 @@ public final class GrokACPClient: @unchecked Sendable {
         }
         if let id = object["id"] as? Int, object["method"] as? String == nil {
             if let error = object["error"] as? JSONObject {
+                let parsed = ACPRPCErrorPayload.parse(error, defaultMessage: "Unknown Grok ACP error")
                 completePending(id: id, result: .failure(GrokACPError.rpcError(
-                    code: error["code"] as? Int,
-                    message: error["message"] as? String ?? "Unknown Grok ACP error"
+                    code: parsed.code,
+                    message: parsed.message,
+                    detail: parsed.detail,
+                    httpStatus: parsed.httpStatus
                 )))
             } else {
                 completePending(id: id, result: .success(object["result"]))
@@ -1283,29 +1292,10 @@ public final class GrokACPClient: @unchecked Sendable {
         )
         var line = data
         line.append(0x0A)
-        let toWrite: Data
-        if tokenSaverCensusAllowed, object["method"] as? String == "session/prompt" {
-            let binding = TokenSaverCensusSeam.defaultBinding(
-                trigger: "provider_outbound_user",
-                provider: "grok",
-                providerAdapterVersion: "acp-jsonrpc",
-                toolShape: "session_prompt_jsonrpc_line"
-            )
-            toWrite = TokenSaverCensusSeam.observeProviderVisiblePayload(
-                line,
-                binding: binding,
-                control: .noChange,
-                streamKind: .completedTranscript,
-                toolKind: .builtin,
-                isSameUser: true
-            )
-        } else {
-            toWrite = line
-        }
         return try writeQueue.sync {
             guard admittedBy?() ?? true else { return false }
             try GuardedStdinWrite.write(
-                toWrite, to: stdinPipe.fileHandleForWriting, process: process,
+                line, to: stdinPipe.fileHandleForWriting, process: process,
                 notFound: { GrokACPError.processExited(reason: .exit, status: -1, stderrTail: "") }
             )
             return true

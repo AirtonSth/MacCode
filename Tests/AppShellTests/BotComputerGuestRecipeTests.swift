@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 
 final class BotComputerGuestRecipeTests: XCTestCase {
     func test_recipeIsFirstPartyLinuxDesktop_notAlpineSleep() throws {
@@ -20,6 +21,33 @@ final class BotComputerGuestRecipeTests: XCTestCase {
         XCTAssertTrue(browser.contains("--no-sandbox"))
         XCTAssertTrue(embed.contains("token"))
         XCTAssertTrue(embed.contains("view_only=0"))
+    }
+
+    func test_xvfbGeometryMatchesTheActCoordinateBounds() throws {
+        // WHY: bot_computer_act bounds clicks/drags by BotComputerGuestSpec's screen
+        // size. If start.sh's Xvfb geometry drifts, valid on-screen points get
+        // rejected or off-screen points get clamped onto the wrong control.
+        let start = try String(
+            contentsOf: sourceURL("Sources/AppShell/Resources/ComputerGuest/start.sh"),
+            encoding: .utf8
+        )
+        let geometry = "\(BotComputerGuestSpec.screenWidth)x\(BotComputerGuestSpec.screenHeight)x24"
+        XCTAssertTrue(start.contains("Xvfb :1 -screen 0 \(geometry) "), "start.sh must start Xvfb at \(geometry)")
+    }
+
+    func test_startClearsTheChromiumProfileLockBeforeLaunchingTheBrowser() throws {
+        // WHY: the profile is on the persisted home bind, and a recreated
+        // container has a new hostname. Chromium then reads the old lock as "in
+        // use on another computer" and never opens (proved on r4 and r5), which
+        // also leaves nothing on CDP 9222 for the in-guest Playwright MCP.
+        let start = try String(
+            contentsOf: sourceURL("Sources/AppShell/Resources/ComputerGuest/start.sh"),
+            encoding: .utf8
+        )
+        let clear = try XCTUnwrap(start.range(of: "\"$HOME/.browser-profiles/chromium/SingletonLock\""))
+        let launch = try XCTUnwrap(start.range(of: "/opt/remotecode-computer/launch-browser.sh"))
+        XCTAssertTrue(start[..<clear.lowerBound].hasSuffix("rm -f "))
+        XCTAssertLessThan(clear.lowerBound, launch.lowerBound)
     }
 
     private func sourceURL(_ relative: String) -> URL {

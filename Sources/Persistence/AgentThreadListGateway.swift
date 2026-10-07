@@ -106,6 +106,8 @@ public final class AgentThreadListGateway: @unchecked Sendable {
 
     private let queue: DispatchQueue
     private let db: SQLiteDB
+    /// WAL reader: paired-device list reads must not wait on the writer.
+    private let readDB: SQLiteDB
 
     // MARK: - Test probes (executor proof, not latency alone)
 
@@ -125,8 +127,9 @@ public final class AgentThreadListGateway: @unchecked Sendable {
         queryOffMainActorCountForTesting = 0
     }
 
-    public init(db: SQLiteDB) {
+    public init(db: SQLiteDB, readDB: SQLiteDB? = nil) {
         self.db = db
+        self.readDB = readDB ?? db
         self.queue = DispatchQueue(label: Self.queueLabel, qos: .userInitiated)
     }
 
@@ -147,7 +150,7 @@ public final class AgentThreadListGateway: @unchecked Sendable {
                 }
                 guard operation.beginWork() else { return }
                 do {
-                    let threads = try AgentThreadRepository(db: self.db)
+                    let threads = try AgentThreadRepository(db: self.db, readDB: self.readDB)
                         .list(workspaceId: workspaceId)
                     operation.finish(.success(threads))
                 } catch {
@@ -180,18 +183,21 @@ public final class AgentThreadListGateway: @unchecked Sendable {
                     guard operation.beginWork() else { return }
                     do {
                         let placeholders = workspaceIDs.map { _ in "?" }.joined(separator: ",")
-                        let statement = try self.db.prepare(
-                            "SELECT DISTINCT workspace_id FROM agent_threads WHERE workspace_id IN (\(placeholders)) AND status = 'running';"
-                        )
-                        for (index, workspaceID) in workspaceIDs.enumerated() {
-                            try statement.bind(Int32(index + 1), workspaceID.value.uuidString)
-                        }
-                        var result = Set<WorkspaceID>()
-                        while try statement.step() {
-                            if let raw = statement.columnText(0),
-                               let uuid = UUID(uuidString: raw) {
-                                result.insert(WorkspaceID(uuid))
+                        let result = try self.readDB.performSync { database in
+                            let statement = try database.prepare(
+                                "SELECT DISTINCT workspace_id FROM agent_threads WHERE workspace_id IN (\(placeholders)) AND status = 'running';"
+                            )
+                            for (index, workspaceID) in workspaceIDs.enumerated() {
+                                try statement.bind(Int32(index + 1), workspaceID.value.uuidString)
                             }
+                            var result = Set<WorkspaceID>()
+                            while try statement.step() {
+                                if let raw = statement.columnText(0),
+                                   let uuid = UUID(uuidString: raw) {
+                                    result.insert(WorkspaceID(uuid))
+                                }
+                            }
+                            return result
                         }
                         operation.finish(.success(result))
                     } catch {

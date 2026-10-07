@@ -1,5 +1,6 @@
 import XCTest
 @testable import AppShell
+import RemoteCodeTreaty
 
 final class MaterialWakeTaxonomyTests: XCTestCase {
     func testPhaseACriticalLifecycleClassifications() {
@@ -228,7 +229,8 @@ final class MaterialWakeTaxonomyTests: XCTestCase {
         }
     }
 
-    /// Extract `EventBus.shared.publishRawForTesting(kind: "…")` string literals from host sources.
+    /// Extract the wire kinds published via `EventBus.shared.publish(kind: .someCase, …)`
+    /// (typed `RemoteCodeEventKind`) or a legacy `kind: "…"` string literal in host sources.
     private static func eventBusPublishKinds(inRelativePaths paths: [String]) throws -> Set<String> {
         // Tests/AppShellTests/ThisFile.swift → repo root.
         let repoRoot = URL(fileURLWithPath: #filePath)
@@ -236,8 +238,11 @@ final class MaterialWakeTaxonomyTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let pattern = try NSRegularExpression(
-            pattern: #"EventBus\.shared\.publish\(\s*kind:\s*"([^"]+)""#,
+            pattern: #"EventBus\.shared\.publish\(\s*kind:\s*(?:\.([A-Za-z_][A-Za-z0-9_]*)|"([^"]+)")"#,
             options: []
+        )
+        let rawKindByCaseName = Dictionary(
+            uniqueKeysWithValues: RemoteCodeEventKind.allCases.map { (String(describing: $0), $0.rawValue) }
         )
         var kinds = Set<String>()
         for relative in paths {
@@ -245,9 +250,14 @@ final class MaterialWakeTaxonomyTests: XCTestCase {
             let text = try String(contentsOf: url, encoding: .utf8)
             let range = NSRange(text.startIndex..<text.endIndex, in: text)
             pattern.enumerateMatches(in: text, options: [], range: range) { match, _, _ in
-                guard let match, match.numberOfRanges >= 2,
-                      let swiftRange = Range(match.range(at: 1), in: text) else { return }
-                kinds.insert(String(text[swiftRange]))
+                guard let match, match.numberOfRanges >= 3 else { return }
+                if let caseRange = Range(match.range(at: 1), in: text) {
+                    let caseName = String(text[caseRange])
+                    XCTAssertNotNil(rawKindByCaseName[caseName], "unknown RemoteCodeEventKind case .\(caseName)")
+                    if let raw = rawKindByCaseName[caseName] { kinds.insert(raw) }
+                } else if let literalRange = Range(match.range(at: 2), in: text) {
+                    kinds.insert(String(text[literalRange]))
+                }
             }
         }
         XCTAssertFalse(kinds.isEmpty, "expected to find EventBus.publish sites in host sources")

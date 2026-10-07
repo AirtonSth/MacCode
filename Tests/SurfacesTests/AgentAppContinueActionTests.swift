@@ -204,10 +204,12 @@ final class AgentAppContinueActionTests: XCTestCase {
     }
 
     func test_unavailableProviderDoesNotConsumeContinueRecoveryAction() async throws {
-        let fixture = try makeRecoverableContinueFixture(runner: FakeProviderRunner(provider: .codex))
+        let fixture = try makeRecoverableContinueFixture(runner: FakeProviderRunner(provider: .distill))
         fixture.vm.providerSnapshots = [providerSnapshot(status: .unavailable, installed: false)]
 
-        XCTAssertTrue(fixture.vm.selectedThreadHasRecoverableContext)
+        await waitForRecoverableContext(fixture.vm)
+        XCTAssertTrue(fixture.vm.selectedThreadHasRecoverableContext,
+                      "the off-main open bundle must arm Continue for a relaunch-interrupted thread")
         await fixture.vm.continueInterruptedThread()
 
         XCTAssertTrue(fixture.vm.selectedThreadHasRecoverableContext,
@@ -221,6 +223,9 @@ final class AgentAppContinueActionTests: XCTestCase {
         let fixture = try makeRecoverableContinueFixture(runner: ContinueStartFailingRunner())
         fixture.vm.providerSnapshots = [providerSnapshot(status: .available, installed: true)]
 
+        await waitForRecoverableContext(fixture.vm)
+        XCTAssertTrue(fixture.vm.selectedThreadHasRecoverableContext,
+                      "the off-main open bundle must arm Continue for a relaunch-interrupted thread")
         await fixture.vm.continueInterruptedThread()
 
         XCTAssertTrue(fixture.vm.selectedThreadHasRecoverableContext,
@@ -299,6 +304,15 @@ final class AgentAppContinueActionTests: XCTestCase {
                      "a failed provider read must not invent a confirmation timestamp")
     }
 
+    /// The recoverable flag is applied from the off-main thread-open bundle
+    /// (gatherThreadOpenBundle), not synchronously in init; wait (bounded) for it.
+    private func waitForRecoverableContext(_ vm: AgentAppViewModel) async {
+        let deadline = Date().addingTimeInterval(2)
+        while !vm.selectedThreadHasRecoverableContext, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
     private func makeRecoverableContinueFixture(
         runner: AgentProviderRunner
     ) throws -> (vm: AgentAppViewModel, coordinator: AgentRunCoordinator, threadId: AgentThreadID) {
@@ -312,26 +326,26 @@ final class AgentAppContinueActionTests: XCTestCase {
         var thread = AgentThread(
             workspaceId: workspaceID,
             title: "recoverable",
-            provider: .codex,
-            model: "gpt-5.5",
-            providerThreadId: "codex-recovery-cursor"
+            provider: .distill,
+            model: "claude/claude-opus-5-5",
+            providerThreadId: "distill-recovery-cursor"
         )
         thread.status = .interrupted
         try threadRepo.upsert(thread)
         try sessionRepo.upsert(ProviderSessionRuntime(
             threadId: thread.id,
-            provider: .codex,
+            provider: .distill,
             status: .interrupted,
-            resumeCursor: "codex-recovery-cursor",
+            resumeCursor: "distill-recovery-cursor",
             cwd: tmp,
-            model: "gpt-5.5"
+            model: "claude/claude-opus-5-5"
         ))
         let coordinator = AgentRunCoordinator(
             runRepo: runRepo,
             messageRepo: messageRepo,
             threadRepo: threadRepo,
             providerSessionRepo: sessionRepo,
-            providers: [.codex: runner]
+            providers: [.distill: runner]
         )
         let vm = AgentAppViewModel(
             workspaceID: workspaceID,
@@ -349,20 +363,20 @@ final class AgentAppContinueActionTests: XCTestCase {
         installed: Bool
     ) -> AgentProviderSnapshot {
         AgentProviderSnapshot(
-            id: AgentProvider.codex.rawValue,
-            provider: .codex,
-            driverKind: .codexCLI,
-            displayName: "Codex",
+            id: AgentProvider.distill.rawValue,
+            provider: .distill,
+            driverKind: .distillACP,
+            displayName: "Distill",
             accentColor: "#2F80ED",
-            continuationGroup: "codex",
+            continuationGroup: "distill",
             interactionModes: [.default, .plan],
             permissionModes: [.supervised],
             enabled: true,
             installed: installed,
             status: status,
-            statusDetail: status == .unavailable ? "Codex is unavailable." : nil,
+            statusDetail: status == .unavailable ? "Distill is unavailable." : nil,
             authenticated: true,
-            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            models: [AgentModelDescriptor(id: "claude/claude-opus-5-5", label: "Claude Opus 5.5", provider: .distill)],
             slashCommands: [],
             capabilities: AgentProviderCapabilities(supportsStreaming: true)
         )
@@ -370,7 +384,7 @@ final class AgentAppContinueActionTests: XCTestCase {
 }
 
 private final class ContinueStartFailingRunner: AgentProviderRunner, @unchecked Sendable {
-    let provider: AgentProvider = .codex
+    let provider: AgentProvider = .distill
 
     func listModels() async -> [AgentModelDescriptor] { [] }
 

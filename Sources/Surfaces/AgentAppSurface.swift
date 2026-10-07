@@ -101,22 +101,11 @@ public final class AgentTranscriptState: ObservableObject {
             if oldValue != messages {
                 contentGeneration &+= 1
                 messagesGeneration &+= 1
-                assistantCharsHot = Self.assistantUTF8Count(messages)
             }
             waitingBotPeerActivity = Self.hasWaitingBotPeerActivity(
                 in: messages,
                 threadId: selectedThreadIdForPeerFlag
             )
-        }
-    }
-    /// UTF-8 length of persisted assistant message bodies. Recomputed only when
-    /// `messagesGeneration` moves so Token Saver footer reloads can pass an Int
-    /// instead of capturing `[AgentMessage]`.
-    public private(set) var assistantCharsHot: Int = 0
-
-    nonisolated static func assistantUTF8Count(_ messages: [AgentMessage]) -> Int {
-        messages.reduce(0) { partial, message in
-            partial + (message.role == .assistant ? message.content.utf8.count : 0)
         }
     }
     /// AA-16: chrome busy must not walk `messages` on every tab poll.
@@ -308,6 +297,42 @@ public enum AgentThreadLifecycleEvent {
     case deleted([AgentThreadID])
 }
 
+/// One committed narrow `agent_threads` chrome write (status, unread or the
+/// provider cursor, plus `updated_at`) that publishes no `agent.*` state
+/// event of its own. The host mirrors it as one partial `agent.thread.updated`
+/// so connected clients and the `agentThreads` snapshot revision see the
+/// commit. A nil field means the write left that column alone.
+public struct AgentThreadChromeWrite: Equatable, Sendable {
+    public var threadID: AgentThreadID
+    public var status: AgentRunStatus?
+    public var hasUnread: Bool?
+    public var providerThreadID: String?
+    public var updatedAt: Date
+
+    public init(
+        threadID: AgentThreadID,
+        status: AgentRunStatus? = nil,
+        hasUnread: Bool? = nil,
+        providerThreadID: String? = nil,
+        updatedAt: Date
+    ) {
+        self.threadID = threadID
+        self.status = status
+        self.hasUnread = hasUnread
+        self.providerThreadID = providerThreadID
+        self.updatedAt = updatedAt
+    }
+
+    /// Folds a later write to the same thread into this one, so a loop that
+    /// commits several writes can publish once with the final row values.
+    public mutating func merge(_ later: AgentThreadChromeWrite) {
+        status = later.status ?? status
+        hasUnread = later.hasUnread ?? hasUnread
+        providerThreadID = later.providerThreadID ?? providerThreadID
+        updatedAt = later.updatedAt
+    }
+}
+
 public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     case signIn
     case retry
@@ -320,10 +345,58 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
         case .startFresh: return "Start fresh"
         }
     }
+
+    /// `[fresh-session:<reason>]`: the adapter already retired the provider
+    /// session whose history the model rejected (`DistillACPFailureTaxonomy`).
+    public static let freshSessionMarkerPrefix = "[fresh-session:"
+
+    private static let freshSessionMarkerRegex = try! NSRegularExpression(
+        pattern: "\\[fresh-session:[^\\]]*\\]\\s*",
+        options: [.caseInsensitive]
+    )
+
+    /// Case-insensitive, like the classifier (which lowercases the message).
+    public static func hasFreshSessionMarker(_ message: String) -> Bool {
+        message.range(of: freshSessionMarkerPrefix, options: .caseInsensitive) != nil
+    }
+
+    /// Error text for people: the fresh-session marker is a machine tag, so it
+    /// is removed. Classify on the raw message, never on this text.
+    public static func displayText(_ message: String) -> String {
+        guard hasFreshSessionMarker(message) else { return message }
+        let range = NSRange(message.startIndex..<message.endIndex, in: message)
+        return freshSessionMarkerRegex.stringByReplacingMatches(
+            in: message, options: [], range: range, withTemplate: ""
+        )
+    }
+
+    /// Paired-client `recovery_action` for a failed run, from the same
+    /// classifier the Mac error row uses. `new_session` is the classifier's
+    /// Retry for a fresh-session failure: retry on the SAME thread (a bot desk
+    /// keeps its conversation link); the host already started a new provider
+    /// session, so the retry does not reuse the rejected history.
+    public static func pairedWireValue(message: String, recoverable: Bool) -> String? {
+        guard let action = AgentAppViewModel.errorRecoveryAction(message: message, recoverable: recoverable) else {
+            return nil
+        }
+        switch action {
+        case .signIn: return "sign_in"
+        case .startFresh: return "start_fresh"
+        case .retry: return hasFreshSessionMarker(message) ? "new_session" : "retry"
+        }
+    }
 }
 
 private struct BotRunUnavailableError: LocalizedError {
     var errorDescription: String? { "Bot indisponível." }
+}
+
+/// `AgentAppViewModel.lockThreadToBot` found the thread's actor already
+/// locked (another device or window locked it first). Nothing was written.
+public struct ThreadActorAlreadyLockedError: LocalizedError {
+    public var errorDescription: String? {
+        "Esta conversa já foi definida para outro ator. Revise o ator e envie de novo."
+    }
 }
 
 /// Opt-in hooks for hosting one fixed thread (e.g. the bot desk) in Agent App.
@@ -333,21 +406,37 @@ public struct AgentAppEmbedding {
     public let promptTransform: (@MainActor (_ text: String, _ threadId: AgentThreadID, _ runId: AgentRunID) async throws -> String)?
     public let onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)?
     public let onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)?
+    /// Takes every composer send before any provider work (a bot group room
+    /// never runs a provider). Returns the rows it wrote to the pinned thread,
+    /// painted at once; a thrown error keeps the prompt and shows its text.
+    public let sendInterceptor: AgentAppSendInterceptor?
+    /// Composer placeholder for an intercepted surface (it names no provider).
+    public let composerPlaceholder: String?
 
     public init(
         pinnedThreadId: AgentThreadID,
         executionCwd: String? = nil,
         promptTransform: (@MainActor (_ text: String, _ threadId: AgentThreadID, _ runId: AgentRunID) async throws -> String)? = nil,
         onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)? = nil,
-        onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)? = nil
+        onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)? = nil,
+        sendInterceptor: AgentAppSendInterceptor? = nil,
+        composerPlaceholder: String? = nil
     ) {
         self.pinnedThreadId = pinnedThreadId
         self.executionCwd = executionCwd
         self.promptTransform = promptTransform
         self.onRunStarted = onRunStarted
         self.onRunFinished = onRunFinished
+        self.sendInterceptor = sendInterceptor
+        self.composerPlaceholder = composerPlaceholder
     }
 }
+
+public typealias AgentAppSendInterceptor = @MainActor (
+    _ text: String,
+    _ attachments: [AgentAttachment],
+    _ threadId: AgentThreadID
+) throws -> [AgentMessage]
 
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
@@ -367,8 +456,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
     public var timeline: AssistantTimelineState {
         get { transcriptState.timeline }
-        set { transcriptState.timeline = newValue }
+        set {
+            transcriptState.timeline = newValue
+            publishedTimelineWriteRevision &+= 1
+        }
     }
+    /// S-F4c: bumped by every write to `timeline`, so a cold restore that lands
+    /// after a reveal can tell whether anything wrote the stand-in meanwhile.
+    private var publishedTimelineWriteRevision: UInt64 = 0
     public var timelineUpdateTick: Int {
         get { transcriptState.timelineUpdateTick }
         set { transcriptState.timelineUpdateTick = newValue }
@@ -433,12 +528,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var botBusyMessage: ((BotID, AgentThreadID) -> String?)?
     /// Registers a thread queued behind another thread's run on the bot's VM.
     public var botWaitForVM: ((BotID, AgentThreadID) -> Void)?
+    /// Claims the bot's VM for a run about to start; returns the other thread's
+    /// run when it holds the VM (nothing claimed then).
+    public var botClaimVM: ((BotID, BotVMRunRegistry.Entry) -> BotVMRunRegistry.Entry?)?
+    /// Frees a VM claim whose run never started.
+    public var botReleaseVM: ((AgentRunID) -> Void)?
+    /// Set when the last start was refused because another thread holds the bot's VM;
+    /// `threadId` is the thread that start was for.
+    private var botVMClaimRefusal: (botID: BotID, notice: String, threadId: AgentThreadID)?
     /// Pending Mac-execution approvals pushed by the host, per thread (reason text).
     @Published public var pendingMacExecutionByThread: [AgentThreadID: String] = [:]
     /// Approves or declines a pending Mac-execution request; wired by the host.
     public var botMacExecutionResolver: (@MainActor (AgentThreadID, Bool) async -> Void)?
     /// Returns a user-facing error when the bot VM cannot run; nil when ready. Wired by the host.
-    public var botVMPreflight: ((BotID, String) async -> String?)?
+    /// The workspace is nil for a workspace-less (Bots Desk) thread: the VM only has to be up.
+    public var botVMPreflight: ((BotID, String?) async -> String?)?
     /// Starts (provisions) the bot VM; returns a user-facing error or nil. Wired by the host.
     public var botVMProvision: ((BotID) async -> String?)?
     /// Set when the VM preflight failed; drives the "VM indisponível" banner.
@@ -493,22 +597,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Gated through `visibleBackgroundTasks` so a finished run cannot keep
     /// advertising work the adapter already dropped.
     @Published public private(set) var liveBackgroundTasks: [AgentBackgroundTask] = []
-    /// Thread footer display figure (credible total: measured + dialect + …).
-    /// 0 when Token Saver is off, not subscribed, or no savings yet.
-    @Published public private(set) var tokenSaverThreadSavedTokens: Int = 0
-    /// Ledger-only delivered total for the thread (floor for honesty / copy).
-    @Published public private(set) var tokenSaverThreadMeasuredTokens: Int = 0
-    /// True when Token Saver is enabled **and** the account is subscribed.
-    @Published public private(set) var tokenSaverFooterEnabled: Bool = false
-    /// False after a thread switch until that thread's footer snapshot lands.
-    /// A reset publishes enabled=false + 0; that is pending, not "deactivated."
-    @Published public private(set) var tokenSaverFooterSnapshotReady: Bool = false
-    private weak var tokenSaverSavingsRepo: TokenSaverSavingsRepository?
-    private var tokenSaverFooterEligibleCheck: (@Sendable () -> Bool)?
-    private var tokenSaverGraphifyActiveCheck: (@Sendable () -> Bool)?
-    private var tokenSaverGraphifySignalCountCheck: (@Sendable () -> Int)?
-    private var tokenSaverMeasuredLoader: (@Sendable (Bool, AgentThreadID?, TokenSaverSavingsRepository?) async -> Int?)?
-    private var tokenSaverFooterObserver: NSObjectProtocol?
     var manualActionObserver: NSObjectProtocol?
     var manualActionStateObserver: NSObjectProtocol?
     /// Durable manual-action requests; wired by the host. Setting it loads the selected thread's card.
@@ -523,11 +611,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public internal(set) var openManualAction: ManualActionRequest?
     /// Continued/declined requests of the selected thread, oldest first.
     @Published public internal(set) var resolvedManualActions: [ManualActionRequest] = []
-    private var tokenSaverFooterAccountObserver: NSObjectProtocol?
-    private var tokenSaverFooterStatusObserver: NSObjectProtocol?
-    /// PERF: cancel-and-coalesce off-main ledger reads (same pattern as sidebar
-    /// PERF-MAC-100). A burst of `rc2TokenSaverUsageChanged` collapses to one read.
-    private var tokenSaverFooterReloadTask: Task<Void, Never>?
     @Published public var currentRunId: AgentRunID?
     @Published public var hasUnreadActivity: Bool = false
     @Published public var showPlanSidebar: Bool = false {
@@ -562,6 +645,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// repo write + reloadThreads) so the host can mirror them to remote
     /// clients. Wired by AppCommandRouter like onThreadConfigPersisted.
     public var onThreadLifecycle: ((AgentThreadLifecycleEvent) -> Void)?
+    /// Fired after this VM commits a status/unread-only `agent_threads` write
+    /// that no `agent.*` state event covers, so the host can mirror it.
+    public var onThreadChromeWritten: ((AgentThreadChromeWrite) -> Void)?
     /// Post-commit process-global retirement for automatic cap victims. The
     /// boolean is true only when AgentRunCoordinator's native fork producer
     /// already retired its coordinator state and the host only needs queue state.
@@ -659,8 +745,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var queuedMessageDraft: String = ""
     /// When the active run started — drives the "Working for Xs" line.
     @Published public var runStartedAt: Date?
-    /// Thread whose turn is being prepared: transcript load, Graphify root
-    /// resolution, prompt compression, provider spawn — all before a run id
+    /// Thread whose turn is being prepared: transcript load, preflight,
+    /// provider spawn — all before a run id
     /// exists to track. Without this the transcript sits silent for seconds
     /// after the user bubble appears, which read as the app having hung.
     /// Drives the "Loading…" line; `workingStatus` takes over the instant the
@@ -669,10 +755,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Thread whose turn is being prepared for the *selected* thread UI (Loading…).
     /// Backed by `preparingRunThreads` so multi-thread prep is not a singleton race.
     @Published public private(set) var preparingRunThreadId: AgentThreadID?
-    /// S5: all threads currently in surface preparation (Graphify/preflight).
+    /// S5: all threads currently in surface preparation (preflight).
     /// Stop/Escape must target the selected/owning thread, not a single global slot.
     private var preparingRunThreads: Set<AgentThreadID> = []
-    /// S5: generation-owned surface preparation (accept → Graphify/preflight →
+    /// S5: generation-owned surface preparation (accept → preflight →
     /// coordinator start). Stop/Escape applies `.stopRequested` so a late
     /// claim cannot call `coordinator.startRun`.
     private var surfacePreparationStates: [AgentThreadID: ProviderPreparationState] = [:]
@@ -695,39 +781,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// an app relaunch and has a recoverable provider session. Drives the inline
     /// Continue action. Cleared when a run starts or the selected thread changes.
     @Published public private(set) var selectedThreadHasRecoverableContext: Bool = false
-    /// Assistant messages whose provider exchange used Token Saver wire.
-    /// Populated live and rebuilt from persisted events so the badge survives restarts.
-    @Published public private(set) var tokenSaverOptimizedMessageIds: Set<AgentMessageID> = []
-    @Published public private(set) var tokenSaverOriginalTextsByMessageId: [AgentMessageID: String] = [:]
-    @Published public private(set) var tokenSaverWireRequestTextsByMessageId: [AgentMessageID: String] = [:]
-    /// RCW1 metadata for streamed assistant items (progress/commentary). These
-    /// items live in the timeline rather than `agent_messages`, so publishing
-    /// only message-id metadata made their raw transport impossible to inspect.
-    @Published public private(set) var tokenSaverTranslationsByItemId: [String: AssistantSR1Translation] = [:]
-    /// Safe view projection keyed by the length-prefixed `(turnId, itemId)` pair.
-    /// Provider item IDs are not globally unique, so UI rows must never read raw
-    /// transport from the legacy item-id-only map when an ID repeats in a thread.
-    private var tokenSaverTranslationsByTimelineItemKey: [String: AssistantSR1Translation] = [:]
-    /// AA-24: structural key of the timeline the item-translation index was built for.
-    private var tokenSaverTranslationsIndexedStructureKey = ""
-    /// Final-message optimization callbacks can arrive before the matching
-    /// timeline translation. Keep those live badges separate so an unrelated
-    /// progress-item translation cannot clear them during the next stream batch.
-    private var liveTokenSaverOptimizedMessageIds: Set<AgentMessageID> = []
-    /// Provider-bound RCW1 requests belong to durable user messages, not the
-    /// evictable stream window. Keep the selected thread's bounded projection
-    /// separate so timeline refresh/backpressure cannot erase its disclosure.
-    private var persistedUserRCW1RequestsByMessageId: [AgentMessageID: String] = [:]
-    /// Exact provider RCW1 responses are durable children of retained assistant
-    /// messages. The turn projection is identity-only; ambiguous provider turn
-    /// ids deliberately return no match instead of comparing visible prose.
-    private var persistedAssistantRCW1ResponsesByMessageId: [AgentMessageID: AgentMessageRCW1Response] = [:]
-    private var persistedAssistantMessageIdByTurnId: [String: AgentMessageID] = [:]
-    private var ambiguousPersistedAssistantTurnIds: Set<String> = []
-    @Published public private(set) var tokenSaverOriginalDisplayMessageIds: Set<AgentMessageID> = []
-    private var tokenSaverDisplayModeWriteGeneration: [AgentMessageID: UInt64] = [:]
-    private var tokenSaverDisplayModeWriteTasks: [AgentMessageID: Task<Void, Never>] = [:]
-    @Published public private(set) var tokenSaverTranslationRetryMessageIds: Set<AgentMessageID> = []
     /// The UI holds only a bounded recent message page. Older durable messages
     /// remain in SQLite and are intentionally outside the hot screen-memory set.
     @Published public private(set) var messageHistoryIsPartial = false
@@ -890,171 +943,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.clock = clock
     }
 
-    public func tokenSaverOriginalText(for id: AgentMessageID) -> String? {
-        tokenSaverOriginalTextsByMessageId[id]
-    }
-
-    public func tokenSaverWireRequestText(for id: AgentMessageID) -> String? {
-        tokenSaverWireRequestTextsByMessageId[id]
-    }
-
-    public func tokenSaverTranslation(forItemId itemId: String) -> AssistantSR1Translation? {
-        tokenSaverTranslationsByItemId[itemId]
-    }
-
-    public func tokenSaverTranslation(
-        forTurnId turnId: String,
-        itemId: String
-    ) -> AssistantSR1Translation? {
-        tokenSaverTranslationsByTimelineItemKey[
-            Self.tokenSaverTimelineItemTranslationKey(turnId: turnId, itemId: itemId)
-        ]
-    }
-
-    nonisolated static func tokenSaverTimelineItemTranslationKey(
-        turnId: String,
-        itemId: String
-    ) -> String {
-        AssistantTimelineState.tokenSaverTimelineItemTranslationKey(
-            turnId: turnId,
-            itemId: itemId
-        )
-    }
-
-    nonisolated static func safelyIndexedTokenSaverItemTranslations(
-        _ translations: [String: AssistantSR1Translation],
-        turns: [AssistantTurnSnapshot]
-    ) -> [String: AssistantSR1Translation] {
-        var occurrenceCounts: [String: Int] = [:]
-        for turn in turns {
-            for item in turn.items {
-                occurrenceCounts[item.id, default: 0] += 1
-            }
-        }
-
-        var indexed: [String: AssistantSR1Translation] = [:]
-        for turn in turns {
-            for item in turn.items {
-                let key = tokenSaverTimelineItemTranslationKey(
-                    turnId: turn.turnId,
-                    itemId: item.id
-                )
-                if let exact = translations[key] {
-                    indexed[key] = exact
-                } else if occurrenceCounts[item.id] == 1,
-                          let legacy = translations[item.id] {
-                    indexed[key] = legacy
-                }
-            }
-        }
-        return indexed
-    }
-
-    public func tokenSaverMessageId(forRCW1TurnId turnId: String) -> AgentMessageID? {
-        guard !ambiguousPersistedAssistantTurnIds.contains(turnId) else { return nil }
-        return persistedAssistantMessageIdByTurnId[turnId]
-    }
-
-    public func tokenSaverDisplaysOriginal(for messageId: AgentMessageID) -> Bool {
-        tokenSaverOriginalDisplayMessageIds.contains(messageId)
-    }
-
-    public func setTokenSaverDisplaysOriginal(
-        _ displaysOriginal: Bool,
-        for messageId: AgentMessageID
-    ) {
-        let previousValue = tokenSaverOriginalDisplayMessageIds.contains(messageId)
-        guard previousValue != displaysOriginal else { return }
-        if displaysOriginal {
-            tokenSaverOriginalDisplayMessageIds.insert(messageId)
-        } else {
-            tokenSaverOriginalDisplayMessageIds.remove(messageId)
-        }
-        let generation = (tokenSaverDisplayModeWriteGeneration[messageId] ?? 0) &+ 1
-        tokenSaverDisplayModeWriteGeneration[messageId] = generation
-        let previousTask = tokenSaverDisplayModeWriteTasks[messageId]
-        let repository = messageRepo
-        let mode: AgentMessageTokenSaverDisplayMode = displaysOriginal ? .rcw1 : .human
-        tokenSaverDisplayModeWriteTasks[messageId] = Task { @MainActor [weak self] in
-            await previousTask?.value
-            do {
-                try await Self.persistTokenSaverDisplayModeOffMain(
-                    repository: repository,
-                    messageId: messageId,
-                    mode: mode
-                )
-            } catch {
-                guard let self,
-                      self.tokenSaverDisplayModeWriteGeneration[messageId] == generation else {
-                    return
-                }
-                if previousValue {
-                    self.tokenSaverOriginalDisplayMessageIds.insert(messageId)
-                } else {
-                    self.tokenSaverOriginalDisplayMessageIds.remove(messageId)
-                }
-                self.statusMessage = "Token Saver display choice could not be saved: \(error.localizedDescription)"
-            }
-            guard let self,
-                  self.tokenSaverDisplayModeWriteGeneration[messageId] == generation else {
-                return
-            }
-            self.tokenSaverDisplayModeWriteGeneration.removeValue(forKey: messageId)
-            self.tokenSaverDisplayModeWriteTasks.removeValue(forKey: messageId)
-        }
-    }
-
-    public nonisolated static func persistTokenSaverDisplayModeOffMain(
-        repository: AgentMessageRepository,
-        messageId: AgentMessageID,
-        mode: AgentMessageTokenSaverDisplayMode
-    ) async throws {
-        try await Task.detached(priority: .userInitiated) {
-            try repository.setTokenSaverDisplayMode(messageId: messageId, mode: mode)
-        }.value
-    }
-
-    /// A durable response without an injective turn link cannot safely lend its
-    /// toggle to timeline text. Keep its canonical message row visible instead.
-    public func tokenSaverRequiresDurableMessageRow(for messageId: AgentMessageID) -> Bool {
-        guard let response = persistedAssistantRCW1ResponsesByMessageId[messageId] else {
-            return false
-        }
-        let turnId = response.turnId
-        return tokenSaverMessageId(forRCW1TurnId: turnId) != messageId
-            || !timeline.turns.contains(where: { $0.turnId == turnId })
-    }
-
-    public func retryTokenSaverTranslation(for id: AgentMessageID) {
-        guard !tokenSaverTranslationRetryMessageIds.contains(id),
-              let raw = tokenSaverOriginalTextsByMessageId[id],
-              let index = messages.firstIndex(where: { $0.id == id }) else { return }
-        let existing = messages[index]
-        tokenSaverTranslationRetryMessageIds.insert(id)
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let rendered = await coordinator.retryWireResponse(raw, threadId: existing.threadId)
-            defer { tokenSaverTranslationRetryMessageIds.remove(id) }
-            guard !rendered.isEmpty, !RCWireProtocol.isWire(rendered) else { return }
-            let updated = AgentMessage(
-                id: existing.id,
-                threadId: existing.threadId,
-                role: existing.role,
-                content: rendered,
-                createdAt: existing.createdAt,
-                attachments: existing.attachments
-            )
-            do {
-                try messageRepo.append(updated)
-                if let liveIndex = messages.firstIndex(where: { $0.id == id }) {
-                    messages[liveIndex] = updated
-                }
-            } catch {
-                statusMessage = "Local translation retry could not be saved: \(error.localizedDescription)"
-            }
-        }
-    }
-
     public init(
         workspaceID: WorkspaceID,
         cwd: String,
@@ -1106,22 +994,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         reloadCustomModels()
         self.coordinator.addObserver(self)
-        self.coordinator.onWireTranslatedMessageId = { [weak self] msgId in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.liveTokenSaverOptimizedMessageIds.insert(msgId)
-                self.tokenSaverOptimizedMessageIds.insert(msgId)
-                guard let threadId = self.selectedThreadId else { return }
-                let persisted = await Self.loadPersistedWireTranslationsOffMain(
-                    repository: self.messageRepo,
-                    threadId: threadId,
-                    messageId: msgId
-                )
-                guard self.selectedThreadId == threadId else { return }
-                self.mergePersistedUserRCW1Requests(persisted.requests)
-                self.mergePersistedAssistantRCW1Responses(persisted.responses)
-            }
-        }
         if let embedding {
             reloadPinnedThread()
             applyNewThreadDefaultsFromRailIfNeeded()
@@ -1243,7 +1115,46 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// PF-10: hidden Agent App tabs keep reducing the stream but must not
     /// publish at 30 Hz, tick, or reload savings/rail until they are visible.
     private var surfaceVisibility: AgentVisibilityState = .visible
-    private var latestHiddenTimeline: AssistantTimelineState?
+    private var latestHiddenTimeline: AssistantTimelineState? {
+        didSet {
+            hiddenTimelineRevision &+= 1
+            // A live tree always supersedes an archived one.
+            if latestHiddenTimeline != nil { hiddenTimelineArchive = nil }
+        }
+    }
+    /// S-F4c: cold-state session for this tab. Its generation moves on every
+    /// hide and reveal, so a reclaim armed for an earlier hide is rejected.
+    private var visibilitySession = AgentVisibilitySession()
+    /// S-F4c: the tab's tree compacted by `reclaimHiddenState`. At most one of
+    /// it and `latestHiddenTimeline` is set. It stays the tab's tree until an
+    /// off-main restore lands (`restoreColdTimelineOffMain`); writers that
+    /// would extend it (stream flush, scheduled poll) wait for that restore.
+    private var hiddenTimelineArchive: Data? {
+        didSet { hiddenTimelineArchiveGeneration &+= 1 }
+    }
+    private var hiddenTimelineArchiveGeneration: UInt64 = 0
+    private var hiddenTimelineRevision: UInt64 = 0
+    private var hiddenReclaimTask: Task<Void, Never>?
+    private var coldRestoreTask: Task<Void, Never>?
+    /// Set when a reveal is waiting on a cold restore: the `timeline` write
+    /// revision at reveal. A restore that finds it moved does not overwrite.
+    private var coldRevealTimelineRevision: UInt64?
+    /// Stream events stayed batched because the tree was archived; the
+    /// restore flushes them onto the restored tree.
+    private var coldRestoreFlushPending = false
+    var hiddenReclaimDelayForTesting: Duration = .seconds(30)
+    /// Below this the archive saves little and restore cost is not worth it.
+    var hiddenArchiveMinimumHotTextBytes = 1 << 20
+    var beforeHiddenArchiveCommitForTesting: (() async -> Void)?
+    var hiddenTimelineIsArchivedForTesting: Bool { hiddenTimelineArchive != nil }
+    var coldRestoreIsInFlightForTesting: Bool { coldRestoreTask != nil }
+    var visibilitySessionForTesting: AgentVisibilitySession { visibilitySession }
+    #if DEBUG
+    func setHiddenTimelineArchiveForTesting(_ archive: Data) {
+        latestHiddenTimeline = nil
+        hiddenTimelineArchive = archive
+    }
+    #endif
     private var hiddenTimelineThreadId: AgentThreadID?
     private var hiddenTimelineOpenGeneration: UInt64 = 0
     private var lastHiddenTimelinePublishAt: Date?
@@ -1258,17 +1169,35 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let previous = surfaceVisibility
         surfaceVisibility = visibility
         if visibility == .hidden {
+            // A repeated hide would stash the already-emptied published
+            // timeline over the real hidden one (or its archive).
+            guard previous != .hidden else { return }
             timelineUpdateTickTask?.cancel()
             timelineUpdateTickTask = nil
             hiddenTimelineThreadId = selectedThreadId
             hiddenTimelineOpenGeneration = selectThreadOpenGeneration
-            latestHiddenTimeline = timeline
+            // A reveal still waiting on its cold restore left the archive as
+            // the tree; the published stand-in is empty and must not replace it.
+            if hiddenTimelineArchive == nil {
+                latestHiddenTimeline = timeline
+            }
+            coldRevealTimelineRevision = nil
             timeline = AssistantTimelineState()
             lastHiddenTimelinePublishAt = nil
             hiddenTimelinePublishCountForTesting = 0
+            visibilitySession = AgentVisibilityColdState.didBecomeHidden(
+                session: visibilitySession,
+                checkpoint: AgentPresentationCheckpoint(
+                    selectedThreadId: selectedThreadId?.value.uuidString
+                )
+            )
+            scheduleHiddenReclaim()
             return
         }
         guard previous == .hidden else { return }
+        hiddenReclaimTask?.cancel()
+        hiddenReclaimTask = nil
+        visibilitySession = AgentVisibilityColdState.beginReveal(session: visibilitySession)
         let sameOpen = hiddenTimelineThreadId == selectedThreadId
             && hiddenTimelineOpenGeneration == selectThreadOpenGeneration
         if sameOpen, let latestHiddenTimeline {
@@ -1276,11 +1205,177 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         hiddenTimelineThreadId = nil
         latestHiddenTimeline = nil
+        if !sameOpen { hiddenTimelineArchive = nil }
         lastHiddenTimelinePublishAt = nil
+        if hiddenTimelineArchive != nil {
+            // The reveal publishes now (durable messages, chrome); the archived
+            // tree decodes off-main and lands in one publish. The session stays
+            // `.restoring` until then.
+            coldRevealTimelineRevision = publishedTimelineWriteRevision
+            restoreColdTimelineOffMain()
+        } else {
+            completeVisibilityReveal()
+        }
         guard sameOpen else { return }
         objectWillChange.send()
         scheduleReloadThreads()
-        reloadTokenSaverThreadSavings()
+    }
+
+    private func scheduleHiddenReclaim() {
+        hiddenReclaimTask?.cancel()
+        let generation = visibilitySession.generation
+        let delay = hiddenReclaimDelayForTesting
+        hiddenReclaimTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            await self?.reclaimHiddenState(generation: generation)
+        }
+    }
+
+    func reclaimHiddenStateForTesting() async {
+        await reclaimHiddenState(generation: visibilitySession.generation)
+    }
+
+    /// S-F4c: a tab that stayed hidden drops the painted caches of threads
+    /// with no live run (a later switch takes the normal full open), and
+    /// compacts the selected thread's hidden tree into an exact archive.
+    /// Encoding runs off-main; the result commits only if this hide is still
+    /// current and nothing wrote the hidden tree meanwhile.
+    func reclaimHiddenState(generation: UInt64) async {
+        guard !isDisposed,
+              surfaceVisibility == .hidden,
+              visibilitySession.generation == generation else { return }
+        let live = Set(runThreads.values)
+        for id in Array(paintedTimelineByThread.keys) where !live.contains(id) {
+            paintedTimelineByThread.removeValue(forKey: id)
+            paintedTimelineOrder.removeAll { $0 == id }
+        }
+        let selectedIsLive = selectedThreadId.map { live.contains($0) } ?? false
+        guard let snapshot = latestHiddenTimeline,
+              !selectedIsLive,
+              currentRunId == nil,
+              scheduledLivePollTask == nil else { return }
+        let revision = hiddenTimelineRevision
+        let minimumBytes = hiddenArchiveMinimumHotTextBytes
+        let archive = (try? await Task.detached(priority: .utility) { () throws -> Data? in
+            guard snapshot.aggregateHotTextByteCount >= minimumBytes else { return nil }
+            return try AgentColdTimelineArchive.archive(snapshot)
+        }.value) ?? nil
+        await beforeHiddenArchiveCommitForTesting?()
+        guard let archive,
+              !isDisposed,
+              surfaceVisibility == .hidden,
+              visibilitySession.generation == generation,
+              hiddenTimelineRevision == revision else { return }
+        latestHiddenTimeline = nil
+        hiddenTimelineArchive = archive
+    }
+
+    /// The cold-state session tracks hide/reveal generations only: this tab
+    /// keeps no durable stream sequence, so the checkpoint sequences stay 0
+    /// and `appliedThroughSequence: 0` always meets their floor. Selection
+    /// staleness is checked by `hiddenTimelineThreadId` + open generation.
+    private func completeVisibilityReveal() {
+        if let revealed = AgentVisibilityColdState.completeReveal(
+            session: visibilitySession,
+            expectedGeneration: visibilitySession.generation,
+            appliedThroughSequence: 0
+        ) {
+            visibilitySession = revealed
+        }
+    }
+
+    /// Decodes the archived tree off-main. Only the task holding
+    /// `coldRestoreTask` clears it; its result applies only if the same
+    /// archive is still the tab's tree.
+    private func restoreColdTimelineOffMain() {
+        guard coldRestoreTask == nil, let archive = hiddenTimelineArchive else { return }
+        let token = hiddenTimelineArchiveGeneration
+        coldRestoreTask = Task { @MainActor [weak self] in
+            let restored = await Task.detached(priority: .userInitiated) {
+                Result { try AgentColdTimelineArchive.restore(archive) }
+            }.value
+            guard let self, !self.isDisposed else { return }
+            self.coldRestoreTask = nil
+            self.finishColdRestore(restored, token: token)
+            if self.coldRestoreFlushPending {
+                self.coldRestoreFlushPending = false
+                self.flushStreamEvents()
+            }
+        }
+    }
+
+    func waitForColdRestoreForTesting() async {
+        while let task = coldRestoreTask { await task.value }
+    }
+
+    private func finishColdRestore(_ restored: Result<AssistantTimelineState, Error>, token: UInt64) {
+        guard hiddenTimelineArchive != nil, hiddenTimelineArchiveGeneration == token else {
+            // A newer archive replaced this one while it decoded.
+            if hiddenTimelineArchive != nil, coldRevealTimelineRevision != nil || coldRestoreFlushPending {
+                restoreColdTimelineOffMain()
+            }
+            return
+        }
+        let timelineState: AssistantTimelineState
+        switch restored {
+        case .success(let value):
+            timelineState = value
+        case .failure(let error):
+            NSLog("[AgentOpen] cold timeline restore failed, reopening the thread: %@", "\(error)")
+            reopenSelectedThreadAfterColdRestoreFailure()
+            return
+        }
+        if surfaceVisibility == .hidden {
+            latestHiddenTimeline = timelineState
+            // The thaw left the tab hot; let it compact again once idle.
+            scheduleHiddenReclaim()
+            return
+        }
+        guard let revision = coldRevealTimelineRevision, revision == publishedTimelineWriteRevision else {
+            // Something wrote the empty stand-in after reveal; the archive can
+            // no longer be merged exactly, so take the normal full open.
+            reopenSelectedThreadAfterColdRestoreFailure()
+            return
+        }
+        hiddenTimelineArchive = nil
+        coldRevealTimelineRevision = nil
+        timeline = timelineState
+        completeVisibilityReveal()
+        objectWillChange.send()
+    }
+
+    /// The archive cannot be shown: drop it and take the normal full open of
+    /// the selected thread (off-main bundle), never a main-thread replay.
+    private func reopenSelectedThreadAfterColdRestoreFailure() {
+        hiddenTimelineArchive = nil
+        latestHiddenTimeline = nil
+        // A hidden tab then reveals the reopened `timeline` (not sameOpen).
+        hiddenTimelineThreadId = nil
+        if coldRevealTimelineRevision != nil {
+            coldRevealTimelineRevision = nil
+            completeVisibilityReveal()
+        }
+        guard let id = selectedThreadId,
+              let thread = threads.first(where: { $0.id == id }) ?? (try? threadRepo.get(id: id)) else { return }
+        selectThreadOpenGeneration &+= 1
+        timeline = AssistantTimelineState()
+        scheduleSelectThreadHydration(
+            thread: thread,
+            markRead: false,
+            openGeneration: selectThreadOpenGeneration,
+            probeExistence: false
+        )
+    }
+
+    /// A thread switch makes the archive another thread's tree.
+    private func dropColdTimelineArchive() {
+        guard hiddenTimelineArchive != nil else { return }
+        hiddenTimelineArchive = nil
+        if coldRevealTimelineRevision != nil {
+            coldRevealTimelineRevision = nil
+            completeVisibilityReveal()
+        }
     }
 
     private func publishInterestedThreadId(_ id: AgentThreadID?) {
@@ -1313,6 +1408,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !isDisposed else { return }
         if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
         isDisposed = true
+        hiddenReclaimTask?.cancel()
+        hiddenReclaimTask = nil
+        coldRestoreTask?.cancel()
+        coldRestoreTask = nil
+        hiddenTimelineArchive = nil
         paintedTimelineByThread.removeAll()
         paintedTimelineOrder.removeAll()
         AgentWorkspaceRailReloadCoordinator.shared.unregister(self)
@@ -1334,10 +1434,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         botPeerReconciliationTask?.cancel()
         botPeerReconciliationTask = nil
         cancelOlderMessageLoad()
-        if let tokenSaverFooterObserver {
-            NotificationCenter.default.removeObserver(tokenSaverFooterObserver)
-            self.tokenSaverFooterObserver = nil
-        }
         if let manualActionObserver {
             NotificationCenter.default.removeObserver(manualActionObserver)
             self.manualActionObserver = nil
@@ -1346,16 +1442,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             NotificationCenter.default.removeObserver(manualActionStateObserver)
             self.manualActionStateObserver = nil
         }
-        if let tokenSaverFooterAccountObserver {
-            NotificationCenter.default.removeObserver(tokenSaverFooterAccountObserver)
-            self.tokenSaverFooterAccountObserver = nil
-        }
-        if let tokenSaverFooterStatusObserver {
-            NotificationCenter.default.removeObserver(tokenSaverFooterStatusObserver)
-            self.tokenSaverFooterStatusObserver = nil
-        }
-        tokenSaverFooterReloadTask?.cancel()
-        tokenSaverFooterReloadTask = nil
         subagentRefreshTask?.cancel()
         subagentRefreshTask = nil
         subagentRefreshGeneration &+= 1
@@ -1365,9 +1451,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         pruneTask?.cancel()
         pruneTask = nil
         pruneGeneration &+= 1
-        tokenSaverSavingsRepo = nil
-        tokenSaverFooterEligibleCheck = nil
-        tokenSaverGraphifyActiveCheck = nil
         streamApplyGeneration &+= 1
         streamAggregateBudgetOps = 0
         streamApplyInFlight = false
@@ -1380,19 +1463,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         messages = []
         messageHistoryIsPartial = false
         timeline = AssistantTimelineState()
-        tokenSaverOptimizedMessageIds = []
-        liveTokenSaverOptimizedMessageIds = []
-        persistedUserRCW1RequestsByMessageId = [:]
-        persistedAssistantRCW1ResponsesByMessageId = [:]
-        persistedAssistantMessageIdByTurnId = [:]
-        ambiguousPersistedAssistantTurnIds = []
-        tokenSaverOriginalDisplayMessageIds = []
-        tokenSaverDisplayModeWriteGeneration = [:]
-        tokenSaverDisplayModeWriteTasks = [:]
-        tokenSaverOriginalTextsByMessageId = [:]
-        tokenSaverWireRequestTextsByMessageId = [:]
-        tokenSaverTranslationsByItemId = [:]
-        tokenSaverTranslationsByTimelineItemKey = [:]
     }
 
     /// Used by the multi-surface rail reload hub (EventBus fan-out).
@@ -2106,162 +2176,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// Wire Token Saver thread-savings footer. Host calls after init with the
-    /// shared ledger + eligibility (enabled && subscribed) + graphify gate.
-    /// Safe to call once per surface.
-    ///
-    /// `isEligible` / `isGraphifyActive` are invoked **off the main actor** inside
-    /// the coalesced reload task — implementors must be thread-safe (fresh
-    /// SettingsStore per call is fine; avoid MainActor-only UI state).
-    public func bindTokenSaverThreadFooter(
-        savingsRepo: TokenSaverSavingsRepository,
-        isEligible: @escaping @Sendable () -> Bool,
-        isGraphifyActive: @escaping @Sendable () -> Bool = { false },
-        graphifySignalCount: @escaping @Sendable () -> Int = { 0 },
-        measuredLoader: @escaping @Sendable (Bool, AgentThreadID?, TokenSaverSavingsRepository?) async -> Int? = {
-            eligible, threadId, repo in
-            await TokenSaverThreadFooterReload.loadMeasured(
-                eligible: eligible,
-                threadId: threadId,
-                repo: repo
-            )
-        }
-    ) {
-        tokenSaverSavingsRepo = savingsRepo
-        tokenSaverFooterEligibleCheck = isEligible
-        tokenSaverGraphifyActiveCheck = isGraphifyActive
-        tokenSaverGraphifySignalCountCheck = graphifySignalCount
-        tokenSaverMeasuredLoader = measuredLoader
-        if tokenSaverFooterObserver == nil {
-            let handler: (Notification) -> Void = { [weak self] _ in
-                self?.reloadTokenSaverThreadSavings()
-            }
-            // Savings ledger changes.
-            tokenSaverFooterObserver = NotificationCenter.default.addObserver(
-                forName: Notification.Name("rc2TokenSaverUsageChanged"),
-                object: nil,
-                queue: .main,
-                using: handler
-            )
-            // B-6 residual: toggle / account change must hide the chip immediately,
-            // not wait for the next turn or thread switch.
-            tokenSaverFooterAccountObserver = NotificationCenter.default.addObserver(
-                forName: Notification.Name("rc2PrivateAccountChanged"),
-                object: nil,
-                queue: .main,
-                using: handler
-            )
-            tokenSaverFooterStatusObserver = NotificationCenter.default.addObserver(
-                forName: Notification.Name("rc2TokenSaverDistillStatusChanged"),
-                object: nil,
-                queue: .main,
-                using: handler
-            )
-        }
-        reloadTokenSaverThreadSavings()
-    }
-
-    /// Schedule a coalesced reload: eligibility + ledger + estimate all off-main.
-    public func reloadTokenSaverThreadSavings() {
-        guard !isDisposed else { return }
-        guard surfaceVisibility != .hidden else { return }
-        tokenSaverFooterReloadTask?.cancel()
-        let eligibleCheck = tokenSaverFooterEligibleCheck
-        let graphifyCheck = tokenSaverGraphifyActiveCheck
-        let graphifySignalCountCheck = tokenSaverGraphifySignalCountCheck
-        let measuredLoader = tokenSaverMeasuredLoader
-        let threadId = selectedThreadId
-        let repo = tokenSaverSavingsRepo
-        // AA-12: assistant UTF-8 is maintained on messages didSet. Capture the
-        // Int + turn count only — do not retain `[AgentMessage]` across the
-        // detached ledger load.
-        let assistantChars = transcriptState.assistantCharsHot
-        let userMessageCount = messages.reduce(0) { $0 + ($1.role == .user ? 1 : 0) }
-        let turnCountSnapshot = max(timeline.turns.count, userMessageCount)
-        let usage = timeline.tokenUsage
-        let cacheRead = usage?.cacheReadInputTokens ?? 0
-        let providerRaw = usage.map { max(0, $0.inputTokens) + max(0, $0.outputTokens) } ?? 0
-        let providerBilled = usage.map { $0.billedTotalTokenUnits } ?? 0
-        let autoRouting = routingMode == .auto
-        // PL-02: `Task { }` here inherits the MainActor, so the "off-main" reads
-        // below ran on main. Detach so eligibility/settings/ledger reads never
-        // touch the main thread.
-        tokenSaverFooterReloadTask = Task.detached(priority: .utility) { [weak self] in
-            let turnCount = turnCountSnapshot
-            let eligible = eligibleCheck?() == true
-            let graphifyActive = graphifyCheck?() == true
-            let graphifyCount = graphifySignalCountCheck?() ?? 0
-            let measured = await measuredLoader?(eligible, threadId, repo)
-            guard let measured else { return }
-            guard !Task.isCancelled else { return }
-            let deliveredRuns = await TokenSaverThreadFooterReload.loadDeliveredTotal(
-                eligible: eligible,
-                threadId: threadId,
-                repo: repo
-            )?.runs ?? 0
-            let next = TokenSaverThreadFooterReload.snapshot(
-                measuredDelivered: measured,
-                eligible: eligible,
-                graphifyActive: graphifyActive,
-                observation: TokenSaverThreadFooterReload.Observation(
-                    assistantChars: assistantChars,
-                    turnCount: turnCount,
-                    cacheReadInputTokens: cacheRead,
-                    providerRawTokens: providerRaw,
-                    providerBilledTokenUnits: providerBilled > 0 ? providerBilled : nil,
-                    autoRoutingActive: autoRouting,
-                    graphifySignalCount: graphifyCount
-                ),
-                deliveredRuns: deliveredRuns
-            )
-            await MainActor.run { [weak self] in
-                guard let self, !self.isDisposed, !Task.isCancelled else { return }
-                guard self.selectedThreadId == threadId else { return }
-                // Soft reselect / stream ticks re-enter constantly. Skip identical
-                // footer assigns so @Published chrome does not multipass-repaint.
-                if Self.shouldPublishTokenSaverFooter(
-                    currentEnabled: self.tokenSaverFooterEnabled,
-                    nextEnabled: next.enabled,
-                    currentMeasured: self.tokenSaverThreadMeasuredTokens,
-                    nextMeasured: next.measuredTokens,
-                    currentDisplay: self.tokenSaverThreadSavedTokens,
-                    nextDisplay: next.displayTokens
-                ) {
-                    self.tokenSaverFooterEnabled = next.enabled
-                    self.tokenSaverThreadMeasuredTokens = next.measuredTokens
-                    self.tokenSaverThreadSavedTokens = next.displayTokens
-                }
-                self.tokenSaverFooterSnapshotReady = true
-            }
-        }
-    }
-
-    /// Drop published footer chrome for the leaving thread. Call after
-    /// `selectedThreadId` changes so an in-flight load for the previous thread
-    /// cannot republish (it checks selectedThreadId).
-    private func resetTokenSaverFooterSnapshot() {
-        tokenSaverFooterReloadTask?.cancel()
-        tokenSaverFooterReloadTask = nil
-        tokenSaverFooterEnabled = false
-        tokenSaverThreadMeasuredTokens = 0
-        tokenSaverThreadSavedTokens = 0
-        tokenSaverFooterSnapshotReady = false
-    }
-
-    /// Skip equal token-saver footer publishes (soft reselect / idle multipass).
-    public nonisolated static func shouldPublishTokenSaverFooter(
-        currentEnabled: Bool,
-        nextEnabled: Bool,
-        currentMeasured: Int,
-        nextMeasured: Int,
-        currentDisplay: Int,
-        nextDisplay: Int
-    ) -> Bool {
-        currentEnabled != nextEnabled
-            || currentMeasured != nextMeasured
-            || currentDisplay != nextDisplay
-    }
-
     /// Bumped on every full thread open so deferred provider-snapshot tasks for
     /// a prior open never wipe a newer selection (or the same thread re-selected soft).
     private var selectThreadOpenGeneration: UInt64 = 0
@@ -2397,8 +2311,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // then restore the opened thread's draft.
         if let previous = selectedThreadId {
             stashComposerDraftOffMain(for: previous)
-            rememberPaintedTimeline(previous, timeline)
+            // A pending cold restore means `timeline` is an empty stand-in.
+            if hiddenTimelineArchive == nil {
+                rememberPaintedTimeline(previous, timeline)
+            }
         }
+        dropColdTimelineArchive()
         selectedThreadId = id
         refreshManualAction()
         transcriptState.selectedThreadIdForPeerFlag = id
@@ -2408,29 +2326,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         )
         PerfSwitchMetrics.markConversationFirstPublish()
         publishInterestedThreadId(id)
-        // Per-thread chip: never keep the leaving thread's savings on the
-        // newly selected one while its ledger read is in flight (or if it fails).
-        resetTokenSaverFooterSnapshot()
         providerThreadSnapshotStatusMessage = nil
         providerThreadSnapshotLastConfirmedAt = providerThreadSnapshotConfirmedAtByThread[id]
-        // F6: Token Saver translation maps are per-thread state. Reset them on a
-        // thread switch so they don't accumulate the union of every translated
-        // message (and its full original text) across every thread visited this
-        // session. refreshTokenSaverOptimizationStateFromTimeline() below rebuilds them
-        // from the opened thread's replayed timeline.
-        tokenSaverOptimizedMessageIds = []
-        liveTokenSaverOptimizedMessageIds = []
-        persistedUserRCW1RequestsByMessageId = [:]
-        persistedAssistantRCW1ResponsesByMessageId = [:]
-        persistedAssistantMessageIdByTurnId = [:]
-        ambiguousPersistedAssistantTurnIds = []
-        tokenSaverOriginalDisplayMessageIds = []
-        tokenSaverDisplayModeWriteGeneration = [:]
-        tokenSaverDisplayModeWriteTasks = [:]
-        tokenSaverOriginalTextsByMessageId = [:]
-        tokenSaverWireRequestTextsByMessageId = [:]
-        tokenSaverTranslationsByItemId = [:]
-        tokenSaverTranslationsByTimelineItemKey = [:]
         // Per-thread provider state: the opened thread republishes its own
         // count on its next snapshot, so carrying the previous thread's
         // shell count over would advertise work that isn't this thread's.
@@ -2864,7 +2761,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         for event in bundle.pendingCallbackEvents {
             timeline.apply(event)
         }
-        refreshTokenSaverOptimizationStateFromTimeline(preservingExisting: true)
         applyCheckpointSummaries(bundle.checkpointSummaries)
         suppressPersistedFinalDuplicatedByTimeline()
         resetTimelineUpdateTick()
@@ -2901,8 +2797,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Subagents is thread-scoped chrome: rebuild after first paint so
         // switching threads never keeps another thread's Active/Done counts.
         refreshSubagentActivity()
-        // Token Saver footer is per-thread; re-read the permanent total on open.
-        reloadTokenSaverThreadSavings()
         rememberPaintedTimeline(id, timeline)
         Self.agentOpenTrace(
             "full open bundle applied gen=\(openGeneration) items=\(Self.renderableItemCount(bundle.persistedEvents)) turns=\(timeline.turns.count) recoverable=\(selectedThreadHasRecoverableContext)"
@@ -2976,7 +2870,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.rehydrateProposedPlans(threadId: id)
                 self.rehydratePendingCallbacks(threadId: id)
                 self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
-                self.refreshTokenSaverOptimizationStateFromTimeline(preservingExisting: true)
             } catch {
                 guard self.selectedThreadId == id,
                       self.selectThreadOpenGeneration == openGeneration else { return }
@@ -4193,7 +4086,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         reloadCheckpoints()
         refreshSubagentActivity()
-        reloadTokenSaverThreadSavings()
         // Do not bump focusTick / resetTimelineUpdateTick / re-fetch provider
         // snapshot — that re-scrolled and re-blinked an already-open thread.
     }
@@ -4306,9 +4198,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 inMemory: self.messages,
                 threadId: id
             )
-            self.mergePersistedUserRCW1Requests(payload.userRCW1Requests)
-            self.mergePersistedAssistantRCW1Responses(payload.assistantRCW1Responses)
-            self.mergePersistedTokenSaverDisplayModes(payload.tokenSaverDisplayModes)
             self.messageHistoryIsPartial = payload.page?.hasMoreOlder ?? false
             self.ensureBotPeerReconciliation()
             // Queue rows are not transcript bubbles; only re-apply plan
@@ -4417,33 +4306,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }.value
     }
 
-    /// Wire-translation hydration for one message id, in a single detached hop.
-    nonisolated static func loadPersistedWireTranslationsOffMain(
-        repository: AgentMessageRepository,
-        threadId: AgentThreadID,
-        messageId: AgentMessageID
-    ) async -> (requests: [AgentMessageID: String], responses: [AgentMessageID: AgentMessageRCW1Response]) {
-        await Task.detached(priority: .userInitiated) {
-            let requests = (try? repository.rcw1RequestTranslations(
-                threadId: threadId,
-                messageIds: [messageId]
-            )) ?? [:]
-            let responses = (try? repository.rcw1ResponseTranslations(
-                threadId: threadId,
-                messageIds: [messageId]
-            )) ?? [:]
-            return (requests, responses)
-        }.value
-    }
 
     /// Everything `loadAllMessages` needs, gathered in ONE detached round-trip
     /// (perf AA-10: the page query and the three persisted per-message lookups
     /// used to be 4 sequential detached hops with a MainActor return each).
     struct AgentMessagePagePayload: Sendable {
         var page: AgentMessageBodyBudgetResult?
-        var userRCW1Requests: [AgentMessageID: String] = [:]
-        var assistantRCW1Responses: [AgentMessageID: AgentMessageRCW1Response] = [:]
-        var tokenSaverDisplayModes: [AgentMessageID: AgentMessageTokenSaverDisplayMode] = [:]
     }
 
     nonisolated static func loadMessagePagePayloadOffMain(
@@ -4460,35 +4328,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 budget: fullLoadBodyBudgetBytes,
                 contentLimit: AssistantTimelineState.liveTextLimit
             )
-            let rows = payload.page?.rows ?? []
-            // PERF: single pass instead of two filter+map traversals over the
-            // history page; id sets identical (roles are disjoint).
-            var userIds: [AgentMessageID] = []
-            var assistantIds: [AgentMessageID] = []
-            userIds.reserveCapacity(rows.count)
-            assistantIds.reserveCapacity(rows.count)
-            for row in rows {
-                if row.role == .user { userIds.append(row.id) }
-                else if row.role == .assistant { assistantIds.append(row.id) }
-            }
-            if !userIds.isEmpty {
-                payload.userRCW1Requests = (try? repository.rcw1RequestTranslations(
-                    threadId: threadId,
-                    messageIds: userIds
-                )) ?? [:]
-            }
-            if !assistantIds.isEmpty {
-                payload.assistantRCW1Responses = (try? repository.rcw1ResponseTranslations(
-                    threadId: threadId,
-                    messageIds: assistantIds
-                )) ?? [:]
-            }
-            if !rows.isEmpty {
-                payload.tokenSaverDisplayModes = (try? repository.tokenSaverDisplayModes(
-                    threadId: threadId,
-                    messageIds: rows.map(\.id)
-                )) ?? [:]
-            }
             return payload
         }.value
     }
@@ -4560,9 +4399,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 older: loaded.rows,
                 current: self.messages
             )
-            self.mergePersistedUserRCW1Requests(payload.userRCW1Requests)
-            self.mergePersistedAssistantRCW1Responses(payload.assistantRCW1Responses)
-            self.mergePersistedTokenSaverDisplayModes(payload.tokenSaverDisplayModes)
             self.messageHistoryIsPartial = loaded.hasMoreOlder
             if !loaded.hasMoreOlder {
                 NSLog("[AgentApp] older message pages exhausted for thread \(expectedThread.value.uuidString)")
@@ -4786,6 +4622,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// `!selectedThreadRunIsStartingOrRunning` guard keeps the neutral copy during
     /// the brief window a resume run is starting.
     public var composerPlaceholder: String {
+        if let placeholder = embedding?.composerPlaceholder { return placeholder }
         let defaultPlaceholder = "Ask \(provider.rawValue.capitalized) for changes…"
         guard !selectedThreadRunIsStartingOrRunning,
               let reason = incompleteTurnReason else { return defaultPlaceholder }
@@ -5232,6 +5069,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 ).listModelsResult()
                 m = result.models
                 isFallback = result.isFallback
+            } else if provider == .distill {
+                // Distill owns its catalog: falling through to Codex discovery
+                // replaced the Distill fetch with Codex ids and let an installed
+                // Codex CLI decide the Distill built-in-defaults signal.
+                let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
+                let result = await DistillACPAdapter(
+                    binaryNameOverride: launchConfig?.binary,
+                    discoveryCwd: cwd,
+                    discoveryEnvironment: launchConfig?.environment ?? [:],
+                    discoveryRunAsUser: runAsUser
+                ).listModelsResult()
+                m = result.models
+                isFallback = result.isFallback
             } else {
                 let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
                 let result = await CodexAppServerModelDiscovery.listModelsResult(
@@ -5374,8 +5224,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 availableModelsAreFallback = current.models.map(\.id) == availableModels.map(\.id)
             }
             availableModels = current.models
+            // A thread stored under the raw provider id ("distill", written by
+            // AppCommandRouter.normalizedProviderInstanceId when no configured
+            // instance matches) is the provider's default instance, not another
+            // source. Mapping it to the snapshot id ("distill-acp") must keep
+            // the thread's pinned model; a real instance switch still resets.
+            let isDefaultInstanceAlias = selectedThreadId != nil
+                && current.provider == previousProvider
+                && previousInstanceId == previousProvider.rawValue
             let sourceChanged = current.provider != previousProvider
-                || current.id != previousInstanceId
+                || (current.id != previousInstanceId && !isDefaultInstanceAlias)
             if sourceChanged {
                 // SC-ux-1: auto-rebind must reset model like setProvider — do not
                 // keep a Codex id (e.g. gpt-5.6-sol) after switching to Claude.
@@ -6127,9 +5985,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Blocks the send (true) when a bot thread's workspace is gone or its VM is down. Never falls back to the Mac.
+    /// A thread with no workspace (a Bots Desk thread runs in BotHome) has nothing to mount: the gate only
+    /// needs the VM up, since BotHome is never a registered workspace and mounting it would always fail.
     private func botVMGateBlocksRun(botID: BotID, thread: AgentThread?) async -> Bool {
-        let workspace = thread?.worktreePath ?? cwd
-        if !FileManager.default.fileExists(atPath: workspace) {
+        let workspace: String? = embedding != nil && thread?.workspaceId == nil
+            ? nil
+            : thread?.worktreePath ?? cwd
+        if let workspace, !FileManager.default.fileExists(atPath: workspace) {
             statusMessage = "Workspace removido"
             return true
         }
@@ -6147,23 +6009,134 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Links the thread to the bot and locks the thread's actor and execution target.
     private func lockBotActor(botID: BotID, threadId tid: AgentThreadID) throws {
         guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
-        try linker(botID, tid)
-        let lockedAt = Date()
         let target = botExecutionTargetProvider(botID)
-        guard try threadRepo.setActor(
+        // The composer's provider belongs to the selected thread only.
+        let lockedAt: Date
+        do {
+            lockedAt = try Self.lockThreadToBot(
+                botID: botID,
+                threadID: tid,
+                target: target,
+                composerProvider: selectedThreadId == tid ? provider : nil,
+                composerRunAsUser: selectedThreadId == tid ? runAsUser : nil,
+                threadRepo: threadRepo,
+                linker: linker
+            )
+        } catch let error as ThreadActorAlreadyLockedError {
+            // Another device locked it first: show its lock, never overwrite it.
+            if let stored = try? threadRepo.get(id: tid) {
+                mirrorActorLock(stored.actor, lockedAt: stored.actorLockedAt, target: stored.executionTarget, thread: tid)
+            }
+            throw error
+        }
+        if let index = threads.firstIndex(where: { $0.id == tid }) {
+            threads[index].actor = .bot(botID)
+            threads[index].actorLockedAt = lockedAt
+            threads[index].executionTarget = target
+            // iOS parity: paired devices show the lock without a refetch.
+            onThreadConfigPersisted?(threads[index])
+        }
+    }
+
+    /// Links the thread to the bot, writes the guest runtime marker and locks
+    /// the thread's actor and execution target. Shared by the composer's first
+    /// bot send and `agent.thread.actor.set` from a paired device. Returns the
+    /// lock date. `composerProvider` and `composerRunAsUser` are what the
+    /// composer will run the thread with; nil reads the thread's own. Throws
+    /// `ThreadActorAlreadyLockedError` when the thread is already locked.
+    @MainActor
+    public static func lockThreadToBot(
+        botID: BotID,
+        threadID tid: AgentThreadID,
+        target: ExecutionTarget,
+        composerProvider: AgentProvider?,
+        composerRunAsUser: AgentRunAsUser? = nil,
+        threadRepo: AgentThreadRepository,
+        linker: @MainActor (BotID, AgentThreadID) throws -> Void
+    ) throws -> Date {
+        let thread = try threadRepo.get(id: tid)
+        // Checked before any write: a lock set elsewhere is never overwritten.
+        guard thread?.actorLockedAt == nil else { throw ThreadActorAlreadyLockedError() }
+        try linker(botID, tid)
+        let lockedAt = storedLockDate()
+        // Written before the lock: on its own (no `.vm` target yet) the marker routes nothing.
+        let previousMarker = try threadRepo.guestPlacement(of: tid)?.guestRuntime
+        let marker = guestRuntimeMarker(
+            target: target,
+            provider: composerProvider ?? thread?.provider,
+            runAsUser: composerProvider != nil ? composerRunAsUser : thread?.runAsUser,
+            hasMacDistillSession: thread?.provider == .distill && thread?.providerThreadId?.isEmpty == false
+        )
+        try threadRepo.setGuestRuntime(id: tid, marker)
+        guard try threadRepo.lockActorIfUnlocked(
             id: tid, actor: .bot(botID), lockedAt: lockedAt, executionTarget: target
         ) else {
+            try? threadRepo.setGuestRuntime(id: tid, previousMarker)
+            if try threadRepo.get(id: tid) != nil { throw ThreadActorAlreadyLockedError() }
             throw NSError(
                 domain: "RemoteCode.AgentAppViewModel",
                 code: 404,
                 userInfo: [NSLocalizedDescriptionKey: "A conversa sumiu antes de iniciar."]
             )
         }
-        if let index = threads.firstIndex(where: { $0.id == tid }) {
-            threads[index].actor = .bot(botID)
-            threads[index].actorLockedAt = lockedAt
-            threads[index].executionTarget = target
-        }
+        return lockedAt
+    }
+
+    /// Now, at the precision `agent_threads.actor_locked_at` keeps (whole
+    /// seconds), so the painted row and its event match what a reload reads.
+    public nonisolated static func storedLockDate() -> Date {
+        Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+    }
+
+    /// Plan A placement rule, one for every bot lock and for later provider or
+    /// run-as-user changes: a Distill thread of a bot on the VM runs inside the
+    /// bot's Linux guest, unless it already has a Mac Distill session (D5) or
+    /// runs as another macOS user (M9: the guest only gets the app user's own
+    /// accounts and the guest resolver refuses such a run).
+    public nonisolated static func guestRuntimeMarker(
+        target: ExecutionTarget?,
+        provider: AgentProvider?,
+        runAsUser: AgentRunAsUser?,
+        hasMacDistillSession: Bool
+    ) -> String? {
+        guard target == .vm, provider == .distill, !hasMacDistillSession,
+              (runAsUser?.uid ?? getuid()) == getuid() else { return nil }
+        return BotGuestRuntime.distillV1
+    }
+
+    /// A provider or run-as-user change on a bot-locked thread that has not
+    /// started re-derives its guest marker with the lock's rule: a paired
+    /// device locks the actor first and picks the provider at its first send.
+    /// A started thread keeps its marker (its session lives where it ran).
+    /// Returns true when the marker changed.
+    @MainActor
+    @discardableResult
+    public static func resyncGuestRuntimeMarker(
+        threadID tid: AgentThreadID,
+        threadRepo: AgentThreadRepository,
+        messageRepo: AgentMessageRepository
+    ) throws -> Bool {
+        guard let thread = try threadRepo.get(id: tid), thread.actorLockedAt != nil,
+              case .bot = thread.actor, !(try messageRepo.hasAny(threadId: tid)) else { return false }
+        let marker = guestRuntimeMarker(
+            target: thread.executionTarget,
+            provider: thread.provider,
+            runAsUser: thread.runAsUser,
+            hasMacDistillSession: thread.provider == .distill && thread.providerThreadId?.isEmpty == false
+        )
+        guard try threadRepo.guestPlacement(of: tid)?.guestRuntime != marker else { return false }
+        try threadRepo.setGuestRuntime(id: tid, marker)
+        return true
+    }
+
+    /// Updates the painted row and, on the selected thread, the actor chip.
+    /// The caller already persisted the lock (a paired device set the actor).
+    public func mirrorActorLock(_ actor: RunActor, lockedAt: Date?, target: ExecutionTarget?, thread id: AgentThreadID) {
+        guard let index = threads.firstIndex(where: { $0.id == id }) else { return }
+        threads[index].actor = actor
+        threads[index].actorLockedAt = lockedAt
+        threads[index].executionTarget = target
+        if selectedThreadId == id { selectedRunActor = actor }
     }
 
     /// "Iniciar VM": provisions through the host, then clears the banner.
@@ -6184,7 +6157,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let botID = vmUnavailableBotID, let tid = selectedThreadId,
               let thread = threads.first(where: { $0.id == tid }) else { return }
         do {
-            let lockedAt = thread.actorLockedAt ?? Date()
+            let lockedAt = thread.actorLockedAt ?? Self.storedLockDate()
             if thread.actorLockedAt == nil {
                 guard let linker = botThreadLinker else { throw BotRunUnavailableError() }
                 try linker(botID, tid)
@@ -6195,6 +6168,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threads[index].actor = actor
                 threads[index].actorLockedAt = lockedAt
                 threads[index].executionTarget = .mac
+                // iOS parity: paired devices see the move to the Mac at once.
+                onThreadConfigPersisted?(threads[index])
             }
             vmUnavailableBotID = nil
             statusMessage = ""
@@ -6203,21 +6178,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// Max chars kept per message in the handoff summary.
-    static let handoffMessageLimit = 300
-    static let handoffMessageCount = 6
-
     /// Deterministic continuation draft: header plus the last user/assistant messages, truncated.
     public static func handoffSummary(title: String, threadId: AgentThreadID, messages: [AgentMessage]) -> String {
-        var lines = ["Continuação da thread \"\(title)\" (id \(threadId.value.uuidString.lowercased()))"]
-        let turns = messages.filter { $0.role == .user || $0.role == .assistant }.suffix(handoffMessageCount)
-        for message in turns {
-            let label = message.role == .user ? "Usuário" : "Assistente"
-            let text = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            let clipped = text.count > handoffMessageLimit ? String(text.prefix(handoffMessageLimit)) + "…" : text
-            lines.append("\(label): \(clipped)")
-        }
-        return lines.joined(separator: "\n")
+        AgentThreadHandoff.summary(title: title, threadId: threadId, messages: messages)
     }
 
     /// Opens a new thread in this workspace for `actor`, with a draft summarising `oldThreadId`.
@@ -6239,6 +6202,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         prompt = summary
         persistComposerDraft(for: newId)
         return newId
+    }
+
+    /// Shown when Retry, Continue or a re-run is asked of a surface whose
+    /// sends are intercepted (a bot group room or a member's private thread).
+    public static let interceptedRunRefusal = "Bots in a group answer from the group. Write in the group."
+
+    /// True when sends are intercepted: nothing may start a provider run here.
+    private func refuseInterceptedRun() -> Bool {
+        guard embedding?.sendInterceptor != nil else { return false }
+        statusMessage = Self.interceptedRunRefusal
+        return true
     }
 
     private func refuseLegacyProviderThreadRun() -> Bool {
@@ -6459,6 +6433,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             currentRunId = durable.id
             runThreads[durable.id] = id
             if status != .running { status = .running }
+        }
+        if plan != .skip, hiddenTimelineArchive != nil {
+            // The suffix must extend the archived tree. The cursor is not
+            // advanced, so the next tick applies the same events once the
+            // off-main restore has landed.
+            restoreColdTimelineOffMain()
+            return
         }
         scheduledLiveApplyCountForTesting = 0
         switch plan {
@@ -6703,6 +6684,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threadId: id,
                 expectedRevision: routingBase.revision
             )
+            // A thread a paired device locked to a bot gets its provider here.
+            if let painted, painted.actorLockedAt != nil,
+               painted.provider != provider || painted.runAsUser != runAsUser {
+                try Self.resyncGuestRuntimeMarker(threadID: id, threadRepo: threadRepo, messageRepo: messageRepo)
+            }
             if let i = threads.firstIndex(where: { $0.id == id }) {
                 threads[i].provider = provider
                 threads[i].providerInstanceId = providerInstanceId
@@ -7492,19 +7478,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         streamUIBackpressured = false
         streamAggregateBudgetOps = 0
         historyReplayNotice = nil
-        tokenSaverOptimizedMessageIds = []
-        liveTokenSaverOptimizedMessageIds = []
-        persistedUserRCW1RequestsByMessageId = [:]
-        persistedAssistantRCW1ResponsesByMessageId = [:]
-        persistedAssistantMessageIdByTurnId = [:]
-        ambiguousPersistedAssistantTurnIds = []
-        tokenSaverOriginalDisplayMessageIds = []
-        tokenSaverDisplayModeWriteGeneration = [:]
-        tokenSaverDisplayModeWriteTasks = [:]
-        tokenSaverOriginalTextsByMessageId = [:]
-        tokenSaverWireRequestTextsByMessageId = [:]
-        tokenSaverTranslationsByItemId = [:]
-        tokenSaverTranslationsByTimelineItemKey = [:]
         providerThreadSnapshotStatusMessage = nil
         providerThreadSnapshotLastConfirmedAt = nil
         selectedThreadHasRecoverableContext = false
@@ -7518,7 +7491,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         transcriptHistoryRevealCount = 0
         planNotes = ""
         subagentActivity = .empty
-        resetTokenSaverFooterSnapshot()
         reloadQueuedMessages()
         reloadCheckpoints()
     }
@@ -7629,8 +7601,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 isActive: true
             )
         ], done: [])
-        tokenSaverThreadSavedTokens = 321
-        tokenSaverThreadMeasuredTokens = 123
     }
 
     /// Test-only: the set of thread ids still present in ANY per-thread VM cache,
@@ -8249,6 +8219,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let sendThreadId = selectedThreadId
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
+        if let interceptor = embedding?.sendInterceptor {
+            sendThroughInterceptor(interceptor, text: trimmed)
+            return
+        }
         if refuseLegacyProviderThreadRun() { return }
         if refuseUnavailableBotThreadRun() { return }
         if let message = selectedDistillEffortValidationMessage {
@@ -8373,23 +8347,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if case .bot(let botID) = sendActor,
            (sendThread?.actorLockedAt != nil ? sendThread?.executionTarget : nil) ?? botExecutionTargetProvider(botID) == .vm,
            let busy = botBusyMessage?(botID, sendThreadId ?? AgentThreadID()) {
-            if selectedThreadId == nil { createThread(title: "New thread") }
-            if let tid = selectedThreadId {
-                if threads.first(where: { $0.id == tid })?.actorLockedAt == nil {
-                    do { try lockBotActor(botID: botID, threadId: tid) } catch {
-                        statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-                        restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
-                        return
-                    }
-                }
-                if await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
-                    botWaitForVM?(botID, tid)
-                    statusMessage = busy
-                    return
-                }
-            }
-            statusMessage = busy
-            restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+            await queueBehindBusyBotVM(
+                botID: botID, busy: busy, text: text, attached: attachedForSend,
+                originalPrompt: originalPrompt, sendThreadId: sendThreadId, threadId: sendThreadId
+            )
             return
         }
         if selectedThreadCanQueuePrompt,
@@ -8403,7 +8364,82 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             interactionMode: interactionMode,
             recoveryDisplayText: originalPrompt
         ) == nil {
+            // Another thread took the bot's VM after the check above: queue too.
+            if let refusal = botVMClaimRefusal {
+                botVMClaimRefusal = nil
+                await queueBehindBusyBotVM(
+                    botID: refusal.botID, busy: refusal.notice, text: text, attached: attachedForSend,
+                    originalPrompt: originalPrompt, sendThreadId: sendThreadId, threadId: refusal.threadId
+                )
+                return
+            }
             restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+        }
+    }
+
+    /// One run per bot VM: the send waits in the queue of the thread it was
+    /// sent for (`threadId`; nil = a fresh thread) behind the holder, even when
+    /// the user switched threads meanwhile. A fresh thread is created and its
+    /// bot actor locked first so the drained message runs as the bot.
+    private func queueBehindBusyBotVM(
+        botID: BotID,
+        busy: String,
+        text: String,
+        attached: [AgentAttachment],
+        originalPrompt: String,
+        sendThreadId: AgentThreadID?,
+        threadId: AgentThreadID?
+    ) async {
+        // A fresh-thread send whose composer moved to another thread meanwhile
+        // has no thread of its own to queue on.
+        var target = threadId
+        if target == nil, selectedThreadId == nil {
+            createThread(title: "New thread")
+            target = selectedThreadId
+        }
+        if let tid = target {
+            if threads.first(where: { $0.id == tid })?.actorLockedAt == nil {
+                do { try lockBotActor(botID: botID, threadId: tid) } catch {
+                    if selectedThreadId == tid {
+                        statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    }
+                    restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+                    return
+                }
+            }
+            if await enqueuePromptWhileRunning(text: text, attached: attached, threadId: tid) {
+                botWaitForVM?(botID, tid)
+                if selectedThreadId == tid { statusMessage = busy }
+                return
+            }
+        }
+        if selectedThreadId == sendThreadId { statusMessage = busy }
+        restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+    }
+
+    /// The interceptor writes the send; its rows paint on this turn and the
+    /// composer clears only once it accepted the message.
+    private func sendThroughInterceptor(_ interceptor: AgentAppSendInterceptor, text: String) {
+        guard let threadId = selectedThreadId ?? embedding?.pinnedThreadId else { return }
+        do {
+            let rows = try interceptor(text, attachments, threadId)
+            prompt = ""
+            attachments = []
+            statusMessage = ""
+            try? clearComposerDraft(threadId: threadId, providerInstanceId: providerInstanceId)
+            guard selectedThreadId == threadId else { return }
+            // Rows already projected while the send ran (waiting rows) are
+            // re-placed in the send's order: the user line first.
+            let sent = rows.filter { $0.threadId == threadId }
+            let ids = Set(sent.map(\.id))
+            var next = messages
+            let insertAt = next.firstIndex { ids.contains($0.id) } ?? next.endIndex
+            next.removeAll { ids.contains($0.id) }
+            next.insert(contentsOf: sent, at: min(insertAt, next.endIndex))
+            messages = next
+            ensureBotPeerReconciliation()
+        } catch {
+            statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         }
     }
 
@@ -8579,11 +8615,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         guard selectedThreadId == threadId else {
             do {
-                guard let wrote = try threadRepo.markUnreadUpdatingActivity(of: threadId) else {
+                let unreadAt = Date()
+                guard let wrote = try threadRepo.markUnreadUpdatingActivity(of: threadId, at: unreadAt) else {
                     statusMessage = "The bot reply thread is no longer available."
                     return nil
                 }
                 if wrote {
+                    onThreadChromeWritten?(AgentThreadChromeWrite(
+                        threadID: threadId, hasUnread: true, updatedAt: unreadAt
+                    ))
                     scheduleReloadThreads(delayMilliseconds: 0)
                 }
             } catch {
@@ -8647,16 +8687,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         routingConfigurationForSend(threadId: threadId)
     }
 
+    /// `threadId` (default: the selected thread) is the thread whose queue takes
+    /// the message; the composer, timeline and queue chrome are touched only
+    /// while that thread is still the selected one.
     private func enqueuePromptWhileRunning(
         text: String,
         attached: [AgentAttachment],
-        interactionMode: AgentInteractionMode? = nil
+        interactionMode: AgentInteractionMode? = nil,
+        threadId: AgentThreadID? = nil
     ) async -> Bool {
         guard !refuseLegacyProviderThreadRun() else { return false }
-        guard let selectedThreadId, let queuedMessageRepo else { return false }
+        guard let targetThreadId = threadId ?? selectedThreadId, let queuedMessageRepo else { return false }
+        let isSelected = targetThreadId == selectedThreadId
+        let draftProviderInstanceId = isSelected
+            ? providerInstanceId
+            : (threads.first(where: { $0.id == targetThreadId })?.providerInstanceId ?? providerInstanceId)
         let mode = interactionMode ?? self.interactionMode
         do {
-            let routing = routingConfigurationForSend(threadId: selectedThreadId)
+            let routing = routingConfigurationForSend(threadId: targetThreadId)
             if routing.mode == .auto {
                 _ = try orchestrationRuntime.route(
                     configuration: routing,
@@ -8671,8 +8719,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 )
             }
             let queued = try queuedMessageRepo.enqueueConsumingDraft(
-                threadId: selectedThreadId,
-                providerInstanceId: providerInstanceId,
+                threadId: targetThreadId,
+                providerInstanceId: draftProviderInstanceId,
                 text: text,
                 attachments: attached,
                 interactionMode: mode,
@@ -8684,27 +8732,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // queued id = future run id on drain (AgentRunID(queued.id)), so the
             // bubble appears once via startProviderRun when the turn actually starts.
             // Still clear the prior Active plan: the user has superseded it.
-            timeline.clearActivePlan()
-            suppressStaleActivePlanUpdates = true
-            resetTimelineUpdateTick()
-            prompt = ""
-            attachments = []
-            clearComposerDraftMemory(threadId: selectedThreadId, providerInstanceId: providerInstanceId)
+            if isSelected {
+                timeline.clearActivePlan()
+                suppressStaleActivePlanUpdates = true
+                resetTimelineUpdateTick()
+                prompt = ""
+                attachments = []
+            }
+            clearComposerDraftMemory(threadId: targetThreadId, providerInstanceId: draftProviderInstanceId)
             // UX-MAC_AGENT-019: a run is in flight, so this message was queued,
             // not sent now — confirm that explicitly near the composer.
-            reloadQueuedMessages()
+            if isSelected { reloadQueuedMessages() }
             setQueueStatus(
                 "Queued — will run after the current turn.",
-                threadId: selectedThreadId
+                threadId: targetThreadId
             )
             // QA-MAC_AGENT-010: track queue depth for diagnostics.
-            agentSurfaceLog.info("queue.enqueued thread=\(selectedThreadId.value.uuidString, privacy: .public) depth=\(self.queuedMessages.count, privacy: .public)")
+            agentSurfaceLog.info("queue.enqueued thread=\(targetThreadId.value.uuidString, privacy: .public) depth=\(self.queuedMessages.count, privacy: .public)")
             onQueuedMessageEvent?(AgentQueueEventKinds.queued, queued)
             return true
         } catch {
             setQueueStatus(
                 "Queue send failed: \(error)",
-                threadId: selectedThreadId
+                threadId: targetThreadId
             )
             return false
         }
@@ -8773,6 +8823,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         /// Provider still receives `text`; omit for non-send callers.
         recoveryDisplayText: String? = nil
     ) async -> AgentRunID? {
+        botVMClaimRefusal = nil
+        // A surface whose sends are intercepted (a bot group room) never runs a provider.
+        guard !refuseInterceptedRun() else { return nil }
         guard !refuseLegacyProviderThreadRun() else { return nil }
         guard !refuseUnavailableBotThreadRun() else { return nil }
         let baseRouting = queuedRoutingSnapshot?.configuration
@@ -8876,9 +8929,55 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let actorThread = threads.first(where: { $0.id == tid })
         let runActor: RunActor = actorThread?.actorLockedAt != nil ? (actorThread?.actor ?? .none) : selectedRunActor
         var botPrompt: String?
-        if embedding == nil, case .bot(let botID) = runActor,
+        // Agent App tabs gate every bot send; the embedded desk gates the threads
+        // locked to the bot's VM (its legacy unlocked threads keep running on the Mac).
+        if case .bot(let botID) = runActor,
+           embedding == nil || (actorThread?.actorLockedAt != nil && actorThread?.executionTarget == .vm),
            await botVMGateBlocksRun(botID: botID, thread: actorThread) {
             return nil
+        }
+        // A paired device can lock the thread while the VM preflight above
+        // awaits, or before this composer mirrored it: the stored lock wins and
+        // this send stops with its prompt kept. Two columns; no full row read.
+        if actorThread?.actorLockedAt == nil,
+           (try? threadRepo.lockedBotActor(of: tid)) != nil,
+           let stored = try? threadRepo.get(id: tid) {
+            mirrorActorLock(stored.actor, lockedAt: stored.actorLockedAt, target: stored.executionTarget, thread: tid)
+            statusMessage = ThreadActorAlreadyLockedError().errorDescription ?? ""
+            return nil
+        }
+        // D12: claim the bot's VM before any visible start effect. When another
+        // thread's run holds it, refuse so `send()` queues behind that run.
+        var vmClaimRunId: AgentRunID?
+        var vmRunStarted = false
+        defer {
+            if let vmClaimRunId, !vmRunStarted { botReleaseVM?(vmClaimRunId) }
+        }
+        if case .bot(let botID) = runActor, let claimVM = botClaimVM {
+            let vmTarget = actorThread?.actorLockedAt != nil
+                ? actorThread?.executionTarget
+                : (embedding == nil ? botExecutionTargetProvider(botID) : nil)
+            if vmTarget == .vm {
+                // The title the thread gets from this message (B5 below).
+                let title = actorThread.map {
+                    AgentThreadTitle.isPlaceholder($0.title) && !((try? messageRepo.hasAny(threadId: tid)) ?? false)
+                        ? Self.deriveTitle(from: text)
+                        : $0.title
+                } ?? Self.deriveTitle(from: text)
+                let entry = BotVMRunRegistry.Entry(
+                    threadID: tid,
+                    runID: runId,
+                    title: title,
+                    workspace: actorThread?.worktreePath ?? embedding?.executionCwd ?? cwd
+                )
+                if let holder = claimVM(botID, entry) {
+                    let notice = "bot ocupado em \(holder.title)"
+                    botVMClaimRefusal = (botID, notice, tid)
+                    if selectedThreadId == tid { statusMessage = notice }
+                    return nil
+                }
+                vmClaimRunId = runId
+            }
         }
         if embedding == nil, case .bot(let botID) = runActor {
             do {
@@ -8891,7 +8990,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         // Everything from here to the tracked run below is preparation the user
-        // cannot see (Graphify roots, prompt compression, provider spawn). Show
+        // cannot see (preflight, provider spawn). Show
         // "Loading…" for it; the defer covers the failure exits so a thread can
         // never be left permanently loading.
         // Run identity is fixed at acceptance so Stop can cancel this generation.
@@ -8902,7 +9001,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             liveBackgroundShellCount = 0
             liveBackgroundTasks = []
         }
-        // S5: accept surface-owned preparation generation before any Graphify work.
+        // S5: accept surface-owned preparation generation before any preparation work.
         // Capture the generation for this startProviderRun invocation — never
         // re-read state.generation after await (Stop + resend can advance it).
         let surfaceAccept = ProviderPreparationStateMachine.apply(
@@ -8915,8 +9014,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         surfacePreparationStates[tid] = surfaceAccept.state
         let acceptedGeneration = surfaceAccept.state.generation
         beginSurfacePreparation(threadId: tid, generation: acceptedGeneration, runId: runId)
-        // Coordinator-owned reservation before Graphify await so RPC/iOS Stop
-        // during root resolution can cancel this run (not only local UI Stop).
+        // Coordinator-owned reservation before preparation so RPC/iOS Stop
+        // during it can cancel this run (not only local UI Stop).
         coordinator.reserveProviderStart(threadId: tid, runId: runId)
         defer {
             endSurfacePreparationIfOwned(threadId: tid, generation: acceptedGeneration)
@@ -8962,30 +9061,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let providerThreadId = persistedThread?.provider == runProvider
             ? persistedThread?.providerThreadId
             : nil
-        // Graphify: same host path as AppCommandRouter RPC send — resolve roots,
-        // kick refresh, inject RC_GRAPHIFY_* into provider environment (fail-open).
-        // Root resolution shells out to `git rev-parse` twice per candidate
-        // directory (blocking Process + waitUntilExit). When the workspace root
-        // is not itself a repo, classify() walks the tree to depth 2, so that is
-        // hundreds of spawns — measured at 2.7s of blocked MainActor on send,
-        // i.e. the macOS spinner before the run started. Resolve off the main
-        // actor; send still awaits it, so the run environment is unchanged.
-        let graphifyBase = launchConfig?.environment ?? [:]
-        let graphifyThreadId = tid.value
-        let graphifyCwd = cwd
-        let graphifyWorktreePath = persistedThread?.worktreePath
-        let graphifyAttachmentPaths = attached.map(\.path)
-        let graphifyEnv = await Task.detached(priority: .userInitiated) {
-            GraphifyWorkspaceService.shared.applyToAgentEnvironment(
-                base: graphifyBase,
-                threadId: graphifyThreadId,
-                threadCwd: graphifyCwd,
-                worktreePath: graphifyWorktreePath,
-                workspaceCwd: graphifyCwd,
-                attachmentPaths: graphifyAttachmentPaths
-            ).environment
-        }.value
-        // S5: claim spawn immediately after Graphify, *before* durable pending /
+        // Leftover Graphify keys in a launch config never reach a provider.
+        let launchEnvironment = (launchConfig?.environment ?? [:])
+            .filter { !$0.key.hasPrefix("RC_GRAPHIFY_") }
+        // S5: claim spawn immediately after preparation, *before* durable pending /
         // currentRunId/runThreads. A late cancelled generation must not leave
         // surface ownership that poisons trackedRunId for a newer send.
         let surfacePrep = surfacePreparationStates[tid] ?? ProviderPreparationState()
@@ -9017,7 +9096,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return nil
         }
         surfacePreparationStates[tid] = claimedState
-        // Reservation already published before Graphify; keep it until startRun
+        // Reservation already published before preparation; keep it until startRun
         // registers or failure paths release it.
         let mentionedBots = BotMentionParser.mentionedBots(
             in: text,
@@ -9025,7 +9104,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             excluding: nil
         )
         let providerEnvironment = BotPeerDelegation.environment(
-            addingTurnContextTo: graphifyEnv,
+            addingTurnContextTo: launchEnvironment,
             mentionedBots: mentionedBots
         )
         var transformFailure: Error?
@@ -9037,7 +9116,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 transformFailure = error
             }
         }
-        var req = AgentRunRequest(
+        let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
             provider: runProvider,
@@ -9061,7 +9140,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             environment: providerEnvironment,
             runAsUser: threadRunAsUser
         )
-        req.tokenSaverCompressesPrompt = runPrompt != text
         do {
             // Status + unread + updated_at only. A leftover 26-column + routing
             // `get` then `upsert` hitchs every composer send and rewrites routing
@@ -9082,6 +9160,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 hasUnread: paintedUnread,
                 at: pendingAt
             )
+            onThreadChromeWritten?(AgentThreadChromeWrite(
+                threadID: tid, status: .pending, hasUnread: paintedUnread, updatedAt: pendingAt
+            ))
             if let index = threads.firstIndex(where: { $0.id == tid }) {
                 threads[index].status = .pending
                 threads[index].updatedAt = pendingAt
@@ -9109,12 +9190,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 if let current = try? threadRepo.status(of: tid), current == .pending {
                     let failedAt = Date()
                     let paintedUnread = threads.first(where: { $0.id == tid })?.hasUnread ?? false
-                    try? threadRepo.updateStatus(
+                    if (try? threadRepo.updateStatus(
                         id: tid,
                         status: .failed,
                         hasUnread: paintedUnread,
                         at: failedAt
-                    )
+                    )) != nil {
+                        onThreadChromeWritten?(AgentThreadChromeWrite(
+                            threadID: tid, status: .failed, hasUnread: paintedUnread, updatedAt: failedAt
+                        ))
+                    }
                     if let index = threads.firstIndex(where: { $0.id == tid }) {
                         threads[index].status = .failed
                         threads[index].updatedAt = failedAt
@@ -9134,7 +9219,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         do {
             if let transformFailure {
-                try? threadRepo.updateStatus(id: tid, status: .failed, hasUnread: false, at: Date())
+                let failedAt = Date()
+                if (try? threadRepo.updateStatus(id: tid, status: .failed, hasUnread: false, at: failedAt)) != nil {
+                    onThreadChromeWritten?(AgentThreadChromeWrite(
+                        threadID: tid, status: .failed, hasUnread: false, updatedAt: failedAt
+                    ))
+                }
                 throw transformFailure
             }
             let runId = try await coordinator.startRun(
@@ -9142,6 +9232,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 routingSnapshot: routingSnapshot,
                 recordUserMessage: !resumeInterrupted
             )
+            vmRunStarted = true
             coordinator.releaseProviderStartReservation(threadId: tid, runId: runId)
             // Surface claim consumed the permit; coordinator owns the live run.
             // Terminalize *this* generation so a second send can accept again.
@@ -9226,6 +9317,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             runThreads[runId] = nil
             if preparingRunGeneration[tid] == acceptedGeneration
                 || preparingRunGeneration[tid] == nil {
+                if !wasCancelled {
+                    failSurfacePendingStampIfUnowned(threadId: tid, runId: runId)
+                }
                 await MainActor.run {
                     if self.selectedThreadId == tid {
                         if wasCancelled {
@@ -9249,6 +9343,33 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             coordinator.releaseProviderStartReservation(threadId: tid, runId: runId)
             return nil
+        }
+    }
+
+    /// `coordinator.startRun` can refuse before it writes its own run row
+    /// (admission, fork recovery, a busy thread, a missing binary...). The
+    /// surface's `pending` stamp then has no owner that will ever finish it,
+    /// so stamp `failed` here, unless another start or live run owns the row.
+    private func failSurfacePendingStampIfUnowned(threadId tid: AgentThreadID, runId: AgentRunID) {
+        guard (try? threadRepo.status(of: tid)) == .pending,
+              (try? coordinator.runStatus(runId)) == nil,
+              coordinator.activeRunId(threadId: tid) == nil,
+              !coordinator.hasPendingProviderStart(threadId: tid),
+              !coordinator.hasProviderSession(threadId: tid) else { return }
+        let failedAt = Date()
+        let paintedUnread = threads.first(where: { $0.id == tid })?.hasUnread ?? false
+        guard (try? threadRepo.updateStatus(
+            id: tid,
+            status: .failed,
+            hasUnread: paintedUnread,
+            at: failedAt
+        )) != nil else { return }
+        onThreadChromeWritten?(AgentThreadChromeWrite(
+            threadID: tid, status: .failed, hasUnread: paintedUnread, updatedAt: failedAt
+        ))
+        if let index = threads.firstIndex(where: { $0.id == tid }) {
+            threads[index].status = .failed
+            threads[index].updatedAt = failedAt
         }
     }
 
@@ -9324,6 +9445,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// UX-MAC_AGENT-009: re-send the last prompt after a recoverable error
     /// without forcing the user to retype it.
     public func retryLastPrompt() async {
+        if refuseInterceptedRun() { return }
         if refuseLegacyProviderThreadRun() { return }
         let failedMessage = selectedThreadId.flatMap { threadId in
             try? messageRepo.listRecent(
@@ -9386,7 +9508,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         message: String,
         recoverable: Bool
     ) -> AgentErrorRecoveryAction? {
+        _ = provider // classification deliberately shares one vocabulary across providers.
+        return errorRecoveryAction(message: message, recoverable: recoverable)
+    }
+
+    nonisolated public static func errorRecoveryAction(
+        message: String,
+        recoverable: Bool
+    ) -> AgentErrorRecoveryAction? {
         let normalized = message.lowercased()
+        // `[fresh-session:…]`: the adapter already retired the session whose
+        // history the model rejected, so Retry re-runs the prompt in a new
+        // provider session on the SAME thread (a bot desk keeps its linked
+        // conversation). Start fresh would orphan the desk link instead.
+        if AgentErrorRecoveryAction.hasFreshSessionMarker(message) {
+            return .retry
+        }
         let resumeInvalidMarkers = [
             "session not found", "session/load", "invalid session", "invalid resume",
             "resume cursor", "could not be resumed", "failed to resume", "resume invalid"
@@ -9410,7 +9547,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if retryMarkers.contains(where: normalized.contains) || recoverable {
             return .retry
         }
-        _ = provider // classification deliberately shares one vocabulary across providers.
         return nil
     }
 
@@ -9496,7 +9632,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return tid.flatMap { trackedRunId(for: $0) }
         }()
         // S5: cancel generation-owned surface preparation even when no run is
-        // tracked yet (Graphify / preflight window before coordinator.startRun).
+        // tracked yet (preflight window before coordinator.startRun).
         if let tid, preparingRunThreads.contains(tid) {
             cancelSurfacePreparation(threadId: tid)
             // Only fall through to stopRun when the coordinator already owns a
@@ -9805,6 +9941,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             streamFlushNeeded = true
             return
         }
+        if hiddenTimelineArchive != nil {
+            // Reducing onto the empty stand-in would replace the archived tree.
+            // Events stay batched; the off-main restore flushes them.
+            coldRestoreFlushPending = true
+            restoreColdTimelineOffMain()
+            return
+        }
         let quantum = streamEventBatch.drainQuantum()
         let pending = quantum.entries
         if pending.isEmpty {
@@ -10030,32 +10173,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return (false, ops)
     }
 
-    /// True when republishing Token Saver optimization state can change anything.
-    ///
-    /// `refreshTokenSaverOptimizationStateFromTimeline` derives the published set purely
-    /// from the timeline's compatibility-backed translation maps and REPLACES it, so with every
-    /// side empty it is a no-op — the common case on every streamed token. The
-    /// published-side terms keep the clearing path alive after the aggregate
-    /// budget walk evicts translations.
-    static func shouldPublishTokenSaverOptimizationState(
-        timeline: AssistantTimelineState,
-        publishedIds: Set<AgentMessageID>,
-        publishedOriginals: [AgentMessageID: String]
-    ) -> Bool {
-        !timeline.tokenSaverTranslationsByMessageId.isEmpty
-            || !timeline.tokenSaverTranslationsByItemId.isEmpty
-            || !publishedIds.isEmpty
-            || !publishedOriginals.isEmpty
-    }
-
     #if DEBUG
     /// Test-only override for the aggregate hot-text ceiling.
     ///
-    /// The walk-before-publish order in `commitStreamQuantum` is load-bearing:
-    /// the walk evicts Token Saver translations and the publish guard must observe the
-    /// post-eviction timeline. Proving that composition needs a real eviction,
-    /// and allocating 96 MiB in a unit test is not viable — so tests lower the
-    /// ceiling instead. DEBUG-only so release builds keep the constant.
+    /// Proving the aggregate budget walk needs a real eviction, and allocating
+    /// 96 MiB in a unit test is not viable — so tests lower the ceiling
+    /// instead. DEBUG-only so release builds keep the constant.
     var aggregateHotTextByteLimitForTesting: Int?
     #endif
 
@@ -10120,15 +10243,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 lastHiddenTimelinePublishAt = now
                 hiddenTimelinePublishCountForTesting += 1
             }
-            // Order is load-bearing: the walk above can evict translations, and
-            // the guard below must see the post-eviction hidden buffer.
-            if Self.shouldPublishTokenSaverOptimizationState(
-                timeline: hidden,
-                publishedIds: tokenSaverOptimizedMessageIds,
-                publishedOriginals: tokenSaverOriginalTextsByMessageId
-            ) {
-                refreshTokenSaverOptimizationStateFromTimeline(hidden)
-            }
             scheduleTimelineUpdateTick()
             if reduced.hasProposedPlan {
                 scheduleFullAccessPlanAutoImplementIfNeeded()
@@ -10139,18 +10253,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if budget.runsWalk {
             timeline.enforceAggregateHotTextBudget(byteLimit: activeAggregateHotTextByteLimit)
             aggregateHotTextBudgetGeneration &+= 1
-        }
-        // Order is load-bearing: the walk above can evict translations, and the
-        // guard below must see the post-eviction timeline so the published cache
-        // clears with them. Pinned by
-        // test_commitStreamQuantum_coalescesWalkThenPublishesEvictedWireState,
-        // which fails if these two blocks are swapped.
-        if Self.shouldPublishTokenSaverOptimizationState(
-            timeline: timeline,
-            publishedIds: tokenSaverOptimizedMessageIds,
-            publishedOriginals: tokenSaverOriginalTextsByMessageId
-        ) {
-            refreshTokenSaverOptimizationStateFromTimeline()
         }
         scheduleTimelineUpdateTick()
         if reduced.hasProposedPlan {
@@ -10215,7 +10317,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if case let .error(_, recoverable) = event {
             lastErrorRecoverable = recoverable
         }
-        refreshTokenSaverOptimizationStateFromTimeline()
         scheduleTimelineUpdateTick()
         if case .proposedPlan = event {
             scheduleFullAccessPlanAutoImplementIfNeeded()
@@ -10266,7 +10367,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline = rebuilt
         rehydrateDurableActiveState(threadId: threadId)
         lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: events)
-        refreshTokenSaverOptimizationStateFromTimeline()
         scheduleTimelineUpdateTick()
     }
 
@@ -10507,6 +10607,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // queued successor is waiting (prior plan must not reappear mid-queue).
                 self.clearActivePlanFollowUpSuppressionIfSafe()
                 self.isStopping = false  // UX-MAC_AGENT-STOP: run finished; clear stopping flag
+                // A run that kept a hidden tab hot may compact once it is idle.
+                if self.surfaceVisibility == .hidden { self.scheduleHiddenReclaim() }
             }
             // Coalesce N same-workspace Agent App tabs into one reload per surface.
             self.scheduleReloadThreads()
@@ -10526,11 +10628,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.onRunStateChange?()
             if let embedding = self.embedding, finishedTid == embedding.pinnedThreadId {
                 embedding.onRunFinished?(runId, finishedTid, status, finalMessage)
-            }
-            // Final replies show cumulative thread savings; refresh after each turn
-            // so the footer tracks ledger growth during the conversation.
-            if finishedTid == self.selectedThreadId {
-                self.reloadTokenSaverThreadSavings()
             }
         }
     }
@@ -10702,141 +10799,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             updated.remove(oldest)
         }
         return updated
-    }
-
-    func refreshTokenSaverOptimizationStateFromTimeline(
-        _ sourceTimeline: AssistantTimelineState? = nil,
-        preservingExisting: Bool = false
-    ) {
-        let sourceTimeline = sourceTimeline ?? timeline
-        var ids: Set<AgentMessageID> = []
-        var originals: [AgentMessageID: String] = [:]
-        var requests: [AgentMessageID: String] = [:]
-        var itemTranslations = sourceTimeline.tokenSaverTranslationsByItemId
-        for (rawId, translation) in sourceTimeline.tokenSaverTranslationsByMessageId {
-            guard let uuid = UUID(uuidString: rawId) else { continue }
-            let id = AgentMessageID(uuid)
-            ids.insert(id)
-            originals[id] = translation.originalText
-            if let request = translation.wireRequestText, !request.isEmpty {
-                requests[id] = request
-            }
-        }
-        if !requests.isEmpty {
-            let visibleUserMessageIds = Set(
-                messages.lazy.filter { $0.role == .user }.map(\.id)
-            )
-            for (id, request) in requests
-                where visibleUserMessageIds.contains(id) && RCWireProtocol.isWire(request) {
-                persistedUserRCW1RequestsByMessageId[id] = request
-            }
-        }
-        ids.formUnion(persistedUserRCW1RequestsByMessageId.keys)
-        requests.merge(persistedUserRCW1RequestsByMessageId) { _, durable in durable }
-        ids.formUnion(persistedAssistantRCW1ResponsesByMessageId.keys)
-        for (messageId, response) in persistedAssistantRCW1ResponsesByMessageId {
-            originals[messageId] = response.wireResponseText
-        }
-        ids.formUnion(liveTokenSaverOptimizedMessageIds)
-        // Two callers, two semantics:
-        // - Live-stream batches REPLACE, so translations evicted by the hot-text
-        //   budget also leave the published cache (memory bound).
-        // - selectThread replays PRESERVE, because live badges
-        //   (onWireTranslatedMessageId) are not in the persisted replay and a
-        //   same-thread reselect or the deferred provider-snapshot re-replay must
-        //   not wipe them (F6 keeps clearing as the explicit job of the
-        //   thread-SWITCH branch in selectThread).
-        if preservingExisting {
-            ids.formUnion(tokenSaverOptimizedMessageIds)
-            originals.merge(tokenSaverOriginalTextsByMessageId) { fromTimeline, _ in fromTimeline }
-            requests.merge(tokenSaverWireRequestTextsByMessageId) { fromTimeline, _ in fromTimeline }
-            itemTranslations.merge(tokenSaverTranslationsByItemId) { fromTimeline, _ in fromTimeline }
-        }
-        if ids != tokenSaverOptimizedMessageIds {
-            tokenSaverOptimizedMessageIds = ids
-        }
-        if originals != tokenSaverOriginalTextsByMessageId {
-            tokenSaverOriginalTextsByMessageId = originals
-        }
-        if requests != tokenSaverWireRequestTextsByMessageId {
-            tokenSaverWireRequestTextsByMessageId = requests
-        }
-        let translationsChanged = itemTranslations != tokenSaverTranslationsByItemId
-        if translationsChanged {
-            tokenSaverTranslationsByItemId = itemTranslations
-        }
-        // AA-24: this ran two full `for turn { for item }` passes over the whole
-        // thread on every stream quantum (~100 Hz). The index only changes when
-        // the translations change or the timeline's item set changes (items are
-        // append-only per turn; a merged duplicate keeps its id).
-        let structure = Self.timelineItemStructureKey(sourceTimeline.turns)
-        if translationsChanged
-            || structure != tokenSaverTranslationsIndexedStructureKey
-            || (itemTranslations.isEmpty) != tokenSaverTranslationsByTimelineItemKey.isEmpty {
-            tokenSaverTranslationsIndexedStructureKey = structure
-            tokenSaverTranslationsByTimelineItemKey = itemTranslations.isEmpty
-                ? [:]
-                : Self.safelyIndexedTokenSaverItemTranslations(
-                    itemTranslations,
-                    turns: sourceTimeline.turns
-                )
-        }
-    }
-
-    /// Cheap structural fingerprint of the timeline's item set: turn count,
-    /// total item count and the newest turn/item ids. Items are append-only
-    /// within a turn, so any addition changes the total or the tail id.
-    nonisolated static func timelineItemStructureKey(_ turns: [AssistantTurnSnapshot]) -> String {
-        var total = 0
-        for turn in turns { total += turn.items.count }
-        let last = turns.last
-        return "\(turns.count)|\(total)|\(last?.turnId ?? "-")|\(last?.items.last?.id ?? "-")"
-    }
-
-    private func mergePersistedUserRCW1Requests(
-        _ persisted: [AgentMessageID: String]
-    ) {
-        guard !persisted.isEmpty else { return }
-        persistedUserRCW1RequestsByMessageId.merge(persisted) { _, durable in durable }
-        tokenSaverOptimizedMessageIds.formUnion(persisted.keys)
-        tokenSaverWireRequestTextsByMessageId.merge(persisted) { _, durable in durable }
-    }
-
-    private func mergePersistedAssistantRCW1Responses(
-        _ persisted: [AgentMessageID: AgentMessageRCW1Response]
-    ) {
-        guard !persisted.isEmpty else { return }
-        for (messageId, response) in persisted {
-            persistedAssistantRCW1ResponsesByMessageId[messageId] = response
-            tokenSaverOptimizedMessageIds.insert(messageId)
-            tokenSaverOriginalTextsByMessageId[messageId] = response.wireResponseText
-            let turnId = response.turnId
-            guard !ambiguousPersistedAssistantTurnIds.contains(turnId) else {
-                continue
-            }
-            if let existing = persistedAssistantMessageIdByTurnId[turnId],
-               existing != messageId {
-                persistedAssistantMessageIdByTurnId.removeValue(forKey: turnId)
-                ambiguousPersistedAssistantTurnIds.insert(turnId)
-            } else {
-                persistedAssistantMessageIdByTurnId[turnId] = messageId
-            }
-        }
-    }
-
-    func mergePersistedTokenSaverDisplayModes(
-        _ modes: [AgentMessageID: AgentMessageTokenSaverDisplayMode]
-    ) {
-        // A page read may predate a click whose write is still in flight. Keep
-        // the newer optimistic choice for that exact message until it settles.
-        for (messageId, mode) in modes
-            where tokenSaverDisplayModeWriteGeneration[messageId] == nil {
-            if mode == .rcw1 {
-                tokenSaverOriginalDisplayMessageIds.insert(messageId)
-            } else {
-                tokenSaverOriginalDisplayMessageIds.remove(messageId)
-            }
-        }
     }
 }
 
@@ -11570,8 +11532,8 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
     // MARK: Tool card presentation (collapsed density)
 
-    // PERF: tool L1/L2 paint recompiled these on every row (label, summary, distill
-    // chip, shell family). Compile once; same patterns as the prior String.range /
+    // PERF: tool L1/L2 paint recompiled these on every row (label, summary,
+    // shell family). Compile once; same patterns as the prior String.range /
     // replacingOccurrences(options: .regularExpression) forms.
     private static let bgPrefixRegex = try! NSRegularExpression(pattern: #"^\[bg\]\s*"#)
     private static let backgroundPrefixRegex = try! NSRegularExpression(
@@ -11581,12 +11543,6 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
     private static let trailingCallIdRegex = try! NSRegularExpression(
         pattern: #"(?::\s*|\s+)call-[0-9a-f-]{8,}\s*$"#,
         options: [.caseInsensitive]
-    )
-    private static let distillPipeWithStderrRegex = try! NSRegularExpression(
-        pattern: #"\s*2>&1\s*\|\s*distill\b[\s\S]*$"#
-    )
-    private static let distillPipeSuffixRegex = try! NSRegularExpression(
-        pattern: #"\s*\|\s*distill\b[\s\S]*$"#
     )
     private static let usersHomePathRegex = try! NSRegularExpression(pattern: #"/Users/[^/\s]+/"#)
     // PERF: tool L1 paint trims trailing colon/whitespace on every streaming row.
@@ -11606,15 +11562,6 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
             range: range,
             withTemplate: template
         )
-    }
-
-    private static func firstMatchRange(_ regex: NSRegularExpression, in text: String) -> Range<String.Index>? {
-        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let match = regex.firstMatch(in: text, options: [], range: nsRange),
-              let range = Range(match.range, in: text) else {
-            return nil
-        }
-        return range
     }
 
     /// L1 title for tool rows: short tool name without full shell pipelines or call UUIDs.
@@ -11745,12 +11692,6 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return showsLiveToolElapsed(for: item)
     }
 
-    /// Token Saver ran for this tool (display chip only). The host verifier owns
-    /// this truth; provider-visible receipt/handle text is never authoritative.
-    static func toolCommandWasDistilled(for item: AssistantItem) -> Bool {
-        item.distillApplied == true
-    }
-
     /// Compact elapsed label (`12s`, `1m 53s`) from start→end timestamps.
     static func durationLabel(fromMs: Int64, toMs: Int64) -> String? {
         let elapsedMs = max(0, Int(toMs - fromMs))
@@ -11790,7 +11731,6 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         if item.state == .streaming, isTaskWaitTool(for: item) {
             parts.append("waiting for task output")
         }
-        if toolCommandWasDistilled(for: item) { parts.append("distilled") }
         if let summary = toolCommandSummary(for: item), !summary.isEmpty {
             parts.append(summary)
         }
@@ -11834,15 +11774,6 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         var s = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return s }
         var elided = 0
-        // Drop Token Saver distill pipes (presentation only; body stays intact).
-        // Count as elided so Token Saver proof is not silently erased (chip + "+N more").
-        if let range = firstMatchRange(distillPipeWithStderrRegex, in: s) {
-            s = String(s[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            elided += 1
-        } else if let range = firstMatchRange(distillPipeSuffixRegex, in: s) {
-            s = String(s[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-            elided += 1
-        }
         // Drop only closed-allowlist leading segments (`cd`, `export`, `source`, `.`, `set -e…`).
         let segments = s
             .components(separatedBy: "&&")
@@ -12150,6 +12081,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         case .failed: return "Failed"
         case .cancelled: return "Cancelled"
         case .completed:
+            if isFreshSessionNotice(item) { return "New session" }
             switch item.type {
             case .fileChange: return "Changed"
             case .webSearch: return "Searched"
@@ -12166,6 +12098,7 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         if item.state == .streaming { return "circle.dotted" }
         if item.state == .failed { return "xmark.octagon" }
         if item.state == .cancelled { return "nosign" }
+        if isFreshSessionNotice(item) { return "arrow.triangle.2.circlepath" }
         switch item.type {
         case .fileChange: return "doc.badge.gearshape"
         case .mcpToolCall, .dynamicToolCall, .collabToolCall: return "puzzlepiece.extension"
@@ -12176,6 +12109,13 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         case .error: return "exclamationmark.triangle"
         default: return "terminal"
         }
+    }
+
+    /// Distill's replacement-session notice rides as `.contextCompaction` for
+    /// decoder compatibility (`DistillACPAdapter.emitFreshSessionNotice`); it
+    /// is a new provider session, not a compaction.
+    static func isFreshSessionNotice(_ item: AssistantItem) -> Bool {
+        item.type == .contextCompaction && item.id.hasPrefix("distill-fresh-session-")
     }
 
 }
@@ -12458,99 +12398,6 @@ public struct AgentAppView: View {
         let offersRetry: Bool
     }
 
-    public enum TokenSaverDisplayMode: String, CaseIterable, Identifiable {
-        case translated
-        case original
-
-        public var id: String { rawValue }
-        public var label: String { self == .translated ? "Human" : "RCW1" }
-    }
-
-    struct TokenSaverDisplaySelections: Equatable {
-        static let maximumPersistedItemCount = 512
-        static let maximumRawBytes = 256 * 1_024
-        static let maximumItemKeyBytes = 1_024
-
-        // PERF: JSONEncoder is ICU-heavy. Share one for display selections behind lock.
-        private static let codecLock = NSLock()
-        private static let encoder: JSONEncoder = JSONEncoder()
-        private static let decoder: JSONDecoder = JSONDecoder()
-
-        private(set) var originalItemKeys: [String]
-
-        init(rawValue: String = "[]") {
-            guard rawValue.utf8.count <= Self.maximumRawBytes,
-                  let data = rawValue.data(using: .utf8) else {
-                originalItemKeys = []
-                return
-            }
-            Self.codecLock.lock()
-            let decoded = try? Self.decoder.decode([String].self, from: data)
-            Self.codecLock.unlock()
-            guard let decoded else {
-                originalItemKeys = []
-                return
-            }
-            var seen: Set<String> = []
-            let newestUnique = decoded.reversed().filter { key in
-                !key.isEmpty
-                    && key.utf8.count <= Self.maximumItemKeyBytes
-                    && seen.insert(key).inserted
-            }.reversed()
-            originalItemKeys = Array(newestUnique.suffix(Self.maximumPersistedItemCount))
-            trimToEncodedByteLimit()
-        }
-
-        func mode(for itemKey: String) -> TokenSaverDisplayMode {
-            originalItemKeys.contains(itemKey) ? .original : .translated
-        }
-
-        mutating func set(_ mode: TokenSaverDisplayMode, for itemKey: String) {
-            originalItemKeys.removeAll { $0 == itemKey }
-            if mode == .original,
-               !itemKey.isEmpty,
-               itemKey.utf8.count <= Self.maximumItemKeyBytes {
-                originalItemKeys.append(itemKey)
-                if originalItemKeys.count > Self.maximumPersistedItemCount {
-                    originalItemKeys.removeFirst(originalItemKeys.count - Self.maximumPersistedItemCount)
-                }
-                trimToEncodedByteLimit()
-            }
-        }
-
-        mutating func removeSelections(threadIds: Set<String>) {
-            guard !threadIds.isEmpty else { return }
-            let prefixes = threadIds.map(AgentAppView.tokenSaverThreadDisplayKeyPrefix)
-            originalItemKeys.removeAll { key in
-                prefixes.contains { prefix in key.hasPrefix(prefix) }
-            }
-        }
-
-        var rawValue: String {
-            Self.codecLock.lock()
-            let data = try? Self.encoder.encode(originalItemKeys)
-            Self.codecLock.unlock()
-            guard let data, let value = String(data: data, encoding: .utf8) else {
-                return "[]"
-            }
-            return value
-        }
-
-        private mutating func trimToEncodedByteLimit() {
-            while !originalItemKeys.isEmpty {
-                Self.codecLock.lock()
-                let data = try? Self.encoder.encode(originalItemKeys)
-                Self.codecLock.unlock()
-                guard let data else {
-                    originalItemKeys = []
-                    return
-                }
-                if data.count <= Self.maximumRawBytes { return }
-                originalItemKeys.removeFirst()
-            }
-        }
-    }
-
     private static let threadRailWidthRange: ClosedRange<CGFloat> = 320...360
     private static let threadRailIdealWidth: CGFloat = 320
     private static let conversationMinimumWidth: CGFloat = 560
@@ -12613,17 +12460,9 @@ public struct AgentAppView: View {
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
     @State private var pendingSessionApproval: PendingSessionApprovalConfirmation?
     @State private var expandedRequestPreviews: Set<String> = []
-    /// Durable per-item overrides. Missing identifiers stay in the readable
-    /// Human mode, so changing one translated row never changes another.
-    @AppStorage("agent.tokenSaver.displayModesByItem.v2") private var tokenSaverDisplaySelectionsRaw = "[]"
-    @State private var tokenSaverTransientOriginalDisplayKeys: Set<String> = []
     @State private var declineReasonDrafts: [String: String] = [:]
     // P1: thread delete confirmation — ids staged here until user confirms.
     @State private var pendingDeleteThreadIds: Set<AgentThreadID> = []
-    /// Preferences follow the same ten-second lifecycle as thread deletion.
-    /// IDs stay staged while Undo can restore them; only a finalized deletion
-    /// removes their per-row modes from UserDefaults.
-    @State private var tokenSaverPendingCleanupThreadIds: Set<AgentThreadID> = []
     /// Clear All confirmation for the thread rail.
     @State private var pendingClearAllThreads = false
     // UX-XPLAT-007: checkpoint revert confirmation — staged turn count until user confirms.
@@ -12642,129 +12481,16 @@ public struct AgentAppView: View {
     @State private var customModelDraft = ""
     /// Composer Simple (attach/model/send) vs Power (full toolbar).
     /// Always full chrome — no Simple/Power collapse toggle on macOS.
-    private var composerChromeMode: AgentComposerChromeMode { .power }
+    /// A surface whose sends are intercepted (a bot group room) only relays:
+    /// its provider, model and run chrome would change nothing.
+    private var composerChromeMode: AgentComposerChromeMode {
+        vm.embedding?.sendInterceptor != nil ? .relay : .power
+    }
 
     public init(vm: AgentAppViewModel, accountPanel: AnyView? = nil, layout: AgentAppViewLayout = .standard) {
         self.vm = vm
         self.accountPanel = accountPanel
         self.layout = layout
-    }
-
-    /// Pure seam for the low-chrome Token Saver disclosure.
-    public static func showsTokenSaverOptimizedBadge(wasTokenSaverOptimized: Bool) -> Bool {
-        wasTokenSaverOptimized
-    }
-
-    public static func tokenSaverBadgeLabel(hasOriginalText _: Bool) -> String {
-        "Token Saver optimized"
-    }
-
-    public static func tokenSaverCopyText(
-        translated: String,
-        original: String,
-        request: String?,
-        mode: TokenSaverDisplayMode
-    ) -> String {
-        guard mode == .original,
-              hasInspectableAssistantRCW1Response(original) else { return translated }
-        let requestSection = request.map { "What was sent\n\($0)\n\n" } ?? ""
-        return requestSection + "Original provider response\n" + original
-    }
-
-    /// A request or plain fallback is never a raw assistant response. Accept a
-    /// strict RCW1 response envelope only; malformed/preamble-only text fails safe.
-    public static func hasInspectableAssistantRCW1Response(_ original: String) -> Bool {
-        let trimmed = original.trimmingCharacters(in: .whitespacesAndNewlines)
-        let payload = RCWireProtocol.transportEnvelope(in: trimmed)?.payload ?? trimmed
-        guard let frames = try? RCWireProtocol.parse(payload), !frames.isEmpty else {
-            return false
-        }
-        return frames.allSatisfy { $0.direction == .response }
-    }
-
-    public static func hasInspectableUserRCW1Request(_ request: String?) -> Bool {
-        guard let request else { return false }
-        let trimmed = request.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let frames = try? RCWireProtocol.parse(trimmed), !frames.isEmpty else {
-            return false
-        }
-        return frames.allSatisfy { $0.direction == .request }
-    }
-
-    /// Composition gate shared by every picker call site. Assistant/progress
-    /// rows require actual RCW1 A bytes; only the durable user row may disclose
-    /// an outbound RCW1 Q before any provider response exists.
-    public static func showsTokenSaverDisplayControl(
-        original: String,
-        request: String?,
-        allowsRequestOnlyRCW1: Bool
-    ) -> Bool {
-        hasInspectableAssistantRCW1Response(original)
-            || (allowsRequestOnlyRCW1 && hasInspectableUserRCW1Request(request))
-    }
-
-    public static func showsTokenSaverOriginalContent(
-        original: String,
-        mode: TokenSaverDisplayMode
-    ) -> Bool {
-        mode == .original && hasInspectableAssistantRCW1Response(original)
-    }
-
-    public static func tokenSaverUserMessageDisplayText(
-        human: String,
-        wireRequest: String?,
-        mode: TokenSaverDisplayMode
-    ) -> String {
-        let body: String
-        if mode == .original, let wireRequest, RCWireProtocol.isWire(wireRequest) {
-            body = wireRequest
-        } else {
-            body = human
-        }
-        return AgentChatTranscriptChrome.preservingImageMarkers(in: body, source: human)
-    }
-
-    public static func tokenSaverMessageDisplayKey(_ messageId: String) -> String {
-        "message|\(messageId.utf8.count)|\(messageId)"
-    }
-
-    static func tokenSaverTimelineItemDisplayKey(turnId: String, itemId: String) -> String {
-        AgentAppViewModel.tokenSaverTimelineItemTranslationKey(
-            turnId: turnId,
-            itemId: itemId
-        )
-    }
-
-    /// Only the newest assistant item in a turn may borrow the durable final
-    /// message identity. Earlier commentary keeps its own composite timeline key.
-    static func durableFinalMessageId(
-        for item: AssistantItem,
-        in turn: AssistantTurnSnapshot,
-        candidate: AgentMessageID?
-    ) -> AgentMessageID? {
-        guard let candidate,
-              item.type == .assistantMessage,
-              item.turnId == turn.turnId,
-              turn.items.last(where: { candidateItem in
-                  candidateItem.type == .assistantMessage
-                      && !candidateItem.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-              })?.id == item.id else {
-            return nil
-        }
-        return candidate
-    }
-
-    static func tokenSaverTurnDisplayKey(_ turnId: String) -> String {
-        "turn|\(turnId.utf8.count)|\(turnId)"
-    }
-
-    static func tokenSaverThreadDisplayKeyPrefix(_ threadId: String) -> String {
-        "thread|\(threadId.utf8.count)|\(threadId)|"
-    }
-
-    static func tokenSaverThreadScopedDisplayKey(threadId: String, itemKey: String) -> String {
-        tokenSaverThreadDisplayKeyPrefix(threadId)
-            + "row|\(itemKey.utf8.count)|\(itemKey)"
     }
 
     static let fullAccessScopeDescription =
@@ -15058,12 +14784,12 @@ public struct AgentAppView: View {
         // leave generation still so hide-set is not rehashed at token rate.
         let generation = vm.transcriptState.contentGeneration
         if hiddenPersistedAssistantMessageCache.generation == generation {
-            return visibleHiddenPersistedIDs(hiddenPersistedAssistantMessageCache.ids)
+            return hiddenPersistedAssistantMessageCache.ids
         }
         let key = cachedHiddenPersistedAssistantContentKey()
         if hiddenPersistedAssistantMessageCache.key == key {
             hiddenPersistedAssistantMessageCache.generation = generation
-            return visibleHiddenPersistedIDs(hiddenPersistedAssistantMessageCache.ids)
+            return hiddenPersistedAssistantMessageCache.ids
         }
         let ids = Self.hiddenPersistedAssistantMessageIDs(
             messages: vm.messages,
@@ -15072,40 +14798,7 @@ public struct AgentAppView: View {
         hiddenPersistedAssistantMessageCache.generation = generation
         hiddenPersistedAssistantMessageCache.key = key
         hiddenPersistedAssistantMessageCache.ids = ids
-        return visibleHiddenPersistedIDs(ids)
-    }
-
-    /// Token Saver may need the durable row when the timeline cannot paint
-    /// that answer. If the live turn already owns the same text, keep it hidden.
-    nonisolated static func keepsTokenSaverPersistedHidden(
-        requiresDurableRow: Bool,
-        messageText: String,
-        turns: [AssistantTurnSnapshot]
-    ) -> Bool {
-        guard requiresDurableRow else { return true }
-        return AgentChatLiveTurnChrome.messageDuplicatesTurn(messageText, turns: turns)
-    }
-
-    private func visibleHiddenPersistedIDs(_ ids: Set<AgentMessageID>) -> Set<AgentMessageID> {
-        // AA-22: this runs once per assistant row per body pass, even on a
-        // cache hit. The message lookup was an eager `messages.first(where:)`
-        // per hidden id although `keepsTokenSaverPersistedHidden` returns early
-        // for every id that does not need its durable row (the common case).
-        // Resolve the text only when needed, through one index built on demand.
-        var contentById: [AgentMessageID: String]?
-        return Set(ids.filter { id in
-            guard vm.tokenSaverRequiresDurableMessageRow(for: id) else { return true }
-            if contentById == nil {
-                var index = [AgentMessageID: String](minimumCapacity: vm.messages.count)
-                for message in vm.messages { index[message.id] = message.content }
-                contentById = index
-            }
-            return Self.keepsTokenSaverPersistedHidden(
-                requiresDurableRow: true,
-                messageText: contentById?[id] ?? "",
-                turns: vm.timeline.turns
-            )
-        })
+        return ids
     }
 
     public var body: some View {
@@ -15159,9 +14852,6 @@ public struct AgentAppView: View {
             // Registration happens in AgentAppViewModel.init.
         }
         .onDeleteCommand { deleteSelectedThreads() }
-        .onChange(of: vm.pendingThreadDeletionUndo?.attachmentGCPinID) { _ in
-            reconcileTokenSaverDisplaySelectionCleanup()
-        }
         // P1: confirm before deleting threads — irreversible and instant otherwise.
         .confirmationDialog(
             pendingDeleteThreadIds.count == 1
@@ -15854,10 +15544,6 @@ public struct AgentAppView: View {
                                 )
                                 .id(row.id)
                             }
-                            // B-1: one chip for the whole thread, after the newest
-                            // finished answer — never N copies under every final.
-                            tokenSaverThreadFooter()
-                                .id("agent.tokenSaver.footer")
                             if Self.shouldRenderActivePlan(
                                 plan: vm.activePlan,
                                 status: vm.status,
@@ -16112,7 +15798,7 @@ public struct AgentAppView: View {
                                         .foregroundColor(DS.Palette.textSecondary)
                                         .lineLimit(1)
                                         .truncationMode(.tail)
-                                    if let detail = activity.detail, !detail.isEmpty {
+                                    if let detail = Self.workLogDetailText(activity), !detail.isEmpty {
                                         Text(detail)
                                             .font(DS.Font.monoSmall)
                                             .foregroundColor(DS.Palette.textTertiary)
@@ -16131,6 +15817,13 @@ public struct AgentAppView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityIdentifier("agent.workLog")
         }
+    }
+
+    /// The work log shows an error's text without the fresh-session machine
+    /// marker, like the composer error row; the stored detail stays raw.
+    nonisolated static func workLogDetailText(_ activity: AssistantWorkActivity) -> String? {
+        guard activity.kind == .error, let detail = activity.detail else { return activity.detail }
+        return AgentErrorRecoveryAction.displayText(detail)
     }
 
     private func workActivityIcon(_ activity: AssistantWorkActivity) -> String {
@@ -16619,181 +16312,6 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Pure seam: thread footer figure — full bare-user credible stack
-    /// (measured tool-output + dialect + graphify + multi-turn cache impact + Auto).
-    ///
-    /// - `measuredDelivered`: permanent ledger total for the thread (floor).
-    /// - Prefers real provider usage when present; else thread-local floor from
-    ///   assistant text + measured pipes so dialect legs can run.
-    /// - Cache amortization uses turn count and/or `cacheReadInputTokens`.
-    /// - Auto routing contributes an orchestration token-equivalent.
-    ///
-    /// Invariant: result ≥ measuredDelivered when enabled (estimates never lower
-    /// the thread figure).
-    public nonisolated static func tokenSaverThreadFooterDisplayTokens(
-        measuredDelivered: Int,
-        assistantChars: Int,
-        tokenSaverEnabled: Bool,
-        graphifyActive: Bool,
-        graphifySignalCount: Int = 0,
-        turnCount: Int = 0,
-        cacheReadInputTokens: Int = 0,
-        providerRawTokens: Int = 0,
-        providerBilledTokenUnits: Double? = nil,
-        autoRoutingActive: Bool = false
-    ) -> Int {
-        let measured = max(0, measuredDelivered)
-        guard tokenSaverEnabled else { return measured }
-        let assistantTokens = max(0, assistantChars) / Int(TokenSaverBareUserEstimator.charsPerToken)
-        // Prefer live provider usage when the thread has it; otherwise a local floor
-        // so dialect can still credit without inventing global day aggregates.
-        let rawFloor = max(measured, assistantTokens, providerRawTokens, 1)
-        let billedFloor: Double = {
-            if let billed = providerBilledTokenUnits, billed > 0 { return billed }
-            return Double(rawFloor)
-        }()
-        let breakdown = TokenSaverBareUserEstimator.estimate(
-            measuredToolOutputSaved: measured,
-            tokenSaverEnabled: true,
-            graphifyActive: graphifyActive,
-            orchestrationActive: autoRoutingActive,
-            observation: TokenSaverBareUserObservation(
-                windowProviderTokens: rawFloor,
-                windowProviderBilledTokenUnits: billedFloor,
-                assistantChars: max(0, assistantChars),
-                graphifySignalCount: graphifyActive ? max(0, graphifySignalCount) : 0,
-                turnCount: max(0, turnCount),
-                cacheReadInputTokens: max(0, cacheReadInputTokens)
-            )
-        )
-        return max(measured, breakdown.totalCredible)
-    }
-
-    /// Pure seam: green savings, yellow on-zero problem, red off. Nil while a
-    /// thread-switch snapshot has not landed — that pending 0 is not off or a
-    /// problem chip.
-    public nonisolated static func tokenSaverThreadFooterPresentation(
-        enabled: Bool,
-        measuredTokens: Int = 0,
-        snapshotReady: Bool = true
-    ) -> AgentChatTokenSaverThreadFooterPresentation? {
-        guard snapshotReady else { return nil }
-        if !enabled { return .deactivated }
-        if measuredTokens <= 0 { return .problem }
-        return .savings
-    }
-
-    /// Pure seam: footer copy.
-    ///
-    /// - Off (and ready): always 0 tokens saved because Token Saver is deactivated.
-    /// - On with `measuredTokens == 0`: still present, yellow problem copy, not red.
-    /// - On with measured > 0: estimates may only **raise** the proven ledger figure.
-    /// - Product copy: full stack in plain language (tool output, shorter answers,
-    ///   multi-turn cache). Optional Auto note for cheaper models.
-    public nonisolated static func tokenSaverThreadFooterText(
-        displayTokens: Int,
-        measuredTokens: Int,
-        enabled: Bool,
-        autoRoutingActive: Bool = false,
-        snapshotReady: Bool = true
-    ) -> String? {
-        guard let presentation = tokenSaverThreadFooterPresentation(
-            enabled: enabled,
-            measuredTokens: measuredTokens,
-            snapshotReady: snapshotReady
-        ) else { return nil }
-        switch presentation {
-        case .deactivated:
-            return "Token Saver: 0 tokens saved because Token Saver is deactivated"
-        case .problem:
-            // "went wrong" was a lie for the common case: a thread whose turns
-            // produced no compressible tool output (MCP-only / chat-only work)
-            // legitimately measures 0. Stay factual; the yellow chip already
-            // flags that no savings landed.
-            return "Token Saver: 0 tokens saved in this thread so far"
-        case .savings:
-            let amount = formatTokenCountForFooter(displayTokens)
-            let base = "Token Saver: \(amount) tokens saved (tool output, shorter answers, multi-turn cache)"
-            if autoRoutingActive {
-                return base + " · Auto picked cheaper models at the same quality"
-            }
-            return base
-        }
-    }
-
-    /// Backward-compatible alias used by older tests — measured-only copy path.
-    nonisolated static func tokenSaverThreadFooterText(
-        savedTokens: Int,
-        enabled: Bool
-    ) -> String? {
-        tokenSaverThreadFooterText(
-            displayTokens: savedTokens,
-            measuredTokens: savedTokens,
-            enabled: enabled,
-            autoRoutingActive: false
-        )
-    }
-
-    nonisolated static func formatTokenCountForFooter(_ value: Int) -> String {
-        let n = max(0, value)
-        if n >= 1_000_000 {
-            let whole = Double(n) / 1_000_000.0
-            if n % 1_000_000 == 0 { return String(format: "%.0fM", whole) }
-            return String(format: whole >= 10 ? "%.0fM" : "%.1fM", whole)
-        }
-        if n >= 1_000 {
-            let whole = Double(n) / 1_000.0
-            // Exact thousands → "100K"; otherwise keep one decimal ("12.5K").
-            if n % 1_000 == 0 {
-                return String(format: "%.0fK", whole)
-            }
-            return String(format: "%.1fK", whole)
-        }
-        return "\(n)"
-    }
-
-    /// True only after the selected thread has finished a turn *and* the
-    /// shipped footer copy is non-nil. Live runs keep the working strip instead.
-    /// Empty threads with no finished turn stay chip-less.
-    public nonisolated static func shouldShowTokenSaverThreadFooter(
-        runIsLive: Bool,
-        footerText: String?,
-        hasFinishedTurn: Bool = true
-    ) -> Bool {
-        !runIsLive && hasFinishedTurn && footerText != nil
-    }
-
-    /// Shared Token Saver chip once under the newest finished answer (not every turn).
-    @ViewBuilder
-    private func tokenSaverThreadFooter() -> some View {
-        // Auto routing is the product name for model-auto orchestration on a thread.
-        let autoRouting = vm.routingMode == .auto
-        let text = Self.tokenSaverThreadFooterText(
-            displayTokens: vm.tokenSaverThreadSavedTokens,
-            measuredTokens: vm.tokenSaverThreadMeasuredTokens,
-            enabled: vm.tokenSaverFooterEnabled,
-            autoRoutingActive: autoRouting,
-            snapshotReady: vm.tokenSaverFooterSnapshotReady
-        )
-        let presentation = Self.tokenSaverThreadFooterPresentation(
-            enabled: vm.tokenSaverFooterEnabled,
-            measuredTokens: vm.tokenSaverThreadMeasuredTokens,
-            snapshotReady: vm.tokenSaverFooterSnapshotReady
-        )
-        let hasFinishedTurn = vm.messages.contains(where: { $0.role == .assistant })
-        if Self.shouldShowTokenSaverThreadFooter(
-            runIsLive: vm.selectedThreadRunIsStartingOrRunning,
-            footerText: text,
-            hasFinishedTurn: hasFinishedTurn
-        ), let text, let presentation {
-            AgentChatTokenSaverThreadFooter(
-                text: text,
-                autoRouting: autoRouting,
-                presentation: presentation
-            )
-        }
-    }
-
     private func runningHiddenTranscriptRow(
         _ count: Int,
         revealedCount: Int,
@@ -16927,7 +16445,7 @@ public struct AgentAppView: View {
                     .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
                     .frame(width: 14, height: 14, alignment: .center)
                 AgentSelectablePlainText(
-                    text: err,
+                    text: AgentErrorRecoveryAction.displayText(err),
                     fontSize: 11,
                     monospaced: true,
                     textColor: recoverable ? DS.NS.warning : DS.NS.danger,
@@ -17075,15 +16593,7 @@ public struct AgentAppView: View {
             if Self.isInternalPeerHopUserMessage(msg) {
                 EmptyView()
             } else {
-            let wireRequest = vm.tokenSaverWireRequestText(for: msg.id)
-            let hasWireTranslation = vm.tokenSaverOptimizedMessageIds.contains(msg.id)
-                && wireRequest.map(RCWireProtocol.isWire) == true
-            let displayIdentifier = Self.tokenSaverMessageDisplayKey(msg.id.value.uuidString)
-            let displayText = Self.tokenSaverUserMessageDisplayText(
-                human: Self.userMessageDisplayText(msg.content),
-                wireRequest: wireRequest,
-                mode: tokenSaverDisplayMode(for: displayIdentifier, messageId: msg.id)
-            )
+            let displayText = Self.userMessageDisplayText(msg.content)
             let mentioned = Self.messagedPeer(
                 in: displayText,
                 bots: mentionableBots
@@ -17107,20 +16617,7 @@ public struct AgentAppView: View {
                             accessibilityIdentifier: "agent.peer.mentioned"
                         )
                     )
-                },
-                belowBubble: {
-                    guard hasWireTranslation, let wireRequest else { return nil }
-                    return AnyView(
-                        tokenSaverDisplayControl(
-                            identifierSuffix: displayIdentifier,
-                            messageId: msg.id,
-                            original: wireRequest,
-                            request: wireRequest,
-                            allowsRequestOnlyRCW1: true,
-                            alignment: .trailing
-                        )
-                    )
-                }()
+                }
             )
             }
         case .assistant:
@@ -17144,9 +16641,6 @@ public struct AgentAppView: View {
                         )
                     )
                 } else if let parsed = BotPeerTranscript.parse(msg.content) {
-                    let showBadge = Self.showsTokenSaverOptimizedBadge(
-                        wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
-                    )
                     let bots = mentionableBots
                     AgentChatAssistantReply(
                         text: parsed.body,
@@ -17154,11 +16648,6 @@ public struct AgentAppView: View {
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
-                                if showBadge {
-                                    AgentChatTokenSaverOptimizedBadge(
-                                        messageId: msg.id.value.uuidString
-                                    )
-                                }
                                 AgentChatPeerIdentityHeader(
                                     name: parsed.name,
                                     handle: parsed.handle,
@@ -17176,50 +16665,11 @@ public struct AgentAppView: View {
                         )
                     )
                 } else {
-                    let showBadge = Self.showsTokenSaverOptimizedBadge(
-                        wasTokenSaverOptimized: vm.tokenSaverOptimizedMessageIds.contains(msg.id)
+                    AgentChatAssistantReply(
+                        text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
+                        roleIdentifier: "agent.role.assistant",
+                        copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)"
                     )
-                    let displayKey = Self.tokenSaverMessageDisplayKey(msg.id.value.uuidString)
-                    if showBadge, let original = vm.tokenSaverOriginalText(for: msg.id) {
-                        let request = vm.tokenSaverWireRequestText(for: msg.id)
-                        AgentChatAssistantReply(
-                            text: Self.tokenSaverCopyText(
-                                translated: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
-                                original: original,
-                                request: request,
-                                mode: tokenSaverDisplayMode(for: displayKey, messageId: msg.id)
-                            ),
-                            roleIdentifier: "agent.role.assistant",
-                            copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
-                            content: AnyView(
-                                tokenSaverContent(
-                                    translated: msg.content,
-                                    original: original,
-                                    request: request,
-                                    identifierSuffix: displayKey,
-                                    displayKey: displayKey,
-                                    messageId: msg.id,
-                                    retryMessageId: msg.id
-                                )
-                            )
-                        )
-                    } else {
-                        AgentChatAssistantReply(
-                            text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
-                            roleIdentifier: "agent.role.assistant",
-                            copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
-                            content: showBadge
-                                ? AnyView(
-                                    VStack(alignment: .leading, spacing: DS.Space.xs) {
-                                        AgentChatTokenSaverOptimizedBadge(
-                                            messageId: msg.id.value.uuidString
-                                        )
-                                        assistantProse(msg.content)
-                                    }
-                                )
-                                : nil
-                        )
-                    }
                 }
             }
         case .system:
@@ -17229,158 +16679,6 @@ public struct AgentAppView: View {
                 textColor: DS.NS.textTertiary
             )
                 .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private func tokenSaverDisplaySelectionKey(for itemKey: String) -> String {
-        let threadID = vm.selectedThreadId?.value.uuidString ?? "no-thread"
-        return Self.tokenSaverThreadScopedDisplayKey(threadId: threadID, itemKey: itemKey)
-    }
-
-    private func tokenSaverDisplayMode(
-        for itemKey: String,
-        messageId: AgentMessageID? = nil
-    ) -> TokenSaverDisplayMode {
-        if let messageId {
-            return vm.tokenSaverDisplaysOriginal(for: messageId) ? .original : .translated
-        }
-        let selectionKey = tokenSaverDisplaySelectionKey(for: itemKey)
-        if tokenSaverTransientOriginalDisplayKeys.contains(selectionKey) {
-            return .original
-        }
-        let selections = TokenSaverDisplaySelections(rawValue: tokenSaverDisplaySelectionsRaw)
-        return selections.mode(for: selectionKey)
-    }
-
-    private func tokenSaverDisplayModeBinding(
-        for itemKey: String,
-        messageId: AgentMessageID? = nil
-    ) -> Binding<TokenSaverDisplayMode> {
-        Binding(
-            get: { tokenSaverDisplayMode(for: itemKey, messageId: messageId) },
-            set: { mode in
-                if let messageId {
-                    vm.setTokenSaverDisplaysOriginal(mode == .original, for: messageId)
-                    return
-                }
-                let selectionKey = tokenSaverDisplaySelectionKey(for: itemKey)
-                if mode == .original {
-                    tokenSaverTransientOriginalDisplayKeys.insert(selectionKey)
-                } else {
-                    tokenSaverTransientOriginalDisplayKeys.remove(selectionKey)
-                }
-                var selections = TokenSaverDisplaySelections(rawValue: tokenSaverDisplaySelectionsRaw)
-                selections.set(mode, for: selectionKey)
-                tokenSaverDisplaySelectionsRaw = selections.rawValue
-            }
-        )
-    }
-
-    @ViewBuilder
-    private func tokenSaverDisplayControl(
-        identifierSuffix: String,
-        displayKey: String? = nil,
-        messageId: AgentMessageID? = nil,
-        original: String,
-        request: String?,
-        allowsRequestOnlyRCW1: Bool = false,
-        alignment: Alignment = .leading
-    ) -> some View {
-        let itemKey = displayKey ?? identifierSuffix
-        let selectionKey = tokenSaverDisplaySelectionKey(for: itemKey)
-        let showsControl = Self.showsTokenSaverDisplayControl(
-            original: original,
-            request: request,
-            allowsRequestOnlyRCW1: allowsRequestOnlyRCW1
-        )
-        let displayMode = tokenSaverDisplayMode(for: itemKey, messageId: messageId)
-        if showsControl {
-            AgentChatTokenSaverDisplayControl(
-                mode: Binding(
-                    get: {
-                        displayMode == .original
-                            ? AgentChatTokenSaverDisplayMode.rcw1
-                            : AgentChatTokenSaverDisplayMode.human
-                    },
-                    set: { mode in
-                        tokenSaverDisplayModeBinding(for: itemKey, messageId: messageId)
-                            .wrappedValue = mode == .rcw1 ? .original : .translated
-                    }
-                ),
-                identifier: selectionKey,
-                alignment: alignment
-            )
-        }
-    }
-
-    @ViewBuilder
-    private func tokenSaverOriginalContent(
-        original: String,
-        request: String?,
-        identifierSuffix: String,
-        retryMessageId: AgentMessageID? = nil
-    ) -> some View {
-        AgentChatTokenSaverOriginalContent(
-            original: original,
-            request: request,
-            identifierSuffix: identifierSuffix,
-            onCopy: { copyToPasteboard($0) },
-            retryLabel: retryMessageId.map { id in
-                vm.tokenSaverTranslationRetryMessageIds.contains(id)
-                    ? "Retrying translation…"
-                    : "Retry translation"
-            },
-            retryDisabled: retryMessageId.map {
-                vm.tokenSaverTranslationRetryMessageIds.contains($0)
-            } ?? false,
-            retryIdentifier: retryMessageId.map {
-                "agent.assistantMessage.retryTokenSaverTranslation.\($0.value.uuidString)"
-            },
-            onRetry: retryMessageId.map { id in
-                { vm.retryTokenSaverTranslation(for: id) }
-            }
-        )
-    }
-
-    @ViewBuilder
-    private func tokenSaverContent(
-        translated: String,
-        original: String,
-        request: String?,
-        identifierSuffix: String,
-        displayKey: String? = nil,
-        messageId: AgentMessageID? = nil,
-        retryMessageId: AgentMessageID? = nil,
-        cacheMarkdown: Bool = true
-    ) -> some View {
-        let itemKey = displayKey ?? identifierSuffix
-        let selectionKey = tokenSaverDisplaySelectionKey(for: itemKey)
-        let effectiveOriginal = original.isEmpty ? translated : original
-        if Self.showsTokenSaverOriginalContent(
-            original: effectiveOriginal,
-            mode: tokenSaverDisplayMode(for: itemKey, messageId: messageId)
-        ) {
-            tokenSaverOriginalContent(
-                original: effectiveOriginal,
-                request: request,
-                identifierSuffix: selectionKey,
-                retryMessageId: retryMessageId
-            )
-        } else {
-            assistantProse(translated, cacheMarkdown: cacheMarkdown)
-        }
-        if Self.showsTokenSaverDisplayControl(
-            original: effectiveOriginal,
-            request: request,
-            allowsRequestOnlyRCW1: false
-        ) {
-            tokenSaverDisplayControl(
-                identifierSuffix: identifierSuffix,
-                displayKey: itemKey,
-                messageId: messageId,
-                original: effectiveOriginal,
-                request: request
-            )
         }
     }
 
@@ -17445,7 +16743,6 @@ public struct AgentAppView: View {
         hideAssistantOutput: Bool
     ) -> some View {
         let turn = segment.snapshot
-        let durableFinalMessageId = vm.tokenSaverMessageId(forRCW1TurnId: turn.turnId)
         let turnPlans: [AssistantProposedPlan] = segment.isLast
             ? vm.timeline.proposedPlans.filter {
                 $0.turnId == turn.turnId
@@ -17461,7 +16758,7 @@ public struct AgentAppView: View {
             showsWorkHeader: AgentChatLiveTurnChrome.showsWorkHeader(for: segment),
             renderFinal: segment.isLast
                 ? { final in
-                    AnyView(agentTurnFinal(final, turn: turn, durableFinalMessageId: durableFinalMessageId))
+                    AnyView(agentTurnFinal(final, turn: turn))
                 }
                 : nil,
             afterWork: (segment.isLast && !vm.suppressesProposedPlanReview && !turnPlans.isEmpty)
@@ -17518,7 +16815,6 @@ public struct AgentAppView: View {
         // LIVE turn on every body pass, `renderableItems` → assistant-text dedupe
         // against every persisted message (O(items × messages × body length),
         // uncached above 16 KiB). Same plan filter `turnSegmentView` uses.
-        let durableFinalMessageId = vm.tokenSaverMessageId(forRCW1TurnId: turn.turnId)
         let turnPlans: [AssistantProposedPlan] = vm.suppressesProposedPlanReview
             ? []
             : vm.timeline.proposedPlans.filter {
@@ -17530,7 +16826,7 @@ public struct AgentAppView: View {
             live: !turn.finished,
             hideAssistantOutput: hideAssistantOutput,
             renderFinal: { final in
-                AnyView(agentTurnFinal(final, turn: turn, durableFinalMessageId: durableFinalMessageId))
+                AnyView(agentTurnFinal(final, turn: turn))
             },
             afterWork: vm.suppressesProposedPlanReview
                 ? nil
@@ -17546,43 +16842,14 @@ public struct AgentAppView: View {
     @ViewBuilder
     private func agentTurnFinal(
         _ final: String,
-        turn: AssistantTurnSnapshot,
-        durableFinalMessageId: AgentMessageID?
+        turn: AssistantTurnSnapshot
     ) -> some View {
-        if let messageId = durableFinalMessageId,
-           let original = vm.tokenSaverOriginalText(for: messageId) {
-            let displayKey = Self.tokenSaverMessageDisplayKey(messageId.value.uuidString)
-            let request = vm.tokenSaverWireRequestText(for: messageId)
-            AgentChatAssistantReply(
-                text: Self.tokenSaverCopyText(
-                    translated: BackgroundAwaitContinuation.strippingAwaitingMarker(final),
-                    original: original,
-                    request: request,
-                    mode: tokenSaverDisplayMode(for: displayKey, messageId: messageId)
-                ),
-                roleIdentifier: "agent.role.assistant",
-                copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
-                content: AnyView(
-                    tokenSaverContent(
-                        translated: final,
-                        original: original,
-                        request: request,
-                        identifierSuffix: displayKey,
-                        displayKey: displayKey,
-                        messageId: messageId,
-                        retryMessageId: messageId,
-                        cacheMarkdown: turn.finished
-                    )
-                )
-            )
-        } else {
-            AgentChatAssistantReply(
-                text: BackgroundAwaitContinuation.strippingAwaitingMarker(final),
-                roleIdentifier: "agent.role.assistant",
-                copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
-                content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
-            )
-        }
+        AgentChatAssistantReply(
+            text: BackgroundAwaitContinuation.strippingAwaitingMarker(final),
+            roleIdentifier: "agent.role.assistant",
+            copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
+            content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
+        )
     }
 
     @ViewBuilder
@@ -17590,8 +16857,7 @@ public struct AgentAppView: View {
         turn: AssistantTurnSnapshot,
         blocks: [TurnRenderBlock],
         workBlockCount: Int,
-        live: Bool = false,
-        durableFinalMessageId: AgentMessageID? = nil
+        live: Bool = false
     ) -> some View {
         let expanded = isCompletedWorkExpanded(for: turn)
         let reveal = workDisclosureRevealByTurn[turn.turnId] ?? 0
@@ -17653,14 +16919,7 @@ public struct AgentAppView: View {
                     ForEach(slice.rows) { block in
                         switch block {
                         case .item(let item):
-                            itemRow(
-                                item,
-                                durableFinalMessageId: Self.durableFinalMessageId(
-                                    for: item,
-                                    in: turn,
-                                    candidate: durableFinalMessageId
-                                )
-                            )
+                            itemRow(item)
                         case .toolGroup(let id, let items): toolGroupRow(id: id, items: items)
                         }
                     }
@@ -17675,78 +16934,14 @@ public struct AgentAppView: View {
 
 
     @ViewBuilder
-    private func itemRow(
-        _ item: AssistantItem,
-        durableFinalMessageId: AgentMessageID? = nil
-    ) -> some View {
+    private func itemRow(_ item: AssistantItem) -> some View {
         switch item.type {
         case .assistantMessage:
             if Self.shouldRenderAssistantItemBody(item.body, persistedAssistantTexts: persistedAssistantTexts) {
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    if let messageId = durableFinalMessageId,
-                       let original = vm.tokenSaverOriginalText(for: messageId) {
-                        let displayKey = Self.tokenSaverMessageDisplayKey(
-                            messageId.value.uuidString
-                        )
-                        tokenSaverContent(
-                            translated: item.body,
-                            original: original,
-                            request: vm.tokenSaverWireRequestText(for: messageId),
-                            identifierSuffix: displayKey,
-                            displayKey: displayKey,
-                            messageId: messageId,
-                            retryMessageId: messageId,
-                            cacheMarkdown: item.state != .streaming
-                        )
-                    } else if let translation = vm.tokenSaverTranslation(
-                        forTurnId: item.turnId,
-                        itemId: item.id
-                    ) {
-                        let displayKey = Self.tokenSaverTimelineItemDisplayKey(turnId: item.turnId, itemId: item.id)
-                        tokenSaverContent(
-                            translated: item.body,
-                            original: translation.originalText,
-                            request: translation.wireRequestText,
-                            identifierSuffix: displayKey,
-                            displayKey: displayKey,
-                            cacheMarkdown: item.state != .streaming
-                        )
-                    } else {
-                        assistantProse(item.body, cacheMarkdown: item.state != .streaming)
-                    }
-                }
+                assistantProse(item.body, cacheMarkdown: item.state != .streaming)
             }
         case .reasoning:
-            if let translation = vm.tokenSaverTranslation(
-                forTurnId: item.turnId,
-                itemId: item.id
-            ) {
-                let text = reasoningText(item)
-                let displayKey = Self.tokenSaverTimelineItemDisplayKey(turnId: item.turnId, itemId: item.id)
-                let original = translation.originalText.isEmpty ? text : translation.originalText
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    if Self.showsTokenSaverOriginalContent(
-                        original: original,
-                        mode: tokenSaverDisplayMode(for: displayKey)
-                    ) {
-                        tokenSaverOriginalContent(
-                            original: original,
-                            request: translation.wireRequestText,
-                            identifierSuffix: tokenSaverDisplaySelectionKey(for: displayKey)
-                        )
-                    } else {
-                        reasoningRow(item)
-                    }
-                    tokenSaverDisplayControl(
-                        identifierSuffix: displayKey,
-                        displayKey: displayKey,
-                        original: original,
-                        request: translation.wireRequestText
-                    )
-                }
-            } else {
-                reasoningRow(item)
-            }
+            reasoningRow(item)
         case .plan:
             VStack(alignment: .leading, spacing: DS.Space.xs) {
                 Text("PLAN").font(DS.Font.caption2.weight(.semibold)).tracking(0.6)
@@ -17903,7 +17098,6 @@ public struct AgentAppView: View {
             ?? AgentTimelineItemPresentation.toolCommandPreview(for: item)
         let commandSummary = AgentTimelineItemPresentation.toolCommandSummary(for: item)
         let isBackground = AgentTimelineItemPresentation.isBackgroundTool(for: item)
-        let wasDistilled = AgentTimelineItemPresentation.toolCommandWasDistilled(for: item)
         let duration = AgentTimelineItemPresentation.toolDurationLabel(for: item, nowMs: nowMs)
         let output = presentation.detail
         let hasOutput = (output?.isEmpty == false)
@@ -17951,16 +17145,6 @@ public struct AgentAppView: View {
                             .background(DS.Palette.accent.opacity(0.12))
                             .clipShape(Capsule())
                             .accessibilityLabel("Background")
-                    }
-                    if wasDistilled {
-                        Text("Distilled")
-                            .font(DS.Font.caption2.weight(.semibold))
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(DS.Palette.surface)
-                            .clipShape(Capsule())
-                            .accessibilityLabel("Distilled")
                     }
                     Spacer(minLength: 0)
                     // Single status word on L1 (verb). Trailing: elapsed for live waits,
@@ -18590,7 +17774,7 @@ public struct AgentAppView: View {
                 && AgentComposerChromePresentation.shows(.sendStop, mode: composerChromeMode),
             runActive: vm.selectedThreadIsStoppableBusy,
             isStopping: vm.isStopping,
-            attachEnabled: vm.selectedProviderCanRun && !(vm.selectedProviderSnapshot.map {
+            attachEnabled: composerChromeMode != .relay && vm.selectedProviderCanRun && !(vm.selectedProviderSnapshot.map {
                 !$0.effectiveCapabilities.supportsAttachments
             } ?? false),
             onSend: { Task { await vm.send() } },
@@ -18617,7 +17801,9 @@ public struct AgentAppView: View {
             runStatusCaption: vm.selectedThreadIsStoppableBusy
                 ? (vm.selectedThreadIsPreparingRun ? "Preparing" : "Running")
                 : nil,
-            onFileDrop: { vm.insertDroppedFilePaths($0) }
+            onFileDrop: { vm.insertDroppedFilePaths($0) },
+            attachUnavailableReason: composerChromeMode == .relay
+                ? AgentComposerChromePresentation.relayAttachUnavailable : nil
         )
     }
 
@@ -19481,8 +18667,6 @@ public struct AgentAppView: View {
         guard !ids.isEmpty else { return }
         Task {
             guard await vm.deleteThreads(ids) else { return }
-            tokenSaverPendingCleanupThreadIds.formUnion(ids)
-            reconcileTokenSaverDisplaySelectionCleanup()
             selectedThreadIds.subtract(ids)
             if let lastSelectedThreadId, ids.contains(lastSelectedThreadId) {
                 self.lastSelectedThreadId = selectedThreadIds.first
@@ -19498,43 +18682,11 @@ public struct AgentAppView: View {
 
     private func commitClearAllThreads() {
         pendingClearAllThreads = false
-        let clearingThreadIds = Set(vm.threads.map(\.id))
         Task {
             guard await vm.clearAllThreads() else { return }
-            tokenSaverPendingCleanupThreadIds.formUnion(clearingThreadIds)
-            reconcileTokenSaverDisplaySelectionCleanup()
             selectedThreadIds = []
             lastSelectedThreadId = nil
         }
-    }
-
-    private func removeTokenSaverDisplaySelections(for threadIds: Set<AgentThreadID>) {
-        var selections = TokenSaverDisplaySelections(rawValue: tokenSaverDisplaySelectionsRaw)
-        let rawThreadIds = Set(threadIds.map { $0.value.uuidString })
-        selections.removeSelections(threadIds: rawThreadIds)
-        tokenSaverDisplaySelectionsRaw = selections.rawValue
-        let prefixes = rawThreadIds.map(Self.tokenSaverThreadDisplayKeyPrefix)
-        tokenSaverTransientOriginalDisplayKeys = Set(
-            tokenSaverTransientOriginalDisplayKeys.filter { key in
-                !prefixes.contains { prefix in key.hasPrefix(prefix) }
-            }
-        )
-    }
-
-    private func reconcileTokenSaverDisplaySelectionCleanup() {
-        guard !tokenSaverPendingCleanupThreadIds.isEmpty else { return }
-        let undoable = Set(
-            vm.pendingThreadDeletionUndo?.snapshots.map(\.thread.id) ?? []
-        )
-        let present = Set(vm.threads.map(\.id))
-        let finalized = tokenSaverPendingCleanupThreadIds
-            .subtracting(undoable)
-            .subtracting(present)
-        if !finalized.isEmpty {
-            removeTokenSaverDisplaySelections(for: finalized)
-        }
-        tokenSaverPendingCleanupThreadIds.subtract(finalized)
-        tokenSaverPendingCleanupThreadIds.subtract(present)
     }
 
     // MARK: Plan notes sidebar

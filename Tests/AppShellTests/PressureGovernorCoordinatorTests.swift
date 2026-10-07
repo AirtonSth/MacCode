@@ -13,15 +13,13 @@ final class PressureGovernorCoordinatorTests: XCTestCase {
             target: PressureMutationTarget(
                 epoch: 4,
                 surfaceVisible: false,
-                providerSessionActive: false,
-                sidecarRequestGeneration: 1
+                providerSessionActive: false
             )
         )
         let live = PressureMutationTarget(
             epoch: 5,
             surfaceVisible: false,
-            providerSessionActive: false,
-            sidecarRequestGeneration: 1
+            providerSessionActive: false
         )
         let outcome = coord.execute(plan: plan, liveTarget: live)
         XCTAssertTrue(outcome.applied.isEmpty)
@@ -35,8 +33,7 @@ final class PressureGovernorCoordinatorTests: XCTestCase {
         let target = PressureMutationTarget(
             epoch: 1,
             surfaceVisible: true,
-            providerSessionActive: false,
-            sidecarRequestGeneration: 0
+            providerSessionActive: false
         )
         let plan = PressureMutationPlan(
             actions: [.reclaimHiddenRecomputableUI, .deferMaintenancePrune],
@@ -76,7 +73,7 @@ final class PressureGovernorCoordinatorTests: XCTestCase {
             envelope: .unmeasured,
             hostPressure: .warning,
             providerTreePressure: .normal,
-            degradationActions: ["pause Graphify ensure"],
+            degradationActions: ["pause background refresh"],
             unavailableSections: ["hangWatchdog"],
             canExportDiagnostics: true
         )

@@ -6,7 +6,7 @@ import CoreModel
 /// `agent.account.usage.refresh` event payloads.
 ///
 /// WHY: the payload field names are the wire contract between the mac host and
-/// any iOS Token Saver surface. No test pinned them before this file; silent
+/// the iOS account usage rings. No test pinned them before this file; silent
 /// schema drift (e.g. renaming `weekly_used_percent` to `weeklyUsedPercent`)
 /// would produce a broken iOS surface with no mac-side failure. These tests
 /// assert the exact field names and value encoding so any drift is intentional

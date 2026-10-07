@@ -18,6 +18,9 @@ public struct CommandReceiptMetricsSnapshot: Sendable, Equatable {
     public let unknownOutcomesTotal: UInt64
     public let finalizationSuccessesTotal: UInt64
     public let finalizationFailuresTotal: UInt64
+    /// `private.push_token.update` answered before the durable claim because
+    /// the token and host binding were already current.
+    public let pushTokenUnchangedSkipsTotal: UInt64
     public let claimLatency: CommandReceiptLatencySnapshot
     public let finalizationLatency: CommandReceiptLatencySnapshot
 }
@@ -57,6 +60,7 @@ public final class CommandReceiptMetrics: @unchecked Sendable {
         var unknownOutcomesTotal: UInt64 = 0
         var finalizationSuccessesTotal: UInt64 = 0
         var finalizationFailuresTotal: UInt64 = 0
+        var pushTokenUnchangedSkipsTotal: UInt64 = 0
         var claimLatency = Latency()
         var finalizationLatency = Latency()
     }
@@ -99,6 +103,12 @@ public final class CommandReceiptMetrics: @unchecked Sendable {
         lock.unlock()
     }
 
+    public func recordPushTokenUnchangedSkip() {
+        lock.lock()
+        storage.pushTokenUnchangedSkipsTotal += 1
+        lock.unlock()
+    }
+
     public func recordFinalization(success: Bool, latencyMilliseconds: Double) {
         lock.lock()
         defer { lock.unlock() }
@@ -124,6 +134,7 @@ public final class CommandReceiptMetrics: @unchecked Sendable {
             unknownOutcomesTotal: storage.unknownOutcomesTotal,
             finalizationSuccessesTotal: storage.finalizationSuccessesTotal,
             finalizationFailuresTotal: storage.finalizationFailuresTotal,
+            pushTokenUnchangedSkipsTotal: storage.pushTokenUnchangedSkipsTotal,
             claimLatency: storage.claimLatency.snapshot,
             finalizationLatency: storage.finalizationLatency.snapshot
         )

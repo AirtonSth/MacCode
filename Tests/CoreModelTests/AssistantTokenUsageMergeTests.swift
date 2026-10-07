@@ -35,7 +35,7 @@ final class AssistantTokenUsageMergeTests: XCTestCase {
         XCTAssertEqual(usage?.contextTokens, 98_786,
                        "later cumulative event must not erase known contextTokens")
         XCTAssertEqual(usage?.totalTokens, 2_880_573,
-                       "cumulative billing totalTokens must survive for Token Saver")
+                       "cumulative billing totalTokens must survive")
         XCTAssertEqual(usage?.inputTokens, 2_856_330)
         XCTAssertEqual(usage?.outputTokens, 24_243)
         XCTAssertEqual(usage?.uncachedInputTokens, 322)

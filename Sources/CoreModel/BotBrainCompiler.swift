@@ -254,6 +254,12 @@ public enum BotBrainCompiler {
     public static let websiteHonesty =
         "Website: call \(BotStandingInstructions.openBrowserTool). Same path as last website. Not a set_settings write."
 
+    /// `websiteHonesty` as a run inside the bot's Linux guest gets it from the
+    /// host gateway: that run is never served `bot_browser_open` and opens
+    /// sites with the Playwright tools on the guest's Chromium.
+    public static let guestWebsiteHonesty =
+        "Website: open sites with the Playwright tool browser_navigate in this Linux VM. Not a set_settings write."
+
     /// Studio dest title already says User request. Compile already
     /// labels User request. A leftover user_request write on
     /// set_settings used to return an empty success, so first-chat
@@ -279,7 +285,8 @@ public enum BotBrainCompiler {
         liveRunMode: AgentPermissionMode? = nil,
         runProvider: AgentProvider = .codex,
         runModel: String = "",
-        turnDirective: String? = nil
+        turnDirective: String? = nil,
+        runsInGuest: Bool = false
     ) -> ContextAssemblyReceipt {
         let payload = composeRunPrompt(
             bot: bot,
@@ -292,7 +299,8 @@ public enum BotBrainCompiler {
             workspace: workspace,
             browser: browser,
             liveRunMode: liveRunMode,
-            turnDirective: turnDirective
+            turnDirective: turnDirective,
+            runsInGuest: runsInGuest
         )
         return ContextAssemblyReceipt(
             botID: bot.id,
@@ -318,7 +326,8 @@ public enum BotBrainCompiler {
                 workspace: workspace,
                 browser: browser,
                 liveRunMode: liveRunMode,
-                turnDirective: turnDirective
+                turnDirective: turnDirective,
+                runsInGuest: runsInGuest
             ),
             assembledAt: now
         )
@@ -336,7 +345,8 @@ public enum BotBrainCompiler {
         workspace: BotWorkspaceHonesty? = nil,
         browser: BotBrowserTarget? = nil,
         liveRunMode: AgentPermissionMode? = nil,
-        turnDirective: String? = nil
+        turnDirective: String? = nil,
+        runsInGuest: Bool = false
     ) -> String {
         var lines: [String] = []
         if let identity = identityLine(
@@ -355,7 +365,7 @@ public enum BotBrainCompiler {
         // Studio already says Desktop. Compile that name so first-chat
         // "which Desktop?" cannot invent a hop. Isolation honesty lives
         // here, not on Workspace. Leftover VM kinds compile as logical.
-        lines.append("Desktop: \(desktopText(for: revision))")
+        lines.append("Desktop: \(desktopText(for: revision, runsInGuest: runsInGuest))")
         // Studio already says Approval mode. Compile that name so first-chat
         // "what's your Approval mode?" cannot invent a hop. Studio Security
         // already says Approvals. Compile that name so first-chat "Allow
@@ -364,7 +374,7 @@ public enum BotBrainCompiler {
         // title stays Permission.
         lines.append("Approval mode: \(approvalModeText(for: effectiveRunMode(revision: revision, liveRunMode: liveRunMode)))")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
-        lines.append(BotStandingInstructions.admittedToolsText(for: revision.desktopKind))
+        lines.append(BotStandingInstructions.admittedToolsText(for: revision.desktopKind, inGuest: runsInGuest))
         if let browser = browserLine(browser) {
             lines.append(browser)
         }
@@ -459,9 +469,14 @@ public enum BotBrainCompiler {
     /// first-chat "which Desktop?" cannot invent a hop or a VM. Leftover
     /// Dedicated local VM / Managed remote Mac compile as Logical
     /// execution space. Not a self-config write — schema omits it.
-    static func desktopText(for revision: BotRevision) -> String {
+    /// A Docker bot's thread says where its own agent runs (`runsInGuest`).
+    static func desktopText(for revision: BotRevision, runsInGuest: Bool = false) -> String {
         let kind = revision.desktopKind.advertisedOrLogical
-        return "\(kind.displayTitle). \(kind.honestyLabel)"
+        guard kind == .dockerDesktop else { return "\(kind.displayTitle). \(kind.honestyLabel)" }
+        let label = runsInGuest
+            ? BotDesktopKind.dockerDesktopGuestRunHonestyLabel
+            : BotDesktopKind.dockerDesktopMacRunHonestyLabel
+        return "\(kind.displayTitle). \(label)"
     }
 
     /// Tools already persist last website. Compile it labeled so first-chat
@@ -616,7 +631,8 @@ public enum BotBrainCompiler {
         workspace: BotWorkspaceHonesty? = nil,
         browser: BotBrowserTarget? = nil,
         liveRunMode: AgentPermissionMode? = nil,
-        turnDirective: String? = nil
+        turnDirective: String? = nil,
+        runsInGuest: Bool = false
     ) -> [BotContextLayer] {
         var layers: [BotContextLayer] = []
         if let identity = identityLine(
@@ -678,7 +694,7 @@ public enum BotBrainCompiler {
                 id: "desktop-kind",
                 kind: .desktop,
                 title: "Desktop",
-                text: desktopText(for: revision),
+                text: desktopText(for: revision, runsInGuest: runsInGuest),
                 included: true,
                 reason: "Advertised execution space. Leftover VM kinds compile as logical space."
             )
@@ -724,7 +740,7 @@ public enum BotBrainCompiler {
                 id: "tools",
                 kind: .tools,
                 title: "Admitted tools",
-                text: BotStandingInstructions.admittedToolsText(for: revision.desktopKind),
+                text: BotStandingInstructions.admittedToolsText(for: revision.desktopKind, inGuest: runsInGuest),
                 included: true,
                 reason: "Desk-admitted tools. Custom soul must not hide them."
             )

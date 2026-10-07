@@ -39,50 +39,53 @@ final class SettingsVMInvariantTests: XCTestCase {
         let vm = try makeVM()
 
         // --- add ---
-        vm.customModelStore.add("model-A", provider: .claude)
+        vm.customModelStore.add("model-A", provider: .distill)
         vm.reload()
         XCTAssertEqual(
-            vm.customModelsByProvider[.claude],
-            vm.customModelStore.list(provider: .claude),
-            "after add: customModelsByProvider[.claude] must equal the store list"
+            vm.customModelsByProvider[.distill],
+            vm.customModelStore.list(provider: .distill),
+            "after add: customModelsByProvider[.distill] must equal the store list"
         )
 
         // --- update ---
-        vm.setCustomModel(provider: .claude, index: 0, value: "model-A-v2")
+        vm.setCustomModel(provider: .distill, index: 0, value: "model-A-v2")
         XCTAssertEqual(
-            vm.customModelsByProvider[.claude],
-            vm.customModelStore.list(provider: .claude),
-            "after update: customModelsByProvider[.claude] must equal the store list  -  " +
+            vm.customModelsByProvider[.distill],
+            vm.customModelStore.list(provider: .distill),
+            "after update: customModelsByProvider[.distill] must equal the store list  -  " +
             "the fast-path must reload from the store, not keep the old value in cache"
         )
 
         // --- clear (sets value to empty string, causing store to remove the row) ---
-        vm.setCustomModel(provider: .claude, index: 0, value: "")
+        vm.setCustomModel(provider: .distill, index: 0, value: "")
         XCTAssertEqual(
-            vm.customModelsByProvider[.claude] ?? [],
-            vm.customModelStore.list(provider: .claude),
-            "after clear: customModelsByProvider[.claude] must reflect the store (empty)  -  " +
+            vm.customModelsByProvider[.distill] ?? [],
+            vm.customModelStore.list(provider: .distill),
+            "after clear: customModelsByProvider[.distill] must reflect the store (empty)  -  " +
             "a stale cache entry at the cleared index would crash the next keystroke"
         )
 
         // --- remove ---
-        vm.customModelStore.add("model-B", provider: .claude)
+        vm.customModelStore.add("model-B", provider: .distill)
         vm.reload()
-        vm.removeCustomModel(provider: .claude, index: 0)
+        vm.removeCustomModel(provider: .distill, index: 0)
         XCTAssertEqual(
-            vm.customModelsByProvider[.claude] ?? [],
-            vm.customModelStore.list(provider: .claude),
-            "after remove: customModelsByProvider[.claude] must equal the store list"
+            vm.customModelsByProvider[.distill] ?? [],
+            vm.customModelStore.list(provider: .distill),
+            "after remove: customModelsByProvider[.distill] must equal the store list"
         )
     }
 
-    /// WHY: The invariant must hold for every provider, not just .claude.
-    /// A provider-specific bug in the fast path would be masked if only one
-    /// provider were tested.
+    /// WHY: The invariant must hold for every provider Settings edits, not just
+    /// the default one. A provider-specific bug in the fast path would be masked
+    /// if only one provider were tested. Settings only edits selectable providers
+    /// (legacy Codex/Claude/Grok are read-only since Distill-only), so iterate those.
     func test_customModelDivergenceGuard_allProviders() throws {
         let vm = try makeVM()
 
-        for provider in AgentProvider.allCases {
+        XCTAssertFalse(AgentProvider.selectable.isEmpty,
+                       "Settings must expose at least one provider whose custom models it edits")
+        for provider in AgentProvider.selectable {
             vm.customModelStore.add("model-\(provider.rawValue)", provider: provider)
             vm.reload()
             XCTAssertEqual(

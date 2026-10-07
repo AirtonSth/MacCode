@@ -47,7 +47,8 @@ extension AgentAppViewModel {
     }
 
     private func postManualActionStateChanged(_ request: ManualActionRequest) {
-        var info: [String: Any] = [:]
+        // The request lets the host publish agent.manual_action.updated for paired devices.
+        var info: [String: Any] = [BotHostNotificationKey.request: request]
         if let threadID = request.threadID { info[BotHostNotificationKey.threadID] = threadID }
         NotificationCenter.default.post(name: .manualActionStateChanged, object: nil, userInfo: info)
     }
@@ -104,8 +105,7 @@ extension AgentAppViewModel {
         guard let store = manualActionStore, let request = openManualAction else { return }
         do {
             // Stale cards lose here: a terminal or already-taken request is never revived.
-            if try store.take(id: request.id) != nil {
-                botComputerControl.take(request.botID)
+            if try store.take(id: request.id, control: botComputerControl) != nil {
                 postManualActionStateChanged(request)
             }
         } catch {
@@ -138,7 +138,7 @@ extension AgentAppViewModel {
         }
         let resolved: ManualActionRequest
         do {
-            guard let result = try store.resolve(id: open.id, state: state, note: note) else {
+            guard let result = try store.resolve(id: open.id, state: state, note: note, control: botComputerControl) else {
                 refreshManualAction()
                 return
             }
@@ -148,8 +148,6 @@ extension AgentAppViewModel {
             refreshManualAction()
             return
         }
-        botComputerControl.release(resolved.botID)
-        botComputerControl.dismiss(resolved.id, as: state, note: note)
         postManualActionStateChanged(resolved)
         refreshManualAction()
         await sendManualActionFollowUp(followUp(resolved))

@@ -476,6 +476,12 @@ private final class RemoteCodeGhosttyRuntime {
         configureGhosttyEnvironment()
         unsetenv("NO_COLOR")
 
+        // ghostty_init starts Ghostty's embedded Breakpad, which takes over the
+        // crash handlers and turns native crashes into a silent _exit. Give them
+        // back to macOS ReportCrash once Ghostty is up, on every return path.
+        let crashHandlerGuard = GhosttyCrashHandlerGuard.begin()
+        defer { crashHandlerGuard.end() }
+
         let result = ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv)
         guard result == GHOSTTY_SUCCESS else {
             NSLog("RemoteCode Ghostty init failed: %d", result)
@@ -970,6 +976,7 @@ final class GhosttyTerminalView: NSView {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         // Pull the raw C pointer out of the slot now (while self is still valid).
         // removeForClose() zeroes surfaceSlot.surface, so the pointer can only
         // come out of here once -- no double-free is possible.
@@ -1092,7 +1099,13 @@ final class GhosttyTerminalView: NSView {
         let center = NotificationCenter.default
         center.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
         center.removeObserver(self, name: NSWindow.didChangeScreenNotification, object: nil)
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceCenter.removeObserver(self, name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         guard let window else { return }
+        // S-F2: the key-window override depends on the active Space, and a Space
+        // switch does not always post an occlusion change, so re-derive the gate.
+        workspaceCenter.addObserver(self, selector: #selector(windowOcclusionDidChange),
+                                    name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         center.addObserver(self, selector: #selector(windowOcclusionDidChange),
                            name: NSWindow.didChangeOcclusionStateNotification, object: window)
         center.addObserver(self, selector: #selector(windowDidChangeScreen),
@@ -1819,6 +1832,7 @@ final class GhosttyTerminalView: NSView {
 
     private var isRenderable: Bool {
         let onScreen = window?.occlusionState.contains(.visible) ?? false
+        let keyOverride = keyOverrideInputs(windowOnScreen: onScreen)
         return Self.canRender(
             visibleInUI: visibleInUI,
             isHidden: isHiddenOrHasHiddenAncestor,
@@ -1827,13 +1841,39 @@ final class GhosttyTerminalView: NSView {
             windowVisible: window?.isVisible ?? false,
             windowMiniaturized: window?.isMiniaturized ?? false,
             windowOnScreen: onScreen,
-            // Only consult the key-window override (audit #1) when occlusionState says
-            // not-visible — and require a LIVE drawable (awake display), so the
-            // false-negative heal can never render into an asleep display (the AGX
-            // trap the gate exists to prevent). When onScreen is already true the
-            // override is irrelevant, so skip the CGDisplayIsAsleep call entirely.
-            windowIsKey: onScreen ? false : Self.windowHasLiveKeyDrawable(window)
+            windowIsKey: keyOverride.windowIsKey,
+            windowOnActiveSpace: keyOverride.windowOnActiveSpace
         )
+    }
+
+    /// Inputs for `canRender`'s key-window override, probed lazily (see
+    /// `keyOverrideInputs`) because `isRenderable` runs on every output drain.
+    private func keyOverrideInputs(windowOnScreen: Bool) -> (windowIsKey: Bool, windowOnActiveSpace: Bool) {
+        let window = self.window
+        return Self.keyOverrideInputs(
+            windowOnScreen: windowOnScreen,
+            // Require a LIVE drawable (awake display), so the false-negative heal
+            // can never render into an asleep display (the AGX trap the gate exists
+            // to prevent).
+            keyLiveDrawable: { Self.windowHasLiveKeyDrawable(window) },
+            // S-F2: a key window can stay key while its Space is not shown.
+            onActiveSpace: { window?.isOnActiveSpace ?? false }
+        )
+    }
+
+    /// The key-window override (audit #1) only matters when occlusionState says
+    /// not-visible, and the Space check only matters for a key window with a live
+    /// drawable. Each probe runs only when the previous one allows the override, so
+    /// an occlusion-visible window, or a non-key one (every output drain of a
+    /// covered or background window), never pays for `isOnActiveSpace`, which is a
+    /// WindowServer round trip on the main thread.
+    nonisolated static func keyOverrideInputs(
+        windowOnScreen: Bool,
+        keyLiveDrawable: () -> Bool,
+        onActiveSpace: () -> Bool
+    ) -> (windowIsKey: Bool, windowOnActiveSpace: Bool) {
+        guard !windowOnScreen, keyLiveDrawable() else { return (false, false) }
+        return (true, onActiveSpace())
     }
 
     /// A key, visible, non-minimized window normally has a live Metal drawable — EXCEPT
@@ -1842,6 +1882,11 @@ final class GhosttyTerminalView: NSView {
     /// occlusionState-false-negative heal (audit #1) is allowed to trust.
     private static func windowHasLiveKeyDrawable(_ window: NSWindow?) -> Bool {
         guard let window, window.isKeyWindow, window.isVisible, !window.isMiniaturized else { return false }
+        // Defensive: the override is for a window the user is looking at in the
+        // active app. Whether `isKeyWindow` can still read true for an inactive
+        // app's window on every deactivation path is not verified, so this cheap
+        // local check keeps the override from depending on it.
+        guard NSApp.isActive else { return false }
         guard let displayID = window.screen?.displayID, displayID != 0 else { return false }
         return CGDisplayIsAsleep(displayID) == 0
     }
@@ -1862,7 +1907,8 @@ final class GhosttyTerminalView: NSView {
         windowVisible: Bool,
         windowMiniaturized: Bool,
         windowOnScreen: Bool,
-        windowIsKey: Bool
+        windowIsKey: Bool,
+        windowOnActiveSpace: Bool
     ) -> Bool {
         guard visibleInUI, !isHidden, hasNonEmptyBounds, windowPresent else { return false }
         // GPU-safety invariant is unchanged: a minimized or ordered-out (invisible)
@@ -1876,8 +1922,10 @@ final class GhosttyTerminalView: NSView {
         // window is by definition the focused front window of the active app, so it
         // HAS a live on-screen drawable. OR it in so a stale occlusionState can never
         // freeze a window the user is actively looking at. (cmux never gates render
-        // purely on occlusionState for the same reason.)
-        return windowOnScreen || windowIsKey
+        // purely on occlusionState for the same reason.) The override still requires
+        // the active Space (S-F2): a key window on a Space that is not shown has no
+        // on-screen drawable, and rendering into it is the AGX trap again.
+        return windowOnScreen || (windowIsKey && windowOnActiveSpace)
     }
 
     /// Decide whether a surface that was closed (`surfaceClosed == true`) should be
@@ -1975,9 +2023,11 @@ final class GhosttyTerminalView: NSView {
 
     override func keyDown(with event: NSEvent) {
         guard let surface = surfaceForInput() else { return }
-        // Self-heal a stale render gate (audit #1): a keystroke proves the window is
-        // focused and on screen, so re-derive occlusion before the input is handled —
+        // Re-derive a stale render gate (audit #1) before the input is handled —
         // otherwise a latched-off occlusion swallows the echo and typing looks dead.
+        // This re-checks the same gate; it does not force rendering. A key window
+        // can receive keystrokes while its Space is not shown, so a stuck
+        // occlusionState heals here only if `isOnActiveSpace` reads true (S-F2).
         syncOcclusion()
         // Ghostty can ignore surface_key while focus is latched off after park/
         // reattach (firstResponder repair races layout). A keystroke is proof the
@@ -2518,11 +2568,12 @@ final class GhosttyTerminalView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let surface = surfaceForInput() else { return }
-        // Self-heal a stale render gate (audit #1): a scroll proves the window is on
-        // screen, so re-derive occlusion before the refresh below — otherwise a
-        // latched-off occlusion makes ghostty_surface_refresh a no-op and the
-        // viewport never moves (scroll looks dead). (Display-link reassert for #2
-        // stays on the focus/refresh paths — not this high-frequency momentum path.)
+        // Re-derive a stale render gate (audit #1) before the refresh below —
+        // otherwise a latched-off occlusion makes ghostty_surface_refresh a no-op and
+        // the viewport never moves (scroll looks dead). Like keyDown, this re-checks
+        // the same gate, so the key override still needs the active Space (S-F2).
+        // (Display-link reassert for #2 stays on the focus/refresh paths — not this
+        // high-frequency momentum path.)
         syncOcclusion()
         var x = event.scrollingDeltaX
         var y = event.scrollingDeltaY

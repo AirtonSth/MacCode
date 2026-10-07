@@ -8,6 +8,13 @@ public enum BotComputerMCPAdmit: Sendable {
     public static let tomlBeginMarker = "# RemoteCode managed bot computer MCP: begin"
     public static let tomlEndMarker = "# RemoteCode managed bot computer MCP: end"
 
+    /// Provider-side per-call timeout for this server, above the longest host
+    /// wait (rebuild, then exec). Codex otherwise gives up on any MCP tool call
+    /// after 60 s while a bot_computer_exec or rebuild is still running.
+    public static var toolTimeoutSeconds: Int {
+        Int(max(BotComputerGuestSpec.execResultWaitSeconds, BotComputerGuestSpec.rebuildResultWaitSeconds)) + 60
+    }
+
     public static func stdioConfig(command: String) -> [String: Any] {
         ["command": command, "args": [cliArgument]]
     }
@@ -64,6 +71,7 @@ public enum BotComputerMCPAdmit: Sendable {
         [mcp_servers.\(serverName)]
         command = \(escaped)
         args = ["\(cliArgument)"]
+        tool_timeout_sec = \(toolTimeoutSeconds)
         \(tomlEndMarker)
         """
         if let start = existing.range(of: tomlBeginMarker),

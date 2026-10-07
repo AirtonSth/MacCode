@@ -21,6 +21,9 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var execFailuresRemaining = 0
     var execError: Error?
     var lastExec: (name: String, command: [String], user: String?, detach: Bool)?
+    var lastExecAt: Date?
+    /// Stands in for a cold `docker start` + desktop boot during provisioning.
+    var startDelay: TimeInterval = 0
     var networks: [String] = []
     var removedNetworks: [String] = []
     var networkError: Error?
@@ -28,6 +31,17 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var imageLabels: [String: String] = [
         BotComputerGuestSpec.imageTag: BotComputerGuestSpec.recipeRevision
     ]
+    /// `remotecode.recipe.sha256` per tag; the base image starts as built from the bundled recipe.
+    var imageDigests: [String: String] = [
+        BotComputerGuestSpec.imageTag: AppShellResourceBundle.computerGuestRecipeURL()
+            .map { BotComputerGuestSpec.recipeDigest(context: $0) } ?? "",
+    ]
+    /// Ordered start/stop log, e.g. "stop:<name>".
+    var lifecycle: [String] = []
+    /// Runs while `docker build` is in progress.
+    var onBuild: (() -> Void)?
+    /// Answers an exec instead of `png` when it returns non-nil.
+    var execOutput: (([String]) -> Data?)?
 
     func info() throws -> String {
         if infoFails { throw BotComputerGuestError.dockerUnavailable }
@@ -35,8 +49,11 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     }
     func imageExists(tag: String) throws -> Bool { images.contains(tag) }
     func imageLabel(tag: String, key: String) throws -> String {
-        guard key == BotComputerGuestSpec.recipeLabelKey else { return "" }
-        return imageLabels[tag] ?? ""
+        switch key {
+        case BotComputerGuestSpec.recipeLabelKey: return imageLabels[tag] ?? ""
+        case BotComputerGuestSpec.recipeDigestLabelKey: return imageDigests[tag] ?? ""
+        default: return ""
+        }
     }
     func imageID(tag: String) throws -> String {
         guard images.contains(tag) else { throw BotComputerGuestError.dockerUnavailable }
@@ -44,21 +61,30 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     }
     func build(context: URL, tag: String) throws {
         builds.append(context)
+        onBuild?()
         images.insert(tag)
         imageLabels[tag] = BotComputerGuestSpec.recipeRevision
+        imageDigests[tag] = BotComputerGuestSpec.recipeDigest(context: context)
     }
     func create(options: BotComputerContainerCreateOptions) throws -> String {
         created.append(options.name)
         createdOptions.append(options)
-        containers[options.name] = BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152)
+        containers[options.name] = BotComputerContainerInspect(
+            running: false, imageID: "img", hostPort: 49152, labels: options.labels
+        )
         return options.name
     }
     func start(name: String) throws {
+        if startDelay > 0 { Thread.sleep(forTimeInterval: startDelay) }
         started.append(name)
-        containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152)
+        lifecycle.append("start:\(name)")
+        containers[name] = BotComputerContainerInspect(
+            running: true, imageID: "img", hostPort: 49152, labels: containers[name]?.labels ?? [:]
+        )
     }
     func stop(name: String) throws {
         stopped.append(name)
+        lifecycle.append("stop:\(name)")
         if var value = containers[name] {
             value.running = false
             containers[name] = value
@@ -71,11 +97,13 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     func exec(name: String, command: [String], user: String?, detach: Bool, workdir: String?, environment: [String: String]) throws -> Data {
         execCalls += 1
         lastExec = (name, command, user, detach)
+        lastExecAt = Date()
         if execFailuresRemaining > 0 {
             execFailuresRemaining -= 1
             throw BotComputerGuestError.observeFailed
         }
         if let execError { throw execError }
+        if let output = execOutput?(command) { return output }
         return png
     }
     func rename(from: String, to: String) throws {
@@ -507,7 +535,7 @@ final class BotComputerGuestServiceTests: XCTestCase {
     }
 
     func test_proveReadyBuildsBundledRecipeWhenImageMissing() throws {
-        // WHY: Studio must build remotecode/computer:local from the bundled
+        // WHY: Studio must build the base image from the bundled
         // ComputerGuest recipe instead of staying disabled forever.
         let support = makeSupport("rc-guest-build")
         defer { try? FileManager.default.removeItem(at: support) }
@@ -542,7 +570,7 @@ final class BotComputerGuestServiceTests: XCTestCase {
 
     func test_proveReadyRebuildsImageWhenRecipeRevisionIsStale() throws {
         // WHY: viewer admission changes do nothing if Studio keeps an older,
-        // unauthenticated remotecode/computer:local image.
+        // unauthenticated base image.
         let support = makeSupport("rc-guest-stale")
         defer { try? FileManager.default.removeItem(at: support) }
         let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
@@ -870,7 +898,7 @@ final class BotComputerGuestServiceTests: XCTestCase {
     func test_liveProveReady_emitsPNGMagicAndLoopback() throws {
         // WHY: skeptic rejected a custom docker wait script. Studio's
         // shipped proveReady() must itself return PNG 89 50 4E 47 on
-        // remotecode/computer:local bound to 127.0.0.1.
+        // remotecode/computer:r5 bound to 127.0.0.1.
         guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {
             throw XCTSkip("set RC_LIVE_DOCKER=1 to run the shipped proveReady capture")
         }
@@ -905,7 +933,7 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(ready, service.lastReason)
         XCTAssertEqual(magic, "89504e47")
         XCTAssertEqual(host, "127.0.0.1")
-        XCTAssertEqual(image, "remotecode/computer:local")
+        XCTAssertEqual(image, "remotecode/computer:r5")
 
         let botID = BotID()
         let shot = try service.observe(botID: botID)
@@ -914,6 +942,257 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(shot.magic, "89504e47")
         try service.act(botID: botID, steps: [BotComputerActStep(action: "key", key: "Return")])
         print("ACT_OK=1")
+        service.teardown(botID: botID)
+    }
+
+    func test_provisionReplacesAContainerFromOlderCreateOptionsOnlyWhileIdle() throws {
+        // WHY: a container created before runtime revision 2 has no agent-kit
+        // bind, no --init and no host alias, so the in-guest agent cannot run
+        // there. It must be replaced, but never under an active run, whose
+        // processes live in that container.
+        let support = makeSupport("rc-guest-runtime-label")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let old = BotComputerContainerInspect(
+            running: true, imageID: "img", hostPort: 49152,
+            labels: [BotComputerGuestSpec.workspacesLabelKey: BotComputerGuestSpec.workspacesLabel([])]
+        )
+
+        let idleFake = FakeDocker()
+        let idle = BotComputerGuestService(
+            appSupport: support, docker: idleFake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: BotVMRunRegistry()
+        )
+        let idleBot = BotID()
+        let idleName = BotComputerGuestSpec.containerName(botID: idleBot)
+        idleFake.containers[idleName] = old
+        XCTAssertFalse(try idle.provision(botID: idleBot).resumed)
+        XCTAssertEqual(idleFake.removed, [idleName])
+        XCTAssertEqual(idleFake.created, [idleName])
+        let created = try XCTUnwrap(idleFake.createdOptions.last)
+        XCTAssertTrue(created.initProcess)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: BotComputerGuestSpec.guestToolsURL(appSupport: support).path
+        ), "the kit's host directory exists before Docker binds it")
+        idleFake.created.removeAll()
+        let runAgent = BotComputerGuestSpec.guestToolsURL(appSupport: support)
+            .appendingPathComponent("bin/run-agent")
+        try FileManager.default.removeItem(at: runAgent)
+        XCTAssertTrue(try idle.provision(botID: idleBot).resumed, "a current container is reused")
+        XCTAssertTrue(idleFake.created.isEmpty)
+        XCTAssertTrue(
+            FileManager.default.isExecutableFile(atPath: runAgent.path),
+            "a reused container sees the agent kit through its bind, so provision restores it"
+        )
+
+        let busyFake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let busy = BotComputerGuestService(
+            appSupport: support, docker: busyFake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: registry
+        )
+        let busyBot = BotID()
+        busyFake.containers[BotComputerGuestSpec.containerName(botID: busyBot)] = old
+        registry.begin(botID: busyBot, entry: .init(
+            threadID: AgentThreadID(), runID: AgentRunID(), title: "Fix CI", workspace: ""
+        ))
+        XCTAssertTrue(try busy.provision(botID: busyBot).resumed)
+        XCTAssertTrue(busyFake.removed.isEmpty)
+        XCTAssertTrue(busyFake.created.isEmpty)
+    }
+
+    func test_rebuildIsRefusedWhileAnotherThreadsRunHoldsTheBot() throws {
+        // WHY: rebuild swaps out the container a running thread is using. The
+        // user's Rebuild button (no thread) and other threads must wait; the
+        // holding thread's own agent asking for it keeps working as before.
+        let support = makeSupport("rc-guest-rebuild-busy")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: registry
+        )
+        let botID = BotID()
+        let holder = AgentThreadID()
+        registry.begin(botID: botID, entry: .init(
+            threadID: holder, runID: AgentRunID(), title: "Fix CI", workspace: ""
+        ))
+
+        XCTAssertThrowsError(try service.rebuild(botID: botID)) {
+            XCTAssertEqual($0 as? BotComputerGuestServiceError, .rebuildWhileRunActive(threadTitle: "Fix CI"))
+        }
+        XCTAssertThrowsError(try service.rebuild(botID: botID, requestingThreadID: AgentThreadID()))
+        XCTAssertTrue(fake.builds.isEmpty, "nothing was built or replaced")
+        XCTAssertTrue(fake.created.isEmpty)
+
+        _ = try service.rebuild(botID: botID, requestingThreadID: holder)
+        XCTAssertEqual(fake.builds.count, 1)
+        registry.end(botID: botID, runID: try XCTUnwrap(registry.active(botID: botID)).runID)
+        _ = try service.rebuild(botID: botID)
+        XCTAssertEqual(fake.builds.count, 2, "an idle bot rebuilds from the button")
+    }
+
+    func test_prepareHomeReplacesTheUneditedRevision4RecipeAndKeepsEditedOnes() throws {
+        // WHY: a bot's rebuild builds its per-bot copy of the recipe. A copy
+        // still byte-equal to what revision 4 seeded was never edited and would
+        // rebuild an image without the agent toolchain; an edited copy is the
+        // user's and must stay.
+        let r4 = """
+        FROM debian:bookworm-slim
+
+        ENV DEBIAN_FRONTEND=noninteractive \\
+            HOME=/home/remotecode \\
+            DISPLAY=:1
+
+        RUN apt-get update && apt-get install -y --no-install-recommends \\
+                xvfb \\
+                fluxbox \\
+                x11vnc \\
+                novnc \\
+                websockify \\
+                chromium \\
+                imagemagick \\
+                xdotool \\
+                x11-utils \\
+                xterm \\
+                ca-certificates \\
+                nodejs \\
+                npm \\
+                python3 \\
+            && rm -rf /var/lib/apt/lists/*
+
+        RUN useradd --create-home --home-dir /home/remotecode --shell /bin/bash remotecode \\
+            && mkdir -p /opt/remotecode-computer
+
+        COPY start.sh /opt/remotecode-computer/start.sh
+        COPY embed.html /opt/remotecode-computer/embed.html
+        COPY launch-browser.sh /opt/remotecode-computer/launch-browser.sh
+        RUN chmod 0755 /opt/remotecode-computer/start.sh /opt/remotecode-computer/launch-browser.sh
+
+        USER remotecode
+        WORKDIR /home/remotecode
+        EXPOSE 6080
+        CMD ["/opt/remotecode-computer/start.sh"]
+        """ + "\n"
+        XCTAssertEqual(
+            SHA256.hash(data: Data(r4.utf8)).map { String(format: "%02x", $0) }.joined(),
+            "f76708fdeadee4b8c2b970e6bcb0d1cf0143ed57331d14a14941406fbc438bb6",
+            "the fixture must stay byte-identical to the revision 4 Dockerfile"
+        )
+        let support = makeSupport("rc-guest-recipe-r4")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
+        let service = BotComputerGuestService(
+            appSupport: support, docker: FakeDocker(), recipeContext: recipe,
+            observeAttempts: 1, observeDelay: 0
+        )
+        let current = try String(contentsOf: recipe.appendingPathComponent("Dockerfile"), encoding: .utf8)
+
+        let stockBot = BotID()
+        let stockHome = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: stockBot)
+        try FileManager.default.createDirectory(at: stockHome, withIntermediateDirectories: true)
+        try r4.write(to: stockHome.appendingPathComponent("Dockerfile"), atomically: true, encoding: .utf8)
+        try service.prepareHome(botID: stockBot)
+        XCTAssertEqual(try String(contentsOf: stockHome.appendingPathComponent("Dockerfile"), encoding: .utf8), current)
+
+        let editedBot = BotID()
+        let editedHome = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: editedBot)
+        try FileManager.default.createDirectory(at: editedHome, withIntermediateDirectories: true)
+        let edited = r4 + "RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg\n"
+        try edited.write(to: editedHome.appendingPathComponent("Dockerfile"), atomically: true, encoding: .utf8)
+        try service.prepareHome(botID: editedBot)
+        XCTAssertEqual(try String(contentsOf: editedHome.appendingPathComponent("Dockerfile"), encoding: .utf8), edited)
+    }
+
+    func test_recipePreparationReassertsTheDockerIgnoreAfterAGuestEdit() throws {
+        // WHY: the build context is the guest-writable home holding the agent's
+        // credentials. A guest that rewrites .dockerignore to re-include
+        // .distill must not get it into the next rebuilt image.
+        let support = makeSupport("rc-guest-dockerignore")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake,
+            recipeContext: try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL()),
+            observeAttempts: 1, observeDelay: 0
+        )
+        let botID = BotID()
+        try service.prepareHome(botID: botID)
+        let ignore = BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID)
+            .appendingPathComponent(".dockerignore")
+        XCTAssertEqual(try String(contentsOf: ignore, encoding: .utf8), BotComputerGuestSpec.enforcedDockerIgnore(nil))
+
+        try "!.distill\n!.distill/claude-auth.json\n".write(to: ignore, atomically: true, encoding: .utf8)
+        _ = try service.rebuild(botID: botID)
+        let lines = try String(contentsOf: ignore, encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertEqual(Array(lines.suffix(3)), BotComputerGuestSpec.requiredDockerIgnorePatterns)
+        XCTAssertEqual(fake.builds.last, BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID))
+
+        // BuildKit reads Dockerfile.dockerignore instead of .dockerignore when
+        // it exists (verified: an empty one put .distill/claude-auth.json into
+        // the image); Podman reads .containerignore. Both get the exclusions.
+        let recipe = BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID)
+        for name in BotComputerGuestSpec.alternateDockerIgnoreFileNames {
+            try "".write(to: recipe.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        _ = try service.rebuild(botID: botID)
+        for name in BotComputerGuestSpec.alternateDockerIgnoreFileNames {
+            let planted = try String(contentsOf: recipe.appendingPathComponent(name), encoding: .utf8)
+            XCTAssertEqual(planted, BotComputerGuestSpec.enforcedDockerIgnore(""), name)
+        }
+
+        // A guest-planted symlink names a host path. The host must replace the
+        // link, never read the file behind it into the guest-readable home.
+        let hostSecret = support.appendingPathComponent("host-secret")
+        try "HOST-PRIVATE-KEY\n".write(to: hostSecret, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: ignore)
+        try FileManager.default.createSymbolicLink(at: ignore, withDestinationURL: hostSecret)
+        _ = try service.rebuild(botID: botID)
+        let replaced = try FileManager.default.attributesOfItem(atPath: ignore.path)[.type] as? FileAttributeType
+        XCTAssertEqual(replaced, .typeRegular)
+        XCTAssertFalse(try String(contentsOf: ignore, encoding: .utf8).contains("HOST-PRIVATE-KEY"))
+        XCTAssertEqual(try String(contentsOf: hostSecret, encoding: .utf8), "HOST-PRIVATE-KEY\n")
+    }
+
+    func test_guestRunVMProbesTheAgentToolsOncePerImageAndNamesWhatIsMissing() throws {
+        // WHY (plan A S8): an in-guest run needs the agent's tools in the
+        // image (a stale or customised image may lack them); it must fail
+        // naming them, not start a broken agent. The probe costs a docker
+        // exec per turn, so a container keeps its result until it is recreated.
+        let support = makeSupport("rc-guest-run-vm")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.infoText = "Server Version: 29.4.0\n Architecture: aarch64\n"
+        var probes = 0
+        var probeAnswer = "git wmctrl "
+        fake.execOutput = { command in
+            guard command.first == "sh", command.last == BotGuestDockerVM.toolsProbeScript else { return nil }
+            probes += 1
+            return Data(probeAnswer.utf8)
+        }
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1, observeDelay: 0
+        )
+        let vm = BotGuestDockerVM(appSupport: support, docker: fake, service: service)
+        let botID = BotID()
+        XCTAssertThrowsError(try vm.prepare(
+            botID: botID, threadID: AgentThreadID(), workspace: nil, registeredWorkspaces: []
+        )) { error in
+            XCTAssertEqual(String(describing: error),
+                           "VM indisponível: the bot's Linux image lacks git, wmctrl. "
+                           + "Add them to the bot's Dockerfile, or restore the default one, and rebuild.")
+        }
+        XCTAssertEqual(fake.lastExec?.user, BotComputerGuestSpec.agentUser, "probed as the user the agent runs as")
+
+        probeAnswer = ""
+        let ready = try vm.prepare(botID: botID, threadID: AgentThreadID(), workspace: nil, registeredWorkspaces: [])
+        XCTAssertEqual(ready, BotGuestVM(
+            container: BotComputerGuestSpec.containerName(botID: botID), dockerArch: "aarch64", mountedWorkspaces: []
+        ))
+        _ = try vm.prepare(botID: botID, threadID: AgentThreadID(), workspace: nil, registeredWorkspaces: [])
+        XCTAssertEqual(probes, 2, "a passed probe is reused while the container keeps its image")
         service.teardown(botID: botID)
     }
 
@@ -956,7 +1235,12 @@ final class BotComputerGuestServiceTests: XCTestCase {
         let botID = BotID()
         _ = try service.exec(botID: botID, command: "apt-get install -y sl")
         XCTAssertEqual(fake.lastExec?.user, "0")
-        XCTAssertEqual(Array(fake.lastExec?.command.prefix(2) ?? []), ["bash", "-lc"])
+        // The agent's shell runs under the guest deadline so a long apt-get is
+        // stopped inside the guest, not orphaned when the host gives up.
+        XCTAssertEqual(
+            fake.lastExec?.command,
+            BotComputerGuestSpec.execDeadlinePrefix + ["bash", "-lc", "apt-get install -y sl"]
+        )
         try service.openTerminal(botID: botID)
         XCTAssertEqual(fake.lastExec?.detach, true)
         XCTAssertEqual(fake.lastExec?.command, BotComputerGuestSpec.terminalCommand())
@@ -964,6 +1248,65 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(rebuilt.screenURL.host, "127.0.0.1")
         XCTAssertTrue(fake.builds.contains(BotComputerGuestSpec.recipeURL(appSupport: support, botID: botID)))
         XCTAssertFalse(fake.renamed.isEmpty)
+        service.teardown(botID: botID)
+    }
+
+    func test_execAfterSlowProvisioningStillAnswersBeforeTheCallerStopsWaiting() throws {
+        // WHY: the MCP caller's wait starts at enqueue; provisioning a cold
+        // container eats into it. The guest limit is sized at exec start so the
+        // host's own deadline (guest + kill grace + docker slack + result margin)
+        // still lands before the caller's deadline.
+        let support = makeSupport("rc-guest-exec-budget")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        fake.startDelay = 1.2
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        let deadline = Date().addingTimeInterval(30)
+        _ = try service.exec(botID: botID, command: "make", deadline: deadline)
+        let command = try XCTUnwrap(fake.lastExec?.command)
+        let guest = try XCTUnwrap(BotComputerGuestSpec.execGuestSeconds(inExecArguments: command))
+        let issuedAt = try XCTUnwrap(fake.lastExecAt)
+        XCTAssertLessThan(guest, BotComputerGuestSpec.execGuestDeadlineSeconds)
+        XCTAssertLessThanOrEqual(
+            issuedAt.addingTimeInterval(
+                BotComputerGuestSpec.execHostDeadline(guestSeconds: guest)
+                    + TimeInterval(BotComputerGuestSpec.execResultMarginSeconds)
+            ),
+            deadline
+        )
+        service.teardown(botID: botID)
+    }
+
+    func test_execWithNoBudgetLeftAfterProvisioningIsRefusedWithoutRunning() throws {
+        // WHY: starting a command the caller can no longer hear about is the
+        // failure this guards against; say so instead of running it blind.
+        let support = makeSupport("rc-guest-exec-no-budget")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support,
+            docker: fake,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL(),
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let botID = BotID()
+        XCTAssertThrowsError(
+            try service.exec(botID: botID, command: "make", deadline: Date().addingTimeInterval(8))
+        ) { error in
+            XCTAssertEqual(error as? BotComputerError, .invalid(BotComputerGuestService.execBudgetExhaustedMessage))
+        }
+        XCTAssertNil(
+            fake.lastExec.flatMap { BotComputerGuestSpec.execGuestSeconds(inExecArguments: $0.command) },
+            "the agent command never reached docker"
+        )
         service.teardown(botID: botID)
     }
 
@@ -1102,6 +1445,207 @@ final class BotComputerGuestServiceTests: XCTestCase {
             defer { lock.unlock() }
             return mainThread
         }
+    }
+
+    func test_ensureImageRebuildsAnImageWithTheRightRevisionButAnotherRecipe() throws {
+        // WHY: another build on the same daemon left an image under this tag and
+        // revision label from a different recipe (no Node 24, no Playwright MCP,
+        // no CDP). Trusting tag + revision would run every bot on it.
+        let support = makeSupport("rc-guest-foreign-image")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let recipe = try XCTUnwrap(AppShellResourceBundle.computerGuestRecipeURL())
+        let fake = FakeDocker()
+        fake.imageDigests[BotComputerGuestSpec.imageTag] = "built-from-another-recipe"
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, recipeContext: recipe,
+            observeAttempts: 1, observeDelay: 0
+        )
+        XCTAssertTrue(service.proveReady())
+        XCTAssertEqual(fake.builds, [recipe])
+        XCTAssertEqual(
+            fake.imageDigests[BotComputerGuestSpec.imageTag],
+            BotComputerGuestSpec.recipeDigest(context: recipe)
+        )
+        XCTAssertTrue(service.proveReady())
+        XCTAssertEqual(fake.builds, [recipe], "an image built from this recipe is reused, not rebuilt every time")
+    }
+
+    func test_rebuildStopsTheOldContainerBeforeTheNewOneStarts() throws {
+        // WHY: both containers bind the same home, and start.sh clears
+        // Chromium's profile lock. Two running at once means two Chromiums
+        // writing one profile, which corrupts the bot's cookies and logins.
+        let support = makeSupport("rc-guest-rebuild-order")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: BotVMRunRegistry()
+        )
+        let botID = BotID()
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        let next = BotComputerGuestSpec.nextContainerName(botID: botID)
+        _ = try service.provision(botID: botID)
+        fake.lifecycle.removeAll()
+
+        _ = try service.rebuild(botID: botID)
+
+        let stop = try XCTUnwrap(fake.lifecycle.firstIndex(of: "stop:\(canonical)"))
+        let start = try XCTUnwrap(fake.lifecycle.firstIndex(of: "start:\(next)"))
+        XCTAssertLessThan(stop, start)
+        XCTAssertEqual(fake.containers[canonical]?.running, true)
+    }
+
+    func test_rebuildThatNeverGetsReadyBringsTheOldContainerBack() throws {
+        // WHY: the old container is stopped before the new one starts; a new
+        // desktop that never proves its screen must not leave the bot with none.
+        let support = makeSupport("rc-guest-rebuild-rollback")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: BotVMRunRegistry()
+        )
+        let botID = BotID()
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        let next = BotComputerGuestSpec.nextContainerName(botID: botID)
+        _ = try service.provision(botID: botID)
+        fake.lifecycle.removeAll()
+        fake.execError = BotComputerGuestError.observeFailed
+
+        XCTAssertThrowsError(try service.rebuild(botID: botID))
+
+        XCTAssertNil(fake.containers[next], "the unready replacement is removed")
+        XCTAssertEqual(fake.lifecycle.last, "start:\(canonical)")
+        XCTAssertEqual(fake.containers[canonical]?.running, true)
+    }
+
+    func test_rebuildHoldsTheBotSoASendDuringTheBuildQueuesAndDrainsAfter() throws {
+        // WHY: `docker build` takes minutes. A run that starts on the old
+        // container meanwhile would have it stopped under it; it must queue
+        // behind the rebuild and be started once the rebuild lets go.
+        let support = makeSupport("rc-guest-rebuild-claim")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let center = NotificationCenter()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            notificationCenter: center, vmRuns: registry
+        )
+        let botID = BotID()
+        let sender = AgentThreadID()
+        var drained: [AgentThreadID] = []
+        let token = center.addObserver(forName: .botVMRebuildReleased, object: nil, queue: nil) { note in
+            if let thread = note.userInfo?[BotHostNotificationKey.threadID] as? AgentThreadID { drained.append(thread) }
+        }
+        defer { center.removeObserver(token) }
+        var refusedBy: BotVMRunRegistry.Entry?
+        fake.onBuild = {
+            refusedBy = registry.tryBegin(botID: botID, entry: .init(
+                threadID: sender, runID: AgentRunID(), title: "Deploy", workspace: ""
+            ))
+            XCTAssertNotNil(registry.busyMessage(botID: botID, threadID: sender))
+            registry.addWaiting(botID: botID, threadID: sender)
+        }
+
+        _ = try service.rebuild(botID: botID)
+
+        XCTAssertEqual(refusedBy?.title, BotComputerGuestService.rebuildClaimTitle)
+        XCTAssertNil(registry.active(botID: botID), "the rebuild lets go of the bot")
+        XCTAssertEqual(drained, [sender])
+        XCTAssertTrue(registry.waitingThreads(botID: botID).isEmpty)
+    }
+
+    func test_rebuildAbortsWhenAnotherRunTookTheBotDuringTheBuild() throws {
+        // WHY: the holding thread's own agent may rebuild, but if that run ends
+        // during the build and another thread's run starts, the old container
+        // now hosts that run and must not be stopped under it.
+        let support = makeSupport("rc-guest-rebuild-recheck")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: registry
+        )
+        let botID = BotID()
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        _ = try service.provision(botID: botID)
+        let holder = AgentThreadID()
+        let holderRun = AgentRunID()
+        registry.begin(botID: botID, entry: .init(threadID: holder, runID: holderRun, title: "Fix CI", workspace: ""))
+        let other = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Deploy", workspace: "")
+        fake.onBuild = {
+            registry.end(botID: botID, runID: holderRun)
+            XCTAssertNil(registry.tryBegin(botID: botID, entry: other))
+        }
+        fake.stopped.removeAll()
+
+        XCTAssertThrowsError(try service.rebuild(botID: botID, requestingThreadID: holder)) {
+            XCTAssertEqual($0 as? BotComputerGuestServiceError, .rebuildWhileRunActive(threadTitle: "Deploy"))
+        }
+        XCTAssertFalse(fake.stopped.contains(canonical))
+        XCTAssertEqual(fake.containers[canonical]?.running, true)
+        XCTAssertNil(fake.containers[BotComputerGuestSpec.nextContainerName(botID: botID)])
+        XCTAssertEqual(registry.active(botID: botID), other)
+    }
+
+    func test_provisionByTheHoldingThreadReplacesAnOutdatedContainer() throws {
+        // WHY: an in-guest agent's run claims the bot before it provisions.
+        // Counting its own claim as "busy" would keep a container without the
+        // agent-kit bind or host alias, where that agent cannot start.
+        let support = makeSupport("rc-guest-runtime-requester")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: registry
+        )
+        let botID = BotID()
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        let holder = AgentThreadID()
+        registry.begin(botID: botID, entry: .init(threadID: holder, runID: AgentRunID(), title: "Fix CI", workspace: ""))
+        fake.containers[name] = BotComputerContainerInspect(
+            running: true, imageID: "img", hostPort: 49152,
+            labels: [BotComputerGuestSpec.workspacesLabelKey: BotComputerGuestSpec.workspacesLabel([])]
+        )
+
+        XCTAssertTrue(try service.provision(botID: botID).resumed, "another caller keeps the holder's container")
+        XCTAssertTrue(fake.created.isEmpty)
+        XCTAssertFalse(try service.provision(botID: botID, requestingThreadID: holder).resumed)
+        XCTAssertEqual(fake.created, [name])
+        XCTAssertEqual(fake.createdOptions.last?.labels[BotComputerGuestSpec.runtimeLabelKey], BotComputerGuestSpec.runtimeRevision)
+    }
+
+    func test_containerFromAnOlderImageIsKeptWhileAnotherRunHoldsTheBot() throws {
+        // WHY: a rebuilt per-bot or base image must not swap the container
+        // out from under a run; it is applied once the bot is idle.
+        let support = makeSupport("rc-guest-image-busy")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: registry
+        )
+        let botID = BotID()
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        let run = AgentRunID()
+        registry.begin(botID: botID, entry: .init(threadID: AgentThreadID(), runID: run, title: "Fix CI", workspace: ""))
+        fake.containers[name] = BotComputerContainerInspect(
+            running: true, imageID: "older-image", hostPort: 49152,
+            labels: [
+                BotComputerGuestSpec.workspacesLabelKey: BotComputerGuestSpec.workspacesLabel([]),
+                BotComputerGuestSpec.runtimeLabelKey: BotComputerGuestSpec.runtimeRevision,
+            ]
+        )
+
+        XCTAssertTrue(try service.provision(botID: botID).resumed)
+        XCTAssertTrue(fake.removed.isEmpty)
+        registry.end(botID: botID, runID: run)
+        XCTAssertFalse(try service.provision(botID: botID).resumed)
+        XCTAssertEqual(fake.removed, [name])
     }
 
     private func makeSupport(_ prefix: String) -> URL {

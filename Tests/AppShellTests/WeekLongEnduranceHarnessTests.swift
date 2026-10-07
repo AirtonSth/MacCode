@@ -57,27 +57,6 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
         }
     }
 
-    private final class OwnedTestSidecarSpawner: DistillProcessSpawning, @unchecked Sendable {
-        private(set) var spawnCount = 0
-
-        func spawn(executableURL: URL, arguments: [String]) throws -> DistillSpawnResult {
-            spawnCount += 1
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/sleep")
-            process.arguments = ["30"]
-            let stdout = Pipe()
-            let stderr = Pipe()
-            process.standardOutput = stdout
-            process.standardError = stderr
-            try process.run()
-            return DistillSpawnResult(
-                process: process,
-                stdoutHandle: stdout.fileHandleForReading,
-                stderrHandle: stderr.fileHandleForReading
-            )
-        }
-    }
-
     func test_virtualFourteenDayEnduranceSmokeStaysBounded() async throws {
         try await runVirtualFourteenDays(.smoke)
     }
@@ -129,8 +108,6 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
         XCTAssertEqual(profile.name, "low-memory-8g")
         XCTAssertNil(profile.providerRootCap)
-        XCTAssertEqual(profile.sidecarMaxConcurrentRequests, 1)
-        XCTAssertEqual(profile.sidecarMaxQueueDepth, 4)
 
         let admissionGate = ManagedProviderAdmissionGate(reservationLifetime: 60)
         let emptyProcessScan = ManagedProcessScan(
@@ -141,22 +118,6 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
             isComplete: true,
             incompleteRootPIDs: []
         )
-        let sidecarSpawner = OwnedTestSidecarSpawner()
-        let sidecar = await MainActor.run {
-            TokenSaverDistillServiceController(
-                appSupportDirectory: directory,
-                executableURLResolver: { URL(fileURLWithPath: "/not-executed/in-memory-sidecar") },
-                processSpawner: sidecarSpawner,
-                terminateForeignServers: { _ in
-                    ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
-                },
-                memoryProfileProvider: { profile }
-            )
-        }
-        defer {
-            Task { @MainActor in sidecar.stop() }
-        }
-
         let eventPolicy = AgentEventRetentionPolicy(
             streamEventCountPerThread: 24,
             streamEventBytesPerThread: 96 * 1_024,
@@ -273,14 +234,6 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
                            "session count is unlimited; only memory ceilings may block")
             providerAdmissionChecks += 3
 
-            await MainActor.run {
-                sidecar.startIfEligible(
-                    session: paidSession(),
-                    settings: AppSettings(tokenSaverEnabled: true),
-                    modelValidation: .installed
-                )
-            }
-
             let checkpoint = try current.budget.passiveCheckpoint(now: now)
             XCTAssertEqual(checkpoint.busyReaders, 0)
             XCTAssertLessThanOrEqual(checkpoint.snapshot.walBytes, 17 * 1_024 * 1_024)
@@ -295,16 +248,6 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
 
         let finalStore = try XCTUnwrap(store)
         XCTAssertEqual(providerAdmissionChecks, 42)
-        // start() now spawns after an off-main foreign-server sweep, so let the
-        // single deferred spawn land before asserting the resident-instance count
-        // (every later startIfEligible coalesces or sees the live process).
-        var spawnPolls = 0
-        while sidecarSpawner.spawnCount == 0, spawnPolls < 150 {
-            try? await Task.sleep(nanoseconds: 20_000_000)
-            spawnPolls += 1
-        }
-        XCTAssertEqual(sidecarSpawner.spawnCount, 1, "repeated lifecycle checks must retain one sidecar instance")
-        await MainActor.run { sidecar.stop() }
         XCTAssertLessThanOrEqual(try finalStore.terminals.totalBytesAllSurfaces(), globalTerminalBytes)
         XCTAssertTrue(try threads.contains { try finalStore.runs.streamHistoryWasPruned(threadId: $0.id) })
         XCTAssertTrue(try surfaceIDs.contains { try finalStore.terminals.partialHistoryState(surfaceID: $0) != nil })
@@ -464,21 +407,6 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
                 seq: 2,
                 kind: "endurance.simulated_disk_full",
                 payloadJSON: #"{"state":"simulated disk full"}"#
-            )
-        )
-    }
-
-    @MainActor
-    private func paidSession() -> PrivateAccountSession {
-        PrivateAccountSession(
-            accessToken: "endurance-access-token",
-            refreshToken: "endurance-refresh-token",
-            user: PrivateAccountUser(
-                daysRemaing: nil,
-                daysRemaining: 30,
-                email: "endurance@example.com",
-                id: "endurance-user",
-                subscribed: true
             )
         )
     }

@@ -51,6 +51,9 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
     case networkAddressPoolExhausted
     case networkSubnetUnavailable
     case provisioningFailed
+    /// A bot_computer_exec command outlived its guest limit (`seconds`, at most
+    /// `BotComputerGuestSpec.execGuestDeadlineSeconds`) and was stopped.
+    case guestCommandTimedOut(seconds: Int)
 
     public var recovery: BotComputerDockerRecovery {
         switch self {
@@ -58,12 +61,19 @@ public enum BotComputerDockerError: Error, Equatable, LocalizedError, CustomStri
         case .daemonUnavailable: return .startDaemon
         case .probeTimedOut: return .retryTimedOutProbe
         case .outputTooLarge: return .retryProvisioning
-        case .networkAddressPoolExhausted, .networkSubnetUnavailable, .provisioningFailed:
+        case .networkAddressPoolExhausted, .networkSubnetUnavailable, .provisioningFailed,
+             .guestCommandTimedOut:
             return .retryProvisioning
         }
     }
 
-    public var description: String { recovery.message }
+    public var description: String {
+        guard case .guestCommandTimedOut(let seconds) = self else { return recovery.message }
+        // The desktop is fine; the agent needs to know its command was stopped.
+        return "The command ran longer than \(seconds) s "
+            + "inside the Linux container and was stopped. Run long jobs in the background "
+            + "(nohup <command> > /tmp/job.log 2>&1 &) and check the log in later calls."
+    }
     public var errorDescription: String? { description }
 }
 
@@ -119,18 +129,24 @@ public struct BotComputerContainerInspect: Equatable, Sendable {
     public var hostPort: Int
     public var networkNames: [String]
     public var labels: [String: String]
+    /// Host path bound at the guest user's home; nil when none is. Tells which
+    /// app's Application Support (the installed app or a debug sandbox) owns
+    /// the container.
+    public var homeSource: String?
     public init(
         running: Bool,
         imageID: String,
         hostPort: Int,
         networkNames: [String] = [],
-        labels: [String: String] = [:]
+        labels: [String: String] = [:],
+        homeSource: String? = nil
     ) {
         self.running = running
         self.imageID = imageID
         self.hostPort = hostPort
         self.networkNames = networkNames
         self.labels = labels
+        self.homeSource = homeSource
     }
 }
 
@@ -181,6 +197,8 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             "-t", tag,
             "--label",
             "\(BotComputerGuestSpec.recipeLabelKey)=\(BotComputerGuestSpec.recipeRevision)",
+            "--label",
+            "\(BotComputerGuestSpec.recipeDigestLabelKey)=\(BotComputerGuestSpec.recipeDigest(context: context))",
             context.path,
         ])
     }
@@ -194,6 +212,12 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         ]
         if let network = options.network, !network.isEmpty {
             args += ["--network", network]
+        }
+        if options.initProcess {
+            args.append("--init")
+        }
+        for host in options.extraHosts {
+            args += ["--add-host", host]
         }
         for (key, value) in options.labels.sorted(by: { $0.key < $1.key }) {
             args += ["--label", "\(key)=\(value)"]
@@ -282,11 +306,18 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         let data = try run([
             "inspect",
             "-f",
-            "{{.State.Running}} {{.Image}} {{with (index .NetworkSettings.Ports \"6080/tcp\")}}{{(index . 0).HostPort}}{{else}}0{{end}} {{range $k, $_ := .NetworkSettings.Networks}}{{$k}},{{end}} {{json .Config.Labels}}",
+            "{{.State.Running}} {{.Image}} {{with (index .NetworkSettings.Ports \"6080/tcp\")}}{{(index . 0).HostPort}}{{else}}0{{end}} {{range $k, $_ := .NetworkSettings.Networks}}{{$k}},{{end}} {{json .Config.Labels}}"
+                + "\n{{range .Mounts}}{{if eq .Destination \"\(BotComputerGuestSpec.guestUserHome)\"}}{{json .Source}}{{end}}{{end}}",
             name,
         ])
-        let text = (String(data: data, encoding: .utf8) ?? "")
+        // Line 2: the home bind's source, JSON-quoted (it may hold spaces).
+        let lines = (String(data: data, encoding: .utf8) ?? "")
+            .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        let text = (lines.first.map(String.init) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let homeSource = lines.dropFirst().first
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { try? JSONDecoder().decode(String.self, from: Data($0.utf8)) }
         let parts = text.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: false)
         let running = parts.first.map { $0.caseInsensitiveCompare("true") == .orderedSame } ?? false
         let image = parts.dropFirst().first.map(String.init) ?? ""
@@ -303,7 +334,8 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             imageID: image,
             hostPort: port,
             networkNames: networks,
-            labels: labels
+            labels: labels,
+            homeSource: homeSource
         )
     }
 
@@ -365,6 +397,7 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         let executable = try BotComputerDockerResolver.shared.resolveHealthyExecutable()
         let timeout = timeoutForArguments(args)
         let result: (data: Data, errorData: Data, terminationStatus: Int32, timedOut: Bool)
+        let started = ProcessInfo.processInfo.systemUptime
         do {
             result = try runProcess(
                 executableURL: URL(fileURLWithPath: executable),
@@ -380,6 +413,13 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         }
         if result.timedOut {
             throw timeoutError(for: args)
+        }
+        if isGuestDeadlineExit(
+            args,
+            status: result.terminationStatus,
+            elapsed: ProcessInfo.processInfo.systemUptime - started
+        ), let seconds = BotComputerGuestSpec.execGuestSeconds(inExecArguments: args) {
+            throw BotComputerDockerError.guestCommandTimedOut(seconds: seconds)
         }
         if result.terminationStatus != 0 {
             BotComputerDockerResolver.shared.invalidateIfMatches(executable)
@@ -404,13 +444,34 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
     static func timeoutForArguments(_ args: [String]) -> TimeInterval {
         switch args.first {
         case "info": return 5
-        case "build": return 600
+        case "build": return BotComputerGuestSpec.imageBuildDeadlineSeconds
+        case "exec":
+            guard let seconds = guestDeadlineSeconds(args) else { return 15 }
+            return BotComputerGuestSpec.execHostDeadline(guestSeconds: seconds)
         default: return 15
         }
     }
 
     static func timeoutError(for args: [String]) -> BotComputerDockerError {
-        args.first == "info" ? .probeTimedOut : .provisioningFailed
+        if let seconds = guestDeadlineSeconds(args) { return .guestCommandTimedOut(seconds: seconds) }
+        return args.first == "info" ? .probeTimedOut : .provisioningFailed
+    }
+
+    /// The guest limit of an agent command wrapped by
+    /// `BotComputerGuestSpec.deadlineExecCommand`, nil for any other docker call.
+    static func guestDeadlineSeconds(_ args: [String]) -> Int? {
+        guard args.first == "exec" else { return nil }
+        return BotComputerGuestSpec.execGuestSeconds(inExecArguments: args)
+    }
+
+    /// GNU `timeout` exits 124 when TERM stopped the command, 137 when it had to
+    /// KILL. The command itself can exit 124/137 too (its own `timeout N curl`,
+    /// an OOM kill), so only a run that actually lasted the guest limit counts.
+    static func isGuestDeadlineExit(_ args: [String], status: Int32, elapsed: TimeInterval) -> Bool {
+        guard let seconds = guestDeadlineSeconds(args), status == 124 || status == 137 else {
+            return false
+        }
+        return elapsed >= TimeInterval(seconds)
     }
 
     static func stdoutLimit(for args: [String]) -> Int {

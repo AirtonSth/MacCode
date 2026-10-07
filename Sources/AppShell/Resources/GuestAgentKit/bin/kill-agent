@@ -1,0 +1,188 @@
+#!/bin/bash
+# kill-agent <runId>   end one in-guest agent run
+# kill-agent --all     end every run (launch sweep)
+#
+# A run is every process whose environment carries RC_GUEST_RUN_ID=<runId>
+# (run-agent tags it), every process in the run's session and every descendant
+# of those (they may have scrubbed their environment or left the session while
+# their parent lived), plus the run's lease reaper. The desktop's own processes
+# carry no tag and survive. Sends TERM, then KILL after 1 s. Running it again,
+# or for a run that already ended, does nothing and exits 0. Exits 1 only if a
+# process survives KILL.
+#
+# Run it as the guest user (`docker exec -u remotecode`), the user every run
+# runs as (the guest has no sudo). Root is refused: without CAP_SYS_PTRACE,
+# which bot containers do not get, root cannot read another user's
+# /proc/<pid>/environ and would find no run at all.
+#
+# kill-agent --reap <runId> is the lease reaper run-agent starts: it ends the
+# run once /home/remotecode/.rc-runs/<runId>.lease has not changed for 45 s of
+# the reaper's own polling (missing counts as unchanged), and exits when the
+# run ends. Only a change in the lease counts, never its age against the guest
+# clock: the Mac writes the mtime with its own clock, and after the Mac sleeps
+# the guest clock jumps ahead, which would end a live run before its next
+# renewal. A sleep that spans a suspend is one poll, so the Mac's next renewal
+# still lands in time. RC_AGENT_LEASE_MAX_AGE and RC_AGENT_REAP_INTERVAL
+# (whole seconds) override 45 and 5 for tests.
+set -u
+
+state=/tmp/rc-agent
+lease_dir=/home/remotecode/.rc-runs
+lease_max_age=${RC_AGENT_LEASE_MAX_AGE:-45}
+reap_interval=${RC_AGENT_REAP_INTERVAL:-5}
+[[ $lease_max_age =~ ^[0-9]+$ ]] || lease_max_age=45
+[[ $reap_interval =~ ^[1-9][0-9]*$ ]] || reap_interval=5
+
+usage() {
+    echo "usage: kill-agent <runId>|--all|--reap <runId>" >&2
+    exit 64
+}
+
+valid_run() {
+    [ ${#1} -eq 36 ] && [[ $1 != *[!0-9A-Fa-f-]* ]]
+}
+
+# One pass over /proc, skipping this shell and its subshell: parent, session,
+# run tag and reaper tag of every process.
+scan() {
+    ppid_of=() sid_of=() run_of=() reaper_of=()
+    local dir pid stat rest parent session entry
+    for dir in /proc/[0-9]*; do
+        pid=${dir#/proc/}
+        [ "$pid" = "$$" ] || [ "$pid" = "$BASHPID" ] && continue
+        { read -r stat < "$dir/stat"; } 2>/dev/null || continue
+        # Fields after the parenthesised command: state ppid pgrp session.
+        rest=${stat##*) }
+        read -r _ parent _ session _ <<< "$rest"
+        ppid_of[pid]=$parent
+        sid_of[pid]=$session
+        while IFS= read -r -d '' entry; do
+            case $entry in
+            RC_GUEST_RUN_ID=*) run_of[pid]=${entry#*=} ;;
+            RC_GUEST_REAPER_RUN_ID=*) reaper_of[pid]=${entry#*=} ;;
+            esac
+        done 2>/dev/null < "$dir/environ"
+    done
+}
+
+# Prints the pids of run $1 (every run when empty) from the last scan; $2=1
+# includes the reapers.
+targets() {
+    local want=$1 with_reaper=$2 pid file run leader changed
+    local -A pick=()
+    for pid in "${!run_of[@]}"; do
+        if [ -z "$want" ] || [ "${run_of[pid]}" = "$want" ]; then pick[$pid]=1; fi
+    done
+    if [ "$with_reaper" = 1 ]; then
+        for pid in "${!reaper_of[@]}"; do
+            if [ -z "$want" ] || [ "${reaper_of[pid]}" = "$want" ]; then pick[$pid]=1; fi
+        done
+    fi
+    for file in "$state"/${want:-*}.pid; do
+        [ -r "$file" ] || continue
+        run=$(basename "$file" .pid)
+        valid_run "$run" || continue
+        read -r leader < "$file" || continue
+        [[ $leader =~ ^[0-9]+$ ]] || continue
+        # A live leader must still carry the run's tag: once its session is
+        # gone its pid can be reused. A dead leader's pid cannot be reused while
+        # its session still has members, so those members are the run's.
+        if [ -n "${sid_of[leader]:-}" ] && [ "${run_of[leader]:-}" != "$run" ]; then continue; fi
+        for pid in "${!sid_of[@]}"; do
+            [ "${sid_of[pid]}" = "$leader" ] && pick[$pid]=1
+        done
+    done
+    changed=1
+    while [ $changed = 1 ]; do
+        changed=0
+        for pid in "${!ppid_of[@]}"; do
+            if [ -z "${pick[$pid]:-}" ] && [ -n "${pick[${ppid_of[pid]}]:-}" ]; then
+                pick[$pid]=1
+                changed=1
+            fi
+        done
+    done
+    [ ${#pick[@]} -eq 0 ] || printf '%s\n' "${!pick[@]}"
+}
+
+alive() {
+    local pid
+    for pid in "$@"; do
+        [ -d "/proc/$pid" ] && echo "$pid"
+    done
+}
+
+terminate() {
+    local left
+    [ $# -gt 0 ] || return 0
+    kill -TERM "$@" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        mapfile -t left < <(alive "$@")
+        [ ${#left[@]} -eq 0 ] && return 0
+        sleep 0.1
+    done
+    kill -KILL "${left[@]}" 2>/dev/null
+    sleep 0.2
+    mapfile -t left < <(alive "${left[@]}")
+    if [ ${#left[@]} -gt 0 ]; then
+        echo "kill-agent: still running after KILL: ${left[*]}" >&2
+        return 1
+    fi
+}
+
+# $1 = run id, empty for every run; $2 = 1 to include the reapers.
+kill_runs() {
+    local pids status
+    scan
+    mapfile -t pids < <(targets "$1" "$2")
+    terminate "${pids[@]}"
+    status=$?
+    # Unquoted on purpose: a run id is validated hex; an empty one globs them all.
+    # shellcheck disable=SC2086
+    rm -f "$state"/${1:-*}.pid
+    return $status
+}
+
+reap() {
+    local run=$1 lease=$lease_dir/$1.lease seen="" current idle=0
+    while sleep "$reap_interval"; do
+        scan
+        if [ -z "$(targets "$run" 0)" ]; then
+            rm -f "$state/$run.pid"
+            exit 0
+        fi
+        # %y has sub-second precision: every renewal changes it.
+        current=$(stat -c %y -- "$lease" 2>/dev/null) || current=""
+        if [ -n "$current" ] && [ "$current" != "$seen" ]; then
+            seen=$current
+            idle=0
+        else
+            idle=$((idle + reap_interval))
+        fi
+        if [ "$idle" -gt "$lease_max_age" ]; then
+            # The Mac stopped renewing the lease: end the run, then this reaper.
+            kill_runs "$run" 0
+            exit
+        fi
+    done
+}
+
+if [ "$EUID" -eq 0 ]; then
+    echo "kill-agent: run as remotecode, not root: root cannot read the run tags here" >&2
+    exit 77
+fi
+
+case ${1:-} in
+--all)
+    [ $# -eq 1 ] || usage
+    kill_runs "" 1
+    ;;
+--reap)
+    if [ $# -ne 2 ] || ! valid_run "$2"; then usage; fi
+    reap "$2"
+    ;;
+*)
+    if [ $# -ne 1 ] || ! valid_run "$1"; then usage; fi
+    kill_runs "$1" 1
+    ;;
+esac

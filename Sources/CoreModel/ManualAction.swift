@@ -105,18 +105,29 @@ public final class BotComputerControl: @unchecked Sendable {
 
     /// The user starts driving. An open request becomes `taken`.
     public func take(_ bot: BotID) {
-        lock.withLock {
-            controlled.insert(bot)
+        let changed = lock.withLock {
+            let inserted = controlled.insert(bot).inserted
             if var request = requests[bot], request.state == .open {
                 request.state = .taken
                 requests[bot] = request
             }
+            return inserted
         }
+        if changed { postChanged(bot) }
     }
 
     /// Hands control back to the bot. The request stays until `dismiss`.
     public func release(_ bot: BotID) {
-        lock.withLock { _ = controlled.remove(bot) }
+        if lock.withLock({ controlled.remove(bot) != nil }) { postChanged(bot) }
+    }
+
+    /// `.botComputerControlChanged` after the lock is released, so observers may read this control.
+    private func postChanged(_ bot: BotID) {
+        NotificationCenter.default.post(
+            name: .botComputerControlChanged,
+            object: self,
+            userInfo: [BotHostNotificationKey.botID: bot]
+        )
     }
 
     /// One open request per bot: a second call returns the existing id and keeps its reason.
@@ -149,10 +160,11 @@ public final class BotComputerControl: @unchecked Sendable {
     }
 
     public func forget(_ bot: BotID) {
-        lock.withLock {
-            controlled.remove(bot)
+        let wasControlled = lock.withLock {
             requests[bot] = nil
+            return controlled.remove(bot) != nil
         }
+        if wasControlled { postChanged(bot) }
     }
 
     private func close(_ id: UUID, state: ManualActionState, note: String?) -> ManualActionRequest? {
@@ -178,8 +190,14 @@ public extension Notification.Name {
     static let botScreenshotPosted = Notification.Name("io.remotecode.bot.screenshot-posted")
     /// userInfo: `botID` BotID, `threadID` AgentThreadID?, `reason` String
     static let botMacExecutionRequested = Notification.Name("io.remotecode.bot.mac-execution-requested")
+    /// userInfo: `botID` BotID, `threadID` AgentThreadID. A rebuild that held the bot finished;
+    /// `threadID` is the send that queued meanwhile and now drains.
+    static let botVMRebuildReleased = Notification.Name("io.remotecode.bot.vm-rebuild-released")
     /// userInfo: `threadID` AgentThreadID. Posted after a manual-action take/resolve so every view model refreshes.
     static let manualActionStateChanged = Notification.Name("io.remotecode.bot.manual-action-state-changed")
+    /// object: the `BotComputerControl`; userInfo: `botID` BotID. Who drives that bot's computer
+    /// changed (Mac card, Mac screen toggle or `bot.guest.control`). Posted on the caller's thread.
+    static let botComputerControlChanged = Notification.Name("io.remotecode.bot.computer-control-changed")
 }
 
 public enum BotHostNotificationKey {

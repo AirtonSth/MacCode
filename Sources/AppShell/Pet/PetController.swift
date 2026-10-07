@@ -72,10 +72,6 @@ public final class PetController {
     private var activeThreadChromeFetchTask: Task<Void, Never>?
     /// True when the last progress republish reused cached chrome.
     private(set) var progressRepublishUsedCachedChromeForTesting = false
-    /// Local-LLM Live Activity descriptions, cached per card and debounced so a
-    /// chatty run does not ask the model to summarize every tool line.
-    private let liveActivitySummaries = LiveActivitySummaryStore()
-    private var liveActivitySummaryTask: Task<Void, Never>?
     private(set) var handledEventOutOfOrderForTests = false
     private(set) var handledEventCountForTests = 0
     private(set) var lastScheduledTransientMillisecondsForTests: Int64?
@@ -915,52 +911,13 @@ public final class PetController {
     }
 
     /// Push pet-identical copy to the remote Live Activity (active + needs you + completed).
-    ///
-    /// Publishes immediately with whatever description is already available, then
-    /// asks the on-device model for a better one in the background. The model is
-    /// never awaited here: `submitSurface` feeds a serialized delivery mailbox,
-    /// and an 8-second generation would stall every Live Activity update behind it.
     private func publishLiveActivitySurface() {
-        let base = PetLiveActivityCopy.Input(
+        let input = PetLiveActivityCopy.Input(
             active: model.activeThreads,
             needsYou: model.needsYouItems,
             completed: model.completedItems
         )
-        guard let source = LiveActivitySummary.source(for: base) else {
-            liveActivitySummaries.reset()
-            context.liveActivitySyncCoordinator.submitSurface(PetLiveActivityCopy.make(base))
-            return
-        }
-        let input = PetLiveActivityCopy.Input(
-            active: base.active,
-            needsYou: base.needsYou,
-            completed: base.completed,
-            summary: liveActivitySummaries.summary(for: source)
-        )
         context.liveActivitySyncCoordinator.submitSurface(PetLiveActivityCopy.make(input))
-        scheduleLiveActivitySummary(source: source, threadId: base.active.first?.threadID)
-    }
-
-    /// Generate off the publish path and republish only when the sentence is
-    /// new, so a slow or unavailable model costs the Lock Screen nothing.
-    private func scheduleLiveActivitySummary(
-        source: LiveActivitySummary.Source,
-        threadId: AgentThreadID?
-    ) {
-        guard liveActivitySummaries.shouldGenerate(for: source) else { return }
-        liveActivitySummaryTask?.cancel()
-        liveActivitySummaryTask = Task { [weak self] in
-            guard let self else { return }
-            let generated = await self.context.liveActivityDescriptionSummary(
-                source: source,
-                threadId: threadId
-            )
-            guard !Task.isCancelled, let generated else { return }
-            self.liveActivitySummaries.store(generated, for: source)
-            // Re-derive from live model state: the surface may have moved on
-            // while the model was thinking, and a stale republish would rewind it.
-            self.publishLiveActivitySurface()
-        }
     }
 
     private func attentionHydration(from snapshot: PetAttentionSnapshot) -> PetAttentionHydration {

@@ -31,7 +31,7 @@ The user's running RemoteCode (`io.remotecode.desktop`) is off-limits. A git wor
 - Create/enter a linked worktree, then edit, build, and test only there: `cd "$(scripts/isolated-sandbox.sh ensure)"`
 - Prove with `scripts/isolated-sandbox.sh test` (optional `--filter …`). Launch a second GUI only via `scripts/isolated-sandbox.sh run`.
 - Never `pkill -x RemoteCode`. Never `osascript` quit `io.remotecode.desktop`. Never `scripts/run-app.sh` (it packages the stable bundle id and quits the host). `script/build_and_run.sh` launches the debug sandbox app via `scripts/isolated-sandbox.sh`.
-- Do not install or overwrite `~/.local/bin/distill` from the sandbox. Leave Token Saver off on the debug instance.
+- Do not touch `~/.remote-code/bin` or `~/.local/bin/distill` from the sandbox; keep `RC2_DISABLE_MANAGED_DISTILL_RECONCILE=1`.
 - Identity, ports, and App Support live in `scripts/isolated-sandbox.sh`. Ritual: `.grok/skills/isolated-sandbox/SKILL.md`.
 
 ## macOS UI automation lease (mandatory)
@@ -55,55 +55,22 @@ The user's running RemoteCode (`io.remotecode.desktop`) is off-limits. A git wor
 - Reusing components is welcome and encouraged when it is done well. If two surfaces already show the same control (composer chips, popovers, bubbles, live-turn chrome, queued header), extract one component and mount it from both. Do not copy a second SwiftUI implementation just because the caller lives in another file.
 - "Well done" means the shared type owns the real look, copy, a11y, and behavior — not a lookalike fork, and not a wrapper that still paints its own capsule. Different products stay different (Desk editor placeholder, workspace-less Local execution, bot @mentions). Same control must stay one component.
 
-## Token Saver / Distill rules
+## Token Saver removed (2026-10-06)
 
-- **CRITICAL — Estimated save must never go down.** The user-facing Estimated save / thread-savings figure is a one-way ratchet. New Token Saver features or capabilities must **add** a positive leg (or leave the number unchanged). They must **never** lower the original calculation: no new caps, no smaller multipliers, no day-scoping that replaces permanent thread amort, no dropping cache/dialect/graphify/orchestration legs, no switching the chip from permanent `runs` to a short painted timeline. Forbidden examples that already shipped and must not return: capping amort at `todayMeasured × 200` (painted 2.6M instead of the lifetime stack), capping extra turns at `min(runs − 1, 50)`, scaling dialect/Graphify down by 4× measured or 12% billed, capping Week to avoid “fantasy,” using only visible timeline turns instead of `token_saver_thread_totals.runs`, dropping PATH-wrapper savings that arrived without `RC_TOKEN_SAVER_THREAD_ID`. Wraps must attribute `RC_TOKEN_SAVER_THREAD_ID` or fall back to `RC_REMOTE_CODE_SUBAGENT_THREAD_ID`; leftover empty thread ids still amortize in the unscoped bucket. Token Saver **off** still reports 0 — that is the feature being off, not a formula reduction. Prove any savings-math change with a test that the same ledger inputs produce a total **≥** the previous formula.
+- Token Saver was removed on 2026-10-06; do not reintroduce Distill compression, PATH wrappers, dialect injection, Graphify or the librarian without an owner decision.
+- The Distill agent provider is not Token Saver. Keep `DistillACP*`, `DistillParser`, `DistillRunner`, `DistillProvisioner`, `DistillAccounts*`, `DistillModelsConfig`, `DistillReasoningPolicy`, `DistillLiveStatus`, the `distill.accounts.*` RPCs, `cli.distill.path`, and the distill effort settings.
+- `RemoteCodeDistillService` stays as a product. Its non-Token-Saver modes stay: Chrome host, `subagent` telemetry (including the legacy `distill subagent` / `cli subagent` forms), Agent App middleware, provider proxy, `rc-computer-use-mcp`, the bot MCPs (`rc-bot-self-config`, `rc-bot-browser`, `rc-bot-web`, `rc-bot-computer`), and pass-through for leftover symlinks.
+- Provider account usage (quota rings, `agent.account.usage`) is a neutral feature, not Token Saver.
 
-### Token Saver counting algorithm (do not silently rewrite)
+### Legacy compatibility (do not delete)
 
-This is the product contract for the paying customer. The headline is a **counterfactual vs a bare agent** (no Distill pipes, no dialect, no Graphify, no Auto, full tool re-reads every later turn). It is labeled Estimated save. It is **not** an Anthropic/OpenAI invoice line and must not be relabeled as billed-only to shrink the number.
-
-**Ledger (measured floor).** Every delivered Distill replacement records `saved = TokenEstimator(original) − TokenEstimator(compressed)` on `token_saver_savings` with `delivered = 1`. Fail-open / verbatim / discarded-no-handle rows are `delivered = 0` and do not raise the thread chip. Permanent per-thread totals live in `token_saver_thread_totals` (`saved_tokens`, `runs`). PATH wraps and hooks must stamp `RC_TOKEN_SAVER_THREAD_ID`, else `RC_REMOTE_CODE_SUBAGENT_THREAD_ID`. Empty thread ids normalize to the `unscoped` bucket so they still amortize. Exact-output tools (`rg`, `cat`, …) and Distill fail-open do not save — they are zeros, not hidden positives.
-
-**Granted estimate (`TokenSaverBareUserEstimator`, formula `credible_v10`).** When Token Saver is on:
-
-```
-totalCredible = measuredPipes
-              + dialect
-              + graphify
-              + cacheAmortization
-              + orchestration
-```
-
-- **dialect** = outputTokens × (`dialectVerbosityMultiplier` − 1). Output tokens are `max(billed × outputShare, assistantChars / 4)` when billed units are known. Default output share is 0.007 (live share only after ≥ 8 stream samples). Grant the raw dialect. Do not scale it down by 4× measured or 12% of billed.
-- **graphify** (only if Graphify is runtime-active **and** the window has signals **and** billed is known) = `max(shareModel, avoidedExploration)` when answer tokens exist, else shareModel. Share intensity is `signalCount / 40` and is **not** clipped at 1.0. Do not take `min(share, avoided)` — that zeroed the leg. No signals → 0, not a preference-on invention.
-- **cacheAmortization** per thread = `permanentSaved × max(0, runs − 1)`, or `0.1 × cacheReadInputTokens` when that floor is larger. Extra turns are **never** capped (not 8, not 50). Today/Week sum this across threads that delivered in the window, using **permanent** `token_saver_thread_totals`, including `unscoped`. Do not substitute painted timeline turns, day-only SUM, or `todayMeasured × 200`.
-- **orchestration** = `0.25 × measured` when Auto is active on that surface. Footer includes it when Auto is on. Do not delete the leg.
-
-When Token Saver is **off**, estimate legs are 0. Measured rows may exist in the DB; the UI still reports 0 saved because the feature is deactivated.
-
-**Adding a capability** (new Distill mode, Graphify phase, cache signal, wrap catalog entry, provider) may only add a non-negative leg or leave totals unchanged for the same ledger inputs. Bump `TokenSaverDailyEconomyRepository.formulaVersion` when the stack changes so Week does not mix formulas. A new version must not produce a smaller total for the same inputs; prove that with a test.
-
-### Token Saver display (do not hide or shrink)
-
-- **Thread footer** (`AgentChatTokenSaverThreadFooter`) always shows after a finished Agent App / Bot Desk turn. Pending thread-switch snapshots stay nil (not a red flash). Off → red, copy `Token Saver: 0 tokens saved because Token Saver is deactivated`. On with measured 0 → yellow, copy `Token Saver: 0 tokens saved because something went wrong` (do not invent a green total from assistant text). On with measured > 0 → green, amount is `max(measured, totalCredible)` with copy `Token Saver: {N} tokens saved (tool output, shorter answers, multi-turn cache)` plus the Auto note when routing is on. English product copy; do not translate the chip.
-- **Today Estimated save** is the current-formula `total_credible` for today: day's measured pipes + dialect/graphify + **uncapped permanent-thread cache amort** (and unscoped). It must be allowed to exceed any historical day-measured cap. The sidebar provider split uses the same uncapped amort.
-- **Week** is Σ current-formula daily `total_credible` (stale-formula days fall back to measured pipes until recompute, never to a smaller invented cap).
-- Do not hide the footer when Token Saver is off or when measured is 0. Do not show another thread's savings. Do not paint Distill success when Distill failed open.
-
-Canonical code: `TokenSaverBareUserEstimator`, `TokenSaverSavingsRepository`, `TokenSaverDailyEconomyRepository`, `AgentAppView.tokenSaverThreadFooter*`, `TokenSaverThreadFooterReload`. Tests that lock this contract include `test_estimatedSavePath_neverCapsAmortAgainstDayMeasured`, `test_cacheAmortization_scalesWithTurnsUncapped`, `test_dialectAndGraphify_areGrantedRawWithoutUsageCeiling`, `test_deliveredRecordWithoutThreadId_amortizesInUnscopedBucket`.
-
-- Token Saver is the only paid token-economy feature. No Distill dialect injection, `| distill` PATH/wrappers, PostToolUse compression, prompt compression, or SR1 humanize may run while `tokenSaverEnabled` is false.
-- Never distill exact-output shell tools: the agent needs full stdout for line slices and matches. Skip `| distill` (and do not PATH-wrap) for raw `rg`/`grep`/`sed`/`awk`/`cat`/`head`/`tail`/`nl`/`cut`/`tr`/`diff`/`jq`/`yq` and `git grep|show|cat-file|blame`. Voluntary `rg … | distill "<question>"` is allowed when the last pipeline command is distill and the agent wants an extractive answer rather than every match line. Prefer distill for noisy builds, tests, logs, large listings, and summary-friendly git/CI output only.
-- Graphify is a Token Saver sub-capability. Host preflight, ensure/update, `RC_GRAPHIFY_*` injection, and query-first agent prompts must not run unless `tokenSaverEnabled && graphifyEnabled` (`AppSettings.isGraphifyRuntimeActive`). When Token Saver is off, fail open: no Graphify env, no ensure, no FSEvents watchers, no query-first nudge.
-- Token Saver must fail open for provider turns: if the local Distill sidecar is unavailable, over deadline, or rejects output, preserve the original provider input.
-- Never introduce Python, Rust, external headroom code, or an HTTP provider proxy for Token Saver. Prefer native Swift, Core ML/MLX, deterministic parsers, and explicit localhost endpoints.
-- ONNX Runtime C++ is fallback-only and needs an explicit benchmark/licensing decision before any dependency is added; Core ML/MLX remains the default native path.
-- Any lossy or truncating path must store the original before loss and attach a recoverable `[[rc:<handle>]]` marker; final assistant messages must strip unresolved handles before user-facing persistence.
-- `distill` CLI subcommands are reserved intentionally. Implement new subcommands explicitly; never let `stats`, `rank`, `wrap`, `retrieve`, or `dsl` fall through as compression prompts.
-- Distill **ledger rows** must be measured from TokenEstimator deltas or provider token-usage events, not raw character counts passed off as tokens. That honesty rule is the **measured floor**. It does not authorize stripping dialect / Graphify / cache amort / orchestration from Estimated save — those granted legs are defined in the counting algorithm section above.
-- Every Token Saver technique (compression hooks, sandbox network grants, PATH wrappers, ledger recording) must work uniformly across all three providers (Claude, Codex, Grok) and across every run shape: primary/top-level agents, same-provider subagents, and cross-provider nested subagents. Gate on a provider-neutral "Token Saver is admitted for this run" signal (e.g. `RC_TOKEN_SAVER_DISTILL_HINT`), never on a run-kind signal like "is this a subagent" — parent/telemetry identity markers (e.g. `RC_REMOTE_CODE_SUBAGENT_THREAD_ID`) are present on primary runs too and must not be mistaken for a subagent-only gate. Do not scope a fix to one provider or one run kind unless the underlying blocker is genuinely provider- or kind-specific — prove that with evidence before narrowing scope.
-- **Per-provider tool-output-rewrite ceiling (re-verified 2026-09-17 against the installed binaries; do not re-attempt without new upstream evidence):** Claude's CLI `PostToolUse` hook genuinely replaces tool output via `updatedToolOutput` before the model sees it, and it is wired in `ClaudeRunner.swift`. **Grok ≥ 1.0.34 (build 2026-09-16) also replaces built-in tool output from a settings-file `PostToolUse` hook** via `updatedToolOutput`, validated against the ran tool's serialized output shape (`{"type":"ReadFile","FileContent":{…}}`, `ListDir`, `WebFetch`); MCP tool output passes through un-checked, the replacement cap is 64K characters, and mismatch keeps the original. Hooks registered through the grok-agent-sdk can only add `additionalContext`, so the replacement hook must stay a `$GROK_HOME/hooks/*.json` settings-file hook — that lane is wired in `AgentSkillInstaller.installGrokPostToolUseHook`, and only shapes verified end to end may be added to `ManagedDistillCLI.grokReplaceableShapes` (shell `Bash`, search `GrepSearch`, and mutation `EditsApplied` results still fail open). Codex 0.154.0 remains the only provider that cannot rewrite tool output: its `PostToolUseHookSpecificOutputWire` carries only `hookEventName` / `additionalContext` / `updatedMCPToolOutput`, and the dispatcher rejects `updatedMCPToolOutput` as unsupported — so for Codex the PATH-command-wrapper catalog (`WrappedCommandCatalog.commands`, `Sources/CoreModel/`) and the PreToolUse `updatedInput` command rewrite remain the levers that actually replace tool output. Keep the wrapper catalog as complete as safely possible (matching the categories already endorsed in the voluntary `| distill` prompt hint: package managers, build tools, test runners, linters, containers/IaC), never adding a command that needs byte-exact stdout (see the exact-output rule above). Re-verify each provider's ceiling directly against its current binary before adding a new rewrite lane.
+- `AssistantEvent` cases `.sr1Translation` and `.itemHostMetadata` stay decode-only: stored events are decoded strictly, so removing a case breaks `agent.thread.read` for old threads.
+- `ManagedProcessKind` cases `.sidecar` and `.graphify` stay: the process-ownership ledger decodes the whole tag array, and an unknown case blocks provider admission.
+- Tables `rc_reversible_content`, `agent_item_host_attestations` and `shared_memory_blocks` stay in use. Never edit historical `SchemaStep`s. Former Token Saver tables stay dormant (no drop migration).
+- Treaty cases `.tokenSaverDigest`, `.graphifyThreadRoots` and `.agentSR1Translation` stay (deprecated) until iOS bumps its treaty pin. The `token_saver.digest.get` RPC stays as a stub answering `{"enabled": false}` until then.
+- `DistillAppliedReceipt.strip` stays so legacy `[[rcd:…]]` markers never render raw.
+- `RC2_DISABLE_MANAGED_DISTILL_RECONCILE` stays: it keeps the sandbox app and the scheduled-task agent away from the user's `~/.remote-code/bin`.
+- For one release: the `RC_TOKEN_SAVER_*` fallbacks in the subagent telemetry scope and `RC2CLI`, `"mcp"` in the process sweeper's distill MCP argv modes, and a fail-open `distill hook` no-op for stale Grok hooks.
 
 ## macOS crash / long-running terminal diagnostics
 

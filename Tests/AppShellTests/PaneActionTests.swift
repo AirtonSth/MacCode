@@ -634,7 +634,14 @@ final class PaneActionTests: XCTestCase {
         try ctx.apply(.addSurface(workspaceID, paneID: nil, descriptor: descriptor))
         let controller = MainWindowController(context: ctx, router: router)
         router.windowController = controller
+        // PF-13: refreshBusyStates skips panes whose window is not visible, so the
+        // in-place spinner contract is about an on-screen window. Show it (no input).
+        controller.window.animationBehavior = .none
+        controller.window.orderFront(nil)
+        defer { controller.window.orderOut(nil) }
         drainMainQueue()
+        XCTAssertTrue(controller.window.isVisible,
+                      "the busy refresh contract below applies to a visible main window")
         let paneRoot = {
             controller.window.contentView?.layoutSubtreeIfNeeded()
             return self.allSubviews(of: controller.window.contentView ?? NSView()).first { $0 is PaneRootView }
@@ -1591,6 +1598,47 @@ final class PaneActionTests: XCTestCase {
                        "the newly selected surface content must be the visible one")
     }
 
+    func test_detachedWorkspaceWindowRefreshKeepsHiddenTabMounted() throws {
+        // WHY (PF-11): any full shell refresh (sidebar, rename, run state)
+        // also refreshes detached workspace windows. Tearing their panes down
+        // unmounted the previously selected tab, and the hidden terminal was
+        // then parked in an offscreen window instead of staying mounted.
+        let (ctx, router) = try makeContext()
+        let detached = try router.createWorkspace(name: "detached-refresh", cwd: NSTemporaryDirectory())
+        guard case .pane(let initialPane) = detached.layout,
+              let firstSurfaceID = initialPane.surfaces.first?.id else {
+            return XCTFail("expected a single-pane workspace with a default surface")
+        }
+        let second = try router.createSurface(
+            workspace: detached.id,
+            type: .terminal,
+            paneID: initialPane.id,
+            title: "terminal-refresh"
+        )
+        try router.focusSurface(workspace: detached.id, surface: second.id)
+        _ = try router.createWorkspace(name: "main-refresh", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        controller.openWorkspaceInNewWindow(detached.id)
+        defer { controller.workspaceWindow(for: detached.id)?.orderOut(nil) }
+        let detachedWindow = try XCTUnwrap(controller.workspaceWindow(for: detached.id))
+        detachedWindow.contentView?.layoutSubtreeIfNeeded()
+
+        try router.focusSurface(workspace: detached.id, surface: firstSurfaceID)
+        controller.refreshFromState()
+        controller.flushPendingRefresh()
+        drainMainQueue()
+
+        let content = try XCTUnwrap(detachedWindow.contentView)
+        let secondSurfaceView = try XCTUnwrap(SurfaceRegistry.shared.surface(second.id)?.view)
+        let firstSurfaceView = try XCTUnwrap(SurfaceRegistry.shared.surface(firstSurfaceID)?.view)
+        XCTAssertTrue(secondSurfaceView.isDescendant(of: content),
+                      "a full refresh must keep the previously selected tab mounted in the detached window")
+        XCTAssertTrue(secondSurfaceView.isHidden)
+        XCTAssertTrue(firstSurfaceView.isDescendant(of: content))
+        XCTAssertFalse(firstSurfaceView.isHidden)
+    }
+
     func test_backButtonFromWorkspaceWindowReturnsToMainSidebarWithoutClosingAppWindow() throws {
         let (ctx, router) = try makeContext()
         let detached = try router.createWorkspace(name: "detached-back", cwd: NSTemporaryDirectory())
@@ -1696,9 +1744,11 @@ final class PaneActionTests: XCTestCase {
         vm.setDiffIgnoreWhitespace(true)
         vm.setCodexPath("/usr/bin/env")
         vm.setClaudePath("/usr/bin/env")
-        AgentCustomModelStore(repo: ctx.settingsRepo).add("gpt-5.5-experimental", provider: .codex)
+        // Custom model IDs are edited only for selectable providers (Distill-only);
+        // legacy providers are read-only and no longer listed in Settings.
+        AgentCustomModelStore(repo: ctx.settingsRepo).add("distill-experimental", provider: .distill)
         vm.reload()
-        vm.setCustomModel(provider: .codex, index: 0, value: "gpt-5.5-custom")
+        vm.setCustomModel(provider: .distill, index: 0, value: "distill-custom")
 
         let reloaded = SettingsViewModel(context: ctx)
         XCTAssertTrue(reloaded.appSettings.diffWordWrap,
@@ -1711,11 +1761,11 @@ final class PaneActionTests: XCTestCase {
                        "Settings must expose and persist the executable path used to launch Claude")
         XCTAssertTrue(reloaded.codexAvailable && reloaded.claudeAvailable,
                       "valid configured CLI paths must be reflected in diagnostics")
-        XCTAssertEqual(reloaded.customModelsByProvider[.codex], ["gpt-5.5-custom"],
+        XCTAssertEqual(reloaded.customModelsByProvider[.distill], ["distill-custom"],
                        "Settings must edit custom model IDs saved from the Agent model menu so they persist until explicitly removed")
 
-        reloaded.removeCustomModel(provider: .codex, index: 0)
-        XCTAssertEqual(SettingsViewModel(context: ctx).customModelsByProvider[.codex], [],
+        reloaded.removeCustomModel(provider: .distill, index: 0)
+        XCTAssertEqual(SettingsViewModel(context: ctx).customModelsByProvider[.distill], [],
                        "Settings must remove custom model IDs instead of leaving stale rows in future Agent model menus")
     }
 

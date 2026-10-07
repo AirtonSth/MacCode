@@ -1233,7 +1233,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 147)
+        XCTAssertEqual(canonical.count, 167)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -1340,6 +1340,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             "workspace.create", "window.create", "agent.thread.create",
             "agent.provider.update", "notification.create",
             "bot.create", "bot.scheduler.tick", "bot.self_config",
+            "distill.accounts.cancel",
         ]
         var covered: Set<String> = []
         var probeCount = 0
@@ -1359,7 +1360,10 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             for (index, probe) in probes.enumerated() {
                 probeCount += 1
                 var params = probe.params
-                params["client_request_id"] = .string("preflight-\(method)-\(index)")
+                // Request ids admit only [A-Za-z0-9_-]; dotted method names would
+                // trip the -32097 identity gate before syntactic preflight runs.
+                let requestMethod = method.replacingOccurrences(of: ".", with: "-")
+                params["client_request_id"] = .string("preflight-\(requestMethod)-\(index)")
                 params["connection_id"] = .string("phase4-connection")
                 params["expected_host_id"] = .string("phase4-host")
                 params["expected_boot_epoch"] = .number(1)
@@ -1465,7 +1469,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         for (name, params) in admitted {
             var uniqueParams = params
             if uniqueParams["client_request_id"] as? String == "gate-valid" {
-                uniqueParams["client_request_id"] = "gate-\(name)"
+                uniqueParams["client_request_id"] = "gate-\(name.replacingOccurrences(of: " ", with: "-"))"
             }
             let response = try await live.rpc(
                 method: "agent.message.send",
@@ -3035,6 +3039,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             ("bot.routine.run", ["bot_id": botID, "routine_id": routineID], "bot.routine.run_requested"),
             ("bot.conversation.select", ["bot_id": botID, "conversation_id": conversationID], "bot.conversation.selected"),
             ("bot.delete", ["bot_id": botID], "bot.deleted"),
+            ("bot.guest.control", ["bot_id": botID, "action": "take"], "bot.guest.updated"),
         ]
 
         for (index, testCase) in cases.enumerated() {
@@ -3637,7 +3642,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         let manifestKinds = Set(mutations.flatMap { $0["eventKinds"] as? [String] ?? [] })
         let treatyKinds = Set(RemoteCodeEventKind.allCases.map(\.rawValue))
 
-        XCTAssertEqual(treatyKinds.count, 144)
+        XCTAssertEqual(treatyKinds.count, 150)
         XCTAssertTrue(
             manifestKinds.isSubset(of: treatyKinds),
             "Treaty is missing manifest kinds: \(manifestKinds.subtracting(treatyKinds).sorted())"

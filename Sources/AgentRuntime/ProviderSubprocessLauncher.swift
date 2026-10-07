@@ -4,7 +4,7 @@ import CoreModel
 /// The only supported construction path for a provider agent subprocess.
 ///
 /// Keeping environment construction and run-as-user rewriting here makes the
-/// Token Saver receipt and provider identity part of the launch contract rather
+/// host scope and provider identity part of the launch contract rather
 /// than a convention repeated by each provider adapter.
 public enum ProviderSubprocessLauncher {
     public static func makeProcess(

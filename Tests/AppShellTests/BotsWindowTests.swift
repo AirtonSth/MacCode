@@ -3,7 +3,6 @@ import XCTest
 import SwiftUI
 import CoreModel
 @testable import AgentRuntime
-@testable import DistillCore
 @testable import AppShell
 @testable import Persistence
 import SocketServer
@@ -392,21 +391,13 @@ final class BotsWindowTests: XCTestCase {
         )
         XCTAssertTrue(human.contains("[Image #1]"))
         XCTAssertTrue(human.contains("[Image #2]"))
-        let rcw1 = AgentChatTokenSaverDisplayMode.userMessageDisplayText(
-            human: human,
-            wireRequest: "RCW1\tQ\t1\nG\tCompare\n.\n",
-            mode: .rcw1
-        )
-        XCTAssertTrue(rcw1.contains("[Image #1]"))
-        XCTAssertTrue(rcw1.contains("[Image #2]"))
     }
 
-    func test_deskSendFailOpenLeavesOriginalPrompt_whenTokenSaverIsOff() async throws {
-        // WHY: Token Saver off must not inject Distill into a Bot turn. The
-        // compiled payload is the original provider input.
+    func test_deskSendLeavesOriginalPromptWithoutTokenSaverKeys() async throws {
+        // WHY: Token Saver was removed; a Bot turn must carry the original
+        // provider input and no Distill admission.
         let context = try makeContext()
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        context.reconcileManagedIntegration()
         let router = AppCommandRouter(context: context)
         context.router = router
         let runner = ControlledBotHandoffRunner(provider: .grok)
@@ -437,38 +428,17 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(request.prompt.contains("FAIL-OPEN-BOT-PROMPT"))
         XCTAssertNil(
             request.environment["RC_TOKEN_SAVER_DISTILL_HINT"],
-            "Token Saver off must not admit Distill on a bot provider turn"
+            "a bot provider turn must not admit Distill"
         )
         XCTAssertNil(request.environment["RC_TOKEN_SAVER_POST_TOOL_USE"])
     }
 
-    func test_deskSendAdmitsTokenSaverWhenEnabled_andRestoreHydratesWireRequest() async throws {
-        // WHY: workspace-less bot threads used to deny wire-encode with
-        // missing_project_scope, so Human/RCW1 never hydrated. Desk send must
-        // admit Distill through the real send() → sendAgentMessage path.
+    func test_deskSendPersistsHumanUserRowAndColdRestoreKeepsIt() async throws {
+        // WHY: the provider gets the compiled Bot brain, but the transcript must
+        // keep the teammate's own words. A real send() must persist the human
+        // row under the run id first, keep it out of the canonical seed, and a
+        // cold restore must show that human text, never the brain envelope.
         let context = try makeContext()
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
-        let configuration = try DistillServiceConfiguration(
-            authToken: "bot-desk-wire-token",
-            appSupportDirectory: directory
-        )
-        let scheduler = DistillScheduler(
-            runtime: LocalDistillRuntime(),
-            maxConcurrentRequests: 2
-        )
-        let server = DistillHTTPServer(
-            configuration: configuration,
-            scheduler: scheduler,
-            scopedRecoveryStore: DeskTokenSaverRecoveryStore(db: context.db)
-        )
-        let ready = try await server.start()
-        defer { server.stop() }
-        context.distillClientOverrideForTesting = DistillServiceClient(
-            ready: ready,
-            authToken: "bot-desk-wire-token"
-        )
-
         let router = AppCommandRouter(context: context)
         context.router = router
         let runner = ControlledBotHandoffRunner(provider: .grok)
@@ -491,39 +461,15 @@ final class BotsWindowTests: XCTestCase {
             model: "grok-4.6",
             routingMode: .manual
         )
-        let longPrompt = String(
-            repeating: "A verbose English bot instruction that Token Saver should compact on an admitted Desk turn. ",
-            count: 90
-        )
-        XCTAssertGreaterThan(TokenEstimator.estimate(longPrompt), 80)
-        vm.composerText = longPrompt
+        let humanText = "Summarize the overnight build failures for the team."
+        vm.composerText = humanText
         XCTAssertTrue(vm.send())
         let started = await waitUntil(timeout: 8) { !runner.requests.isEmpty }
         XCTAssertTrue(started, "Desk send must reach the provider runner")
         let request = try XCTUnwrap(runner.requests.first)
-        XCTAssertEqual(
-            request.environment["RC_TOKEN_SAVER_DISTILL_HINT"],
-            "1",
-            "Token Saver on must admit Distill env on a bot provider turn"
-        )
         let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
         let persisted = try XCTUnwrap(context.threadRepo.get(id: threadID))
         XCTAssertNil(persisted.workspaceId, "bot threads must stay off Agent App workspace rails")
-        let denials = try context.db.prepare("""
-            SELECT object_id FROM token_saver_audit_events
-            WHERE event_kind = 'token_saver_denial' AND thread_id = ?;
-            """)
-        try denials.bind(1, threadID.value.uuidString)
-        var deniedReasons: [String] = []
-        while try denials.step() {
-            if let reason = denials.columnText(0) {
-                deniedReasons.append(reason)
-            }
-        }
-        XCTAssertFalse(
-            deniedReasons.contains("missing_project_scope"),
-            "bot-linked threads must have an exact Token Saver scope; denials=\(deniedReasons)"
-        )
         XCTAssertTrue(
             request.prompt.contains("User request:"),
             "Desk still compiles the Bot brain around the user turn"
@@ -537,18 +483,16 @@ final class BotsWindowTests: XCTestCase {
         let hydrated = await waitUntil(timeout: 5) {
             vm.selectDeskThread(conversationID)
             return vm.deskMessages.contains {
-                $0.role == .user && $0.tokenSaverWireRequest != nil
+                $0.role == .user && $0.agentMessageID?.value == request.runId.value
             }
         }
-        XCTAssertTrue(hydrated, "restore must hydrate the persisted RCW1 request onto the Desk user row")
+        XCTAssertTrue(hydrated, "restore must show the persisted human row for this run")
         let user = try XCTUnwrap(vm.deskMessages.first { $0.role == .user })
-        let wireRequest = try XCTUnwrap(user.tokenSaverWireRequest)
-        XCTAssertTrue(RCWireProtocol.isWire(wireRequest))
-        XCTAssertFalse(
-            RCWireProtocol.isWire(user.text),
-            "Desk Human must keep the teammate line, not the provider-bound wire"
+        XCTAssertTrue(
+            user.text.contains(humanText),
+            "Desk must keep the teammate line, not the provider-bound envelope"
         )
-        XCTAssertTrue(user.text.contains("verbose English bot instruction"))
+        XCTAssertFalse(user.text.contains("User request:"))
         XCTAssertEqual(user.agentMessageID?.value, request.runId.value)
 
         let cold = BotsViewModel(context: context, router: router)
@@ -556,69 +500,14 @@ final class BotsWindowTests: XCTestCase {
         cold.selectDeskThread(conversationID)
         let restored = try XCTUnwrap(cold.deskMessages.first { $0.role == .user })
         XCTAssertEqual(restored.agentMessageID?.value, request.runId.value)
-        XCTAssertFalse(
-            RCWireProtocol.isWire(restored.text),
-            "cold restore must keep Human bytes, not the provider-bound wire"
+        XCTAssertTrue(
+            restored.text.contains(humanText),
+            "cold restore must keep the human text"
         )
         XCTAssertFalse(
             restored.text.contains("You are Piper"),
             "cold restore must not surface the compiled brain envelope"
         )
-        let coldWire = try XCTUnwrap(restored.tokenSaverWireRequest)
-        XCTAssertTrue(RCWireProtocol.isWire(coldWire))
-        XCTAssertEqual(coldWire, wireRequest)
-    }
-
-    func test_deskFooterCalculatorMatchesAgentApp_onIdenticalInputs() {
-        // WHY: Desk figures must be the Agent App calculator, not a second formula.
-        let observation = TokenSaverThreadFooterReload.Observation(
-            assistantChars: 80_000,
-            turnCount: 6,
-            cacheReadInputTokens: 12_000,
-            providerRawTokens: 9_000,
-            providerBilledTokenUnits: 9_500,
-            autoRoutingActive: false
-        )
-        let snapshot = TokenSaverThreadFooterReload.snapshot(
-            measuredDelivered: 4_000,
-            eligible: true,
-            graphifyActive: false,
-            observation: observation
-        )
-        XCTAssertEqual(
-            snapshot.displayTokens,
-            AgentAppView.tokenSaverThreadFooterDisplayTokens(
-                measuredDelivered: 4_000,
-                assistantChars: 80_000,
-                tokenSaverEnabled: true,
-                graphifyActive: false,
-                turnCount: 6,
-                cacheReadInputTokens: 12_000,
-                providerRawTokens: 9_000,
-                providerBilledTokenUnits: 9_500,
-                autoRoutingActive: false
-            )
-        )
-        let context = try? makeContext()
-        XCTAssertNotNil(context)
-        if let context {
-            let vm = BotsViewModel(context: context)
-            XCTAssertNil(vm.tokenSaverFooterTextForTesting())
-            XCTAssertFalse(vm.tokenSaverFooterEnabled)
-            XCTAssertFalse(vm.tokenSaverFooterSnapshotReady)
-            vm.applyTokenSaverFooterSnapshotForTesting(
-                TokenSaverThreadFooterReload.Snapshot(
-                    enabled: false,
-                    measuredTokens: 0,
-                    displayTokens: 0
-                )
-            )
-            XCTAssertEqual(
-                vm.tokenSaverFooterTextForTesting(),
-                "Token Saver: 0 tokens saved because Token Saver is deactivated"
-            )
-            XCTAssertEqual(vm.deskTokenSaverFooterPresentation, .deactivated)
-        }
     }
 
     func test_deskRestoreRebuildsImageMarkersFromCompiledPayload() throws {
@@ -665,266 +554,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(user.text.contains("Look at this"))
         XCTAssertFalse(user.text.contains("You are Piper"))
         XCTAssertEqual(user.agentMessageID != nil, true)
-    }
-
-    func test_tokenSaverTurnMappingFailsClosedOnDuplicateTurnIds() throws {
-        // WHY: Agent App refuses to lend RCW1 to a live turn when the turn id
-        // is ambiguous. Desk must not pick the first duplicate.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let turn = "turn-shared"
-        let first = BotDeskMessage(
-            role: .assistant,
-            text: "first",
-            agentMessageID: AgentMessageID(),
-            tokenSaverOriginal: "RCW1\tA\t1\nO\tfirst\n.\n",
-            tokenSaverTurnId: turn
-        )
-        let second = BotDeskMessage(
-            role: .assistant,
-            text: "second",
-            agentMessageID: AgentMessageID(),
-            tokenSaverOriginal: "RCW1\tA\t1\nO\tsecond\n.\n",
-            tokenSaverTurnId: turn
-        )
-        vm.replaceDeskMessagesForTesting([first, second])
-        XCTAssertNil(vm.tokenSaverMessage(forTurnId: turn))
-        vm.replaceDeskMessagesForTesting([first])
-        XCTAssertEqual(vm.tokenSaverMessage(forTurnId: turn)?.text, "first")
-    }
-
-    func test_clearAllDeskThreadsHidesTokenSaverFooter() throws {
-        // WHY: deleting every conversation must not leave the previous thread's
-        // savings chip on an empty Desk.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let bot = try vm.create(name: "Piper", title: "Scout")
-        vm.openDesk(bot)
-        vm.applyTokenSaverFooterSnapshotForTesting(
-            TokenSaverThreadFooterReload.Snapshot(
-                enabled: true,
-                measuredTokens: 12_500,
-                displayTokens: 12_500
-            )
-        )
-        XCTAssertNotNil(vm.tokenSaverFooterTextForTesting())
-        vm.clearAllDeskThreads()
-        XCTAssertFalse(vm.tokenSaverFooterEnabled)
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
-        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, 0)
-        XCTAssertNil(vm.tokenSaverFooterTextForTesting())
-    }
-
-    func test_switchingWarmCachedBotsResetsTokenSaverFooter() throws {
-        // WHY: a subscribed user must not keep bot A's savings chip after a
-        // warm-cache switch to bot B that skips restoreDeskMessages.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let alpha = try vm.create(name: "Alpha", title: "A")
-        let beta = try vm.create(name: "Beta", title: "B")
-        let threadA = AgentThread(title: "alpha-thread", provider: .codex, model: "test")
-        let threadB = AgentThread(title: "beta-thread", provider: .codex, model: "test")
-        try context.threadRepo.upsert(threadA)
-        try context.threadRepo.upsert(threadB)
-        try context.messageRepo.append(AgentMessage(threadId: threadA.id, role: .user, content: "hello alpha"))
-        try context.messageRepo.append(AgentMessage(threadId: threadB.id, role: .user, content: "hello beta"))
-        try context.botStore.upsertConversation(BotConversation(
-            botID: alpha.id,
-            title: "Alpha chat",
-            linkedAgentThreadID: threadA.id
-        ))
-        try context.botStore.upsertConversation(BotConversation(
-            botID: beta.id,
-            title: "Beta chat",
-            linkedAgentThreadID: threadB.id
-        ))
-        vm.openDesk(alpha)
-        XCTAssertFalse(vm.deskMessages.isEmpty, "alpha cache must be warm")
-        vm.applyTokenSaverFooterSnapshotForTesting(
-            TokenSaverThreadFooterReload.Snapshot(
-                enabled: true,
-                measuredTokens: 8_000,
-                displayTokens: 8_000
-            )
-        )
-        XCTAssertNotNil(vm.tokenSaverFooterTextForTesting())
-        vm.openDesk(beta)
-        XCTAssertFalse(vm.tokenSaverFooterEnabled)
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
-        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, 0)
-        XCTAssertNil(vm.tokenSaverFooterTextForTesting())
-        vm.applyTokenSaverFooterSnapshotForTesting(
-            TokenSaverThreadFooterReload.Snapshot(
-                enabled: true,
-                measuredTokens: 3_000,
-                displayTokens: 3_000
-            )
-        )
-        vm.openDesk(alpha)
-        XCTAssertFalse(vm.tokenSaverFooterEnabled)
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
-        XCTAssertNil(vm.tokenSaverFooterTextForTesting())
-    }
-
-    func test_switchingBotsPublishesOnlyTheSelectedThreadLedger() async throws {
-        // WHY: after the immediate reset, the async reload must publish the
-        // selected thread's measured savings, never the previous bot's.
-        let context = try makeContext()
-        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
-        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
-            accessToken: "token",
-            refreshToken: "refresh",
-            user: PrivateAccountUser(
-                daysRemaing: nil,
-                daysRemaining: 30,
-                email: "paid@example.com",
-                id: "paid-user",
-                subscribed: true
-            )
-        ))
-        let vm = BotsViewModel(context: context)
-        let alpha = try vm.create(name: "Alpha", title: "A")
-        let beta = try vm.create(name: "Beta", title: "B")
-        let threadA = AgentThread(title: "alpha-thread", provider: .codex, model: "test")
-        let threadB = AgentThread(title: "beta-thread", provider: .codex, model: "test")
-        try context.threadRepo.upsert(threadA)
-        try context.threadRepo.upsert(threadB)
-        try context.messageRepo.append(AgentMessage(threadId: threadA.id, role: .user, content: "hello alpha"))
-        try context.messageRepo.append(AgentMessage(threadId: threadB.id, role: .user, content: "hello beta"))
-        try context.botStore.upsertConversation(BotConversation(
-            botID: alpha.id,
-            title: "Alpha chat",
-            linkedAgentThreadID: threadA.id
-        ))
-        try context.botStore.upsertConversation(BotConversation(
-            botID: beta.id,
-            title: "Beta chat",
-            linkedAgentThreadID: threadB.id
-        ))
-        try context.tokenSaverSavingsRepo.record(
-            provider: "codex",
-            mode: "command-output",
-            inputTokens: 9_000,
-            outputTokens: 1_000,
-            delivered: true,
-            threadID: threadA.id.value.uuidString
-        )
-        try context.tokenSaverSavingsRepo.record(
-            provider: "codex",
-            mode: "command-output",
-            inputTokens: 4_000,
-            outputTokens: 1_000,
-            delivered: true,
-            threadID: threadB.id.value.uuidString
-        )
-        vm.openDesk(alpha)
-        await vm.awaitTokenSaverFooterReloadForTesting()
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 8_000)
-        vm.openDesk(beta)
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0, "switch must hide the previous bot immediately")
-        await vm.awaitTokenSaverFooterReloadForTesting()
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 3_000)
-        vm.openDesk(alpha)
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
-        await vm.awaitTokenSaverFooterReloadForTesting()
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 8_000)
-    }
-
-    func test_switchingDeskThreadsDropsPreviousThreadObservation() async throws {
-        // WHY: selectDeskThread used to reload the footer before restoring the
-        // new thread's live timeline, so thread B could inherit thread A's
-        // cache/turn observation and inflate the displayed savings figure.
-        let context = try makeContext()
-        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
-        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
-            accessToken: "token",
-            refreshToken: "refresh",
-            user: PrivateAccountUser(
-                daysRemaing: nil,
-                daysRemaining: 30,
-                email: "paid@example.com",
-                id: "paid-user",
-                subscribed: true
-            )
-        ))
-        let vm = BotsViewModel(context: context)
-        let bot = try vm.create(name: "Piper", title: "Scout")
-        let threadA = AgentThread(title: "thread-a", provider: .codex, model: "test")
-        let threadB = AgentThread(title: "thread-b", provider: .codex, model: "test")
-        try context.threadRepo.upsert(threadA)
-        try context.threadRepo.upsert(threadB)
-        try context.messageRepo.append(AgentMessage(threadId: threadA.id, role: .user, content: "alpha"))
-        try context.messageRepo.append(AgentMessage(threadId: threadB.id, role: .user, content: "beta"))
-        let conversationA = BotConversation(
-            botID: bot.id,
-            title: "Alpha",
-            linkedAgentThreadID: threadA.id
-        )
-        let conversationB = BotConversation(
-            botID: bot.id,
-            title: "Beta",
-            linkedAgentThreadID: threadB.id
-        )
-        try context.botStore.upsertConversation(conversationA)
-        try context.botStore.upsertConversation(conversationB)
-        try context.tokenSaverSavingsRepo.record(
-            provider: "codex",
-            mode: "command-output",
-            inputTokens: 9_000,
-            outputTokens: 1_000,
-            delivered: true,
-            threadID: threadA.id.value.uuidString
-        )
-        try context.tokenSaverSavingsRepo.record(
-            provider: "codex",
-            mode: "command-output",
-            inputTokens: 4_000,
-            outputTokens: 1_000,
-            delivered: true,
-            threadID: threadB.id.value.uuidString
-        )
-        vm.openDesk(bot)
-        vm.selectDeskThread(conversationA.id)
-        await vm.awaitTokenSaverFooterReloadForTesting()
-        var fat = AssistantTimelineState()
-        fat.tokenUsage = AssistantTokenUsage(
-            inputTokens: 80_000,
-            outputTokens: 1_000,
-            totalTokens: 81_000,
-            cacheReadInputTokens: 70_000
-        )
-        vm.replaceDeskLiveTimelineForTesting(fat)
-        vm.selectDeskThread(conversationB.id)
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 0)
-        await vm.awaitTokenSaverFooterReloadForTesting()
-        XCTAssertEqual(vm.tokenSaverThreadMeasuredTokens, 3_000)
-        let expected = AgentAppView.tokenSaverThreadFooterDisplayTokens(
-            measuredDelivered: 3_000,
-            assistantChars: vm.deskMessages.filter { $0.role == .assistant }.reduce(0) { $0 + $1.text.utf8.count },
-            tokenSaverEnabled: true,
-            graphifyActive: false,
-            turnCount: max(vm.deskLiveTimeline.turns.count, vm.deskMessages.filter { $0.role == .user }.count),
-            cacheReadInputTokens: vm.deskLiveTimeline.tokenUsage?.cacheReadInputTokens ?? 0,
-            providerRawTokens: {
-                guard let usage = vm.deskLiveTimeline.tokenUsage else { return 0 }
-                return max(0, usage.inputTokens) + max(0, usage.outputTokens)
-            }(),
-            providerBilledTokenUnits: vm.deskLiveTimeline.tokenUsage.map(\.billedTotalTokenUnits).flatMap { $0 > 0 ? $0 : nil },
-            autoRoutingActive: false
-        )
-        XCTAssertEqual(vm.tokenSaverThreadSavedTokens, expected)
-        let inflated = AgentAppView.tokenSaverThreadFooterDisplayTokens(
-            measuredDelivered: 3_000,
-            assistantChars: 0,
-            tokenSaverEnabled: true,
-            graphifyActive: false,
-            turnCount: 1,
-            cacheReadInputTokens: 70_000,
-            providerRawTokens: 81_000,
-            providerBilledTokenUnits: nil,
-            autoRoutingActive: false
-        )
-        XCTAssertNotEqual(expected, inflated, "B must not inherit A's cache observation")
     }
 
     func test_hostCatalogBotSendUsesTheFullDeskBrainPipeline() async throws {
@@ -2114,6 +1743,51 @@ final class BotsWindowTests: XCTestCase {
             vm.deskWorkingLabel(now: started.addingTimeInterval(9)),
             AgentWorkingStripPresentation.label(phase: .thinking, elapsedSeconds: 9)
         )
+    }
+
+    func test_groupMemberRunCountsForBotWideStopButNeverReachesTheDesk() throws {
+        // WHY (T1 decision): bot-wide Stop and delete must reach the bot's
+        // room turn, so a member-thread run counts as the bot's live run. The
+        // member conversation is still hidden plumbing: it never shows on the
+        // desk, does not make the desk look busy, and a desk send cannot
+        // target it (that would bypass the group's sequential turns).
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let group = try context.botStore.createGroup(
+            title: "Launch room",
+            roomThreadID: AgentThreadID(),
+            participantBotIDs: [bot.id]
+        )
+        var member = try XCTUnwrap(context.botStore.listGroupMemberConversations(groupID: group.id).first)
+        let thread = AgentThread(title: "Launch room", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ))
+        member.linkedAgentThreadID = thread.id
+        try context.botStore.upsertConversation(member)
+
+        XCTAssertTrue(vm.hasLiveRun(botID: bot.id), "bot-wide stop must see the room turn")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.conversations.isEmpty)
+        XCTAssertFalse(vm.deskRunIsLive)
+        XCTAssertThrowsError(try vm.enqueueHostMessage(
+            botID: bot.id,
+            text: "hi",
+            conversationID: member.id,
+            routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        )) { error in
+            guard case BotStoreError.notFound = error else {
+                return XCTFail("expected notFound for a member conversation, got \(error)")
+            }
+        }
     }
 
     func test_deskReplaysStreamEventsOnOpen_becauseThinkingMustSurviveClose() throws {
@@ -8046,7 +7720,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNil(vm.resolvedProvider(for: bot))
     }
 
-    func test_distillACPBotDeskSendAndReopenUsesPersistedSessionWithTokenSaverOff() async throws {
+    func test_distillACPBotDeskSendAndReopenUsesPersistedSession() async throws {
         // WHY: Bot Desk must run through Distill ACP, preserve the conversation on reopen, and keep compression off.
         let root = URL(fileURLWithPath: directory, isDirectory: true)
             .appendingPathComponent("distill-bot-acp-\(UUID().uuidString)", isDirectory: true)
@@ -8089,7 +7763,15 @@ final class BotsWindowTests: XCTestCase {
                 meta = params.get("_meta", {})
                 record({"method":method,"sessionId":params.get("sessionId"),"modelId":meta.get("modelId")})
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":params.get("sessionId", "bot-distill-session"),"models":{"availableModels":[{"modelId":"gpt-6-luna","name":"GPT-6 Luna"}],"currentModelId":"gpt-6-luna"}}})
-            elif method in ("session/set_mode", "session/set_model", "session/set_config_option"):
+            elif method == "session/set_model":
+                # Distill 2.0.25 acknowledges the applied Main model; the adapter refuses to prompt without it.
+                requested = params.get("modelId")
+                ack = {"model":{"Ok":requested},"canonicalModelId":requested}
+                auto = params.get("_meta", {}).get("reasoningEffortAuto")
+                if auto is not None:
+                    ack["reasoningEffortAuto"] = auto
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"_meta":ack}})
+            elif method in ("session/set_mode", "session/set_config_option"):
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
             elif method == "session/prompt":
                 count = int(counter.read_text()) if counter.exists() else 0
@@ -8104,8 +7786,7 @@ final class BotsWindowTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: harnessURL.path)
 
         let context = try makeContext()
-        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = false }
-        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        context.reconcileManagedIntegration()
         let router = AppCommandRouter(context: context)
         context.router = router
         let adapter = DistillACPAdapter(binaryNameOverride: harnessURL.path)
@@ -8171,6 +7852,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual((reopenedThread.runAsUser ?? AgentRunAsUser.current()).shortName, reopenedVM.deskRouting.runAsUser.shortName)
         XCTAssertEqual(reopenedVM.deskRunProvider, .distill)
         XCTAssertEqual(reopenedVM.deskRunModel, "gpt-6-luna")
+        // The Auto Main effort gate reads the Desk provider catalog, which a fresh
+        // Bots window fills from the router's send cache on its next turn.
+        let reopenedCatalogLoaded = await waitUntil(timeout: 5) { !reopenedVM.providers.isEmpty }
+        XCTAssertTrue(reopenedCatalogLoaded, "the reopened Desk must load the cached Distill provider snapshot")
         reopenedVM.composerText = "Follow-up Distill bot turn"
         XCTAssertTrue(reopenedVM.send())
         let followUpReplyArrived = await waitUntil(timeout: 8) {
@@ -8210,7 +7895,7 @@ final class BotsWindowTests: XCTestCase {
                       "Token Saver off must not admit compression into either Distill ACP process")
     }
 
-    func test_deskProviderChoicePersistsPerThread_notPerBot() throws {
+    func test_deskProviderChoicePersistsPerThread_notPerBot() async throws {
         // WHY: one Bot can be called from Grok in one thread and Claude in
         // another. Reopening either thread must restore that user's choice
         // without turning either provider into a Bot property.
@@ -8251,6 +7936,11 @@ final class BotsWindowTests: XCTestCase {
             XCTAssertEqual(vm.deskRunProvider, .claude)
             XCTAssertEqual(vm.deskRunModel, "opus")
         }
+        // Desk routes are written after the interaction turn.
+        let stored = await waitUntil(timeout: 5) {
+            (try? context.botStore.listDeskRoutingJSON().count) == 3
+        }
+        XCTAssertTrue(stored)
 
         let restored = BotsViewModel(context: context)
         restored.openDesk(bot)
@@ -12074,6 +11764,9 @@ final class BotsWindowTests: XCTestCase {
         let pane = String(source[paneStart...].prefix(2200))
         XCTAssertTrue(pane.contains("BotComputerGuestCanvas"))
         XCTAssertTrue(pane.contains("bots.desk.desktop.guestScreen"))
+        // Plan A: the pane says where the selected thread's agent runs (guest or Mac).
+        XCTAssertTrue(pane.contains("vm.deskRuntimeLabel"))
+        XCTAssertTrue(pane.contains("bots.desk.desktop.runtime"))
         XCTAssertTrue(pane.contains("bots.desk.desktop.start"))
         XCTAssertTrue(source.contains("openGuestDesktopInNewWindow"))
         let canvas = try String(
@@ -16306,11 +15999,6 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("studioAvatarPane"),
             "Studio Profile right pane must be the avatar, not Configuration summary"
         )
-        XCTAssertTrue(
-            bots.contains("AgentChatTokenSaverThreadFooter"),
-            "Desk must mount the shared Token Saver footer, not a lookalike capsule"
-        )
-        XCTAssertTrue(bots.contains("bindTokenSaverThreadFooter"))
         XCTAssertFalse(
             bots.contains("AgentChatTranscriptChrome.composerPlaceholder("),
             "Bots Desk must not reuse the Agent App Ask <provider> for changes placeholder"
@@ -16962,7 +16650,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(request.prompt.contains(raw))
         XCTAssertTrue(request.prompt.contains("Piper"), "queued send carries the bot brain")
         XCTAssertEqual(request.userMessageContent, raw, "visible user message stays the raw text")
-        XCTAssertTrue(request.tokenSaverCompressesPrompt)
         let home = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root
         XCTAssertTrue(request.cwd.hasSuffix(home.lastPathComponent),
                       "bot threads run in the bot home, not the process cwd")
@@ -17046,6 +16733,111 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: home.path))
         try await Task.sleep(for: .milliseconds(300))
         XCTAssertEqual(try context.threadRepo.list().count, threadsBefore + 1)
+    }
+
+    private func unlinkedDeskDistillSnapshot(id: String = "distill-acp") -> AgentProviderSnapshot {
+        AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: [
+                AgentModelDescriptor(id: "main-a", label: "Main A", provider: .distill),
+                AgentModelDescriptor(id: "main-b", label: "Main B", provider: .distill),
+            ],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: id,
+            capabilitiesOverride: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
+        )
+    }
+
+    private func isolatedLastModelStore(distill: String?) -> AgentLastModelStore {
+        let suiteName = "rc2-bots-last-model-" + UUID().uuidString
+        let suite = UserDefaults(suiteName: suiteName)!
+        addTeardownBlock { suite.removePersistentDomain(forName: suiteName) }
+        let store = AgentLastModelStore(defaults: suite)
+        if let distill { store.remember(model: distill, for: .distill) }
+        return store
+    }
+
+    func test_unlinkedDeskMainModelPickIsTheModelTheFirstSendRuns() async throws {
+        // WHY: an empty bot conversation has no embedded Agent App, so its
+        // composer mounts the shared Main pill bound to deskRouting. Run 1 once
+        // used a hidden route the user never saw; the model picked on the empty
+        // conversation must be exactly the model the first send runs.
+        AgentProvider.selectableForTesting = nil
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .distill)
+        context.coordinator.replaceProvider(.distill, runner: runner)
+        let snapshot = unlinkedDeskDistillSnapshot()
+        router.rememberProviderSnapshotsForSend([snapshot])
+        router.preflightListedProviderSnapshotsForTesting = false
+        let vm = BotsViewModel(context: context, router: router)
+        vm.lastModelStore = isolatedLastModelStore(distill: nil)
+        vm.replaceProvidersForTests([snapshot])
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertNil(vm.selectedConversation?.linkedAgentThreadID)
+        XCTAssertEqual(vm.deskRouting.model, "main-a",
+                       "no last-used model: the pill opens on the first listed model, never an empty Main")
+
+        // The pill's onSelectMainModel is vm.setDeskModel (source-pinned in AgentComposerChromeTests).
+        vm.setDeskModel("main-b")
+        XCTAssertTrue(vm.send("first words"))
+
+        let started = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
+        XCTAssertTrue(started, "the first send must reach the Distill runner")
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertEqual(request.model, "main-b", "run 1 must use the model the empty-thread pill showed")
+        let threadID = try XCTUnwrap(vm.selectedConversation?.linkedAgentThreadID)
+        XCTAssertEqual(try context.threadRepo.get(id: threadID)?.model, "main-b",
+                       "the lazily created thread must store the picked model, not a copied route")
+        runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
+    func test_newDeskConversationNeverRunsOnAnInvisibleEmptyOrStaleModel() throws {
+        // WHY: a new conversation copies the previous route (sticky model). A
+        // valid copied model must stay; an empty or unlisted one must resolve
+        // like a new Agent App thread (last-used first) so shown == run.
+        AgentProvider.selectableForTesting = nil
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        let snapshot = unlinkedDeskDistillSnapshot()
+        let emptyRoute = BotDeskRouting(provider: .distill, providerInstanceID: "distill-acp", model: "")
+        XCTAssertEqual(
+            BotsViewModel.resolvedUnlinkedDeskModel(emptyRoute, snapshot: snapshot, lastUsed: "main-b"),
+            "main-b", "an empty route takes the user's last-used Distill model")
+        XCTAssertEqual(
+            BotsViewModel.resolvedUnlinkedDeskModel(emptyRoute, snapshot: snapshot, lastUsed: nil),
+            "main-a", "no last-used: first listed model, as AgentDefaultModelSelection does")
+        var staleRoute = emptyRoute
+        staleRoute.model = "retired-model"
+        XCTAssertEqual(
+            BotsViewModel.resolvedUnlinkedDeskModel(staleRoute, snapshot: snapshot, lastUsed: nil),
+            "main-a", "a model the provider no longer lists (and no custom ids) must not run invisibly")
+        var stickyRoute = emptyRoute
+        stickyRoute.model = "main-b"
+        XCTAssertEqual(
+            BotsViewModel.resolvedUnlinkedDeskModel(stickyRoute, snapshot: snapshot, lastUsed: "main-a"),
+            "main-b", "a valid copied model is the sticky-model feature and must win over last-used")
+
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.lastModelStore = isolatedLastModelStore(distill: nil)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertEqual(vm.deskRouting.model, "",
+                       "before snapshots load there is nothing honest to show yet")
+        vm.replaceProvidersForTests([snapshot])
+        XCTAssertEqual(vm.deskRouting.model, "main-a",
+                       "late snapshots must fill the empty Main model of the open unlinked conversation")
+
+        vm.setDeskModel("main-b")
+        XCTAssertTrue(vm.createDeskThread())
+        XCTAssertEqual(vm.deskRouting.model, "main-b",
+                       "the next new conversation keeps the previous valid model, now visible on its pill")
     }
 
     private func makeWorkspaceLinkedDesk() throws -> (
@@ -17572,87 +17364,6 @@ private final class BlockingAcceptanceRunner: AgentProviderRunner, @unchecked Se
     }
 }
 
-private final class DeskTokenSaverRecoveryStore: TokenSaverScopedRecoveryStoring, @unchecked Sendable {
-    private let store: TokenSaverScopedRecoveryStore
-
-    init(db: SQLiteDB) {
-        store = TokenSaverScopedRecoveryStore(db: db)
-    }
-
-    private func scope(_ context: TokenSaverRecoveryRequestContext) -> TokenSaverPersistentScope {
-        .init(
-            workspaceID: context.workspaceID,
-            projectID: context.projectID,
-            threadID: context.threadID,
-            provider: context.provider,
-            attemptID: context.attemptID
-        )
-    }
-
-    func prepareOriginal(
-        _ data: Data,
-        context: TokenSaverRecoveryRequestContext,
-        lane: String
-    ) throws -> TokenSaverScopedPreparation {
-        let prepared = try store.prepare(
-            data,
-            scope: scope(context),
-            operationID: context.operationID,
-            lane: lane,
-            expiresAt: Date().addingTimeInterval(7 * 86_400),
-            disk: .init(
-                freeBytes: 40 * 1_024 * 1_024 * 1_024,
-                totalBytes: 100 * 1_024 * 1_024 * 1_024
-            )
-        )
-        return .init(
-            capability: prepared.capability,
-            idempotencyKey: prepared.idempotencyKey,
-            readBackVerified: prepared.readBackVerified
-        )
-    }
-
-    func retrieveOriginal(
-        capability: String,
-        context: TokenSaverRecoveryRequestContext
-    ) throws -> Data? {
-        try store.retrieve(capability: capability, scope: scope(context))
-    }
-
-    func markDelivered(
-        capability: String,
-        idempotencyKey: String,
-        context: TokenSaverRecoveryRequestContext,
-        outcome: TokenSaverScopedDeliveryOutcome
-    ) throws -> Bool {
-        let mapped: TokenSaverRecoveryTransportOutcome
-        switch outcome {
-        case .notSent: mapped = .notSent
-        case .sentUnknown: mapped = .sentUnknown
-        case .acked: mapped = .acked
-        case .failed: mapped = .failed
-        }
-        return try store.markDelivered(
-            capability: capability,
-            scope: scope(context),
-            idempotencyKey: idempotencyKey,
-            outcome: mapped
-        )
-    }
-
-    func ack(
-        capability: String,
-        idempotencyKey: String,
-        context: TokenSaverRecoveryRequestContext
-    ) throws -> Bool {
-        try store.ack(
-            capability: capability,
-            scope: scope(context),
-            idempotencyKey: idempotencyKey
-        )
-    }
-}
-
 final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable {
     let provider: AgentProvider
 
@@ -17775,6 +17486,14 @@ final class ControlledBotHandoffRunner: AgentProviderRunner, @unchecked Sendable
             finalMessage: status == .completed ? reply : nil,
             providerThreadId: providerThreadID
         ))
+        return true
+    }
+
+    /// Streams one provider event into a still-running run.
+    @discardableResult
+    func emit(runID: AgentRunID, _ event: AssistantEvent) -> Bool {
+        guard let pending = lock.withLock({ pendingByRunID[runID] }) else { return false }
+        pending.onEvent(.event(event))
         return true
     }
 

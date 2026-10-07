@@ -552,6 +552,9 @@ public enum AgentWorkingCatCopy {
 public enum AgentComposerChromeMode: String, Sendable, Equatable, CaseIterable {
     case simple
     case power
+    /// The composer only relays the message (a bot group room): no provider,
+    /// model, source, run-as-user, permission or execution choice applies.
+    case relay
 
     public mutating func toggle() {
         self = self == .simple ? .power : .simple
@@ -579,8 +582,13 @@ public enum AgentComposerChromePresentation {
             return [.attach, .model, .sendStop]
         case .power:
             return Set(AgentComposerChromeControl.allCases)
+        case .relay:
+            return [.attach, .sendStop]
         }
     }
+
+    /// Relay surfaces never take attachments: the button stays, disabled, with this reason.
+    public static let relayAttachUnavailable = "Attachments are not supported in group conversations yet."
 
     public static func shows(_ control: AgentComposerChromeControl, mode: AgentComposerChromeMode) -> Bool {
         controls(for: mode).contains(control)
