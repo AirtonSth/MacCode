@@ -224,7 +224,16 @@ private final class TerminalHistoryPendingDeleteRegistry: @unchecked Sendable {
     }
 
     func resetForTesting() {
+        // A lock-bound attempt can still be inside its retry window when the
+        // quit deadline expires (late dispatch under load). Simulated process
+        // exit waits for it to end instead of racing it into the precondition.
+        let quiescenceDeadline = Date().addingTimeInterval(10)
         lock.lock()
+        while entries.values.contains(where: { $0.isRunning }), Date() < quiescenceDeadline {
+            lock.unlock()
+            Thread.sleep(forTimeInterval: 0.01)
+            lock.lock()
+        }
         precondition(
             entries.values.allSatisfy { !$0.isRunning },
             "pending delete attempts must be quiescent before simulating process exit"
