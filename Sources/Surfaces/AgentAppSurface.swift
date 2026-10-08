@@ -17816,7 +17816,9 @@ public struct AgentAppView: View {
                 : nil,
             onFileDrop: { vm.insertDroppedFilePaths($0) },
             attachUnavailableReason: composerChromeMode == .relay
-                ? AgentComposerChromePresentation.relayAttachUnavailable : nil
+                ? AgentComposerChromePresentation.relayAttachUnavailable : nil,
+            ultracodeBorder: AgentUltracodeBorderPresentation.shows(
+                provider: vm.provider, ultracode: vm.distillUltracode)
         )
     }
 

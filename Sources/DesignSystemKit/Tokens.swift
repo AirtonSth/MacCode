@@ -36,6 +36,8 @@ public enum DS {
         public static let success     = Color(hex: 0x8EE6A8)
         public static let warning     = Color(hex: 0xFFD37A)
         public static let danger      = Color(hex: 0xFF8F8F)
+        public static let ultracode     = Color(hex: 0xC084FC)
+        public static let ultracodeDeep = Color(hex: 0x818CF8)
 
         // Interaction layers (composited over surface)
         public static let hover       = Color.white.opacity(0.05)
