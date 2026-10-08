@@ -108,7 +108,14 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     /// durable owner binding and persisted capability grants. A second lookup
     /// could observe a revoke or grant change between the two decisions.
     public func authorizedRPCPrincipal(token: String) -> DirectRPCPrincipal? {
-        guard let trust = (try? repo.verifyCached(token: token)) ?? nil else { return nil }
+        (try? resolveRPCPrincipal(token: token)) ?? nil
+    }
+
+    /// Throws when the trust lookup itself failed (storage error). Nil only for
+    /// an unknown or revoked bearer, so a caller can answer "retry" instead of
+    /// "pair again".
+    public func resolveRPCPrincipal(token: String) throws -> DirectRPCPrincipal? {
+        guard let trust = try repo.verifyCached(token: token) else { return nil }
         return DirectRPCPrincipal(
             ownerFingerprint: Self.opaqueAuthorizedOwnerFingerprint(
                 stableIdentity: "token:\(trust.tokenHash)"
