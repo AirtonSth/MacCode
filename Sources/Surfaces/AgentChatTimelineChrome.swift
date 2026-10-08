@@ -124,7 +124,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
                         } label: {
                             Image(systemName: "arrow.down")
                                 .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(.white)
+                                .foregroundColor(DS.Palette.onAccent)
                                 .frame(width: 44, height: 44)
                                 .background(DS.Palette.accent)
                                 .clipShape(Circle())

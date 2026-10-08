@@ -109,10 +109,14 @@ public final class BotTeamsGroupsController: ObservableObject {
     static let inspectorDefaultsKey = "bots.groupInspector"
     static let privateThreadReadOnlyMessage = "This is the bot's private thread. Write in the group."
     static let roomPlaceholder = "Message the group. @mention a bot to choose who answers…"
+    /// Empty room copy: the same instruction as the placeholder, not the
+    /// Agent App's "Start a new agent run."
+    static let roomEmptyTitle = "Message the group"
+    static let roomEmptySubtitle = "@mention a bot to choose who answers."
 
     private let context: AppContext
     private let routerProvider: () -> AppCommandRouter?
-    /// Errors the user must see (the Bots alert).
+    /// Errors the user must see (the Bots error strip).
     var onError: ((String) -> Void)?
     /// The selected group is gone (deleted here or on a paired device).
     var onSelectedGroupVanished: (() -> Void)?
@@ -355,7 +359,9 @@ public final class BotTeamsGroupsController: ObservableObject {
                 guard let self else { throw BotStoreError.notFound }
                 return try self.sendToGroup(groupID, text: text, attachments: attachments)
             },
-            composerPlaceholder: Self.roomPlaceholder
+            composerPlaceholder: Self.roomPlaceholder,
+            emptyConversationTitle: Self.roomEmptyTitle,
+            emptyConversationSubtitle: Self.roomEmptySubtitle
         )
         let vm = makeEmbeddedVM(threadID: group.roomThreadID, embedding: embedding, router: router)
         vm.mentionableBotsProvider = { [weak self] in
@@ -408,7 +414,9 @@ public final class BotTeamsGroupsController: ObservableObject {
             sendInterceptor: { _, _, _ in
                 throw BotGroupOrchestrator.SendError.rejected(Self.privateThreadReadOnlyMessage)
             },
-            composerPlaceholder: Self.privateThreadReadOnlyMessage
+            composerPlaceholder: Self.privateThreadReadOnlyMessage,
+            emptyConversationTitle: "No messages",
+            emptyConversationSubtitle: Self.privateThreadReadOnlyMessage
         )
         privateThreadVM = makeEmbeddedVM(threadID: threadID, embedding: embedding, router: router)
         privateThreadBotID = botID
@@ -812,6 +820,8 @@ struct BotGroupConversationsSection: View {
         let names = members.map(\.name).joined(separator: ", ")
         let key = group.id.value.uuidString.lowercased()
         return Button {
+            // An older Bot error must not sit above the group's room.
+            vm.errorMessage = nil
             vm.openGroup(group.id)
         } label: {
             HStack(spacing: DS.Space.sm) {
@@ -824,7 +834,7 @@ struct BotGroupConversationsSection: View {
                         .lineLimit(1)
                     Text(names.isEmpty ? "No bots" : names)
                         .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
+                        .foregroundColor(DS.Palette.textSecondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
@@ -1342,7 +1352,7 @@ struct BotGroupRoomScreen: View {
                     .accessibilityIdentifier("bots.group.header.title")
                 Text("\(members.count) bots · \(group.policy.displayName)")
                     .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
+                    .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
             }
             Spacer(minLength: DS.Space.lg)

@@ -412,6 +412,10 @@ public struct AgentAppEmbedding {
     public let sendInterceptor: AgentAppSendInterceptor?
     /// Composer placeholder for an intercepted surface (it names no provider).
     public let composerPlaceholder: String?
+    /// Empty-conversation copy for the host surface (a bot desk or group room
+    /// does not "start a new agent run"). Nil keeps the Agent App copy.
+    public let emptyConversationTitle: String?
+    public let emptyConversationSubtitle: String?
 
     public init(
         pinnedThreadId: AgentThreadID,
@@ -420,7 +424,9 @@ public struct AgentAppEmbedding {
         onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)? = nil,
         onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)? = nil,
         sendInterceptor: AgentAppSendInterceptor? = nil,
-        composerPlaceholder: String? = nil
+        composerPlaceholder: String? = nil,
+        emptyConversationTitle: String? = nil,
+        emptyConversationSubtitle: String? = nil
     ) {
         self.pinnedThreadId = pinnedThreadId
         self.executionCwd = executionCwd
@@ -429,7 +435,18 @@ public struct AgentAppEmbedding {
         self.onRunFinished = onRunFinished
         self.sendInterceptor = sendInterceptor
         self.composerPlaceholder = composerPlaceholder
+        self.emptyConversationTitle = emptyConversationTitle
+        self.emptyConversationSubtitle = emptyConversationSubtitle
     }
+}
+
+/// First message page of the open thread. `pending` and `failed` both keep
+/// the "No messages" placeholder off: a thread whose page has not been read,
+/// or could not be read, is not an empty thread.
+public enum AgentMessagePageLoadState: Equatable, Sendable {
+    case idle
+    case pending
+    case failed(message: String)
 }
 
 public typealias AgentAppSendInterceptor = @MainActor (
@@ -784,6 +801,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// The UI holds only a bounded recent message page. Older durable messages
     /// remain in SQLite and are intentionally outside the hot screen-memory set.
     @Published public private(set) var messageHistoryIsPartial = false
+    /// Read state of the open thread's first message page. Goes `pending` on a
+    /// thread switch and on Retry only: a same-thread reload keeps the current
+    /// value so an empty thread's placeholder does not blink.
+    @Published public private(set) var messagePageLoadState: AgentMessagePageLoadState = .idle
     /// True while an older-page keyset load is in flight (UI disable / spinner).
     /// Derived from `loadingOlderGeneration != 0` for ownership-safe clears.
     @Published public private(set) var isLoadingOlderMessages = false
@@ -1013,6 +1034,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         } else {
             publishInterestedThreadId(nil)
+            // A restored tab opens its thread only after the rail read: until
+            // then that thread's page is unread, not empty.
+            if pendingInitialThreadId != nil { messagePageLoadState = .pending }
             Task { @MainActor [weak self] in
                 guard let self, !self.isDisposed else { return }
                 let snapshot = await self.loadRailSnapshotOffMainActor()
@@ -1024,6 +1048,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 } else {
                     self.publishInterestedThreadId(self.selectedThreadId)
                 }
+                // The restored thread did not open, so nothing is being read.
+                // A thread the user opened meanwhile owns its own page state.
+                if self.selectedThreadId == nil { self.messagePageLoadState = .idle }
             }
         }
         loadGitBranch()
@@ -2406,6 +2433,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } else {
             timeline = AssistantTimelineState()
         }
+        messagePageLoadState = .pending
         loadAllMessages(id)
         focusTick &+= 1
         scheduleSelectThreadHydration(
@@ -4189,6 +4217,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let loadedRows = payload.page?.rows ?? []
             guard let self, !Task.isCancelled, !self.isDisposed,
                   self.selectedThreadId == id else { return }
+            // Every winning load resolves the page state, whatever the merge
+            // below does with optimistic rows: a thrown read is a failure the
+            // user sees, never an empty thread.
+            if let failure = payload.failure {
+                self.messagePageLoadState = .failed(message: failure)
+            } else {
+                self.messagePageLoadState = .idle
+            }
             // Rows appended in-memory while the page was being read (system
             // notes, the send() user-message mirror) must survive the swap —
             // the page snapshot predates them. Optimistic mirrors share the
@@ -4290,6 +4326,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         await messageHistoryLoadTask?.value
     }
 
+    /// Text of the failed-read banner; nil when the read did not fail.
+    public var messagePageLoadFailureMessage: String? {
+        if case .failed(let message) = messagePageLoadState { return message }
+        return nil
+    }
+
+    /// Retry of the failed-read banner: reads the open thread's page again.
+    public func retryMessagePageLoad() {
+        guard !isDisposed, let selectedThreadId else { return }
+        messagePageLoadState = .pending
+        loadAllMessages(selectedThreadId)
+    }
+
     nonisolated static func loadMessagePageOffMain(
         repository: AgentMessageRepository,
         threadId: AgentThreadID,
@@ -4312,6 +4361,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// used to be 4 sequential detached hops with a MainActor return each).
     struct AgentMessagePagePayload: Sendable {
         var page: AgentMessageBodyBudgetResult?
+        /// Set when the read threw. A nil `page` alone cannot tell an
+        /// unreadable thread from an empty one.
+        var failure: String?
     }
 
     nonisolated static func loadMessagePagePayloadOffMain(
@@ -4321,13 +4373,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     ) async -> AgentMessagePagePayload {
         await Task.detached(priority: .userInitiated) {
             var payload = AgentMessagePagePayload()
-            payload.page = try? repository.listPageWithinBodyBudget(
-                threadId: threadId,
-                limit: messageHistoryPageLimit,
-                before: before,
-                budget: fullLoadBodyBudgetBytes,
-                contentLimit: AssistantTimelineState.liveTextLimit
-            )
+            do {
+                payload.page = try repository.listPageWithinBodyBudget(
+                    threadId: threadId,
+                    limit: messageHistoryPageLimit,
+                    before: before,
+                    budget: fullLoadBodyBudgetBytes,
+                    contentLimit: AssistantTimelineState.liveTextLimit
+                )
+            } catch {
+                payload.failure = "Could not load messages: \(error)"
+            }
             return payload
         }.value
     }
@@ -7425,6 +7481,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.selectedThreadId = nil
         messages = []
         messageHistoryIsPartial = false
+        messagePageLoadState = .idle
         timeline = AssistantTimelineState()
         resetTimelineUpdateTick()
         }
@@ -7471,6 +7528,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         pendingAttachmentRetryConfirmation = nil
         messages = []
         messageHistoryIsPartial = false
+        // No thread is open: a page load in flight for the removed one will
+        // never resolve this, and the fresh composer really is empty.
+        messagePageLoadState = .idle
         cancelOlderMessageLoad()
         timeline = AssistantTimelineState()
         resetTimelineUpdateTick()
@@ -15090,6 +15150,16 @@ public struct AgentAppView: View {
             }
             backgroundAwaitBanner
             pendingCallbackRows
+            // A failed page read stays on screen with Retry; the transcript
+            // above shows no "No messages" for it. No dismiss: without the
+            // strip the unread thread would be a blank column with no Retry.
+            if let failure = vm.messagePageLoadFailureMessage {
+                AgentChatErrorStrip(
+                    message: failure,
+                    identifier: "agent.messages.loadFailed",
+                    onRetry: { vm.retryMessagePageLoad() }
+                )
+            }
             // Unified system strip: severity-ordered, capped (replaces stacked banners).
             systemStatusStrip
             queuedMessagesSection
@@ -15166,17 +15236,19 @@ public struct AgentAppView: View {
             Text(vm.gitBranch ?? "no branch")
                 .font(DS.Font.caption2.monospaced())
                 .foregroundColor(DS.Palette.textSecondary)
+                .lineLimit(1).truncationMode(.middle)
+                .help(vm.gitBranch ?? "no branch")
             if let context = vm.contextHealthMessage {
                 Text("·").foregroundColor(DS.Palette.textTertiary)
                 Text(context)
                     .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
+                    .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
             }
             Text("·").foregroundColor(DS.Palette.textTertiary)
             Text(URL(fileURLWithPath: vm.cwd).lastPathComponent)
                 .font(DS.Font.caption2)
-                .foregroundColor(DS.Palette.textTertiary)
+                .foregroundColor(DS.Palette.textSecondary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
             botScreenControls
@@ -15557,7 +15629,8 @@ public struct AgentAppView: View {
                                 messagesEmpty: vm.messages.isEmpty,
                                 turnsEmpty: vm.timeline.turns.isEmpty,
                                 hasTimelineError: vm.timeline.error != nil,
-                                isHidden: vm.isHiddenFromSurface
+                                isHidden: vm.isHiddenFromSurface,
+                                messagePageLoadState: vm.messagePageLoadState
                             ) {
                                 emptyConversation
                                     .id("agent.emptyConversation")
@@ -16331,7 +16404,7 @@ public struct AgentAppView: View {
                     nextCount: nextCount
                 ))
                     .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
+                    .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
                 Spacer(minLength: 0)
             }
@@ -16352,14 +16425,18 @@ public struct AgentAppView: View {
 
     /// Hide-drop publishes an empty timeline while the run still lives in
     /// `latestHiddenTimeline`. That 0-turn publish must not paint the empty
-    /// conversation placeholder.
+    /// conversation placeholder. Neither may a first page that is still being
+    /// read or that failed to read: only a resolved page proves the thread
+    /// has no messages.
     nonisolated static func shouldShowEmptyConversation(
         messagesEmpty: Bool,
         turnsEmpty: Bool,
         hasTimelineError: Bool,
-        isHidden: Bool
+        isHidden: Bool,
+        messagePageLoadState: AgentMessagePageLoadState
     ) -> Bool {
         !isHidden && messagesEmpty && turnsEmpty && !hasTimelineError
+            && messagePageLoadState == .idle
     }
 
     nonisolated static func hiddenTranscriptRevealLabel(
@@ -16408,25 +16485,11 @@ public struct AgentAppView: View {
     }
 
     private var emptyConversation: some View {
-        VStack(spacing: DS.Space.lg) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 44, weight: .regular))
-                .foregroundColor(DS.Palette.textTertiary)
-                .frame(width: 72, height: 72)
-                .background(DS.Palette.surfaceRaised)
-                .clipShape(Circle())
-                .overlay(Circle().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-            VStack(spacing: DS.Space.sm) {
-                Text("No messages")
-                    .font(.system(size: 28, weight: .semibold))
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .lineLimit(1)
-                Text("Start a new agent run.")
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-            }
+        DSEmptyState(
+            icon: "sparkles",
+            title: vm.embedding?.emptyConversationTitle ?? "No messages",
+            subtitle: vm.embedding?.emptyConversationSubtitle ?? "Start a new agent run."
+        ) {
             if let accountPanel {
                 accountPanel.frame(maxWidth: 420)
             }
@@ -16676,7 +16739,7 @@ public struct AgentAppView: View {
             AgentSelectablePlainText(
                 text: msg.content,
                 fontSize: 11,
-                textColor: DS.NS.textTertiary
+                textColor: DS.NS.textSecondary
             )
                 .frame(maxWidth: .infinity, alignment: .leading)
         }

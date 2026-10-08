@@ -380,6 +380,38 @@ final class AgentMessageMarkdownTests: XCTestCase {
         )
     }
 
+    /// WHY: a Copy button mounted only under the pointer cannot be reached by
+    /// keyboard or VoiceOver. It must stay mounted; hover or focus only paints it.
+    func test_codeBlockCopyStaysMountedWithoutHover_becauseKeyboardAndVoiceOverHaveNoPointer() throws {
+        XCTAssertEqual(CodeBlockCopyChrome.copyOpacity(hovered: false, focused: false), 0)
+        XCTAssertEqual(
+            CodeBlockCopyChrome.copyOpacity(hovered: false, focused: true), 1,
+            "keyboard focus must paint Copy without a pointer"
+        )
+        XCTAssertEqual(CodeBlockCopyChrome.copyOpacity(hovered: true, focused: false), 1)
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/AgentMessageMarkdown.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "struct CodeBlockCopyChrome"))
+        let end = try XCTUnwrap(source.range(of: ".onHover", range: start.upperBound..<source.endIndex))
+        let chrome = String(source[start.lowerBound..<end.lowerBound])
+        XCTAssertFalse(
+            chrome.contains("if hovered {"),
+            "a hover-gated Button is absent from the accessibility tree at rest"
+        )
+        XCTAssertFalse(
+            chrome.contains(".accessibilityHidden(true)"),
+            "hiding Copy from accessibility would undo the mount"
+        )
+        XCTAssertTrue(
+            chrome.contains(".accessibilityIdentifier(\"agent.codeBlock.copy\")"),
+            "an accessibility query must find Copy without hover"
+        )
+    }
+
     /// Microbench for issue #4. Prints raw medians; the ≥5% target is recorded in
     /// `loops-out/20260906-agent-app-memperf-r9-markdown/performance-proof.md`
     /// from HEAD vs patched runs (not a hardcoded CI baseline).

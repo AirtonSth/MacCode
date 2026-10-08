@@ -92,7 +92,7 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View, Equatable
                         .lineLimit(1)
                     Text(subtitle)
                         .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
+                        .foregroundColor(DS.Palette.textSecondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
@@ -913,6 +913,106 @@ public struct AgentChatWorkingPill: View {
     }
 }
 
+/// Shared non-modal error strip. Agent App and the Bots roots mount this one
+/// row so an error stays on screen with its recovery, without a blocking
+/// alert and without reading as empty content.
+public struct AgentChatErrorStrip: View {
+    public let message: String
+    public let identifier: String
+    public var offersCopy: Bool
+    /// Changes on every write of the owner's error slot, so the same message
+    /// set again is spoken again. Nil: only a changed message is.
+    public var announcementToken: Int?
+    public var onRetry: (() -> Void)?
+    /// Nil: no dismiss control. An error whose only recovery is Retry must
+    /// not be hidden with nothing left on screen to recover from.
+    public var onDismiss: (() -> Void)?
+
+    public init(
+        message: String,
+        identifier: String,
+        offersCopy: Bool = true,
+        announcementToken: Int? = nil,
+        onRetry: (() -> Void)? = nil,
+        onDismiss: (() -> Void)? = nil
+    ) {
+        self.message = message
+        self.identifier = identifier
+        self.offersCopy = offersCopy
+        self.announcementToken = announcementToken
+        self.onRetry = onRetry
+        self.onDismiss = onDismiss
+    }
+
+    public var body: some View {
+        HStack(alignment: .center, spacing: DS.Space.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Palette.danger)
+                .frame(width: 14, height: 14, alignment: .center)
+                .accessibilityHidden(true)
+            AgentSelectablePlainText(
+                text: message,
+                fontSize: 11,
+                textColor: DS.NS.text
+            )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if offersCopy {
+                Button("Copy") {
+                    AgentChatTranscriptChrome.copyToPasteboard(message)
+                }
+                .buttonStyle(.plain)
+                .font(DS.Font.caption)
+                .accessibilityIdentifier("\(identifier).copy")
+            }
+            if let onRetry {
+                Button("Retry", action: onRetry)
+                    .buttonStyle(.plain)
+                    .font(DS.Font.caption)
+                    .accessibilityIdentifier("\(identifier).retry")
+            }
+            if let onDismiss {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 16, height: 16, alignment: .center)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityLabel("Dismiss error")
+                .accessibilityIdentifier("\(identifier).dismiss")
+                .help("Dismiss error")
+            }
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.sm)
+        .background(DS.Palette.danger.opacity(0.09))
+        // Opaque base: a root may mount the strip over content.
+        .background(DS.Palette.bg)
+        // `.contain`, not `.combine`: Retry and Dismiss stay reachable.
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(identifier)
+        .onAppear { announce() }
+        // One key, so a write that changes both message and token is spoken once.
+        .onChange(of: "\(announcementToken ?? 0):\(message)") { _ in announce() }
+    }
+
+    /// The alert this strip replaces was spoken by VoiceOver; a silent row
+    /// would hide the error from anyone not looking at it.
+    private func announce() {
+        guard let app = NSApp else { return }
+        NSAccessibility.post(
+            element: (app.mainWindow as NSResponder?) ?? app,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ]
+        )
+    }
+}
+
 public struct AgentChatPeerActivityRow: View {
     public let snapshot: BotPeerActivitySnapshot
     public let startedAt: Date
@@ -1083,7 +1183,7 @@ public struct AgentChatThreadRail<Content: View>: View {
                 } else {
                     Text(AgentChatThreadRailCopy.noMatchText(query: searchQuery))
                         .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
+                        .foregroundColor(DS.Palette.textSecondary)
                         .padding(DS.Space.sm)
                 }
             }

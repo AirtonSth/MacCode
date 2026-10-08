@@ -11830,16 +11830,63 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(canvas.contains("Button(\"Terminal\""))
     }
 
-    func test_detachedGuestDesktopPresentsRebuildFailureAlert() throws {
+    func test_detachedGuestDesktopShowsRebuildFailureStrip_becauseItsRootMustNotSwallowTheError() throws {
         // WHY: the shared Rebuild control is also mounted in the detached
         // desktop window, whose root must not silently swallow vm.errorMessage.
+        // It shows the shared strip, not an alert: an alert put an OK button
+        // between the owner and the live desktop.
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         guard let start = source.range(of: "private struct BotGuestDesktopRoot") else {
             return XCTFail("detached guest root must exist")
         }
         let root = String(source[start.lowerBound...])
-        XCTAssertTrue(root.contains(".alert(\"Bots\""))
-        XCTAssertTrue(root.contains("vm.errorMessage"))
+        XCTAssertTrue(root.contains("if let message = vm.errorMessage {"))
+        XCTAssertTrue(root.contains("AgentChatErrorStrip("))
+        XCTAssertTrue(root.contains("identifier: \"bots.desk.desktop.window.error\""))
+        XCTAssertTrue(
+            root.contains("onDismiss: { vm.errorMessage = nil }"),
+            "the strip stays until dismissed, and dismissing clears the one error slot"
+        )
+        XCTAssertFalse(root.contains(".alert("), "a Bots error must not block the desktop window")
+    }
+
+    func test_botsErrorsShowAsNonModalStrip_becauseAnAlertBlockedTheWindowAndTookComposerFocus() throws {
+        // WHY: dozens of sites write vm.errorMessage, including soft validation
+        // such as "Name is required." Each one opened a modal alert, so the window
+        // stopped answering and the composer lost focus until OK. The error is
+        // now one row above the destination: it names the failure, stays until
+        // dismissed, and leaves every control (and the first responder) alone.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertFalse(
+            source.contains(".alert(\"Bots\""),
+            "no Bots root may present vm.errorMessage as a modal alert"
+        )
+        let start = try XCTUnwrap(source.range(of: "public struct BotsRootView"))
+        let end = try XCTUnwrap(source.range(
+            of: ".modifier(BotsTitlebarBleed(edges: titlebarSafeAreaEdges))",
+            range: start.upperBound..<source.endIndex
+        ))
+        let root = String(source[start.lowerBound..<end.lowerBound])
+        let guardLine = try XCTUnwrap(
+            root.range(of: "if let message = vm.errorMessage {"),
+            "the root must mount the strip whenever vm.errorMessage is set"
+        )
+        let strip = try XCTUnwrap(root.range(of: "AgentChatErrorStrip("))
+        let destination = try XCTUnwrap(root.range(of: "switch vm.screen.resolvedDestination"))
+        XCTAssertLessThan(guardLine.lowerBound, strip.lowerBound)
+        XCTAssertLessThan(
+            strip.lowerBound, destination.lowerBound,
+            "the strip is a row above the destination, so it covers neither the header nor the composer"
+        )
+        XCTAssertTrue(root.contains("identifier: \"bots.error\""))
+        XCTAssertTrue(
+            root.contains("onDismiss: { vm.errorMessage = nil }"),
+            "dismissing the strip clears the one error slot, as OK did"
+        )
+        XCTAssertFalse(root.contains(".alert("), "the Bots root presents no alert at all")
+        // The strip is the shared chat component, not a Bots lookalike.
+        let chrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatSharedChrome.swift"), encoding: .utf8)
+        XCTAssertTrue(chrome.contains("public struct AgentChatErrorStrip"))
     }
 
     func test_rebuildDockerGuestPublishesProgressAndRejectsDuplicateWork() async throws {
@@ -12222,6 +12269,37 @@ final class BotsWindowTests: XCTestCase {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("vm.presentAlertError(error)"))
         XCTAssertTrue(source.contains("bots.studio.save"))
+    }
+
+    func test_saveBotClearsAnOlderError_becauseTheStripIsNotModalAndWouldMaskThisSavesFailure() throws {
+        // WHY: presentAlertError keeps a message that is already set, so the
+        // copy saveStudio wrote survives. Under the modal alert that slot was
+        // always empty when Save ran. The strip does not block the window, so
+        // an older message can still be there: a failed save would show that
+        // stale text instead of its own error, and a successful save would
+        // leave it on screen.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.errorMessage = "Name is required."
+        vm.presentAlertError(BotComputerGuestError.notReady)
+        XCTAssertEqual(
+            vm.errorMessage, "Name is required.",
+            "the view model keeps the older message, so the Save action has to clear it first"
+        )
+
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "Button(BotsChrome.Label.saveBot) {"))
+        let end = try XCTUnwrap(source.range(
+            of: ".accessibilityIdentifier(\"bots.studio.save\")",
+            range: start.upperBound..<source.endIndex
+        ))
+        let save = String(source[start.lowerBound..<end.lowerBound])
+        let clear = try XCTUnwrap(
+            save.range(of: "vm.errorMessage = nil"),
+            "Save must start from an empty error slot"
+        )
+        let attempt = try XCTUnwrap(save.range(of: "try vm.saveStudio()"))
+        XCTAssertLessThan(clear.lowerBound, attempt.lowerBound)
     }
 
     func test_leftoverDedicatedLocalVMDoesNotBecomeDockerWhenGuestReady() throws {
@@ -16587,6 +16665,342 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNotEqual(payload, raw)
         XCTAssertTrue(payload.contains(raw))
         XCTAssertTrue(payload.contains("Piper"), "compiled payload carries the bot brain")
+    }
+
+    func test_linkedDeskKeepsMessageBotPlaceholderAndEmptyCopy_becauseTheInputMustNotFlipToTheProviderAfterTheFirstSend() async throws {
+        // WHY: before the first message the Desk composer read "Message Piper…".
+        // Once the thread was linked, the embedded Agent App fell back to
+        // "Ask Claude for changes…" and an empty thread said "Start a new agent
+        // run." In a Bot chat the Bot is who you talk to; the provider is a detail.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        try await linkDeskThreadByFirstSend(vm, context: context, router: router)
+        let agent = try XCTUnwrap(vm.deskAgentVM, "desk must own an Agent App VM")
+        XCTAssertEqual(agent.composerPlaceholder, "Message Piper…")
+        XCTAssertEqual(agent.embedding?.emptyConversationTitle, "Message Piper")
+        XCTAssertEqual(agent.embedding?.emptyConversationSubtitle, "This thread has no messages yet.")
+        // The unlinked composer reads the same helper, so the two cannot drift.
+        XCTAssertEqual(agent.composerPlaceholder, BotsViewModel.deskComposerPlaceholder(botName: bot.name))
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(
+            source.contains("placeholder: BotsViewModel.deskComposerPlaceholder(botName: bot.name),"),
+            "the unlinked Desk composer must use the shared placeholder"
+        )
+    }
+
+    func test_groupRoomsPassTheirOwnEmptyCopy_becauseARoomNeverStartsAnAgentRun() throws {
+        // WHY: the room and the private member thread mount the Agent App
+        // surface, whose empty state says "Start a new agent run." A room only
+        // relays to its bots and the private thread is read-only, so that line
+        // told the owner to do something neither place can do.
+        XCTAssertEqual(BotTeamsGroupsController.roomEmptyTitle, "Message the group")
+        XCTAssertEqual(BotTeamsGroupsController.roomEmptySubtitle, "@mention a bot to choose who answers.")
+        let groups = try String(contentsOf: sourceURL("Sources/AppShell/BotsTeamsGroups.swift"), encoding: .utf8)
+        XCTAssertTrue(groups.contains("emptyConversationTitle: Self.roomEmptyTitle,"))
+        XCTAssertTrue(groups.contains("emptyConversationSubtitle: Self.roomEmptySubtitle"))
+        XCTAssertTrue(
+            groups.contains("emptyConversationSubtitle: Self.privateThreadReadOnlyMessage"),
+            "an empty private thread says it is read-only, as its composer does"
+        )
+        XCTAssertEqual(
+            groups.components(separatedBy: "emptyConversationTitle:").count - 1,
+            groups.components(separatedBy: "AgentAppEmbedding(").count - 1,
+            "every embedded group surface names its own empty state"
+        )
+    }
+
+    func test_botNameStaysOnOneLineWithAFallback_becauseALongNameWrappedOverTheChatAndAnEmptyOneHadNoLabel() throws {
+        // WHY: the Desk header is a fixed 44pt bar. The Bot name had no line
+        // limit, so a long name wrapped and spilled over the transcript. An
+        // empty name left the roster row, the header and VoiceOver with nothing
+        // to show or say.
+        XCTAssertEqual(BotsViewModel.displayName(""), "Untitled")
+        XCTAssertEqual(BotsViewModel.displayName("Piper"), "Piper")
+        let long = String(repeating: "N", count: 200)
+        XCTAssertEqual(BotsViewModel.displayName(long), long, "the view truncates; the name itself is never cut")
+        XCTAssertEqual(BotsViewModel.deskComposerPlaceholder(botName: ""), "Message Untitled…")
+
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let headerStart = try XCTUnwrap(source.range(of: "private func deskHeader"))
+        let headerRest = source[headerStart.upperBound...]
+        let headerEnd = headerRest.range(of: "\n    private func deskChat")?.lowerBound ?? headerRest.endIndex
+        let header = String(source[headerStart.lowerBound..<headerEnd])
+        let name = try XCTUnwrap(header.range(of: "Text(BotsViewModel.displayName(bot.name))"))
+        let nameID = try XCTUnwrap(header.range(
+            of: ".accessibilityIdentifier(\"bots.desk.name\")",
+            range: name.upperBound..<header.endIndex
+        ))
+        let nameModifiers = String(header[name.lowerBound..<nameID.lowerBound])
+        XCTAssertTrue(nameModifiers.contains(".lineLimit(1)"), "a 200-character name must stay inside the 44pt bar")
+        XCTAssertTrue(nameModifiers.contains(".truncationMode(.tail)"))
+        XCTAssertTrue(
+            nameModifiers.contains(".help(BotsViewModel.displayName(bot.name))"),
+            "the truncated name stays readable as a tooltip"
+        )
+        XCTAssertTrue(header.contains(".frame(height: 44)"))
+        XCTAssertTrue(
+            header.contains(".layoutPriority(1)"),
+            "the attention badge keeps its place when the name truncates"
+        )
+        XCTAssertTrue(header.contains("\"Open Studio for \\(BotsViewModel.displayName(bot.name))\""))
+
+        let rowStart = try XCTUnwrap(source.range(of: "private func rosterRow"))
+        let rowRest = source[rowStart.upperBound...]
+        let rowEnd = rowRest.range(of: "\n@MainActor")?.lowerBound ?? rowRest.endIndex
+        let row = String(source[rowStart.lowerBound..<rowEnd])
+        XCTAssertTrue(row.contains("let displayName = BotsViewModel.displayName(bot.name)"))
+        XCTAssertTrue(row.contains("Text(displayName)"))
+        XCTAssertTrue(row.contains(".accessibilityLabel(displayName)"), "VoiceOver must not read an empty row")
+    }
+
+    func test_rosterAndHeaderSubtitlesUseTextSecondary_becauseTertiaryIsUnreadableAt10pt() throws {
+        // WHY: the roster preview, the Desk header's handle and permission and
+        // the group subtitles are 10pt text the owner reads to pick a chat and
+        // to see what a Bot may do. textTertiary is 3.72:1 on the rail
+        // (DSContrastTests); information text needs 4.5:1, so these sites use
+        // textSecondary. The token value itself does not change.
+        func slice(_ source: String, from start: String, to end: String) throws -> String {
+            let lower = try XCTUnwrap(source.range(of: start), "\(start) must exist")
+            let upper = try XCTUnwrap(
+                source.range(of: end, range: lower.upperBound..<source.endIndex),
+                "\(end) must follow \(start)"
+            )
+            return String(source[lower.lowerBound..<upper.upperBound])
+        }
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let groups = try String(contentsOf: sourceURL("Sources/AppShell/BotsTeamsGroups.swift"), encoding: .utf8)
+        // A selected roster row is filled with the Bot's own colour at 0.22.
+        // On the light head swatches textSecondary is about 4.0:1 there, so
+        // the selected preview uses text (at least 8:1 on every fill).
+        let preview = try slice(bots, from: "Text(preview)", to: ".lineLimit(1)")
+        XCTAssertTrue(
+            preview.contains(".foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)"),
+            preview
+        )
+        XCTAssertFalse(preview.contains("textTertiary"), preview)
+        let sites = [
+            try slice(bots, from: "Text(\"@\\(bot.handle)\")", to: "\"bots.desk.permission\""),
+            try slice(groups, from: "Text(names.isEmpty ? \"No bots\" : names)", to: ".lineLimit(1)"),
+            try slice(groups, from: "Text(\"\\(members.count) bots · \\(group.policy.displayName)\")", to: ".lineLimit(1)"),
+        ]
+        for site in sites {
+            XCTAssertTrue(site.contains(".foregroundColor(DS.Palette.textSecondary)"), site)
+            XCTAssertFalse(site.contains("textTertiary"), site)
+        }
+    }
+
+    func test_unlinkedDeskThreadShowsMessageBotEmptyState_becauseThatIsTheEmptyDeskTheOwnerSees() throws {
+        // WHY: a Desk thread is linked by its first message, so the empty
+        // state of the linked surface is almost never painted. The empty Desk
+        // the owner opens is the unlinked one, and it was a blank column over
+        // the composer. It names the Bot with the linked surface's copy, and
+        // a long name is capped so it cannot push the composer.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func deskUnlinkedComposer"))
+        let end = try XCTUnwrap(source.range(of: "AgentChatComposerBar(", range: start.upperBound..<source.endIndex))
+        let empty = String(source[start.lowerBound..<end.lowerBound])
+        XCTAssertTrue(empty.contains("DSEmptyState("))
+        XCTAssertTrue(empty.contains("title: \"Message \\(BotsViewModel.displayName(bot.name))\""))
+        XCTAssertTrue(empty.contains("subtitle: \"This thread has no messages yet.\""))
+        // The limit set from outside reaches the subtitle as well as the
+        // title. Two lines cut "This thread has no messages yet." in the
+        // 120pt column of the minimum window; three keep it whole.
+        XCTAssertTrue(empty.contains(".lineLimit(3)"), "DSEmptyState's title has no line limit of its own")
+        XCTAssertFalse(empty.contains(".lineLimit(2)"), "two lines truncate the fixed subtitle")
+        XCTAssertTrue(
+            empty.contains(".multilineTextAlignment(.center)"),
+            "a name that wraps to the second line stays centred in the narrow chat column"
+        )
+        // A send can persist its message and then fail to link the thread
+        // (no router, no published revision). The conversation stays unlinked
+        // with a message in it, and "no messages yet" would be false.
+        let guardLine = try XCTUnwrap(
+            empty.range(of: "if vm.deskMessages.isEmpty {"),
+            "the empty copy is shown only while the thread has no message"
+        )
+        let state = try XCTUnwrap(empty.range(of: "DSEmptyState("))
+        XCTAssertLessThan(guardLine.lowerBound, state.lowerBound)
+        // The linked surface must keep saying the same thing.
+        XCTAssertEqual(
+            source.components(separatedBy: "\"This thread has no messages yet.\"").count - 1, 2,
+            "linked and unlinked Desk threads share one empty copy"
+        )
+    }
+
+    func test_savesAndRosterNavigationStartFromAnEmptyErrorSlot_becauseTheStripIsNotModalAndWouldOutliveTheFix() throws {
+        // WHY: under the modal alert, OK emptied the error slot before any
+        // other action. The strip stays until dismissed, so "…are required."
+        // survived the corrected save and stayed above a saved task, and an
+        // error about one Bot moved above the next Bot the owner opened.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let nova = try vm.create(name: "Nova", title: "Writer", provider: .claude)
+        vm.openDesk(piper)
+
+        vm.createScheduleTask()
+        var draft = try XCTUnwrap(vm.scheduleTaskDraft)
+        vm.saveScheduleTask(draft)
+        XCTAssertEqual(vm.errorMessage, "Task name and instruction are required.")
+        draft.name = "Morning scan"
+        draft.prompt = "Scan overnight"
+        vm.saveScheduleTask(draft)
+        XCTAssertNil(vm.scheduleTaskDraft, "fixture: the corrected task saved")
+        XCTAssertNil(vm.errorMessage, "a saved task must not keep the earlier validation error")
+
+        vm.saveRoutine()
+        XCTAssertEqual(vm.errorMessage, "Routine name and prompt are required.")
+        vm.routineName = "Evening scan"
+        vm.routinePrompt = "Check the day's failures"
+        vm.saveRoutine()
+        XCTAssertTrue(vm.routines.contains { $0.definition.name == "Evening scan" }, "fixture: the routine saved")
+        XCTAssertNil(vm.errorMessage, "a saved routine must not keep the earlier validation error")
+
+        vm.errorMessage = "Force stop: timed out"
+        vm.openDeskFromRoster(nova)
+        XCTAssertEqual(vm.selectedBotID, nova.id)
+        XCTAssertNil(vm.errorMessage, "Piper's error must not sit above Nova's Desk")
+    }
+
+    func test_ownerSendAndRowNavigationStartFromAnEmptyErrorSlot_becauseAStaleRefusalInvitesADuplicateSend() throws {
+        // WHY: a Docker-desktop Bot refuses the first send while its guest
+        // starts. The alert made the owner press OK before trying again. The
+        // strip stays, so after the second, admitted send it still read as a
+        // refusal above a working Bot, and "Try again" invites a duplicate
+        // send. The same row followed the owner from the Active and Finished
+        // lists into another Bot's Desk, and into a group room.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let nova = try vm.create(name: "Nova", title: "Writer", provider: .claude)
+        vm.openDesk(piper)
+        vm.dockerGuestReadyOverrideForTesting = false
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+        XCTAssertFalse(vm.send("open chrome"))
+        XCTAssertEqual(vm.errorMessage, "Docker desktop is not ready.")
+        vm.desktopKindOverrideForTesting = nil
+        vm.dockerGuestReadyOverrideForTesting = true
+        XCTAssertTrue(vm.send("open chrome"))
+        XCTAssertEqual(
+            vm.errorMessage, "Docker desktop is not ready.",
+            "fixture: send() also drains queued follow-ups, which must not erase an error, so the composer clears it"
+        )
+
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let composerStart = try XCTUnwrap(bots.range(of: "private func deskUnlinkedComposer"))
+        let onSend = try XCTUnwrap(bots.range(of: "onSend: {", range: composerStart.upperBound..<bots.endIndex))
+        let onStop = try XCTUnwrap(bots.range(of: "onStop:", range: onSend.upperBound..<bots.endIndex))
+        let ownerSend = String(bots[onSend.lowerBound..<onStop.lowerBound])
+        let clear = try XCTUnwrap(
+            ownerSend.range(of: "vm.errorMessage = nil"),
+            "the owner's send must start from an empty error slot"
+        )
+        let attempt = try XCTUnwrap(ownerSend.range(of: "vm.send()"))
+        XCTAssertLessThan(clear.lowerBound, attempt.lowerBound, "a refusal of this send must survive the clear")
+
+        vm.openActiveBotItem(ActiveBotScreenItem(bot: nova, preview: "", providerName: "Claude"))
+        XCTAssertEqual(vm.selectedBotID, nova.id)
+        XCTAssertNil(vm.errorMessage, "Piper's refusal must not sit above Nova's Desk (Active list)")
+
+        vm.errorMessage = "Docker desktop is not ready."
+        let run = AgentRun(threadId: AgentThreadID(), provider: .claude, model: "opus", status: .completed)
+        vm.openFinishedBotItem(FinishedBotScreenItem(run: run, bot: piper, conversationTitle: "Standup"))
+        XCTAssertEqual(vm.selectedBotID, piper.id)
+        XCTAssertNil(vm.errorMessage, "Nova's error must not sit above Piper's Desk (Finished list)")
+
+        // openGroup is also the restore path, so the sidebar row clears.
+        let groups = try String(contentsOf: sourceURL("Sources/AppShell/BotsTeamsGroups.swift"), encoding: .utf8)
+        let rowStart = try XCTUnwrap(groups.range(of: "private func groupRow"))
+        let open = try XCTUnwrap(groups.range(of: "vm.openGroup(group.id)", range: rowStart.upperBound..<groups.endIndex))
+        let row = String(groups[rowStart.lowerBound..<open.lowerBound])
+        XCTAssertTrue(
+            row.contains("vm.errorMessage = nil"),
+            "a Bot's error must not sit above a group's room"
+        )
+    }
+
+    func test_slowStopIsReportedOverAnOlderError_becauseTheStripIsNotModalAndTheSlotMayBeTaken() throws {
+        // WHY: "Stop is taking longer than expected" was written only into an
+        // empty error slot, which the modal alert guaranteed. With the strip an
+        // older undismissed error can still be there, and it hid the fact that
+        // the run is still going. Only this Task's own "Force stop:" failure
+        // may keep the slot.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "public func stopDeskThread"))
+        let end = try XCTUnwrap(source.range(
+            of: "\"Stop is taking longer than expected. Try again or restart the agent.\"",
+            range: start.upperBound..<source.endIndex
+        ))
+        let forceStop = String(source[start.lowerBound..<end.lowerBound])
+        XCTAssertTrue(forceStop.contains("var forceStopFailed = false"))
+        XCTAssertTrue(forceStop.contains("forceStopFailed = true"))
+        XCTAssertTrue(forceStop.contains("if !forceStopFailed {"))
+        XCTAssertFalse(
+            forceStop.contains("if self.errorMessage == nil"),
+            "an unrelated older error must not suppress the slow-stop message"
+        )
+    }
+
+    func test_repeatedErrorIsAnnouncedAgain_becauseTheAlertItReplacedWasSpokenOnEveryAttempt() throws {
+        // WHY: the strip spoke only when its message changed. A second failed
+        // attempt writes the same string, the view sees an equal value and
+        // VoiceOver says nothing, where the alert reappeared and was read each
+        // time. Every write of the slot now moves a revision the strip keys on.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        vm.errorMessage = "Task name and instruction are required."
+        let first = vm.errorMessageRevision
+        vm.errorMessage = "Task name and instruction are required."
+        XCTAssertNotEqual(vm.errorMessageRevision, first, "an equal write must still move the revision")
+
+        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertEqual(
+            bots.components(separatedBy: "announcementToken: vm.errorMessageRevision,").count - 1, 2,
+            "both Bots roots hand the revision to their strip"
+        )
+        let chrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatSharedChrome.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(chrome.range(of: "public struct AgentChatErrorStrip"))
+        let end = try XCTUnwrap(chrome.range(of: "private func announce()", range: start.upperBound..<chrome.endIndex))
+        let strip = String(chrome[start.lowerBound..<end.lowerBound])
+        XCTAssertTrue(
+            strip.contains(".onChange(of: \"\\(announcementToken ?? 0):\\(message)\") { _ in announce() }"),
+            "the announcement is keyed on the token and the message together, so one write speaks once"
+        )
+        XCTAssertFalse(strip.contains(".onChange(of: message)"))
+    }
+
+    func test_renameWhileDeskStaysOpenRebuildsLinkedComposerCopy_becauseTheHeaderAndTheInputMustNameTheSameBot() async throws {
+        // WHY: the linked Desk captures the Bot's name once for its composer
+        // and empty copy. A detached Desk window has its own view model and
+        // stays on .desk, so a rename saved in the main window's Studio
+        // reached its header but left "Message <old name>…" in the input.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        XCTAssertTrue(vm.createDeskThread())
+        try await linkDeskThreadByFirstSend(vm, context: context, router: router)
+        XCTAssertEqual(vm.deskAgentVM?.composerPlaceholder, "Message Piper…")
+
+        let studio = BotsViewModel(context: context, router: router)
+        studio.beginEdit(bot)
+        studio.studioDraft.name = "Nova"
+        XCTAssertEqual(try studio.saveStudio().name, "Nova")
+
+        // How the open Desk learns of a publish made elsewhere.
+        vm.refreshPublishedIdentity(for: bot.id)
+        XCTAssertEqual(vm.selectedBot?.name, "Nova", "fixture: the header reads the new name")
+        XCTAssertEqual(vm.screen, .desk)
+        let agent = try XCTUnwrap(vm.deskAgentVM)
+        XCTAssertEqual(agent.composerPlaceholder, "Message Nova…")
+        XCTAssertEqual(agent.embedding?.emptyConversationTitle, "Message Nova")
     }
 
     func test_queuedFollowUpOnBotThreadCompilesBrainButKeepsUserTextRaw_becauseQueueDrainBypassesEmbeddedComposer() async throws {
