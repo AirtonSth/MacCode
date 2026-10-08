@@ -6,7 +6,7 @@ import CoreModel
 @testable import AppShell
 @testable import Persistence
 import SocketServer
-import Surfaces
+@testable import Surfaces
 
 @MainActor
 final class BotsWindowTests: XCTestCase {
@@ -694,6 +694,156 @@ final class BotsWindowTests: XCTestCase {
         let second = try XCTUnwrap(runner.requests.last)
         XCTAssertTrue(second.prompt.contains("second exact follow-up"))
         XCTAssertTrue(runner.finish(runID: second.runId, status: .completed, reply: "second done"))
+    }
+
+    func test_hostSendToAnotherBotCompilesThatBotsBrowserPage_becauseOneBotsPageMustNeverReachAnothersPrompt() async throws {
+        // WHY: the run prompt names the last page the Bot's browser had open.
+        // It was read from the Bot selected on the Mac, so a paired send to
+        // Quinn while Piper was open told Quinn's model that Piper's page was
+        // its own. A Bot is only ever given its own data.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let store = BotBrowserStore(appSupportDirectory: context.appSupportDirectory)
+        try store.persistTarget(
+            BotBrowserTarget(url: "https://piper.example/inbox", title: "Piper Inbox"),
+            botID: piper.id
+        )
+        try store.persistTarget(
+            BotBrowserTarget(url: "https://quinn.example/review", title: "Quinn Review"),
+            botID: quinn.id
+        )
+        vm.openDesk(piper)
+        XCTAssertEqual(
+            vm.advertisedBrowser?.url,
+            "https://piper.example/inbox",
+            "fixture: Piper is the Bot open on the Mac, with its own page"
+        )
+
+        _ = try vm.enqueueHostMessage(
+            botID: quinn.id,
+            text: "What page do you have open?",
+            conversationID: nil,
+            routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        )
+        let started = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertTrue(
+            request.prompt.contains("Browser: Quinn Review (https://quinn.example/review)"),
+            "the send to Quinn must compile Quinn's own page"
+        )
+        XCTAssertFalse(
+            request.prompt.contains("piper.example"),
+            "the page of the Bot open on the Mac must never reach another Bot's prompt"
+        )
+        XCTAssertEqual(vm.selectedBotID, piper.id, "a host send never changes the Mac selection")
+        XCTAssertTrue(runner.finish(runID: request.runId, status: .completed, reply: "done"))
+    }
+
+    func test_hostSendAcknowledgementDoesNotReadTheBotsBrain_becauseThePhoneWaitsOnThatAcknowledgement() async throws {
+        // WHY: `bot.send` is acknowledged on the main actor, before the
+        // provider starts, and the phone shows the send as confirmed only then.
+        // The memory files and the skill and routine rows are used later, in
+        // the start task. Reading them inside the acknowledgement made every
+        // paired send to a Bot that is not open on the Mac wait on disk and on
+        // two SQLite reads it did not use. They must still reach the prompt,
+        // also when that Bot is opened on the Mac between the acknowledgement
+        // and the start: a desk that has not loaded yet is not the Bot's brain.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        try vm.botHome(for: quinn).writeFile(
+            relativePath: BotHome.memoryName,
+            contents: "- Quinn reviews on Fridays\n"
+        )
+        let routine = BotRoutineDefinition(
+            botID: quinn.id,
+            name: "Release scan",
+            prompt: "Read the release notes before review",
+            scheduleNote: "Daily"
+        )
+        try context.botStore.saveRoutine(routine)
+        try context.botStore.setRoutineEnabled(id: routine.id, enabled: true)
+        vm.openDesk(piper)
+
+        let skillListsBefore = vm.skillListCountForTesting
+        let routineListsBefore = vm.routineListCountForTesting
+        let mainSyncsBefore = PerfSwitchMetrics.mainThreadSyncCountForTesting()
+        _ = try vm.enqueueHostMessage(
+            botID: quinn.id,
+            text: "When do you review?",
+            conversationID: nil,
+            routing: BotDeskRouting(provider: .claude, providerInstanceID: "claude", model: "opus")
+        )
+        let acknowledgementMainSyncs = PerfSwitchMetrics.mainThreadSyncCountForTesting() - mainSyncsBefore
+        XCTAssertFalse(vm.lastSendUsedDestBrainForTesting, "fixture: Quinn is not the Bot open on the Mac")
+        XCTAssertEqual(
+            vm.skillListCountForTesting,
+            skillListsBefore,
+            "the acknowledgement must not list the Bot's skills"
+        )
+        XCTAssertEqual(
+            vm.routineListCountForTesting,
+            routineListsBefore,
+            "the acknowledgement must not list the Bot's routines"
+        )
+        // Every wait in this window is a main-thread SQLite sync. The print is
+        // the count to compare before and after on the same machine.
+        XCTAssertLessThanOrEqual(
+            acknowledgementMainSyncs,
+            5,
+            "the acknowledgement must not gain main-thread SQLite reads"
+        )
+        print("PERF bot.send acknowledgement unselectedBot mainThreadSQLiteSyncs=\(acknowledgementMainSyncs)")
+
+        // The user opens Quinn before the start task has run. The cache-first
+        // desk shows no routines until its freshness pass.
+        vm.enableNavigationFirstFrameDeferral()
+        vm.openDesk(quinn)
+        XCTAssertEqual(vm.selectedBotID, quinn.id)
+        XCTAssertTrue(vm.routines.isEmpty, "fixture: Quinn's desk has not loaded its routines yet")
+
+        let started = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertTrue(
+            request.prompt.contains("Quinn reviews on Fridays"),
+            "the Bot's memory must still reach the prompt"
+        )
+        XCTAssertTrue(
+            request.prompt.contains("Read the release notes before review"),
+            "the Bot's routines must come from the store, not from a desk that has not loaded"
+        )
+        XCTAssertTrue(runner.finish(runID: request.runId, status: .completed, reply: "done"))
     }
 
     func test_deskSendDoesNotRelistProviders_becauseAgentAppDoesNotProbeCatalogOnSend() async throws {
@@ -13506,6 +13656,147 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_queueingOneFollowUpWritesOneRow_becauseASendMustNotRewriteEveryBotsQueue() throws {
+        // WHY: a message sent while the Bot is working is queued inside the
+        // send's acknowledgement. Queueing it deleted and re-inserted the
+        // queue of every Bot on the Mac, so the wait before "queued" grew with
+        // the whole fleet's backlog (20 Bots, 200 rows: 201 inserts for one
+        // message). The words other Bots are holding must not be touched.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        var bots: [BotDefinition] = []
+        for index in 0..<20 {
+            bots.append(try vm.create(name: "Queue Bot \(index)", title: "Queue", provider: .claude))
+        }
+        let queuedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        for (index, bot) in bots.enumerated() {
+            for item in 0..<10 {
+                _ = try context.botStore.enqueueQueuedFollowUp(BotQueuedFollowUpRecord(
+                    botID: bot.id,
+                    text: "queued \(index)-\(item)",
+                    createdAt: queuedAt.addingTimeInterval(TimeInterval(index * 10 + item))
+                ))
+            }
+        }
+        vm.reloadQueuedFollowUpsFromStore()
+
+        let target = bots[7]
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: target.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(target)
+        XCTAssertTrue(vm.deskRunIsLive, "fixture: the send must take the queued branch")
+        let seeded = try context.botStore.listAllQueuedFollowUps()
+        XCTAssertEqual(seeded.count, 200, "fixture: 20 Bots with 10 queued rows each")
+        XCTAssertEqual(vm.queuedFollowUps.count, 10, "fixture: the queue is in memory, not only in SQLite")
+
+        let rowWritesBefore = context.botStore.queuedFollowUpRowWriteCountForTesting
+        vm.composerText = "one more for the queue"
+        XCTAssertTrue(vm.send())
+        XCTAssertEqual(
+            context.botStore.queuedFollowUpRowWriteCountForTesting - rowWritesBefore,
+            1,
+            "one queued message must write one row"
+        )
+
+        let stored = try context.botStore.listAllQueuedFollowUps()
+        XCTAssertEqual(stored.count, 201)
+        let untouched = stored.filter { $0.text != "one more for the queue" }
+        XCTAssertEqual(
+            untouched.map(\.id),
+            seeded.map(\.id),
+            "the rows already queued keep their order"
+        )
+        XCTAssertEqual(
+            untouched.map(\.createdAt),
+            seeded.map(\.createdAt),
+            "the rows already queued keep the moment they were queued"
+        )
+        let targetRows = try context.botStore.listQueuedFollowUps(botID: target.id)
+        XCTAssertEqual(targetRows.last?.text, "one more for the queue", "the new row is last in its Bot's queue")
+        XCTAssertEqual(
+            vm.queuedFollowUps.map(\.text),
+            targetRows.map(\.text),
+            "the queue on screen is the stored queue, in the same order"
+        )
+
+        let reopened = BotsViewModel(context: context)
+        reopened.openDesk(target)
+        XCTAssertEqual(
+            reopened.queuedFollowUps.map(\.text),
+            targetRows.map(\.text),
+            "the queued message survives a relaunch"
+        )
+    }
+
+    func test_refusedOneRowQueueInsertFallsBackToTheRewrite_becauseQueuedWordsMustNotLiveOnlyInMemory() throws {
+        // WHY: the one-row insert can be refused by SQLite. The message is
+        // already shown as queued, so it must still reach the store through the
+        // full rewrite; kept only in memory, a relaunch would lose words the
+        // user saw accepted.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let target = try vm.create(name: "Queue Bot", title: "Queue", provider: .claude)
+        for item in 0..<10 {
+            _ = try context.botStore.enqueueQueuedFollowUp(
+                BotQueuedFollowUpRecord(botID: target.id, text: "queued \(item)")
+            )
+        }
+        vm.reloadQueuedFollowUpsFromStore()
+        let thread = AgentThread(title: "Standup", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(thread)
+        try context.runRepo.upsert(AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "opus",
+            status: .running,
+            startedAt: Date()
+        ))
+        try context.botStore.upsertConversation(
+            BotConversation(botID: target.id, title: "Standup", linkedAgentThreadID: thread.id)
+        )
+        vm.openDesk(target)
+        XCTAssertTrue(vm.deskRunIsLive, "fixture: the send must take the queued branch")
+
+        // A real refused write, not a mock. Only the appended row (order 110)
+        // aborts; the rewrite numbers the queue 0...10 and goes through.
+        try context.db.execute("UPDATE bot_queued_follow_ups SET sort_order = sort_order + 100;")
+        try context.db.execute("""
+            CREATE TRIGGER t_refuse_appended_queue_row
+            BEFORE INSERT ON bot_queued_follow_ups
+            WHEN NEW.sort_order = 110
+            BEGIN
+                SELECT RAISE(ABORT, 'refused');
+            END;
+            """)
+        defer { try? context.db.execute("DROP TRIGGER t_refuse_appended_queue_row;") }
+
+        vm.composerText = "one more for the queue"
+        XCTAssertTrue(vm.send())
+
+        let targetRows = try context.botStore.listQueuedFollowUps(botID: target.id)
+        XCTAssertEqual(
+            targetRows.map(\.sortOrder),
+            Array(0...10),
+            "fixture: the one-row insert was refused, so the rewrite renumbered the queue"
+        )
+        XCTAssertEqual(targetRows.last?.text, "one more for the queue", "the refused message is still stored, last")
+        XCTAssertEqual(
+            vm.queuedFollowUps.map(\.text),
+            targetRows.map(\.text),
+            "the queue on screen is the stored queue, in the same order"
+        )
+    }
+
     func test_deletedBotDropsItsQueuedFollowUp_becauseTheTeammateIsGone() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
@@ -17348,6 +17639,64 @@ final class BotsWindowTests: XCTestCase {
             embedding: AgentAppEmbedding(pinnedThreadId: f.thread.id)
         )
         XCTAssertFalse(bare.canContinueWithoutBot)
+    }
+
+    func test_deskSelectionReadsTheThreadRowOnce_becauseTheClickWaitsBehindTheStreamWriter() async throws {
+        // WHY: choosing a Bot builds its embedded Agent App on the click, and
+        // each full read of the thread row waits on the queue the stream
+        // writer uses while another Bot is answering. The build read the same
+        // row four times (cwd, the embedded rail, the hand-off gate, the
+        // runtime label). One read must serve all four, and the row handed to
+        // the new view model must be this Bot's thread and no other.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        let quinn = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude)
+        let piperThread = AgentThread(title: "Piper standup", provider: .claude, model: "opus")
+        let quinnThread = AgentThread(title: "Quinn review", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(piperThread)
+        try context.threadRepo.upsert(quinnThread)
+        let piperConversation = BotConversation(
+            botID: piper.id, title: piperThread.title, linkedAgentThreadID: piperThread.id
+        )
+        let quinnConversation = BotConversation(
+            botID: quinn.id, title: quinnThread.title, linkedAgentThreadID: quinnThread.id
+        )
+        try context.botStore.upsertConversation(piperConversation)
+        try context.botStore.upsertConversation(quinnConversation)
+
+        vm.openDesk(piper)
+        vm.selectDeskThread(piperConversation.id)
+        let piperAgent = try XCTUnwrap(vm.deskAgentVM)
+        XCTAssertEqual(piperAgent.selectedThreadId, piperThread.id)
+        // Let Piper's open settle so only Quinn's selection is counted.
+        try await Task.sleep(for: .milliseconds(500))
+
+        vm.openDesk(quinn)
+        vm.selectDeskThread(quinnConversation.id)
+        let quinnAgent = try XCTUnwrap(vm.deskAgentVM)
+        XCTAssertFalse(quinnAgent === piperAgent, "each Bot gets its own embedded Agent App")
+        XCTAssertEqual(
+            vm.lastDeskAgentSyncThreadReadCountForTesting,
+            1,
+            "selecting a Bot must read its thread row once"
+        )
+        XCTAssertEqual(
+            quinnAgent.durableThreadSelectionLookupCountForTesting,
+            0,
+            "the embedded Agent App must open from the row the desk already read"
+        )
+        XCTAssertEqual(quinnAgent.selectedThreadId, quinnThread.id)
+        XCTAssertEqual(quinnAgent.threads.map(\.id), [quinnThread.id])
+        XCTAssertEqual(quinnAgent.threads.first?.title, "Quinn review")
+        XCTAssertEqual(
+            piperAgent.selectedThreadId,
+            piperThread.id,
+            "the view model left behind must never be moved to another Bot's thread"
+        )
+        XCTAssertEqual(piperAgent.threads.map(\.id), [piperThread.id])
     }
 
     func test_botDesk2000DeltaDistillReplyPaintsThroughEmbeddedAgentAppWithoutDeskRepublish() async throws {

@@ -93,6 +93,117 @@ final class ResidualPersistenceBenchmarkTests: XCTestCase {
         )
     }
 
+    // MARK: - Bot sidecar write counts (always run: counts, not timings)
+
+    /// WHY: a Bot mutation (send, pin, select a conversation) answers the phone
+    /// only after its sidecar persist, and the production database commits with
+    /// full fsync. Rewriting all 17 sidecar rows as 17 commits made every ack
+    /// wait on 17 durable commits. A mutation must commit once and write only
+    /// the rows it changed, and a relaunch must still read back exactly what
+    /// the phone was told.
+    func test_botRemoteSidecar_mutationCommitsOnlyItsChangedRowsOnce() throws {
+        let fixture = try makeSidecarFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.support) }
+        let created = try fixture.authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "sidecar-count-create", "name": "Sidecar",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+
+        let counter = SidecarWriteCounter()
+        counter.attach(to: fixture.db)
+        let pinned = try fixture.authority.dispatch(method: "bot.set_pinned", params: [
+            "client_request_id": "sidecar-count-pin", "bot_id": botID, "pinned": true,
+        ])
+        XCTAssertEqual(counter.commits, 1, "bot.set_pinned must persist its sidecar rows in one commit")
+        XCTAssertGreaterThanOrEqual(counter.rowWrites, 1, "the mutation's own receipt must be persisted")
+        XCTAssertLessThanOrEqual(counter.rowWrites, 3, "bot.set_pinned must not rewrite sidecar rows it did not change")
+
+        counter.reset()
+        let conversation = try fixture.authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "sidecar-count-conversation", "bot_id": botID, "title": "Counted",
+        ])
+        XCTAssertEqual(counter.commits, 1, "bot.conversation.create must persist its sidecar rows in one commit")
+        XCTAssertGreaterThanOrEqual(counter.rowWrites, 1, "the mutation's own receipt must be persisted")
+        XCTAssertLessThanOrEqual(counter.rowWrites, 3, "bot.conversation.create must not rewrite sidecar rows it did not change")
+        counter.detach(from: fixture.db)
+
+        let relaunched = BotRemoteControlAuthority(
+            db: fixture.db,
+            store: fixture.store,
+            settings: fixture.settings,
+            appSupportDirectory: fixture.support
+        )
+        for receipt in [pinned, conversation] {
+            let requestID = try XCTUnwrap(receipt["request_id"] as? String)
+            let replayed = try relaunched.dispatch(method: "bot.receipt.status", params: [
+                "client_request_id": requestID,
+            ])
+            XCTAssertEqual(
+                replayed as NSDictionary,
+                receipt as NSDictionary,
+                "\(requestID) must replay after relaunch exactly as it was answered"
+            )
+        }
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let listed = try relaunched.dispatch(method: "bot.conversation.list", params: ["bot_id": botID])
+        XCTAssertEqual(
+            listed["selected_id"] as? String,
+            conversationID,
+            "a row written by an earlier mutation must survive later mutations that skipped it"
+        )
+    }
+
+    /// WHY: writing only changed rows must never turn a failed write into a
+    /// lost one. A row SQLite rejected has to travel with the next mutation,
+    /// still in one commit, even though that mutation did not touch it; and
+    /// one rejected row must not take the mutation's receipt down with it.
+    func test_botRemoteSidecar_rejectedRowIsWrittenAgainByNextMutation() throws {
+        let fixture = try makeSidecarFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.support) }
+        let created = try fixture.authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "sidecar-retry-create", "name": "Sidecar",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        try fixture.db.execute("""
+            CREATE TRIGGER fail_selection_sidecar
+            BEFORE UPDATE ON settings
+            WHEN OLD.key = 'bot.remote.selected_conversations'
+            BEGIN SELECT RAISE(ABORT, 'injected selection sidecar failure'); END;
+            """)
+        let conversation = try fixture.authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "sidecar-retry-conversation", "bot_id": botID, "title": "Retried",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        XCTAssertNil(
+            try sidecarObject(fixture.db, key: "bot.remote.selected_conversations")[botID],
+            "the injected failure must have rejected the selection row"
+        )
+        XCTAssertNotNil(
+            try sidecarObject(fixture.db, key: "bot.remote.receipts")["sidecar-retry-conversation"],
+            "the receipt must commit even when another row of the same persist is rejected"
+        )
+        try fixture.db.execute("DROP TRIGGER fail_selection_sidecar;")
+
+        let counter = SidecarWriteCounter()
+        counter.attach(to: fixture.db)
+        _ = try fixture.authority.dispatch(method: "bot.set_pinned", params: [
+            "client_request_id": "sidecar-retry-pin", "bot_id": botID, "pinned": true,
+        ])
+        counter.detach(from: fixture.db)
+
+        XCTAssertEqual(
+            try sidecarObject(fixture.db, key: "bot.remote.selected_conversations")[botID] as? String,
+            conversationID,
+            "the rejected row must be written by the next mutation"
+        )
+        XCTAssertEqual(counter.commits, 1, "the retried row must travel in the mutation's single commit")
+        XCTAssertLessThanOrEqual(counter.rowWrites, 3, "only the receipt rows and the retried row are written")
+    }
+
     private func requireOptIn() throws {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["RC2_RUN_RESIDUAL_PERSISTENCE_BENCHMARKS"] == "1",
@@ -355,6 +466,80 @@ final class ResidualPersistenceBenchmarkTests: XCTestCase {
                 try? FileManager.default.removeItem(at: support)
             }
         )
+    }
+
+    /// Counts writes to `settings` and the durable commits that carry them: a
+    /// write outside a transaction is its own commit. The mutations measured
+    /// with it write to `settings` only through the Bot sidecar.
+    private final class SidecarWriteCounter {
+        private(set) var rowWrites = 0
+        private(set) var commits = 0
+        private var transactionOpen = false
+        private var rowWritesInTransaction = 0
+
+        func attach(to db: SQLiteDB) {
+            db.beforeExecuteForTesting = { [self] sql in
+                if sql.hasPrefix("BEGIN") {
+                    transactionOpen = true
+                    rowWritesInTransaction = 0
+                } else if sql.hasPrefix("COMMIT") {
+                    if rowWritesInTransaction > 0 { commits += 1 }
+                    transactionOpen = false
+                } else if sql.hasPrefix("ROLLBACK") {
+                    transactionOpen = false
+                }
+            }
+            db.beforeStatementStepForTesting = { [self] sql in
+                guard sql.contains("INTO settings") else { return }
+                rowWrites += 1
+                if transactionOpen {
+                    rowWritesInTransaction += 1
+                } else {
+                    commits += 1
+                }
+            }
+        }
+
+        func detach(from db: SQLiteDB) {
+            db.beforeExecuteForTesting = nil
+            db.beforeStatementStepForTesting = nil
+        }
+
+        func reset() {
+            rowWrites = 0
+            commits = 0
+        }
+    }
+
+    private func makeSidecarFixture() throws -> (
+        db: SQLiteDB,
+        store: BotStore,
+        settings: SettingsStore,
+        support: URL,
+        authority: BotRemoteControlAuthority
+    ) {
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-bot-sidecar-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let store = BotStore(db: db)
+        let settings = SettingsStore(db: db)
+        let authority = BotRemoteControlAuthority(
+            db: db,
+            store: store,
+            settings: settings,
+            appSupportDirectory: support
+        )
+        return (db, store, settings, support, authority)
+    }
+
+    private func sidecarObject(_ db: SQLiteDB, key: String) throws -> [String: Any] {
+        let data = try settingData(db, key: key)
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw HarnessError.invalidStoredJSON(key)
+        }
+        return object
     }
 
     private func scalar(

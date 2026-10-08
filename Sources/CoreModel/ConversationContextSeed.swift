@@ -315,6 +315,18 @@ public struct ConversationContextSnapshot: Sendable, Equatable {
         )
     }
 
+    /// Rows a bounded capture reads from the newest end of a thread:
+    /// `maxItems` prior rows, the current user row (it may already be stored),
+    /// and one more that proves the thread is over the bound.
+    public static let boundedReadLimit = ConversationContextSeed.maxItems + 2
+
+    /// True when the newest rows of a thread already prove `capture` returns
+    /// nil for the whole thread. `capture` drops at most one row (the current
+    /// user turn), so more than `maxItems + 1` user/assistant rows cannot fit.
+    public static func exceedsItemBound(newestMessages: [AgentMessage]) -> Bool {
+        newestMessages.lazy.filter { $0.role != .system }.count > ConversationContextSeed.maxItems + 1
+    }
+
     public static func digest(for items: [Item]) -> String {
         let material = items.map { item in
             "\(item.ordinal)\u{1e}\(item.role.rawValue)\u{1e}\(item.messageId)\u{1e}\(item.canonicalText)"

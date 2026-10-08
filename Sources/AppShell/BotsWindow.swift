@@ -3448,6 +3448,9 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var skillListCountForTesting = 0
     /// Test seam: send dest used dest brain cache instead of listing.
     public private(set) var lastSendUsedDestBrainForTesting = false
+    /// Test seam: full thread-row reads (`threadRepo.get`) of the last desk
+    /// Agent App build, the embedded view model's included. Selection must pay one.
+    public private(set) var lastDeskAgentSyncThreadReadCountForTesting = 0
     /// Test seam: listConversations rereads. Persist dest must not increment this.
     public private(set) var conversationListCountForTesting = 0
     /// Test seam: listAttention rereads. Acknowledge dest must not increment this.
@@ -6687,6 +6690,12 @@ public final class BotsViewModel: ObservableObject {
     /// cannot invent a page. Blank URL compiles as omitted.
     public var advertisedBrowser: BotBrowserTarget? {
         guard let bot = selectedBot else { return nil }
+        return advertisedBrowser(for: bot)
+    }
+
+    /// A run compiles the page of the Bot it is sent to. That Bot is not
+    /// always the one open on the Mac (a paired send, a drained follow-up).
+    private func advertisedBrowser(for bot: BotDefinition) -> BotBrowserTarget? {
         let store = BotBrowserStore(appSupportDirectory: context.appSupportDirectory)
         guard let target = try? store.loadTarget(botID: bot.id) else { return nil }
         let url = target.url.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -9878,11 +9887,23 @@ public final class BotsViewModel: ObservableObject {
         return revision
     }
 
+    /// The open desk's skill and routine rows for `bot`; nil when another
+    /// teammate is open. In memory only.
+    private func deskBrainCache(for bot: BotDefinition) -> (skills: [BotSkillBinding], routines: [BotRoutine])? {
+        selectedBotID == bot.id ? (skills: skillBindings, routines: routines) : nil
+    }
+
     /// Send dest used to listMemory/listSkillBindings after dest
     /// painted the bubble. Use dest cache when this teammate is open.
-    private func destBrainInputs(for bot: BotDefinition) -> (memoryFiles: [BotMemoryFileText], skills: [BotSkillBinding], routines: [BotRoutine]) {
-        if selectedBotID == bot.id {
-            return (memoryFileTexts(for: bot), skillBindings, routines)
+    /// A send takes `deskBrainCache` in its acknowledgement and calls this
+    /// from its start task: the selection may have changed by then, so the
+    /// live desk rows are never read here.
+    private func destBrainInputs(
+        for bot: BotDefinition,
+        deskCache: (skills: [BotSkillBinding], routines: [BotRoutine])?
+    ) -> (memoryFiles: [BotMemoryFileText], skills: [BotSkillBinding], routines: [BotRoutine]) {
+        if let deskCache {
+            return (memoryFileTexts(for: bot), deskCache.skills, deskCache.routines)
         }
         skillListCountForTesting += 1
         routineListCountForTesting += 1
@@ -10028,8 +10049,14 @@ public final class BotsViewModel: ObservableObject {
         let key = DeskAgentKey(botID: bot.id, conversationID: live.id, threadID: threadID, botName: bot.name)
         if deskAgentKey == key, deskAgentVM != nil { return }
         tearDownDeskAgentVM()
+        let threadReadsBefore = context.threadRepo.durableGetCountForTesting
+        // One read of the thread row serves the cwd, the embedded Agent App's
+        // first paint, the hand-off gate and the first runtime value. This
+        // runs on the click, on the queue the stream writer also uses.
+        let thread: AgentThread? = try? context.threadRepo.get(id: threadID)
+        let workspaceCwd = workspaceExecutionCwd(for: thread)
         let deskCwd: String
-        if let workspaceCwd = workspaceExecutionCwd(forThread: threadID) {
+        if let workspaceCwd {
             deskCwd = workspaceCwd
         } else {
             deskCwd = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root.path
@@ -10056,7 +10083,8 @@ public final class BotsViewModel: ObservableObject {
             },
             composerPlaceholder: Self.deskComposerPlaceholder(botName: bot.name),
             emptyConversationTitle: "Message \(Self.displayName(bot.name))",
-            emptyConversationSubtitle: "This thread has no messages yet."
+            emptyConversationSubtitle: "This thread has no messages yet.",
+            pinnedThread: thread
         )
         let vm = AgentAppViewModel(
             workspaceID: Self.botDeskWorkspaceID,
@@ -10118,7 +10146,7 @@ public final class BotsViewModel: ObservableObject {
         vm.botNameProvider = { [weak self] botID in
             (try? self?.botStore.get(id: botID))??.name
         }
-        if workspaceExecutionCwd(forThread: threadID) != nil {
+        if workspaceCwd != nil {
             vm.handoffHost = { [weak self, weak router] oldID, actor in
                 do {
                     try router?.startBotHandoff(from: oldID, actor: actor)
@@ -10133,7 +10161,9 @@ public final class BotsViewModel: ObservableObject {
         vm.refreshProviderSnapshotsInBackground()
         deskAgentKey = key
         deskAgentVM = vm
-        observeDeskThreadRuntime(threadID, in: vm)
+        observeDeskThreadRuntime(threadID, in: vm, row: thread)
+        lastDeskAgentSyncThreadReadCountForTesting =
+            context.threadRepo.durableGetCountForTesting - threadReadsBefore
     }
 
     /// Desk send gate: nil when Docker reports the bot's container running.
@@ -10179,9 +10209,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     /// Workspace-linked threads keep running in their workspace (or worktree), not the bot home.
-    private func workspaceExecutionCwd(forThread threadID: AgentThreadID) -> String? {
-        guard let thread = (try? context.threadRepo.get(id: threadID)) ?? nil,
-              let workspaceID = thread.workspaceId else { return nil }
+    private func workspaceExecutionCwd(for thread: AgentThread?) -> String? {
+        guard let thread, let workspaceID = thread.workspaceId else { return nil }
         if let worktree = thread.worktreePath, !worktree.isEmpty { return worktree }
         return context.state.workspaces[workspaceID]?.cwd
     }
@@ -10300,23 +10329,30 @@ public final class BotsViewModel: ObservableObject {
 
     /// Re-reads the placement whenever the thread's target or provider
     /// changes on the embedded Agent App (a Mac handoff, an approved Mac
-    /// execution request, a model switch); the first value comes at once.
-    private func observeDeskThreadRuntime(_ threadID: AgentThreadID, in vm: AgentAppViewModel) {
+    /// execution request, a model switch); the first value comes at once,
+    /// from the row the desk sync just read.
+    private func observeDeskThreadRuntime(
+        _ threadID: AgentThreadID,
+        in vm: AgentAppViewModel,
+        row: AgentThread?
+    ) {
         struct Route: Equatable {
             let target: ExecutionTarget?
             let provider: AgentProvider?
         }
+        refreshDeskThreadRuntime(threadID, row: row)
         deskThreadRuntimeObservation = vm.$threads
             .map { $0.first(where: { $0.id == threadID }).map { Route(target: $0.executionTarget, provider: $0.provider) } }
             .removeDuplicates()
+            .dropFirst()
             .sink { [weak self] _ in self?.refreshDeskThreadRuntime(threadID) }
     }
 
-    private func refreshDeskThreadRuntime(_ threadID: AgentThreadID) {
+    private func refreshDeskThreadRuntime(_ threadID: AgentThreadID, row: AgentThread? = nil) {
         let next = DeskThreadRuntime(
             threadID: threadID,
             placementInGuest: ((try? context.threadRepo.guestPlacement(of: threadID)) ?? nil)?.runsInGuest == true,
-            provider: ((try? context.threadRepo.get(id: threadID)) ?? nil)?.provider
+            provider: (row ?? (try? context.threadRepo.get(id: threadID)))?.provider
         )
         if next != deskThreadRuntime { deskThreadRuntime = next }
     }
@@ -10363,7 +10399,7 @@ public final class BotsViewModel: ObservableObject {
         let inGuest = runsInGuest(threadID: threadID, provider: routing.provider)
         let conversation = conversations.first(where: { $0.id == conversationID })
             ?? ((try? botStore.conversation(id: conversationID)) ?? nil)
-        let brain = destBrainInputs(for: bot)
+        let brain = destBrainInputs(for: bot, deskCache: deskBrainCache(for: bot))
         let receipt = BotBrainCompiler.assemble(
             bot: bot,
             revision: revision,
@@ -10373,7 +10409,7 @@ public final class BotsViewModel: ObservableObject {
             ownedSkills: ownedSkillTexts(for: bot),
             routines: brain.routines,
             workspace: nil,
-            browser: advertisedBrowser,
+            browser: advertisedBrowser(for: bot),
             conversationID: conversation?.id ?? conversationID,
             liveRunMode: routing.permissionMode,
             runProvider: routing.provider,
@@ -10627,9 +10663,12 @@ public final class BotsViewModel: ObservableObject {
     ) throws -> BotStartedRun? {
         // Dest first. Send used to listMemory/listSkillBindings after the
         // bubble painted. Both Desk and host-catalog sends snapshot the same
-        // cached brain before starting the provider.
-        let brain = destBrainInputs(for: bot)
-        lastSendUsedDestBrainForTesting = selectedBotID == bot.id
+        // cached brain before starting the provider. Only the desk rows are
+        // taken here; the memory files and the store rows are read in the
+        // start task below, so the acknowledgement of a paired send does not
+        // wait on reads it never uses.
+        let deskBrain = deskBrainCache(for: bot)
+        lastSendUsedDestBrainForTesting = deskBrain != nil
         guard let router = resolvedRouter(),
               let revision = try currentRevision(for: bot) else {
             recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
@@ -10683,6 +10722,7 @@ public final class BotsViewModel: ObservableObject {
                     self.clearDeskSendInFlight(for: bot.id)
                     return
                 }
+                let brain = self.destBrainInputs(for: bot, deskCache: deskBrain)
                 let started = await self.startSupervisedRun(
                     bot: bot,
                     revision: revision,
@@ -10775,7 +10815,7 @@ public final class BotsViewModel: ObservableObject {
                 ownedSkills: ownedSkillTexts(for: bot),
                 routines: routines,
                 workspace: nil,
-                browser: advertisedBrowser,
+                browser: advertisedBrowser(for: bot),
                 conversationID: prepared.conversation.id,
                 liveRunMode: routing.permissionMode,
                 runProvider: routing.provider,
@@ -10968,7 +11008,23 @@ public final class BotsViewModel: ObservableObject {
 
     private func enqueueFollowUp(_ item: BotQueuedFollowUp, botID: BotID) {
         queuedFollowUpsByBot[botID, default: []].append(item)
-        persistQueuedFollowUps()
+        // One queued message writes one row, appended after the Bot's stored
+        // rows. `persistQueuedFollowUps` deletes and re-inserts every Bot's
+        // queue, and this runs inside the acknowledgement of a paired send.
+        // It stays as the fallback so a refused insert persists as before, and
+        // the legacy defaults copy is dropped here as that rewrite drops it.
+        let record = BotQueuedFollowUpRecord(
+            id: item.id.uuidString.lowercased(),
+            botID: botID,
+            conversationID: item.conversationID?.value.uuidString.lowercased(),
+            text: item.text,
+            payloadJSON: encodeQueuedFollowUpPayload(item)
+        )
+        if (try? botStore.enqueueQueuedFollowUp(record)) != nil {
+            UserDefaults.standard.removeObject(forKey: Self.queuedFollowUpsDefaultsKey)
+        } else {
+            persistQueuedFollowUps()
+        }
         syncQueuedFollowUps()
     }
 

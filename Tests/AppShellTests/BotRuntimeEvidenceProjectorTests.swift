@@ -2,6 +2,7 @@ import XCTest
 import CoreModel
 import SocketServer
 @testable import AppShell
+@testable import Persistence
 
 final class BotRuntimeEvidenceProjectorTests: XCTestCase {
     /// WHY: an idempotent replay of a completed Bot receipt must reconcile the
@@ -27,6 +28,7 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         XCTAssertTrue(projector.registerCompletedSend(receipt))
 
         XCTAssertEqual(projected.map(\.kind), ["bot.run.stream", "bot.run.completed"])
+        projector.flushTerminalsForTesting()
         XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: "run-a", failed: false)])
     }
 
@@ -52,6 +54,7 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         bus.publish(kind: .agentItemDelta, payload: agentPayload())
 
         XCTAssertEqual(projected.map(\.kind), ["bot.run.stream", "bot.run.completed"])
+        projector.flushTerminalsForTesting()
         XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: "run-a", failed: false)])
         XCTAssertTrue(zip(projected, projected.dropFirst()).allSatisfy { $0.seq < $1.seq })
         for event in projected {
@@ -101,6 +104,7 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
             threadID: threadID.uppercased()
         ))
 
+        projector.flushTerminalsForTesting()
         XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: runID, failed: false)])
     }
 
@@ -201,6 +205,7 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
             projectedRuns(),
             ["bot.run.stream run-a", "bot.run.stream run-b", "bot.run.completed run-b"]
         )
+        projector.flushTerminalsForTesting()
         XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: "run-b", failed: false)])
 
         // The dropped run-a ticks stay consumed: a replayed receipt, even
@@ -225,6 +230,7 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         bus.publish(kind: .agentRunFailed, payload: agentPayload())
         bus.flushPersistenceSubmissions()
         XCTAssertEqual(projectedRuns().last, "bot.run.failed run-a")
+        projector.flushTerminalsForTesting()
         XCTAssertEqual(terminals.last, .init(botID: "bot-a", runID: "run-a", failed: true))
     }
 
@@ -264,7 +270,171 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         // they are published while the replay subscription is still installed.
         XCTAssertEqual(projector.replayedEventCountForTesting, EventBus.defaultRecentLimit + 2)
         XCTAssertEqual(projected.map(\.kind), ["bot.run.stream", "bot.run.completed"])
+        projector.flushTerminalsForTesting()
         XCTAssertEqual(terminals, [.init(botID: "bot-a", runID: "run-a", failed: false)])
+    }
+
+    /// WHY: the settle behind `onTerminal` reads fleet attention and writes
+    /// the sidecar in SQLite. Run on the EventBus delivery lane, a slow settle
+    /// held back the phone's `bot.run.completed` and every other publisher,
+    /// other Bots' terminal events included. It must run off the lane, and
+    /// still once per run and in the order the runs ended.
+    func test_heldSettleDoesNotHoldBackTerminalEvidenceAndSettlesOncePerRunInOrder() throws {
+        let bus = EventBus(recentLimit: 32)
+        let settleStarted = DispatchSemaphore(value: 0)
+        let releaseSettle = DispatchSemaphore(value: 0)
+        var terminals: [BotRuntimeEvidenceProjector.TerminalEvidence] = []
+        var settlesHeldUntilReleased = 0
+        let projector = BotRuntimeEvidenceProjector(eventBus: bus) { terminal in
+            settleStarted.signal()
+            // Stands in for a settle waiting on SQLite. Bounded, so a settle
+            // on the delivery lane fails this test instead of hanging it.
+            if releaseSettle.wait(timeout: .now() + 10) == .success { settlesHeldUntilReleased += 1 }
+            terminals.append(terminal)
+        }
+        XCTAssertTrue(projector.registerCompletedSend(sendReceipt()))
+        XCTAssertTrue(projector.registerCompletedSend(sendReceipt(runID: "run-b", threadID: "thread-b")))
+
+        var projected: [String] = []
+        let token = bus.subscribe(since: bus.currentSeq) { event in
+            guard event.kind.hasPrefix("bot.run.") else { return }
+            projected.append("\(event.kind) \(event.payload.objectValue?["run_id"]?.stringValue ?? "")")
+        }
+        defer { bus.unsubscribe(token) }
+
+        bus.publish(kind: .agentRunCompleted, payload: agentPayload())
+        XCTAssertEqual(settleStarted.wait(timeout: .now() + 10), .success)
+        // run-a's settle is held. run-b fails meanwhile: its evidence must
+        // not wait for run-a's settle.
+        bus.publish(kind: .agentRunFailed, payload: agentPayload(runID: "run-b", threadID: "thread-b"))
+        bus.flushPersistenceSubmissions()
+        XCTAssertEqual(projected, ["bot.run.completed run-a", "bot.run.failed run-b"])
+
+        // A receipt replay while the settle is pending must not queue a second one.
+        XCTAssertTrue(projector.registerCompletedSend(sendReceipt()))
+        bus.flushPersistenceSubmissions()
+        XCTAssertEqual(projected.count, 2)
+
+        releaseSettle.signal()
+        releaseSettle.signal()
+        projector.flushTerminalsForTesting()
+        XCTAssertEqual(
+            settlesHeldUntilReleased,
+            2,
+            "both settles were still held when the terminal evidence above was delivered"
+        )
+        XCTAssertEqual(terminals, [
+            .init(botID: "bot-a", runID: "run-a", failed: false),
+            .init(botID: "bot-a", runID: "run-b", failed: true),
+        ])
+    }
+
+    /// WHY: `settleRuntime` reads attention and writes the sidecar. While
+    /// another thread holds the SQLite connection (a long stream flush or
+    /// prune), the phone must still get `bot.run.completed` at once, and the
+    /// run must still settle exactly once when the connection frees.
+    func test_heldSQLiteConnectionDoesNotDelayBotRunCompletedAndTheRunSettlesExactlyOnce() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let supportDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-bot-projector-settle-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: supportDir) }
+        let authority = BotRemoteControlAuthority(
+            db: db,
+            store: BotStore(db: db),
+            settings: SettingsStore(db: db),
+            appSupportDirectory: supportDir
+        )
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "held-create",
+            "name": "Held Bot",
+        ])
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
+            "client_request_id": "held-conversation",
+            "bot_id": botID,
+            "title": "Held",
+        ])
+        let conversationID = try XCTUnwrap(
+            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
+        )
+        let runID = UUID().uuidString.lowercased()
+        let threadID = UUID().uuidString.lowercased()
+        authority.onSend = { _, _, _, _, _ in
+            [
+                "bot_id": botID,
+                "conversation_id": conversationID,
+                "thread_id": threadID,
+                "run_id": runID,
+                "queued_follow_up": false,
+            ]
+        }
+        let sent = try authority.dispatch(method: "bot.send", params: [
+            "client_request_id": "held-send",
+            "host_id": "held-host",
+            "bot_id": botID,
+            "conversation_id": conversationID,
+            "text": "Finish while SQLite is busy",
+        ])
+
+        let bus = EventBus(recentLimit: 8)
+        let settleFinished = DispatchSemaphore(value: 0)
+        var settleResults: [Bool] = []
+        let projector = BotRuntimeEvidenceProjector(eventBus: bus) { terminal in
+            settleResults.append(authority.settleRuntime(
+                botID: terminal.botID,
+                runID: terminal.runID,
+                failed: terminal.failed
+            ))
+            settleFinished.signal()
+        }
+        XCTAssertTrue(
+            projector.registerCompletedSend(JSONValue.from(sent)),
+            "the authority's own bot.send receipt binds the run"
+        )
+
+        var projected: [String] = []
+        let token = bus.subscribe(since: bus.currentSeq) { event in
+            if event.kind.hasPrefix("bot.run.") { projected.append(event.kind) }
+        }
+        defer { bus.unsubscribe(token) }
+
+        let connectionHeld = DispatchSemaphore(value: 0)
+        let releaseConnection = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            db.performSync { _ in
+                connectionHeld.signal()
+                // Bounded, so a settle on the delivery lane fails this test
+                // instead of hanging it.
+                _ = releaseConnection.wait(timeout: .now() + 10)
+            }
+        }
+        XCTAssertEqual(connectionHeld.wait(timeout: .now() + 10), .success)
+
+        bus.publish(kind: .agentRunCompleted, payload: agentPayload(runID: runID, threadID: threadID))
+        bus.flushPersistenceSubmissions()
+        XCTAssertEqual(projected, ["bot.run.completed"])
+        XCTAssertEqual(
+            settleFinished.wait(timeout: .now()),
+            .timedOut,
+            "bot.run.completed reached the subscriber while the settle still waits for SQLite"
+        )
+
+        releaseConnection.signal()
+        XCTAssertEqual(settleFinished.wait(timeout: .now() + 10), .success)
+        projector.flushTerminalsForTesting()
+        XCTAssertEqual(settleResults, [true], "the exact run settles once")
+        let listed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        let item = try XCTUnwrap((listed["items"] as? [[String: Any]])?.first {
+            $0["bot_id"] as? String == botID
+        })
+        XCTAssertEqual(item["run_id"] as? String, runID)
+        XCTAssertEqual(item["state"] as? String, "finished")
+        XCTAssertFalse(
+            authority.settleRuntime(botID: botID, runID: runID, failed: false),
+            "nothing is left to settle a second time"
+        )
     }
 
     private func sendReceipt(

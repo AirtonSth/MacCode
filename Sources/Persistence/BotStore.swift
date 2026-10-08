@@ -87,6 +87,9 @@ public final class BotStore: @unchecked Sendable {
     private var cachedBotList: (revision: UInt64, includeHidden: Bool, bots: [BotDefinition])?
 #if DEBUG
     public private(set) var listQueryCountForTesting = 0
+    /// Rows inserted into `bot_queued_follow_ups`, under the same lock. One
+    /// queued message must write one row, not every Bot's queue again.
+    public private(set) var queuedFollowUpRowWriteCountForTesting = 0
 #endif
 
     /// In-memory `linked_agent_thread_id → bot` map so run-status broadcasts
@@ -2055,6 +2058,9 @@ public final class BotStore: @unchecked Sendable {
         try statement.bind(6, record.sortOrder)
         try statement.bind(7, string(record.createdAt))
         _ = try statement.step()
+#if DEBUG
+        listCacheState.withLock { queuedFollowUpRowWriteCountForTesting += 1 }
+#endif
     }
 
     private func deleteQueuedFollowUpsLocked(botID: BotID, database: SQLiteDB) throws {

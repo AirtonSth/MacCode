@@ -30,6 +30,13 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     private let eventBus: EventBus
     private let onTerminal: (TerminalEvidence) -> Void
     private let now: () -> Date
+    /// `onTerminal` settles the run with SQLite reads and writes. It runs
+    /// here, in the order the terminals were projected, so the EventBus
+    /// delivery lane fans `bot.run.completed` out without waiting for it.
+    private let terminalQueue = DispatchQueue(
+        label: "io.remotecode.bot-runtime-evidence.terminal",
+        qos: .userInitiated
+    )
     private let lock = NSLock()
     private var bindingsByRunID: [String: Binding] = [:]
     private var lastProjectedSequenceByRunID: [String: Int64] = [:]
@@ -41,6 +48,11 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     var replayedEventCountForTesting: Int {
         lock.lock(); defer { lock.unlock() }
         return replayedEventCount
+    }
+
+    /// Test seam: returns once every terminal projected so far has run `onTerminal`.
+    func flushTerminalsForTesting() {
+        terminalQueue.sync {}
     }
 
     init(
@@ -196,11 +208,12 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
         }
         eventBus.publish(kind: projectedKind, payload: .object(projectedPayload))
         if projectedKind == .botRunCompleted || projectedKind == .botRunFailed {
-            onTerminal(TerminalEvidence(
+            let terminal = TerminalEvidence(
                 botID: binding.botID,
                 runID: binding.runID,
                 failed: projectedKind == .botRunFailed
-            ))
+            )
+            terminalQueue.async { [self] in onTerminal(terminal) }
         }
     }
 

@@ -416,6 +416,9 @@ public struct AgentAppEmbedding {
     /// does not "start a new agent run"). Nil keeps the Agent App copy.
     public let emptyConversationTitle: String?
     public let emptyConversationSubtitle: String?
+    /// The pinned thread's row when the host read it on this same turn, so
+    /// the first paint does not read it again. Later reloads read the store.
+    public let pinnedThread: AgentThread?
 
     public init(
         pinnedThreadId: AgentThreadID,
@@ -426,7 +429,8 @@ public struct AgentAppEmbedding {
         sendInterceptor: AgentAppSendInterceptor? = nil,
         composerPlaceholder: String? = nil,
         emptyConversationTitle: String? = nil,
-        emptyConversationSubtitle: String? = nil
+        emptyConversationSubtitle: String? = nil,
+        pinnedThread: AgentThread? = nil
     ) {
         self.pinnedThreadId = pinnedThreadId
         self.executionCwd = executionCwd
@@ -437,6 +441,7 @@ public struct AgentAppEmbedding {
         self.composerPlaceholder = composerPlaceholder
         self.emptyConversationTitle = emptyConversationTitle
         self.emptyConversationSubtitle = emptyConversationSubtitle
+        self.pinnedThread = pinnedThread?.id == pinnedThreadId ? pinnedThread : nil
     }
 }
 
@@ -1017,7 +1022,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadCustomModels()
         self.coordinator.addObserver(self)
         if let embedding {
-            reloadPinnedThread()
+            reloadPinnedThread(seeded: embedding.pinnedThread)
             applyNewThreadDefaultsFromRailIfNeeded()
             selectThread(embedding.pinnedThreadId)
             return
@@ -1609,9 +1614,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Embedded surfaces list only their pinned thread.
-    private func reloadPinnedThread() {
+    private func reloadPinnedThread(seeded: AgentThread? = nil) {
         guard let embedding else { return }
-        guard let thread = try? threadRepo.get(id: embedding.pinnedThreadId) else { return }
+        guard let thread = seeded ?? (try? threadRepo.get(id: embedding.pinnedThreadId)) else { return }
         threads = [thread]
         threadWorkspaceCache[thread.id] = thread.workspaceId ?? workspaceID
     }

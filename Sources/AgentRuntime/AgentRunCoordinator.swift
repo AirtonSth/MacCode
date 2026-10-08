@@ -308,7 +308,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         excludingCurrentUserText: String,
         excludingCurrentUserMessageId: AgentMessageID? = nil
     ) throws -> ConversationContextSnapshot? {
-        let messages = try messageRepo.list(threadId: threadId)
+        // PERF: a thread over the seed bound has no snapshot. Read only the
+        // newest rows that can prove it instead of hydrating the whole thread.
+        // A window that is not full is the whole thread, in the same order.
+        let limit = ConversationContextSnapshot.boundedReadLimit
+        var messages = try messageRepo.listRecent(threadId: threadId, limit: limit)
+        if messages.count >= limit {
+            if ConversationContextSnapshot.exceedsItemBound(newestMessages: messages) {
+                return nil
+            }
+            // System rows fill the window: only the whole thread can decide.
+            messages = try messageRepo.list(threadId: threadId)
+        }
         return ConversationContextSnapshot.capture(
             messages: messages,
             excludingCurrentUserText: excludingCurrentUserText,
