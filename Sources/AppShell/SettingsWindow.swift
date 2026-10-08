@@ -1094,6 +1094,18 @@ public final class SettingsViewModel: ObservableObject {
                 privateAccountStatus = refreshed.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
             } catch {
                 Self.accountLog.error("Private account refresh failed: \(String(describing: error), privacy: .public)")
+                // The push refresher may have stored a newer session meanwhile.
+                if let current = privateAccountStore.load(), current.accessToken != stored.accessToken {
+                    privateAccountUser = current.user
+                    privateAccountEmail = current.user.email
+                    privateAccountStatus = current.user.subscribed ? "Subscription active" : "Signed in; subscription required for backend push"
+                    return
+                }
+                // Only the backend's auth rejection ends the session.
+                guard let apiError = error as? PrivateAccountAPIError, apiError == .http(401) else {
+                    privateAccountStatus = Self.signInFailureMessage(for: error)
+                    return
+                }
                 privateAccountStore.clear()
                 privateAccountUser = nil
                 privateBillingPortalURL = nil

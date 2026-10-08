@@ -1064,9 +1064,10 @@ final class HTTPServerTests: XCTestCase {
                        "fresh connection next interest is the first ping")
         XCTAssertEqual(state.nextWakeDelay(now: 3), 7, accuracy: 0.001)
         _ = state.nextAction(now: 10)
-        // Outstanding ping: next interest is the hard timeout from last proof (t=0).
-        XCTAssertEqual(state.nextWakeDelay(now: 10), 20, accuracy: 0.001,
-                       "while awaiting pong, wake only at timeout")
+        // Outstanding ping: the pong does not re-arm the timer, so the next
+        // interest is one interval later (never past the hard timeout).
+        XCTAssertEqual(state.nextWakeDelay(now: 10), 10, accuracy: 0.001,
+                       "while awaiting pong, wake after one interval")
         XCTAssertTrue(state.acceptPong(nonce, now: 12))
         XCTAssertEqual(state.nextWakeDelay(now: 12), 10, accuracy: 0.001,
                        "after pong, next wake is interval from proof")
@@ -1353,11 +1354,11 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(owner.enqueueApplication(Data("event".utf8)), .accepted)
         owner.finish()
 
+        // Nothing is written after a failed socket write: the frame may be
+        // partly on the wire.
         XCTAssertEqual(recorded.snapshot, [
             "app:event",
             "terminal:write_failed",
-            "control:1:write-failure",
-            "control:8:",
             "shutdown",
         ])
         XCTAssertEqual(owner.queuedByteCount, 0)
