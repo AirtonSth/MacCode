@@ -460,6 +460,8 @@ public struct AgentChatComposerBar: View {
     public var onFileDrop: (([String]) -> Void)?
     /// Why attach is disabled (its tooltip); nil keeps "Attach files".
     public var attachUnavailableReason: String?
+    /// Replaces the hairline with the animated Ultracode border.
+    public var ultracodeBorder: Bool = false
 
     @State private var editorHeight: CGFloat = AgentComposerTextEditor.minHeight
     @State private var suggestionSelectedIndex: Int?
@@ -495,7 +497,8 @@ public struct AgentChatComposerBar: View {
         attachmentsIdentifier: String = "bots.desk.attachments",
         runStatusCaption: String? = nil,
         onFileDrop: (([String]) -> Void)? = nil,
-        attachUnavailableReason: String? = nil
+        attachUnavailableReason: String? = nil,
+        ultracodeBorder: Bool = false
     ) {
         self._text = text
         self.attachments = attachments
@@ -527,6 +530,7 @@ public struct AgentChatComposerBar: View {
         self.runStatusCaption = runStatusCaption
         self.onFileDrop = onFileDrop
         self.attachUnavailableReason = attachUnavailableReason
+        self.ultracodeBorder = ultracodeBorder
     }
 
     public var body: some View {
@@ -651,7 +655,9 @@ public struct AgentChatComposerBar: View {
         .overlay(
             RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
                 .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                .opacity(ultracodeBorder ? 0 : 1)
         )
+        .modifier(UltracodeBorder(active: ultracodeBorder))
         .padding(DS.Space.lg)
         .background(DS.Palette.bg)
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in

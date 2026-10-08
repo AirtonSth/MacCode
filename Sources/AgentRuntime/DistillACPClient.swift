@@ -1083,6 +1083,18 @@ public final class DistillACPClient: @unchecked Sendable {
         let isAutomatic: Bool
     }
 
+    /// Distill extension method that toggles this session's Ultracode orchestration mode.
+    static let ultracodeSetMethod = "_x.ai/session/ultracode/set"
+    /// Sets Ultracode on or off; returns the state Distill confirmed.
+    @discardableResult
+    func setUltracode(sessionId: String, enabled: Bool) async throws -> Bool {
+        let response = try await requestJSONObject(
+            method: Self.ultracodeSetMethod,
+            params: ["sessionId": sessionId, "enabled": enabled],
+            timeout: 15
+        )
+        return response["enabled"] as? Bool ?? enabled
+    }
     /// Distill extension method that binds this session's Worker model.
     static let workerModelSetMethod = "_x.ai/session/worker_model/set"
 

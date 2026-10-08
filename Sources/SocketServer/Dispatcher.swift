@@ -3602,7 +3602,7 @@ public final class JSONRPCDispatcher {
                 let routing = try routingRequest(from: params, requireManualSelection: false)
                 let nestedRunContext = try nestedRunContext(from: params)
                 if routing?.mode == .auto,
-                   ["provider", "provider_instance_id", "providerInstanceId", "model", "reasoning_effort", "service_tier", "model_selection", "distill_main_effort", "worker_model", "worker_effort"].contains(where: { params[$0] != nil }) {
+                   ["provider", "provider_instance_id", "providerInstanceId", "model", "reasoning_effort", "service_tier", "model_selection", "distill_main_effort", "worker_model", "worker_effort", "distill_ultracode"].contains(where: { params[$0] != nil }) {
                     throw JSONRPCError.invalidParams
                 }
                 if params["worker_model"] != nil { _ = try router.setAgentWorkerModel(thread: tid, model: workerModel(from: params)) }
@@ -5460,6 +5460,7 @@ public final class JSONRPCDispatcher {
         object["distill_main_effort"] = .string(thread.modelSelection.distillMainEffortSelection?.effort?.rawValue ?? "auto")
         object["worker_model"] = .string(thread.reasoningModel ?? "")
         object["worker_effort"] = .string(thread.modelSelection.distillReasoningEffortSelection?.effort?.rawValue ?? "auto")
+        object["distill_ultracode"] = .bool(thread.modelSelection.distillUltracode)
     }
 
     private func encodeRunAsUser(_ user: AgentRunAsUser?) -> JSONValue {
@@ -5658,7 +5659,7 @@ public final class JSONRPCDispatcher {
 
     private func modelSelection(from params: [String: JSONValue]) throws -> AgentModelSelection? {
         let nested = modelSelection(from: params["model_selection"])
-        let hasFlat = params["distill_main_effort"] != nil || params["worker_model"] != nil || params["worker_effort"] != nil
+        let hasFlat = params["distill_main_effort"] != nil || params["worker_model"] != nil || params["worker_effort"] != nil || params["distill_ultracode"] != nil
         guard nested != nil || hasFlat else { return nil }
         let provider = nested?.provider ?? AgentProvider(rawValue: params["provider"]?.stringValue ?? "distill") ?? .distill
         var selection = nested ?? AgentModelSelection(
@@ -5674,6 +5675,10 @@ public final class JSONRPCDispatcher {
         if let raw = params["worker_effort"] {
             guard let value = raw.stringValue else { throw JSONRPCError.invalidParams }
             selection.distillReasoningEffortSelection = try effortSelection(value)
+        }
+        if let raw = params["distill_ultracode"] {
+            guard case .bool(let enabled) = raw else { throw JSONRPCError.invalidParams }
+            selection.distillUltracode = enabled
         }
         return selection
     }
@@ -5884,6 +5889,7 @@ public final class JSONRPCDispatcher {
             "distill_main_effort": .string(thread.modelSelection.distillMainEffortSelection?.effort?.rawValue ?? "auto"),
             "worker_model": .string(thread.reasoningModel ?? ""),
             "worker_effort": .string(thread.modelSelection.distillReasoningEffortSelection?.effort?.rawValue ?? "auto"),
+            "distill_ultracode": .bool(thread.modelSelection.distillUltracode),
             "execution_mode": .string(thread.executionMode.rawValue),
             "interaction_mode": .string(thread.effectiveInteractionMode.rawValue),
             "interactionMode": .string(thread.effectiveInteractionMode.rawValue),
