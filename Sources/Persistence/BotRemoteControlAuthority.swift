@@ -254,6 +254,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "attention.list":
             try synchronizeDurableNeedsAttention()
             try synchronizeDelegatedAttention()
+            settleOrphanedWorkingAttention(now: now)
             // Group items are opt-in (`include_kinds: ["group"]`): a client
             // without groups would show one as the bot's own attention and
             // could never clear it (bot.attention.ack is per bot).
@@ -280,10 +281,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         defer { lock.unlock() }
         guard let run = liveRuns[botID],
               let storedRunID = run["run_id"] as? String,
-              runtimeIDsMatch(storedRunID, runID),
-              var item = attention[botID],
+              runtimeIDsMatch(storedRunID, runID) else { return false }
+        liveRuns.removeValue(forKey: botID)
+        // The slot holds one item per Bot. When a routine or a delegated row
+        // replaced it, the run has still ended; leave that item alone.
+        guard var item = attention[botID],
               let attentionRunID = item["run_id"] as? String,
-              runtimeIDsMatch(attentionRunID, runID) else { return false }
+              runtimeIDsMatch(attentionRunID, runID) else { return true }
         // A projection read failure must not block the terminal settle;
         // otherwise liveRuns stays pinned until the host restarts.
         let durableQuestion: [String: Any]?
@@ -299,7 +303,6 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             )
             durableQuestion = nil
         }
-        liveRuns.removeValue(forKey: botID)
         if let durableQuestion {
             attention[botID] = durableQuestion
             persistSidecar()
@@ -340,6 +343,29 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 attention[botID] = item
                 changed = true
             }
+        }
+        if changed { persistSidecar() }
+    }
+
+    /// A `working` bot.send item whose run this process does not track (a host
+    /// relaunch drops `liveRuns`) can never reach `settleRuntime`. Close it from
+    /// the run's durable terminal status.
+    private func settleOrphanedWorkingAttention(now: Date) {
+        var changed = false
+        for (botID, item) in attention {
+            guard item["state"] as? String == "working",
+                  item["source"] as? String == "bot",
+                  let runID = item["run_id"] as? String,
+                  (liveRuns[botID]?["run_id"] as? String).map({ runtimeIDsMatch($0, runID) }) != true,
+                  let terminal = terminalRunStatus(runID: runID) else { continue }
+            let failed = terminal.status != "completed"
+            var finished = item
+            finished["state"] = "finished"
+            finished["finished_at"] = terminal.finishedAt ?? now.timeIntervalSince1970
+            finished["detail"] = failed ? "Run failed" : "Run completed"
+            finished["outcome"] = failed ? "failed" : "completed"
+            attention[botID] = canonicalAttentionItem(finished)
+            changed = true
         }
         if changed { persistSidecar() }
     }
@@ -702,7 +728,22 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func receiptStatus(params: [String: Any]) -> [String: Any] {
         let requestID = string(params, "client_request_id") ?? ""
-        return receipts[requestID] ?? ["status": Status.unknown.rawValue, "request_id": requestID]
+        guard var stored = receipts[requestID] else {
+            return ["status": Status.unknown.rawValue, "request_id": requestID]
+        }
+        // The stored bot.send receipt proves admission only. Report the run's
+        // durable end on the returned copy so a client that missed the live
+        // terminal event can settle. `receipts` itself is not changed.
+        if stored["status"] as? String == Status.completed.rawValue,
+           var readback = stored["readback"] as? [String: Any],
+           readback["enqueued"] as? Bool == false,
+           let runID = readback["run_id"] as? String,
+           let terminal = terminalRunStatus(runID: runID) {
+            readback["run_outcome"] = terminal.status
+            if let finishedAt = terminal.finishedAt { readback["run_finished_at"] = finishedAt }
+            stored["readback"] = readback
+        }
+        return stored
     }
 
     private func peerReceiptStatus(params: [String: Any]) -> [String: Any] {
@@ -3430,6 +3471,33 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 try statement.bind(1, raw)
                 guard try statement.step() else { return nil }
                 return nonemptyIdentity(statement.columnText(0))
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    /// Terminal `agent_runs` status of an admitted run. Nil while the run is
+    /// pending or running, while it has no row yet (the provider start is
+    /// asynchronous), or when the read fails: only a durable terminal row ends a run.
+    private func terminalRunStatus(runID: String) -> (status: String, finishedAt: Double?)? {
+        let upper = UUID(uuidString: runID)?.uuidString ?? runID
+        do {
+            return try db.performSync { database -> (status: String, finishedAt: Double?)? in
+                // Two exact probes keep the primary-key lookup; NOCASE would scan.
+                let statement = try database.prepare("""
+                    SELECT status, finished_at FROM agent_runs
+                    WHERE id IN (?, ?)
+                      AND status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                    LIMIT 1;
+                    """)
+                defer { statement.reset() }
+                try statement.bind(1, upper)
+                try statement.bind(2, upper.lowercased())
+                guard try statement.step(),
+                      let status = nonemptyIdentity(statement.columnText(0)) else { return nil }
+                let finishedAt = statement.columnText(1).flatMap { iso.date(from: $0) }?.timeIntervalSince1970
+                return (status: status, finishedAt: finishedAt)
             }
         } catch {
             return nil

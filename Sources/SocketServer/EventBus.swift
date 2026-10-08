@@ -159,11 +159,13 @@ public final class EventBus: @unchecked Sendable {
     /// not persisted (`AppDelegate.shouldPersistEvent`) and carry no thread,
     /// layout or settings mutation. The `sync.snapshot` fence ignores them so
     /// a streaming agent or printing terminal cannot starve baseline reads.
+    /// `bot.run.stream` is liveness evidence of a Bot run and carries no state.
     public static let liveOnlyStreamEventKinds: Set<String> = [
         "surface.output",
         "agent.item.delta",
         "agent.item.progress",
         "agent.provider_runtime.event",
+        "bot.run.stream",
     ]
 
     /// `agent.*` kinds that never change an `agentThreads` snapshot row

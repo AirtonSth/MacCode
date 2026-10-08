@@ -1278,7 +1278,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         )
         guard let tailcatSupervisor else { return }
         let enabled = requested && listenerReady
+        // Strict FIFO with the sleep/wake tasks: a parked suspend must not run
+        // after a newer resume, and an off toggle must not be overtaken by an
+        // older queued enable. No setting may skip the wait.
+        let previous = tailcatSettingTask
         tailcatSettingTask = Task.detached(priority: .userInitiated) {
+            await previous?.value
             await tailcatSupervisor.setEnabled(enabled)
         }
         if requested && !listenerReady {

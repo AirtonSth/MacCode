@@ -1198,7 +1198,18 @@ private actor PrivatePushSessionRefresher {
             return session
         } catch {
             refreshTask = nil
-            accountStore.clear()
+            // Another refresher (Settings) may have stored a newer session
+            // while this refresh was in flight: use it.
+            let current = accountStore.load()
+            if let current, current.accessToken != staleSession.accessToken {
+                return current
+            }
+            // Only the backend's auth rejection ends the session. Offline,
+            // timeout, 5xx, 429 and decode errors keep it for the next try.
+            if let apiError = error as? PrivateAccountAPIError, apiError == .http(401),
+               current?.refreshToken == staleSession.refreshToken {
+                accountStore.clear()
+            }
             throw error
         }
     }

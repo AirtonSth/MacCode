@@ -143,6 +143,9 @@ public final class DurableReplaySubscription: @unchecked Sendable {
 
     static let maximumBufferedItems = 16_384
     static let maximumBufferedBytes = 4 * 1_024 * 1_024
+    /// Buffered items delivered by `goLive` between two `afterBufferedBatch`
+    /// calls; below the coalescing batcher's admission bound.
+    static let bufferedDeliveryBatch = 128
 
     init(id: UUID, plan: EventBus.DurableReplayPlan, bus: EventBus) {
         self.id = id
@@ -196,12 +199,17 @@ public final class DurableReplaySubscription: @unchecked Sendable {
     /// No closure runs under `lock`: `receive` takes it on the EventBus
     /// delivery queue, and `onOverflow` / `deliver` can publish to the bus
     /// (pressure diagnostics), which waits on that queue.
+    ///
+    /// `afterBufferedBatch` runs on the caller's thread after every
+    /// `bufferedDeliveryBatch` buffered items, never once live.
     @discardableResult
     public func goLive(
         deliver: @escaping (Item) -> Void,
-        onOverflow: (Int64) -> Void
+        onOverflow: (Int64) -> Void,
+        afterBufferedBatch: () -> Void = {}
     ) -> GoLiveOutcome {
         var overflowedAt: Int64?
+        var bufferedDelivered = 0
         while true {
             lock.lock()
             if let through = overflowedThrough {
@@ -223,7 +231,13 @@ public final class DurableReplaySubscription: @unchecked Sendable {
             buffered.removeAll()
             bufferedBytes = 0
             lock.unlock()
-            for item in items { deliver(item) }
+            for item in items {
+                deliver(item)
+                bufferedDelivered += 1
+                if bufferedDelivered % Self.bufferedDeliveryBatch == 0 {
+                    afterBufferedBatch()
+                }
+            }
         }
     }
 
@@ -249,6 +263,9 @@ struct DurableReplayDriver {
 
     /// A slice the socket cannot drain in this long ends the replay.
     static let defaultStallTimeout: TimeInterval = 10
+    /// Upper estimate of what the event frame envelope adds to an event's
+    /// retained size: the outbound queue and `waitForRoom` count wire bytes.
+    static let frameEnvelopeBytes = 256
 
     var sliceBytes: Int
     /// First event-log page, read before the welcome (proves the log still
@@ -293,6 +310,7 @@ struct DurableReplayDriver {
             if let mapped = subscription.map(event) {
                 deliverEvent(mapped)
                 budgetUsed += EventBus.retainedJSONByteCount(mapped)
+                    + DurableReplayDriver.frameEnvelopeBytes
             } else {
                 deliverFiltered(event.seq)
             }
@@ -300,6 +318,9 @@ struct DurableReplayDriver {
             replayed += 1
             if budgetUsed >= sliceBytes {
                 budgetUsed = 0
+                // Flush coalesced frames first so the wait sees the whole
+                // slice in the outbound queue.
+                advanceWatermark(event.seq)
                 return waitForRoom(sliceBytes, stallTimeout)
             }
             return isOpen() ? .ready : .closed

@@ -36,6 +36,10 @@ public protocol DirectAuthProvider: AnyObject {
     /// Resolve the durable owner and its persisted RPC grants atomically.
     /// Returns nil when the bearer is invalid or revoked.
     func authorizedRPCPrincipal(token: String) -> DirectRPCPrincipal?
+    /// Same resolution, but throws when the trust lookup itself failed.
+    /// Returns nil only for an invalid or revoked bearer, so the caller can
+    /// answer "retry" instead of "pair again".
+    func resolveRPCPrincipal(token: String) throws -> DirectRPCPrincipal?
     /// Opaque durable owner fingerprint for a verified bearer.
     ///
     /// Used by Attachment Upload v2 so a bearer refresh for the same
@@ -228,6 +232,12 @@ public extension DirectAuthProvider {
             ownerFingerprint: ownerFingerprint,
             grantedCapabilities: "*"
         )
+    }
+
+    /// Providers that cannot tell a failed lookup from an unknown bearer
+    /// never throw.
+    func resolveRPCPrincipal(token: String) throws -> DirectRPCPrincipal? {
+        authorizedRPCPrincipal(token: token)
     }
 
     /// Safe default: still validates the token and preserves owner isolation
@@ -900,7 +910,9 @@ final class WebSocketLivenessState: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let timeoutAt = lastProofAt + timeout
         if outstandingPing != nil {
-            return max(0, timeoutAt - now)
+            // The pong clears the ping without re-arming this one-shot timer,
+            // so wake after one interval to keep the heartbeat cadence.
+            return max(0, min(interval, timeoutAt - now))
         }
         let nextHeartbeatAt = lastHeartbeatAt + interval
         return max(0, min(nextHeartbeatAt, timeoutAt) - now)
@@ -974,8 +986,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxClientFramePayloadBytes = WebSocketClientFrameAssembler.maxFragmentedMessageBytes
     public static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
     /// C8: one durable-replay slice; the next waits until the outbound queue
-    /// is back under it (a quarter of the queue, so live frames keep room).
-    static let durableReplaySliceBytes = maxWebSocketOutboundQueuedBytes / 4
+    /// is back under it. Counted per event with the frame envelope
+    /// (`DurableReplayDriver.frameEnvelopeBytes`): a quarter of the smallest
+    /// outbound budget, so a slice plus the allowed remainder fits the bulk
+    /// lane of a slow link's queue, and one slice holds far fewer events
+    /// than the batcher's admission bound.
+    static let durableReplaySliceBytes = WebSocketOutboundQueue.minimumQueuedBytes / 4
 
     /// Baseline welcome capabilities required by old and new peers. Optional
     /// negotiated controls (e.g. `stream.interest.v1`) are appended only when
@@ -1202,6 +1218,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // Always-gated: identity proof for cold connect; not loopback-trusted.
         if path == "/v1/capabilities/authenticated" { return true }
         return (!loopbackOnly || remoteAuthenticated) && !authExemptV1Paths.contains(path)
+    }
+
+    /// True when an uncompressed JSON body is a top-level array (first byte
+    /// after JSON whitespace is `[`), without parsing it.
+    nonisolated static func isTopLevelJSONArray(_ body: Data) -> Bool {
+        body.first(where: { $0 != 0x20 && $0 != 0x09 && $0 != 0x0A && $0 != 0x0D }) == UInt8(ascii: "[")
     }
 
     /// Admission for GET /v1/devices and POST /v1/devices/revoke.
@@ -1516,6 +1538,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private static let badContentLengthBody = Data("bad content length\n".utf8)
     private static let badEncodedBodyBody = Data("bad encoded body\n".utf8)
     private static let unauthorizedBody = Data("unauthorized\n".utf8)
+    private static let authLookupFailedBody = Data("auth lookup failed\n".utf8)
     private static let forbiddenBody = Data("forbidden\n".utf8)
     private static let okBody = Data("ok\n".utf8)
     private static let badRequestBody = Data("bad request\n".utf8)
@@ -2638,6 +2661,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
                let auth = auth {
                 guard let token = presentedBearerToken,
                       let owner = auth.authorizedOwnerFingerprint(token: token) else {
+                    // A failed trust lookup is not an unknown bearer: answer
+                    // "retry", not the 401 that makes the client stop
+                    // reconnecting. A principal here means the lookup above
+                    // failed transiently. The bearer is never accepted.
+                    var authLookupFailed = false
+                    if let token = presentedBearerToken {
+                        do {
+                            authLookupFailed = try auth.resolveRPCPrincipal(token: token) != nil
+                        } catch {
+                            authLookupFailed = true
+                        }
+                    }
+                    if authLookupFailed {
+                        send(fd: fd, status: 503, contentType: "text/plain",
+                             body: Self.authLookupFailedBody,
+                             additionalHeaders: ["Retry-After": "1"]); return
+                    }
                     send(fd: fd, status: 401, contentType: "text/plain",
                          body: Self.unauthorizedBody,
                          additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
@@ -2918,12 +2958,28 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     stickyBaseline.scheduleFlush()
                     return
                 }
-                let current = sequenceWatermark.value
+                // A dropped state event the client may already be past is
+                // only recovered by the snapshot form (requestedAfter below
+                // the drop); otherwise the cheap form at the watermark.
+                // Residual: an event accepted between this take and the
+                // enqueue below can reach the client first; closing that
+                // needs the take and the enqueue atomic with event admission.
+                let drops = gate.takeStateDrops()
+                let restoreStateDrops: () -> Void = {
+                    guard let drops else { return }
+                    gate.noteStateDrop(drops.lowest)
+                    gate.noteStateDrop(drops.highest)
+                }
+                let current = max(sequenceWatermark.value, drops?.highest ?? 0)
+                let requestedAfter = drops.map {
+                    $0.clientMayBePast ? max(0, $0.lowest - 1) : current
+                } ?? current
                 guard let baselineData = self.connectionBaselineRequiredData(
                     connectionId: connectionId,
-                    requestedAfterSequence: current,
+                    requestedAfterSequence: requestedAfter,
                     currentSequence: current
                 ) else {
+                    restoreStateDrops()
                     gate.markPending()
                     stickyBaseline.scheduleFlush()
                     return
@@ -2945,17 +3001,29 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 switch outcome {
                 case .accepted:
                     gate.recordSuccess(forGeneration: generation)
+                    if requestedAfter != current {
+                        // One snapshot form per client snapshot window: a
+                        // later one would invalidate the snapshot in flight.
+                        let hold = TimeInterval(snapshotTimeoutMs) / 1_000
+                        gate.holdSnapshotForm(for: hold)
+                        // A state drop inside the hold is only peeked and no
+                        // pressure site may run after it: one emission at the
+                        // hold end owns it. Wall clock, like the hold itself.
+                        DispatchQueue.global(qos: .utility).asyncAfter(
+                            wallDeadline: .now() + (hold + 0.05)
+                        ) { [weak stickyBaseline] in
+                            guard let stickyBaseline,
+                                  stickyBaseline.gate.hasPendingStateDrops else { return }
+                            stickyBaseline.emit()
+                        }
+                    }
                     NSLog(
                         "[RC2.WS] outbound pressure: baseline_required without close seq=%lld",
                         current
                     )
-                    EventBus.shared.publish(kind: .diagnosticWSOutboundPressure, payload: .object([
-                        "reason": .string("outbound_queue_pressure"),
-                        "baseline_required": .bool(true),
-                        "current_sequence": .number(Double(current))
-                    ]))
                     if gate.hasPendingRecovery { stickyBaseline.scheduleFlush() }
                 case .retryable:
+                    restoreStateDrops()
                     gate.markPending()
                     stickyBaseline.scheduleFlush()
                 case .terminalClosed:
@@ -2964,9 +3032,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             let emitPressureBaseline: @Sendable () -> Void = { stickyBaseline.emit() }
             let recordAcceptedEvent: @Sendable (Int64) -> Void = { sequence in
+                stickyBaseline.gate.noteAccepted(sequence)
                 if case .gap(let expected, let received) = sequenceWatermark.recordEnqueuedEvent(
                     sequence: sequence
                 ) {
+                    // Recorded first: the read loop may see the shutdown
+                    // before terminate's own callback runs on this thread.
+                    closeRecord.recordTerminal("event_gap")
                     _ = outbound.terminate(
                         errorData: nil,
                         closingData: self.connectionClosingData(
@@ -3029,6 +3101,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         sequenceWatermark.recordFilteredEvent(sequence: frame.event.seq)
                         wsTracker.recordFramesRejectedOrEvicted(1)
                         closeRecord.recordFramesShed(1)
+                        stickyBaseline.gate.noteStateDrop(frame.event.seq)
                         emitPressureBaseline()
                     case .closed:
                         break
@@ -3061,6 +3134,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 onAdmissionOverflow: { lostSequences, _reason in
                     for sequence in lostSequences {
                         sequenceWatermark.recordFilteredEvent(sequence: sequence)
+                        stickyBaseline.gate.noteStateDrop(sequence)
                     }
                     closeRecord.recordFramesShed(lostSequences.count)
                     emitPressureBaseline()
@@ -3106,17 +3180,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     payload: ev.payload
                 ))
                 guard let data = try? rawFrame.encoded() else {
-                    _ = outbound.terminate(
-                        errorData: nil,
-                        closingData: self.connectionClosingData(
-                            connectionId: connectionId,
-                            reason: "invalidEvent",
-                            code: 1011,
-                            retryable: true,
-                            retryAfterMs: 1_000
-                        ),
-                        reason: "invalidEvent"
-                    )
+                    // An event that cannot be encoded is skipped, not closed
+                    // for: a reconnect would replay it and close again.
+                    sequenceWatermark.recordFilteredEvent(sequence: ev.seq)
+                    emitPressureBaseline()
                     return
                 }
                 self.wsTracker.recordFrameBytes(data.count)
@@ -3125,13 +3192,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     recordAcceptedEvent(ev.seq)
                     sampleOutboundQueuedBytes()
                 case .queueFull:
-                    _ = outbound.degrade()
+                    if outbound.degrade().needsBaselineRequired { emitPressureBaseline() }
                     if outbound.enqueueApplication(data) == .accepted {
                         recordAcceptedEvent(ev.seq)
                         sampleOutboundQueuedBytes()
                     } else {
                         sequenceWatermark.recordFilteredEvent(sequence: ev.seq)
                         closeRecord.recordFramesShed(1)
+                        stickyBaseline.gate.noteStateDrop(ev.seq)
                         emitPressureBaseline()
                     }
                 case .closed:
@@ -3207,7 +3275,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         case .accepted:
                             return true
                         case .queueFull:
-                            _ = outbound.degrade()
+                            // Freed frames were already counted as delivered:
+                            // the replay must end in a baseline, not complete.
+                            guard !outbound.degrade().needsBaselineRequired else { return false }
                             return outbound.enqueueApplication(data) == .accepted
                         case .closed:
                             return false
@@ -3252,8 +3322,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                        outbound.enqueueApplication(complete) != .accepted {
                         // Without the end marker the client cannot finish
                         // catch-up; fall back to the baseline it handles anyway.
-                        _ = outbound.degrade()
-                        if outbound.enqueueApplication(complete) != .accepted {
+                        // Freed frames also need it: no end marker then.
+                        if outbound.degrade().needsBaselineRequired
+                            || outbound.enqueueApplication(complete) != .accepted {
                             requireBaseline(plan.head)
                         }
                     }
@@ -3268,7 +3339,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                             batcher.flush()
                             metrics.recordOverflow()
                             requireBaseline(lastSequence)
-                        }
+                        },
+                        // Replay thread only: keeps a long live buffer under
+                        // the batcher's admission bound.
+                        afterBufferedBatch: { batcher.flush() }
                     )
                 }
             } else {
@@ -3343,7 +3417,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     case .accepted:
                         _ = outbound.enqueueControl(opcode: 0x9, data: payload)
                     case .queueFull:
-                        _ = outbound.degrade()
+                        if outbound.degrade().needsBaselineRequired { emitPressureBaseline() }
                         if outbound.enqueueControl(opcode: 0x1, data: heartbeatData) == .accepted {
                             _ = outbound.enqueueControl(opcode: 0x9, data: payload)
                         } else if outbound.enqueueControl(opcode: 0x9, data: payload) == .queueFull {
@@ -3358,6 +3432,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 case .timedOut:
                     // Host-side heartbeat timeout (distinct from queue pressure).
                     NSLog("[RC2.WS] disconnect class=host_heartbeat_timeout")
+                    // Recorded first: the read loop may see the shutdown
+                    // before terminate's own callback runs on this thread.
+                    closeRecord.recordTerminal("heartbeatTimeout")
                     _ = outbound.terminate(
                         errorData: nil,
                         closingData: self.connectionClosingData(
@@ -3451,11 +3528,32 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 // fingerprint reused below, so the bearer is never verified twice.
                 requestBearerAttempted = true
                 let authStarted = DispatchTime.now().uptimeNanoseconds
-                requestRPCPrincipal = auth.authorizedRPCPrincipal(token: token)
+                var authLookupFailed = false
+                do {
+                    requestRPCPrincipal = try auth.resolveRPCPrincipal(token: token)
+                } catch {
+                    authLookupFailed = true
+                }
                 requestPhaseMetrics.record(
                     .auth,
                     latencyMilliseconds: HTTPRequestPhaseMetrics.elapsedMilliseconds(since: authStarted)
                 )
+                // A failed trust lookup is not an unknown bearer: a GET is
+                // told to retry instead of "pair again". Other methods keep
+                // the 401, because an unchanged client treats a 5xx on a
+                // mutation as an unknown outcome. The bearer is never accepted.
+                // A top-level /v1/rpc batch carries no mutation (dispatchRPC
+                // refuses one), so it is told to retry as well. A single call
+                // and a compressed body are not inspected and keep the 401.
+                if authLookupFailed,
+                   method == "GET"
+                    || (method == "POST" && path == "/v1/rpc"
+                        && (headers["content-encoding"] ?? "").isEmpty
+                        && Self.isTopLevelJSONArray(buffer[bodyStartAbsolute..<bodyEndAbsolute])) {
+                    send(fd: fd, status: 503, contentType: "text/plain",
+                         body: Self.authLookupFailedBody,
+                         additionalHeaders: ["Retry-After": "1"]); return
+                }
                 requestBearerVerified = requestRPCPrincipal != nil
                 authenticated = requestBearerVerified
             } else {
@@ -3657,9 +3755,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Only Sendable values are captured by value; subID is nil on
             // this path and is intentionally not touched by the Task.
             //
-            // Disconnect mid-RPC: a watchdog cancels the work Task when the
-            // accepted socket is closed so slow snapshots cannot keep CPU
-            // after the peer is gone. HTTP remains independent of WS queues.
+            // Disconnect mid-RPC: a watchdog releases the fd when the accepted
+            // socket is closed and cancels only bulk snapshot/replay work so
+            // it cannot keep CPU after the peer is gone. A mutation runs to
+            // its receipt commit, so a retry with the same client_request_id
+            // reads `committed`. HTTP remains independent of WS queues.
             handedOff = true
             let ae = headers["accept-encoding"]
             let registry = acceptedSockets
@@ -3673,7 +3773,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Scheduler admission only: bulk snapshot/replay runs at utility
             // priority so stop/input/control Tasks can preempt on the host.
             // Does not change wire fields, response routing, or method behavior.
-            let rpcTaskPriority = RPCDispatchSchedulerClass.taskPriority(for: bodyData)
+            let rpcSchedulerClass = RPCDispatchSchedulerClass.classify(bodyData: bodyData)
+            let rpcTaskPriority = rpcSchedulerClass.taskPriority
             let admitStarted = DispatchTime.now().uptimeNanoseconds
             Task(priority: rpcTaskPriority) { [weak self] in
                 guard let self else {
@@ -3696,7 +3797,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 let watchdog = RPCPeerDisconnectWatchdog(fd: fd, isOwned: { registry.isActive(fd) }) {
                     ownerRegistry.unbind(fd)
                     registry.close(fd)
-                    work.cancel()
+                    if rpcSchedulerClass == .bulk { work.cancel() }
                 }
                 let respData = await work.value
                 // The watchdog already released this fd. The accept loop may

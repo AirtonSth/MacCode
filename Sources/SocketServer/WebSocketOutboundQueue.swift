@@ -826,7 +826,8 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             return true
         }
         switch kind {
-        case "surface.output", "surface.output.summary", "agent.item.delta":
+        case "surface.output", "surface.output.summary", "agent.item.delta",
+             "bot.run.stream":
             return true
         default:
             return false
@@ -967,9 +968,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             return false
         }
         state = .terminalQueued
-        lock.unlock()
-
-        onTerminal(reason)
+        // Submitted under the lock: a teardown close() + finish() either wins
+        // the lock (this call returns false) or waits for the block, so it
+        // never writes to or shuts down an fd the teardown already closed.
         queue.async { [weak self] in
             guard let self, self.beginQueuedTerminalSend() else { return }
             if let errorData { _ = self.controlWriter(0x1, errorData) }
@@ -977,6 +978,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             _ = self.controlWriter(0x8, Data())
             self.didSendTerminal()
         }
+        lock.unlock()
+
+        onTerminal(reason)
         return true
     }
 
@@ -1060,7 +1064,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         }
         guard let data = frame.encoded(knownEventEncoder: knownEventEncoder) else {
             removeQueuedItem(byteCount: byteCount, isControl: false)
-            terminateImmediatelyAfterWriteFailure()
+            terminateImmediatelyAfterWriteFailure(socketWriteFailed: false)
             return
         }
         let writeStartedAt = now()
@@ -1070,7 +1074,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             isControl: false,
             drainStartedAt: succeeded ? writeStartedAt : nil
         )
-        if !succeeded { terminateImmediatelyAfterWriteFailure() }
+        if !succeeded { terminateImmediatelyAfterWriteFailure(socketWriteFailed: true) }
     }
 
     private func writeControl(opcode: UInt8, data: Data) {
@@ -1085,7 +1089,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             isControl: true,
             drainStartedAt: succeeded ? writeStartedAt : nil
         )
-        if !succeeded { terminateImmediatelyAfterWriteFailure() }
+        if !succeeded { terminateImmediatelyAfterWriteFailure(socketWriteFailed: true) }
     }
 
     private func shouldWriteQueuedItem() -> Bool {
@@ -1131,7 +1135,10 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         }
     }
 
-    private func terminateImmediatelyAfterWriteFailure() {
+    /// `socketWriteFailed`: a frame may be partly on the wire, so nothing more
+    /// is written (it would be spliced into the truncated frame and each
+    /// write could block for another idle timeout).
+    private func terminateImmediatelyAfterWriteFailure(socketWriteFailed: Bool) {
         lock.lock()
         guard state != .terminalSent && state != .closed else {
             lock.unlock()
@@ -1140,8 +1147,10 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         state = .terminalSent
         lock.unlock()
         onTerminal("write_failed")
-        _ = controlWriter(0x1, writeFailureClosingData)
-        _ = controlWriter(0x8, Data())
+        if !socketWriteFailed {
+            _ = controlWriter(0x1, writeFailureClosingData)
+            _ = controlWriter(0x8, Data())
+        }
         didSendTerminal()
     }
 }
@@ -1195,9 +1204,65 @@ final class OutboundPressureBaselineGate: @unchecked Sendable {
     private var issuedGeneration: UInt64 = 0
     private var flushScheduled = false
     private var closed = false
+    /// Dropped events not known to be sheddable, not yet covered by an
+    /// accepted baseline. Sheddable drops are not tracked: escalating for
+    /// them would request a snapshot every second during an output flood.
+    private var lowestStateDrop: Int64?
+    private var highestStateDrop: Int64 = 0
+    private var highestAccepted: Int64 = 0
+    /// Until this instant only the cheap baseline form is emitted, so a
+    /// snapshot the client is still fetching is not invalidated every second.
+    private var snapshotFormHoldUntil: TimeInterval = 0
 
     init(minInterval: TimeInterval = 1.0) {
         self.minInterval = max(0, minInterval)
+    }
+
+    func noteStateDrop(_ sequence: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        lowestStateDrop = min(lowestStateDrop ?? sequence, sequence)
+        highestStateDrop = max(highestStateDrop, sequence)
+    }
+
+    func noteAccepted(_ sequence: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        highestAccepted = max(highestAccepted, sequence)
+    }
+
+    /// Pending state-drop range for the baseline about to be emitted.
+    /// `clientMayBePast`: an event above the lowest drop was accepted, so the
+    /// client cursor may be past it and only the snapshot form recovers it.
+    /// Inside the snapshot-form hold the range is only peeked (it stays
+    /// pending) and `clientMayBePast` is false.
+    func takeStateDrops(
+        now: TimeInterval = Date().timeIntervalSinceReferenceDate
+    ) -> (lowest: Int64, highest: Int64, clientMayBePast: Bool)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let lowest = lowestStateDrop else { return nil }
+        let highest = highestStateDrop
+        if now < snapshotFormHoldUntil {
+            return (lowest, highest, false)
+        }
+        lowestStateDrop = nil
+        highestStateDrop = 0
+        return (lowest, highest, highestAccepted > lowest)
+    }
+
+    /// Call when a snapshot-form baseline was accepted: at most one per
+    /// client snapshot window.
+    func holdSnapshotForm(
+        for duration: TimeInterval,
+        now: TimeInterval = Date().timeIntervalSinceReferenceDate
+    ) {
+        lock.lock(); defer { lock.unlock() }
+        snapshotFormHoldUntil = now + max(0, duration)
+    }
+
+    /// True while a dropped state event is not covered by an emitted baseline
+    /// and the connection is open: the emission at the hold end is still owed.
+    var hasPendingStateDrops: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !closed && lowestStateDrop != nil
     }
 
     /// True when a recovery emission is still owed and the connection is open.
