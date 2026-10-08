@@ -146,6 +146,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         var mainEffortSelection: AgentEffortSelection?
         var reasoningModel: String?
         var reasoningModelEffortSelection: AgentEffortSelection?
+        /// Last Ultracode state applied to this ACP session; fresh and loaded sessions start off.
+        var ultracode = false
         /// True when open advertised a selectable `reasoning_effort` config option.
         let advertisesReasoningEffortConfig: Bool
         /// Thought-level ids from the open-result config option (and live model catalog).
@@ -1396,6 +1398,22 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 synchronized {
                     session.reasoningModel = applied.modelId
                     session.reasoningModelEffortSelection = appliedEffortSelection
+                }
+            }
+            let wantsUltracode = request.distillUltracode
+            if wantsUltracode != synchronized({ session.ultracode }) {
+                do {
+                    let applied = try await session.client.setUltracode(
+                        sessionId: session.providerThreadId,
+                        enabled: wantsUltracode
+                    )
+                    synchronized { session.ultracode = applied }
+                } catch DistillACPError.rpcError(let code, let message, _, _) where code == -32601 {
+                    distillAcpLog.info("Distill peer lacks ultracode/set: \(message, privacy: .public)")
+                    synchronized { session.ultracode = wantsUltracode }
+                } catch let error as DistillACPError {
+                    if case .processExited = error { throw error }
+                    distillAcpLog.error("Distill ultracode/set failed: \(String(describing: error), privacy: .public)")
                 }
             }
             let requestedMode: String?

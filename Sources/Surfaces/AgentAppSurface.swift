@@ -581,6 +581,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var reasoningModel: String?
     @Published public var distillMainEffortSelection: AgentEffortSelection = .automatic
     @Published public var distillReasoningEffortSelection: AgentEffortSelection = .automatic
+    @Published public var distillUltracode = false
     @Published public var serviceTier: AgentServiceTier = .auto
     @Published public private(set) var routingMode: AgentRoutingMode = .manual
     @Published public var executionMode: AgentExecutionMode = .local
@@ -2392,6 +2393,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         distillMainEffortSelection = manual.distillMainEffortSelection
             ?? .fixed(manual.reasoningEffort)
         distillReasoningEffortSelection = manual.distillReasoningEffortSelection ?? .automatic
+        distillUltracode = manual.distillUltracode
         serviceTier = manual.serviceTier
         executionMode = selectedThread.executionMode
         baseBranch = selectedThread.baseBranch ?? gitBranch ?? "main"
@@ -4059,6 +4061,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if Self.shouldAssignIfChanged(current: distillReasoningEffortSelection, next: nextReasoningEffortSelection) {
             distillReasoningEffortSelection = nextReasoningEffortSelection
         }
+        if Self.shouldAssignIfChanged(current: distillUltracode, next: manual.distillUltracode) {
+            distillUltracode = manual.distillUltracode
+        }
         if Self.shouldAssignIfChanged(current: serviceTier, next: manual.serviceTier) {
             serviceTier = manual.serviceTier
         }
@@ -5699,7 +5704,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier,
             distillMainEffortSelection: provider == .distill ? distillMainEffortSelection : nil,
-            distillReasoningEffortSelection: provider == .distill ? distillReasoningEffortSelection : nil
+            distillReasoningEffortSelection: provider == .distill ? distillReasoningEffortSelection : nil,
+            distillUltracode: provider == .distill && distillUltracode
         )
     }
 
@@ -7009,6 +7015,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             reasoningEffort = effort
         }
         distillMainEffortSelection = selection
+        persistThreadConfig()
+    }
+
+    public func setDistillUltracode(_ enabled: Bool) {
+        guard provider == .distill else { return }
+        distillUltracode = enabled
         persistThreadConfig()
     }
 
@@ -9194,6 +9206,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 ? runModelSelection.distillMainEffortSelection : nil,
             distillReasoningEffortSelection: runProvider == .distill
                 ? runModelSelection.distillReasoningEffortSelection : nil,
+            distillUltracode: runProvider == .distill && runModelSelection.distillUltracode,
             serviceTier: runServiceTier,
             interactionMode: interactionMode,
             providerBinary: launchConfig?.binary,
@@ -17866,7 +17879,9 @@ public struct AgentAppView: View {
                 : nil,
             onFileDrop: { vm.insertDroppedFilePaths($0) },
             attachUnavailableReason: composerChromeMode == .relay
-                ? AgentComposerChromePresentation.relayAttachUnavailable : nil
+                ? AgentComposerChromePresentation.relayAttachUnavailable : nil,
+            ultracodeBorder: AgentUltracodeBorderPresentation.shows(
+                provider: vm.provider, ultracode: vm.distillUltracode)
         )
     }
 
@@ -17924,6 +17939,11 @@ public struct AgentAppView: View {
                             }
                         }
                     )
+                    Toggle("Ultracode", isOn: Binding(get: { vm.distillUltracode }, set: { vm.setDistillUltracode($0) }))
+                        .toggleStyle(.checkbox)
+                        .disabled(vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun)
+                        .help("Plan, fan out to parallel subagents, then integrate and verify")
+                        .accessibilityIdentifier("agent.distill.ultracode")
                 } else { modelMenu }
             }
             if AgentComposerChromePresentation.shows(.permission, mode: composerChromeMode) {

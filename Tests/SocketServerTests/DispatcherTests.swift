@@ -1220,6 +1220,40 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_agentThreadUltracodeParamsRoundTripAndMissingIsFalse() async {
+        let router = FakeRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let created = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.create", params: [
+            "provider": .string("distill"), "model": .string("distill-main"), "distill_ultracode": .bool(true)
+        ]))
+        XCTAssertEqual(created.result?.objectValue?["distill_ultracode"], .bool(true))
+        XCTAssertEqual(router.threadStore.first?.modelSelection.distillUltracode, true)
+        let tid = router.threadStore[0].id.value.uuidString
+        let off = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.thread.configure", params: [
+            "thread_id": .string(tid), "distill_ultracode": .bool(false)
+        ]))
+        XCTAssertNil(off.error)
+        XCTAssertEqual(router.threadStore.first?.modelSelection.distillUltracode, false)
+        let bad = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.thread.configure", params: [
+            "thread_id": .string(tid), "distill_ultracode": .string("yes")
+        ]))
+        XCTAssertNotNil(bad.error)
+        let plain = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "agent.thread.create", params: [
+            "provider": .string("distill"), "model": .string("distill-main")
+        ]))
+        XCTAssertEqual(plain.result?.objectValue?["distill_ultracode"], .bool(false))
+    }
+
+    func test_modelSelectionDecodesMissingUltracodeAsFalse() throws {
+        let json = #"{"provider":"distill","modelId":"m","reasoningEffort":"high","serviceTier":"auto"}"#
+        let decoded = try JSONDecoder().decode(AgentModelSelection.self, from: Data(json.utf8))
+        XCTAssertFalse(decoded.distillUltracode)
+        let withFlag = AgentModelSelection(provider: .distill, modelId: "m", distillUltracode: true)
+        let round = try JSONDecoder().decode(AgentModelSelection.self, from: JSONEncoder().encode(withFlag))
+        XCTAssertTrue(round.distillUltracode)
+    }
+
+    @MainActor
     func test_flatDistillEffortRejectsUnknownLevel() async {
         let dispatcher = JSONRPCDispatcher(router: FakeRouter())
         let response = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.create", params: [
