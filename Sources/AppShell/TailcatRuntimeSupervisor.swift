@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Security
 import SocketServer
 
@@ -45,6 +46,8 @@ actor TailcatRuntimeSupervisor {
         let fallback: TailcatRunningServer?
         let endpoints: [TailcatCatalogEndpoint]
     }
+
+    private static let log = Logger(subsystem: "io.remotecode.app", category: "tailcat")
 
     private let serverID: String
     private let displayName: String
@@ -449,6 +452,7 @@ actor TailcatRuntimeSupervisor {
             lastRenewal = now()
             currentETag = published.eTag
             publishedHost = published.host
+            Self.log.notice("\(Self.connBlobLengthLogLine(endpoints: started.endpoints), privacy: .public)")
             try saveSecureState(TailcatSecureState(
                 phase: .active,
                 accountID: session.user.id,
@@ -653,6 +657,13 @@ actor TailcatRuntimeSupervisor {
               !TailcatAdmission.admittedPeersChanged(stored: stored, snapshot: snapshot)
         else { return nil }
         return keys
+    }
+
+    /// Measurement only: a ConnBlob is a credential, so the log carries the
+    /// endpoint count and each blob's UTF-8 byte length, never its content.
+    static func connBlobLengthLogLine(endpoints: [TailcatCatalogEndpoint]) -> String {
+        let lengths = endpoints.map { "\($0.priority):\($0.connBlob.utf8.count)" }.joined(separator: ",")
+        return "tailcat_publish endpoints=\(endpoints.count) conn_blob_len=\(lengths)"
     }
 
     private func withAccessTokenRetry<T: Sendable>(
