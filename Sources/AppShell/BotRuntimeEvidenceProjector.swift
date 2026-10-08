@@ -4,8 +4,8 @@ import SocketServer
 import RemoteCodeTreaty
 
 /// Projects Agent runtime events only after a completed Bot send receipt binds
-/// one authenticated host/Bot/conversation/request/run/thread tuple, then
-/// reconciles matching events retained before that binding became available.
+/// one authenticated host/Bot/conversation/request/run/thread tuple. Matching
+/// events retained before that binding are reconciled only for a replayed receipt.
 final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     struct TerminalEvidence: Equatable {
         let botID: String
@@ -22,19 +22,35 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
         let threadID: String
     }
 
+    /// `bot.run.stream` carries ids only: it is liveness evidence, and every
+    /// one costs a frame and flushes the delta coalescing window. A bound run
+    /// publishes its first one at once and then at most one per interval.
+    static let streamTickInterval: TimeInterval = 1
+
     private let eventBus: EventBus
     private let onTerminal: (TerminalEvidence) -> Void
+    private let now: () -> Date
     private let lock = NSLock()
     private var bindingsByRunID: [String: Binding] = [:]
     private var lastProjectedSequenceByRunID: [String: Int64] = [:]
+    private var lastStreamTickByRunID: [String: Date] = [:]
+    private var replayedEventCount = 0
     private var subscriptionID: UUID?
+
+    /// Test seam: events that registration replay subscriptions passed to `receive`.
+    var replayedEventCountForTesting: Int {
+        lock.lock(); defer { lock.unlock() }
+        return replayedEventCount
+    }
 
     init(
         eventBus: EventBus = .shared,
-        onTerminal: @escaping (TerminalEvidence) -> Void = { _ in }
+        onTerminal: @escaping (TerminalEvidence) -> Void = { _ in },
+        now: @escaping () -> Date = { Date() }
     ) {
         self.eventBus = eventBus
         self.onTerminal = onTerminal
+        self.now = now
         subscriptionID = eventBus.subscribe(since: eventBus.currentSeq) { [weak self] event in
             self?.receive(event)
         }
@@ -81,25 +97,40 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             threadID: canonicalRuntimeID(threadID)
         )
         lock.lock()
+        // A new receipt names a run that has published nothing yet: its
+        // provider start is queued behind the MainActor turn that registers
+        // it. Only an idempotent replay of a receipt this projector already
+        // knows can have retained events left to reconcile.
+        let isReplayedReceipt = bindingsByRunID[binding.runID] != nil
+            || lastProjectedSequenceByRunID[binding.runID] != nil
         bindingsByRunID[binding.runID] = binding
         lock.unlock()
 
-        let replaySubscriptionID = eventBus.subscribe(since: 0) { [weak self] event in
-            self?.receive(event)
+        if isReplayedReceipt {
+            let replaySubscriptionID = eventBus.subscribe(since: 0) { [weak self] event in
+                self?.receiveReplayed(event)
+            }
+            eventBus.unsubscribe(replaySubscriptionID)
         }
-        eventBus.unsubscribe(replaySubscriptionID)
 
-        let oldestRetainedSequence = eventBus.recentEvents(since: 0, maxBytes: nil).events.first?.seq
+        let ring = eventBus.healthCounters()
         lock.lock()
-        if let oldestRetainedSequence {
+        if ring.retainedCount > 0 {
             lastProjectedSequenceByRunID = lastProjectedSequenceByRunID.filter {
-                $0.value >= oldestRetainedSequence
+                $0.value >= ring.oldestRetainedSeq
             }
         } else {
             lastProjectedSequenceByRunID.removeAll()
         }
         lock.unlock()
         return true
+    }
+
+    private func receiveReplayed(_ event: EventBus.Event) {
+        lock.lock()
+        replayedEventCount += 1
+        lock.unlock()
+        receive(event)
     }
 
     private func receive(_ event: EventBus.Event) {
@@ -131,6 +162,19 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
         lastProjectedSequenceByRunID[runID] = event.seq
         if projectedKind == .botRunCompleted || projectedKind == .botRunFailed {
             bindingsByRunID.removeValue(forKey: runID)
+            lastStreamTickByRunID.removeValue(forKey: runID)
+        } else {
+            let tickTime = now()
+            if let lastTick = lastStreamTickByRunID[runID] {
+                let elapsed = tickTime.timeIntervalSince(lastTick)
+                // A wall clock stepped backwards (negative) publishes: it
+                // must never hold liveness back.
+                if elapsed >= 0, elapsed < Self.streamTickInterval {
+                    lock.unlock()
+                    return
+                }
+            }
+            lastStreamTickByRunID[runID] = tickTime
         }
         lock.unlock()
 
