@@ -595,6 +595,19 @@ public enum AgentComposerChromePresentation {
     }
 }
 
+/// Pure policy for the animated purple composer border shown while Ultracode is on.
+public enum AgentUltracodeBorderPresentation {
+    public static let lapSeconds: Double = 4
+
+    public static func shows(provider: AgentProvider, ultracode: Bool) -> Bool {
+        provider == .distill && ultracode
+    }
+
+    public static func isAnimated(reduceMotion: Bool) -> Bool {
+        !reduceMotion
+    }
+}
+
 // MARK: - Completed work density (perf)
 
 /// Pure gate: whether finished-turn work blocks must be fully built.
