@@ -1159,6 +1159,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             guard let self, let agent else { return }
                             self.openURLInAdjacentSplit(workspace: wid, sourceSurface: agent.descriptor.id, url: url)
                         }
+                        agent.viewModel.onForkInNewChat = { [weak self, weak agent] messageID in
+                            guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+                            Task { @MainActor in
+                                if let child = try? await self.forkAgentThread(sourceThreadId: source, messageID: messageID) {
+                                    agent.viewModel.selectThread(child.id)
+                                }
+                            }
+                        }
                         agent.viewModel.onRunStateChange = { [weak self] in
                             guard let self else { return }
                             if !self.promoteWorkspaceIfBusy(wid) {
@@ -9460,6 +9468,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 agent.viewModel.onOpenURLInSplit = { [weak self, weak agent] url in
                     guard let self, let agent else { return }
                     self.openURLInAdjacentSplit(workspace: workspace, sourceSurface: agent.descriptor.id, url: url)
+                }
+                agent.viewModel.onForkInNewChat = { [weak self, weak agent] messageID in
+                    guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+                    Task { @MainActor in
+                        if let child = try? await self.forkAgentThread(sourceThreadId: source, messageID: messageID) {
+                            agent.viewModel.selectThread(child.id)
+                        }
+                    }
                 }
                 agent.viewModel.onRunStateChange = { [weak self] in
                     guard let self else { return }

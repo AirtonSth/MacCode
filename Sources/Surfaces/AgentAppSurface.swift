@@ -692,6 +692,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// UX-MAC_AGENT-OPEN-SPLIT: wired by AppCommandRouter. A clicked web link
     /// opens — or reuses — a Browser split panel to the right of this surface.
     public var onOpenURLInSplit: ((URL) -> Void)?
+    /// Wired by AppCommandRouter. Branches the selected thread into a new
+    /// persisted child chat (optionally from a message id) and selects it.
+    public var onForkInNewChat: ((String?) -> Void)?
+    /// Wired by AppCommandRouter. Opens the ephemeral side thread in a right
+    /// split pane; the optional string is sent as the side chat's first message.
+    public var onOpenSideChat: ((AgentThreadID, String?) -> Void)?
     public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
     public var providerLaunchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?
@@ -16321,6 +16327,14 @@ public struct AgentAppView: View {
             .accessibilityLabel("Copy message")
             .accessibilityIdentifier("agent.assistantMessage.copy.\(identifierSuffix)")
             .help("Copy message")
+            Button { vm.onForkInNewChat?(identifierSuffix) } label: {
+                Image(systemName: "arrow.triangle.branch").font(.system(size: 10))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(DS.Palette.textTertiary)
+            .accessibilityLabel("Branch in new chat")
+            .accessibilityIdentifier("agent.assistantMessage.branch.\(identifierSuffix)")
+            .help("Branch in new chat")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -16659,6 +16673,8 @@ public struct AgentAppView: View {
                         text: parsed.body,
                         roleIdentifier: "agent.role.assistant",
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
+                        branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
+                        onBranch: { vm.onForkInNewChat?(msg.id.value.uuidString) },
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
                                 AgentChatPeerIdentityHeader(
@@ -16681,7 +16697,9 @@ public struct AgentAppView: View {
                     AgentChatAssistantReply(
                         text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
                         roleIdentifier: "agent.role.assistant",
-                        copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)"
+                        copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
+                        branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
+                        onBranch: { vm.onForkInNewChat?(msg.id.value.uuidString) }
                     )
                 }
             }
@@ -16861,6 +16879,8 @@ public struct AgentAppView: View {
             text: BackgroundAwaitContinuation.strippingAwaitingMarker(final),
             roleIdentifier: "agent.role.assistant",
             copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
+            branchIdentifier: "agent.assistantMessage.branch.\(turn.turnId)",
+            onBranch: { vm.onForkInNewChat?(turn.turnId) },
             content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
         )
     }
