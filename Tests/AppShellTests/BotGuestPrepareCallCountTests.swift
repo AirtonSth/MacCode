@@ -31,6 +31,10 @@ private final class ScriptedDockerDaemon: @unchecked Sendable {
     var networks: Set<String> = []
     /// The daemon stopped answering: every command fails as the real CLI's does.
     var down = false
+    /// No desktop comes up: every screenshot fails.
+    var screenDown = false
+    /// Runs when a `docker stop` arrives, while its container is still running.
+    var beforeStop: (() throws -> Void)?
 
     var launches: [[String]] { lock.withLock { recorded } }
     func forgetLaunches() { lock.withLock { recorded.removeAll() } }
@@ -58,8 +62,14 @@ private final class ScriptedDockerDaemon: @unchecked Sendable {
             }
             return Data()
         case "build":
-            builds += 1
-            images[value(after: "-t", in: args) ?? ""] = Image(id: "sha256:built-\(builds)", labels: labels(in: args))
+            // Docker's layer cache: an unchanged recipe (the digest label)
+            // builds to the image the tag already has.
+            let tag = value(after: "-t", in: args) ?? ""
+            let stamped = labels(in: args)
+            if images[tag]?.labels != stamped {
+                builds += 1
+                images[tag] = Image(id: "sha256:built-\(builds)", labels: stamped)
+            }
             return Data()
         case "create":
             let name = value(after: "--name", in: args) ?? ""
@@ -74,6 +84,7 @@ private final class ScriptedDockerDaemon: @unchecked Sendable {
             containers[last]?.running = true
             return Data()
         case "stop":
+            try beforeStop?()
             containers[last]?.running = false
             return Data()
         case "rename":
@@ -82,9 +93,15 @@ private final class ScriptedDockerDaemon: @unchecked Sendable {
         case "rm":
             containers[last] = nil
             return Data()
+        case "ps":
+            // `ps -aq --filter name=^/<name>$`: an id when that container exists.
+            let exists = containers.keys.contains { last == "name=^/\($0)$" }
+            return Data((exists ? "id\n" : "").utf8)
         case "exec":
             // The screenshot; any other exec (the tools probe) prints nothing.
-            return args.contains("import") ? Self.png : Data()
+            guard args.contains("import") else { return Data() }
+            if screenDown { throw BotComputerDockerError.provisioningFailed }
+            return Self.png
         default:
             return Data()
         }
@@ -428,6 +445,123 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         guest.daemon.forgetLaunches()
         try prepare(vm, guest, workspace: project.path)
         XCTAssertEqual(verbs(guest), ["image inspect", "inspect"], "proven once, then short")
+    }
+
+    func test_aContainerAFailedRebuildRestarted_isScreenshottedOnceBeforeTheShortPathTrustsIt() throws {
+        // WHY: a rebuild stops the bot's desktop before it starts the new
+        // one, so two Chromiums never write one profile. When the new one
+        // does not come up, the old container is started again with no
+        // screenshot. Rebuilding an unchanged recipe gives the same image, so
+        // that container is still current: the short path would take it for
+        // a desktop already seen up and start the agent in one nobody saw
+        // come back.
+        let guest = try makeRunningGuest()
+        let ownTag = BotComputerGuestSpec.botImageTag(botID: guest.botID)
+        _ = try guest.service.rebuild(botID: guest.botID)
+        let ownImage = try XCTUnwrap(guest.daemon.images[ownTag]?.id)
+        let vm = makeVM(guest)
+        guest.daemon.forgetLaunches()
+        try prepare(vm, guest)
+        XCTAssertFalse(verbs(guest).contains("screenshot"), "a successful rebuild leaves its desktop proven")
+        guest.daemon.forgetLaunches()
+        try prepare(vm, guest)
+        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"], "a rebuilt desktop was proven: its sends are short")
+
+        guest.daemon.screenDown = true
+        guest.daemon.forgetLaunches()
+        XCTAssertThrowsError(try guest.service.rebuild(botID: guest.botID))
+        guest.daemon.screenDown = false
+
+        let rolledBack = guest.daemon.launches
+        XCTAssertTrue(rolledBack.contains(["stop", guest.container]), "\(verbs(guest))")
+        XCTAssertEqual(rolledBack.last, ["start", guest.container], "started again, and nothing screenshots it")
+        XCTAssertEqual(guest.daemon.containers[guest.container]?.imageID, ownImage)
+        XCTAssertEqual(
+            guest.daemon.images[ownTag]?.id, ownImage,
+            "an unchanged recipe builds to the same image, so the old container is still current"
+        )
+        guest.daemon.forgetLaunches()
+
+        try prepare(vm, guest)
+
+        let proven = verbs(guest)
+        XCTAssertTrue(proven.contains("screenshot"), "a desktop nothing has screenshotted since its restart: \(proven)")
+        XCTAssertNotEqual(proven, ["image inspect", "inspect"])
+        XCTAssertFalse(proven.contains("create") || proven.contains("rm"), "it is proven, not replaced: \(proven)")
+        guest.daemon.forgetLaunches()
+        try prepare(vm, guest)
+        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"], "proven once, then short")
+    }
+
+    func test_aScreenshotTakenWhileARebuildStopsTheContainer_doesNotProveTheOneStartedAgain() throws {
+        // WHY: opening the bot's desktop screenshots its container whether or
+        // not a rebuild is under way. One taken just before the rebuild stops
+        // that container shows a desktop about to go down. It must not count
+        // for the container a failed rebuild starts again after it.
+        let guest = try makeRunningGuest()
+        _ = try guest.service.rebuild(botID: guest.botID)
+        let vm = makeVM(guest)
+        try prepare(vm, guest)
+        guest.daemon.beforeStop = {
+            _ = try guest.service.provision(botID: guest.botID)
+            guest.daemon.screenDown = true
+        }
+        guest.daemon.forgetLaunches()
+        XCTAssertThrowsError(try guest.service.rebuild(botID: guest.botID))
+        guest.daemon.beforeStop = nil
+        guest.daemon.screenDown = false
+        XCTAssertEqual(
+            verbs(guest).filter { $0 == "screenshot" }.count, 2,
+            "one of the running desktop as it is stopped, one the new container fails: \(verbs(guest))"
+        )
+        XCTAssertEqual(guest.daemon.launches.last, ["start", guest.container], "started again, and nothing screenshots it")
+        guest.daemon.forgetLaunches()
+
+        try prepare(vm, guest)
+
+        let proven = verbs(guest)
+        XCTAssertTrue(proven.contains("screenshot"), "its only screenshot predates its restart: \(proven)")
+        XCTAssertFalse(proven.contains("create") || proven.contains("rm"), "it is proven, not replaced: \(proven)")
+    }
+
+    func test_aContainerStartedWhoseScreenshotFailed_isScreenshottedAgainBeforeTheShortPathTrustsIt() throws {
+        // WHY: a send that starts or creates the container and gets no
+        // screenshot fails with the desktop's own error, and leaves the
+        // container running. The next send must ask for the screenshot again,
+        // as every send did before the short path, instead of taking a
+        // desktop that never showed its screen for one already seen up.
+        try assertProvenAfterAFailedScreenshot("a stopped container started again") { guest in
+            guest.daemon.containers[guest.container]?.running = false
+        }
+        try assertProvenAfterAFailedScreenshot("a container created in place of an outdated one") { guest in
+            guest.daemon.images[BotComputerGuestSpec.imageTag]?.id = "sha256:rebuilt"
+        }
+    }
+
+    private func assertProvenAfterAFailedScreenshot(
+        _ what: String, _ change: (Guest) -> Void, line: UInt = #line
+    ) throws {
+        let guest = try makeRunningGuest()
+        let vm = makeVM(guest)
+        try prepare(vm, guest)
+        change(guest)
+        guest.daemon.screenDown = true
+        XCTAssertThrowsError(try prepare(vm, guest), what, line: line)
+        guest.daemon.screenDown = false
+        XCTAssertEqual(guest.daemon.containers[guest.container]?.running, true, what, line: line)
+        guest.daemon.forgetLaunches()
+
+        try prepare(vm, guest)
+
+        let proven = verbs(guest)
+        XCTAssertTrue(proven.contains("screenshot"), "\(what): no screenshot has proven it yet: \(proven)", line: line)
+        XCTAssertFalse(
+            proven.contains("create") || proven.contains("rm"),
+            "\(what): it is proven, not replaced again: \(proven)", line: line
+        )
+        guest.daemon.forgetLaunches()
+        try prepare(vm, guest)
+        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"], what, line: line)
     }
 
     func test_aBoundFolderThatWasDeleted_isDroppedNotMountedAgain_andTheSendStillSaysItIsNotMounted() throws {

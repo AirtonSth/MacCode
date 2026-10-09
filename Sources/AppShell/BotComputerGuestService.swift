@@ -50,9 +50,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
     public static let maxScreenshotBase64Bytes = ((maxScreenshotBytes + 2) / 3) * 4
     private static let viewerTokenLock = NSLock()
     private static let unprovenLock = NSLock()
-    /// Containers `ensureWorkspaceMounted` stopped and started again, whose
-    /// desktop no screenshot has proven yet. Static: a send's preflight and
-    /// its guest prepare use different service instances.
+    /// Containers started here whose desktop no screenshot has proven yet: a
+    /// mount's replacement, a failed rebuild's rollback, a start whose
+    /// screenshot failed. Static: a send's preflight and its guest prepare
+    /// use different service instances.
     private static var unprovenContainers: Set<String> = []
     /// SHA-256 of every recipe file version earlier releases seeded into a bot's
     /// home. A per-bot copy still equal to one of them was never edited, so it is
@@ -211,6 +212,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
                heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID)
                 || (imageMatches(existing, tag: image) && runtimeIsCurrent(existing)) {
                 if existing.running == false {
+                    // Unproven until `readyState` has its screenshot.
+                    Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }
                     try docker.start(name: name)
                 }
                 return try readyState(name: name, botID: botID, resumed: true)
@@ -228,6 +231,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
         )
         options.network = network
         _ = try createContainer(options)
+        // Unproven until `readyState` has its screenshot.
+        Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }
         try docker.start(name: name)
         return try readyState(name: name, botID: botID, resumed: false)
     }
@@ -246,7 +251,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         requestingThreadID: AgentThreadID?
     ) throws -> BotComputerContainerInspect? {
         let name = BotComputerGuestSpec.containerName(botID: botID)
-        // Restarted by a mount, not yet screenshotted: `provision` proves it.
+        // Started with no screenshot of it yet: `provision` proves it.
         guard !Self.unprovenLock.withLock({ Self.unprovenContainers.contains(name) }) else { return nil }
         if let workspace {
             try BotComputerGuestSpec.assertWorkspaceMountPath(workspace, registeredWorkspaces: registered)
@@ -615,6 +620,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
         } catch {
             try? docker.remove(name: next)
             if stoppedCanonical, (try? docker.containerExists(name: canonical)) == true {
+                // Started again with no screenshot. Marked here, not before
+                // the stop: a screenshot taken until then clears the mark.
+                Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(canonical) }
                 try? docker.start(name: canonical)
             }
             throw error
