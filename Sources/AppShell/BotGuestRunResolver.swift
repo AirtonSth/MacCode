@@ -102,7 +102,17 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     ) async throws -> DistillGuestLaunchPlan? {
         guard let placement = try deps.threadRepo.guestPlacement(of: request.threadId),
               placement.runsInGuest else { return nil }
-        let work = Task { try await self.prepareGuestRun(request, placement: placement, progress: progress) }
+        let stamps = BotGuestPrepareIntervals()
+        let work = Task {
+            // Covers the launch barrier and the run claim, until the first
+            // stage is reported.
+            stamps.begin(.starting)
+            defer { stamps.end() }
+            return try await self.prepareGuestRun(request, placement: placement) { stage in
+                stamps.begin(stage)
+                progress(stage)
+            }
+        }
         request.acceptancePermit?.onInvalidate { work.cancel() }
         return try await withTaskCancellationHandler {
             try await work.value
@@ -401,6 +411,33 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 continuation.resume(with: Result { try body() })
             }
         }
+    }
+}
+
+/// `bot_guest_prepare` signpost intervals on `io.remotecode.perf`, one per
+/// preparation stage and named by it: a stage ends where the next one begins,
+/// or where preparation returns or throws.
+private final class BotGuestPrepareIntervals: @unchecked Sendable {
+    private let lock = NSLock()
+    private var open: OSSignpostIntervalState?
+
+    func begin(_ stage: DistillGuestStage) {
+        end()
+        let signposter = PerfSwitchMetrics.signposter
+        let interval = signposter.beginInterval(
+            "bot_guest_prepare",
+            id: signposter.makeSignpostID(),
+            "\(stage.rawValue, privacy: .public)"
+        )
+        lock.withLock { open = interval }
+    }
+
+    func end() {
+        let interval = lock.withLock { () -> OSSignpostIntervalState? in
+            defer { open = nil }
+            return open
+        }
+        if let interval { PerfSwitchMetrics.signposter.endInterval("bot_guest_prepare", interval) }
     }
 }
 

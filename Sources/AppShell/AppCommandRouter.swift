@@ -3579,6 +3579,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private lazy var botRuntimeEvidenceProjector: BotRuntimeEvidenceProjector = {
         botRuntimeEvidenceProjectorExists = true
         return BotRuntimeEvidenceProjector { [weak self] terminal in
+            let signposter = PerfSwitchMetrics.signposter
+            let interval = signposter.beginInterval("bot_settle", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("bot_settle", interval) }
             _ = self?.pairedBotRemote?.settleRuntime(
                 botID: terminal.botID,
                 runID: terminal.runID,
@@ -3661,6 +3664,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             if Self.pairedBotMainActorReadMethods.contains(method) {
                 return JSONValue.from(try authority.dispatch(method: method, params: foundation))
+            }
+            // `bot_send_ack`: the MainActor turn that acknowledges a paired
+            // send, from admitting the run to registering its receipt.
+            let signposter = PerfSwitchMetrics.signposter
+            let sendAckInterval = method == "bot.send"
+                ? signposter.beginInterval("bot_send_ack", id: signposter.makeSignpostID())
+                : nil
+            defer {
+                if let sendAckInterval { signposter.endInterval("bot_send_ack", sendAckInterval) }
             }
             var result = try authority.dispatch(method: method, params: foundation)
             if method == "bot.stop" || method == "bot.force_stop",

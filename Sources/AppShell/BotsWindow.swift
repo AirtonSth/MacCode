@@ -10722,6 +10722,10 @@ public final class BotsViewModel: ObservableObject {
                     self.clearDeskSendInFlight(for: bot.id)
                     return
                 }
+                // `bot_send_start`: from reading the Bot's brain until the
+                // provider has accepted the turn or the start has failed.
+                let signposter = PerfSwitchMetrics.signposter
+                let startInterval = signposter.beginInterval("bot_send_start", id: signposter.makeSignpostID())
                 let brain = self.destBrainInputs(for: bot, deskCache: deskBrain)
                 let started = await self.startSupervisedRun(
                     bot: bot,
@@ -10735,6 +10739,7 @@ public final class BotsViewModel: ObservableObject {
                     router: router,
                     expectedEpoch: epoch
                 )
+                signposter.endInterval("bot_send_start", startInterval)
                 self.forgetDeskSend(work, botID: bot.id)
                 self.clearDeskSendInFlight(for: bot.id)
                 if let started {

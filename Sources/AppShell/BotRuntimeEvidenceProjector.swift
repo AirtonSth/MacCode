@@ -1,5 +1,7 @@
 import Foundation
+import os
 import CoreModel
+import Persistence
 import SocketServer
 import RemoteCodeTreaty
 
@@ -41,6 +43,11 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     private var bindingsByRunID: [String: Binding] = [:]
     private var lastProjectedSequenceByRunID: [String: Int64] = [:]
     private var lastStreamTickByRunID: [String: Date] = [:]
+    /// `bot_first_event` signpost intervals on `io.remotecode.perf`, open from
+    /// binding a new receipt to the run's first projected event, one per Bot
+    /// (a Bot has one live run). A run whose start was abandoned projects no
+    /// event: its interval stays open until the Bot's next send closes it.
+    private var firstEventIntervalByBotID: [String: OSSignpostIntervalState] = [:]
     private var replayedEventCount = 0
     private var subscriptionID: UUID?
 
@@ -133,6 +140,14 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
         let isReplayedReceipt = bindingsByRunID[binding.runID] != nil
             || lastProjectedSequenceByRunID[binding.runID] != nil
         bindingsByRunID[binding.runID] = binding
+        let signposter = PerfSwitchMetrics.signposter
+        if !isReplayedReceipt, signposter.isEnabled {
+            let abandoned = firstEventIntervalByBotID.updateValue(
+                signposter.beginInterval("bot_first_event", id: signposter.makeSignpostID()),
+                forKey: binding.botID
+            )
+            if let abandoned { signposter.endInterval("bot_first_event", abandoned) }
+        }
         lock.unlock()
 
         if isReplayedReceipt {
@@ -189,6 +204,10 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             return
         }
         lastProjectedSequenceByRunID[runID] = event.seq
+        if !firstEventIntervalByBotID.isEmpty,
+           let firstEventInterval = firstEventIntervalByBotID.removeValue(forKey: binding.botID) {
+            PerfSwitchMetrics.signposter.endInterval("bot_first_event", firstEventInterval)
+        }
         if projectedKind == .botRunCompleted || projectedKind == .botRunFailed {
             bindingsByRunID.removeValue(forKey: runID)
             lastStreamTickByRunID.removeValue(forKey: runID)
