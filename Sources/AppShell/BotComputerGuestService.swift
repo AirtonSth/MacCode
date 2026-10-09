@@ -49,6 +49,11 @@ public final class BotComputerGuestService: @unchecked Sendable {
     public static let maxScreenshotBytes = 8 * 1_024 * 1_024
     public static let maxScreenshotBase64Bytes = ((maxScreenshotBytes + 2) / 3) * 4
     private static let viewerTokenLock = NSLock()
+    private static let unprovenLock = NSLock()
+    /// Containers `ensureWorkspaceMounted` stopped and started again, whose
+    /// desktop no screenshot has proven yet. Static: a send's preflight and
+    /// its guest prepare use different service instances.
+    private static var unprovenContainers: Set<String> = []
     /// SHA-256 of every recipe file version earlier releases seeded into a bot's
     /// home. A per-bot copy still equal to one of them was never edited, so it is
     /// replaced with the current file; an edited copy stays the user's choice.
@@ -227,6 +232,70 @@ public final class BotComputerGuestService: @unchecked Sendable {
         return try readyState(name: name, botID: botID, resumed: false)
     }
 
+    /// The bot's container when it is already running and nothing about it is
+    /// out of date; nil when `ensureWorkspaceMounted` or `provision` has work
+    /// to do. It applies their checks, but asks Docker twice (both images in
+    /// one inspect, then the container) and takes no screenshot: a screenshot
+    /// proves a desktop this call started, and this one was already up. A
+    /// running container attached to the bot's network is what proves that
+    /// network exists. An in-guest run asks this on every send.
+    func runningCurrentContainer(
+        botID: BotID,
+        workspace: String?,
+        registered: Set<String>,
+        requestingThreadID: AgentThreadID?
+    ) throws -> BotComputerContainerInspect? {
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        // Restarted by a mount, not yet screenshotted: `provision` proves it.
+        guard !Self.unprovenLock.withLock({ Self.unprovenContainers.contains(name) }) else { return nil }
+        if let workspace {
+            try BotComputerGuestSpec.assertWorkspaceMountPath(workspace, registeredWorkspaces: registered)
+        }
+        _ = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
+        // A reused container sees the current kit through its bind too.
+        try BotGuestAgentKit.materialize(appSupport: appSupport)
+        try seedRecipe(botID: botID)
+        let baseTag = BotComputerGuestSpec.imageTag
+        let botTag = BotComputerGuestSpec.botImageTag(botID: botID)
+        let images = try docker.imageStates(tags: [baseTag, botTag])
+        // `ensureCurrentImage` would build anything else.
+        guard var image = images[baseTag] else { return nil }
+        if let recipeContext {
+            guard image.labels[BotComputerGuestSpec.recipeLabelKey] == BotComputerGuestSpec.recipeRevision,
+                  image.labels[BotComputerGuestSpec.recipeDigestLabelKey]
+                    == BotComputerGuestSpec.recipeDigest(context: recipeContext)
+            else { return nil }
+        }
+        // `resolvedImage`: the bot's own image when it has a current one.
+        if let own = images[botTag],
+           own.labels[BotComputerGuestSpec.recipeLabelKey] == BotComputerGuestSpec.recipeRevision {
+            image = own
+        }
+        // The test `ensureWorkspaceMounted` passes without touching the container.
+        var mountedLabel: String?
+        if let workspace {
+            let stored = prunedWorkspaces(botID: botID, keeping: [workspace])
+            guard stored.contains(workspace) else { return nil }
+            mountedLabel = BotComputerGuestSpec.workspacesLabel(Array(Set(stored)))
+        }
+        // Read, not pruned: dropping a removed folder from the manifest is
+        // `provision`'s, after `ensureWorkspaceMounted` has read it.
+        let workspaces = loadWorkspaces(botID: botID).filter { FileManager.default.fileExists(atPath: $0) }
+        guard let existing = try? docker.inspect(name: name), existing.running,
+              existing.networkNames == [BotComputerGuestSpec.networkName(botID: botID)]
+        else { return nil }
+        let held = heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID)
+        if let mountedLabel {
+            guard existing.labels[BotComputerGuestSpec.workspacesLabelKey] == mountedLabel,
+                  runtimeIsCurrent(existing) || held
+            else { return nil }
+        }
+        guard currentWorkspacesLabel(existing) == BotComputerGuestSpec.workspacesLabel(workspaces),
+              held || (!image.id.isEmpty && sameImage(existing.imageID, image.id) && runtimeIsCurrent(existing))
+        else { return nil }
+        return existing
+    }
+
     /// Mounts `workspace` at the same path in the bot container. The old container
     /// stays as `<name>-backup` until the replacement is running.
     public func ensureWorkspaceMounted(
@@ -267,6 +336,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
             try? docker.remove(name: backup)
         }
         var renamed = false
+        // Whatever ends up under this name was started here with no screenshot.
+        Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(canonical) }
         do {
             try docker.stop(name: canonical)
             try docker.rename(from: canonical, to: backup)
@@ -707,6 +778,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     private func readyState(name: String, botID: BotID, resumed: Bool) throws -> BotComputerGuestReady {
         let png = try waitForPNG(name: name)
+        Self.unprovenLock.withLock { _ = Self.unprovenContainers.remove(name) }
         let hash = try BotComputerGuestObserve.validatePNG(png)
         let inspect = try docker.inspect(name: name)
         let url = try BotComputerGuestSpec.screenURL(
@@ -774,9 +846,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
     private func imageMatches(_ existing: BotComputerContainerInspect, tag: String) -> Bool {
         let want = (try? docker.imageID(tag: tag)) ?? ""
         if want.isEmpty { return true }
-        return existing.imageID == want
-            || existing.imageID.hasSuffix(want)
-            || want.hasSuffix(existing.imageID)
+        return sameImage(existing.imageID, want)
+    }
+
+    private func sameImage(_ containerImage: String, _ want: String) -> Bool {
+        containerImage == want
+            || containerImage.hasSuffix(want)
+            || want.hasSuffix(containerImage)
     }
 
     private func networkMatches(_ existing: BotComputerContainerInspect, network: String) -> Bool {

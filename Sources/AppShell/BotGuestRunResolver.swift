@@ -65,6 +65,11 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         var workspaces: @Sendable () async -> [WorkspaceID: String]
         /// The Mac distill binary, for its version (nil: not installed).
         var hostBinary: @Sendable (_ request: AgentRunRequest) -> String?
+        /// Reads the Mac distill binary's version ahead of `binaryGuestPath`,
+        /// which reuses a version that was read (one that could not be read
+        /// is asked for again). It does not depend on the VM, so it runs
+        /// while the VM comes up.
+        var probeHostVersion: @Sendable (_ hostBinary: String?) async -> Void = { _ in }
         var gitIdentity: @Sendable () -> GitIdentity?
         /// The app's own environment, under the run's (DISTILL_HOME, model keys).
         var processEnvironment: [String: String] = ProcessInfo.processInfo.environment
@@ -153,6 +158,13 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             let workspace = try await workspaceRoot(of: thread)
             let registered = Set(await deps.workspaces().values)
             let vmPreparer = deps.vm
+            // Runs while the VM comes up: it needs nothing from the VM. Not
+            // awaited when the VM fails or the send is stopped, so neither
+            // waits on a distill binary that hangs. The sign-in renewal
+            // stays after the VM: a stopped or failed start renews nothing.
+            let hostBinary = deps.hostBinary(request)
+            let probeHostVersion = deps.probeHostVersion
+            let hostVersionProbe = Task { await probeHostVersion(hostBinary) }
             let vm = try await Self.blocking {
                 try vmPreparer.prepare(
                     botID: botID, threadID: request.threadId,
@@ -165,7 +177,8 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             )
 
             progress(.preparingAgent)
-            let binaryPath = try await deps.binaryGuestPath(deps.hostBinary(request), vm.dockerArch)
+            await hostVersionProbe.value
+            let binaryPath = try await deps.binaryGuestPath(hostBinary, vm.dockerArch)
             let dockerExecutable = try deps.dockerExecutable()
             try Task.checkCancellation()
 
@@ -466,11 +479,22 @@ final class BotGuestDockerVM: BotGuestVMPreparing, @unchecked Sendable {
     /// Container name → image whose tools passed the probe. Tools come from
     /// the image, so a container keeps its result until it is recreated.
     private var probedImages: [String: String] = [:]
+    private let resolveExecutable: (@Sendable () throws -> String)?
+    /// Resolved docker executable → the `docker info` Architecture it reported.
+    private var architectures: [String: String] = [:]
 
-    init(appSupport: URL, docker: any BotComputerDockerClienting, service: BotComputerGuestService) {
+    /// `resolveExecutable` nil: the architecture is read from `docker info`
+    /// on every prepare instead of once per docker executable.
+    init(
+        appSupport: URL,
+        docker: any BotComputerDockerClienting,
+        service: BotComputerGuestService,
+        resolveExecutable: (@Sendable () throws -> String)? = nil
+    ) {
         self.appSupport = appSupport
         self.docker = docker
         self.service = service
+        self.resolveExecutable = resolveExecutable
     }
 
     func prepare(
@@ -479,22 +503,53 @@ final class BotGuestDockerVM: BotGuestVMPreparing, @unchecked Sendable {
         workspace: String?,
         registeredWorkspaces: Set<String>
     ) throws -> BotGuestVM {
+        let executable = try resolveExecutable?()
+        let remembered = executable.flatMap { executable in lock.withLock { architectures[executable] } }
+        var arch = try remembered ?? dockerArchitecture(rememberingFor: executable)
+        let container: String
+        let image: String
+        let recreated: Bool
+        if let running = try? service.runningCurrentContainer(
+            botID: botID, workspace: workspace,
+            registered: registeredWorkspaces, requestingThreadID: threadID
+        ) {
+            container = BotComputerGuestSpec.containerName(botID: botID)
+            image = running.imageID
+            recreated = false
+        } else {
+            // Anything but running and current takes the path every send took
+            // before. It starts with `docker info`, which is what names a
+            // daemon that is down.
+            if remembered != nil {
+                arch = try dockerArchitecture(rememberingFor: executable)
+            }
+            if let workspace {
+                try service.ensureWorkspaceMounted(
+                    botID: botID, workspace: workspace,
+                    registered: registeredWorkspaces, requestingThreadID: threadID
+                )
+            }
+            let ready = try service.provision(botID: botID, requestingThreadID: threadID)
+            container = ready.containerID
+            image = ready.imageReference
+            recreated = !ready.resumed
+        }
+        try checkTools(container: container, image: image, recreated: recreated)
+        let manifest = BotComputerGuestSpec.workspacesURL(appSupport: appSupport, botID: botID)
+        let mounted = (try? Data(contentsOf: manifest))
+            .flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
+        return BotGuestVM(container: container, dockerArch: arch, mountedWorkspaces: mounted)
+    }
+
+    private func dockerArchitecture(rememberingFor executable: String?) throws -> String {
         let info = try docker.info()
         guard let arch = DistillGuestBinaryProvisioner.dockerArchitecture(fromInfo: info) else {
             throw DistillGuestLaunchError.unavailable("Docker did not report its CPU architecture.")
         }
-        if let workspace {
-            try service.ensureWorkspaceMounted(
-                botID: botID, workspace: workspace,
-                registered: registeredWorkspaces, requestingThreadID: threadID
-            )
+        if let executable {
+            lock.withLock { architectures[executable] = arch }
         }
-        let ready = try service.provision(botID: botID, requestingThreadID: threadID)
-        try checkTools(container: ready.containerID, image: ready.imageReference, recreated: !ready.resumed)
-        let manifest = BotComputerGuestSpec.workspacesURL(appSupport: appSupport, botID: botID)
-        let mounted = (try? Data(contentsOf: manifest))
-            .flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
-        return BotGuestVM(container: ready.containerID, dockerArch: arch, mountedWorkspaces: mounted)
+        return arch
     }
 
     static let toolsProbeScript =
@@ -571,7 +626,8 @@ extension AppContext {
                     appSupport: appSupport,
                     docker: docker,
                     recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
-                )
+                ),
+                resolveExecutable: { try BotComputerDockerResolver.shared.resolveHealthyExecutable() }
             ),
             binaryGuestPath: { hostBinary, arch in
                 try await binaries.resolve(hostBinary: hostBinary, dockerArch: arch).guestPath
@@ -587,6 +643,9 @@ extension AppContext {
             },
             hostBinary: { request in
                 DistillProvisioner.resolveInstalledBinary(override: request.providerBinary ?? distillOverride)
+            },
+            probeHostVersion: { hostBinary in
+                if let hostBinary { _ = await binaries.hostVersion(binary: hostBinary) }
             },
             gitIdentity: { BotComputerGuestService.gitIdentity() },
             hostsGuestRuns: hostsGuestRuns

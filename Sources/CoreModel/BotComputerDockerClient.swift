@@ -82,6 +82,9 @@ public protocol BotComputerDockerClienting: Sendable {
     func imageExists(tag: String) throws -> Bool
     func imageLabel(tag: String, key: String) throws -> String
     func imageID(tag: String) throws -> String
+    /// The id and labels of each of `tags` that exists; a tag with no image
+    /// is left out. Throws when Docker cannot tell.
+    func imageStates(tags: [String]) throws -> [String: BotComputerImageState]
     func build(context: URL, tag: String) throws
     func create(options: BotComputerContainerCreateOptions) throws -> String
     func start(name: String) throws
@@ -108,6 +111,21 @@ public extension BotComputerDockerClienting {
     func removeNetwork(name: String) throws {}
 
     func top(name: String) throws -> String { "" }
+
+    /// One Docker call per fact, and only the labels RemoteCode stamps on its
+    /// images. `BotComputerDockerCLI` reads everything in one call instead.
+    func imageStates(tags: [String]) throws -> [String: BotComputerImageState] {
+        var states: [String: BotComputerImageState] = [:]
+        for tag in tags {
+            guard try imageExists(tag: tag) else { continue }
+            var labels: [String: String] = [:]
+            for key in [BotComputerGuestSpec.recipeLabelKey, BotComputerGuestSpec.recipeDigestLabelKey] {
+                labels[key] = try imageLabel(tag: tag, key: key)
+            }
+            states[tag] = BotComputerImageState(id: try imageID(tag: tag), labels: labels)
+        }
+        return states
+    }
 
     func exec(name: String, command: [String], user: String?, detach: Bool) throws -> Data {
         try exec(name: name, command: command, user: user, detach: detach, workdir: nil, environment: [:])
@@ -150,6 +168,16 @@ public struct BotComputerContainerInspect: Equatable, Sendable {
     }
 }
 
+/// What Docker knows about the image behind a tag.
+public struct BotComputerImageState: Equatable, Sendable {
+    public var id: String
+    public var labels: [String: String]
+    public init(id: String, labels: [String: String] = [:]) {
+        self.id = id
+        self.labels = labels
+    }
+}
+
 /// App-process CLI wrapper. Agent children must never receive this client.
 public struct BotComputerDockerCLI: BotComputerDockerClienting {
     static let stdoutRetentionLimit = 8 * 1_024 * 1_024
@@ -189,6 +217,38 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         let data = try run(["inspect", "-f", "{{.Id}}", tag])
         return (String(data: data, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// One line per image that exists: its tags, its id and its labels.
+    static let imageStatesFormat = "{{json .RepoTags}}\t{{.Id}}\t{{json .Config.Labels}}"
+
+    static func imageStatesArguments(tags: [String]) -> [String] {
+        ["image", "inspect", "-f", imageStatesFormat] + tags
+    }
+
+    /// One `docker image inspect` for every tag. Docker prints a line for each
+    /// image that exists and exits non-zero when one does not; `defaultRun`
+    /// returns what was printed, and each line names the tags it answers for.
+    public func imageStates(tags: [String]) throws -> [String: BotComputerImageState] {
+        let data = try run(Self.imageStatesArguments(tags: tags))
+        var states: [String: BotComputerImageState] = [:]
+        for line in String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            let named = fields.first
+                .flatMap { try? JSONDecoder().decode([String].self, from: Data($0.utf8)) } ?? []
+            // Docker may print a tag with its registry in front.
+            let answered = tags.filter { tag in named.contains { $0 == tag || $0.hasSuffix("/" + tag) } }
+            // A line that answers for none of `tags` leaves an image unknown,
+            // which must not read as "no such image".
+            guard fields.count == 3, !fields[1].isEmpty, !answered.isEmpty else {
+                throw BotComputerDockerError.provisioningFailed
+            }
+            let labels = (try? JSONDecoder().decode([String: String].self, from: Data(fields[2].utf8))) ?? [:]
+            for tag in answered {
+                states[tag] = BotComputerImageState(id: String(fields[1]), labels: labels)
+            }
+        }
+        return states
     }
 
     public func build(context: URL, tag: String) throws {
@@ -422,10 +482,21 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             throw BotComputerDockerError.guestCommandTimedOut(seconds: seconds)
         }
         if result.terminationStatus != 0 {
+            if let printed = partialImageStates(args: args, status: result.terminationStatus, stdout: result.data) {
+                return printed
+            }
             BotComputerDockerResolver.shared.invalidateIfMatches(executable)
             throw failureError(for: args, stderr: result.errorData)
         }
         return result.data
+    }
+
+    /// An inspect of several images prints the ones that exist and exits
+    /// non-zero for the rest: what it printed is the answer. nil for any
+    /// other failed command, and when it printed nothing.
+    static func partialImageStates(args: [String], status: Int32, stdout: Data) -> Data? {
+        guard status != 0, args.starts(with: imageStatesArguments(tags: [])), !stdout.isEmpty else { return nil }
+        return stdout
     }
 
     static func failureError(for args: [String], stderr: Data) -> BotComputerDockerError {
@@ -444,6 +515,9 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
     static func timeoutForArguments(_ args: [String]) -> TimeInterval {
         switch args.first {
         case "info": return 5
+        // Asked on every send, ahead of `info`: a daemon that hangs must not
+        // be named much later than `info` alone names it.
+        case "image" where args.starts(with: imageStatesArguments(tags: [])): return 5
         case "build": return BotComputerGuestSpec.imageBuildDeadlineSeconds
         case "exec":
             guard let seconds = guestDeadlineSeconds(args) else { return 15 }
