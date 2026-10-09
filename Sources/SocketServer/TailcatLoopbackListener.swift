@@ -5,6 +5,15 @@ public protocol TailcatLoopbackListening: Sendable {
     @discardableResult
     func start() throws -> UInt16
     func stop()
+    /// F5: digest of the published Tailcat endpoints, nil when nothing is published.
+    func setPublishedEndpointDigest(_ digest: String?)
+    /// F5: tell the sockets that asked that the endpoints with this digest are about to stop.
+    func announceRotation(retiringDigest: String)
+}
+
+public extension TailcatLoopbackListening {
+    func setPublishedEndpointDigest(_ digest: String?) {}
+    func announceRotation(retiringDigest: String) {}
 }
 
 public final class TailcatLoopbackListener: TailcatLoopbackListening, @unchecked Sendable {
@@ -15,6 +24,7 @@ public final class TailcatLoopbackListener: TailcatLoopbackListening, @unchecked
     private var listenFD: Int32 = -1
     private var listenFD6: Int32 = -1
     private var boundPort: UInt16?
+    private var publishedEndpointDigest: String?
 
     public init(authenticator: TailcatRemoteConnectionAuthenticator) {
         self.authenticator = authenticator
@@ -25,7 +35,24 @@ public final class TailcatLoopbackListener: TailcatLoopbackListening, @unchecked
     public func setHTTPServer(_ server: DirectHTTPServer?) {
         lock.lock()
         httpServer = server
+        // F5: the server is recreated at every wake; under the lock, so it
+        // never ends with an older digest than the listener's.
+        server?.setTailcatEndpointDigest(publishedEndpointDigest)
         lock.unlock()
+    }
+
+    public func setPublishedEndpointDigest(_ digest: String?) {
+        lock.lock()
+        publishedEndpointDigest = digest
+        httpServer?.setTailcatEndpointDigest(digest)
+        lock.unlock()
+    }
+
+    public func announceRotation(retiringDigest: String) {
+        lock.lock()
+        let server = httpServer
+        lock.unlock()
+        server?.announceTailcatRotation(retiringDigest: retiringDigest)
     }
 
     @discardableResult

@@ -40,6 +40,7 @@ actor TailcatRuntimeSupervisor {
     typealias SessionProvider = @Sendable () -> PrivateAccountSession?
     typealias TokenRefresh = @Sendable () async -> String?
     typealias StatusHandler = @Sendable (TailcatRuntimeStatus) -> Void
+    typealias PublishHandler = @Sendable () -> Void
 
     private struct ActiveRuntime: Sendable {
         let primary: TailcatRunningServer?
@@ -58,10 +59,12 @@ actor TailcatRuntimeSupervisor {
     private let tokenRefresh: TokenRefresh?
     private let authenticator: TailcatRemoteConnectionAuthenticator
     private let listener: any TailcatLoopbackListening
+    private let publishHandler: PublishHandler
     private let statusHandler: StatusHandler
     private let now: @Sendable () -> Date
     private let automaticPolling: Bool
     private var enabled = false
+    private var suspended = false
     private var generation: UInt64 = 0
     private var loopTask: Task<Void, Never>?
     private var runtime: ActiveRuntime?
@@ -69,7 +72,17 @@ actor TailcatRuntimeSupervisor {
     private var lastRenewal: Date?
     private var currentSnapshot: TailcatAllowlistSnapshot?
     private var currentETag: String?
-    private var publishedHost: TailcatCatalogHost?
+    private var publishedHost: TailcatCatalogHost? {
+        didSet {
+            // F5: `renew` can assign after the runtime was stopped, or while a disable still
+            // waits for its DELETE; offer the digest only while an enabled runtime runs.
+            publishedEndpointDigest = (runtime == nil || !enabled) ? nil : publishedHost.map {
+                TailcatEndpointDigest.digest(buildId: $0.transportBuildId, endpoints: $0.endpoints)
+            }
+            listener.setPublishedEndpointDigest(publishedEndpointDigest)
+        }
+    }
+    private var publishedEndpointDigest: String?
     private var lastAccessToken: String?
     private var reconcilePending = false
     private var reconciling = false
@@ -92,6 +105,7 @@ actor TailcatRuntimeSupervisor {
         listener: any TailcatLoopbackListening,
         now: @escaping @Sendable () -> Date = { Date() },
         automaticPolling: Bool = true,
+        publishHandler: @escaping PublishHandler = {},
         statusHandler: @escaping StatusHandler
     ) {
         self.serverID = serverID
@@ -105,10 +119,12 @@ actor TailcatRuntimeSupervisor {
         self.listener = listener
         self.now = now
         self.automaticPolling = automaticPolling
+        self.publishHandler = publishHandler
         self.statusHandler = statusHandler
     }
 
     func setEnabled(_ enabled: Bool) async {
+        suspended = false
         generation &+= 1
         self.enabled = enabled
         if !enabled {
@@ -131,6 +147,8 @@ actor TailcatRuntimeSupervisor {
     /// delayed suspend cannot disable after wake.
     func suspend() async {
         generation &+= 1
+        // F5: a reconcile left pending must not restart the runtime after the Mac was told to sleep.
+        suspended = true
         let operationGeneration = generation
         loopTask?.cancel()
         loopTask = nil
@@ -145,12 +163,20 @@ actor TailcatRuntimeSupervisor {
     /// when admission is unchanged. No-ops when the user has disabled access.
     func resume() async {
         generation &+= 1
+        suspended = false
         let operationGeneration = generation
         guard enabled else { return }
         statusHandler(.checking)
         lastBackendSuccess = now()
         startPollingLoopIfNeeded()
         guard enabled, generation == operationGeneration else { return }
+        await requestReconcile()
+    }
+
+    /// F5: the network path changed and is usable. The same reconcile as the
+    /// poll, sooner. Never bumps `generation` and never reports `.checking`.
+    func networkPathChanged() async {
+        Self.log.notice("tailcat_reconcile trigger=path")
         await requestReconcile()
     }
 
@@ -166,6 +192,13 @@ actor TailcatRuntimeSupervisor {
             leaseExpiresAt: host.leaseExpiresAt,
             transportBuildId: host.transportBuildId
         )
+    }
+
+    /// F5: `pushHint()` plus the digest of the same publication, read in one actor turn.
+    func pushHintWithEndpointDigest() -> TailcatPushHint? {
+        guard var hint = pushHint() else { return nil }
+        hint.endpointDigest = publishedEndpointDigest
+        return hint
     }
 
 #if DEBUG
@@ -231,12 +264,12 @@ actor TailcatRuntimeSupervisor {
     }
 
     private func requestReconcile() async {
-        guard enabled else { return }
+        guard enabled, !suspended else { return }
         reconcilePending = true
         guard !reconciling else { return }
         reconciling = true
         defer { reconciling = false }
-        while reconcilePending, enabled {
+        while reconcilePending, enabled, !suspended {
             reconcilePending = false
             await tick()
         }
@@ -335,6 +368,10 @@ actor TailcatRuntimeSupervisor {
         reuseKeys: TailcatKeyVersion? = nil
     ) async {
         let operationGeneration = generation
+        // F5: a live runtime here always means new keys; tell the sockets that asked before they lose the old address.
+        if runtime != nil, let retiring = publishedEndpointDigest {
+            listener.announceRotation(retiringDigest: retiring)
+        }
         await stopRuntime()
         statusHandler(.checking)
         do {
@@ -464,6 +501,7 @@ actor TailcatRuntimeSupervisor {
                 active: keys,
                 pending: nil
             ))
+            publishHandler()
             statusHandler(.active)
         } catch {
             await stopRuntime()
@@ -491,6 +529,8 @@ actor TailcatRuntimeSupervisor {
             lastRenewal = now()
             currentETag = published.eTag
             publishedHost = published.host
+            // F5: the renewal can be answered after a stop or during a disable; then nothing is published to announce.
+            if self.runtime != nil, enabled { publishHandler() }
             if var stored = try loadSecureState() {
                 stored.eTag = published.eTag
                 if let snapshot = currentSnapshot {

@@ -3,11 +3,13 @@ import Foundation
 /// Public facts about the last successfully published Tailcat catalog host.
 /// Never carries `connBlob`, tokens, or keys (APNs payload is 4096 bytes and
 /// transits Apple); iOS uses version/lease to decide whether to prefetch.
+/// F5: `endpointDigest` is a SHA-256 of the published endpoints, never an endpoint.
 struct TailcatPushHint: Sendable, Equatable {
     let serverId: String
     let version: Int64
     let leaseExpiresAt: String
     let transportBuildId: String
+    var endpointDigest: String? = nil
 }
 
 /// Connection + catch-up hints merged into every host -> iOS push `data`
@@ -17,7 +19,10 @@ enum PushConnectionHints {
     static let tailcatVersionKey = "rc2_tc_ver"
     static let tailcatLeaseExpiresKey = "rc2_tc_exp"
     static let tailcatBuildKey = "rc2_tc_build"
-    static let tailcatKeys = [tailcatServerIdKey, tailcatVersionKey, tailcatLeaseExpiresKey, tailcatBuildKey]
+    static let tailcatDigestKey = "rc2_tc_dig"
+    static let tailcatKeys = [
+        tailcatServerIdKey, tailcatVersionKey, tailcatLeaseExpiresKey, tailcatBuildKey, tailcatDigestKey,
+    ]
 
     private static let maxServerIdLength = 128
     private static let maxBuildLength = 96
@@ -44,6 +49,10 @@ enum PushConnectionHints {
             out[tailcatVersionKey] = String(tailcat.version)
             out[tailcatLeaseExpiresKey] = tailcat.leaseExpiresAt
             out[tailcatBuildKey] = tailcat.transportBuildId
+            // F5: the digest rides only with the four keys; a malformed one is omitted, the four stay.
+            if let digest = tailcat.endpointDigest, TailcatEndpointDigest.isValid(digest) {
+                out[tailcatDigestKey] = digest
+            }
         }
         return out
     }
