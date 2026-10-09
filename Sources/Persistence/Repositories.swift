@@ -569,9 +569,9 @@ public final class AgentThreadRepository {
     public func upsert(_ t: AgentThread) throws {
         Self.bumpIdentityRevision()
         let st = try db.prepare("""
-            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json, reasoning_model, actor_json, actor_locked_at, execution_target)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, provider_instance_id=excluded.provider_instance_id, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color, pinned=excluded.pinned, sort_order=excluded.sort_order, permission_mode=excluded.permission_mode, reasoning_effort=excluded.reasoning_effort, execution_mode=excluded.execution_mode, base_branch=excluded.base_branch, worktree_path=excluded.worktree_path, service_tier=excluded.service_tier, model_selection_json=excluded.model_selection_json, interaction_mode=excluded.interaction_mode, run_as_user_json=excluded.run_as_user_json, reasoning_model=excluded.reasoning_model, actor_json=excluded.actor_json, actor_locked_at=excluded.actor_locked_at, execution_target=excluded.execution_target;
+            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json, reasoning_model, actor_json, actor_locked_at, execution_target, parent_thread_id, is_ephemeral)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, provider_instance_id=excluded.provider_instance_id, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color, pinned=excluded.pinned, sort_order=excluded.sort_order, permission_mode=excluded.permission_mode, reasoning_effort=excluded.reasoning_effort, execution_mode=excluded.execution_mode, base_branch=excluded.base_branch, worktree_path=excluded.worktree_path, service_tier=excluded.service_tier, model_selection_json=excluded.model_selection_json, interaction_mode=excluded.interaction_mode, run_as_user_json=excluded.run_as_user_json, reasoning_model=excluded.reasoning_model, actor_json=excluded.actor_json, actor_locked_at=excluded.actor_locked_at, execution_target=excluded.execution_target, parent_thread_id=excluded.parent_thread_id, is_ephemeral=excluded.is_ephemeral;
         """)
         try st.bind(1, t.id.value.uuidString)
         try st.bind(2, t.projectId?.value.uuidString)
@@ -603,6 +603,8 @@ public final class AgentThreadRepository {
         try st.bind(28, encodeRunActor(t.actor))
         try st.bind(29, t.actorLockedAt.map { iso.string(from: $0) })
         try st.bind(30, t.executionTarget?.rawValue)
+        try st.bind(31, t.parentThreadId?.value.uuidString)
+        try st.bind(32, t.isEphemeral)
         _ = try st.step()
 
         if let routingConfiguration = t.routingConfiguration {
@@ -963,13 +965,14 @@ public final class AgentThreadRepository {
         // JOIN routing so a 20-thread rail is one statement, not 1+N.
         // PF-30: WAL reader so the rail does not wait on stream writers.
         let columns = """
-            t.id, t.project_id, t.workspace_id, t.title, t.provider, t.provider_instance_id, t.model, t.provider_thread_id, t.status, unixepoch(t.created_at), unixepoch(t.updated_at), t.diff_additions, t.diff_deletions, t.has_unread, t.color, t.pinned, t.sort_order, t.permission_mode, t.reasoning_effort, t.execution_mode, t.base_branch, t.worktree_path, t.service_tier, t.model_selection_json, t.interaction_mode, t.run_as_user_json, t.reasoning_model, r.mode, r.configuration_json, r.revision, t.actor_json, t.actor_locked_at, t.execution_target
+            t.id, t.project_id, t.workspace_id, t.title, t.provider, t.provider_instance_id, t.model, t.provider_thread_id, t.status, unixepoch(t.created_at), unixepoch(t.updated_at), t.diff_additions, t.diff_deletions, t.has_unread, t.color, t.pinned, t.sort_order, t.permission_mode, t.reasoning_effort, t.execution_mode, t.base_branch, t.worktree_path, t.service_tier, t.model_selection_json, t.interaction_mode, t.run_as_user_json, t.reasoning_model, r.mode, r.configuration_json, r.revision, t.actor_json, t.actor_locked_at, t.execution_target, t.parent_thread_id, t.is_ephemeral
             """
-        let from = "FROM agent_threads t LEFT JOIN agent_thread_routing r ON r.thread_id = t.id"
+        // Ephemeral side threads are hidden from the rail/`agent.thread.list`.
+        let from = "FROM agent_threads t LEFT JOIN agent_thread_routing r ON r.thread_id = t.id WHERE t.is_ephemeral = 0"
         let order = "ORDER BY t.updated_at DESC, t.id DESC"
         let sql = workspaceId == nil
             ? "SELECT \(columns) \(from) \(order);"
-            : "SELECT \(columns) \(from) WHERE t.workspace_id = ? \(order);"
+            : "SELECT \(columns) \(from) AND t.workspace_id = ? \(order);"
         return try readDB.performSync { database in
             let st = try database.prepare(sql)
             if let wid = workspaceId { try st.bind(1, wid.value.uuidString) }
@@ -1025,7 +1028,9 @@ public final class AgentThreadRepository {
                     routingConfiguration: routing,
                     actor: decodeRunActor(st.columnText(30)),
                     actorLockedAt: st.columnText(31).map { parseDate($0) },
-                    executionTarget: st.columnText(32).flatMap { ExecutionTarget(rawValue: $0) }
+                    executionTarget: st.columnText(32).flatMap { ExecutionTarget(rawValue: $0) },
+                    parentThreadId: (st.columnText(33)).flatMap { UUID(uuidString: $0) }.map { AgentThreadID($0) },
+                    isEphemeral: st.columnInt64(34) != 0
                 ))
             }
             return out
@@ -1490,7 +1495,7 @@ public final class AgentThreadRepository {
     }
 
     private func loadThread(id: AgentThreadID, includeRouting: Bool) throws -> AgentThread? {
-        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json, reasoning_model, actor_json, actor_locked_at, execution_target FROM agent_threads WHERE id = ?;")
+        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json, reasoning_model, actor_json, actor_locked_at, execution_target, parent_thread_id, is_ephemeral FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         if try st.step() {
             let idVal = AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
@@ -1531,7 +1536,9 @@ public final class AgentThreadRepository {
                 routingConfiguration: includeRouting ? try loadRoutingConfiguration(threadId: idVal) : nil,
                 actor: decodeRunActor(st.columnText(27)),
                 actorLockedAt: st.columnText(28).map { parseDate($0) },
-                executionTarget: st.columnText(29).flatMap { ExecutionTarget(rawValue: $0) }
+                executionTarget: st.columnText(29).flatMap { ExecutionTarget(rawValue: $0) },
+                parentThreadId: (st.columnText(30)).flatMap { UUID(uuidString: $0) }.map { AgentThreadID($0) },
+                isEphemeral: st.columnInt64(31) != 0
             )
         }
         return nil
@@ -1620,6 +1627,61 @@ public final class AgentThreadRepository {
         let st = try db.prepare("DELETE FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         _ = try st.step()
+    }
+
+    /// Every ephemeral side thread still on disk. Launch sweeps these before the
+    /// process creates any new side thread, so nothing live is caught.
+    public func ephemeralThreadIds() throws -> [AgentThreadID] {
+        try readDB.performSync { database in
+            let st = try database.prepare("SELECT id FROM agent_threads WHERE is_ephemeral = 1;")
+            var out: [AgentThreadID] = []
+            while try st.step() {
+                if let raw = st.columnText(0), let uuid = UUID(uuidString: raw) {
+                    out.append(AgentThreadID(uuid))
+                }
+            }
+            return out
+        }
+    }
+
+    /// Deletes all ephemeral side threads and returns their ids so the caller can
+    /// compensate the provider-side children.
+    @discardableResult
+    public func deleteEphemeralThreads() throws -> [AgentThreadID] {
+        let ids = try ephemeralThreadIds()
+        guard !ids.isEmpty else { return [] }
+        Self.bumpIdentityRevision()
+        let st = try db.prepare("DELETE FROM agent_threads WHERE is_ephemeral = 1;")
+        _ = try st.step()
+        return ids
+    }
+
+    public struct EphemeralThreadSweepRow: Sendable {
+        public let id: AgentThreadID
+        public let parentThreadId: AgentThreadID?
+        public let provider: AgentProvider
+        public let providerThreadId: String?
+        public let worktreePath: String?
+    }
+
+    /// Rows needed to compensate provider children of ephemeral side threads swept at launch.
+    public func ephemeralThreadSweepRows() throws -> [EphemeralThreadSweepRow] {
+        try readDB.performSync { database in
+            let st = try database.prepare("SELECT id, parent_thread_id, provider, provider_thread_id, worktree_path FROM agent_threads WHERE is_ephemeral = 1;")
+            var out: [EphemeralThreadSweepRow] = []
+            while try st.step() {
+                guard let raw = st.columnText(0), let uuid = UUID(uuidString: raw) else { continue }
+                let providerThreadId = st.columnText(3)
+                out.append(EphemeralThreadSweepRow(
+                    id: AgentThreadID(uuid),
+                    parentThreadId: (st.columnText(1)).flatMap { UUID(uuidString: $0) }.map { AgentThreadID($0) },
+                    provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
+                    providerThreadId: (providerThreadId?.isEmpty == false) ? providerThreadId : nil,
+                    worktreePath: st.columnText(4)
+                ))
+            }
+            return out
+        }
     }
 
     public func count(workspaceId: WorkspaceID) throws -> Int {
