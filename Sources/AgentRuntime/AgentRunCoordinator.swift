@@ -925,6 +925,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         onActiveRunProjectionChanged?(ActiveRunProjection(runs: []), .launchReconciliation)
         let task = Task { [weak self] in
             guard let self else { return }
+            await self.sweepEphemeralThreadsOnLaunch()
             await self.reconcileForkIntentsOnLaunch()
         }
         lock.lock()
@@ -4255,12 +4256,60 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Side question against a thread's live provider session.
+    public func btwThread(threadId: AgentThreadID, question: String) async throws -> String {
+        let adapter = try adapterForThread(threadId)
+        return try await adapter.btw(threadId: threadId, question: question)
+    }
+
+    /// Closes an ephemeral side thread: compensates the provider child and deletes
+    /// the local row. Closing a missing or non-ephemeral thread is a no-op.
+    public func closeSideThread(threadId: AgentThreadID) async throws {
+        guard let thread = try? threadRepo.get(id: threadId), thread.isEphemeral else { return }
+        if let providerThreadId = thread.providerThreadId, !providerThreadId.isEmpty,
+           let adapter = providerAdapterSnapshot(for: thread.provider) {
+            let request = AgentProviderForkRequest(
+                sourceThreadId: thread.parentThreadId ?? threadId,
+                childThreadId: threadId,
+                idempotencyKey: "remotecode-thread-fork:\(threadId.value.uuidString.lowercased())",
+                workingDirectory: thread.worktreePath,
+                sourceProviderThreadId: nil
+            )
+            try? await adapter.compensateFork(request, providerChildThreadId: providerThreadId)
+        }
+        stopRun(threadId: threadId)
+        try threadRepo.delete(id: threadId)
+    }
+
+    /// Deletes ephemeral side threads left by a previous launch and compensates
+    /// their provider children. Runs once at launch, before any new side thread
+    /// can exist, so it never deletes live work.
+    public func sweepEphemeralThreadsOnLaunch() async {
+        let rows = (try? threadRepo.ephemeralThreadSweepRows()) ?? []
+        guard !rows.isEmpty else { return }
+        _ = try? threadRepo.deleteEphemeralThreads()
+        for row in rows {
+            guard let providerThreadId = row.providerThreadId,
+                  let adapter = providerAdapterSnapshot(for: row.provider) else { continue }
+            guard (await ProviderCLIProbe.runOffCooperativePool { adapter.forkSafety(threadId: row.parentThreadId ?? row.id) }).supportsDurableFork else {
+                continue
+            }
+            let request = AgentProviderForkRequest(
+                sourceThreadId: row.parentThreadId ?? row.id,
+                childThreadId: row.id,
+                idempotencyKey: "remotecode-thread-fork:\(row.id.value.uuidString.lowercased())",
+                workingDirectory: row.worktreePath,
+                sourceProviderThreadId: nil
+            )
+            try? await adapter.compensateFork(request, providerChildThreadId: providerThreadId)
+        }
+    }
+
     private func beginExclusiveThreadMutation(
         _ threadId: AgentThreadID,
         operation: String,
         requiresIdleThread: Bool = false
-    ) throws {
-        lock.lock(); defer { lock.unlock() }
+    ) throws {        lock.lock(); defer { lock.unlock() }
         guard !exclusiveThreadMutations.contains(threadId),
               !requiresIdleThread || activeThreads[threadId] == nil else {
             throw AgentProviderAdapterError.unsupported(

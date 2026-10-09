@@ -154,6 +154,10 @@ public protocol CommandRouting: AnyObject {
     func listAgentThreadsOffMain(workspace: WorkspaceID?) async throws -> [AgentThread]
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?) throws -> AgentThread
     func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext?) async throws -> AgentThread
+    func forkAgentThread(sourceThreadId: AgentThreadID, messageID: String?) async throws -> AgentThread
+    func sideAgentThread(sourceThreadId: AgentThreadID, text: String?) async throws -> AgentThread
+    func closeSideThread(threadId: AgentThreadID) async throws
+    func btwAgentThread(threadId: AgentThreadID, question: String) async throws -> String
     func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?) throws -> AgentThread
     func configureAgentThreadRouting(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, routing: AgentRoutingRequest?) async throws -> AgentThread
     func listAgentRunAsUsers() throws -> [AgentRunAsUser]
@@ -409,6 +413,18 @@ public extension CommandRouting {
     }
     func getAgentAccountUsage() async throws -> JSONValue {
         throw JSONRPCError.notSupported("agent.account.usage.get")
+    }
+    func forkAgentThread(sourceThreadId: AgentThreadID, messageID: String?) async throws -> AgentThread {
+        throw JSONRPCError.notSupported("agent.thread.fork")
+    }
+    func sideAgentThread(sourceThreadId: AgentThreadID, text: String?) async throws -> AgentThread {
+        throw JSONRPCError.notSupported("agent.thread.side")
+    }
+    func closeSideThread(threadId: AgentThreadID) async throws {
+        throw JSONRPCError.notSupported("agent.thread.side.close")
+    }
+    func btwAgentThread(threadId: AgentThreadID, question: String) async throws -> String {
+        throw JSONRPCError.notSupported("agent.thread.btw")
     }
 
     func sshTransferUploadAsync(surface: SurfaceID, localPath: String, remotePath: String) async throws -> JSONValue {
@@ -3471,6 +3487,25 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .array(threads.map {
                     encodeThread($0, lockedThreads: lockedThreads, pendingManualActions: manualActions, guestRuntimes: guestRuntimes)
                 }))
+            case "agent.thread.fork", "host.agent.thread.fork":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                let messageID = params["message_id"]?.stringValue
+                let forked = try await router.forkAgentThread(sourceThreadId: tid, messageID: messageID)
+                return .init(id: id, result: encodeThread(forked))
+            case "agent.thread.side", "host.agent.thread.side":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                let text = params["text"]?.stringValue
+                let side = try await router.sideAgentThread(sourceThreadId: tid, text: text)
+                return .init(id: id, result: encodeThread(side))
+            case "agent.thread.side.close", "host.agent.thread.side.close":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                try await router.closeSideThread(threadId: tid)
+                return .init(id: id, result: .object([:]))
+            case "agent.thread.btw", "host.agent.thread.btw":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let question = params["question"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let answer = try await router.btwAgentThread(threadId: tid, question: question)
+                return .init(id: id, result: .object(["answer": .string(answer)]))
             case "agent.thread.create", "host.agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let title = params["title"]?.stringValue ?? "New thread"

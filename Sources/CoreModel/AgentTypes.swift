@@ -1550,6 +1550,10 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     public var actor: RunActor
     public var actorLockedAt: Date?
     public var executionTarget: ExecutionTarget?
+    /// Source thread this thread was forked/sided from; nil for a root thread.
+    public var parentThreadId: AgentThreadID?
+    /// Ephemeral side threads are hidden from `agent.thread.list` and swept on launch.
+    public var isEphemeral: Bool
 
     public var effectiveInteractionMode: AgentInteractionMode {
         interactionMode ?? .default
@@ -1594,7 +1598,9 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         routingConfiguration: AgentRoutingConfiguration? = nil,
         actor: RunActor = .none,
         actorLockedAt: Date? = nil,
-        executionTarget: ExecutionTarget? = nil
+        executionTarget: ExecutionTarget? = nil,
+        parentThreadId: AgentThreadID? = nil,
+        isEphemeral: Bool = false
     ) {
         self.id = id
         self.projectId = projectId
@@ -1632,6 +1638,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         self.actor = actor
         self.actorLockedAt = actorLockedAt
         self.executionTarget = executionTarget
+        self.parentThreadId = parentThreadId
+        self.isEphemeral = isEphemeral
     }
 
     /// Hand-written only so pre-actor JSON (no `actor` key) still decodes.
@@ -1668,6 +1676,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         actor = try c.decodeIfPresent(RunActor.self, forKey: .actor) ?? .none
         actorLockedAt = try c.decodeIfPresent(Date.self, forKey: .actorLockedAt)
         executionTarget = try c.decodeIfPresent(ExecutionTarget.self, forKey: .executionTarget)
+        parentThreadId = try c.decodeIfPresent(AgentThreadID.self, forKey: .parentThreadId)
+        isEphemeral = try c.decodeIfPresent(Bool.self, forKey: .isEphemeral) ?? false
     }
 }
 

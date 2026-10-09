@@ -1159,6 +1159,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             guard let self, let agent else { return }
                             self.openURLInAdjacentSplit(workspace: wid, sourceSurface: agent.descriptor.id, url: url)
                         }
+                        agent.viewModel.onForkInNewChat = { [weak self, weak agent] messageID in
+                            guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+                            Task { @MainActor in
+                                do {
+                                    let child = try await self.forkAgentThread(sourceThreadId: source, messageID: messageID)
+                                    agent.viewModel.selectThread(child.id)
+                                } catch {
+                                    agent.viewModel.statusMessage = "Could not fork thread: \(error)"
+                                }
+                            }
+                        }
+                        agent.viewModel.onRequestSideChat = { [weak self, weak agent] text in
+                            guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+                            Task { @MainActor in
+                                do {
+                                    let child = try await self.sideAgentThread(sourceThreadId: source, text: text.isEmpty ? nil : text)
+                                    self.openSideChatSplit(workspace: wid, sourceSurface: agent.descriptor.id, threadId: child.id, seed: text.isEmpty ? nil : text)
+                                } catch {
+                                    agent.viewModel.statusMessage = "Could not open side chat: \(error)"
+                                }
+                            }
+                        }
+                        agent.viewModel.onRequestBtw = { [weak self, weak agent] question in
+                            guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+                            Task { @MainActor in
+                                do {
+                                    let answer = try await self.btwAgentThread(threadId: source, question: question)
+                                    agent.viewModel.appendBtwNote(question: question, answer: answer)
+                                } catch {
+                                    agent.viewModel.statusMessage = "Could not get side answer: \(error)"
+                                }
+                            }
+                        }
                         agent.viewModel.onRunStateChange = { [weak self] in
                             guard let self else { return }
                             if !self.promoteWorkspaceIfBusy(wid) {
@@ -2118,6 +2151,63 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         publishPaneSplit(workspace: workspace, surface: desc)
+    }
+
+    // MARK: Agent App side chat (ephemeral right split)
+
+    /// Opens the ephemeral side chat in a right split pane bound to `threadId`.
+    /// Reuses a side-chat agent surface already in the right neighbor; never
+    /// repurposes a normal agent tab. Its close calls `closeSideThread`.
+    public func openSideChatSplit(workspace: WorkspaceID, sourceSurface: SurfaceID, threadId: AgentThreadID, seed: String?) {
+        guard let ctx = context, let ws = ctx.state.workspaces[workspace] else { return }
+        let sourcePane = paneIDContaining(surface: sourceSurface, in: ws.layout)
+        if let sourcePane, let neighbor = ws.layout.rightNeighborPane(of: sourcePane),
+           let agentDesc = neighbor.surfaces.first(where: { $0.type == .agentApp && $0.metadata["side_thread"] != nil }),
+           let agent = SurfaceRegistry.shared.surface(agentDesc.id) as? AgentAppSurface {
+            agent.viewModel.selectThread(threadId)
+            updateSurfaceDescriptor(workspace: workspace, surface: agentDesc.id) { descriptor in
+                descriptor.title = "Side chat"
+                descriptor.iconName = "plus.circle"
+                descriptor.metadata["selected_thread"] = threadId.value.uuidString
+                descriptor.metadata["side_thread"] = threadId.value.uuidString
+            }
+            try? ctx.apply(.focusSurface(workspace, agentDesc.id))
+            windowController?.refreshFromState()
+            reconcileSurfaceVisibility()
+            registerSideChatClose(surface: agent)
+            seedSideSurface(agent, seed: seed)
+            return
+        }
+        var desc = makeSurface(type: .agentApp, title: "Side chat", workspace: workspace, cwd: ws.cwd, sideThreadId: threadId)
+        desc.iconName = "plus.circle"
+        desc.metadata["side_thread"] = threadId.value.uuidString
+        guard let targetPane = sourcePane ?? ws.focusedPaneID ?? ws.layout.paneIDs().first else { return }
+        try? ctx.apply(.splitPane(workspace, paneID: targetPane, direction: .right, newSurface: desc))
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        publishPaneSplit(workspace: workspace, surface: desc)
+        if let agent = SurfaceRegistry.shared.surface(desc.id) as? AgentAppSurface {
+            registerSideChatClose(surface: agent)
+            seedSideSurface(agent, seed: seed)
+        }
+    }
+
+    /// Closing the side chat pane deletes the ephemeral thread (local delete +
+    /// provider compensation). Chains onto the surface's existing onClose.
+    private func registerSideChatClose(surface: AgentAppSurface) {
+        let previous = surface.onClose
+        surface.onClose = { [weak self, weak surface] in
+            previous?()
+            guard let self, let threadId = surface?.viewModel.selectedThreadId else { return }
+            Task { @MainActor in
+                try? await self.closeSideThread(threadId: threadId)
+            }
+        }
+    }
+
+    private func seedSideSurface(_ agent: AgentAppSurface, seed: String?) {
+        guard let seed, !seed.isEmpty else { return }
+        agent.viewModel.seedSideChatMessage(seed)
     }
 
     /// Workspace-relative path + tab title for an absolute target. Files resolve
@@ -4700,6 +4790,65 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // see scheduled / RPC-created threads immediately.
         EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(t))
         return t
+    }
+
+    /// Builds a fork/side child from the source thread WITHOUT persisting it: the
+    /// coordinator's durable fork persists the child graph atomically.
+    private func makeForkChild(source: AgentThread, ephemeral: Bool, title: String) -> AgentThread {
+        AgentThread(
+            projectId: source.projectId,
+            workspaceId: source.workspaceId,
+            title: title,
+            provider: source.provider,
+            providerInstanceId: source.providerInstanceId,
+            model: source.model,
+            permissionMode: source.permissionMode,
+            reasoningEffort: source.reasoningEffort,
+            reasoningModel: source.reasoningModel,
+            executionMode: source.executionMode,
+            baseBranch: source.baseBranch,
+            worktreePath: source.worktreePath,
+            serviceTier: source.serviceTier,
+            modelSelection: source.modelSelection,
+            runAsUser: source.runAsUser,
+            routingConfiguration: source.routingConfiguration,
+            parentThreadId: source.id,
+            isEphemeral: ephemeral
+        )
+    }
+
+    /// Durable provider fork of a thread into a persisted child (`agent.thread.fork`).
+    public func forkAgentThread(sourceThreadId: AgentThreadID, messageID: String?) async throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard let source = try ctx.threadRepo.get(id: sourceThreadId) else {
+            throw LayoutError.workspaceNotFound
+        }
+        let child = makeForkChild(source: source, ephemeral: false, title: source.title)
+        let forked = try await ctx.coordinator.forkThread(sourceThreadId: sourceThreadId, childThread: child)
+        EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(forked))
+        return forked
+    }
+
+    /// Ephemeral fork of a thread (`agent.thread.side`). Hidden from the rail and swept at launch.
+    public func sideAgentThread(sourceThreadId: AgentThreadID, text: String?) async throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard let source = try ctx.threadRepo.get(id: sourceThreadId) else {
+            throw LayoutError.workspaceNotFound
+        }
+        let child = makeForkChild(source: source, ephemeral: true, title: "Side · \(source.title)")
+        return try await ctx.coordinator.forkThread(sourceThreadId: sourceThreadId, childThread: child)
+    }
+
+    /// Closes an ephemeral side thread (`agent.thread.side.close`).
+    public func closeSideThread(threadId: AgentThreadID) async throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try await ctx.coordinator.closeSideThread(threadId: threadId)
+    }
+
+    /// Side question against a live thread session (`agent.thread.btw`).
+    public func btwAgentThread(threadId: AgentThreadID, question: String) async throws -> String {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try await ctx.coordinator.btwThread(threadId: threadId, question: question)
     }
 
     public func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentThread {
@@ -9313,7 +9462,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// `restoringFrom` carries the descriptor of a closed tab (⌘⇧T), so the new
     /// surface re-derives the target/state the descriptor kept (`url`, `path`,
     /// `files_state`, ssh profile) exactly like `reinstantiateRestoredSurfaces`.
-    private func makeSurface(type: SurfaceType, title: String?, workspace: WorkspaceID, cwd: String, initialThreadId: AgentThreadID? = nil, restoringFrom restore: SurfaceDescriptor? = nil) -> SurfaceDescriptor {
+    private func makeSurface(type: SurfaceType, title: String?, workspace: WorkspaceID, cwd: String, initialThreadId: AgentThreadID? = nil, sideThreadId: AgentThreadID? = nil, restoringFrom restore: SurfaceDescriptor? = nil) -> SurfaceDescriptor {
         let baseTitle = title ?? defaultTitle(for: type)
         let descriptor = SurfaceDescriptor(type: type, title: baseTitle, iconName: type.rawValue, metadata: ["workspace": workspace.value.uuidString, "cwd": cwd])
         let terminalFontSize = context.map { SettingsStore(db: $0.db).load().terminalFontSize } ?? 0
@@ -9355,7 +9504,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: restore.flatMap(restoredBrowserURL(from:)), title: baseTitle, botID: botID), workspace: workspace)
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, orchestrationRuntime: ctx.orchestrationRuntime, accountPanel: distillAccountsPanel)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, sideThreadId: sideThreadId, orchestrationRuntime: ctx.orchestrationRuntime, accountPanel: distillAccountsPanel)
                 // Per-surface thread binding: persist this surface's selected
                 // thread into its descriptor metadata so app restart restores it.
                 agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
@@ -9441,6 +9590,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 agent.viewModel.onOpenURLInSplit = { [weak self, weak agent] url in
                     guard let self, let agent else { return }
                     self.openURLInAdjacentSplit(workspace: workspace, sourceSurface: agent.descriptor.id, url: url)
+                }
+                agent.viewModel.onForkInNewChat = { [weak self, weak agent] messageID in
+                    guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+                    Task { @MainActor in
+                        do {
+                            let child = try await self.forkAgentThread(sourceThreadId: source, messageID: messageID)
+                            agent.viewModel.selectThread(child.id)
+                        } catch {
+                            agent.viewModel.statusMessage = "Could not fork thread: \(error)"
+                        }
+                    }
+                }
+                agent.viewModel.onRequestSideChat = { [weak self, weak agent] text in
+                    guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+                    Task { @MainActor in
+                        do {
+                            let child = try await self.sideAgentThread(sourceThreadId: source, text: text.isEmpty ? nil : text)
+                            self.openSideChatSplit(workspace: workspace, sourceSurface: agent.descriptor.id, threadId: child.id, seed: text.isEmpty ? nil : text)
+                        } catch {
+                            agent.viewModel.statusMessage = "Could not open side chat: \(error)"
+                        }
+                    }
+                }
+                agent.viewModel.onRequestBtw = { [weak self, weak agent] question in
+                    guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+                    Task { @MainActor in
+                        do {
+                            let answer = try await self.btwAgentThread(threadId: source, question: question)
+                            agent.viewModel.appendBtwNote(question: question, answer: answer)
+                        } catch {
+                            agent.viewModel.statusMessage = "Could not get side answer: \(error)"
+                        }
+                    }
                 }
                 agent.viewModel.onRunStateChange = { [weak self] in
                     guard let self else { return }

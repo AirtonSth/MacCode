@@ -465,6 +465,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let embedding: AgentAppEmbedding?
     @Published public var threads: [AgentThread] = [] { didSet { filteredThreadsCache = nil } }
     @Published public var selectedThreadId: AgentThreadID?
+    /// True when the selected thread is an ephemeral side chat (hidden from the
+    /// rail, so the row is not available through `threads`).
+    @Published public private(set) var selectedThreadIsEphemeral = false
+    /// Parent thread of the selected side chat, for the parent status strip.
+    @Published public private(set) var selectedThreadParentId: AgentThreadID?
     /// Transcript paint lives on `transcriptState` so stream ticks do not
     /// republish chrome/rail fields on this object. Proxies keep `vm.messages` /
     /// `vm.timeline` call sites (tests + host) working unchanged.
@@ -714,6 +719,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// UX-MAC_AGENT-OPEN-SPLIT: wired by AppCommandRouter. A clicked web link
     /// opens — or reuses — a Browser split panel to the right of this surface.
     public var onOpenURLInSplit: ((URL) -> Void)?
+    /// Wired by AppCommandRouter. Branches the selected thread into a new
+    /// persisted child chat (optionally from a message id) and selects it.
+    public var onForkInNewChat: ((String?) -> Void)?
+    /// Wired by AppCommandRouter. Creates the ephemeral side thread for the
+    /// selected thread and opens it in a right split pane. The string is the
+    /// optional `/side` inline first message.
+    public var onRequestSideChat: ((String) -> Void)?
+    /// Wired by AppCommandRouter. Asks the selected thread's live session the
+    /// `/btw` side question; the host answers via `appendBtwNote`.
+    public var onRequestBtw: ((String) -> Void)?
     public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
     public var providerLaunchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?
@@ -987,6 +1002,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         customModelStore: AgentCustomModelStore? = nil,
         planNotesStore: PlanNotesStore? = nil,
         initialThreadId: AgentThreadID? = nil,
+        sideThreadId: AgentThreadID? = nil,
         lastModelStore: AgentLastModelStore = .shared,
         initialRoutingMode: AgentRoutingMode = .manual,
         newThreadDefaultsStore: AgentNewThreadDefaultsStore? = nil,
@@ -1026,6 +1042,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             applyNewThreadDefaultsFromRailIfNeeded()
             selectThread(embedding.pinnedThreadId)
             return
+        }
+        // Side chat: bind to the ephemeral thread explicitly. It is hidden from
+        // the rail (agent.thread.list excludes ephemeral rows), so the normal
+        // initialThreadId path below would never select it.
+        if let sideThreadId {
+            selectThread(sideThreadId)
         }
         // XCTest: same-stack rail load so selectThread(initial) sees rows.
         // Production: first cap+list off MainActor so opening a tab does not hitch.
@@ -2319,6 +2341,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         threadWorkspaceCache[id] = selectedThread.workspaceId ?? workspaceID
+        selectedThreadIsEphemeral = selectedThread.isEphemeral
+        selectedThreadParentId = selectedThread.parentThreadId
         if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
             statusMessage = ""
         }
@@ -7574,8 +7598,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func recoverDeletedSelectionIfNeeded(_ removedThreadIDs: Set<AgentThreadID>) {
         guard let selectedThreadId, removedThreadIDs.contains(selectedThreadId) else { return }
+        // Ephemeral side threads are hidden from the rail, so a rail snapshot
+        // never contains them. Keep the selection while the durable row exists;
+        // only recover once the side thread was actually closed/deleted.
+        if selectedThreadIsEphemeral, (try? threadRepo.get(id: selectedThreadId)) != nil { return }
         let preservedUnsentDraft = !prompt.isEmpty || !attachments.isEmpty
         self.selectedThreadId = nil
+        selectedThreadIsEphemeral = false
+        selectedThreadParentId = nil
         publishInterestedThreadId(nil)
         resetDeletedSelectionToFreshComposer()
         if preservedUnsentDraft {
@@ -8043,9 +8073,64 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// `/side` — ask the host to fork an ephemeral side chat and open it in a
+    /// right split pane. Refused inside a side chat and when the provider cannot
+    /// fork. The host creates the thread via `AppCommandRouter.sideAgentThread`.
+    public func requestSideChat(text: String) {
+        guard let tid = selectedThreadId else { return }
+        // A side thread is hidden from the rail, so check its flag first.
+        guard !selectedThreadIsEphemeral else {
+            systemNote("/side — already in a side chat.")
+            return
+        }
+        guard let src = threads.first(where: { $0.id == tid }) ?? (try? threadRepo.get(id: tid)) else { return }
+        guard src.provider.isSelectable else {
+            systemNote("This conversation is read-only. Start a new Distill conversation instead.")
+            return
+        }
+        guard selectedProviderCapabilities.supportsFork else {
+            systemNote(threadForkUnavailableReason ?? "Provider-side fork is unavailable for this session.")
+            return
+        }
+        onRequestSideChat?(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Sends the `/side` inline text as the side chat's first message once the
+    /// side surface is mounted and bound to the ephemeral thread.
+    public func seedSideChatMessage(_ text: String) {
+        guard selectedThreadId != nil else { return }
+        prompt = text
+        Task { @MainActor [weak self] in
+            await self?.send()
+        }
+    }
+
+    /// `/btw` — ask the host for a side answer against the thread's live session.
+    /// The host replies through `appendBtwNote`, which shows it inline.
+    public func requestBtw(question: String) {
+        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            systemNote("/btw — usage: /btw <question>")
+            return
+        }
+        onRequestBtw?(q)
+    }
+
+    /// `/btw` answer as a non-persisted inline transcript note.
+    public func appendBtwNote(question: String, answer: String) {
+        appendInlineNoteToTranscript("BTW · \(question)\n\(answer)")
+    }
+
+    /// Non-persisted inline transcript note: appended to the in-memory message
+    /// list only. A reload from disk drops it (intended for `/btw` answers).
+    private func appendInlineNoteToTranscript(_ text: String) {
+        guard let tid = selectedThreadId else { return }
+        messages.append(AgentMessage(threadId: tid, role: .system, content: text))
+    }
+
     /// Intercept only RemoteCode-owned slash commands before they reach the
     /// provider. Provider commands such as `/goal` must pass through.
-    public static let localSlashCommands = ["/clear", "/default", "/fork", "/model", "/plan", "/status"]
+    public static let localSlashCommands = ["/btw", "/clear", "/default", "/fork", "/model", "/plan", "/side", "/status"]
 
     private var distillAdvertisedCommandNames: [String] {
         provider == .distill ? distillSlashCommands.map { "/\($0.name)" } : []
@@ -8087,9 +8172,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // the silent switch doesn't look like a bug.
             systemNote("/clear — started a new thread. Previous thread is still in the rail.")
         case "fork":
-            Task { @MainActor in
-                await forkCurrentThread()
+            if let onForkInNewChat {
+                onForkInNewChat(nil)
+            } else {
+                Task { @MainActor in
+                    await forkCurrentThread()
+                }
             }
+        case "side":
+            requestSideChat(text: arg)
+        case "btw":
+            requestBtw(question: arg)
         case "model":
             if !arg.isEmpty, let m = availableModels.first(where: {
                 $0.id.localizedCaseInsensitiveContains(arg) || $0.label.localizedCaseInsensitiveContains(arg)
@@ -15206,6 +15299,11 @@ public struct AgentAppView: View {
             // Unified system strip: severity-ordered, capped (replaces stacked banners).
             systemStatusStrip
             queuedMessagesSection
+            if vm.selectedThreadIsEphemeral {
+                sideChatParentStatusStrip
+                    .padding(.horizontal, 22)
+                    .padding(.bottom, DS.Space.xs)
+            }
             // F1: render the composer inside a scope that observes only the composer
             // text, so a keystroke re-renders the composer subtree and NOT this body
             // (which builds the whole transcript).
@@ -16458,6 +16556,14 @@ public struct AgentAppView: View {
             .accessibilityLabel("Copy message")
             .accessibilityIdentifier("agent.assistantMessage.copy.\(identifierSuffix)")
             .help("Copy message")
+            Button { vm.onForkInNewChat?(identifierSuffix) } label: {
+                Image(systemName: "arrow.triangle.branch").font(.system(size: 10))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(DS.Palette.textTertiary)
+            .accessibilityLabel("Branch in new chat")
+            .accessibilityIdentifier("agent.assistantMessage.branch.\(identifierSuffix)")
+            .help("Branch in new chat")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -16561,17 +16667,64 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.hiddenLiveTurnItems")
     }
 
+    @ViewBuilder
     private var emptyConversation: some View {
-        DSEmptyState(
-            icon: "sparkles",
-            title: vm.embedding?.emptyConversationTitle ?? "No messages",
-            subtitle: vm.embedding?.emptyConversationSubtitle ?? "Start a new agent run."
-        ) {
-            if let accountPanel {
-                accountPanel.frame(maxWidth: 420)
+        if vm.selectedThreadIsEphemeral {
+            sideChatEmptyConversation
+        } else {
+            DSEmptyState(
+                icon: "sparkles",
+                title: vm.embedding?.emptyConversationTitle ?? "No messages",
+                subtitle: vm.embedding?.emptyConversationSubtitle ?? "Start a new agent run."
+            ) {
+                if let accountPanel {
+                    accountPanel.frame(maxWidth: 420)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
+        }
+    }
+
+    private var sideChatEmptyConversation: some View {
+        VStack(spacing: DS.Space.lg) {
+            Image(systemName: "plus.circle")
+                .font(.system(size: 44, weight: .regular))
+                .foregroundColor(DS.Palette.textTertiary)
+                .frame(width: 72, height: 72)
+                .background(DS.Palette.surfaceRaised)
+                .clipShape(Circle())
+                .overlay(Circle().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+            VStack(spacing: DS.Space.sm) {
+                Text("Side chat")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(1)
+                Text("Side chats are temporary and disappear when you close the app.")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
             }
         }
         .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
+    }
+
+    /// Parent thread running/idle indicator for a side chat.
+    @ViewBuilder
+    private var sideChatParentStatusStrip: some View {
+        if let parentId = vm.selectedThreadParentId {
+            let running = vm.isThreadStartingOrRunning(parentId)
+            HStack(spacing: DS.Space.xs) {
+                Circle()
+                    .fill(running ? DS.Palette.warning : DS.Palette.textTertiary)
+                    .frame(width: 6, height: 6)
+                Text(running ? "Parent thread running" : "Parent thread idle")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
+            }
+            .accessibilityIdentifier("agent.sideChat.parentStatus")
+        }
     }
 
     @ViewBuilder
@@ -16786,6 +16939,8 @@ public struct AgentAppView: View {
                         text: parsed.body,
                         roleIdentifier: "agent.role.assistant",
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
+                        branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
+                        onBranch: { vm.onForkInNewChat?(msg.id.value.uuidString) },
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
                                 AgentChatPeerIdentityHeader(
@@ -16808,7 +16963,9 @@ public struct AgentAppView: View {
                     AgentChatAssistantReply(
                         text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
                         roleIdentifier: "agent.role.assistant",
-                        copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)"
+                        copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
+                        branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
+                        onBranch: { vm.onForkInNewChat?(msg.id.value.uuidString) }
                     )
                 }
             }
@@ -16988,6 +17145,8 @@ public struct AgentAppView: View {
             text: BackgroundAwaitContinuation.strippingAwaitingMarker(final),
             roleIdentifier: "agent.role.assistant",
             copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
+            branchIdentifier: "agent.assistantMessage.branch.\(turn.turnId)",
+            onBranch: { vm.onForkInNewChat?(turn.turnId) },
             content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
         )
     }
@@ -19884,11 +20043,11 @@ public final class AgentAppSurface: NSObject, Surface {
     /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
     public var onClose: (() -> Void)?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(), accountPanel: AnyView? = nil) {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, sideThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(), accountPanel: AnyView? = nil) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
-        if let initialThreadId { metadata["selected_thread"] = initialThreadId.value.uuidString }
+        if let binding = sideThreadId ?? initialThreadId { metadata["selected_thread"] = binding.value.uuidString }
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared, orchestrationRuntime: orchestrationRuntime)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, sideThreadId: sideThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared, orchestrationRuntime: orchestrationRuntime)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel, accountPanel: accountPanel))
         host.sizingOptions = []
         host.translatesAutoresizingMaskIntoConstraints = false

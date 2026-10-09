@@ -5139,6 +5139,84 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertFalse(vm.messages.contains { $0.content.contains("Unknown command") })
     }
 
+    // MARK: Side chat / btw / branch (feat/side-chat)
+
+    func test_localSlashCommands_includeSideAndBtw() {
+        let local = AgentAppViewModel.localSlashCommands
+        XCTAssertTrue(local.contains("/side"), "/side must be a local command")
+        XCTAssertTrue(local.contains("/btw"), "/btw must be a local command")
+    }
+
+    func test_slashSide_invokesHostSideChatRequestWithInlineText() throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .codex
+        vm.providerSnapshots = [crashSafeForkSnapshot()]
+        vm.createThread(title: "source")
+        var requested: String?
+        vm.onRequestSideChat = { requested = $0 }
+        XCTAssertTrue(vm.handleSlashCommand("/side hello side"))
+        XCTAssertEqual(requested, "hello side",
+                       "/side must hand the inline text to the host (which creates the ephemeral thread)")
+    }
+
+    func test_slashSide_refusedInsideSideChat() throws {
+        let (vm, threadRepo) = try makeVM()
+        vm.provider = .codex
+        vm.providerSnapshots = [crashSafeForkSnapshot()]
+        vm.createThread(title: "source")
+        let parentId = try XCTUnwrap(vm.selectedThreadId)
+        let side = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "Side · source",
+            provider: .codex,
+            model: "gpt-5.5",
+            parentThreadId: parentId,
+            isEphemeral: true
+        )
+        try threadRepo.upsert(side)
+        vm.selectThread(side.id)
+        XCTAssertTrue(vm.selectedThreadIsEphemeral)
+        var requested = false
+        vm.onRequestSideChat = { _ in requested = true }
+        XCTAssertTrue(vm.handleSlashCommand("/side"))
+        XCTAssertFalse(requested, "/side inside a side chat must not fork another side thread")
+        XCTAssertTrue(vm.messages.last?.content.contains("already in a side chat") ?? false)
+    }
+
+    func test_slashBtw_handsQuestionToHostAndRefusesEmpty() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "t")
+        var requested: String?
+        vm.onRequestBtw = { requested = $0 }
+        XCTAssertTrue(vm.handleSlashCommand("/btw what changed?"))
+        XCTAssertEqual(requested, "what changed?")
+        requested = nil
+        XCTAssertTrue(vm.handleSlashCommand("/btw"))
+        XCTAssertNil(requested, "empty /btw must not reach the host")
+        XCTAssertTrue(vm.messages.last?.content.contains("/btw") ?? false)
+    }
+
+    func test_appendBtwNote_appendsNonPersistedSystemMessage() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "t")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        vm.appendBtwNote(question: "q", answer: "a")
+        XCTAssertEqual(vm.messages.last?.role, .system)
+        XCTAssertTrue(vm.messages.last?.content.contains("BTW · q") ?? false)
+        let persisted = (try? vm.messageRepo.list(threadId: tid)) ?? []
+        XCTAssertFalse(persisted.contains { $0.content.contains("BTW · q") },
+                       "a /btw answer must stay in memory only")
+    }
+
+    func test_slashFork_prefersRouterCallbackWhenWired() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "t")
+        var branched = false
+        vm.onForkInNewChat = { _ in branched = true }
+        XCTAssertTrue(vm.handleSlashCommand("/fork"))
+        XCTAssertTrue(branched, "a wired /fork must route through the host's forkAgentThread callback")
+    }
+
     // MARK: B4 — read/unread, active count, provider-model coherence
 
     /// Async wait — `Task.sleep` yields the main-actor executor so the
@@ -5822,6 +5900,31 @@ final class AgentAppViewModelTests: XCTestCase {
             "only an unopened tab is released to idle"
         )
         XCTAssertLessThan(open.lowerBound, release.lowerBound)
+    }
+
+    func test_emptyConversationKeepsSideChatAndEmbeddingCopy_becauseTwoChangesMeetInThisView() throws {
+        // WHY: a side chat shows its own empty state, and every other thread
+        // shows the shared DSEmptyState with the embedding's copy (a Bot desk
+        // says "Message <bot>"). Losing the first hides what a side chat is;
+        // losing the second puts "Start a new agent run." on a Bot desk.
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private var emptyConversation: some View {"))
+        let end = try XCTUnwrap(source.range(
+            of: "private var sideChatEmptyConversation: some View {",
+            range: start.upperBound..<source.endIndex
+        ))
+        let view = String(source[start.lowerBound..<end.lowerBound])
+        let sideChat = try XCTUnwrap(view.range(of: "if vm.selectedThreadIsEphemeral {"))
+        let shared = try XCTUnwrap(view.range(of: "DSEmptyState("))
+        XCTAssertLessThan(sideChat.lowerBound, shared.lowerBound, "a side chat is asked first")
+        XCTAssertTrue(view.contains("sideChatEmptyConversation"))
+        XCTAssertTrue(view.contains("title: vm.embedding?.emptyConversationTitle ?? \"No messages\""))
+        XCTAssertTrue(view.contains("subtitle: vm.embedding?.emptyConversationSubtitle ?? \"Start a new agent run.\""))
     }
 
     func test_truncatedBranchKeepsATooltipAndEarlierHistoryRevealIsReadable_becauseBothAreInformationNotDecoration() throws {
