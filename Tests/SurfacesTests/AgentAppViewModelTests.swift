@@ -5925,6 +5925,44 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(view.contains("sideChatEmptyConversation"))
         XCTAssertTrue(view.contains("title: vm.embedding?.emptyConversationTitle ?? \"No messages\""))
         XCTAssertTrue(view.contains("subtitle: vm.embedding?.emptyConversationSubtitle ?? \"Start a new agent run.\""))
+        // WHY: the side chat subtitle is the only place that says a side chat
+        // is temporary. Hand-drawn it was textTertiary (4.06:1 on bg, see
+        // DSContrastTests); the shared component keeps it at textSecondary.
+        let stripStart = try XCTUnwrap(source.range(
+            of: "private var sideChatParentStatusStrip: some View {",
+            range: end.upperBound..<source.endIndex
+        ))
+        let sideChatBody = String(source[end.lowerBound..<stripStart.lowerBound])
+        XCTAssertTrue(sideChatBody.contains("DSEmptyState("))
+        XCTAssertTrue(sideChatBody.contains("Side chats are temporary and disappear when you close the app."))
+        XCTAssertFalse(sideChatBody.contains("textTertiary"))
+        // "Parent thread running / idle" is status the owner reads, not decoration.
+        let statusStart = try XCTUnwrap(source.range(
+            of: "Text(running ? \"Parent thread running\" : \"Parent thread idle\")",
+            range: stripStart.upperBound..<source.endIndex
+        ))
+        let statusEnd = try XCTUnwrap(source.range(
+            of: "Spacer(minLength: 0)",
+            range: statusStart.upperBound..<source.endIndex
+        ))
+        let status = String(source[statusStart.lowerBound..<statusEnd.lowerBound])
+        XCTAssertTrue(status.contains(".foregroundColor(DS.Palette.textSecondary)"))
+        XCTAssertFalse(status.contains("textTertiary"))
+    }
+
+    func test_branchInNewChatIsOfferedOnlyOutsideAnEmbeddedChat_becauseOnlyTheAgentAppHostCanOpenTheBranch() throws {
+        // WHY: the reply draws "Branch in new chat" whenever onBranch is not
+        // nil. Only Agent App tabs get onForkInNewChat from the router; a Bot
+        // desk or group room embeds this view without it, so an always
+        // present closure drew a button that did nothing on every reply.
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertEqual(source.components(separatedBy: "onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(").count - 1, 3)
+        XCTAssertFalse(source.contains("onBranch: {"), "an unconditional closure shows the button on a Bot desk")
     }
 
     func test_truncatedBranchKeepsATooltipAndEarlierHistoryRevealIsReadable_becauseBothAreInformationNotDecoration() throws {

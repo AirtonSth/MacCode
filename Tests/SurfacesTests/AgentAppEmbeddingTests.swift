@@ -164,6 +164,48 @@ final class AgentAppEmbeddingTests: XCTestCase {
         XCTAssertEqual(started, 0)
         XCTAssertTrue(h.vm.statusMessage.contains("Failed to start"))
     }
+
+    /// WHY: only Agent App tabs get the side chat and /btw hosts from the router.
+    /// A Bot desk has neither, and send() clears the composer before the command
+    /// runs, so without a note the typed question vanished with no answer.
+    func test_sideAndBtwOnAnEmbeddedChatLeaveANoteBecauseNoHostCanAnswerThem() async throws {
+        let h = try makeHarness(threadWorkspace: nil) { AgentAppEmbedding(pinnedThreadId: $0) }
+        h.vm.providerSnapshots = [
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .codex,
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                capabilitiesOverride: AgentProviderCapabilities(
+                    supportsAttachments: true,
+                    supportedAttachmentKinds: [.file, .image],
+                    supportedAttachmentMediaTypes: ["*/*"],
+                    supportsApprovals: true,
+                    supportsUserInput: true,
+                    supportsStreaming: true,
+                    supportsFork: true,
+                    supportsRollback: true,
+                    supportsPlanReview: true
+                )
+            )
+        ]
+        h.vm.selectThread(h.thread.id)
+        await h.vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertNil(h.vm.onRequestBtw, "an embedded chat is not wired to a /btw host")
+        XCTAssertNil(h.vm.onRequestSideChat, "an embedded chat is not wired to a side chat host")
+
+        h.vm.prompt = "/btw what changed?"
+        await h.vm.send()
+        XCTAssertEqual(h.vm.messages.last?.role, .system)
+        XCTAssertEqual(h.vm.messages.last?.content, "/btw is not available in this chat.")
+
+        h.vm.prompt = "/side compare both"
+        await h.vm.send()
+        XCTAssertEqual(h.vm.messages.last?.role, .system)
+        XCTAssertEqual(h.vm.messages.last?.content, "/side is not available in this chat.")
+
+        XCTAssertTrue(h.runner.requests.isEmpty, "a local command must not start a provider run")
+    }
 }
 
 private final class EmbeddingCapturingRunner: AgentProviderRunner, @unchecked Sendable {

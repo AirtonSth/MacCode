@@ -8092,7 +8092,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             systemNote(threadForkUnavailableReason ?? "Provider-side fork is unavailable for this session.")
             return
         }
-        onRequestSideChat?(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        // An embedded chat (Bot desk) has no host for a side pane: say so
+        // instead of swallowing the typed command.
+        guard let onRequestSideChat else {
+            systemNote("/side is not available in this chat.")
+            return
+        }
+        onRequestSideChat(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// Sends the `/side` inline text as the side chat's first message once the
@@ -8113,7 +8119,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             systemNote("/btw — usage: /btw <question>")
             return
         }
-        onRequestBtw?(q)
+        guard let onRequestBtw else {
+            systemNote("/btw is not available in this chat.")
+            return
+        }
+        onRequestBtw(q)
     }
 
     /// `/btw` answer as a non-persisted inline transcript note.
@@ -16686,26 +16696,11 @@ public struct AgentAppView: View {
     }
 
     private var sideChatEmptyConversation: some View {
-        VStack(spacing: DS.Space.lg) {
-            Image(systemName: "plus.circle")
-                .font(.system(size: 44, weight: .regular))
-                .foregroundColor(DS.Palette.textTertiary)
-                .frame(width: 72, height: 72)
-                .background(DS.Palette.surfaceRaised)
-                .clipShape(Circle())
-                .overlay(Circle().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-            VStack(spacing: DS.Space.sm) {
-                Text("Side chat")
-                    .font(.system(size: 28, weight: .semibold))
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .lineLimit(1)
-                Text("Side chats are temporary and disappear when you close the app.")
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-            }
-        }
+        DSEmptyState(
+            icon: "plus.circle",
+            title: "Side chat",
+            subtitle: "Side chats are temporary and disappear when you close the app."
+        )
         .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
     }
 
@@ -16720,7 +16715,7 @@ public struct AgentAppView: View {
                     .frame(width: 6, height: 6)
                 Text(running ? "Parent thread running" : "Parent thread idle")
                     .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
+                    .foregroundColor(DS.Palette.textSecondary)
                 Spacer(minLength: 0)
             }
             .accessibilityIdentifier("agent.sideChat.parentStatus")
@@ -16940,7 +16935,7 @@ public struct AgentAppView: View {
                         roleIdentifier: "agent.role.assistant",
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
-                        onBranch: { vm.onForkInNewChat?(msg.id.value.uuidString) },
+                        onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
                                 AgentChatPeerIdentityHeader(
@@ -16965,7 +16960,7 @@ public struct AgentAppView: View {
                         roleIdentifier: "agent.role.assistant",
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
-                        onBranch: { vm.onForkInNewChat?(msg.id.value.uuidString) }
+                        onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil
                     )
                 }
             }
@@ -17146,7 +17141,7 @@ public struct AgentAppView: View {
             roleIdentifier: "agent.role.assistant",
             copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
             branchIdentifier: "agent.assistantMessage.branch.\(turn.turnId)",
-            onBranch: { vm.onForkInNewChat?(turn.turnId) },
+            onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(turn.turnId) } : nil,
             content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
         )
     }
