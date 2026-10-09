@@ -1003,6 +1003,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         sequenceOmissionsCapability,
         ConnectionSnapshotThreadWindow.capability,
         DurableReplayContract.capability,
+        ConnectionClientFeatures.resumeHead,
     ]
 
     /// Every WS filter (including the default `.full`) may skip sequences:
@@ -2854,6 +2855,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     ? plan.metadata.oldestReplaySequence
                     : min(plan.since + 1, plan.head)
             }()
+            // F7: only a durable socket that asked, with this boot's cursor
+            // accepted as sent, is told the head it was subscribed at.
+            let welcomeHeadSequence = DurableReplayContract.welcomeHeadSequence(
+                requested: ConnectionClientFeatures.requestsResumeHead(
+                    header: headers[ConnectionClientFeatures.header]
+                ),
+                plan: durableSubscription?.plan,
+                needsBaseline: durableNeedsBaseline,
+                requestedSinceSequence: requestedSinceSequence,
+                cursorBootProven: durableEventLog,
+                previousBoot: durablePreviousBoot
+            )
             let sequenceWatermark = ConnectionSequenceWatermark(initialSequence: wsSinceSeq)
             // C-W: only a client that asks gets the extra welcome fields.
             let welcomeIdentityRequested = ConnectionWelcomeIdentity.isRequested(
@@ -2896,6 +2909,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 replayFromSequence: durableSubscription.map { subscription in
                     durableNeedsBaseline ? subscription.plan.head : subscription.plan.since
                 },
+                headSequence: welcomeHeadSequence,
                 tailcatEndpointDigest: welcomeTailcatEndpointDigest
             ))
             activeWebSocketConnections.insert(

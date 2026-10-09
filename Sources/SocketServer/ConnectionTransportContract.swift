@@ -312,6 +312,11 @@ struct ConnectionWelcomeFrame: Codable, Equatable, Sendable {
     var capabilitiesDigest: String? = nil
     /// C8: present only on durable-replay sockets (see `DurableReplayContract`).
     var replayFromSequence: Int64? = nil
+    /// F7: the bus head read in the lock hold that subscribed this socket.
+    /// Present only on a durable-replay socket that listed `resume.head.v1`
+    /// and whose cursor this boot accepted as sent (see
+    /// `DurableReplayContract.welcomeHeadSequence`). Omitted, never null.
+    var headSequence: Int64? = nil
     /// F5: present only on a socket that listed `tailcat.rotation_notice.v1`
     /// while a Tailcat host is published. Omitted, never null.
     var tailcatEndpointDigest: String? = nil
@@ -353,12 +358,23 @@ enum ConnectionClientFeatures {
     static let tailcatRotationNotice = "tailcat.rotation_notice.v1"
     static let welcomeKey = "tailcatEndpointDigest"
     static let rotatingFrameType = "host.tailcat.rotating"
+    /// F7: capability name in the welcome and opt-in token in this header.
+    static let resumeHead = "resume.head.v1"
+    static let headSequenceWelcomeKey = "headSequence"
 
     /// True when the comma-separated header lists `tailcat.rotation_notice.v1`.
     static func requestsTailcatRotationNotice(header value: String?) -> Bool {
         guard let value else { return false }
         return value.split(separator: ",").contains {
             $0.trimmingCharacters(in: .whitespaces).lowercased() == tailcatRotationNotice
+        }
+    }
+
+    /// True when the comma-separated header lists `resume.head.v1`.
+    static func requestsResumeHead(header value: String?) -> Bool {
+        guard let value else { return false }
+        return value.split(separator: ",").contains {
+            $0.trimmingCharacters(in: .whitespaces).lowercased() == resumeHead
         }
     }
 
@@ -655,6 +671,9 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             if object[ConnectionClientFeatures.welcomeKey] != nil {
                 allowedKeys.insert(ConnectionClientFeatures.welcomeKey)
             }
+            if object[ConnectionClientFeatures.headSequenceWelcomeKey] != nil {
+                allowedKeys.insert(ConnectionClientFeatures.headSequenceWelcomeKey)
+            }
         case "heartbeat":
             allowedKeys = [
                 "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
@@ -799,6 +818,8 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 "currentSequence", "oldestReplaySequence",
             ] + (object[DurableReplayContract.welcomeKey] != nil
                 ? [DurableReplayContract.welcomeKey] : [])
+            + (object[ConnectionClientFeatures.headSequenceWelcomeKey] != nil
+                ? [ConnectionClientFeatures.headSequenceWelcomeKey] : [])
         case "heartbeat":
             requiredKeys = ["bootEpoch", "sentAtEpochMs", "lastReceivedSequence"]
         case "closing":
@@ -870,6 +891,14 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         if let replayFrom = frame.replayFromSequence,
            !(0...frame.currentSequence).contains(replayFrom) {
             throw ConnectionProtocolFailure.invalidFrame
+        }
+        // F7: the head is the sequence this welcome is anchored on, and only
+        // a durable socket with a real cursor is told it.
+        if let head = frame.headSequence {
+            guard head == frame.currentSequence,
+                  let replayFrom = frame.replayFromSequence, replayFrom > 0 else {
+                throw ConnectionProtocolFailure.invalidFrame
+            }
         }
         // C-W: the identity extension is all-or-nothing.
         switch (frame.apiVersion, frame.capabilitiesDigest) {
