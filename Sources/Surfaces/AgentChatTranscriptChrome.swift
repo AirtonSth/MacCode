@@ -375,17 +375,23 @@ public struct AgentChatAssistantReply: View, Equatable {
     public let text: String
     public var roleIdentifier: String = "bots.desk.role.assistant"
     public var copyIdentifier: String? = nil
+    public var branchIdentifier: String? = nil
+    public var onBranch: (() -> Void)? = nil
     public var content: AnyView? = nil
 
     public init(
         text: String,
         roleIdentifier: String = "bots.desk.role.assistant",
         copyIdentifier: String? = nil,
+        branchIdentifier: String? = nil,
+        onBranch: (() -> Void)? = nil,
         content: AnyView? = nil
     ) {
         self.text = text
         self.roleIdentifier = roleIdentifier
         self.copyIdentifier = copyIdentifier
+        self.branchIdentifier = branchIdentifier
+        self.onBranch = onBranch
         self.content = content
     }
 
@@ -414,6 +420,19 @@ public struct AgentChatAssistantReply: View, Equatable {
                 .accessibilityLabel("Copy message")
                 .accessibilityIdentifier(copyIdentifier ?? "agent.assistantMessage.copy")
                 .help("Copy message")
+                if let onBranch {
+                    Button(action: onBranch) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .font(.system(size: 11, weight: .regular))
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityLabel("Branch in new chat")
+                    .accessibilityIdentifier(branchIdentifier ?? "agent.assistantMessage.branch")
+                    .help("Branch in new chat")
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -424,6 +443,8 @@ public struct AgentChatAssistantReply: View, Equatable {
         lhs.text == rhs.text
             && lhs.roleIdentifier == rhs.roleIdentifier
             && lhs.copyIdentifier == rhs.copyIdentifier
+            && lhs.branchIdentifier == rhs.branchIdentifier
+            && (lhs.onBranch != nil) == (rhs.onBranch != nil)
             && (lhs.content != nil) == (rhs.content != nil)
     }
 }

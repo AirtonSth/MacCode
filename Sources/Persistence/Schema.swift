@@ -52,7 +52,9 @@ public enum Schema {
     private static let threadGuestRuntimeSchemaVersion = 87
     static let botTeamsGroupsSchemaVersion = 88
     static let botConversationRoutingSchemaVersion = 89
-    public static let currentVersion: Int = botConversationRoutingSchemaVersion
+    /// v90 adds agent_threads.parent_thread_id / is_ephemeral for forked and side threads.
+    static let threadForkColumnsSchemaVersion = 90
+    public static let currentVersion: Int = threadForkColumnsSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1805,7 +1807,31 @@ public enum Schema {
         """),
         SchemaStep(botTeamsGroupsSchemaVersion, botTeamsGroupsMigrationSQL),
         SchemaStep(botConversationRoutingSchemaVersion, botConversationRoutingMigrationSQL),
+        SchemaStep(threadForkColumnsSchemaVersion, """
+        ALTER TABLE agent_threads ADD COLUMN parent_thread_id TEXT;
+        ALTER TABLE agent_threads ADD COLUMN is_ephemeral INTEGER NOT NULL DEFAULT 0;
+        """),
     ]
+
+    /// Fork/side columns are added only when missing so a database that already
+    /// recorded v90 (or a partial prior run) does not fail the ALTER.
+    private static func addMissingThreadForkColumns(_ db: SQLiteDB) throws {
+        let existingColumns: Set<String> = try {
+            let statement = try db.prepare("PRAGMA table_info(agent_threads);")
+            defer { statement.reset() }
+            var names = Set<String>()
+            while try statement.step() {
+                if let name = statement.columnText(1) { names.insert(name) }
+            }
+            return names
+        }()
+        if !existingColumns.contains("parent_thread_id") {
+            try db.execute("ALTER TABLE agent_threads ADD COLUMN parent_thread_id TEXT;")
+        }
+        if !existingColumns.contains("is_ephemeral") {
+            try db.execute("ALTER TABLE agent_threads ADD COLUMN is_ephemeral INTEGER NOT NULL DEFAULT 0;")
+        }
+    }
 
     /// Additive and idempotent. One row per desk conversation holds the
     /// encoded Bot desk route (Main/Worker model, efforts, permission, run-as
@@ -2034,6 +2060,8 @@ public enum Schema {
                 } else if step.version == Self.botTeamsGroupsSchemaVersion {
                     try Self.addMissingBotConversationGroupColumn(db)
                     try db.execute(step.sql)
+                } else if step.version == Self.threadForkColumnsSchemaVersion {
+                    try Self.addMissingThreadForkColumns(db)
                 } else {
                     try db.execute(step.sql)
                 }

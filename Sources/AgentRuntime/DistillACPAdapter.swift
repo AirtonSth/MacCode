@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import CryptoKit
 import os
 
 private let distillAcpLog = Logger(subsystem: "io.remotecode.agent", category: "distill.acp")
@@ -135,6 +136,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         let threadId: AgentThreadID
         let providerThreadId: String
         let client: DistillACPClient
+        /// Working directory the session was opened with; a provider fork needs it as the source cwd.
+        let cwd: String
         /// In-guest run: the session lives for one turn, then the run finishes.
         let guestPlan: DistillGuestLaunchPlan?
         let capabilities: DistillACPInitializeResult
@@ -205,6 +208,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             threadId: AgentThreadID,
             providerThreadId: String,
             client: DistillACPClient,
+            cwd: String,
             guestPlan: DistillGuestLaunchPlan? = nil,
             capabilities: DistillACPInitializeResult,
             mapper: DistillACPEventMapper,
@@ -228,6 +232,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             self.threadId = threadId
             self.providerThreadId = providerThreadId
             self.client = client
+            self.cwd = cwd
             self.guestPlan = guestPlan
             self.capabilities = capabilities
             self.mapper = mapper
@@ -953,6 +958,82 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         throw AgentProviderAdapterError.unsupported("Distill ACP 0.2.101 does not negotiate rollback")
     }
 
+    /// Provider fork is keyed-idempotent: the child session id is UUIDv5(idempotencyKey), so a
+    /// retried fork converges on the same child, and `compensateFork` deletes it.
+    public var forkSafety: AgentProviderForkSafety { .keyedIdempotent(compensationSupported: true) }
+
+    public func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety { .keyedIdempotent(compensationSupported: true) }
+
+    /// Namespace for deterministic fork child session ids. Fixed so the same idempotency key
+    /// always maps to the same Distill session id.
+    static let forkChildNamespace = UUID(uuidString: "8f2a6c1e-4b3d-5a7f-9c0e-2d1b4a6f8c3e")!
+
+    /// UUIDv5(namespace, name): SHA-1 based, deterministic.
+    static func deterministicForkChildId(namespace: UUID = forkChildNamespace, idempotencyKey: String) -> String {
+        var bytes = withUnsafeBytes(of: namespace.uuid) { Array($0) }
+        bytes.append(contentsOf: Array(idempotencyKey.utf8))
+        var digest = Array(Insecure.SHA1.hash(data: Data(bytes)))
+        digest[6] = (digest[6] & 0x0f) | 0x50 // version 5
+        digest[8] = (digest[8] & 0x3f) | 0x80 // RFC 4122 variant
+        let uuid = uuid_t(
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5], digest[6], digest[7],
+            digest[8], digest[9], digest[10], digest[11],
+            digest[12], digest[13], digest[14], digest[15]
+        )
+        return UUID(uuid: uuid).uuidString.lowercased()
+    }
+
+    /// Forks the source thread's live Distill session into the request's deterministic child id.
+    public func forkThread(_ request: AgentProviderForkRequest) async throws -> String {
+        guard !isGuestThread(request.sourceThreadId) else {
+            throw AgentProviderAdapterError.unsupported("Distill guest threads cannot fork a provider session")
+        }
+        guard let source = synchronized({ sessions[request.sourceThreadId] }) else {
+            throw AgentProviderAdapterError.unsupported("Distill ACP fork requires the source session to be live")
+        }
+        let childId = Self.deterministicForkChildId(idempotencyKey: request.idempotencyKey)
+        guard childId != source.providerThreadId else {
+            throw AgentProviderAdapterError.unsupported("provider-native fork did not return a distinct child session")
+        }
+        let newCwd = request.workingDirectory.flatMap { $0.isEmpty ? nil : $0 } ?? source.cwd
+        return try await source.client.forkSession(
+            sourceSessionId: source.providerThreadId,
+            sourceCwd: source.cwd,
+            newCwd: newCwd,
+            newSessionId: childId,
+            kind: "fork"
+        )
+    }
+
+    /// Deletes the provider child session. Uses the live client when the source or child is
+    /// resident; otherwise opens a short-lived Distill process, since `x.ai/session/delete`
+    /// does not need the session to be resident.
+    public func compensateFork(_ request: AgentProviderForkRequest, providerChildThreadId: String) async throws {
+        let cwd = request.workingDirectory.flatMap { $0.isEmpty ? nil : $0 } ?? discoveryCwd
+        if let client = synchronized({
+            sessions[request.childThreadId]?.client ?? sessions[request.sourceThreadId]?.client
+        }) {
+            try await client.deleteSession(sessionId: providerChildThreadId, cwd: cwd)
+            return
+        }
+        let client = try DistillACPClient(
+            binary: binaryNameOverride ?? DistillProvisioner.binaryName,
+            cwd: cwd
+        )
+        defer { client.stop() }
+        _ = try await client.initialize()
+        try await client.deleteSession(sessionId: providerChildThreadId, cwd: cwd)
+    }
+
+    /// Side question against the thread's live Distill session; never interrupts the active turn.
+    public func btw(threadId: AgentThreadID, question: String) async throws -> String {
+        guard let session = synchronized({ sessions[threadId] }) else {
+            throw AgentProviderAdapterError.unsupported("Distill ACP side question requires a live session")
+        }
+        return try await session.client.btw(sessionId: session.providerThreadId, question: question)
+    }
+
     public func stopAll() {
         lock.lock()
         let all = Array(sessions.values)
@@ -1128,6 +1209,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 threadId: request.threadId,
                 providerThreadId: opened.sessionId,
                 client: client,
+                cwd: request.cwd,
                 guestPlan: guestPlan,
                 capabilities: capabilities,
                 mapper: mapper,

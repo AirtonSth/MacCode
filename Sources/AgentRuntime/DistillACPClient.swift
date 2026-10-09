@@ -1083,6 +1083,67 @@ public final class DistillACPClient: @unchecked Sendable {
         let isAutomatic: Bool
     }
 
+    /// Distill extension that forks a saved session into a new session id.
+    static let sessionForkMethod = "x.ai/session/fork"
+    /// Distill extension that deletes a session (used to compensate a fork).
+    static let sessionDeleteMethod = "x.ai/session/delete"
+    /// Distill extension that answers a side question without interrupting the turn.
+    static let btwMethod = "x.ai/btw"
+
+    /// Forks `sourceSessionId` into `newSessionId`. `kind` is `"fork"` or `"side"`.
+    /// Passing an existing `newSessionId` is what makes a retried fork converge.
+    func forkSession(
+        sourceSessionId: String,
+        sourceCwd: String,
+        newCwd: String,
+        newSessionId: String,
+        kind: String = "fork",
+        targetPromptIndex: Int? = nil
+    ) async throws -> String {
+        var params: JSONObject = [
+            "sourceSessionId": sourceSessionId,
+            "sourceCwd": sourceCwd,
+            "newCwd": newCwd,
+            "newSessionId": newSessionId,
+            "sessionKind": kind
+        ]
+        if let targetPromptIndex { params["targetPromptIndex"] = targetPromptIndex }
+        let response = try await requestJSONObject(
+            method: Self.sessionForkMethod,
+            params: params,
+            timeout: 30
+        )
+        guard let newId = (response["newSessionId"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !newId.isEmpty else {
+            throw DistillACPError.unsupported("Distill x.ai/session/fork omitted newSessionId")
+        }
+        return newId
+    }
+
+    /// Deletes a session. Distill treats deleting a missing session as success, so this is idempotent.
+    func deleteSession(sessionId: String, cwd: String?) async throws {
+        var params: JSONObject = ["sessionId": sessionId]
+        if let cwd, !cwd.isEmpty { params["cwd"] = cwd }
+        _ = try await requestJSONObject(
+            method: Self.sessionDeleteMethod,
+            params: params,
+            timeout: 30
+        )
+    }
+
+    /// Side question against a live session; returns the answer without touching the active turn.
+    func btw(sessionId: String, question: String) async throws -> String {
+        let response = try await requestJSONObject(
+            method: Self.btwMethod,
+            params: ["sessionId": sessionId, "question": question],
+            timeout: 180
+        )
+        guard let answer = response["answer"] as? String else {
+            throw DistillACPError.responseTypeMismatch(Self.btwMethod)
+        }
+        return answer
+    }
+
     /// Distill extension method that toggles this session's Ultracode orchestration mode.
     static let ultracodeSetMethod = "_x.ai/session/ultracode/set"
     /// Sets Ultracode on or off; returns the state Distill confirmed.
