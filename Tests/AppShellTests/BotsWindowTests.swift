@@ -16562,7 +16562,7 @@ final class BotsWindowTests: XCTestCase {
             "mode switcher track must be a translucent hover wash so sidebar glass shows through"
         )
         XCTAssertTrue(
-            switcher.contains("selected ? Color.white.opacity(0.12) : Color.clear"),
+            switcher.contains("selected ? DS.Palette.pressed : Color.clear"),
             "selected segment must be a frost wash, not a solid raised surface"
         )
         XCTAssertTrue(

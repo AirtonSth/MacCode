@@ -135,4 +135,31 @@ final class DSContrastTests: XCTestCase {
         )
         XCTAssertFalse(timestamp.contains("textTertiary"), "4.06:1 on the transcript background")
     }
+
+    func test_emptyStateSubtitleUsesTextSecondary_becauseItCarriesInstructions() throws {
+        // WHY: the empty-state subtitle is the instruction for the screen
+        // ("@mention a bot to choose who answers."), printed at 12pt on bg.
+        // textTertiary there is 4.06:1; textSecondary is the dimmest tier
+        // allowed for text the owner has to read.
+        XCTAssertGreaterThanOrEqual(
+            try contrastRatio(DS.Palette.textSecondary, on: DS.Palette.bg),
+            4.5,
+            "textSecondary must stay readable on the window background"
+        )
+        XCTAssertLessThan(
+            try contrastRatio(DS.Palette.textTertiary, on: DS.Palette.bg),
+            4.5,
+            "textTertiary on bg is 4.06:1, below 4.5:1"
+        )
+        let subtitle = try chatSource(
+            "Sources/DesignSystemKit/Components.swift",
+            from: "Text(subtitle)",
+            to: ".multilineTextAlignment(.center)"
+        )
+        XCTAssertTrue(
+            subtitle.contains(".foregroundColor(DS.Palette.textSecondary)"),
+            "DSEmptyState subtitle must use textSecondary"
+        )
+        XCTAssertFalse(subtitle.contains("textTertiary"), "4.06:1 at 12pt on bg")
+    }
 }

@@ -12469,6 +12469,19 @@ public struct AgentAppViewLayout: Equatable {
     public static let standard = AgentAppViewLayout()
 }
 
+/// Where the undo toasts mount (pure, testable seam). One toast fits in the
+/// transcript's top padding, so it floats over it. Two would cover the first
+/// row, and each carries a live Undo, so the checkpoint toast takes a row
+/// above the transcript while both are armed.
+public enum AgentUndoToastPlacement {
+    public static func checkpointRevertTakesARow(
+        threadDeletionArmed: Bool,
+        checkpointRevertArmed: Bool
+    ) -> Bool {
+        threadDeletionArmed && checkpointRevertArmed
+    }
+}
+
 public struct AgentAppView: View {
     struct QueueStatusBannerPresentation: Equatable {
         let message: String
@@ -12502,6 +12515,8 @@ public struct AgentAppView: View {
     @ObservedObject var vm: AgentAppViewModel
     private let accountPanel: AnyView?
     private let layout: AgentAppViewLayout
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var announcedUndoToasts: Set<Date> = []
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
     @State private var expandedTools: Set<String> = []
@@ -15147,10 +15162,10 @@ public struct AgentAppView: View {
             if vm.permissionMode == .fullAccess {
                 fullAccessBanner
             }
-            if let undo = vm.pendingThreadDeletionUndo {
-                threadDeletionUndoBanner(undo)
-            }
-            if let crToast = vm.pendingCheckpointRevertUndo {
+            if AgentUndoToastPlacement.checkpointRevertTakesARow(
+                threadDeletionArmed: vm.pendingThreadDeletionUndo != nil,
+                checkpointRevertArmed: vm.pendingCheckpointRevertUndo != nil
+            ), let crToast = vm.pendingCheckpointRevertUndo {
                 checkpointRevertUndoBanner(crToast)
             }
             // Stream paint: observe transcriptState only so token/tool ticks do
@@ -15164,6 +15179,16 @@ public struct AgentAppView: View {
                             .background(DS.Palette.bg)
                     }
                     timeline
+                        // An undo toast floats over the top of the transcript. As
+                        // a row above it, it pushed every message down, then
+                        // let it jump back when the undo window closed.
+                        .overlay(alignment: .top) {
+                            if let undo = vm.pendingThreadDeletionUndo {
+                                threadDeletionUndoBanner(undo)
+                            } else if let crToast = vm.pendingCheckpointRevertUndo {
+                                checkpointRevertUndoBanner(crToast)
+                            }
+                        }
                 }
             }
             backgroundAwaitBanner
@@ -15303,11 +15328,11 @@ public struct AgentAppView: View {
     @ViewBuilder
     private var botScreenControls: some View {
         if vm.botScreenBotID != nil {
-            Button("Ver tela") { vm.viewBotScreen() }
+            Button("View bot screen") { vm.viewBotScreen() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .accessibilityIdentifier("agent.botScreen.view")
-            Button(vm.botScreenControlled ? "Devolver" : "Assumir controle") {
+            Button(vm.botScreenControlled ? "Release" : "Take control") {
                 Task { await vm.toggleBotScreenControl() }
             }
             .buttonStyle(.bordered)
@@ -15346,11 +15371,12 @@ public struct AgentAppView: View {
     // UX-XPLAT-DELETE-UNDO: transient toast offering to restore a just-deleted
     // thread. The delete already happened; Undo re-inserts the snapshot.
     private func threadDeletionUndoBanner(_ undo: AgentAppViewModel.ThreadDeletionUndo) -> some View {
-        HStack(spacing: DS.Space.sm) {
+        let message = undo.count > 1 ? "\(undo.count.formatted()) threads deleted" : "Thread deleted"
+        return HStack(spacing: DS.Space.sm) {
             Image(systemName: "trash")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(DS.Palette.textSecondary)
-            Text(undo.count > 1 ? "\(undo.count) threads deleted" : "Thread deleted")
+            Text(message)
                 .font(DS.Font.caption.weight(.semibold))
                 .foregroundColor(DS.Palette.text)
             Spacer(minLength: 0)
@@ -15364,14 +15390,22 @@ public struct AgentAppView: View {
         .background(DS.Palette.surfaceRaised)
         .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.line).frame(height: 1) }
         .accessibilityIdentifier("agent.thread.delete.undoBanner")
+        .onAppear {
+            announceUndoToast(message, window: AgentAppViewModel.threadDeletionUndoWindow, armedAt: undo.capturedAt)
+        }
+        // A second delete inside the window replaces the toast in place.
+        .onChange(of: undo.capturedAt) { _, _ in
+            announceUndoToast(message, window: AgentAppViewModel.threadDeletionUndoWindow, armedAt: undo.capturedAt)
+        }
     }
 
     private func checkpointRevertUndoBanner(_ toast: AgentAppViewModel.CheckpointRevertUndoToast) -> some View {
-        HStack(spacing: DS.Space.sm) {
+        let message = "Reverted to checkpoint \(toast.checkpointTurnCount.formatted())"
+        return HStack(spacing: DS.Space.sm) {
             Image(systemName: "arrow.uturn.backward")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(DS.Palette.textSecondary)
-            Text("Reverted to checkpoint \(toast.checkpointTurnCount)")
+            Text(message)
                 .font(DS.Font.caption.weight(.semibold))
                 .foregroundColor(DS.Palette.text)
             Spacer(minLength: 0)
@@ -15385,6 +15419,28 @@ public struct AgentAppView: View {
         .background(DS.Palette.surfaceRaised)
         .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.line).frame(height: 1) }
         .accessibilityIdentifier("agent.checkpoint.revert.undoBanner")
+        .onAppear {
+            announceUndoToast(message, window: AgentAppViewModel.checkpointRevertUndoWindow, armedAt: toast.capturedAt)
+        }
+        .onChange(of: toast.capturedAt) { _, _ in
+            announceUndoToast(message, window: AgentAppViewModel.checkpointRevertUndoWindow, armedAt: toast.capturedAt)
+        }
+    }
+
+    /// VoiceOver does not read a view that appears on its own, and the undo
+    /// window is short: say the toast when it shows. Once per arming: a toast
+    /// that only changes place (see `AgentUndoToastPlacement`) is not news.
+    private func announceUndoToast(_ message: String, window: TimeInterval, armedAt: Date) {
+        guard announcedUndoToasts.insert(armedAt).inserted else { return }
+        guard let app = NSApp else { return }
+        NSAccessibility.post(
+            element: (app.mainWindow as NSResponder?) ?? app,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: "\(message). Undo is available for \(Int(window)) seconds.",
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ]
+        )
     }
 
     private var modelLabel: String {
@@ -15849,7 +15905,7 @@ public struct AgentAppView: View {
         if !activities.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.16)) {
+                    withAnimation(reduceMotion ? nil : DS.Motion.micro) {
                         showWorkLog.toggle()
                     }
                 } label: {
@@ -15901,7 +15957,7 @@ public struct AgentAppView: View {
                             }
                         }
                     }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(AgentChatMotion.transition(.fadeAndMove, reduceMotion: reduceMotion))
                 }
             }
             .padding(.vertical, DS.Space.sm)
@@ -16069,11 +16125,14 @@ public struct AgentAppView: View {
                         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
                         .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                             .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-                    Button { copyToPasteboard(detail) } label: {
-                        Image(systemName: "doc.on.doc").font(.system(size: 10))
+                    AgentChatCopyButton(text: detail) { copied in
+                        Image(systemName: AgentChatCopyChrome.symbolName(copied: copied))
+                            .font(.system(size: 10))
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
                     .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityLabel("Copy command")
                     .help("Copy command")
                 }
             case .applyPatch, .fileChange:
@@ -16429,7 +16488,7 @@ public struct AgentAppView: View {
             .padding(.horizontal, DS.Space.sm)
             .padding(.vertical, 6)
             .background(DS.Palette.surface.opacity(0.55))
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -16498,7 +16557,7 @@ public struct AgentAppView: View {
         .padding(.horizontal, DS.Space.sm)
         .padding(.vertical, 6)
         .background(DS.Palette.surface.opacity(0.55))
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
         .accessibilityIdentifier("agent.hiddenLiveTurnItems")
     }
 
@@ -16945,7 +17004,7 @@ public struct AgentAppView: View {
         let slice = AgentWorkDisclosureLayout.paintSlice(all: blocks, revealCount: reveal)
         VStack(alignment: .leading, spacing: DS.Space.md) {
             Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
+                withAnimation(reduceMotion ? nil : DS.Motion.micro) {
                     let wasExpanded = isCompletedWorkExpanded(for: turn)
                     toggleCompletedWork(for: turn)
                     if !wasExpanded {
@@ -17006,7 +17065,7 @@ public struct AgentAppView: View {
                     }
                 }
                 .padding(.leading, DS.Space.md)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(AgentChatMotion.transition(.fadeAndMove, reduceMotion: reduceMotion))
                 .accessibilityIdentifier("agent.work.lazyList.\(turn.turnId)")
             }
         }
@@ -17289,17 +17348,13 @@ public struct AgentAppView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .help(commandFull ?? summary)
                     if let full = commandFull, !full.isEmpty {
-                        Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(full, forType: .string)
-                        } label: {
-                            Image(systemName: "doc.on.doc")
+                        AgentChatCopyButton(text: full) { copied in
+                            Image(systemName: AgentChatCopyChrome.symbolName(copied: copied))
                                 .font(.system(size: 10))
                                 .foregroundColor(DS.Palette.textTertiary)
                                 .frame(width: 22, height: 22)
                                 .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
                         .dsPointingHandCursor()
                         .help("Copy full command")
                         .accessibilityIdentifier("agent.tool.copyCommand.\(item.id)")
@@ -17327,7 +17382,7 @@ public struct AgentAppView: View {
                 .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(DS.Palette.surface)
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             }
 
             // Liveness strip: one "not frozen" line (no second elapsed — trailing owns the clock).
@@ -17345,7 +17400,7 @@ public struct AgentAppView: View {
                 .padding(.vertical, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(DS.Palette.accent.opacity(0.06))
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(activityHint)
                 .accessibilityIdentifier("agent.tool.activityHint.\(item.id)")
@@ -17362,7 +17417,7 @@ public struct AgentAppView: View {
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface.opacity(0.7))
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
                     .accessibilityIdentifier("agent.tool.fullCommand.\(item.id)")
             }
 
@@ -17379,7 +17434,7 @@ public struct AgentAppView: View {
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -17411,7 +17466,7 @@ public struct AgentAppView: View {
             : (failed ? "exclamationmark.triangle" : (imageOnly ? "photo" : "terminal"))
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
+                withAnimation(reduceMotion ? nil : DS.Motion.micro) {
                     if expanded { expandedToolGroups.remove(id) } else { expandedToolGroups.insert(id) }
                 }
             } label: {
@@ -17484,7 +17539,7 @@ public struct AgentAppView: View {
 
             if expanded {
                 HStack(alignment: .top, spacing: DS.Space.sm) {
-                    RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    Capsule()
                         .fill(DS.Palette.line)
                         .frame(width: 1.5)
                         .padding(.leading, 4)
@@ -17516,7 +17571,7 @@ public struct AgentAppView: View {
                         }
                     }
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(AgentChatMotion.transition(.fadeAndMove, reduceMotion: reduceMotion))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -18086,7 +18141,50 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.legacyProvider.banner")
     }
 
+    @ViewBuilder
     private func systemStripRow(_ item: AgentSystemStripItem) -> some View {
+        if item.severity == .error {
+            // Same strip as a failed page read: one error row for the chat.
+            AgentChatErrorStrip(
+                message: item.message,
+                identifier: item.id,
+                offersCopy: item.offersCopy,
+                onRetry: item.offersRetry ? { retrySystemStripItem(item.id) } : nil,
+                onDismiss: item.offersDismiss ? { dismissSystemStripItem(item.id) } : nil
+            )
+        } else {
+            systemStripStatusRow(item)
+        }
+    }
+
+    private func retrySystemStripItem(_ id: String) {
+        switch id {
+        case "agent.provider.snapshot.stale":
+            vm.retryProviderThreadSnapshotRead()
+        case "agent.queue.status":
+            Task { await vm.send() }
+        default:
+            break
+        }
+    }
+
+    private func dismissSystemStripItem(_ id: String) {
+        switch id {
+        case "agent.history.replay.notice":
+            vm.dismissHistoryReplayNotice()
+        case "agent.status.message":
+            vm.dismissStatusMessage()
+        case "agent.provider.snapshot.stale":
+            vm.dismissProviderThreadSnapshotStatusMessage()
+        case "agent.queue.status":
+            vm.dismissQueueStatusMessage()
+        default:
+            break
+        }
+    }
+
+    /// Warning and info rows. Errors go through `AgentChatErrorStrip`.
+    private func systemStripStatusRow(_ item: AgentSystemStripItem) -> some View {
         let tone: Color = {
             switch item.severity {
             case .error: return DS.Palette.danger
@@ -18113,43 +18211,20 @@ public struct AgentAppView: View {
             )
                 .frame(maxWidth: .infinity, alignment: .leading)
             if item.offersCopy {
-                Button("Copy") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(item.message, forType: .string)
-                }
-                .buttonStyle(.plain)
+                AgentChatCopyButton(text: item.message) { AgentChatCopyWordLabel(copied: $0) }
                 .font(DS.Font.caption)
+                .accessibilityLabel("Copy")
                 .accessibilityIdentifier("\(item.id).copy")
             }
             if item.offersRetry {
-                Button("Retry") {
-                    switch item.id {
-                    case "agent.provider.snapshot.stale":
-                        vm.retryProviderThreadSnapshotRead()
-                    case "agent.queue.status":
-                        Task { await vm.send() }
-                    default:
-                        break
-                    }
-                }
+                Button("Retry") { retrySystemStripItem(item.id) }
                 .buttonStyle(.plain)
                 .font(DS.Font.caption)
                 .accessibilityIdentifier("\(item.id).retry")
             }
             if item.offersDismiss {
                 Button {
-                    switch item.id {
-                    case "agent.history.replay.notice":
-                        vm.dismissHistoryReplayNotice()
-                    case "agent.status.message":
-                        vm.dismissStatusMessage()
-                    case "agent.provider.snapshot.stale":
-                        vm.dismissProviderThreadSnapshotStatusMessage()
-                    case "agent.queue.status":
-                        vm.dismissQueueStatusMessage()
-                    default:
-                        break
-                    }
+                    dismissSystemStripItem(item.id)
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
@@ -18164,9 +18239,7 @@ public struct AgentAppView: View {
         }
         .padding(.horizontal, DS.Space.lg)
         .padding(.vertical, DS.Space.sm)
-        .background(item.severity == .error
-            ? DS.Palette.danger.opacity(0.09)
-            : DS.Palette.surfaceRaised)
+        .background(DS.Palette.surfaceRaised)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier(item.id)
     }

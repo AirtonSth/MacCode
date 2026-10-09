@@ -134,6 +134,8 @@ public enum DS {
         public static let control: CGFloat = 5
         public static let card:    CGFloat = 7
         public static let panel:   CGFloat = 9
+        /// User message bubble. Same value as iOS `DS.Radius.md`.
+        public static let bubble:  CGFloat = 10
         public static let modal:   CGFloat = 12
         public static let pill:    CGFloat = 999
     }

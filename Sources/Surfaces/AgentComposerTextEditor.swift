@@ -26,6 +26,7 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
     let onPopupNavDown: () -> Void
     let onPopupApply: () -> Void
     let onPopupDismiss: () -> Void
+    let onFocusChanged: (Bool) -> Void
 
     public init(
         text: Binding<String>,
@@ -44,7 +45,8 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
         onPopupNavUp: @escaping () -> Void,
         onPopupNavDown: @escaping () -> Void,
         onPopupApply: @escaping () -> Void,
-        onPopupDismiss: @escaping () -> Void
+        onPopupDismiss: @escaping () -> Void,
+        onFocusChanged: @escaping (Bool) -> Void = { _ in }
     ) {
         self._text = text
         self._height = height
@@ -63,6 +65,7 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
         self.onPopupNavDown = onPopupNavDown
         self.onPopupApply = onPopupApply
         self.onPopupDismiss = onPopupDismiss
+        self.onFocusChanged = onFocusChanged
     }
 
     public func makeNSView(context: Context) -> NSScrollView {
@@ -103,6 +106,7 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
         textView.onPopupNavDown = onPopupNavDown
         textView.onPopupApply = onPopupApply
         textView.onPopupDismiss = onPopupDismiss
+        textView.onFocusChanged = onFocusChanged
         textView.placeholderString = placeholder
         textView.setAccessibilityIdentifier(accessibilityIdentifier)
         context.coordinator.textView = textView
@@ -126,6 +130,7 @@ public struct AgentComposerTextEditor: NSViewRepresentable {
         textView.onPopupNavDown = onPopupNavDown
         textView.onPopupApply = onPopupApply
         textView.onPopupDismiss = onPopupDismiss
+        textView.onFocusChanged = onFocusChanged
         textView.placeholderString = placeholder
         textView.setAccessibilityIdentifier(accessibilityIdentifier)
         // Do not clobber an in-progress dead-key / IME composition: replacing
@@ -330,8 +335,28 @@ final class PromptComposerTextView: NSTextView {
     var onPopupNavDown: (() -> Void)?
     var onPopupApply: (() -> Void)?
     var onPopupDismiss: (() -> Void)?
+    var onFocusChanged: ((Bool) -> Void)?
     var placeholderString: String = "" {
         didSet { needsDisplay = true }
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became { reportFocus(true) }
+        return became
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { reportFocus(false) }
+        return resigned
+    }
+
+    /// Hopped: a responder change can land inside a SwiftUI update, and the
+    /// callback writes view state.
+    private func reportFocus(_ focused: Bool) {
+        guard let onFocusChanged else { return }
+        DispatchQueue.main.async { onFocusChanged(focused) }
     }
 
     override func keyDown(with event: NSEvent) {

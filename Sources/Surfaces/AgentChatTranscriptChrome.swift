@@ -182,9 +182,10 @@ public enum AgentChatTranscriptChrome {
         absoluteFormatter.string(from: date)
     }
 
-    public static func copyToPasteboard(_ text: String) {
+    @discardableResult
+    public static func copyToPasteboard(_ text: String) -> Bool {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        return NSPasteboard.general.setString(text, forType: .string)
     }
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {
@@ -317,15 +318,12 @@ public struct AgentChatUserBubble: View, Equatable {
                     .frame(maxWidth: bubbleMax, alignment: .trailing)
                     .accessibilityIdentifier(accessibilityIdentifier)
                 HStack(spacing: DS.Space.xs) {
-                    Button {
-                        AgentChatTranscriptChrome.copyToPasteboard(text)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
+                    AgentChatCopyButton(text: text) { copied in
+                        Image(systemName: AgentChatCopyChrome.symbolName(copied: copied))
                             .font(.system(size: 11, weight: .regular))
                             .frame(width: 18, height: 18)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
                     .foregroundColor(DS.Palette.textTertiary)
                     .accessibilityLabel("Copy message")
                     .accessibilityIdentifier(copyIdentifier ?? "agent.userMessage.copy")
@@ -366,7 +364,7 @@ public struct AgentChatUserBubble: View, Equatable {
             .padding(.horizontal, DS.Space.xl)
             .padding(.vertical, DS.Space.lg)
             .background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.bubble, style: .continuous))
             .accessibilityLabel(text)
     }
 }
@@ -401,15 +399,12 @@ public struct AgentChatAssistantReply: View, Equatable {
                     .accessibilityLabel(text)
             }
             HStack(spacing: DS.Space.xs) {
-                Button {
-                    AgentChatTranscriptChrome.copyToPasteboard(text)
-                } label: {
-                    Image(systemName: "doc.on.doc")
+                AgentChatCopyButton(text: text) { copied in
+                    Image(systemName: AgentChatCopyChrome.symbolName(copied: copied))
                         .font(.system(size: 11, weight: .regular))
                         .frame(width: 18, height: 18)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.textTertiary)
                 .accessibilityLabel("Copy message")
                 .accessibilityIdentifier(copyIdentifier ?? "agent.assistantMessage.copy")
@@ -425,6 +420,15 @@ public struct AgentChatAssistantReply: View, Equatable {
             && lhs.roleIdentifier == rhs.roleIdentifier
             && lhs.copyIdentifier == rhs.copyIdentifier
             && (lhs.content != nil) == (rhs.content != nil)
+    }
+}
+
+/// When the composer card draws its focus hairline (pure, testable seam).
+/// AppKit keeps a window's first responder while the window is not key and
+/// while the editor is disabled, and neither takes the keyboard.
+public enum AgentChatComposerFocusChrome {
+    public static func showsFocus(editorFocused: Bool, windowIsKey: Bool, enabled: Bool) -> Bool {
+        editorFocused && windowIsKey && enabled
     }
 }
 
@@ -466,6 +470,9 @@ public struct AgentChatComposerBar: View {
     @State private var editorHeight: CGFloat = AgentComposerTextEditor.minHeight
     @State private var suggestionSelectedIndex: Int?
     @State private var suggestionPopupDismissed = false
+    @State private var editorFocused = false
+    @Environment(\.controlActiveState) private var controlActiveState
+    @Environment(\.isEnabled) private var isEnabled
 
     public init(
         text: Binding<String>,
@@ -587,7 +594,8 @@ public struct AgentChatComposerBar: View {
                     )
                 },
                 onPopupApply: { applyHighlightedSuggestion() },
-                onPopupDismiss: { suggestionPopupDismissed = true }
+                onPopupDismiss: { suggestionPopupDismissed = true },
+                onFocusChanged: { editorFocused = $0 }
             )
             .frame(height: editorHeight)
             .padding(.horizontal, DS.Space.lg)
@@ -654,7 +662,15 @@ public struct AgentChatComposerBar: View {
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                // The card is the field: its hairline shows the editor's focus.
+                .strokeBorder(
+                    AgentChatComposerFocusChrome.showsFocus(
+                        editorFocused: editorFocused,
+                        windowIsKey: controlActiveState == .key,
+                        enabled: isEnabled
+                    ) ? DS.Palette.focusRing : DS.Palette.line,
+                    lineWidth: DS.Border.hairline
+                )
                 .opacity(ultracodeBorder ? 0 : 1)
         )
         .modifier(UltracodeBorder(active: ultracodeBorder))

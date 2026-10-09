@@ -706,6 +706,7 @@ struct BotRosterTeamSections<Row: View>: View {
     @ObservedObject var teamsGroups: BotTeamsGroupsController
     let sections: BotRosterSections?
     let row: (BotDefinition) -> Row
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         if let sections {
@@ -733,7 +734,7 @@ struct BotRosterTeamSections<Row: View>: View {
         let collapsed = teamsGroups.collapsedTeamIDs.contains(section.team.id)
         return VStack(alignment: .leading, spacing: DS.Space.lg) {
             Button {
-                withAnimation(DS.Motion.standard) { teamsGroups.toggleCollapsed(section.team.id) }
+                withAnimation(reduceMotion ? nil : DS.Motion.standard) { teamsGroups.toggleCollapsed(section.team.id) }
             } label: {
                 HStack(spacing: DS.Space.xs) {
                     Image(systemName: collapsed ? "chevron.right" : "chevron.down")
@@ -859,6 +860,7 @@ struct BotGroupConversationsSection: View {
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                     .fill(selected ? DS.Palette.accent.opacity(0.18) : Color.white.opacity(0.001))
             )
+            .dsHoverFill(enabled: !selected)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1311,6 +1313,7 @@ extension BotTeamsGroupsController {
 struct BotGroupRoomScreen: View {
     @ObservedObject var vm: BotsViewModel
     @ObservedObject var teamsGroups: BotTeamsGroupsController
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         if let group = teamsGroups.selectedGroup {
@@ -1373,7 +1376,7 @@ struct BotGroupRoomScreen: View {
                 "sidebar.right",
                 help: teamsGroups.isInspectorVisible ? "Hide inspector" : "Show inspector"
             ) {
-                withAnimation(DS.Motion.standard) { teamsGroups.isInspectorVisible.toggle() }
+                withAnimation(reduceMotion ? nil : DS.Motion.standard) { teamsGroups.isInspectorVisible.toggle() }
             }
             .accessibilityIdentifier("bots.group.inspectorToggle")
         }

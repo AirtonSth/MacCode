@@ -11888,7 +11888,7 @@ public struct BotsModeSwitcher: View {
             }
             .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
             .frame(maxWidth: .infinity, minHeight: 26)
-            .background(selected ? Color.white.opacity(0.12) : Color.clear)
+            .background(selected ? DS.Palette.pressed : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             .contentShape(Rectangle())
         }
@@ -12121,6 +12121,7 @@ public struct BotsRosterList: View {
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                     .fill(selected ? identity.opacity(0.22) : Color.white.opacity(0.001))
             )
+            .dsHoverFill(enabled: !selected)
             .overlay(alignment: .leading) {
                 if selected {
                     identity
@@ -12272,6 +12273,7 @@ public struct BotsRootView: View {
     private let embedsRosterRail: Bool
     @State private var pendingClearAllDeskThreads = false
     @State private var pendingDockerDataClear: BotID?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
         self.vm = vm
@@ -13035,7 +13037,7 @@ public struct BotsRootView: View {
                     ? AgentChatThreadRailCopy.hideHelp
                     : AgentChatThreadRailCopy.showHelp
             ) {
-                withAnimation(DS.Motion.standard) {
+                withAnimation(reduceMotion ? nil : DS.Motion.standard) {
                     vm.isDeskThreadRailVisible.toggle()
                 }
             }
@@ -13107,7 +13109,7 @@ public struct BotsRootView: View {
                     "sidebar.right",
                     help: vm.isDeskSidePaneVisible ? "Hide inspector" : "Show inspector"
                 ) {
-                    withAnimation(DS.Motion.standard) {
+                    withAnimation(reduceMotion ? nil : DS.Motion.standard) {
                         vm.isDeskSidePaneVisible.toggle()
                     }
                 }
@@ -13170,8 +13172,8 @@ public struct BotsRootView: View {
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        .animation(DS.Motion.standard, value: vm.isDeskSidePaneVisible)
-        .animation(DS.Motion.standard, value: vm.isDeskThreadRailVisible)
+        .animation(reduceMotion ? nil : DS.Motion.standard, value: vm.isDeskSidePaneVisible)
+        .animation(reduceMotion ? nil : DS.Motion.standard, value: vm.isDeskThreadRailVisible)
         .animation(nil, value: vm.selectedBotID)
         .animation(nil, value: vm.selectedConversation?.id)
         .confirmationDialog(
@@ -13651,7 +13653,7 @@ public struct BotsRootView: View {
             newIdentifier: "bots.desk.thread.new",
             searchIdentifier: "bots.desk.thread.search",
             onHide: {
-                withAnimation(DS.Motion.standard) {
+                withAnimation(reduceMotion ? nil : DS.Motion.standard) {
                     vm.isDeskThreadRailVisible = false
                 }
             },
