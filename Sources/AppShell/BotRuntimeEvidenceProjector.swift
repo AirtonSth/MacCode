@@ -55,6 +55,23 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
         terminalQueue.sync {}
     }
 
+    /// Test seam: keeps the terminals projected from now on queued, as when
+    /// this queue has not been scheduled yet, until `release` is signalled.
+    func holdTerminalsForTesting(until release: DispatchSemaphore) {
+        terminalQueue.async { release.wait() }
+    }
+
+    /// Runs `completion` once every terminal projected before this call has
+    /// run `onTerminal`; a terminal projected later is not waited for. A read
+    /// made on `bot.run.completed` waits here, so it never reports that run
+    /// unsettled. The terminal is queued before its event reaches a
+    /// subscriber: `receive` runs on the EventBus delivery lane, which
+    /// delivers the projected event only after `receive` has returned.
+    /// Never blocks the caller: safe on the MainActor and on this queue.
+    func afterQueuedTerminals(_ completion: @escaping @Sendable () -> Void) {
+        terminalQueue.async(execute: completion)
+    }
+
     init(
         eventBus: EventBus = .shared,
         onTerminal: @escaping (TerminalEvidence) -> Void = { _ in },

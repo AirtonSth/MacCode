@@ -437,6 +437,98 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
         )
     }
 
+    /// WHY: `bot.run.completed` is published before the run is settled, so a
+    /// phone read made on that event could be told the run is still working:
+    /// "run status unconfirmed" with the answer already on screen. A read
+    /// waits on this barrier first. It must cover the settle of the event the
+    /// reader has already seen and nothing queued afterwards. (A later settle
+    /// that is already running can still delay the read through the
+    /// authority's lock; that is unchanged here.)
+    func test_barrierTakenWhenTerminalEvidenceArrivesWaitsForThatSettleAndNoLaterOne() throws {
+        let bus = EventBus(recentLimit: 32)
+        let settleStarted = DispatchSemaphore(value: 0)
+        let releaseSettle = DispatchSemaphore(value: 0)
+        let barrierPassed = DispatchSemaphore(value: 0)
+        let order = TerminalOrderLog()
+        let projector = BotRuntimeEvidenceProjector(eventBus: bus) { terminal in
+            settleStarted.signal()
+            // Stands in for a settle waiting on SQLite. Bounded, so a
+            // regression fails this test instead of hanging it.
+            _ = releaseSettle.wait(timeout: .now() + 10)
+            order.record("settled \(terminal.runID)")
+        }
+        XCTAssertTrue(projector.registerCompletedSend(sendReceipt()))
+        XCTAssertTrue(projector.registerCompletedSend(sendReceipt(runID: "run-b", threadID: "thread-b")))
+
+        let token = bus.subscribe(since: bus.currentSeq) { event in
+            guard event.kind == "bot.run.completed" else { return }
+            // The reader's reaction, taken the moment the evidence arrives.
+            projector.afterQueuedTerminals {
+                order.record("barrier")
+                barrierPassed.signal()
+            }
+        }
+        defer { bus.unsubscribe(token) }
+
+        bus.publish(kind: .agentRunCompleted, payload: agentPayload())
+        bus.flushPersistenceSubmissions()
+        XCTAssertEqual(settleStarted.wait(timeout: .now() + 10), .success)
+        // run-b ends after the reader took its barrier.
+        bus.publish(kind: .agentRunFailed, payload: agentPayload(runID: "run-b", threadID: "thread-b"))
+        bus.flushPersistenceSubmissions()
+        XCTAssertEqual(
+            barrierPassed.wait(timeout: .now()),
+            .timedOut,
+            "the barrier does not pass while run-a's settle is still running"
+        )
+
+        // Releases run-a's settle only; run-b's stays held.
+        releaseSettle.signal()
+        XCTAssertEqual(barrierPassed.wait(timeout: .now() + 10), .success)
+        XCTAssertEqual(
+            order.entries,
+            ["settled run-a", "barrier"],
+            "the barrier passes after the settle queued before it and before the one queued after it"
+        )
+
+        releaseSettle.signal()
+        projector.flushTerminalsForTesting()
+        XCTAssertEqual(order.entries, ["settled run-a", "barrier", "settled run-b"])
+    }
+
+    /// WHY: paired reads are served on the MainActor, and a settle can itself
+    /// lead to a read. Taking the barrier must never block its caller, or a
+    /// read on the main thread or on the settle queue would freeze the host.
+    func test_barrierNeverBlocksACallerOnTheMainThreadOrOnTheSettleQueue() throws {
+        let bus = EventBus(recentLimit: 8)
+        let settleStarted = DispatchSemaphore(value: 0)
+        let releaseSettle = DispatchSemaphore(value: 0)
+        let passedFromSettleQueue = DispatchSemaphore(value: 0)
+        let passedFromMainThread = DispatchSemaphore(value: 0)
+        var settleQueueProjector: BotRuntimeEvidenceProjector?
+        let projector = BotRuntimeEvidenceProjector(eventBus: bus) { _ in
+            // Taken on the settle queue, inside the settle it would wait for.
+            settleQueueProjector?.afterQueuedTerminals { passedFromSettleQueue.signal() }
+            settleStarted.signal()
+            _ = releaseSettle.wait(timeout: .now() + 10)
+        }
+        settleQueueProjector = projector
+        defer { settleQueueProjector = nil }
+        XCTAssertTrue(projector.registerCompletedSend(sendReceipt()))
+
+        bus.publish(kind: .agentRunCompleted, payload: agentPayload())
+        XCTAssertEqual(settleStarted.wait(timeout: .now() + 10), .success)
+        XCTAssertTrue(Thread.isMainThread)
+        // Returns at once although the settle it waits for is still held.
+        projector.afterQueuedTerminals { passedFromMainThread.signal() }
+        XCTAssertEqual(passedFromMainThread.wait(timeout: .now()), .timedOut)
+
+        releaseSettle.signal()
+        XCTAssertEqual(passedFromSettleQueue.wait(timeout: .now() + 10), .success)
+        XCTAssertEqual(passedFromMainThread.wait(timeout: .now() + 10), .success)
+        projector.flushTerminalsForTesting()
+    }
+
     private func sendReceipt(
         runID: String = "run-a",
         threadID: String = "thread-a"
@@ -477,5 +569,22 @@ final class BotRuntimeEvidenceProjectorTests: XCTestCase {
             "run_id": .string(runID),
             "thread_id": .string(threadID),
         ])
+    }
+}
+
+/// What ran on the projector's settle queue, in order.
+private final class TerminalOrderLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    var entries: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return recorded
+    }
+
+    func record(_ entry: String) {
+        lock.lock()
+        recorded.append(entry)
+        lock.unlock()
     }
 }
