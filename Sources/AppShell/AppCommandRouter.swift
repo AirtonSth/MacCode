@@ -4662,6 +4662,65 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return t
     }
 
+    /// Builds a fork/side child from the source thread WITHOUT persisting it: the
+    /// coordinator's durable fork persists the child graph atomically.
+    private func makeForkChild(source: AgentThread, ephemeral: Bool, title: String) -> AgentThread {
+        AgentThread(
+            projectId: source.projectId,
+            workspaceId: source.workspaceId,
+            title: title,
+            provider: source.provider,
+            providerInstanceId: source.providerInstanceId,
+            model: source.model,
+            permissionMode: source.permissionMode,
+            reasoningEffort: source.reasoningEffort,
+            reasoningModel: source.reasoningModel,
+            executionMode: source.executionMode,
+            baseBranch: source.baseBranch,
+            worktreePath: source.worktreePath,
+            serviceTier: source.serviceTier,
+            modelSelection: source.modelSelection,
+            runAsUser: source.runAsUser,
+            routingConfiguration: source.routingConfiguration,
+            parentThreadId: source.id,
+            isEphemeral: ephemeral
+        )
+    }
+
+    /// Durable provider fork of a thread into a persisted child (`agent.thread.fork`).
+    public func forkAgentThread(sourceThreadId: AgentThreadID, messageID: String?) async throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard let source = try ctx.threadRepo.get(id: sourceThreadId) else {
+            throw LayoutError.workspaceNotFound
+        }
+        let child = makeForkChild(source: source, ephemeral: false, title: source.title)
+        let forked = try await ctx.coordinator.forkThread(sourceThreadId: sourceThreadId, childThread: child)
+        EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(forked))
+        return forked
+    }
+
+    /// Ephemeral fork of a thread (`agent.thread.side`). Hidden from the rail and swept at launch.
+    public func sideAgentThread(sourceThreadId: AgentThreadID, text: String?) async throws -> AgentThread {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        guard let source = try ctx.threadRepo.get(id: sourceThreadId) else {
+            throw LayoutError.workspaceNotFound
+        }
+        let child = makeForkChild(source: source, ephemeral: true, title: "Side · \(source.title)")
+        return try await ctx.coordinator.forkThread(sourceThreadId: sourceThreadId, childThread: child)
+    }
+
+    /// Closes an ephemeral side thread (`agent.thread.side.close`).
+    public func closeSideThread(threadId: AgentThreadID) async throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try await ctx.coordinator.closeSideThread(threadId: threadId)
+    }
+
+    /// Side question against a live thread session (`agent.thread.btw`).
+    public func btwAgentThread(threadId: AgentThreadID, question: String) async throws -> String {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try await ctx.coordinator.btwThread(threadId: threadId, question: question)
+    }
+
     public func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?, nestedRunContext: AgentNestedRunContext? = nil) async throws -> AgentThread {
         let parentThread = try nestedRunContext.map {
             try validatedNestedParent(

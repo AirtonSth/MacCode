@@ -418,6 +418,7 @@ public protocol AgentProviderAdapter: AnyObject {
     func forkThread(threadId: AgentThreadID) async throws -> String
     func forkThread(_ request: AgentProviderForkRequest) async throws -> String
     func compensateFork(_ request: AgentProviderForkRequest, providerChildThreadId: String) async throws
+    func btw(threadId: AgentThreadID, question: String) async throws -> String
     func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws
     func stopAll()
     func stopAllForAppTermination()
@@ -449,6 +450,10 @@ public extension AgentProviderAdapter {
 
     func compensateFork(_ request: AgentProviderForkRequest, providerChildThreadId: String) async throws {
         throw AgentProviderAdapterError.unsupported("idempotent provider fork compensation")
+    }
+
+    func btw(threadId: AgentThreadID, question: String) async throws -> String {
+        throw AgentProviderAdapterError.unsupported("provider side question")
     }
 
     func stopAllForAppTermination() {
