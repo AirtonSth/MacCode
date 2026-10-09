@@ -443,6 +443,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let embedding: AgentAppEmbedding?
     @Published public var threads: [AgentThread] = [] { didSet { filteredThreadsCache = nil } }
     @Published public var selectedThreadId: AgentThreadID?
+    /// True when the selected thread is an ephemeral side chat (hidden from the
+    /// rail, so the row is not available through `threads`).
+    @Published public private(set) var selectedThreadIsEphemeral = false
+    /// Parent thread of the selected side chat, for the parent status strip.
+    @Published public private(set) var selectedThreadParentId: AgentThreadID?
     /// Transcript paint lives on `transcriptState` so stream ticks do not
     /// republish chrome/rail fields on this object. Proxies keep `vm.messages` /
     /// `vm.timeline` call sites (tests + host) working unchanged.
@@ -2304,6 +2309,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         threadWorkspaceCache[id] = selectedThread.workspaceId ?? workspaceID
+        selectedThreadIsEphemeral = selectedThread.isEphemeral
+        selectedThreadParentId = selectedThread.parentThreadId
         if statusMessage.contains(Self.deletedThreadDraftRecoveryMessage) {
             statusMessage = ""
         }
@@ -7526,8 +7533,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func recoverDeletedSelectionIfNeeded(_ removedThreadIDs: Set<AgentThreadID>) {
         guard let selectedThreadId, removedThreadIDs.contains(selectedThreadId) else { return }
+        // Ephemeral side threads are hidden from the rail, so a rail snapshot
+        // never contains them. Keep the selection while the durable row exists;
+        // only recover once the side thread was actually closed/deleted.
+        if selectedThreadIsEphemeral, (try? threadRepo.get(id: selectedThreadId)) != nil { return }
         let preservedUnsentDraft = !prompt.isEmpty || !attachments.isEmpty
         self.selectedThreadId = nil
+        selectedThreadIsEphemeral = false
+        selectedThreadParentId = nil
         publishInterestedThreadId(nil)
         resetDeletedSelectionToFreshComposer()
         if preservedUnsentDraft {
@@ -7999,14 +8012,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// right split pane. Refused inside a side chat and when the provider cannot
     /// fork. The host creates the thread via `AppCommandRouter.sideAgentThread`.
     public func requestSideChat(text: String) {
-        guard let tid = selectedThreadId,
-              let src = threads.first(where: { $0.id == tid }) else { return }
-        guard src.provider.isSelectable else {
-            systemNote("This conversation is read-only. Start a new Distill conversation instead.")
+        guard let tid = selectedThreadId else { return }
+        // A side thread is hidden from the rail, so check its flag first.
+        guard !selectedThreadIsEphemeral else {
+            systemNote("/side — already in a side chat.")
             return
         }
-        guard !src.isEphemeral else {
-            systemNote("/side — already in a side chat.")
+        guard let src = threads.first(where: { $0.id == tid }) ?? (try? threadRepo.get(id: tid)) else { return }
+        guard src.provider.isSelectable else {
+            systemNote("This conversation is read-only. Start a new Distill conversation instead.")
             return
         }
         guard selectedProviderCapabilities.supportsFork else {
@@ -15185,6 +15199,11 @@ public struct AgentAppView: View {
             // Unified system strip: severity-ordered, capped (replaces stacked banners).
             systemStatusStrip
             queuedMessagesSection
+            if vm.selectedThreadIsEphemeral {
+                sideChatParentStatusStrip
+                    .padding(.horizontal, 22)
+                    .padding(.bottom, DS.Space.xs)
+            }
             // F1: render the composer inside a scope that observes only the composer
             // text, so a keystroke re-renders the composer subtree and NOT this body
             // (which builds the whole transcript).
@@ -16507,9 +16526,41 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.hiddenLiveTurnItems")
     }
 
+    @ViewBuilder
     private var emptyConversation: some View {
+        if vm.selectedThreadIsEphemeral {
+            sideChatEmptyConversation
+        } else {
+            VStack(spacing: DS.Space.lg) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 44, weight: .regular))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .frame(width: 72, height: 72)
+                    .background(DS.Palette.surfaceRaised)
+                    .clipShape(Circle())
+                    .overlay(Circle().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                VStack(spacing: DS.Space.sm) {
+                    Text("No messages")
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .lineLimit(1)
+                    Text("Start a new agent run.")
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                }
+                if let accountPanel {
+                    accountPanel.frame(maxWidth: 420)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
+        }
+    }
+
+    private var sideChatEmptyConversation: some View {
         VStack(spacing: DS.Space.lg) {
-            Image(systemName: "sparkles")
+            Image(systemName: "plus.circle")
                 .font(.system(size: 44, weight: .regular))
                 .foregroundColor(DS.Palette.textTertiary)
                 .frame(width: 72, height: 72)
@@ -16517,21 +16568,36 @@ public struct AgentAppView: View {
                 .clipShape(Circle())
                 .overlay(Circle().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
             VStack(spacing: DS.Space.sm) {
-                Text("No messages")
+                Text("Side chat")
                     .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
-                Text("Start a new agent run.")
+                Text("Side chats are temporary and disappear when you close the app.")
                     .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textTertiary)
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
             }
-            if let accountPanel {
-                accountPanel.frame(maxWidth: 420)
-            }
         }
         .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
+    }
+
+    /// Parent thread running/idle indicator for a side chat.
+    @ViewBuilder
+    private var sideChatParentStatusStrip: some View {
+        if let parentId = vm.selectedThreadParentId {
+            let running = vm.isThreadStartingOrRunning(parentId)
+            HStack(spacing: DS.Space.xs) {
+                Circle()
+                    .fill(running ? DS.Palette.warning : DS.Palette.textTertiary)
+                    .frame(width: 6, height: 6)
+                Text(running ? "Parent thread running" : "Parent thread idle")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
+            }
+            .accessibilityIdentifier("agent.sideChat.parentStatus")
+        }
     }
 
     @ViewBuilder
