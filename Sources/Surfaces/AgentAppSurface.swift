@@ -695,9 +695,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Wired by AppCommandRouter. Branches the selected thread into a new
     /// persisted child chat (optionally from a message id) and selects it.
     public var onForkInNewChat: ((String?) -> Void)?
-    /// Wired by AppCommandRouter. Opens the ephemeral side thread in a right
-    /// split pane; the optional string is sent as the side chat's first message.
-    public var onOpenSideChat: ((AgentThreadID, String?) -> Void)?
+    /// Wired by AppCommandRouter. Creates the ephemeral side thread for the
+    /// selected thread and opens it in a right split pane. The string is the
+    /// optional `/side` inline first message.
+    public var onRequestSideChat: ((String) -> Void)?
+    /// Wired by AppCommandRouter. Asks the selected thread's live session the
+    /// `/btw` side question; the host answers via `appendBtwNote`.
+    public var onRequestBtw: ((String) -> Void)?
     public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
     public var providerLaunchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?
@@ -967,6 +971,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         customModelStore: AgentCustomModelStore? = nil,
         planNotesStore: PlanNotesStore? = nil,
         initialThreadId: AgentThreadID? = nil,
+        sideThreadId: AgentThreadID? = nil,
         lastModelStore: AgentLastModelStore = .shared,
         initialRoutingMode: AgentRoutingMode = .manual,
         newThreadDefaultsStore: AgentNewThreadDefaultsStore? = nil,
@@ -1006,6 +1011,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             applyNewThreadDefaultsFromRailIfNeeded()
             selectThread(embedding.pinnedThreadId)
             return
+        }
+        // Side chat: bind to the ephemeral thread explicitly. It is hidden from
+        // the rail (agent.thread.list excludes ephemeral rows), so the normal
+        // initialThreadId path below would never select it.
+        if let sideThreadId {
+            selectThread(sideThreadId)
         }
         // XCTest: same-stack rail load so selectThread(initial) sees rows.
         // Production: first cap+list off MainActor so opening a tab does not hitch.
@@ -7984,9 +7995,63 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// `/side` — ask the host to fork an ephemeral side chat and open it in a
+    /// right split pane. Refused inside a side chat and when the provider cannot
+    /// fork. The host creates the thread via `AppCommandRouter.sideAgentThread`.
+    public func requestSideChat(text: String) {
+        guard let tid = selectedThreadId,
+              let src = threads.first(where: { $0.id == tid }) else { return }
+        guard src.provider.isSelectable else {
+            systemNote("This conversation is read-only. Start a new Distill conversation instead.")
+            return
+        }
+        guard !src.isEphemeral else {
+            systemNote("/side — already in a side chat.")
+            return
+        }
+        guard selectedProviderCapabilities.supportsFork else {
+            systemNote(threadForkUnavailableReason ?? "Provider-side fork is unavailable for this session.")
+            return
+        }
+        onRequestSideChat?(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Sends the `/side` inline text as the side chat's first message once the
+    /// side surface is mounted and bound to the ephemeral thread.
+    public func seedSideChatMessage(_ text: String) {
+        guard selectedThreadId != nil else { return }
+        prompt = text
+        Task { @MainActor [weak self] in
+            await self?.send()
+        }
+    }
+
+    /// `/btw` — ask the host for a side answer against the thread's live session.
+    /// The host replies through `appendBtwNote`, which shows it inline.
+    public func requestBtw(question: String) {
+        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            systemNote("/btw — usage: /btw <question>")
+            return
+        }
+        onRequestBtw?(q)
+    }
+
+    /// `/btw` answer as a non-persisted inline transcript note.
+    public func appendBtwNote(question: String, answer: String) {
+        appendInlineNoteToTranscript("BTW · \(question)\n\(answer)")
+    }
+
+    /// Non-persisted inline transcript note: appended to the in-memory message
+    /// list only. A reload from disk drops it (intended for `/btw` answers).
+    private func appendInlineNoteToTranscript(_ text: String) {
+        guard let tid = selectedThreadId else { return }
+        messages.append(AgentMessage(threadId: tid, role: .system, content: text))
+    }
+
     /// Intercept only RemoteCode-owned slash commands before they reach the
     /// provider. Provider commands such as `/goal` must pass through.
-    public static let localSlashCommands = ["/clear", "/default", "/fork", "/model", "/plan", "/status"]
+    public static let localSlashCommands = ["/btw", "/clear", "/default", "/fork", "/model", "/plan", "/side", "/status"]
 
     private var distillAdvertisedCommandNames: [String] {
         provider == .distill ? distillSlashCommands.map { "/\($0.name)" } : []
@@ -8028,9 +8093,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // the silent switch doesn't look like a bug.
             systemNote("/clear — started a new thread. Previous thread is still in the rail.")
         case "fork":
-            Task { @MainActor in
-                await forkCurrentThread()
+            if let onForkInNewChat {
+                onForkInNewChat(nil)
+            } else {
+                Task { @MainActor in
+                    await forkCurrentThread()
+                }
             }
+        case "side":
+            requestSideChat(text: arg)
+        case "btw":
+            requestBtw(question: arg)
         case "model":
             if !arg.isEmpty, let m = availableModels.first(where: {
                 $0.id.localizedCaseInsensitiveContains(arg) || $0.label.localizedCaseInsensitiveContains(arg)
@@ -19763,11 +19836,11 @@ public final class AgentAppSurface: NSObject, Surface {
     /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
     public var onClose: (() -> Void)?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(), accountPanel: AnyView? = nil) {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, sideThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(), accountPanel: AnyView? = nil) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
-        if let initialThreadId { metadata["selected_thread"] = initialThreadId.value.uuidString }
+        if let binding = sideThreadId ?? initialThreadId { metadata["selected_thread"] = binding.value.uuidString }
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared, orchestrationRuntime: orchestrationRuntime)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, sideThreadId: sideThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared, orchestrationRuntime: orchestrationRuntime)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel, accountPanel: accountPanel))
         host.sizingOptions = []
         host.translatesAutoresizingMaskIntoConstraints = false
