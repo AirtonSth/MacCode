@@ -312,6 +312,41 @@ private func tailcatHexDigest<D: Sequence>(_ digest: D) -> String where D.Elemen
     return String(bytes: out, encoding: .utf8) ?? ""
 }
 
+/// F5: identity of this Mac's published Tailcat endpoints, version 1. Must
+/// equal iOS `TailcatEndpointDigest.digest` byte for byte (shared vector).
+enum TailcatEndpointDigest {
+    /// SHA-256 over the length-prefixed build id, then each length-prefixed
+    /// blob in canonical order. Kind, priority values, version and lease are
+    /// not hashed, so a lease renewal keeps the digest.
+    static func digest(buildId: String, endpoints: [TailcatCatalogEndpoint]) -> String {
+        var hasher = SHA256()
+        feed(buildId, into: &hasher)
+        // Priority ascending, ties by the blob's UTF-8 bytes. Not `String <`
+        // (as in `tailcatAdmissionDigest`): that is not byte order.
+        let ordered = endpoints.sorted { lhs, rhs in
+            if lhs.priority != rhs.priority { return lhs.priority < rhs.priority }
+            return lhs.connBlob.utf8.lexicographicallyPrecedes(rhs.connBlob.utf8)
+        }
+        for endpoint in ordered {
+            feed(endpoint.connBlob, into: &hasher)
+        }
+        return tailcatHexDigest(hasher.finalize())
+    }
+
+    /// Exactly 64 bytes, each in 0-9 or a-f.
+    static func isValid(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            (0x30...0x39).contains($0) || (0x61...0x66).contains($0)
+        }
+    }
+
+    private static func feed(_ text: String, into hasher: inout SHA256) {
+        let bytes = Data(text.utf8)
+        withUnsafeBytes(of: UInt64(bytes.count).bigEndian) { hasher.update(bufferPointer: $0) }
+        hasher.update(data: bytes)
+    }
+}
+
 private struct TailcatAnyEncodable: Encodable {
     private let encodeBody: (Encoder) throws -> Void
 

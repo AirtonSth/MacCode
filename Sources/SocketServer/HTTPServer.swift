@@ -1003,6 +1003,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         sequenceOmissionsCapability,
         ConnectionSnapshotThreadWindow.capability,
         DurableReplayContract.capability,
+        ConnectionClientFeatures.resumeHead,
     ]
 
     /// Every WS filter (including the default `.full`) may skip sequences:
@@ -2128,6 +2129,35 @@ public final class DirectHTTPServer: @unchecked Sendable {
         acceptedSockets.shutdown(scope: .tailcat)
     }
 
+    private let tailcatEndpointDigestLock = NSLock()
+    private var tailcatEndpointDigest: String?
+
+    /// F5: digest of the Tailcat endpoints this Mac currently publishes; nil = no information.
+    func setTailcatEndpointDigest(_ digest: String?) {
+        let valid = digest.flatMap { ConnectionWelcomeIdentity.isValidDigest($0) ? $0 : nil }
+        tailcatEndpointDigestLock.lock()
+        tailcatEndpointDigest = valid
+        tailcatEndpointDigestLock.unlock()
+    }
+
+    /// F5: queues `host.tailcat.rotating` on every LAN socket that asked for it. Returns how many accepted it.
+    @discardableResult
+    func announceTailcatRotation(retiringDigest: String) -> Int {
+        guard ConnectionWelcomeIdentity.isValidDigest(retiringDigest) else { return 0 }
+        var accepted = 0
+        for notice in activeWebSocketConnections.tailcatRotationNotices() {
+            if notice(retiringDigest) { accepted += 1 }
+        }
+        NSLog("[RC2.WS] tailcat_rotation_notice sockets=%d", accepted)
+        return accepted
+    }
+
+#if DEBUG
+    var tailcatRotationNoticeSocketCountForTesting: Int {
+        activeWebSocketConnections.tailcatRotationNotices().count
+    }
+#endif
+
     private func trackedOwnerFingerprints() -> Set<String> {
         activeWebSocketConnections.ownerFingerprints()
             .union(activeHTTPOwnerConnections.ownerFingerprints())
@@ -2825,11 +2855,33 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     ? plan.metadata.oldestReplaySequence
                     : min(plan.since + 1, plan.head)
             }()
+            // F7: only a durable socket that asked, with this boot's cursor
+            // accepted as sent, is told the head it was subscribed at.
+            let welcomeHeadSequence = DurableReplayContract.welcomeHeadSequence(
+                requested: ConnectionClientFeatures.requestsResumeHead(
+                    header: headers[ConnectionClientFeatures.header]
+                ),
+                plan: durableSubscription?.plan,
+                needsBaseline: durableNeedsBaseline,
+                requestedSinceSequence: requestedSinceSequence,
+                cursorBootProven: durableEventLog,
+                previousBoot: durablePreviousBoot
+            )
             let sequenceWatermark = ConnectionSequenceWatermark(initialSequence: wsSinceSeq)
             // C-W: only a client that asks gets the extra welcome fields.
             let welcomeIdentityRequested = ConnectionWelcomeIdentity.isRequested(
                 header: headers[ConnectionWelcomeIdentity.header]
             )
+            // F5: only a client that asks gets the welcome digest and the rotating frame.
+            let tailcatRotationNoticeRequested = ConnectionClientFeatures.requestsTailcatRotationNotice(
+                header: headers[ConnectionClientFeatures.header]
+            )
+            var welcomeTailcatEndpointDigest: String?
+            if tailcatRotationNoticeRequested {
+                tailcatEndpointDigestLock.lock()
+                welcomeTailcatEndpointDigest = tailcatEndpointDigest
+                tailcatEndpointDigestLock.unlock()
+            }
             let welcome = ConnectionTransportFrame.welcome(ConnectionWelcomeFrame(
                 protocolVersion: ConnectionTransportFrame.protocolVersion,
                 type: "welcome",
@@ -2856,7 +2908,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     : nil,
                 replayFromSequence: durableSubscription.map { subscription in
                     durableNeedsBaseline ? subscription.plan.head : subscription.plan.since
-                }
+                },
+                headSequence: welcomeHeadSequence,
+                tailcatEndpointDigest: welcomeTailcatEndpointDigest
             ))
             activeWebSocketConnections.insert(
                 connectionId,
@@ -2918,6 +2972,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     )
                 }
             )
+            // F5: a Tailcat-scope socket gets no sink: the rotation shuts it
+            // down in the same turn and the lost write would count as a
+            // slow-client drop. The sink must not capture `self` (the registry
+            // that holds it is owned by the server).
+            if tailcatRotationNoticeRequested && !remoteAuthenticated {
+                let noticeHostId = serverId
+                let noticeBootEpoch = bootEpoch
+                activeWebSocketConnections.setTailcatRotationNotice(connectionId) { retiringDigest in
+                    guard let data = ConnectionClientFeatures.tailcatRotatingData(
+                        connectionId: connectionId,
+                        hostId: noticeHostId,
+                        bootEpoch: noticeBootEpoch,
+                        retiringDigest: retiringDigest
+                    ) else { return false }
+                    return outbound.enqueueControl(opcode: 0x1, data: data) == .accepted
+                }
+            }
             // C-04: pressure baseline_required ≤1/s, never as a close reason.
             // S10: generation-aware sticky recovery. Emit body is held weakly so
             // connection teardown can nil it and markClosed without a cycle.

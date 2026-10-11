@@ -228,6 +228,6 @@ final class BotSendRoutingParityTests: XCTestCase {
         try Schema.migrate(db)
         try Schema.migrate(db)
         XCTAssertTrue(try store.listDeskRoutingJSON().isEmpty)
-        XCTAssertEqual(Schema.currentVersion, 89)
+        XCTAssertEqual(Schema.currentVersion, 90)
     }
 }
