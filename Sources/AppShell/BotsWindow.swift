@@ -3448,6 +3448,9 @@ public final class BotsViewModel: ObservableObject {
     public private(set) var skillListCountForTesting = 0
     /// Test seam: send dest used dest brain cache instead of listing.
     public private(set) var lastSendUsedDestBrainForTesting = false
+    /// Test seam: full thread-row reads (`threadRepo.get`) of the last desk
+    /// Agent App build, the embedded view model's included. Selection must pay one.
+    public private(set) var lastDeskAgentSyncThreadReadCountForTesting = 0
     /// Test seam: listConversations rereads. Persist dest must not increment this.
     public private(set) var conversationListCountForTesting = 0
     /// Test seam: listAttention rereads. Acknowledge dest must not increment this.
@@ -3520,7 +3523,12 @@ public final class BotsViewModel: ObservableObject {
     @Published public var routineSpec = BotScheduleSpec() {
         didSet { persistInspectorIfHydrated() }
     }
-    @Published public var errorMessage: String?
+    @Published public var errorMessage: String? {
+        didSet { errorMessageRevision &+= 1 }
+    }
+    /// Bumped on every write, also an equal one, so the error strip speaks a
+    /// repeated failure again, as the alert it replaced did on each attempt.
+    public private(set) var errorMessageRevision = 0
     @Published public private(set) var botSecrets: [BotSecretMetadata] = []
     @Published public private(set) var isBotSecretsLoading = false
     @Published public private(set) var botSecretsLoadFailed = false
@@ -3982,6 +3990,9 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func saveScheduleTask(_ draft: BotScheduleTaskDraft) {
+        // The error strip is not modal: start from an empty slot so a fixed
+        // and saved task does not keep the earlier "required" message.
+        errorMessage = nil
         let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = draft.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !prompt.isEmpty else {
@@ -4113,12 +4124,16 @@ public final class BotsViewModel: ObservableObject {
 
     public func openActiveBotItem(_ item: ActiveBotScreenItem) {
         if let bot = bots.first(where: { $0.id == item.botID }) ?? (try? botStore.get(id: item.botID)) {
+            // Same rule as openDeskFromRoster: an older error must not sit
+            // above another Bot.
+            errorMessage = nil
             openDesk(bot)
         }
     }
 
     public func openFinishedBotItem(_ item: FinishedBotScreenItem) {
         if let bot = bots.first(where: { $0.id == item.botID }) ?? (try? botStore.get(id: item.botID)) {
+            errorMessage = nil
             openDesk(bot)
         }
     }
@@ -4554,6 +4569,9 @@ public final class BotsViewModel: ObservableObject {
         requestLeaveUnsavedNewBot { [weak self] in
             guard let self else { return }
             if self.bots.contains(where: { $0.id == bot.id }) {
+                // Cleared before the navigation, not after: an older error
+                // must not sit above another Bot, and one openDesk raises stays.
+                self.errorMessage = nil
                 self.openDesk(bot)
             } else {
                 self.leaveStudioAfterUnsavedGate()
@@ -6067,16 +6085,20 @@ public final class BotsViewModel: ObservableObject {
         if isStopping, affectsComposer {
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                // Not `errorMessage == nil`: the strip is not modal, so an
+                // older undismissed error must not hide this one.
+                var forceStopFailed = false
                 do {
                     try await self.context.coordinator.stopAndAwaitTermination(threadId: threadID)
                 } catch {
+                    forceStopFailed = true
                     self.errorMessage = "Force stop: \(error.localizedDescription)"
                 }
                 if self.context.coordinator.activeRunId(threadId: threadID) == nil {
                     self.isStopping = false
                 } else {
                     self.isStopping = false
-                    if self.errorMessage == nil {
+                    if !forceStopFailed {
                         self.errorMessage = "Stop is taking longer than expected. Try again or restart the agent."
                     }
                 }
@@ -6668,6 +6690,12 @@ public final class BotsViewModel: ObservableObject {
     /// cannot invent a page. Blank URL compiles as omitted.
     public var advertisedBrowser: BotBrowserTarget? {
         guard let bot = selectedBot else { return nil }
+        return advertisedBrowser(for: bot)
+    }
+
+    /// A run compiles the page of the Bot it is sent to. That Bot is not
+    /// always the one open on the Mac (a paired send, a drained follow-up).
+    private func advertisedBrowser(for bot: BotDefinition) -> BotBrowserTarget? {
         let store = BotBrowserStore(appSupportDirectory: context.appSupportDirectory)
         guard let target = try? store.loadTarget(botID: bot.id) else { return nil }
         let url = target.url.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -6824,6 +6852,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func saveRoutine() {
+        errorMessage = nil
         guard let bot = selectedBot else { return }
         let name = routineName.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = routinePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -7522,6 +7551,18 @@ public final class BotsViewModel: ObservableObject {
         return DS.Space.xl
     }
 
+    /// A Bot with no name still needs a label in the roster, the Desk header
+    /// and VoiceOver. Same fallback as iOS.
+    static func displayName(_ name: String) -> String {
+        name.isEmpty ? "Untitled" : name
+    }
+
+    /// One placeholder for the Desk composer before and after the thread is
+    /// linked: in a Bot chat the Bot is who you talk to, not the provider.
+    static func deskComposerPlaceholder(botName: String) -> String {
+        "Message \(displayName(botName))…"
+    }
+
     static func cancelsWindowLeadingTitlebarGutter(presentsAsDetachedWindow: Bool) -> Bool {
         !presentsAsDetachedWindow
     }
@@ -7801,6 +7842,8 @@ public final class BotsViewModel: ObservableObject {
                     }
                 }
             }
+            // A rename changes the Desk key, so the linked composer follows.
+            syncDeskAgentVM()
         }
         return fresh
     }
@@ -9844,11 +9887,23 @@ public final class BotsViewModel: ObservableObject {
         return revision
     }
 
+    /// The open desk's skill and routine rows for `bot`; nil when another
+    /// teammate is open. In memory only.
+    private func deskBrainCache(for bot: BotDefinition) -> (skills: [BotSkillBinding], routines: [BotRoutine])? {
+        selectedBotID == bot.id ? (skills: skillBindings, routines: routines) : nil
+    }
+
     /// Send dest used to listMemory/listSkillBindings after dest
     /// painted the bubble. Use dest cache when this teammate is open.
-    private func destBrainInputs(for bot: BotDefinition) -> (memoryFiles: [BotMemoryFileText], skills: [BotSkillBinding], routines: [BotRoutine]) {
-        if selectedBotID == bot.id {
-            return (memoryFileTexts(for: bot), skillBindings, routines)
+    /// A send takes `deskBrainCache` in its acknowledgement and calls this
+    /// from its start task: the selection may have changed by then, so the
+    /// live desk rows are never read here.
+    private func destBrainInputs(
+        for bot: BotDefinition,
+        deskCache: (skills: [BotSkillBinding], routines: [BotRoutine])?
+    ) -> (memoryFiles: [BotMemoryFileText], skills: [BotSkillBinding], routines: [BotRoutine]) {
+        if let deskCache {
+            return (memoryFileTexts(for: bot), deskCache.skills, deskCache.routines)
         }
         skillListCountForTesting += 1
         routineListCountForTesting += 1
@@ -9949,6 +10004,8 @@ public final class BotsViewModel: ObservableObject {
         let botID: BotID
         let conversationID: BotConversationID
         let threadID: AgentThreadID
+        /// The embedding captures the name for its composer and empty copy.
+        let botName: String
     }
 
     private var deskAgentKey: DeskAgentKey?
@@ -9989,11 +10046,17 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         let live = conversation
-        let key = DeskAgentKey(botID: bot.id, conversationID: live.id, threadID: threadID)
+        let key = DeskAgentKey(botID: bot.id, conversationID: live.id, threadID: threadID, botName: bot.name)
         if deskAgentKey == key, deskAgentVM != nil { return }
         tearDownDeskAgentVM()
+        let threadReadsBefore = context.threadRepo.durableGetCountForTesting
+        // One read of the thread row serves the cwd, the embedded Agent App's
+        // first paint, the hand-off gate and the first runtime value. This
+        // runs on the click, on the queue the stream writer also uses.
+        let thread: AgentThread? = try? context.threadRepo.get(id: threadID)
+        let workspaceCwd = workspaceExecutionCwd(for: thread)
         let deskCwd: String
-        if let workspaceCwd = workspaceExecutionCwd(forThread: threadID) {
+        if let workspaceCwd {
             deskCwd = workspaceCwd
         } else {
             deskCwd = BotHome(appSupportDirectory: context.appSupportDirectory, bot: bot).root.path
@@ -10017,7 +10080,11 @@ public final class BotsViewModel: ObservableObject {
             },
             onRunStarted: { [weak self] runId, _ in
                 self?.deskAgentRunStarted(botID: bot.id, conversationID: live.id, runID: runId)
-            }
+            },
+            composerPlaceholder: Self.deskComposerPlaceholder(botName: bot.name),
+            emptyConversationTitle: "Message \(Self.displayName(bot.name))",
+            emptyConversationSubtitle: "This thread has no messages yet.",
+            pinnedThread: thread
         )
         let vm = AgentAppViewModel(
             workspaceID: Self.botDeskWorkspaceID,
@@ -10079,7 +10146,7 @@ public final class BotsViewModel: ObservableObject {
         vm.botNameProvider = { [weak self] botID in
             (try? self?.botStore.get(id: botID))??.name
         }
-        if workspaceExecutionCwd(forThread: threadID) != nil {
+        if workspaceCwd != nil {
             vm.handoffHost = { [weak self, weak router] oldID, actor in
                 do {
                     try router?.startBotHandoff(from: oldID, actor: actor)
@@ -10094,7 +10161,9 @@ public final class BotsViewModel: ObservableObject {
         vm.refreshProviderSnapshotsInBackground()
         deskAgentKey = key
         deskAgentVM = vm
-        observeDeskThreadRuntime(threadID, in: vm)
+        observeDeskThreadRuntime(threadID, in: vm, row: thread)
+        lastDeskAgentSyncThreadReadCountForTesting =
+            context.threadRepo.durableGetCountForTesting - threadReadsBefore
     }
 
     /// Desk send gate: nil when Docker reports the bot's container running.
@@ -10140,9 +10209,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     /// Workspace-linked threads keep running in their workspace (or worktree), not the bot home.
-    private func workspaceExecutionCwd(forThread threadID: AgentThreadID) -> String? {
-        guard let thread = (try? context.threadRepo.get(id: threadID)) ?? nil,
-              let workspaceID = thread.workspaceId else { return nil }
+    private func workspaceExecutionCwd(for thread: AgentThread?) -> String? {
+        guard let thread, let workspaceID = thread.workspaceId else { return nil }
         if let worktree = thread.worktreePath, !worktree.isEmpty { return worktree }
         return context.state.workspaces[workspaceID]?.cwd
     }
@@ -10261,23 +10329,30 @@ public final class BotsViewModel: ObservableObject {
 
     /// Re-reads the placement whenever the thread's target or provider
     /// changes on the embedded Agent App (a Mac handoff, an approved Mac
-    /// execution request, a model switch); the first value comes at once.
-    private func observeDeskThreadRuntime(_ threadID: AgentThreadID, in vm: AgentAppViewModel) {
+    /// execution request, a model switch); the first value comes at once,
+    /// from the row the desk sync just read.
+    private func observeDeskThreadRuntime(
+        _ threadID: AgentThreadID,
+        in vm: AgentAppViewModel,
+        row: AgentThread?
+    ) {
         struct Route: Equatable {
             let target: ExecutionTarget?
             let provider: AgentProvider?
         }
+        refreshDeskThreadRuntime(threadID, row: row)
         deskThreadRuntimeObservation = vm.$threads
             .map { $0.first(where: { $0.id == threadID }).map { Route(target: $0.executionTarget, provider: $0.provider) } }
             .removeDuplicates()
+            .dropFirst()
             .sink { [weak self] _ in self?.refreshDeskThreadRuntime(threadID) }
     }
 
-    private func refreshDeskThreadRuntime(_ threadID: AgentThreadID) {
+    private func refreshDeskThreadRuntime(_ threadID: AgentThreadID, row: AgentThread? = nil) {
         let next = DeskThreadRuntime(
             threadID: threadID,
             placementInGuest: ((try? context.threadRepo.guestPlacement(of: threadID)) ?? nil)?.runsInGuest == true,
-            provider: ((try? context.threadRepo.get(id: threadID)) ?? nil)?.provider
+            provider: (row ?? (try? context.threadRepo.get(id: threadID)))?.provider
         )
         if next != deskThreadRuntime { deskThreadRuntime = next }
     }
@@ -10324,7 +10399,7 @@ public final class BotsViewModel: ObservableObject {
         let inGuest = runsInGuest(threadID: threadID, provider: routing.provider)
         let conversation = conversations.first(where: { $0.id == conversationID })
             ?? ((try? botStore.conversation(id: conversationID)) ?? nil)
-        let brain = destBrainInputs(for: bot)
+        let brain = destBrainInputs(for: bot, deskCache: deskBrainCache(for: bot))
         let receipt = BotBrainCompiler.assemble(
             bot: bot,
             revision: revision,
@@ -10334,7 +10409,7 @@ public final class BotsViewModel: ObservableObject {
             ownedSkills: ownedSkillTexts(for: bot),
             routines: brain.routines,
             workspace: nil,
-            browser: advertisedBrowser,
+            browser: advertisedBrowser(for: bot),
             conversationID: conversation?.id ?? conversationID,
             liveRunMode: routing.permissionMode,
             runProvider: routing.provider,
@@ -10588,9 +10663,12 @@ public final class BotsViewModel: ObservableObject {
     ) throws -> BotStartedRun? {
         // Dest first. Send used to listMemory/listSkillBindings after the
         // bubble painted. Both Desk and host-catalog sends snapshot the same
-        // cached brain before starting the provider.
-        let brain = destBrainInputs(for: bot)
-        lastSendUsedDestBrainForTesting = selectedBotID == bot.id
+        // cached brain before starting the provider. Only the desk rows are
+        // taken here; the memory files and the store rows are read in the
+        // start task below, so the acknowledgement of a paired send does not
+        // wait on reads it never uses.
+        let deskBrain = deskBrainCache(for: bot)
+        lastSendUsedDestBrainForTesting = deskBrain != nil
         guard let router = resolvedRouter(),
               let revision = try currentRevision(for: bot) else {
             recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
@@ -10644,6 +10722,11 @@ public final class BotsViewModel: ObservableObject {
                     self.clearDeskSendInFlight(for: bot.id)
                     return
                 }
+                // `bot_send_start`: from reading the Bot's brain until the
+                // provider has accepted the turn or the start has failed.
+                let signposter = PerfSwitchMetrics.signposter
+                let startInterval = signposter.beginInterval("bot_send_start", id: signposter.makeSignpostID())
+                let brain = self.destBrainInputs(for: bot, deskCache: deskBrain)
                 let started = await self.startSupervisedRun(
                     bot: bot,
                     revision: revision,
@@ -10656,6 +10739,7 @@ public final class BotsViewModel: ObservableObject {
                     router: router,
                     expectedEpoch: epoch
                 )
+                signposter.endInterval("bot_send_start", startInterval)
                 self.forgetDeskSend(work, botID: bot.id)
                 self.clearDeskSendInFlight(for: bot.id)
                 if let started {
@@ -10736,7 +10820,7 @@ public final class BotsViewModel: ObservableObject {
                 ownedSkills: ownedSkillTexts(for: bot),
                 routines: routines,
                 workspace: nil,
-                browser: advertisedBrowser,
+                browser: advertisedBrowser(for: bot),
                 conversationID: prepared.conversation.id,
                 liveRunMode: routing.permissionMode,
                 runProvider: routing.provider,
@@ -10929,7 +11013,23 @@ public final class BotsViewModel: ObservableObject {
 
     private func enqueueFollowUp(_ item: BotQueuedFollowUp, botID: BotID) {
         queuedFollowUpsByBot[botID, default: []].append(item)
-        persistQueuedFollowUps()
+        // One queued message writes one row, appended after the Bot's stored
+        // rows. `persistQueuedFollowUps` deletes and re-inserts every Bot's
+        // queue, and this runs inside the acknowledgement of a paired send.
+        // It stays as the fallback so a refused insert persists as before, and
+        // the legacy defaults copy is dropped here as that rewrite drops it.
+        let record = BotQueuedFollowUpRecord(
+            id: item.id.uuidString.lowercased(),
+            botID: botID,
+            conversationID: item.conversationID?.value.uuidString.lowercased(),
+            text: item.text,
+            payloadJSON: encodeQueuedFollowUpPayload(item)
+        )
+        if (try? botStore.enqueueQueuedFollowUp(record)) != nil {
+            UserDefaults.standard.removeObject(forKey: Self.queuedFollowUpsDefaultsKey)
+        } else {
+            persistQueuedFollowUps()
+        }
         syncQueuedFollowUps()
     }
 
@@ -11793,7 +11893,7 @@ public struct BotsModeSwitcher: View {
             }
             .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
             .frame(maxWidth: .infinity, minHeight: 26)
-            .background(selected ? Color.white.opacity(0.12) : Color.clear)
+            .background(selected ? DS.Palette.pressed : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             .contentShape(Rectangle())
         }
@@ -11963,6 +12063,7 @@ public struct BotsRosterList: View {
             && vm.screen.resolvedDestination != .group
         let state = vm.attentionState(for: bot)
         let preview = vm.rosterPreview(for: bot)
+        let displayName = BotsViewModel.displayName(bot.name)
         let identity = BotsChrome.identityColor(
             name: bot.name,
             handle: bot.handle,
@@ -11987,13 +12088,15 @@ public struct BotsRosterList: View {
                 }
                 .frame(width: BotsChrome.rosterAvatarSize, height: BotsChrome.rosterAvatarSize)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(bot.name)
+                    Text(displayName)
                         .font(selected ? DS.Font.bodyStrong : DS.Font.body)
                         .foregroundColor(DS.Palette.text)
                         .lineLimit(1)
                     Text(preview)
                         .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
+                        // The selected fill is the Bot's own colour, where
+                        // textSecondary can drop under 4.5:1.
+                        .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
@@ -12023,6 +12126,7 @@ public struct BotsRosterList: View {
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                     .fill(selected ? identity.opacity(0.22) : Color.white.opacity(0.001))
             )
+            .dsHoverFill(enabled: !selected)
             .overlay(alignment: .leading) {
                 if selected {
                     identity
@@ -12034,8 +12138,8 @@ public struct BotsRosterList: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("\(bot.name) · \(BotsChrome.statusTitle(for: state))")
-        .accessibilityLabel(bot.name)
+        .help("\(displayName) · \(BotsChrome.statusTitle(for: state))")
+        .accessibilityLabel(displayName)
         .accessibilityValue("\(bot.pinned ? "Pinned. " : "")\(bot.hidden ? "Hidden. " : "")\(BotsChrome.statusTitle(for: state)). \(preview)")
         .accessibilityIdentifier("bots.roster.row.\(bot.handle)")
         .contextMenu {
@@ -12174,6 +12278,7 @@ public struct BotsRootView: View {
     private let embedsRosterRail: Bool
     @State private var pendingClearAllDeskThreads = false
     @State private var pendingDockerDataClear: BotID?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
         self.vm = vm
@@ -12196,23 +12301,35 @@ public struct BotsRootView: View {
                     .frame(width: 1)
                     .accessibilityHidden(true)
             }
-            Group {
-                switch vm.screen.resolvedDestination {
-                case .studio:
-                    BotsStudioReactiveScope(studioState: vm.studioState) {
-                        studioScreen
-                    }
-                case .activeBots:
-                    ActiveBotsRootView(vm: vm)
-                case .scheduleTasks:
-                    BotScheduleTasksRootView(vm: vm)
-                case .group:
-                    BotGroupRoomScreen(vm: vm, teamsGroups: vm.teamsGroups)
-                case .desk, .fleet, .attention:
-                    deskScreen
+            VStack(spacing: 0) {
+                // A row, not an alert: an error must not block the window or
+                // take the composer's focus, and must stay until dismissed.
+                if let message = vm.errorMessage {
+                    AgentChatErrorStrip(
+                        message: message,
+                        identifier: "bots.error",
+                        announcementToken: vm.errorMessageRevision,
+                        onDismiss: { vm.errorMessage = nil }
+                    )
                 }
+                Group {
+                    switch vm.screen.resolvedDestination {
+                    case .studio:
+                        BotsStudioReactiveScope(studioState: vm.studioState) {
+                            studioScreen
+                        }
+                    case .activeBots:
+                        ActiveBotsRootView(vm: vm)
+                    case .scheduleTasks:
+                        BotScheduleTasksRootView(vm: vm)
+                    case .group:
+                        BotGroupRoomScreen(vm: vm, teamsGroups: vm.teamsGroups)
+                    case .desk, .fleet, .attention:
+                        deskScreen
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: embedsRosterRail ? 980 : 700, minHeight: 680)
         .background(DS.Palette.bg)
@@ -12221,14 +12338,6 @@ public struct BotsRootView: View {
         // Ceo header floats a titlebar below the traffic lights, .leading
         // or it hangs in empty padding beside the open sidebar.
         .modifier(BotsTitlebarBleed(edges: titlebarSafeAreaEdges))
-        .alert("Bots", isPresented: Binding(
-            get: { vm.errorMessage != nil },
-            set: { if !$0 { vm.errorMessage = nil } }
-        )) {
-            Button("OK") { vm.errorMessage = nil }
-        } message: {
-            Text(vm.errorMessage ?? "")
-        }
         .confirmationDialog(
             "Remove secret?",
             isPresented: Binding(
@@ -12436,6 +12545,10 @@ public struct BotsRootView: View {
                     .accessibilityIdentifier("bots.studio.openChat")
             }
             Button(BotsChrome.Label.saveBot) {
+                // The error strip is not modal, so an older message can still
+                // be set here. Clear it: presentAlertError keeps any message
+                // already set and would hide this save's own failure behind it.
+                vm.errorMessage = nil
                 do {
                     _ = try vm.saveStudio()
                 } catch {
@@ -12929,7 +13042,7 @@ public struct BotsRootView: View {
                     ? AgentChatThreadRailCopy.hideHelp
                     : AgentChatThreadRailCopy.showHelp
             ) {
-                withAnimation(DS.Motion.standard) {
+                withAnimation(reduceMotion ? nil : DS.Motion.standard) {
                     vm.isDeskThreadRailVisible.toggle()
                 }
             }
@@ -12947,11 +13060,17 @@ public struct BotsRootView: View {
                     )
                     VStack(alignment: .leading, spacing: 1) {
                         HStack(spacing: DS.Space.sm) {
-                            Text(bot.name)
+                            // One line: the bar is a fixed 44pt strip, so a
+                            // long name must truncate, not wrap over the chat.
+                            Text(BotsViewModel.displayName(bot.name))
                                 .font(DS.Font.bodyStrong)
                                 .foregroundColor(DS.Palette.text)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .help(BotsViewModel.displayName(bot.name))
                                 .accessibilityIdentifier("bots.desk.name")
                             attentionBadge(vm.attentionState(for: bot))
+                                .layoutPriority(1)
                         }
                         HStack(spacing: DS.Space.sm) {
                             Text(bot.title.isEmpty ? "No job yet" : bot.title)
@@ -12960,11 +13079,11 @@ public struct BotsRootView: View {
                                 .accessibilityIdentifier("bots.desk.job")
                             Text("@\(bot.handle)")
                                 .font(DS.Font.caption2)
-                                .foregroundColor(DS.Palette.textTertiary)
+                                .foregroundColor(DS.Palette.textSecondary)
                                 .accessibilityIdentifier("bots.desk.handle")
                             Text(vm.permissionLabel(for: bot))
                                 .font(DS.Font.caption2)
-                                .foregroundColor(DS.Palette.textTertiary)
+                                .foregroundColor(DS.Palette.textSecondary)
                                 .accessibilityIdentifier("bots.desk.permission")
                         }
                         .lineLimit(1)
@@ -12973,7 +13092,7 @@ public struct BotsRootView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Open Studio for \(bot.name)")
+            .accessibilityLabel("Open Studio for \(BotsViewModel.displayName(bot.name))")
             .accessibilityIdentifier("bots.desk.identity")
             Spacer(minLength: DS.Space.lg)
             HStack(spacing: Self.deskHeaderIconSpacing) {
@@ -12995,7 +13114,7 @@ public struct BotsRootView: View {
                     "sidebar.right",
                     help: vm.isDeskSidePaneVisible ? "Hide inspector" : "Show inspector"
                 ) {
-                    withAnimation(DS.Motion.standard) {
+                    withAnimation(reduceMotion ? nil : DS.Motion.standard) {
                         vm.isDeskSidePaneVisible.toggle()
                     }
                 }
@@ -13058,8 +13177,8 @@ public struct BotsRootView: View {
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        .animation(DS.Motion.standard, value: vm.isDeskSidePaneVisible)
-        .animation(DS.Motion.standard, value: vm.isDeskThreadRailVisible)
+        .animation(reduceMotion ? nil : DS.Motion.standard, value: vm.isDeskSidePaneVisible)
+        .animation(reduceMotion ? nil : DS.Motion.standard, value: vm.isDeskThreadRailVisible)
         .animation(nil, value: vm.selectedBotID)
         .animation(nil, value: vm.selectedConversation?.id)
         .confirmationDialog(
@@ -13082,15 +13201,40 @@ public struct BotsRootView: View {
     /// conversation's `deskRouting`, so the first run uses the model shown.
     private func deskUnlinkedComposer(_ bot: BotDefinition) -> some View {
         VStack(spacing: 0) {
-            Spacer(minLength: 0)
+            // Same copy as the linked thread's empty state, which is rarely
+            // painted: a thread is linked by its first message.
+            if vm.deskMessages.isEmpty {
+                DSEmptyState(
+                    icon: "sparkles",
+                    title: "Message \(BotsViewModel.displayName(bot.name))",
+                    subtitle: "This thread has no messages yet."
+                )
+                // Reaches the subtitle too: three lines keep it whole in the
+                // narrowest chat column.
+                .lineLimit(3)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, DS.Space.lg)
+            } else {
+                // A send that persisted but could not link its thread: the
+                // message exists, so the column must not say it does not.
+                Spacer(minLength: 0)
+            }
             AgentChatComposerBar(
                 text: $vm.composerText,
                 attachments: vm.attachments,
-                placeholder: "Message \(bot.name)…",
+                placeholder: BotsViewModel.deskComposerPlaceholder(botName: bot.name),
                 sendEnabled: vm.deskSendEnabled,
                 runActive: vm.deskRunIsLive,
                 isStopping: vm.isStopping,
-                onSend: { vm.send() },
+                onSend: {
+                    // The owner's own send starts from an empty error slot, as
+                    // it did behind the modal alert: the refusal of the last
+                    // attempt must not stay above a send that went through.
+                    // Not inside send(): queued follow-ups drain through it
+                    // and must not erase an error on their own.
+                    vm.errorMessage = nil
+                    vm.send()
+                },
                 onStop: { vm.stopDeskRun() },
                 onAttach: { vm.addAttachments($0) },
                 onRemoveAttachment: { vm.removeAttachment($0) },
@@ -13514,7 +13658,7 @@ public struct BotsRootView: View {
             newIdentifier: "bots.desk.thread.new",
             searchIdentifier: "bots.desk.thread.search",
             onHide: {
-                withAnimation(DS.Motion.standard) {
+                withAnimation(reduceMotion ? nil : DS.Motion.standard) {
                     vm.isDeskThreadRailVisible = false
                 }
             },
@@ -14025,38 +14169,42 @@ private struct BotGuestDesktopRoot: View {
     @ObservedObject var vm: BotsViewModel
 
     var body: some View {
-        Group {
-            if let bot = vm.selectedBot {
-                BotComputerGuestCanvas(
-                    url: vm.guestScreenURL(for: bot.id),
-                    running: vm.isGuestRunning(bot.id),
-                    rebuilding: vm.isGuestRebuilding(bot.id),
-                    launchState: vm.guestLaunchState(for: bot.id),
-                    startIdentifier: "bots.desk.desktop.window.start",
-                    rebuildIdentifier: "bots.desk.desktop.window.rebuild",
-                    stopIdentifier: "bots.desk.desktop.window.stop",
-                    screenIdentifier: "bots.desk.desktop.window.guestScreen",
-                    onStart: { vm.presentGuestDesktop(botID: bot.id) },
-                    onRebuild: { vm.rebuildDockerGuest(botID: bot.id) },
-                    onStop: { vm.stopDockerGuest(botID: bot.id) }
+        VStack(spacing: 0) {
+            // Same non-modal row as the Bots root: a failed Rebuild or Stop
+            // stays on screen without blocking the desktop.
+            if let message = vm.errorMessage {
+                AgentChatErrorStrip(
+                    message: message,
+                    identifier: "bots.desk.desktop.window.error",
+                    announcementToken: vm.errorMessageRevision,
+                    onDismiss: { vm.errorMessage = nil }
                 )
-                .padding(DS.Space.lg)
-            } else {
-                Text("Start the Linux desktop to use this machine.")
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textSecondary)
             }
+            Group {
+                if let bot = vm.selectedBot {
+                    BotComputerGuestCanvas(
+                        url: vm.guestScreenURL(for: bot.id),
+                        running: vm.isGuestRunning(bot.id),
+                        rebuilding: vm.isGuestRebuilding(bot.id),
+                        launchState: vm.guestLaunchState(for: bot.id),
+                        startIdentifier: "bots.desk.desktop.window.start",
+                        rebuildIdentifier: "bots.desk.desktop.window.rebuild",
+                        stopIdentifier: "bots.desk.desktop.window.stop",
+                        screenIdentifier: "bots.desk.desktop.window.guestScreen",
+                        onStart: { vm.presentGuestDesktop(botID: bot.id) },
+                        onRebuild: { vm.rebuildDockerGuest(botID: bot.id) },
+                        onStop: { vm.stopDockerGuest(botID: bot.id) }
+                    )
+                    .padding(DS.Space.lg)
+                } else {
+                    Text("Start the Linux desktop to use this machine.")
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.Palette.surface)
-        .alert("Bots", isPresented: Binding(
-            get: { vm.errorMessage != nil },
-            set: { if !$0 { vm.errorMessage = nil } }
-        )) {
-            Button("OK") { vm.errorMessage = nil }
-        } message: {
-            Text(vm.errorMessage ?? "")
-        }
         .onAppear { vm.scheduleFreshnessPass() }
     }
 }

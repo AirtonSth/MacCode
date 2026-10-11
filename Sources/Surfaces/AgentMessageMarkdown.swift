@@ -710,6 +710,13 @@ struct CodeBlockCopyChrome: View {
     let text: String
     @State private var hovered = false
     @State private var copied = false
+    @FocusState private var copyFocused: Bool
+
+    /// Copy stays mounted so keyboard and VoiceOver reach it without a
+    /// pointer; hover or keyboard focus only decides whether it is painted.
+    nonisolated static func copyOpacity(hovered: Bool, focused: Bool) -> Double {
+        hovered || focused ? 1 : 0
+    }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -726,29 +733,32 @@ struct CodeBlockCopyChrome: View {
             .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                 .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
 
-            if hovered {
-                Button(action: {
-                    AgentMessageMarkdown.copyCodeToPasteboard(text)
-                    copied = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                        copied = false
-                    }
-                }) {
-                    Text(copied ? "Copied" : "Copy")
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .padding(.horizontal, DS.Space.sm)
-                        .padding(.vertical, DS.Space.xxs)
-                        .background(DS.Palette.surfaceRaised)
-                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+            Button(action: {
+                AgentMessageMarkdown.copyCodeToPasteboard(text)
+                copied = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                    copied = false
                 }
-                .buttonStyle(.plain)
-                .help("Copy code to clipboard")
-                .padding(DS.Space.sm)
-                .transition(.opacity)
+            }) {
+                Text(copied ? "Copied" : "Copy")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .padding(.horizontal, DS.Space.sm)
+                    .padding(.vertical, DS.Space.xxs)
+                    .background(DS.Palette.surfaceRaised)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    // Fade the label, not the Button: a zero-opacity control
+                    // can drop out of the accessibility tree.
+                    .opacity(Self.copyOpacity(hovered: hovered, focused: copyFocused))
             }
+            .buttonStyle(.plain)
+            .focused($copyFocused)
+            .accessibilityLabel(copied ? "Copied" : "Copy code")
+            .accessibilityIdentifier("agent.codeBlock.copy")
+            .help("Copy code to clipboard")
+            .padding(DS.Space.sm)
         }
         .onHover { inside in
             withAnimation(.easeInOut(duration: 0.12)) {
@@ -973,7 +983,7 @@ struct DiffPreviewText: View {
         }
         if lines.count > maxLines {
             var more = AttributedString("… \(lines.count - maxLines) more lines")
-            more.foregroundColor = DS.Palette.textTertiary
+            more.foregroundColor = DS.Palette.textSecondary
             out.append(more)
         }
         return out
@@ -1054,7 +1064,7 @@ struct AgentFileEditDiffCard: View {
                     } else if model.hiddenLineCount > 0 {
                         Text("… \(model.hiddenLineCount) more lines truncated")
                             .font(DS.Font.caption2)
-                            .foregroundColor(DS.Palette.textTertiary)
+                            .foregroundColor(DS.Palette.textSecondary)
                             .padding(.horizontal, DS.Space.sm)
                             .padding(.vertical, 4)
                     }

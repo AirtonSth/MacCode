@@ -165,6 +165,7 @@ public struct AgentCompactMenuRow: View {
             .padding(.vertical, DS.Space.xs)
             .frame(width: width, alignment: .leading)
             .background(selected ? DS.Palette.selection : Color.clear)
+            .dsHoverFill(enabled: !selected)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
         }
         .buttonStyle(.plain)

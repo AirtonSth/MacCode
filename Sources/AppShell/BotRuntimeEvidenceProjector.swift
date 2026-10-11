@@ -1,11 +1,13 @@
 import Foundation
+import os
 import CoreModel
+import Persistence
 import SocketServer
 import RemoteCodeTreaty
 
 /// Projects Agent runtime events only after a completed Bot send receipt binds
-/// one authenticated host/Bot/conversation/request/run/thread tuple, then
-/// reconciles matching events retained before that binding became available.
+/// one authenticated host/Bot/conversation/request/run/thread tuple. Matching
+/// events retained before that binding are reconciled only for a replayed receipt.
 final class BotRuntimeEvidenceProjector: @unchecked Sendable {
     struct TerminalEvidence: Equatable {
         let botID: String
@@ -22,19 +24,69 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
         let threadID: String
     }
 
+    /// `bot.run.stream` carries ids only: it is liveness evidence, and every
+    /// one costs a frame and flushes the delta coalescing window. A bound run
+    /// publishes its first one at once and then at most one per interval.
+    static let streamTickInterval: TimeInterval = 1
+
     private let eventBus: EventBus
     private let onTerminal: (TerminalEvidence) -> Void
+    private let now: () -> Date
+    /// `onTerminal` settles the run with SQLite reads and writes. It runs
+    /// here, in the order the terminals were projected, so the EventBus
+    /// delivery lane fans `bot.run.completed` out without waiting for it.
+    private let terminalQueue = DispatchQueue(
+        label: "io.remotecode.bot-runtime-evidence.terminal",
+        qos: .userInitiated
+    )
     private let lock = NSLock()
     private var bindingsByRunID: [String: Binding] = [:]
     private var lastProjectedSequenceByRunID: [String: Int64] = [:]
+    private var lastStreamTickByRunID: [String: Date] = [:]
+    /// `bot_first_event` signpost intervals on `io.remotecode.perf`, open from
+    /// binding a new receipt to the run's first projected event, one per Bot
+    /// (a Bot has one live run). A run whose start was abandoned projects no
+    /// event: its interval stays open until the Bot's next send closes it.
+    private var firstEventIntervalByBotID: [String: OSSignpostIntervalState] = [:]
+    private var replayedEventCount = 0
     private var subscriptionID: UUID?
+
+    /// Test seam: events that registration replay subscriptions passed to `receive`.
+    var replayedEventCountForTesting: Int {
+        lock.lock(); defer { lock.unlock() }
+        return replayedEventCount
+    }
+
+    /// Test seam: returns once every terminal projected so far has run `onTerminal`.
+    func flushTerminalsForTesting() {
+        terminalQueue.sync {}
+    }
+
+    /// Test seam: keeps the terminals projected from now on queued, as when
+    /// this queue has not been scheduled yet, until `release` is signalled.
+    func holdTerminalsForTesting(until release: DispatchSemaphore) {
+        terminalQueue.async { release.wait() }
+    }
+
+    /// Runs `completion` once every terminal projected before this call has
+    /// run `onTerminal`; a terminal projected later is not waited for. A read
+    /// made on `bot.run.completed` waits here, so it never reports that run
+    /// unsettled. The terminal is queued before its event reaches a
+    /// subscriber: `receive` runs on the EventBus delivery lane, which
+    /// delivers the projected event only after `receive` has returned.
+    /// Never blocks the caller: safe on the MainActor and on this queue.
+    func afterQueuedTerminals(_ completion: @escaping @Sendable () -> Void) {
+        terminalQueue.async(execute: completion)
+    }
 
     init(
         eventBus: EventBus = .shared,
-        onTerminal: @escaping (TerminalEvidence) -> Void = { _ in }
+        onTerminal: @escaping (TerminalEvidence) -> Void = { _ in },
+        now: @escaping () -> Date = { Date() }
     ) {
         self.eventBus = eventBus
         self.onTerminal = onTerminal
+        self.now = now
         subscriptionID = eventBus.subscribe(since: eventBus.currentSeq) { [weak self] event in
             self?.receive(event)
         }
@@ -81,25 +133,48 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             threadID: canonicalRuntimeID(threadID)
         )
         lock.lock()
+        // A new receipt names a run that has published nothing yet: its
+        // provider start is queued behind the MainActor turn that registers
+        // it. Only an idempotent replay of a receipt this projector already
+        // knows can have retained events left to reconcile.
+        let isReplayedReceipt = bindingsByRunID[binding.runID] != nil
+            || lastProjectedSequenceByRunID[binding.runID] != nil
         bindingsByRunID[binding.runID] = binding
+        let signposter = PerfSwitchMetrics.signposter
+        if !isReplayedReceipt, signposter.isEnabled {
+            let abandoned = firstEventIntervalByBotID.updateValue(
+                signposter.beginInterval("bot_first_event", id: signposter.makeSignpostID()),
+                forKey: binding.botID
+            )
+            if let abandoned { signposter.endInterval("bot_first_event", abandoned) }
+        }
         lock.unlock()
 
-        let replaySubscriptionID = eventBus.subscribe(since: 0) { [weak self] event in
-            self?.receive(event)
+        if isReplayedReceipt {
+            let replaySubscriptionID = eventBus.subscribe(since: 0) { [weak self] event in
+                self?.receiveReplayed(event)
+            }
+            eventBus.unsubscribe(replaySubscriptionID)
         }
-        eventBus.unsubscribe(replaySubscriptionID)
 
-        let oldestRetainedSequence = eventBus.recentEvents(since: 0, maxBytes: nil).events.first?.seq
+        let ring = eventBus.healthCounters()
         lock.lock()
-        if let oldestRetainedSequence {
+        if ring.retainedCount > 0 {
             lastProjectedSequenceByRunID = lastProjectedSequenceByRunID.filter {
-                $0.value >= oldestRetainedSequence
+                $0.value >= ring.oldestRetainedSeq
             }
         } else {
             lastProjectedSequenceByRunID.removeAll()
         }
         lock.unlock()
         return true
+    }
+
+    private func receiveReplayed(_ event: EventBus.Event) {
+        lock.lock()
+        replayedEventCount += 1
+        lock.unlock()
+        receive(event)
     }
 
     private func receive(_ event: EventBus.Event) {
@@ -129,8 +204,25 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
             return
         }
         lastProjectedSequenceByRunID[runID] = event.seq
+        if !firstEventIntervalByBotID.isEmpty,
+           let firstEventInterval = firstEventIntervalByBotID.removeValue(forKey: binding.botID) {
+            PerfSwitchMetrics.signposter.endInterval("bot_first_event", firstEventInterval)
+        }
         if projectedKind == .botRunCompleted || projectedKind == .botRunFailed {
             bindingsByRunID.removeValue(forKey: runID)
+            lastStreamTickByRunID.removeValue(forKey: runID)
+        } else {
+            let tickTime = now()
+            if let lastTick = lastStreamTickByRunID[runID] {
+                let elapsed = tickTime.timeIntervalSince(lastTick)
+                // A wall clock stepped backwards (negative) publishes: it
+                // must never hold liveness back.
+                if elapsed >= 0, elapsed < Self.streamTickInterval {
+                    lock.unlock()
+                    return
+                }
+            }
+            lastStreamTickByRunID[runID] = tickTime
         }
         lock.unlock()
 
@@ -152,11 +244,12 @@ final class BotRuntimeEvidenceProjector: @unchecked Sendable {
         }
         eventBus.publish(kind: projectedKind, payload: .object(projectedPayload))
         if projectedKind == .botRunCompleted || projectedKind == .botRunFailed {
-            onTerminal(TerminalEvidence(
+            let terminal = TerminalEvidence(
                 botID: binding.botID,
                 runID: binding.runID,
                 failed: projectedKind == .botRunFailed
-            ))
+            )
+            terminalQueue.async { [self] in onTerminal(terminal) }
         }
     }
 

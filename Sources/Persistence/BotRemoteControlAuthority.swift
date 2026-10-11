@@ -123,6 +123,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var consumedRoutingReceipts: Set<String> = []
     private var selectedConversation: [String: String] = [:]
     private var generation: Int = 1
+    /// The JSON this process last committed for each sidecar key, so a
+    /// mutation writes only the rows it changed. Empty at launch: the first
+    /// persist writes every row.
+    private var persistedSidecarJSON: [String: Data] = [:]
 
     private struct QuarantinedBotState {
         let wasUnpublished: Bool
@@ -4003,11 +4007,21 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
     }
 
+    /// Writes the sidecar rows whose JSON changed since this process last
+    /// committed them, in one transaction: one durable commit per mutation
+    /// instead of one per key. Returns the keys that were not written; those
+    /// stay out of `persistedSidecarJSON`, so the next persist writes them again.
     @discardableResult
     private func persistSidecar() -> [String] {
         var failed: [String] = []
+        var changed: [(key: String, json: Data)] = []
         func save(_ key: String, _ value: Any) {
-            if !saveJSON(key, value) { failed.append(key) }
+            guard JSONSerialization.isValidJSONObject(value),
+                  let json = try? JSONSerialization.data(withJSONObject: value) else {
+                failed.append(key)
+                return
+            }
+            if persistedSidecarJSON[key] != json { changed.append((key, json)) }
         }
         save("bot.remote.unpublished", Array(unpublished).sorted())
         save("bot.remote.receipts", persistentReceiptSnapshot())
@@ -4031,7 +4045,30 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         save("bot.remote.attention", attention)
         save("bot.remote.scheduler_runs", schedulerRuns)
         save("bot.remote.routine_runtime", routineRuntime)
-        return failed
+        guard !changed.isEmpty else { return failed }
+        var rejected: [String] = []
+        do {
+            try db.transaction {
+                // The transaction helper runs this block again after a lock retry.
+                rejected = []
+                for row in changed {
+                    do {
+                        try writeSidecarRow(row.key, String(decoding: row.json, as: UTF8.self), database: db)
+                    } catch {
+                        // Only this statement is undone; the other rows still commit.
+                        rejected.append(row.key)
+                    }
+                }
+            }
+        } catch {
+            // What reached the database is unknown: write these rows again next time.
+            for row in changed { persistedSidecarJSON[row.key] = nil }
+            return failed + changed.map { $0.key }
+        }
+        for row in changed where !rejected.contains(row.key) {
+            persistedSidecarJSON[row.key] = row.json
+        }
+        return failed + rejected
     }
 
     /// Frame bytes stay available to the live receipt/state read path, but are
@@ -4088,6 +4125,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard JSONSerialization.isValidJSONObject(value),
               let data = try? JSONSerialization.data(withJSONObject: value),
               let text = String(data: data, encoding: .utf8) else { return false }
+        do {
+            try db.performSync { database in
+                try writeSidecarRow(key, text, database: database)
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func writeSidecarRow(_ key: String, _ text: String, database: SQLiteDB) throws {
 #if DEBUG
         let timestamp = useLegacySidecarDateFormatterForBenchmark
             ? ISO8601DateFormatter().string(from: Date())
@@ -4095,20 +4143,13 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 #else
         let timestamp = iso.string(from: Date())
 #endif
-        do {
-            try db.performSync { database in
-                let statement = try database.prepare(
-                    "INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;"
-                )
-                defer { statement.reset() }
-                try statement.bind(1, key)
-                try statement.bind(2, text)
-                try statement.bind(3, timestamp)
-                _ = try statement.step()
-            }
-            return true
-        } catch {
-            return false
-        }
+        let statement = try database.prepare(
+            "INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;"
+        )
+        defer { statement.reset() }
+        try statement.bind(1, key)
+        try statement.bind(2, text)
+        try statement.bind(3, timestamp)
+        _ = try statement.step()
     }
 }

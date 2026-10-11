@@ -962,7 +962,11 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     /// retried fork converges on the same child, and `compensateFork` deletes it.
     public var forkSafety: AgentProviderForkSafety { .keyedIdempotent(compensationSupported: true) }
 
-    public func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety { .keyedIdempotent(compensationSupported: true) }
+    /// A guest thread has no Mac session to fork (`forkThread` refuses it), so it
+    /// must not advertise a durable fork: the coordinator would write a fork intent first.
+    public func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety {
+        isGuestThread(threadId) ? .unsupported : .keyedIdempotent(compensationSupported: true)
+    }
 
     /// Namespace for deterministic fork child session ids. Fixed so the same idempotency key
     /// always maps to the same Distill session id.

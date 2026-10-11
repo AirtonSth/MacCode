@@ -628,16 +628,13 @@ public struct AgentChatLiveToolRow: View, Equatable {
                     )
                     .frame(maxWidth: .infinity, alignment: .leading)
                     if let full = commandFull, !full.isEmpty {
-                        Button {
-                            AgentChatTranscriptChrome.copyToPasteboard(full)
-                        } label: {
-                            Image(systemName: "doc.on.doc")
+                        AgentChatCopyButton(text: full) { copied in
+                            Image(systemName: AgentChatCopyChrome.symbolName(copied: copied))
                                 .font(.system(size: 10))
                                 .foregroundColor(DS.Palette.textTertiary)
                                 .frame(width: 22, height: 22)
                                 .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
                         .help("Copy full command")
                         .accessibilityIdentifier("agent.tool.copyCommand.\(item.id)")
                     }
@@ -645,7 +642,7 @@ public struct AgentChatLiveToolRow: View, Equatable {
                 .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(DS.Palette.surface)
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             }
 
             if let activityHint {
@@ -661,7 +658,7 @@ public struct AgentChatLiveToolRow: View, Equatable {
                 .padding(.vertical, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(DS.Palette.accent.opacity(0.06))
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
                 .accessibilityIdentifier("agent.tool.activityHint.\(item.id)")
             }
 
@@ -675,7 +672,7 @@ public struct AgentChatLiveToolRow: View, Equatable {
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface.opacity(0.7))
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
                     .accessibilityIdentifier("agent.tool.fullCommand.\(item.id)")
             }
 
@@ -689,7 +686,7 @@ public struct AgentChatLiveToolRow: View, Equatable {
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -702,6 +699,7 @@ public struct AgentChatToolGroupRow: View {
     public let items: [AssistantItem]
     @Binding public var expandedGroupIDs: Set<String>
     @Binding public var expandedToolIDs: Set<String>
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(
         id: String,
@@ -724,7 +722,7 @@ public struct AgentChatToolGroupRow: View {
             : (failed ? "exclamationmark.triangle" : "terminal")
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
+                withAnimation(reduceMotion ? nil : DS.Motion.micro) {
                     if expanded { expandedGroupIDs.remove(id) } else { expandedGroupIDs.insert(id) }
                 }
             } label: {
@@ -781,6 +779,7 @@ public struct AgentChatWorkSoFarDisclosure: View {
     @Binding public var expandedReasoning: Set<String>
     @Binding public var expandedTools: Set<String>
     @Binding public var expandedToolGroups: Set<String>
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(
         turn: AssistantTurnSnapshot,
@@ -807,7 +806,7 @@ public struct AgentChatWorkSoFarDisclosure: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             Button {
-                withAnimation(.easeInOut(duration: 0.16)) { onToggle() }
+                withAnimation(reduceMotion ? nil : DS.Motion.micro) { onToggle() }
             } label: {
                 HStack(spacing: DS.Space.sm) {
                     if live {
@@ -846,7 +845,7 @@ public struct AgentChatWorkSoFarDisclosure: View {
                     }
                 }
                 .padding(.leading, DS.Space.md)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(AgentChatMotion.transition(.fadeAndMove, reduceMotion: reduceMotion))
                 .accessibilityIdentifier("agent.work.lazyList.\(turn.turnId)")
             }
         }

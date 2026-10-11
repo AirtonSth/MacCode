@@ -3662,13 +3662,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private var pairedBotRemote: BotRemoteControlAuthority?
     private var pairedGuestObserver: BotGuestObserveCoordinator?
     private var pairedBotSettlementWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
-    private lazy var botRuntimeEvidenceProjector = BotRuntimeEvidenceProjector { [weak self] terminal in
-        _ = self?.pairedBotRemote?.settleRuntime(
-            botID: terminal.botID,
-            runID: terminal.runID,
-            failed: terminal.failed
-        )
-    }
+    /// False until the projector is created, which a paired `bot.send` does.
+    /// Until then no run is bound and no settle is queued, so a read has
+    /// nothing to wait for and must not be what subscribes it to every event.
+    private(set) var botRuntimeEvidenceProjectorExists = false
+    private lazy var botRuntimeEvidenceProjector: BotRuntimeEvidenceProjector = {
+        botRuntimeEvidenceProjectorExists = true
+        return BotRuntimeEvidenceProjector { [weak self] terminal in
+            let signposter = PerfSwitchMetrics.signposter
+            let interval = signposter.beginInterval("bot_settle", id: signposter.makeSignpostID())
+            defer { signposter.endInterval("bot_settle", interval) }
+            _ = self?.pairedBotRemote?.settleRuntime(
+                botID: terminal.botID,
+                runID: terminal.runID,
+                failed: terminal.failed
+            )
+        }
+    }()
 
     /// Paired-device `bot.*` reads that touch only the authority's own state
     /// and SQLite (no MainActor callback, no queue write). They run off
@@ -3694,6 +3704,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         "bot.conversation.list",
         "bot.reserved.probe",
     ]
+    /// Paired-device reads whose answer reports a run's status, attention
+    /// state or `run_id`. `bot.run.completed` is published before the run is
+    /// settled, so each first waits for the settles already queued when it
+    /// arrives: a read made on that event never shows the run still working.
+    /// `bot.receipt.status` reads `run_outcome` from the durable run row,
+    /// already written when the event is published; it waits only so the
+    /// three reads answer in one order.
+    nonisolated static let pairedBotRunStateReadMethods: Set<String> = [
+        "bot.attention.list",
+        "bot.conversation.list",
+        "bot.receipt.status",
+    ]
+    /// Test seam: the projector whose queued settles those reads wait for.
+    var botRuntimeEvidenceProjectorForTesting: BotRuntimeEvidenceProjector { botRuntimeEvidenceProjector }
 
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
         if BotTeamGroupService.handles(method) {
@@ -3710,6 +3734,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let authority = try pairedBotAuthority()
         let foundation = Self.foundationObject(params)
+        if botRuntimeEvidenceProjectorExists, Self.pairedBotRunStateReadMethods.contains(method) {
+            // Suspends, never blocks: the MainActor stays free while a queued
+            // settle waits for SQLite.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                botRuntimeEvidenceProjector.afterQueuedTerminals { continuation.resume() }
+            }
+        }
         // An observing `bot.guest.state` goes through the observe coordinator,
         // never the plain off-main read.
         let observesGuest = method == "bot.guest.state" && foundation["observe"] as? Bool == true
@@ -3723,6 +3754,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             if Self.pairedBotMainActorReadMethods.contains(method) {
                 return JSONValue.from(try authority.dispatch(method: method, params: foundation))
+            }
+            // `bot_send_ack`: the MainActor turn that acknowledges a paired
+            // send, from admitting the run to registering its receipt.
+            let signposter = PerfSwitchMetrics.signposter
+            let sendAckInterval = method == "bot.send"
+                ? signposter.beginInterval("bot_send_ack", id: signposter.makeSignpostID())
+                : nil
+            defer {
+                if let sendAckInterval { signposter.endInterval("bot_send_ack", sendAckInterval) }
             }
             var result = try authority.dispatch(method: method, params: foundation)
             if method == "bot.stop" || method == "bot.force_stop",

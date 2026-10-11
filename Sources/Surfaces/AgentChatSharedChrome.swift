@@ -84,6 +84,8 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View, Equatable
         Button(action: onSelect) {
             HStack(spacing: DS.Space.md) {
                 statusMark
+                    // DSBusySpinner's box, so the title does not shift when a run starts.
+                    .frame(width: 16, height: 16)
                 leading
                 VStack(alignment: .leading, spacing: 1) {
                     Text(title)
@@ -92,7 +94,7 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View, Equatable
                         .lineLimit(1)
                     Text(subtitle)
                         .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textTertiary)
+                        .foregroundColor(DS.Palette.textSecondary)
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
@@ -108,6 +110,7 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View, Equatable
             .padding(.horizontal, DS.Space.md)
             .padding(.vertical, DS.Space.sm)
             .background(selected ? DS.Palette.selection : Color.clear)
+            .dsHoverFill(enabled: !selected)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             .contentShape(Rectangle())
         }
@@ -124,9 +127,13 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View, Equatable
                 Image(systemName: AgentChatThreadRowStopChrome.symbolName)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(DS.Palette.danger.opacity(0.75))
+                    .frame(width: 22, height: 22)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.trailing, DS.Space.md)
+            // The 22pt hit box is wider than the glyph; the smaller inset
+            // keeps the glyph where it was.
+            .padding(.trailing, DS.Space.xs)
             .accessibilityLabel(AgentChatThreadRowStopChrome.accessibilityLabel)
             .accessibilityIdentifier(stopIdentifier ?? "\(identifier).stop")
             .help(AgentChatThreadRowStopChrome.help)
@@ -139,12 +146,11 @@ public struct AgentChatThreadRow<Leading: View, Trailing: View>: View, Equatable
         case .hidden:
             Color.clear.frame(width: 8, height: 8)
         case .running:
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: 8, weight: .semibold))
-                .foregroundColor(DS.Palette.textTertiary)
-                .frame(width: 8, height: 8)
-                .accessibilityLabel("Running")
-                .accessibilityIdentifier(runningIdentifier ?? "\(identifier).running")
+            // Same spinner as the Bots roster and the workspace rows.
+            DSBusySpinner(
+                label: "Running",
+                identifier: runningIdentifier ?? "\(identifier).running"
+            )
         case .unread:
             Circle()
                 .fill(DS.Palette.accent)
@@ -174,7 +180,7 @@ public struct AgentThreadProviderMonogram: View {
             .foregroundColor(DS.Palette.textSecondary)
             .frame(width: 16, height: 16)
             .background(DS.Palette.surfaceRaised)
-            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             .accessibilityHidden(true)
     }
 }
@@ -794,7 +800,7 @@ private struct AgentChatAttachmentThumbnail: View {
                     .interpolation(.high)
                     .scaledToFill()
                     .frame(width: 18, height: 18)
-                    .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             } else {
                 Image(systemName: "photo")
                     .font(.system(size: 9))
@@ -910,6 +916,212 @@ public struct AgentChatWorkingPill: View {
         } else {
             pill
         }
+    }
+}
+
+/// Reduce Motion rule for chat transitions (pure, testable seam): the fade
+/// stays, the slide or the scale goes.
+public enum AgentChatMotion {
+    public enum TransitionKind: Equatable {
+        case fade
+        /// Disclosure content entering from the top.
+        case fadeAndMove
+        /// The scroll-to-latest button growing in from 0.94.
+        case fadeAndScale
+    }
+
+    public static func transitionKind(_ full: TransitionKind, reduceMotion: Bool) -> TransitionKind {
+        reduceMotion ? .fade : full
+    }
+
+    public static func transition(_ full: TransitionKind, reduceMotion: Bool) -> AnyTransition {
+        switch transitionKind(full, reduceMotion: reduceMotion) {
+        case .fade:
+            return .opacity
+        case .fadeAndMove:
+            return .opacity.combined(with: .move(edge: .top))
+        case .fadeAndScale:
+            return .opacity.combined(with: .scale(scale: 0.94))
+        }
+    }
+}
+
+/// Glyph and timing shared by every chat copy control.
+public enum AgentChatCopyChrome {
+    /// How long the check stays after a copy.
+    public static let acknowledgementSeconds: TimeInterval = 1.5
+
+    public static func symbolName(copied: Bool) -> String {
+        copied ? "checkmark" : "doc.on.doc"
+    }
+}
+
+/// The check's lifetime (pure, testable seam): a copy shows it, and only the
+/// latest copy's timer may clear it.
+public struct AgentChatCopyAcknowledgement: Equatable {
+    public private(set) var copied = false
+    private var generation = 0
+
+    public init() {}
+
+    /// Shows the check. Returns the generation to hand back to `expire`.
+    public mutating func copy() -> Int {
+        generation &+= 1
+        copied = true
+        return generation
+    }
+
+    /// Latest copy wins: an earlier timer must not clear a newer check.
+    public mutating func expire(_ generation: Int) {
+        guard generation == self.generation else { return }
+        copied = false
+    }
+}
+
+/// One copy control for the chat. It copies, then hands `copied == true` to
+/// its label for `AgentChatCopyChrome.acknowledgementSeconds`, so the click
+/// is answered where it happened. Each mount draws its own label.
+public struct AgentChatCopyButton<Label: View>: View {
+    private let text: String
+    private let label: (Bool) -> Label
+    @State private var acknowledgement = AgentChatCopyAcknowledgement()
+
+    public init(text: String, @ViewBuilder label: @escaping (_ copied: Bool) -> Label) {
+        self.text = text
+        self.label = label
+    }
+
+    public var body: some View {
+        Button {
+            // Only a copy that reached the pasteboard gets the check.
+            guard AgentChatTranscriptChrome.copyToPasteboard(text) else { return }
+            let generation = acknowledgement.copy()
+            DispatchQueue.main.asyncAfter(deadline: .now() + AgentChatCopyChrome.acknowledgementSeconds) {
+                acknowledgement.expire(generation)
+            }
+        } label: {
+            label(acknowledgement.copied)
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(acknowledgement.copied ? "Copied" : "")
+    }
+}
+
+/// The word "Copy" that becomes the check in the same footprint, so the
+/// message beside it does not rewrap. One label for the chat's strips.
+public struct AgentChatCopyWordLabel: View {
+    private let copied: Bool
+
+    public init(copied: Bool) {
+        self.copied = copied
+    }
+
+    public var body: some View {
+        Text("Copy")
+            .opacity(copied ? 0 : 1)
+            .overlay {
+                if copied {
+                    Image(systemName: AgentChatCopyChrome.symbolName(copied: true))
+                }
+            }
+    }
+}
+
+/// Shared non-modal error strip. Agent App and the Bots roots mount this one
+/// row so an error stays on screen with its recovery, without a blocking
+/// alert and without reading as empty content.
+public struct AgentChatErrorStrip: View {
+    public let message: String
+    public let identifier: String
+    public var offersCopy: Bool
+    /// Changes on every write of the owner's error slot, so the same message
+    /// set again is spoken again. Nil: only a changed message is.
+    public var announcementToken: Int?
+    public var onRetry: (() -> Void)?
+    /// Nil: no dismiss control. An error whose only recovery is Retry must
+    /// not be hidden with nothing left on screen to recover from.
+    public var onDismiss: (() -> Void)?
+
+    public init(
+        message: String,
+        identifier: String,
+        offersCopy: Bool = true,
+        announcementToken: Int? = nil,
+        onRetry: (() -> Void)? = nil,
+        onDismiss: (() -> Void)? = nil
+    ) {
+        self.message = message
+        self.identifier = identifier
+        self.offersCopy = offersCopy
+        self.announcementToken = announcementToken
+        self.onRetry = onRetry
+        self.onDismiss = onDismiss
+    }
+
+    public var body: some View {
+        HStack(alignment: .center, spacing: DS.Space.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Palette.danger)
+                .frame(width: 14, height: 14, alignment: .center)
+                .accessibilityHidden(true)
+            AgentSelectablePlainText(
+                text: message,
+                fontSize: 11,
+                textColor: DS.NS.text
+            )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if offersCopy {
+                AgentChatCopyButton(text: message) { AgentChatCopyWordLabel(copied: $0) }
+                .font(DS.Font.caption)
+                .accessibilityLabel("Copy")
+                .accessibilityIdentifier("\(identifier).copy")
+            }
+            if let onRetry {
+                Button("Retry", action: onRetry)
+                    .buttonStyle(.plain)
+                    .font(DS.Font.caption)
+                    .accessibilityIdentifier("\(identifier).retry")
+            }
+            if let onDismiss {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 16, height: 16, alignment: .center)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityLabel("Dismiss error")
+                .accessibilityIdentifier("\(identifier).dismiss")
+                .help("Dismiss error")
+            }
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.sm)
+        .background(DS.Palette.danger.opacity(0.09))
+        // Opaque base: a root may mount the strip over content.
+        .background(DS.Palette.bg)
+        // `.contain`, not `.combine`: Retry and Dismiss stay reachable.
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(identifier)
+        .onAppear { announce() }
+        // One key, so a write that changes both message and token is spoken once.
+        .onChange(of: "\(announcementToken ?? 0):\(message)") { _ in announce() }
+    }
+
+    /// The alert this strip replaces was spoken by VoiceOver; a silent row
+    /// would hide the error from anyone not looking at it.
+    private func announce() {
+        guard let app = NSApp else { return }
+        NSAccessibility.post(
+            element: (app.mainWindow as NSResponder?) ?? app,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ]
+        )
     }
 }
 
@@ -1083,7 +1295,7 @@ public struct AgentChatThreadRail<Content: View>: View {
                 } else {
                     Text(AgentChatThreadRailCopy.noMatchText(query: searchQuery))
                         .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
+                        .foregroundColor(DS.Palette.textSecondary)
                         .padding(DS.Space.sm)
                 }
             }

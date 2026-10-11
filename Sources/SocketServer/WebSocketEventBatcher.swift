@@ -81,6 +81,13 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     private var stopped = false
     private var pendingBytes: Int = 0
     private var oldestEnqueueUptime: TimeInterval?
+    /// Uptime of the last flush that sent at least one frame; nil until then.
+    private var lastFlushUptime: TimeInterval?
+    /// Clock behind `lastFlushUptime`; tests inject it to count idle gaps.
+    private let uptime: @Sendable () -> TimeInterval
+    /// True while a streaming delta waits in the nil-key window; the leading
+    /// edge stays shut until that window flushes.
+    private var deltaHeldInWindow = false
     private var overflowCount: Int = 0
     /// Synchronous pre-queue admission so the DispatchQueue backlog cannot grow
     /// unboundedly before per-frame admission runs (S10).
@@ -113,6 +120,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             onCoalescedAway?(data)
         }
         self.onAdmissionOverflow = onAdmissionOverflow ?? { _, _ in }
+        self.uptime = { ProcessInfo.processInfo.systemUptime }
         self.send = { frame in
             guard case .raw(_, let data) = frame else { return }
             send(data)
@@ -129,6 +137,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         maxPendingAge: TimeInterval = WebSocketEventBatcher.defaultMaxPendingAge,
         onCoalescedAway: @escaping @Sendable (Int64) -> Void = { _ in },
         onAdmissionOverflow: @escaping @Sendable ([Int64], String) -> Void = { _, _ in },
+        uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         sendKnownEvent: @escaping @Sendable (KnownConnectionEventFrame) -> Void
     ) {
         self.enabled = enabled
@@ -141,6 +150,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         self.maxPendingAge = max(0, maxPendingAge)
         self.onCoalescedAway = { onCoalescedAway($0.sequence) }
         self.onAdmissionOverflow = onAdmissionOverflow
+        self.uptime = uptime
         self.send = { frame in
             guard case .known(let known) = frame else { return }
             sendKnownEvent(known)
@@ -155,6 +165,11 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             self.preQueueLock.unlock()
             return (pendingBytes, pending.count + nilKeyQueue.count, overflows)
         }
+    }
+
+    /// Test seam: whether a window timer is still owed to keyed / nil-key frames.
+    func windowTimerSnapshot() -> (keyed: Bool, nilKey: Bool) {
+        queue.sync { (scheduled, nilKeyScheduled) }
     }
 
     func enqueue(event: EventBus.Event, data: Data) {
@@ -359,6 +374,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             queue.async {
                 defer { releasePreQueue() }
                 guard !self.stopped else { return }
+                let isStreamingDelta = data.knownEvent.map { Self.fullStreamCoalescedKinds.contains($0.kind) } ?? false
                 if self.wouldExceedAdmissionLocked(additionalBytes: data.count) {
                     self.handleOverflowLocked(reason: "admission_bytes_or_count")
                 }
@@ -376,6 +392,30 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                     self.flushLocked()
                     return
                 }
+                // Leading edge: the first delta after an idle window (nothing
+                // flushed for one whole window) leaves now instead of sitting
+                // out the window with nothing to merge with; on cellular that
+                // wait is the negotiated window before a reply's first
+                // character. Frames already waiting leave with it, in sequence
+                // order. The idle check measures from the last flush, but the
+                // window timer starts at the first held delta, which is later:
+                // while a delta is held, the next ones merge behind it even
+                // once the check turns true, or a bursty reply would flush
+                // twice per window. At most one extra flush per idle gap.
+                if isStreamingDelta, !self.deltaHeldInWindow,
+                   self.isFlushIdleLocked(window: self.nilKeyDelay) {
+                    // A timer armed for the frames that were waiting is still
+                    // pending and closes this window. Clearing the flags would
+                    // let the next frame arm a second timer and double the
+                    // flush rate for the rest of the stream.
+                    let scheduled = self.scheduled
+                    let nilKeyScheduled = self.nilKeyScheduled
+                    self.flushLocked()
+                    self.scheduled = scheduled
+                    self.nilKeyScheduled = nilKeyScheduled
+                    return
+                }
+                if isStreamingDelta { self.deltaHeldInWindow = true }
                 guard !self.nilKeyScheduled else { return }
                 self.nilKeyScheduled = true
                 self.queue.asyncAfter(deadline: .now() + self.nilKeyDelay) {
@@ -406,6 +446,12 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         return ProcessInfo.processInfo.systemUptime - oldest >= maxPendingAge
     }
 
+    /// True when no frame left through `flushLocked` within the last `window`.
+    private func isFlushIdleLocked(window: TimeInterval) -> Bool {
+        guard let last = lastFlushUptime else { return true }
+        return uptime() - last >= window
+    }
+
     private func handleOverflowLocked(reason: String) {
         preQueueLock.lock()
         overflowCount += 1
@@ -418,6 +464,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         oldestEnqueueUptime = nil
         scheduled = false
         nilKeyScheduled = false
+        deltaHeldInWindow = false
         // Always notify; production must supply a handler that advances watermark
         // and emits baseline_required. Nil still counts as explicit overflow for tests.
         onAdmissionOverflow(lost.sorted(), reason)
@@ -451,6 +498,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         guard !stopped else { return }
         scheduled = false
         nilKeyScheduled = false
+        deltaHeldInWindow = false
 
         var frames: [Frame] = []
         if !pending.isEmpty {
@@ -474,6 +522,9 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         // C-14: emit by event sequence when present so keyed LWW + nil-key
         // events in the same window cannot invent host-side 1012 gaps.
         frames.sort { $0.sequence < $1.sequence }
+        if !frames.isEmpty {
+            lastFlushUptime = uptime()
+        }
         for frame in frames {
             send(frame)
         }

@@ -56,6 +56,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
     private let content: (CGFloat) -> Content
     private let followOverlay: (@escaping () -> Void) -> FollowOverlay
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var sticksToBottom = true
     @State private var showScrollDownButton = false
     @State private var pinForceToken = 0
@@ -124,7 +125,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
                         } label: {
                             Image(systemName: "arrow.down")
                                 .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(.white)
+                                .foregroundColor(DS.Palette.onAccent)
                                 .frame(width: 44, height: 44)
                                 .background(DS.Palette.accent)
                                 .clipShape(Circle())
@@ -136,7 +137,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
                         .help("Scroll to latest message")
                         .padding(.trailing, 14)
                         .padding(.bottom, AgentChatTimelineScrollChrome.scrollDownButtonBottomInset)
-                        .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                        .transition(AgentChatMotion.transition(.fadeAndScale, reduceMotion: reduceMotion))
                     }
                 }
             }

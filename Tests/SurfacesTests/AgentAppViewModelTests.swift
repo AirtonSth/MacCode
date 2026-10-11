@@ -5694,6 +5694,305 @@ final class AgentAppViewModelTests: XCTestCase {
                       "every body stays hydrated — no eviction that would change a row's height on scroll")
     }
 
+    // MARK: First message page state (pending / failed are not "No messages")
+
+    /// The transcript's empty-placeholder decision, fed from the view model
+    /// the way `AgentAppView.timeline` feeds it.
+    private func showsEmptyConversation(_ vm: AgentAppViewModel) -> Bool {
+        AgentAppView.shouldShowEmptyConversation(
+            messagesEmpty: vm.messages.isEmpty,
+            turnsEmpty: vm.timeline.turns.isEmpty,
+            hasTimelineError: vm.timeline.error != nil,
+            isHidden: vm.isHiddenFromSurface,
+            messagePageLoadState: vm.messagePageLoadState
+        )
+    }
+
+    func test_selectThreadKeepsEmptyPlaceholderOffUntilFirstMessagePageLands() async throws {
+        // WHY: the selection publishes on the click turn and the page is read
+        // off-main afterwards. In that gap `messages` is empty, and painting
+        // "No messages" over a thread that has messages tells the user their
+        // history is gone.
+        let (vm, threadRepo) = try makeVM()
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "has history",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try threadRepo.upsert(thread)
+        try vm.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "hello"))
+
+        vm.selectThread(thread.id)
+
+        XCTAssertTrue(vm.messages.isEmpty, "fixture: the page has not landed on the selection turn")
+        XCTAssertTrue(vm.timeline.turns.isEmpty, "fixture: nothing else keeps the placeholder off")
+        XCTAssertEqual(vm.messagePageLoadState, .pending)
+        XCTAssertFalse(
+            showsEmptyConversation(vm),
+            "an unread first page must not present the thread as empty"
+        )
+
+        await vm.waitForMessageHistoryLoad()
+
+        XCTAssertEqual(vm.messagePageLoadState, .idle)
+        XCTAssertEqual(vm.messages.map(\.content), ["hello"])
+    }
+
+    func test_emptyThreadShowsPlaceholderOnceFirstPageResolves_andSameThreadReloadDoesNotBlinkIt() async throws {
+        // WHY: the pending state must end. A thread that really has no
+        // messages still says so, and a same-thread reload (soft reselect
+        // re-reads an empty thread's page) must not take the placeholder away
+        // and bring it back on every host refresh.
+        let (vm, threadRepo) = try makeVM()
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "really empty",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try threadRepo.upsert(thread)
+
+        vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        await vm.waitForMessageHistoryLoad()
+
+        XCTAssertEqual(vm.messagePageLoadState, .idle)
+        XCTAssertTrue(showsEmptyConversation(vm), "a resolved empty page is an empty thread")
+
+        vm.selectThread(thread.id)
+
+        XCTAssertTrue(
+            showsEmptyConversation(vm),
+            "re-reading the open thread's page must not blink the placeholder"
+        )
+        await vm.waitForMessageHistoryLoad()
+        XCTAssertTrue(showsEmptyConversation(vm))
+    }
+
+    func test_rapidThreadSwitchResolvesPageStateForTheWinningThread() async throws {
+        // WHY: latest wins. The cancelled page load of A must neither leave B
+        // stuck in `pending` (B would never show its placeholder) nor land
+        // A's rows on B.
+        let (vm, threadRepo) = try makeVM()
+        let threadA = AgentThread(workspaceId: vm.workspaceID, title: "A", provider: .codex, model: "gpt-5.5")
+        let threadB = AgentThread(workspaceId: vm.workspaceID, title: "B", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(threadA)
+        try threadRepo.upsert(threadB)
+        try vm.messageRepo.append(AgentMessage(threadId: threadA.id, role: .user, content: "from A"))
+
+        vm.selectThread(threadA.id)
+        vm.selectThread(threadB.id)
+
+        XCTAssertEqual(vm.messagePageLoadState, .pending)
+        await vm.waitForMessageHistoryLoad()
+
+        XCTAssertEqual(vm.selectedThreadId, threadB.id)
+        XCTAssertEqual(vm.messagePageLoadState, .idle)
+        XCTAssertTrue(vm.messages.isEmpty, "A's cancelled page must not land on B")
+        XCTAssertTrue(showsEmptyConversation(vm), "B is empty and its own page resolved")
+    }
+
+    func test_failedFirstMessagePageShowsRetryBanner_notEmptyConversation() async throws {
+        // WHY: the page read used `try?`, so a thrown SQLite error became
+        // zero rows and the thread read "No messages". An unreadable thread
+        // is not an empty one, and an error is never hidden.
+        let (vm, threadRepo) = try makeVM()
+        let thread = AgentThread(
+            workspaceId: vm.workspaceID,
+            title: "unreadable",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        try threadRepo.upsert(thread)
+        try vm.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "hello"))
+        // A real read failure, not a mock: the message table stops resolving.
+        try vm.messageRepo.db.execute("ALTER TABLE agent_messages RENAME TO agent_messages_unreadable;")
+
+        vm.selectThread(thread.id)
+        await vm.waitForMessageHistoryLoad()
+
+        XCTAssertTrue(vm.messages.isEmpty, "fixture: the failed read delivered no rows")
+        let failure = try XCTUnwrap(
+            vm.messagePageLoadFailureMessage,
+            "a thrown page read must reach the banner"
+        )
+        XCTAssertTrue(failure.hasPrefix("Could not load messages: "), failure)
+        XCTAssertFalse(
+            showsEmptyConversation(vm),
+            "a failed read must not present the thread as empty"
+        )
+
+        try vm.messageRepo.db.execute("ALTER TABLE agent_messages_unreadable RENAME TO agent_messages;")
+        vm.retryMessagePageLoad()
+
+        XCTAssertEqual(vm.messagePageLoadState, .pending)
+        await vm.waitForMessageHistoryLoad()
+
+        XCTAssertEqual(vm.messagePageLoadState, .idle)
+        XCTAssertEqual(
+            vm.messages.map(\.content),
+            ["hello"],
+            "Retry must load the page that failed"
+        )
+    }
+
+    func test_failedPageStripHasNoDismiss_becauseHidingItLeftABlankThreadWithNoRetry() throws {
+        // WHY: the failed-read strip carries the only Retry. With an x, one
+        // click left a blank transcript: no error, no "No messages", no
+        // recovery. On a Bot Desk a second click on the open thread does not
+        // re-read it, so the thread stayed blank. The shared strip therefore
+        // draws its x only when the owner passes a dismiss, and this mount
+        // passes none.
+        let surfaces = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces")
+        let source = try String(
+            contentsOf: surfaces.appendingPathComponent("AgentAppSurface.swift"), encoding: .utf8
+        )
+        let mountStart = try XCTUnwrap(source.range(of: "if let failure = vm.messagePageLoadFailureMessage {"))
+        let mountEnd = try XCTUnwrap(source.range(of: "systemStatusStrip", range: mountStart.upperBound..<source.endIndex))
+        let mount = String(source[mountStart.lowerBound..<mountEnd.lowerBound])
+        XCTAssertTrue(mount.contains("identifier: \"agent.messages.loadFailed\""))
+        XCTAssertTrue(mount.contains("onRetry: { vm.retryMessagePageLoad() }"))
+        XCTAssertFalse(mount.contains("onDismiss"), "the failed read must stay on screen until Retry succeeds")
+
+        let chrome = try String(
+            contentsOf: surfaces.appendingPathComponent("AgentChatSharedChrome.swift"), encoding: .utf8
+        )
+        let stripStart = try XCTUnwrap(chrome.range(of: "public struct AgentChatErrorStrip"))
+        let dismissLabel = try XCTUnwrap(chrome.range(
+            of: ".accessibilityLabel(\"Dismiss error\")",
+            range: stripStart.upperBound..<chrome.endIndex
+        ))
+        let strip = String(chrome[stripStart.lowerBound..<dismissLabel.lowerBound])
+        XCTAssertTrue(strip.contains("if let onDismiss {"), "no handler, no x")
+    }
+
+    func test_restoredTabHoldsPagePendingUntilItsThreadOpens_becauseNoMessagesFlashedOverARestoredThread() throws {
+        // WHY: a restored tab selects its thread only after the rail is read
+        // off the main actor. Until then nothing is selected, the state was
+        // `idle`, and "No messages" painted over a thread that has history.
+        // If the thread is gone, or the user opened another one meanwhile,
+        // the state must not stay `pending` (a real empty composer would
+        // never show its placeholder) and must not overwrite that other
+        // thread's own `failed`. That branch does not run under XCTest (the
+        // init takes the same-stack path here), so this is a source pin.
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "let pendingInitialThreadId = initialThreadId"))
+        let end = try XCTUnwrap(source.range(of: "loadGitBranch()", range: start.upperBound..<source.endIndex))
+        let restore = String(source[start.lowerBound..<end.lowerBound])
+        let hold = try XCTUnwrap(
+            restore.range(of: "if pendingInitialThreadId != nil { messagePageLoadState = .pending }")
+        )
+        let railRead = try XCTUnwrap(restore.range(of: "await self.loadRailSnapshotOffMainActor()"))
+        XCTAssertLessThan(hold.lowerBound, railRead.lowerBound, "pending is set on the turn the tab is built")
+        let open = try XCTUnwrap(restore.range(of: "self.selectThread(pendingInitialThreadId)"))
+        let release = try XCTUnwrap(
+            restore.range(of: "if self.selectedThreadId == nil { self.messagePageLoadState = .idle }"),
+            "only an unopened tab is released to idle"
+        )
+        XCTAssertLessThan(open.lowerBound, release.lowerBound)
+    }
+
+    func test_emptyConversationKeepsSideChatAndEmbeddingCopy_becauseTwoChangesMeetInThisView() throws {
+        // WHY: a side chat shows its own empty state, and every other thread
+        // shows the shared DSEmptyState with the embedding's copy (a Bot desk
+        // says "Message <bot>"). Losing the first hides what a side chat is;
+        // losing the second puts "Start a new agent run." on a Bot desk.
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private var emptyConversation: some View {"))
+        let end = try XCTUnwrap(source.range(
+            of: "private var sideChatEmptyConversation: some View {",
+            range: start.upperBound..<source.endIndex
+        ))
+        let view = String(source[start.lowerBound..<end.lowerBound])
+        let sideChat = try XCTUnwrap(view.range(of: "if vm.selectedThreadIsEphemeral {"))
+        let shared = try XCTUnwrap(view.range(of: "DSEmptyState("))
+        XCTAssertLessThan(sideChat.lowerBound, shared.lowerBound, "a side chat is asked first")
+        XCTAssertTrue(view.contains("sideChatEmptyConversation"))
+        XCTAssertTrue(view.contains("title: vm.embedding?.emptyConversationTitle ?? \"No messages\""))
+        XCTAssertTrue(view.contains("subtitle: vm.embedding?.emptyConversationSubtitle ?? \"Start a new agent run.\""))
+        // WHY: the side chat subtitle is the only place that says a side chat
+        // is temporary. Hand-drawn it was textTertiary (4.06:1 on bg, see
+        // DSContrastTests); the shared component keeps it at textSecondary.
+        let stripStart = try XCTUnwrap(source.range(
+            of: "private var sideChatParentStatusStrip: some View {",
+            range: end.upperBound..<source.endIndex
+        ))
+        let sideChatBody = String(source[end.lowerBound..<stripStart.lowerBound])
+        XCTAssertTrue(sideChatBody.contains("DSEmptyState("))
+        XCTAssertTrue(sideChatBody.contains("Side chats are temporary and disappear when you close the app."))
+        XCTAssertFalse(sideChatBody.contains("textTertiary"))
+        // "Parent thread running / idle" is status the owner reads, not decoration.
+        let statusStart = try XCTUnwrap(source.range(
+            of: "Text(running ? \"Parent thread running\" : \"Parent thread idle\")",
+            range: stripStart.upperBound..<source.endIndex
+        ))
+        let statusEnd = try XCTUnwrap(source.range(
+            of: "Spacer(minLength: 0)",
+            range: statusStart.upperBound..<source.endIndex
+        ))
+        let status = String(source[statusStart.lowerBound..<statusEnd.lowerBound])
+        XCTAssertTrue(status.contains(".foregroundColor(DS.Palette.textSecondary)"))
+        XCTAssertFalse(status.contains("textTertiary"))
+    }
+
+    func test_branchInNewChatIsOfferedOnlyOutsideAnEmbeddedChat_becauseOnlyTheAgentAppHostCanOpenTheBranch() throws {
+        // WHY: the reply draws "Branch in new chat" whenever onBranch is not
+        // nil. Only Agent App tabs get onForkInNewChat from the router; a Bot
+        // desk or group room embeds this view without it, so an always
+        // present closure drew a button that did nothing on every reply.
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertEqual(source.components(separatedBy: "onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(").count - 1, 3)
+        XCTAssertFalse(source.contains("onBranch: {"), "an unconditional closure shows the button on a Bot desk")
+    }
+
+    func test_truncatedBranchKeepsATooltipAndEarlierHistoryRevealIsReadable_becauseBothAreInformationNotDecoration() throws {
+        // WHY: the header branch is cut in the middle to stay on one line, and
+        // it is drawn nowhere else, so without a tooltip a long branch cannot
+        // be read at all. "Earlier in this thread · show N more" is 11pt text
+        // on a control that opens hidden history; textTertiary is 3.88:1 on
+        // its fill, textSecondary 7.39:1.
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let branchStart = try XCTUnwrap(source.range(of: "Text(vm.gitBranch ?? \"no branch\")"))
+        let branchEnd = try XCTUnwrap(source.range(
+            of: "if let context = vm.contextHealthMessage",
+            range: branchStart.upperBound..<source.endIndex
+        ))
+        let branch = String(source[branchStart.lowerBound..<branchEnd.lowerBound])
+        XCTAssertTrue(branch.contains(".truncationMode(.middle)"))
+        XCTAssertTrue(branch.contains(".help(vm.gitBranch ?? \"no branch\")"))
+
+        let revealStart = try XCTUnwrap(source.range(of: "Text(Self.hiddenTranscriptRevealLabel("))
+        let revealEnd = try XCTUnwrap(source.range(of: ".lineLimit(1)", range: revealStart.upperBound..<source.endIndex))
+        let reveal = String(source[revealStart.lowerBound..<revealEnd.lowerBound])
+        XCTAssertTrue(reveal.contains(".foregroundColor(DS.Palette.textSecondary)"), reveal)
+        XCTAssertFalse(reveal.contains("textTertiary"), reveal)
+    }
+
     func test_applyBodyBudgetBlanksOldestBodiesOnPathologicalThread() {
         let tid = AgentThreadID()
         let base = Date(timeIntervalSince1970: 1)
@@ -10015,7 +10314,8 @@ final class AgentAppViewModelTests: XCTestCase {
                 messagesEmpty: hidden.messages.isEmpty,
                 turnsEmpty: hidden.timeline.turns.isEmpty,
                 hasTimelineError: hidden.timeline.error != nil,
-                isHidden: hidden.isHiddenFromSurface
+                isHidden: hidden.isHiddenFromSurface,
+                messagePageLoadState: .idle
             ),
             "a hidden live run must not be treated as an empty conversation"
         )

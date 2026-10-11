@@ -67,6 +67,11 @@ final class DSRadiusTests: XCTestCase {
         XCTAssertEqual(DS.Radius.panel, 9)
     }
 
+    func test_bubble_is10() {
+        // The user message bubble; same value as iOS DS.Radius.md.
+        XCTAssertEqual(DS.Radius.bubble, 10)
+    }
+
     func test_modal_is12() {
         XCTAssertEqual(DS.Radius.modal, 12)
     }

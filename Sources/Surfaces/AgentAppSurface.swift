@@ -412,6 +412,13 @@ public struct AgentAppEmbedding {
     public let sendInterceptor: AgentAppSendInterceptor?
     /// Composer placeholder for an intercepted surface (it names no provider).
     public let composerPlaceholder: String?
+    /// Empty-conversation copy for the host surface (a bot desk or group room
+    /// does not "start a new agent run"). Nil keeps the Agent App copy.
+    public let emptyConversationTitle: String?
+    public let emptyConversationSubtitle: String?
+    /// The pinned thread's row when the host read it on this same turn, so
+    /// the first paint does not read it again. Later reloads read the store.
+    public let pinnedThread: AgentThread?
 
     public init(
         pinnedThreadId: AgentThreadID,
@@ -420,7 +427,10 @@ public struct AgentAppEmbedding {
         onRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)? = nil,
         onRunFinished: (@MainActor (AgentRunID, AgentThreadID, AgentRunStatus, String?) -> Void)? = nil,
         sendInterceptor: AgentAppSendInterceptor? = nil,
-        composerPlaceholder: String? = nil
+        composerPlaceholder: String? = nil,
+        emptyConversationTitle: String? = nil,
+        emptyConversationSubtitle: String? = nil,
+        pinnedThread: AgentThread? = nil
     ) {
         self.pinnedThreadId = pinnedThreadId
         self.executionCwd = executionCwd
@@ -429,7 +439,19 @@ public struct AgentAppEmbedding {
         self.onRunFinished = onRunFinished
         self.sendInterceptor = sendInterceptor
         self.composerPlaceholder = composerPlaceholder
+        self.emptyConversationTitle = emptyConversationTitle
+        self.emptyConversationSubtitle = emptyConversationSubtitle
+        self.pinnedThread = pinnedThread?.id == pinnedThreadId ? pinnedThread : nil
     }
+}
+
+/// First message page of the open thread. `pending` and `failed` both keep
+/// the "No messages" placeholder off: a thread whose page has not been read,
+/// or could not be read, is not an empty thread.
+public enum AgentMessagePageLoadState: Equatable, Sendable {
+    case idle
+    case pending
+    case failed(message: String)
 }
 
 public typealias AgentAppSendInterceptor = @MainActor (
@@ -800,6 +822,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// The UI holds only a bounded recent message page. Older durable messages
     /// remain in SQLite and are intentionally outside the hot screen-memory set.
     @Published public private(set) var messageHistoryIsPartial = false
+    /// Read state of the open thread's first message page. Goes `pending` on a
+    /// thread switch and on Retry only: a same-thread reload keeps the current
+    /// value so an empty thread's placeholder does not blink.
+    @Published public private(set) var messagePageLoadState: AgentMessagePageLoadState = .idle
     /// True while an older-page keyset load is in flight (UI disable / spinner).
     /// Derived from `loadingOlderGeneration != 0` for ownership-safe clears.
     @Published public private(set) var isLoadingOlderMessages = false
@@ -1012,7 +1038,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadCustomModels()
         self.coordinator.addObserver(self)
         if let embedding {
-            reloadPinnedThread()
+            reloadPinnedThread(seeded: embedding.pinnedThread)
             applyNewThreadDefaultsFromRailIfNeeded()
             selectThread(embedding.pinnedThreadId)
             return
@@ -1036,6 +1062,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         } else {
             publishInterestedThreadId(nil)
+            // A restored tab opens its thread only after the rail read: until
+            // then that thread's page is unread, not empty.
+            if pendingInitialThreadId != nil { messagePageLoadState = .pending }
             Task { @MainActor [weak self] in
                 guard let self, !self.isDisposed else { return }
                 let snapshot = await self.loadRailSnapshotOffMainActor()
@@ -1047,6 +1076,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 } else {
                     self.publishInterestedThreadId(self.selectedThreadId)
                 }
+                // The restored thread did not open, so nothing is being read.
+                // A thread the user opened meanwhile owns its own page state.
+                if self.selectedThreadId == nil { self.messagePageLoadState = .idle }
             }
         }
         loadGitBranch()
@@ -1604,9 +1636,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Embedded surfaces list only their pinned thread.
-    private func reloadPinnedThread() {
+    private func reloadPinnedThread(seeded: AgentThread? = nil) {
         guard let embedding else { return }
-        guard let thread = try? threadRepo.get(id: embedding.pinnedThreadId) else { return }
+        guard let thread = seeded ?? (try? threadRepo.get(id: embedding.pinnedThreadId)) else { return }
         threads = [thread]
         threadWorkspaceCache[thread.id] = thread.workspaceId ?? workspaceID
     }
@@ -2432,6 +2464,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } else {
             timeline = AssistantTimelineState()
         }
+        messagePageLoadState = .pending
         loadAllMessages(id)
         focusTick &+= 1
         scheduleSelectThreadHydration(
@@ -4218,6 +4251,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let loadedRows = payload.page?.rows ?? []
             guard let self, !Task.isCancelled, !self.isDisposed,
                   self.selectedThreadId == id else { return }
+            // Every winning load resolves the page state, whatever the merge
+            // below does with optimistic rows: a thrown read is a failure the
+            // user sees, never an empty thread.
+            if let failure = payload.failure {
+                self.messagePageLoadState = .failed(message: failure)
+            } else {
+                self.messagePageLoadState = .idle
+            }
             // Rows appended in-memory while the page was being read (system
             // notes, the send() user-message mirror) must survive the swap —
             // the page snapshot predates them. Optimistic mirrors share the
@@ -4319,6 +4360,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         await messageHistoryLoadTask?.value
     }
 
+    /// Text of the failed-read banner; nil when the read did not fail.
+    public var messagePageLoadFailureMessage: String? {
+        if case .failed(let message) = messagePageLoadState { return message }
+        return nil
+    }
+
+    /// Retry of the failed-read banner: reads the open thread's page again.
+    public func retryMessagePageLoad() {
+        guard !isDisposed, let selectedThreadId else { return }
+        messagePageLoadState = .pending
+        loadAllMessages(selectedThreadId)
+    }
+
     nonisolated static func loadMessagePageOffMain(
         repository: AgentMessageRepository,
         threadId: AgentThreadID,
@@ -4341,6 +4395,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// used to be 4 sequential detached hops with a MainActor return each).
     struct AgentMessagePagePayload: Sendable {
         var page: AgentMessageBodyBudgetResult?
+        /// Set when the read threw. A nil `page` alone cannot tell an
+        /// unreadable thread from an empty one.
+        var failure: String?
     }
 
     nonisolated static func loadMessagePagePayloadOffMain(
@@ -4350,13 +4407,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     ) async -> AgentMessagePagePayload {
         await Task.detached(priority: .userInitiated) {
             var payload = AgentMessagePagePayload()
-            payload.page = try? repository.listPageWithinBodyBudget(
-                threadId: threadId,
-                limit: messageHistoryPageLimit,
-                before: before,
-                budget: fullLoadBodyBudgetBytes,
-                contentLimit: AssistantTimelineState.liveTextLimit
-            )
+            do {
+                payload.page = try repository.listPageWithinBodyBudget(
+                    threadId: threadId,
+                    limit: messageHistoryPageLimit,
+                    before: before,
+                    budget: fullLoadBodyBudgetBytes,
+                    contentLimit: AssistantTimelineState.liveTextLimit
+                )
+            } catch {
+                payload.failure = "Could not load messages: \(error)"
+            }
             return payload
         }.value
     }
@@ -7461,6 +7522,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.selectedThreadId = nil
         messages = []
         messageHistoryIsPartial = false
+        messagePageLoadState = .idle
         timeline = AssistantTimelineState()
         resetTimelineUpdateTick()
         }
@@ -7507,6 +7569,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         pendingAttachmentRetryConfirmation = nil
         messages = []
         messageHistoryIsPartial = false
+        // No thread is open: a page load in flight for the removed one will
+        // never resolve this, and the fresh composer really is empty.
+        messagePageLoadState = .idle
         cancelOlderMessageLoad()
         timeline = AssistantTimelineState()
         resetTimelineUpdateTick()
@@ -8027,7 +8092,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             systemNote(threadForkUnavailableReason ?? "Provider-side fork is unavailable for this session.")
             return
         }
-        onRequestSideChat?(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        // An embedded chat (Bot desk) has no host for a side pane: say so
+        // instead of swallowing the typed command.
+        guard let onRequestSideChat else {
+            systemNote("/side is not available in this chat.")
+            return
+        }
+        onRequestSideChat(text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     /// Sends the `/side` inline text as the side chat's first message once the
@@ -8048,7 +8119,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             systemNote("/btw — usage: /btw <question>")
             return
         }
-        onRequestBtw?(q)
+        guard let onRequestBtw else {
+            systemNote("/btw is not available in this chat.")
+            return
+        }
+        onRequestBtw(q)
     }
 
     /// `/btw` answer as a non-persisted inline transcript note.
@@ -12497,6 +12572,19 @@ public struct AgentAppViewLayout: Equatable {
     public static let standard = AgentAppViewLayout()
 }
 
+/// Where the undo toasts mount (pure, testable seam). One toast fits in the
+/// transcript's top padding, so it floats over it. Two would cover the first
+/// row, and each carries a live Undo, so the checkpoint toast takes a row
+/// above the transcript while both are armed.
+public enum AgentUndoToastPlacement {
+    public static func checkpointRevertTakesARow(
+        threadDeletionArmed: Bool,
+        checkpointRevertArmed: Bool
+    ) -> Bool {
+        threadDeletionArmed && checkpointRevertArmed
+    }
+}
+
 public struct AgentAppView: View {
     struct QueueStatusBannerPresentation: Equatable {
         let message: String
@@ -12530,6 +12618,8 @@ public struct AgentAppView: View {
     @ObservedObject var vm: AgentAppViewModel
     private let accountPanel: AnyView?
     private let layout: AgentAppViewLayout
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var announcedUndoToasts: Set<Date> = []
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
     @State private var expandedTools: Set<String> = []
@@ -15175,10 +15265,10 @@ public struct AgentAppView: View {
             if vm.permissionMode == .fullAccess {
                 fullAccessBanner
             }
-            if let undo = vm.pendingThreadDeletionUndo {
-                threadDeletionUndoBanner(undo)
-            }
-            if let crToast = vm.pendingCheckpointRevertUndo {
+            if AgentUndoToastPlacement.checkpointRevertTakesARow(
+                threadDeletionArmed: vm.pendingThreadDeletionUndo != nil,
+                checkpointRevertArmed: vm.pendingCheckpointRevertUndo != nil
+            ), let crToast = vm.pendingCheckpointRevertUndo {
                 checkpointRevertUndoBanner(crToast)
             }
             // Stream paint: observe transcriptState only so token/tool ticks do
@@ -15192,10 +15282,30 @@ public struct AgentAppView: View {
                             .background(DS.Palette.bg)
                     }
                     timeline
+                        // An undo toast floats over the top of the transcript. As
+                        // a row above it, it pushed every message down, then
+                        // let it jump back when the undo window closed.
+                        .overlay(alignment: .top) {
+                            if let undo = vm.pendingThreadDeletionUndo {
+                                threadDeletionUndoBanner(undo)
+                            } else if let crToast = vm.pendingCheckpointRevertUndo {
+                                checkpointRevertUndoBanner(crToast)
+                            }
+                        }
                 }
             }
             backgroundAwaitBanner
             pendingCallbackRows
+            // A failed page read stays on screen with Retry; the transcript
+            // above shows no "No messages" for it. No dismiss: without the
+            // strip the unread thread would be a blank column with no Retry.
+            if let failure = vm.messagePageLoadFailureMessage {
+                AgentChatErrorStrip(
+                    message: failure,
+                    identifier: "agent.messages.loadFailed",
+                    onRetry: { vm.retryMessagePageLoad() }
+                )
+            }
             // Unified system strip: severity-ordered, capped (replaces stacked banners).
             systemStatusStrip
             queuedMessagesSection
@@ -15277,17 +15387,19 @@ public struct AgentAppView: View {
             Text(vm.gitBranch ?? "no branch")
                 .font(DS.Font.caption2.monospaced())
                 .foregroundColor(DS.Palette.textSecondary)
+                .lineLimit(1).truncationMode(.middle)
+                .help(vm.gitBranch ?? "no branch")
             if let context = vm.contextHealthMessage {
                 Text("·").foregroundColor(DS.Palette.textTertiary)
                 Text(context)
                     .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
+                    .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
             }
             Text("·").foregroundColor(DS.Palette.textTertiary)
             Text(URL(fileURLWithPath: vm.cwd).lastPathComponent)
                 .font(DS.Font.caption2)
-                .foregroundColor(DS.Palette.textTertiary)
+                .foregroundColor(DS.Palette.textSecondary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
             botScreenControls
@@ -15324,11 +15436,11 @@ public struct AgentAppView: View {
     @ViewBuilder
     private var botScreenControls: some View {
         if vm.botScreenBotID != nil {
-            Button("Ver tela") { vm.viewBotScreen() }
+            Button("View bot screen") { vm.viewBotScreen() }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .accessibilityIdentifier("agent.botScreen.view")
-            Button(vm.botScreenControlled ? "Devolver" : "Assumir controle") {
+            Button(vm.botScreenControlled ? "Release" : "Take control") {
                 Task { await vm.toggleBotScreenControl() }
             }
             .buttonStyle(.bordered)
@@ -15367,11 +15479,12 @@ public struct AgentAppView: View {
     // UX-XPLAT-DELETE-UNDO: transient toast offering to restore a just-deleted
     // thread. The delete already happened; Undo re-inserts the snapshot.
     private func threadDeletionUndoBanner(_ undo: AgentAppViewModel.ThreadDeletionUndo) -> some View {
-        HStack(spacing: DS.Space.sm) {
+        let message = undo.count > 1 ? "\(undo.count.formatted()) threads deleted" : "Thread deleted"
+        return HStack(spacing: DS.Space.sm) {
             Image(systemName: "trash")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(DS.Palette.textSecondary)
-            Text(undo.count > 1 ? "\(undo.count) threads deleted" : "Thread deleted")
+            Text(message)
                 .font(DS.Font.caption.weight(.semibold))
                 .foregroundColor(DS.Palette.text)
             Spacer(minLength: 0)
@@ -15385,14 +15498,22 @@ public struct AgentAppView: View {
         .background(DS.Palette.surfaceRaised)
         .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.line).frame(height: 1) }
         .accessibilityIdentifier("agent.thread.delete.undoBanner")
+        .onAppear {
+            announceUndoToast(message, window: AgentAppViewModel.threadDeletionUndoWindow, armedAt: undo.capturedAt)
+        }
+        // A second delete inside the window replaces the toast in place.
+        .onChange(of: undo.capturedAt) { _, _ in
+            announceUndoToast(message, window: AgentAppViewModel.threadDeletionUndoWindow, armedAt: undo.capturedAt)
+        }
     }
 
     private func checkpointRevertUndoBanner(_ toast: AgentAppViewModel.CheckpointRevertUndoToast) -> some View {
-        HStack(spacing: DS.Space.sm) {
+        let message = "Reverted to checkpoint \(toast.checkpointTurnCount.formatted())"
+        return HStack(spacing: DS.Space.sm) {
             Image(systemName: "arrow.uturn.backward")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(DS.Palette.textSecondary)
-            Text("Reverted to checkpoint \(toast.checkpointTurnCount)")
+            Text(message)
                 .font(DS.Font.caption.weight(.semibold))
                 .foregroundColor(DS.Palette.text)
             Spacer(minLength: 0)
@@ -15406,6 +15527,28 @@ public struct AgentAppView: View {
         .background(DS.Palette.surfaceRaised)
         .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.line).frame(height: 1) }
         .accessibilityIdentifier("agent.checkpoint.revert.undoBanner")
+        .onAppear {
+            announceUndoToast(message, window: AgentAppViewModel.checkpointRevertUndoWindow, armedAt: toast.capturedAt)
+        }
+        .onChange(of: toast.capturedAt) { _, _ in
+            announceUndoToast(message, window: AgentAppViewModel.checkpointRevertUndoWindow, armedAt: toast.capturedAt)
+        }
+    }
+
+    /// VoiceOver does not read a view that appears on its own, and the undo
+    /// window is short: say the toast when it shows. Once per arming: a toast
+    /// that only changes place (see `AgentUndoToastPlacement`) is not news.
+    private func announceUndoToast(_ message: String, window: TimeInterval, armedAt: Date) {
+        guard announcedUndoToasts.insert(armedAt).inserted else { return }
+        guard let app = NSApp else { return }
+        NSAccessibility.post(
+            element: (app.mainWindow as NSResponder?) ?? app,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: "\(message). Undo is available for \(Int(window)) seconds.",
+                .priority: NSAccessibilityPriorityLevel.high.rawValue,
+            ]
+        )
     }
 
     private var modelLabel: String {
@@ -15668,7 +15811,8 @@ public struct AgentAppView: View {
                                 messagesEmpty: vm.messages.isEmpty,
                                 turnsEmpty: vm.timeline.turns.isEmpty,
                                 hasTimelineError: vm.timeline.error != nil,
-                                isHidden: vm.isHiddenFromSurface
+                                isHidden: vm.isHiddenFromSurface,
+                                messagePageLoadState: vm.messagePageLoadState
                             ) {
                                 emptyConversation
                                     .id("agent.emptyConversation")
@@ -15869,7 +16013,7 @@ public struct AgentAppView: View {
         if !activities.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.16)) {
+                    withAnimation(reduceMotion ? nil : DS.Motion.micro) {
                         showWorkLog.toggle()
                     }
                 } label: {
@@ -15921,7 +16065,7 @@ public struct AgentAppView: View {
                             }
                         }
                     }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(AgentChatMotion.transition(.fadeAndMove, reduceMotion: reduceMotion))
                 }
             }
             .padding(.vertical, DS.Space.sm)
@@ -16089,11 +16233,14 @@ public struct AgentAppView: View {
                         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
                         .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                             .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-                    Button { copyToPasteboard(detail) } label: {
-                        Image(systemName: "doc.on.doc").font(.system(size: 10))
+                    AgentChatCopyButton(text: detail) { copied in
+                        Image(systemName: AgentChatCopyChrome.symbolName(copied: copied))
+                            .font(.system(size: 10))
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
                     .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityLabel("Copy command")
                     .help("Copy command")
                 }
             case .applyPatch, .fileChange:
@@ -16450,14 +16597,14 @@ public struct AgentAppView: View {
                     nextCount: nextCount
                 ))
                     .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
+                    .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, DS.Space.sm)
             .padding(.vertical, 6)
             .background(DS.Palette.surface.opacity(0.55))
-            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -16471,14 +16618,18 @@ public struct AgentAppView: View {
 
     /// Hide-drop publishes an empty timeline while the run still lives in
     /// `latestHiddenTimeline`. That 0-turn publish must not paint the empty
-    /// conversation placeholder.
+    /// conversation placeholder. Neither may a first page that is still being
+    /// read or that failed to read: only a resolved page proves the thread
+    /// has no messages.
     nonisolated static func shouldShowEmptyConversation(
         messagesEmpty: Bool,
         turnsEmpty: Bool,
         hasTimelineError: Bool,
-        isHidden: Bool
+        isHidden: Bool,
+        messagePageLoadState: AgentMessagePageLoadState
     ) -> Bool {
         !isHidden && messagesEmpty && turnsEmpty && !hasTimelineError
+            && messagePageLoadState == .idle
     }
 
     nonisolated static func hiddenTranscriptRevealLabel(
@@ -16522,7 +16673,7 @@ public struct AgentAppView: View {
         .padding(.horizontal, DS.Space.sm)
         .padding(.vertical, 6)
         .background(DS.Palette.surface.opacity(0.55))
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
         .accessibilityIdentifier("agent.hiddenLiveTurnItems")
     }
 
@@ -16531,25 +16682,11 @@ public struct AgentAppView: View {
         if vm.selectedThreadIsEphemeral {
             sideChatEmptyConversation
         } else {
-            VStack(spacing: DS.Space.lg) {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 44, weight: .regular))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .frame(width: 72, height: 72)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(Circle())
-                    .overlay(Circle().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-                VStack(spacing: DS.Space.sm) {
-                    Text("No messages")
-                        .font(.system(size: 28, weight: .semibold))
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .lineLimit(1)
-                    Text("Start a new agent run.")
-                        .font(DS.Font.body)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(2)
-                        .multilineTextAlignment(.center)
-                }
+            DSEmptyState(
+                icon: "sparkles",
+                title: vm.embedding?.emptyConversationTitle ?? "No messages",
+                subtitle: vm.embedding?.emptyConversationSubtitle ?? "Start a new agent run."
+            ) {
                 if let accountPanel {
                     accountPanel.frame(maxWidth: 420)
                 }
@@ -16559,26 +16696,11 @@ public struct AgentAppView: View {
     }
 
     private var sideChatEmptyConversation: some View {
-        VStack(spacing: DS.Space.lg) {
-            Image(systemName: "plus.circle")
-                .font(.system(size: 44, weight: .regular))
-                .foregroundColor(DS.Palette.textTertiary)
-                .frame(width: 72, height: 72)
-                .background(DS.Palette.surfaceRaised)
-                .clipShape(Circle())
-                .overlay(Circle().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-            VStack(spacing: DS.Space.sm) {
-                Text("Side chat")
-                    .font(.system(size: 28, weight: .semibold))
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .lineLimit(1)
-                Text("Side chats are temporary and disappear when you close the app.")
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-            }
-        }
+        DSEmptyState(
+            icon: "plus.circle",
+            title: "Side chat",
+            subtitle: "Side chats are temporary and disappear when you close the app."
+        )
         .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
     }
 
@@ -16593,7 +16715,7 @@ public struct AgentAppView: View {
                     .frame(width: 6, height: 6)
                 Text(running ? "Parent thread running" : "Parent thread idle")
                     .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
+                    .foregroundColor(DS.Palette.textSecondary)
                 Spacer(minLength: 0)
             }
             .accessibilityIdentifier("agent.sideChat.parentStatus")
@@ -16813,7 +16935,7 @@ public struct AgentAppView: View {
                         roleIdentifier: "agent.role.assistant",
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
-                        onBranch: { vm.onForkInNewChat?(msg.id.value.uuidString) },
+                        onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
                                 AgentChatPeerIdentityHeader(
@@ -16838,7 +16960,7 @@ public struct AgentAppView: View {
                         roleIdentifier: "agent.role.assistant",
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
-                        onBranch: { vm.onForkInNewChat?(msg.id.value.uuidString) }
+                        onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil
                     )
                 }
             }
@@ -16846,7 +16968,7 @@ public struct AgentAppView: View {
             AgentSelectablePlainText(
                 text: msg.content,
                 fontSize: 11,
-                textColor: DS.NS.textTertiary
+                textColor: DS.NS.textSecondary
             )
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -17019,7 +17141,7 @@ public struct AgentAppView: View {
             roleIdentifier: "agent.role.assistant",
             copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
             branchIdentifier: "agent.assistantMessage.branch.\(turn.turnId)",
-            onBranch: { vm.onForkInNewChat?(turn.turnId) },
+            onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(turn.turnId) } : nil,
             content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
         )
     }
@@ -17036,7 +17158,7 @@ public struct AgentAppView: View {
         let slice = AgentWorkDisclosureLayout.paintSlice(all: blocks, revealCount: reveal)
         VStack(alignment: .leading, spacing: DS.Space.md) {
             Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
+                withAnimation(reduceMotion ? nil : DS.Motion.micro) {
                     let wasExpanded = isCompletedWorkExpanded(for: turn)
                     toggleCompletedWork(for: turn)
                     if !wasExpanded {
@@ -17097,7 +17219,7 @@ public struct AgentAppView: View {
                     }
                 }
                 .padding(.leading, DS.Space.md)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(AgentChatMotion.transition(.fadeAndMove, reduceMotion: reduceMotion))
                 .accessibilityIdentifier("agent.work.lazyList.\(turn.turnId)")
             }
         }
@@ -17380,17 +17502,13 @@ public struct AgentAppView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .help(commandFull ?? summary)
                     if let full = commandFull, !full.isEmpty {
-                        Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(full, forType: .string)
-                        } label: {
-                            Image(systemName: "doc.on.doc")
+                        AgentChatCopyButton(text: full) { copied in
+                            Image(systemName: AgentChatCopyChrome.symbolName(copied: copied))
                                 .font(.system(size: 10))
                                 .foregroundColor(DS.Palette.textTertiary)
                                 .frame(width: 22, height: 22)
                                 .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
                         .dsPointingHandCursor()
                         .help("Copy full command")
                         .accessibilityIdentifier("agent.tool.copyCommand.\(item.id)")
@@ -17418,7 +17536,7 @@ public struct AgentAppView: View {
                 .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(DS.Palette.surface)
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             }
 
             // Liveness strip: one "not frozen" line (no second elapsed — trailing owns the clock).
@@ -17436,7 +17554,7 @@ public struct AgentAppView: View {
                 .padding(.vertical, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(DS.Palette.accent.opacity(0.06))
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(activityHint)
                 .accessibilityIdentifier("agent.tool.activityHint.\(item.id)")
@@ -17453,7 +17571,7 @@ public struct AgentAppView: View {
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface.opacity(0.7))
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
                     .accessibilityIdentifier("agent.tool.fullCommand.\(item.id)")
             }
 
@@ -17470,7 +17588,7 @@ public struct AgentAppView: View {
                     .padding(DS.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(DS.Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -17502,7 +17620,7 @@ public struct AgentAppView: View {
             : (failed ? "exclamationmark.triangle" : (imageOnly ? "photo" : "terminal"))
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             Button {
-                withAnimation(.easeInOut(duration: 0.16)) {
+                withAnimation(reduceMotion ? nil : DS.Motion.micro) {
                     if expanded { expandedToolGroups.remove(id) } else { expandedToolGroups.insert(id) }
                 }
             } label: {
@@ -17575,7 +17693,7 @@ public struct AgentAppView: View {
 
             if expanded {
                 HStack(alignment: .top, spacing: DS.Space.sm) {
-                    RoundedRectangle(cornerRadius: 1, style: .continuous)
+                    Capsule()
                         .fill(DS.Palette.line)
                         .frame(width: 1.5)
                         .padding(.leading, 4)
@@ -17607,7 +17725,7 @@ public struct AgentAppView: View {
                         }
                     }
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(AgentChatMotion.transition(.fadeAndMove, reduceMotion: reduceMotion))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -18177,7 +18295,50 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.legacyProvider.banner")
     }
 
+    @ViewBuilder
     private func systemStripRow(_ item: AgentSystemStripItem) -> some View {
+        if item.severity == .error {
+            // Same strip as a failed page read: one error row for the chat.
+            AgentChatErrorStrip(
+                message: item.message,
+                identifier: item.id,
+                offersCopy: item.offersCopy,
+                onRetry: item.offersRetry ? { retrySystemStripItem(item.id) } : nil,
+                onDismiss: item.offersDismiss ? { dismissSystemStripItem(item.id) } : nil
+            )
+        } else {
+            systemStripStatusRow(item)
+        }
+    }
+
+    private func retrySystemStripItem(_ id: String) {
+        switch id {
+        case "agent.provider.snapshot.stale":
+            vm.retryProviderThreadSnapshotRead()
+        case "agent.queue.status":
+            Task { await vm.send() }
+        default:
+            break
+        }
+    }
+
+    private func dismissSystemStripItem(_ id: String) {
+        switch id {
+        case "agent.history.replay.notice":
+            vm.dismissHistoryReplayNotice()
+        case "agent.status.message":
+            vm.dismissStatusMessage()
+        case "agent.provider.snapshot.stale":
+            vm.dismissProviderThreadSnapshotStatusMessage()
+        case "agent.queue.status":
+            vm.dismissQueueStatusMessage()
+        default:
+            break
+        }
+    }
+
+    /// Warning and info rows. Errors go through `AgentChatErrorStrip`.
+    private func systemStripStatusRow(_ item: AgentSystemStripItem) -> some View {
         let tone: Color = {
             switch item.severity {
             case .error: return DS.Palette.danger
@@ -18204,43 +18365,20 @@ public struct AgentAppView: View {
             )
                 .frame(maxWidth: .infinity, alignment: .leading)
             if item.offersCopy {
-                Button("Copy") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(item.message, forType: .string)
-                }
-                .buttonStyle(.plain)
+                AgentChatCopyButton(text: item.message) { AgentChatCopyWordLabel(copied: $0) }
                 .font(DS.Font.caption)
+                .accessibilityLabel("Copy")
                 .accessibilityIdentifier("\(item.id).copy")
             }
             if item.offersRetry {
-                Button("Retry") {
-                    switch item.id {
-                    case "agent.provider.snapshot.stale":
-                        vm.retryProviderThreadSnapshotRead()
-                    case "agent.queue.status":
-                        Task { await vm.send() }
-                    default:
-                        break
-                    }
-                }
+                Button("Retry") { retrySystemStripItem(item.id) }
                 .buttonStyle(.plain)
                 .font(DS.Font.caption)
                 .accessibilityIdentifier("\(item.id).retry")
             }
             if item.offersDismiss {
                 Button {
-                    switch item.id {
-                    case "agent.history.replay.notice":
-                        vm.dismissHistoryReplayNotice()
-                    case "agent.status.message":
-                        vm.dismissStatusMessage()
-                    case "agent.provider.snapshot.stale":
-                        vm.dismissProviderThreadSnapshotStatusMessage()
-                    case "agent.queue.status":
-                        vm.dismissQueueStatusMessage()
-                    default:
-                        break
-                    }
+                    dismissSystemStripItem(item.id)
                 } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
@@ -18255,9 +18393,7 @@ public struct AgentAppView: View {
         }
         .padding(.horizontal, DS.Space.lg)
         .padding(.vertical, DS.Space.sm)
-        .background(item.severity == .error
-            ? DS.Palette.danger.opacity(0.09)
-            : DS.Palette.surfaceRaised)
+        .background(DS.Palette.surfaceRaised)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier(item.id)
     }

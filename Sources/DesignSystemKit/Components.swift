@@ -17,6 +17,42 @@ public extension View {
     }
 }
 
+// MARK: - Hover fill
+
+/// Fill decision for `dsHoverFill` (pure, testable seam).
+public enum DSHoverFill {
+    /// - enabled: false => clear, so a selected row keeps its own fill
+    /// - isHovering: true => DS.Palette.hover
+    /// - otherwise => clear
+    public static func fill(isHovering: Bool, enabled: Bool) -> Color {
+        isHovering && enabled ? DS.Palette.hover : Color.clear
+    }
+}
+
+private struct DSHoverFillModifier: ViewModifier {
+    let enabled: Bool
+    let cornerRadius: CGFloat
+    @State private var hovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(DSHoverFill.fill(isHovering: hovering, enabled: enabled))
+            )
+            .onHover { hovering = $0 }
+    }
+}
+
+public extension View {
+    /// Paints DS.Palette.hover behind a clickable row while the pointer is over it.
+    /// Instant on purpose: hover on the Mac does not fade.
+    /// Usage: row.dsHoverFill(enabled: !selected)
+    func dsHoverFill(enabled: Bool = true, cornerRadius: CGFloat = DS.Radius.control) -> some View {
+        modifier(DSHoverFillModifier(enabled: enabled, cornerRadius: cornerRadius))
+    }
+}
+
 // MARK: - Surface containers
 
 public extension View {
@@ -298,7 +334,7 @@ public struct DSEmptyState<Action: View>: View {
             Text(title).font(DS.Font.title3).foregroundColor(DS.Palette.textSecondary)
             Text(subtitle)
                 .font(DS.Font.bodyDense)
-                .foregroundColor(DS.Palette.textTertiary)
+                .foregroundColor(DS.Palette.textSecondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 360)
             action
