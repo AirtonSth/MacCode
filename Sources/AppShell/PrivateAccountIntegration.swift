@@ -1240,12 +1240,33 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     private static let tailcatAnnouncedDigestKey = "private.tailcat.announcedDigest.v1"
     private static let silentWakeBudgetKey = "private.silentWake.budget.v1"
     private let silentWakeBudgetLock = NSLock()
-    /// Silent sends between budget admission and the backend's answer.
-    private var silentWakesInFlight = 0
-    /// Stored budget value: delivered silent wakes of one push-target device.
+    /// Silent sends between budget admission and the backend's answer, by device.
+    private var silentWakesInFlight: [String: Int] = [:]
+    /// Stored budget value, retaining every push-target device's delivered wakes.
     private struct SilentWakeBudgetState: Codable {
-        var device: String
-        var sent: [TimeInterval]
+        var devices: [String: [TimeInterval]]
+
+        private enum CodingKeys: String, CodingKey { case devices, device, sent }
+
+        init(devices: [String: [TimeInterval]]) {
+            self.devices = devices
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if let devices = try container.decodeIfPresent([String: [TimeInterval]].self, forKey: .devices) {
+                self.devices = devices
+            } else {
+                let device = try container.decode(String.self, forKey: .device)
+                let sent = try container.decode([TimeInterval].self, forKey: .sent)
+                self.devices = [device: sent]
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(devices, forKey: .devices)
+        }
     }
 
     /// Holds the outbox → bridge send handler without a process-wide singleton.
@@ -1501,13 +1522,18 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         return deviceId
     }
 
-    /// Stored delivery times of `device`; another device id resets the list.
-    /// Call with `silentWakeBudgetLock` held.
+    /// Stored delivery times of `device`. Call with `silentWakeBudgetLock` held.
     private func storedSilentWakeTimes(device: String) -> [TimeInterval] {
         guard let json = try? settings.get(Self.silentWakeBudgetKey),
-              let state = try? JSONDecoder().decode(SilentWakeBudgetState.self, from: Data(json.utf8)),
-              state.device == device else { return [] }
-        return state.sent
+              let state = try? JSONDecoder().decode(SilentWakeBudgetState.self, from: Data(json.utf8)) else { return [] }
+        return state.devices[device] ?? []
+    }
+
+    /// All stored device histories. Call with `silentWakeBudgetLock` held.
+    private func storedSilentWakeBudgetDevices() -> [String: [TimeInterval]] {
+        guard let json = try? settings.get(Self.silentWakeBudgetKey),
+              let state = try? JSONDecoder().decode(SilentWakeBudgetState.self, from: Data(json.utf8)) else { return [:] }
+        return state.devices
     }
 
     /// F5: takes one in-flight slot of the hourly budget, or drops and logs.
@@ -1517,9 +1543,9 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             // Always the window of the stored list, never its length: three
             // delivered wakes must not silence the phone after their hour.
             let used = MaterialWakeBudget.sentInWindow(storedSilentWakeTimes(device: device), now: Date()).count
-                + silentWakesInFlight
+                + (silentWakesInFlight[device] ?? 0)
             guard MaterialWakeBudget.admits(coalesceClass, used: used) else { return used }
-            silentWakesInFlight += 1
+            silentWakesInFlight[device, default: 0] += 1
             return nil
         }
         guard let refusedAt else { return true }
@@ -1533,14 +1559,15 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     /// F5: one exit of an admitted silent send. Only a delivered one costs a slot.
     private func settleSilentWake(delivered: Bool, device: String) {
         silentWakeBudgetLock.withLock {
-            silentWakesInFlight -= 1
+            let remaining = max(0, (silentWakesInFlight[device] ?? 0) - 1)
+            if remaining == 0 { silentWakesInFlight.removeValue(forKey: device) }
+            else { silentWakesInFlight[device] = remaining }
             guard delivered else { return }
             let deliveredAt = Date()
-            let state = SilentWakeBudgetState(
-                device: device,
-                sent: MaterialWakeBudget.sentInWindow(storedSilentWakeTimes(device: device), now: deliveredAt)
-                    + [deliveredAt.timeIntervalSince1970]
-            )
+            var devices = storedSilentWakeBudgetDevices()
+            devices[device] = MaterialWakeBudget.sentInWindow(storedSilentWakeTimes(device: device), now: deliveredAt)
+                + [deliveredAt.timeIntervalSince1970]
+            let state = SilentWakeBudgetState(devices: devices)
             do {
                 let data = try JSONEncoder().encode(state)
                 try settings.set(Self.silentWakeBudgetKey, String(decoding: data, as: UTF8.self))

@@ -177,6 +177,72 @@ final class SilentWakeBudgetBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.api.requests.count, 4, "device-2 has a budget of its own")
     }
 
+    func testLegacyBudgetEntryMigratesWithoutDroppingItsThreeWakeHistory() async throws {
+        // WHY: upgraded clients must honor the device budget written by earlier builds.
+        let fixture = try makeFixture()
+        let now = Date().timeIntervalSince1970
+        try fixture.settings.set(
+            Self.budgetKey,
+            "{\"device\":\"device-1\",\"sent\":[\(now),\(now),\(now)]}"
+        )
+
+        await send(.attention, on: fixture.makeBridge())
+
+        XCTAssertTrue(fixture.api.requests.isEmpty, "three legacy wakes already used device-1's hourly budget")
+    }
+
+    func testSwitchingDevicesDoesNotEraseHourlyWakeHistory() async throws {
+        // WHY: switching the registered target must not mint another hourly budget for a device.
+        let fixture = try makeFixture()
+        let bridge = fixture.makeBridge()
+
+        await send(.attention, on: bridge)
+        await send(.attention, on: bridge)
+        try fixture.targetStore.save(
+            pushToken: "apns-token-2",
+            pushTokenType: "apns",
+            liveActivityToken: nil,
+            deviceId: "device-2"
+        )
+        await send(.attention, on: bridge)
+        try fixture.targetStore.save(
+            pushToken: "apns-token-1",
+            pushTokenType: "apns",
+            liveActivityToken: nil,
+            deviceId: "device-1"
+        )
+        await send(.attention, on: bridge)
+        XCTAssertEqual(fixture.api.requests.count, 4, "device-1's third wake remains admitted after switching away and back")
+
+        await send(.attention, on: bridge)
+        XCTAssertEqual(fixture.api.requests.count, 4, "device-1's fourth wake is refused across device switches")
+    }
+
+    func testInFlightWakeBudgetIsScopedToItsDeviceAcrossSwitches() async throws {
+        // WHY: one device's pending sends must not reduce another device's independent budget.
+        let fixture = try makeFixture()
+        let bridge = fixture.makeBridge()
+        fixture.api.script([.hold])
+        let pendingA = Task {
+            await send(.attention, on: bridge)
+        }
+        await fixture.api.waitUntilHeld()
+
+        try fixture.targetStore.save(
+            pushToken: "apns-token-2",
+            pushTokenType: "apns",
+            liveActivityToken: nil,
+            deviceId: "device-2"
+        )
+        for _ in 0..<3 {
+            await send(.attention, on: bridge)
+        }
+        XCTAssertEqual(fixture.api.requests.count, 4, "device-2 gets all three slots while device-1 send remains pending")
+
+        fixture.api.releaseHeld()
+        await pendingA.value
+    }
+
     func testOutboxReplayIsInsideTheBudget() async throws {
         // WHY: the durable replay must not be a way around the budget. A
         // refused record throws, so the outbox keeps it instead of dropping it.
