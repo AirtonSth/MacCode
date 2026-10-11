@@ -517,11 +517,6 @@ final class BotGuestDockerVM: BotGuestVMPreparing, @unchecked Sendable {
     /// the image, so a container keeps its result until it is recreated.
     private var probedImages: [String: String] = [:]
     private let resolveExecutable: (@Sendable () throws -> String)?
-    /// Resolved docker executable → the `docker info` Architecture it reported.
-    private var architectures: [String: String] = [:]
-
-    /// `resolveExecutable` nil: the architecture is read from `docker info`
-    /// on every prepare instead of once per docker executable.
     init(
         appSupport: URL,
         docker: any BotComputerDockerClienting,
@@ -540,9 +535,8 @@ final class BotGuestDockerVM: BotGuestVMPreparing, @unchecked Sendable {
         workspace: String?,
         registeredWorkspaces: Set<String>
     ) throws -> BotGuestVM {
-        let executable = try resolveExecutable?()
-        let remembered = executable.flatMap { executable in lock.withLock { architectures[executable] } }
-        var arch = try remembered ?? dockerArchitecture(rememberingFor: executable)
+        _ = try resolveExecutable?()
+        let arch = try dockerArchitecture()
         let container: String
         let image: String
         let recreated: Bool
@@ -557,9 +551,6 @@ final class BotGuestDockerVM: BotGuestVMPreparing, @unchecked Sendable {
             // Anything but running and current takes the path every send took
             // before. It starts with `docker info`, which is what names a
             // daemon that is down.
-            if remembered != nil {
-                arch = try dockerArchitecture(rememberingFor: executable)
-            }
             if let workspace {
                 try service.ensureWorkspaceMounted(
                     botID: botID, workspace: workspace,
@@ -578,13 +569,10 @@ final class BotGuestDockerVM: BotGuestVMPreparing, @unchecked Sendable {
         return BotGuestVM(container: container, dockerArch: arch, mountedWorkspaces: mounted)
     }
 
-    private func dockerArchitecture(rememberingFor executable: String?) throws -> String {
+    private func dockerArchitecture() throws -> String {
         let info = try docker.info()
         guard let arch = DistillGuestBinaryProvisioner.dockerArchitecture(fromInfo: info) else {
             throw DistillGuestLaunchError.unavailable("Docker did not report its CPU architecture.")
-        }
-        if let executable {
-            lock.withLock { architectures[executable] = arch }
         }
         return arch
     }

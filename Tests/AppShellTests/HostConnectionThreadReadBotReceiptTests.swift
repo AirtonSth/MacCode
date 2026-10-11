@@ -460,12 +460,12 @@ final class HostConnectionThreadReadBotReceiptTests: XCTestCase {
                 "the run's delta was not projected to bot.run.stream"
             )
             let runEnded = try XCTUnwrap(marks.time("agent.run.completed", requestID: requestID))
-            // One delivery lane takes every mark, in the order the events
-            // were published. A send out of this order has a wrong mark and
-            // must not be recorded as a measurement.
+            // `agent.run.started` is published after `sendTurn` returns. A
+            // provider may emit its first delta before then, so those marks
+            // are not required to arrive in that order.
             XCTAssertTrue(
-                sent <= runStarted && runStarted <= firstStream && firstStream <= phoneTold && runEnded <= phoneTold,
-                "the marks of \(requestID) are out of order"
+                sent <= runStarted && firstStream <= phoneTold && runEnded <= phoneTold,
+                "the marks of \(requestID) violate their event-order contract"
             )
             let runEndedPublished = try XCTUnwrap(marks.published("agent.run.completed", requestID: requestID))
             let phoneToldPublished = try XCTUnwrap(marks.published("bot.run.completed", requestID: requestID))

@@ -31,6 +31,7 @@ private final class ScriptedDockerDaemon: @unchecked Sendable {
     var networks: Set<String> = []
     /// The daemon stopped answering: every command fails as the real CLI's does.
     var down = false
+    var architecture = "aarch64"
     /// No desktop comes up: every screenshot fails.
     var screenDown = false
     /// Runs when a `docker stop` arrives, while its container is still running.
@@ -49,7 +50,7 @@ private final class ScriptedDockerDaemon: @unchecked Sendable {
         let last = args.last ?? ""
         switch args.first {
         case "info":
-            return Data("Server Version: 29.4.0\n Architecture: aarch64\n".utf8)
+            return Data("Server Version: 29.4.0\n Architecture: \(architecture)\n".utf8)
         case "image":
             return try inspectImages(args)
         case "inspect":
@@ -317,28 +318,19 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         ], "the base image and the bot's own image are read in one inspect")
     }
 
-    func test_theDockerArchitectureIsReadOncePerDockerExecutable_notOnEverySend() throws {
-        // WHY (P1-02): `docker info` was the first process of every send only
-        // to learn the CPU architecture. It is now remembered per docker
-        // executable, and another executable (Docker Desktop vs OrbStack) is
-        // asked again. Known limit: one executable pointed at a daemon of
-        // another CPU architecture (`docker context use`) keeps the remembered
-        // value until a send that is not short, or an app relaunch.
+    func test_sameExecutableDaemonArchitectureSwitchUsesCurrentArchitectureOnRunningGuest() throws {
+        // WHY: Docker context can switch daemon CPU architecture without
+        // changing the executable or the already-running container.
         let guest = try makeRunningGuest()
-        let executable = OSAllocatedUnfairLock(initialState: "/usr/local/bin/docker")
-        let vm = BotGuestDockerVM(
-            appSupport: guest.support, docker: guest.docker, service: guest.service,
-            resolveExecutable: { executable.withLock { $0 } }
-        )
-        try prepare(vm, guest)
-        guest.daemon.forgetLaunches()
-
+        let vm = makeVM(guest)
         XCTAssertEqual(try prepare(vm, guest).dockerArch, "aarch64")
-        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"])
 
-        executable.withLock { $0 = "/opt/homebrew/bin/docker" }
+        guest.daemon.architecture = "x86_64"
         guest.daemon.forgetLaunches()
-        try prepare(vm, guest)
+        let prepared = try prepare(vm, guest)
+
+        XCTAssertEqual(prepared.container, guest.container)
+        XCTAssertEqual(prepared.dockerArch, "x86_64")
         XCTAssertEqual(verbs(guest), ["info", "image inspect", "inspect"])
     }
 
@@ -385,7 +377,7 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         // The replacement is current: the next send is the short one.
         guest.daemon.forgetLaunches()
         try prepare(vm, guest)
-        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"], what, line: line)
+        XCTAssertEqual(verbs(guest), ["info", "image inspect", "inspect"], what, line: line)
     }
 
     func test_aStoppedGuestIsStartedAndScreenshotted_andOnlyThenTakesTheShortPath() throws {
@@ -399,17 +391,17 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
 
         try prepare(vm, guest)
 
-        // The short check (2 launches) comes first and the path every send
-        // took before follows whole: a send that is not short costs 2 more
+        // The short check (3 launches, including `docker info`) comes first
+        // and the path every send took before follows whole: a send that is not short costs 2 more
         // launches than it did. Pinned so that cost cannot grow unseen.
         XCTAssertEqual(verbs(guest), [
-            "image inspect", "inspect",
-            "info", "image inspect", "inspect", "inspect", "network create", "network inspect",
+            "info", "image inspect", "inspect",
+            "image inspect", "inspect", "inspect", "network create", "network inspect",
             "image inspect", "inspect", "inspect", "start", "screenshot", "inspect",
         ], "a stopped container is started and screenshotted, not recreated")
         guest.daemon.forgetLaunches()
         try prepare(vm, guest)
-        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"])
+        XCTAssertEqual(verbs(guest), ["info", "image inspect", "inspect"])
     }
 
     func test_aContainerAMountRestarted_isScreenshottedOnceBeforeTheShortPathTrustsIt() throws {
@@ -444,7 +436,7 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         XCTAssertFalse(proven.contains("create") || proven.contains("rm"), "it is proven, not replaced again: \(proven)")
         guest.daemon.forgetLaunches()
         try prepare(vm, guest, workspace: project.path)
-        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"], "proven once, then short")
+        XCTAssertEqual(verbs(guest), ["info", "image inspect", "inspect"], "proven once, then short")
     }
 
     func test_aContainerAFailedRebuildRestarted_isScreenshottedOnceBeforeTheShortPathTrustsIt() throws {
@@ -465,7 +457,7 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         XCTAssertFalse(verbs(guest).contains("screenshot"), "a successful rebuild leaves its desktop proven")
         guest.daemon.forgetLaunches()
         try prepare(vm, guest)
-        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"], "a rebuilt desktop was proven: its sends are short")
+        XCTAssertEqual(verbs(guest), ["info", "image inspect", "inspect"], "a rebuilt desktop was proven: its sends are short")
 
         guest.daemon.screenDown = true
         guest.daemon.forgetLaunches()
@@ -490,7 +482,7 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         XCTAssertFalse(proven.contains("create") || proven.contains("rm"), "it is proven, not replaced: \(proven)")
         guest.daemon.forgetLaunches()
         try prepare(vm, guest)
-        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"], "proven once, then short")
+        XCTAssertEqual(verbs(guest), ["info", "image inspect", "inspect"], "proven once, then short")
     }
 
     func test_aScreenshotTakenWhileARebuildStopsTheContainer_doesNotProveTheOneStartedAgain() throws {
@@ -561,7 +553,7 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         )
         guest.daemon.forgetLaunches()
         try prepare(vm, guest)
-        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"], what, line: line)
+        XCTAssertEqual(verbs(guest), ["info", "image inspect", "inspect"], what, line: line)
     }
 
     func test_aBoundFolderThatWasDeleted_isDroppedNotMountedAgain_andTheSendStillSaysItIsNotMounted() throws {
@@ -590,8 +582,8 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         // The short check, then exactly what this send launched before (the
         // last one is the tools probe of a new container).
         XCTAssertEqual(verbs(guest), [
-            "image inspect", "inspect",
-            "info", "inspect", "image inspect", "inspect", "inspect", "network create", "network inspect",
+            "info", "image inspect", "inspect",
+            "inspect", "image inspect", "inspect", "inspect", "network create", "network inspect",
             "image inspect", "inspect", "rm", "create", "start", "screenshot", "inspect", "exec",
         ])
         XCTAssertThrowsError(try BotGuestRunResolver.guestCwd(
@@ -616,7 +608,7 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         XCTAssertThrowsError(try prepare(vm, guest)) { error in
             XCTAssertEqual(error as? BotComputerDockerError, .daemonUnavailable)
         }
-        XCTAssertEqual(verbs(guest), ["image inspect", "info"])
+        XCTAssertEqual(verbs(guest), ["info"])
     }
 
     func test_aWorkspaceThreadWithItsFolderMountedIsAsShort_andAnUnmountedFolderIsNotWavedThrough() throws {
@@ -635,7 +627,7 @@ final class BotGuestPrepareCallCountTests: XCTestCase {
         guest.daemon.forgetLaunches()
 
         XCTAssertEqual(try prepare(vm, guest, workspace: project.path).mountedWorkspaces, [project.path])
-        XCTAssertEqual(verbs(guest), ["image inspect", "inspect"])
+        XCTAssertEqual(verbs(guest), ["info", "image inspect", "inspect"])
 
         XCTAssertNil(try guest.service.runningCurrentContainer(
             botID: guest.botID, workspace: other.path,
