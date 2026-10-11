@@ -1233,6 +1233,41 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     }
     private let connectionHintLock = NSLock()
     private var connectionHintSources = ConnectionHintSources()
+    /// F5: the resolved settings store. Besides the outbox it holds the hourly
+    /// silent-wake budget and the last Tailcat digest a delivered silent push
+    /// carried. Not `UserDefaults.standard`: that store is process-wide.
+    private let settings: SettingsRepository
+    private static let tailcatAnnouncedDigestKey = "private.tailcat.announcedDigest.v1"
+    private static let silentWakeBudgetKey = "private.silentWake.budget.v1"
+    private let silentWakeBudgetLock = NSLock()
+    /// Silent sends between budget admission and the backend's answer, by device.
+    private var silentWakesInFlight: [String: Int] = [:]
+    /// Stored budget value, retaining every push-target device's delivered wakes.
+    private struct SilentWakeBudgetState: Codable {
+        var devices: [String: [TimeInterval]]
+
+        private enum CodingKeys: String, CodingKey { case devices, device, sent }
+
+        init(devices: [String: [TimeInterval]]) {
+            self.devices = devices
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if let devices = try container.decodeIfPresent([String: [TimeInterval]].self, forKey: .devices) {
+                self.devices = devices
+            } else {
+                let device = try container.decode(String.self, forKey: .device)
+                let sent = try container.decode([TimeInterval].self, forKey: .sent)
+                self.devices = [device: sent]
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(devices, forKey: .devices)
+        }
+    }
 
     /// Holds the outbox → bridge send handler without a process-wide singleton.
     private final class SilentWakeOutboxSendBox: @unchecked Sendable {
@@ -1261,13 +1296,15 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         self.pushTargetStore = pushTargetStore
         self.api = api
         self.sessionRefresher = PrivatePushSessionRefresher(accountStore: accountStore, api: api)
+        let resolvedSettings = settings ?? accountStore.settingsRepository
+        self.settings = resolvedSettings
         let sendBox = SilentWakeOutboxSendBox()
         self.silentWakeSendBox = sendBox
         if let silentWakeOutbox {
             self.silentWakeOutbox = silentWakeOutbox
         } else {
             let store = SilentWakeOutboxStore(
-                settings: settings ?? accountStore.settingsRepository
+                settings: resolvedSettings
             )
             self.silentWakeOutbox = SilentWakeOutbox(store: store) { record in
                 try await sendBox.send(record)
@@ -1307,6 +1344,17 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         )
     }
 
+    /// F5: the digest a push built now would carry, or nil (no source, no hint, invalid digest, lease not in the future).
+    private func currentTailcatDigestForPush() async -> String? {
+        let source = connectionHintLock.withLock { connectionHintSources.tailcat }
+        return PushConnectionHints.merge(
+            into: [:],
+            tailcat: await source?(),
+            watermark: nil,
+            bootEpoch: nil
+        )[PushConnectionHints.tailcatDigestKey]
+    }
+
     /// Test seam: observe the durable silent-wake outbox.
     public var silentWakeOutboxForTests: SilentWakeOutbox { silentWakeOutbox }
 
@@ -1320,6 +1368,20 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             .isLiveActivityUpdateChannelArmed(activityUpdateTokens: updateTokens)
     }
 
+    /// F5: a Live Activity card of the push target's device was registered
+    /// within ActivityKit's 8 h active limit.
+    func isLiveActivityActiveForPushTarget(now: Date = Date()) -> Bool {
+        guard let target = pushTargetStore.load() else { return false }
+        // A legacy target without a device id keeps today's rule: any card counts.
+        let targetDeviceId = target.deviceId ?? ""
+        return ((try? pushTargetStore.records()) ?? []).contains { record in
+            record.purpose == .activityUpdate
+                && !record.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && now.timeIntervalSince(record.updatedAt) < PrivatePushTargetStore.activityUpdateRetention
+                && (targetDeviceId.isEmpty || record.deviceId == targetDeviceId)
+        }
+    }
+
     /// Terminal main-agent finish remote path: suppress the visible APNs banner
     /// when a Live Activity update channel is already armed (Lock Screen covers
     /// completed/failed). Cancelled still alerts. Always forces silent catch-up
@@ -1328,7 +1390,8 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         _ content: RemoteCodeNotificationContent,
         phase: AgentRunStatus
     ) async {
-        let armed = isLiveActivityUpdateChannelArmed()
+        // F5: only a card that is active for this phone hides the banner; the wake below is inside the hourly budget.
+        let armed = isLiveActivityActiveForPushTarget()
         guard RemoteCodeNotificationContent.AgentAppPushPolicy
             .shouldDeliverRemoteFinishAlert(
                 phase: phase,
@@ -1446,10 +1509,130 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         Self.log.info("wake_not_sent reason=\(reason, privacy: .public)")
     }
 
+    /// F5: the card already shows progress, so the run-progress wake is withheld.
+    private func withholdsForLiveActivity(_ coalesceClass: MaterialWakeCoalesceClass) -> Bool {
+        guard coalesceClass == .runProgress, isLiveActivityActiveForPushTarget() else { return false }
+        HostWakeMetrics.shared.increment(.liveActivitySuppressed)
+        Self.log.info("silent_wake suppressed reason=live_activity_active class=run_progress")
+        return true
+    }
+
+    private static func silentWakeBudgetDevice(_ target: PrivatePushTarget) -> String {
+        guard let deviceId = target.deviceId, !deviceId.isEmpty else { return "legacy" }
+        return deviceId
+    }
+
+    /// Stored delivery times of `device`. Call with `silentWakeBudgetLock` held.
+    private func storedSilentWakeTimes(device: String) -> [TimeInterval] {
+        guard let json = try? settings.get(Self.silentWakeBudgetKey),
+              let state = try? JSONDecoder().decode(SilentWakeBudgetState.self, from: Data(json.utf8)) else { return [] }
+        return state.devices[device] ?? []
+    }
+
+    /// All stored device histories. Call with `silentWakeBudgetLock` held.
+    private func storedSilentWakeBudgetDevices() -> [String: [TimeInterval]] {
+        guard let json = try? settings.get(Self.silentWakeBudgetKey),
+              let state = try? JSONDecoder().decode(SilentWakeBudgetState.self, from: Data(json.utf8)) else { return [:] }
+        return state.devices
+    }
+
+    /// F5: takes one in-flight slot of the hourly budget, or drops and logs.
+    /// An admitted send must end in exactly one `settleSilentWake`.
+    private func admitSilentWakeToBudget(_ coalesceClass: MaterialWakeCoalesceClass, device: String) -> Bool {
+        let refusedAt: Int? = silentWakeBudgetLock.withLock { () -> Int? in
+            // Always the window of the stored list, never its length: three
+            // delivered wakes must not silence the phone after their hour.
+            let used = MaterialWakeBudget.sentInWindow(storedSilentWakeTimes(device: device), now: Date()).count
+                + (silentWakesInFlight[device] ?? 0)
+            guard MaterialWakeBudget.admits(coalesceClass, used: used) else { return used }
+            silentWakesInFlight[device, default: 0] += 1
+            return nil
+        }
+        guard let refusedAt else { return true }
+        HostWakeMetrics.shared.increment(.budgetDropped)
+        Self.log.info(
+            "silent_wake budget_dropped class=\(coalesceClass.rawValue, privacy: .public) used=\(refusedAt, privacy: .public) limit=\(MaterialWakeBudget.limit(for: coalesceClass), privacy: .public) window_s=\(Int(MaterialWakeBudget.windowSeconds), privacy: .public)"
+        )
+        return false
+    }
+
+    /// F5: one exit of an admitted silent send. Only a delivered one costs a slot.
+    private func settleSilentWake(delivered: Bool, device: String) {
+        silentWakeBudgetLock.withLock {
+            let remaining = max(0, (silentWakesInFlight[device] ?? 0) - 1)
+            if remaining == 0 { silentWakesInFlight.removeValue(forKey: device) }
+            else { silentWakesInFlight[device] = remaining }
+            guard delivered else { return }
+            let deliveredAt = Date()
+            var devices = storedSilentWakeBudgetDevices()
+            devices[device] = MaterialWakeBudget.sentInWindow(storedSilentWakeTimes(device: device), now: deliveredAt)
+                + [deliveredAt.timeIntervalSince1970]
+            let state = SilentWakeBudgetState(devices: devices)
+            do {
+                let data = try JSONEncoder().encode(state)
+                try settings.set(Self.silentWakeBudgetKey, String(decoding: data, as: UTF8.self))
+            } catch {
+                Self.log.error("silent_wake budget_write_failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+    }
+
+    /// F5: a delivered silent push that carried the digest still published is
+    /// its announcement. One that carried an older digest (built before a
+    /// rotation, answered after it) never moves the baseline back.
+    private func noteAnnouncedTailcatDigest(_ carried: String?) async {
+        guard let carried else { return }
+        let current = await currentTailcatDigestForPush()
+        guard carried == current,
+              (try? settings.get(Self.tailcatAnnouncedDigestKey)) != carried else { return }
+        do {
+            try settings.set(Self.tailcatAnnouncedDigestKey, carried)
+        } catch {
+            Self.log.error("tailcat_announce baseline_write_failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// F5: asks for one silent push when the published Tailcat endpoints differ
+    /// from the last digest a delivered silent push carried to this phone.
+    func announceTailcatEndpointIfChanged() async {
+        // Nobody to tell: record nothing as announced and log nothing per renewal.
+        guard let session = accountStore.load(), session.user.subscribed,
+              pushTargetStore.load() != nil else { return }
+        guard let digest = await currentTailcatDigestForPush() else { return }
+        let baseline: String
+        do {
+            baseline = try settings.get(Self.tailcatAnnouncedDigestKey) ?? ""
+        } catch {
+            // An unreadable baseline is not "no baseline": the next renewal asks again.
+            return
+        }
+        if baseline == digest { return }
+        if baseline.isEmpty {
+            // First publish of this build: the phone has nothing older to invalidate.
+            do {
+                try settings.set(Self.tailcatAnnouncedDigestKey, digest)
+                // `notice`, not `info`: the device check counts these lines and `info` is not persisted.
+                Self.log.notice("tailcat_announce outcome=seeded")
+            } catch {
+                Self.log.error("tailcat_announce baseline_write_failed: \(String(describing: error), privacy: .public)")
+            }
+            return
+        }
+        Self.log.notice("tailcat_announce outcome=attempt")
+        // Not forced: the 30 s bucket keeps two digests off one idempotency key.
+        await deliverSilentCatchUp(
+            hostHint: "tailcat",
+            force: false,
+            payload: SilentCatchUpV1(reason: "tailcat_endpoint_changed"),
+            coalesceClass: .tailcat
+        )
+    }
+
     /// Silent APNs background wake: iOS `didReceiveRemoteNotification` runs
     /// `BackgroundSyncCoordinator` catch-up. Coalesced per reason-class 30s
     /// bucket so an attention wake cannot be suppressed by run-progress traffic.
     /// Payload is `silent_catchup.v1` only (no agent text/titles in data).
+    /// F5: every silent wake is also inside the hourly budget (`MaterialWakeBudget`); a forced wake bypasses only the 30 s bucket.
     public func deliverSilentCatchUp(
         hostHint: String = "host",
         force: Bool = false,
@@ -1468,6 +1651,8 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             recordWakeNotSent(reason: "no_push_target")
             return
         }
+        // F5: before the coalescer and the budget, so it marks no bucket and costs no slot.
+        if withholdsForLiveActivity(coalesceClass) { return }
         let now = Date()
         let bucket = Int(now.timeIntervalSince1970 / Self.silentCatchUpBucketSeconds)
         // Serialize check/set: concurrent run outcomes must not both send.
@@ -1498,10 +1683,23 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             )
             return
         }
+        // F5: `force` bypassed the 30 s bucket above; nothing bypasses the hourly budget.
+        let budgetDevice = Self.silentWakeBudgetDevice(target)
+        guard admitSilentWakeToBudget(coalesceClass, device: budgetDevice) else { return }
         var contract = payload
         contract.catchUp = true
         let data = await withConnectionHints(contract.asPushData())
-        let idempotencyKey = "catchup.\(coalesceClass.rawValue).\(hostHint).\(bucket)"
+        let carriedDigest = data[PushConnectionHints.tailcatDigestKey]
+        if coalesceClass == .tailcat, carriedDigest == nil {
+            // F5: the rotation push is about the address only; never a bare wake.
+            settleSilentWake(delivered: false, device: budgetDevice)
+            Self.log.notice("tailcat_announce outcome=no_digest")
+            return
+        }
+        // F5: the rotation push's key names its digest. Two Macs of one account rotate
+        // together; on a shared key the backend answers the second from its cache, unsent.
+        let keyHint = (coalesceClass == .tailcat ? carriedDigest : nil) ?? hostHint
+        let idempotencyKey = "catchup.\(coalesceClass.rawValue).\(keyHint).\(bucket)"
         HostWakeMetrics.shared.increment(.silentAttempt)
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
@@ -1519,17 +1717,21 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             if result.shouldDropSubscription {
                 pushTargetStore.clear()
             }
+            settleSilentWake(delivered: result.delivered, device: budgetDevice)
             if result.delivered {
                 HostWakeMetrics.shared.increment(.silentSent)
+                await noteAnnouncedTailcatDigest(carriedDigest)
             } else {
                 // Backend may signal rate limit via non-delivered without throw.
                 HostWakeMetrics.shared.increment(.silent429)
             }
         } catch {
+            settleSilentWake(delivered: false, device: budgetDevice)
             HostWakeMetrics.shared.increment(.silentFailed)
             Self.log.error("Silent catch-up push failed: \(String(describing: error), privacy: .public)")
             // Durable retry only behind wake_outbox. Flag off preserves log-and-drop.
-            if ConnectionFeatureFlags.wakeOutboxEnabled {
+            // F5: never for the rotation push; the next renewal is its retry.
+            if ConnectionFeatureFlags.wakeOutboxEnabled, coalesceClass != .tailcat {
                 let record = SilentWakeOutboxRecord(
                     coalesceClass: coalesceClass,
                     hostHint: hostHint,
@@ -1556,6 +1758,13 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         guard let target = pushTargetStore.load() else {
             throw SilentWakeOutboxError.missingSessionOrTarget
         }
+        // F5: the replay is inside the same two rules. A withheld progress wake
+        // is acknowledged and dropped; one the budget refuses stays queued.
+        if withholdsForLiveActivity(record.coalesceClassValue) { return }
+        let budgetDevice = Self.silentWakeBudgetDevice(target)
+        guard admitSilentWakeToBudget(record.coalesceClassValue, device: budgetDevice) else {
+            throw SilentWakeOutboxError.notDelivered("budget")
+        }
         var contract = record.payload
         contract.catchUp = true
         let data = await withConnectionHints(contract.asPushData())
@@ -1576,16 +1785,20 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             if result.shouldDropSubscription {
                 pushTargetStore.clear()
             }
+            settleSilentWake(delivered: result.delivered, device: budgetDevice)
             if result.delivered {
                 HostWakeMetrics.shared.increment(.silentSent)
+                await noteAnnouncedTailcatDigest(data[PushConnectionHints.tailcatDigestKey])
                 return
             }
             // Non-throwing rate-limit: retry via outbox without inventing success.
             HostWakeMetrics.shared.increment(.silent429)
             throw SilentWakeOutboxError.notDelivered(result.errorCode)
         } catch let error as SilentWakeOutboxError {
+            // Only the `notDelivered` thrown above arrives here, already settled.
             throw error
         } catch {
+            settleSilentWake(delivered: false, device: budgetDevice)
             HostWakeMetrics.shared.increment(.silentFailed)
             throw error
         }

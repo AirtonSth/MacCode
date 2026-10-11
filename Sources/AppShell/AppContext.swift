@@ -552,6 +552,7 @@ public final class AppContext {
         dbPathOverride: String? = nil,
         appSupportOverride: String? = nil,
         accountUsageRefresher: ProviderAccountUsageRefreshing = ProviderAccountUsageRefresher(),
+        privateAccountAPI: PrivateAccountAPI = URLSessionPrivateAccountAPI(),
         agentSkillsHomeOverrideForTesting: URL? = nil,
         /// Interactive RemoteCode must reconcile abandoned runs on launch.
         /// Background helpers that share the same SQLite (Scheduled Task Agent)
@@ -594,7 +595,8 @@ public final class AppContext {
         let privatePushTargetStore = PrivatePushTargetStore(repo: self.settingsRepo)
         let privateNotificationBridge = PrivateNotificationBridge(
             accountStore: PrivateAccountSessionStore(repo: self.settingsRepo),
-            pushTargetStore: privatePushTargetStore
+            pushTargetStore: privatePushTargetStore,
+            api: privateAccountAPI
         )
         self.privateNotificationBridge = privateNotificationBridge
         let liveActivityIdentity = try LiveActivityIdentityStore.beginBoot(settings: self.settingsRepo)
@@ -1104,6 +1106,9 @@ public final class AppContext {
         coordinator.onRunFinished = { [weak self] tid, rid, status in
             let nextWaiting = BotVMRunRegistry.shared.releaseAndNextWaiter(runID: rid)
             let streamErrorAction = runErrorActions.take(runId: rid)
+            // Read before the hop: closing a side chat stops its run and deletes
+            // the row right after this callback returns.
+            let isSideThread = (try? self?.threadRepo.isEphemeral(of: tid)) ?? false
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 // The hand-off starts the next thread (VM preflight, guest
@@ -1129,6 +1134,11 @@ public final class AppContext {
                         streamErrorAction: streamErrorAction
                     )) { $1 }
                     failedPayload = .object(obj)
+                }
+                if isSideThread {
+                    // The phone does not list side threads: their finish wakes no
+                    // phone, so it takes no slot of the hourly silent-wake budget.
+                    MaterialWakeCoordinator.shared.muteTerminalWake(runId: rid.value.uuidString.lowercased())
                 }
                 EventBus.shared.publish(kind: kind, payload: kind == .agentRunFailed ? failedPayload : agentRunPayload(threadId: tid, runId: rid, status: status))
                 EventBus.shared.publish(kind: .agentRunFinished, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
@@ -1162,11 +1172,14 @@ public final class AppContext {
                     // when Live Activity already covers Lock Screen (attention
                     // path still uses deliver(_:) and is never gated here).
                     SystemNotifier.shared.post(content)
-                    Task {
-                        await self.privateNotificationBridge.deliverThreadOutcomeRemote(
-                            content,
-                            phase: status
-                        )
+                    // No phone banner and no catch-up for a side thread either.
+                    if !isSideThread {
+                        Task {
+                            await self.privateNotificationBridge.deliverThreadOutcomeRemote(
+                                content,
+                                phase: status
+                            )
+                        }
                     }
                 }
             }

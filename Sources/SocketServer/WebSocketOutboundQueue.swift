@@ -1500,6 +1500,9 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
         /// Accepted TCP descriptor. Revoke must `SHUT_RDWR` this fd; the
         /// session owner still performs the final `Darwin.close`.
         let socketFD: Int32
+        /// F5: queues `host.tailcat.rotating` on this socket. Lives in the
+        /// entry so every removal path drops it with the connection.
+        var tailcatRotationNotice: (@Sendable (String) -> Bool)? = nil
     }
 
     private let lock = NSLock()
@@ -1566,6 +1569,19 @@ final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
 
     func remove(_ connectionID: String) {
         lock.lock(); entries.removeValue(forKey: connectionID); lock.unlock()
+    }
+
+    /// F5: per-socket writer of `host.tailcat.rotating`; only a socket that sent the feature header sets one.
+    func setTailcatRotationNotice(_ connectionID: String, _ notice: @escaping @Sendable (String) -> Bool) {
+        lock.lock(); defer { lock.unlock() }
+        guard var entry = entries[connectionID] else { return }
+        entry.tailcatRotationNotice = notice
+        entries[connectionID] = entry
+    }
+
+    func tailcatRotationNotices() -> [@Sendable (String) -> Bool] {
+        lock.lock(); defer { lock.unlock() }
+        return entries.values.compactMap { $0.tailcatRotationNotice }
     }
 
     func ownerFingerprints() -> Set<String> {

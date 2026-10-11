@@ -1250,6 +1250,16 @@ public final class AgentThreadRepository {
         return AgentRunStatus(rawValue: st.columnText(0) ?? "") ?? .pending
     }
 
+    /// Cheap side-chat probe for run finish. Avoids the full `get` when only
+    /// `is_ephemeral` decides whether the phone is told. False when the
+    /// durable row is gone.
+    public func isEphemeral(of id: AgentThreadID) throws -> Bool {
+        let st = try db.prepare("SELECT is_ephemeral FROM agent_threads WHERE id = ? LIMIT 1;")
+        try st.bind(1, id.value.uuidString)
+        guard try st.step() else { return false }
+        return st.columnInt64(0) != 0
+    }
+
     /// Cheap provider probe for fork admission. Avoids the full `get`
     /// (26 columns + routing JSON) when only existence and `provider`
     /// decide whether the child may use the parent provider. Returns nil

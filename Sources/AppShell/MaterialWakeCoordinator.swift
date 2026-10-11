@@ -30,6 +30,8 @@ public final class MaterialWakeCoordinator: @unchecked Sendable {
     /// delivery; drained off it. At most one entry per coalesce class.
     private var pending: [PendingWake] = []
     private var drainTask: Task<Void, Never>?
+    /// Runs whose terminal event wakes no phone (`muteTerminalWake`).
+    private var mutedRunIds: Set<String> = []
 
     #if DEBUG
     /// DEBUG-only delivery observer/replacement for unit tests. Compiled out of
@@ -126,12 +128,24 @@ public final class MaterialWakeCoordinator: @unchecked Sendable {
         testDelivererDivertCount = 0
         #endif
         pending.removeAll()
+        mutedRunIds.removeAll()
         drainTask?.cancel()
         drainTask = nil
         lock.unlock()
         if let token {
             EventBus.shared.unsubscribe(token)
         }
+    }
+
+    /// The terminal event of this run (`agent.run.completed` / `agent.run.failed`)
+    /// queues no wake. For a side chat: the phone does not list side threads, so
+    /// their finish must not take a slot of the hourly silent-wake budget. The
+    /// publisher calls this before it publishes; `runId` is the payload's `run_id`.
+    public func muteTerminalWake(runId: String) {
+        lock.lock()
+        // Not subscribed: no event would ever take the entry out again.
+        if subscriptionToken != nil { mutedRunIds.insert(runId) }
+        lock.unlock()
     }
 
     /// Pure seam: build v1 payload for a material event (tests assert fields).
@@ -243,6 +257,13 @@ public final class MaterialWakeCoordinator: @unchecked Sendable {
     private func handle(event: EventBus.Event) {
         // Runs on EventBus serial delivery queue — classify here, deliver off-queue.
         let kind = event.kind
+        if kind == "agent.run.completed" || kind == "agent.run.failed",
+           let runId = event.payload.objectValue?["run_id"]?.stringValue {
+            lock.lock()
+            let muted = mutedRunIds.remove(runId) != nil
+            lock.unlock()
+            if muted { return }
+        }
         let decision = Self.shouldSilentWake(
             kind: kind,
             wakePhaseA: ConnectionFeatureFlags.wakePhaseAEnabled,

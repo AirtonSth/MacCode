@@ -749,12 +749,21 @@ final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable {
     private let failingRelay: TailcatRelay?
     private let failAll: Bool
     private let blockCloses: Bool
+    private let blobsFollowKeys: Bool
     private let closeGate = DispatchSemaphore(value: 0)
 
-    init(failingRelay: TailcatRelay? = nil, failAll: Bool = false, blockCloses: Bool = false) {
+    /// `blobsFollowKeys`: each blob names the key it was started with, so the
+    /// published endpoints change exactly when the keys do.
+    init(
+        failingRelay: TailcatRelay? = nil,
+        failAll: Bool = false,
+        blockCloses: Bool = false,
+        blobsFollowKeys: Bool = false
+    ) {
         self.failingRelay = failingRelay
         self.failAll = failAll
         self.blockCloses = blockCloses
+        self.blobsFollowKeys = blobsFollowKeys
     }
 
     var startCalls: [StartCall] { lock.withLock { starts } }
@@ -789,9 +798,10 @@ final class FakeTailcatBridge: TailcatBridgeRuntime, @unchecked Sendable {
         )
         lock.withLock { starts.append(call) }
         if failAll || matches(relay, failingRelay) { throw TailcatBridgeError.rejected("start_failed") }
+        let suffix = blobsFollowKeys ? "-\(key.publicKey)" : ""
         switch relay {
-        case .primary: return TailcatRunningServer(handle: 101, connBlob: "primary-blob", nodePublic: key.publicKey)
-        case .publicFallback: return TailcatRunningServer(handle: 202, connBlob: "fallback-blob", nodePublic: key.publicKey)
+        case .primary: return TailcatRunningServer(handle: 101, connBlob: "primary-blob\(suffix)", nodePublic: key.publicKey)
+        case .publicFallback: return TailcatRunningServer(handle: 202, connBlob: "fallback-blob\(suffix)", nodePublic: key.publicKey)
         }
     }
 
@@ -838,6 +848,11 @@ actor FakeTailcatCatalog: TailcatCatalogAPI {
     private var unauthorizedTokens: Set<String> = []
     private var holdNextHost = false
     private var hostHold: CheckedContinuation<Void, Never>?
+    private var publishError: Error?
+    private var holdNextPublish = false
+    private var publishHold: CheckedContinuation<Void, Never>?
+    private var holdNextDelete = false
+    private var deleteHold: CheckedContinuation<Void, Never>?
     private(set) var lastPublish: Publish?
     private(set) var deleteAccessTokens: [String] = []
     private(set) var hostAccessTokens: [String] = []
@@ -865,6 +880,29 @@ actor FakeTailcatCatalog: TailcatCatalogAPI {
         hostHold = nil
     }
 
+    /// Fails `publishHost` only; `host()` keeps answering, so a tick reaches the `PUT`.
+    func setPublishError(_ error: Error?) { publishError = error }
+
+    var isHoldingPublish: Bool { publishHold != nil }
+
+    func holdNextPublishCall() { holdNextPublish = true }
+
+    func releasePublishCall() {
+        holdNextPublish = false
+        publishHold?.resume()
+        publishHold = nil
+    }
+
+    var isHoldingDelete: Bool { deleteHold != nil }
+
+    func holdNextDeleteCall() { holdNextDelete = true }
+
+    func releaseDeleteCall() {
+        holdNextDelete = false
+        deleteHold?.resume()
+        deleteHold = nil
+    }
+
     func host(serverID: String, accessToken: String) async throws -> TailcatHostSnapshot {
         hostAccessTokens.append(accessToken)
         if holdNextHost {
@@ -889,12 +927,25 @@ actor FakeTailcatCatalog: TailcatCatalogAPI {
         ifMatch: String?
     ) async throws -> TailcatPublishedHost {
         publishAccessTokens.append(accessToken)
+        if holdNextPublish {
+            holdNextPublish = false
+            await withCheckedContinuation { continuation in
+                publishHold = continuation
+            }
+        }
+        if let publishError { throw publishError }
         if unavailable { throw URLError(.notConnectedToInternet) }
         lastPublish = Publish(endpoints: endpoints, ifMatch: ifMatch)
         return TailcatPublishedHost(host: hostValue(serverID: serverID, version: 2, endpoints: endpoints), eTag: "\"2\"")
     }
 
     func deleteHost(serverID: String, accessToken: String) async throws {
+        if holdNextDelete {
+            holdNextDelete = false
+            await withCheckedContinuation { continuation in
+                deleteHold = continuation
+            }
+        }
         if unavailable { throw URLError(.notConnectedToInternet) }
         deleteAccessTokens.append(accessToken)
     }

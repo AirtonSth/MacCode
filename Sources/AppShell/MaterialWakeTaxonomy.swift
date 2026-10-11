@@ -28,10 +28,44 @@ public enum MaterialWakeCoalesceClass: String, Sendable, Equatable, CaseIterable
     case notification = "notification"
     /// Host boot/identity rebaseline (force path).
     case boot = "boot"
+    /// F5: Tailcat endpoint digest changed; never produced by an EventBus kind.
+    case tailcat = "tailcat"
     /// Phase B git material kinds.
     case git = "git"
     /// Fallback bucket for unclassified silent reasons.
     case other = "other"
+}
+
+/// F5: at most `capacity` delivered silent wakes per rolling hour per
+/// device; a lower class is refused earlier, so attention always has a slot.
+public enum MaterialWakeBudget: Sendable {
+    public static let windowSeconds: TimeInterval = 60 * 60
+    public static let capacity = 3
+
+    /// The class is admitted while `used` is below this.
+    public static func limit(for coalesceClass: MaterialWakeCoalesceClass) -> Int {
+        // No `default`: a new class must not compile until it has a limit.
+        switch coalesceClass {
+        case .attention:
+            return capacity
+        case .tailcat, .boot, .notification:
+            return 2
+        case .runProgress, .git, .other:
+            return 1
+        }
+    }
+
+    /// Delivery times still inside the window: `now - windowSeconds < t <= now`.
+    /// A time later than `now` (the wall clock was set back) is dropped too.
+    public static func sentInWindow(_ sent: [TimeInterval], now: Date) -> [TimeInterval] {
+        let end = now.timeIntervalSince1970
+        return sent.filter { $0 > end - windowSeconds && $0 <= end }
+    }
+
+    /// `used` = delivered sends in the window plus sends in flight.
+    public static func admits(_ coalesceClass: MaterialWakeCoalesceClass, used: Int) -> Bool {
+        used < limit(for: coalesceClass)
+    }
 }
 
 /// Frozen kind → wake class map (plan A-003 default). Expansions only via phase flags.

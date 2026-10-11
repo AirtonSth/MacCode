@@ -312,6 +312,14 @@ struct ConnectionWelcomeFrame: Codable, Equatable, Sendable {
     var capabilitiesDigest: String? = nil
     /// C8: present only on durable-replay sockets (see `DurableReplayContract`).
     var replayFromSequence: Int64? = nil
+    /// F7: the bus head read in the lock hold that subscribed this socket.
+    /// Present only on a durable-replay socket that listed `resume.head.v1`
+    /// and whose cursor this boot accepted as sent (see
+    /// `DurableReplayContract.welcomeHeadSequence`). Omitted, never null.
+    var headSequence: Int64? = nil
+    /// F5: present only on a socket that listed `tailcat.rotation_notice.v1`
+    /// while a Tailcat host is published. Omitted, never null.
+    var tailcatEndpointDigest: String? = nil
 }
 
 /// C-W: opt-in welcome fields that let a pinned client validate a reconnect
@@ -339,6 +347,59 @@ enum ConnectionWelcomeIdentity {
             (0x30...0x39).contains($0) || (0x61...0x66).contains($0)
         }
     }
+}
+
+/// F5: opt-in client features (`X-RC2-Client-Features`, comma separated).
+/// Shipped iOS builds decode welcome with an exact key set and treat an
+/// unknown frame type as terminal, so both things below reach only sockets
+/// that list `tailcat.rotation_notice.v1`.
+enum ConnectionClientFeatures {
+    static let header = "x-rc2-client-features"
+    static let tailcatRotationNotice = "tailcat.rotation_notice.v1"
+    static let welcomeKey = "tailcatEndpointDigest"
+    static let rotatingFrameType = "host.tailcat.rotating"
+    /// F7: capability name in the welcome and opt-in token in this header.
+    static let resumeHead = "resume.head.v1"
+    static let headSequenceWelcomeKey = "headSequence"
+
+    /// True when the comma-separated header lists `tailcat.rotation_notice.v1`.
+    static func requestsTailcatRotationNotice(header value: String?) -> Bool {
+        guard let value else { return false }
+        return value.split(separator: ",").contains {
+            $0.trimmingCharacters(in: .whitespaces).lowercased() == tailcatRotationNotice
+        }
+    }
+
+    /// True when the comma-separated header lists `resume.head.v1`.
+    static func requestsResumeHead(header value: String?) -> Bool {
+        guard let value else { return false }
+        return value.split(separator: ",").contains {
+            $0.trimmingCharacters(in: .whitespaces).lowercased() == resumeHead
+        }
+    }
+
+    static func tailcatRotatingData(
+        connectionId: String, hostId: String, bootEpoch: UInt64, retiringDigest: String
+    ) -> Data? {
+        try? ConnectionTransportFrame.tailcatRotating(ConnectionTailcatRotatingFrame(
+            protocolVersion: ConnectionTransportFrame.protocolVersion,
+            type: rotatingFrameType,
+            connectionId: connectionId,
+            hostId: hostId,
+            bootEpoch: bootEpoch,
+            retiringDigest: retiringDigest
+        )).encoded()
+    }
+}
+
+/// F5: `host.tailcat.rotating`, notice sockets only (`ConnectionClientFeatures`).
+struct ConnectionTailcatRotatingFrame: Codable, Equatable, Sendable {
+    let protocolVersion: Int
+    let type: String
+    let connectionId: String
+    let hostId: String
+    let bootEpoch: UInt64
+    let retiringDigest: String
 }
 
 struct ConnectionHeartbeatFrame: Codable, Equatable, Sendable {
@@ -545,6 +606,8 @@ enum ConnectionTransportFrame: Equatable, Sendable {
     /// C8: durable-replay sockets only.
     case streamGap(ConnectionStreamGapFrame)
     case replayComplete(ConnectionReplayCompleteFrame)
+    /// F5: sockets that listed `tailcat.rotation_notice.v1` only.
+    case tailcatRotating(ConnectionTailcatRotatingFrame)
 
     func encoded() throws -> Data {
         Self.codecLock.lock()
@@ -560,6 +623,7 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         case .snapshot(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         case .streamGap(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         case .replayComplete(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
+        case .tailcatRotating(let frame): try Self.validate(frame); data = try Self.sharedEncoder.encode(frame)
         }
         guard data.count <= Self.maximumEncodedBytes else {
             throw ConnectionProtocolFailure.frameTooLarge
@@ -604,6 +668,12 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             if object[DurableReplayContract.welcomeKey] != nil {
                 allowedKeys.insert(DurableReplayContract.welcomeKey)
             }
+            if object[ConnectionClientFeatures.welcomeKey] != nil {
+                allowedKeys.insert(ConnectionClientFeatures.welcomeKey)
+            }
+            if object[ConnectionClientFeatures.headSequenceWelcomeKey] != nil {
+                allowedKeys.insert(ConnectionClientFeatures.headSequenceWelcomeKey)
+            }
         case "heartbeat":
             allowedKeys = [
                 "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
@@ -646,6 +716,11 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
                 "throughSequence",
             ]
+        case ConnectionClientFeatures.rotatingFrameType:
+            allowedKeys = [
+                "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
+                "retiringDigest",
+            ]
         default:
             throw ConnectionProtocolFailure.unknownType
         }
@@ -656,6 +731,11 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             throw ConnectionProtocolFailure.invalidFrame
         }
         if type == "snapshot", !hasStrictSnapshotRevisionFields(object) {
+            throw ConnectionProtocolFailure.invalidFrame
+        }
+        // F5: the welcome digest is omitted, never null.
+        if type == "welcome", let digest = object[ConnectionClientFeatures.welcomeKey],
+           !(digest is String) {
             throw ConnectionProtocolFailure.invalidFrame
         }
 
@@ -699,6 +779,10 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 let frame = try sharedDecoder.decode(ConnectionReplayCompleteFrame.self, from: data)
                 try validate(frame)
                 return .replayComplete(frame)
+            case ConnectionClientFeatures.rotatingFrameType:
+                let frame = try sharedDecoder.decode(ConnectionTailcatRotatingFrame.self, from: data)
+                try validate(frame)
+                return .tailcatRotating(frame)
             default: throw ConnectionProtocolFailure.unknownType
             }
         } catch let failure as ConnectionProtocolFailure {
@@ -734,6 +818,8 @@ enum ConnectionTransportFrame: Equatable, Sendable {
                 "currentSequence", "oldestReplaySequence",
             ] + (object[DurableReplayContract.welcomeKey] != nil
                 ? [DurableReplayContract.welcomeKey] : [])
+            + (object[ConnectionClientFeatures.headSequenceWelcomeKey] != nil
+                ? [ConnectionClientFeatures.headSequenceWelcomeKey] : [])
         case "heartbeat":
             requiredKeys = ["bootEpoch", "sentAtEpochMs", "lastReceivedSequence"]
         case "closing":
@@ -750,6 +836,8 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             requiredKeys = ["bootEpoch", "sinceSequence", "throughSequence"]
         case "replayComplete":
             requiredKeys = ["bootEpoch", "throughSequence"]
+        case ConnectionClientFeatures.rotatingFrameType:
+            requiredKeys = ["bootEpoch"]
         default:
             return false
         }
@@ -804,6 +892,14 @@ enum ConnectionTransportFrame: Equatable, Sendable {
            !(0...frame.currentSequence).contains(replayFrom) {
             throw ConnectionProtocolFailure.invalidFrame
         }
+        // F7: the head is the sequence this welcome is anchored on, and only
+        // a durable socket with a real cursor is told it.
+        if let head = frame.headSequence {
+            guard head == frame.currentSequence,
+                  let replayFrom = frame.replayFromSequence, replayFrom > 0 else {
+                throw ConnectionProtocolFailure.invalidFrame
+            }
+        }
         // C-W: the identity extension is all-or-nothing.
         switch (frame.apiVersion, frame.capabilitiesDigest) {
         case (nil, nil):
@@ -812,6 +908,10 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             where isNonEmpty(apiVersion) && ConnectionWelcomeIdentity.isValidDigest(digest):
             break
         default:
+            throw ConnectionProtocolFailure.invalidFrame
+        }
+        if let digest = frame.tailcatEndpointDigest,
+           !ConnectionWelcomeIdentity.isValidDigest(digest) {
             throw ConnectionProtocolFailure.invalidFrame
         }
     }
@@ -932,6 +1032,20 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             bootEpoch: frame.bootEpoch
         )
         guard frame.throughSequence >= 0 else { throw ConnectionProtocolFailure.invalidFrame }
+    }
+
+    private static func validate(_ frame: ConnectionTailcatRotatingFrame) throws {
+        try validateCommon(
+            protocolVersion: frame.protocolVersion,
+            type: frame.type,
+            expectedType: ConnectionClientFeatures.rotatingFrameType,
+            connectionId: frame.connectionId,
+            hostId: frame.hostId,
+            bootEpoch: frame.bootEpoch
+        )
+        guard ConnectionWelcomeIdentity.isValidDigest(frame.retiringDigest) else {
+            throw ConnectionProtocolFailure.invalidFrame
+        }
     }
 
     private static func validate(_ frame: ConnectionSnapshotFrame) throws {

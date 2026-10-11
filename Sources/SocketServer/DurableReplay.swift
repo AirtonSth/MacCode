@@ -80,6 +80,29 @@ public enum DurableReplayContract {
         }
         return (requestedSinceSequence, true, true)
     }
+
+    /// F7: the head this socket's welcome may state (`headSequence`), or nil
+    /// for no statement. It is the plan's own head: read in the lock hold
+    /// that installed the subscriber, so nothing is published between the
+    /// two. Only a durable socket that asked, with this boot's cursor
+    /// accepted as sent and no baseline to follow, is told.
+    static func welcomeHeadSequence(
+        requested: Bool,
+        plan: EventBus.DurableReplayPlan?,
+        needsBaseline: Bool,
+        requestedSinceSequence: Int64,
+        cursorBootProven: Bool,
+        previousBoot: Bool
+    ) -> Int64? {
+        guard requested,
+              let plan,
+              !needsBaseline,
+              cursorBootProven,
+              !previousBoot,
+              requestedSinceSequence > 0,
+              plan.since == requestedSinceSequence else { return nil }
+        return plan.head
+    }
 }
 
 /// `streamGap`: replay-only events of one stream were lost after the

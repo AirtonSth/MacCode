@@ -11,6 +11,10 @@ public enum HostWakeMetricKey: String, Sendable, CaseIterable {
     /// Attempt never left the host: unsubscribed account and/or no push target.
     /// Distinguishes "host pushed nothing" from a successful silent send.
     case wakeNotSent = "wake_not_sent"
+    /// F5: refused by the hourly silent-wake budget (`MaterialWakeBudget`).
+    case budgetDropped = "budget_dropped"
+    /// F5: run-progress wake withheld while a Live Activity is active for the device.
+    case liveActivitySuppressed = "live_activity_suppressed"
 }
 
 public final class HostWakeMetrics: @unchecked Sendable {

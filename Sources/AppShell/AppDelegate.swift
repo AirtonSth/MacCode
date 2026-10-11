@@ -102,6 +102,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         authenticator: tailcatAuthenticator
     )
     var tailcatSupervisor: TailcatRuntimeSupervisor?
+    private var tailcatPathObserver: TailcatNetworkPathObserver?
     private var tailcatSettingTask: Task<Void, Never>?
     lazy var tailcatAccessSettingAuthority = TailcatAccessSettingAuthority { [weak self] requested in
         self?.applyTailcatAccessSetting(requested)
@@ -364,6 +365,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             sessionProvider: { tailcatAccountStore.load() },
             authenticator: tailcatAuthenticator,
             listener: tailcatLoopbackListener,
+            // F5: not awaited; the send can take the URL timeout and must not hold the reconcile.
+            publishHandler: { [weak bridge = context.privateNotificationBridge] in
+                Task { [weak bridge] in await bridge?.announceTailcatEndpointIfChanged() }
+            },
             statusHandler: { [weak self] status in
                 DispatchQueue.main.async { [weak self] in
                     self?.tailcatAccessSettingAuthority.updateStatus(status)
@@ -380,8 +385,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         )
         if let supervisor = tailcatSupervisor {
             context.privateNotificationBridge.setConnectionHintSources(
-                tailcat: { await supervisor.pushHint() }
+                tailcat: { await supervisor.pushHintWithEndpointDigest() }
             )
+            // F5: a usable network path reconciles now instead of at the next poll. Straight
+            // to the actor, not through `tailcatSettingTask`: its own guards order the trigger.
+            tailcatPathObserver = TailcatNetworkPathObserver { Task { await supervisor.networkPathChanged() } }
+            tailcatPathObserver?.start()
         }
         configureTailcatAccess()
 
@@ -650,6 +659,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         context?.botGuestMCPGateway.stop()
         directAccessSupervisor?.shutdown()
         directAccessSupervisor = nil
+        tailcatPathObserver?.stop()
+        tailcatPathObserver = nil
         let tailcat = tailcatSupervisor
         tailcatSupervisor = nil
         Task { await tailcat?.shutdown() }
