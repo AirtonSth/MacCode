@@ -1,6 +1,4 @@
-import CryptoKit
 import Foundation
-import Network
 
 public enum DistillAccountProvider: String, CaseIterable, Codable, Sendable {
     case grok, chatgpt, claude, openrouter
@@ -14,22 +12,14 @@ public enum DistillAccountProvider: String, CaseIterable, Codable, Sendable {
         }
     }
 
-    /// OpenRouter has no Distill CLI login; it is handled natively.
+    public var legacyID: String { "legacy-\(rawValue)" }
+
     var cliLoginArguments: [String]? {
         switch self {
         case .grok: return ["login"]
         case .chatgpt: return ["login", "--chatgpt"]
         case .claude: return ["login", "--claude"]
-        case .openrouter: return nil
-        }
-    }
-
-    var cliLogoutArguments: [String]? {
-        switch self {
-        case .grok: return ["logout"]
-        case .chatgpt: return ["logout", "--chatgpt"]
-        case .claude: return ["logout", "--claude"]
-        case .openrouter: return nil
+        case .openrouter: return ["accounts", "login", legacyID]
         }
     }
 
@@ -44,24 +34,150 @@ public enum DistillAccountProvider: String, CaseIterable, Codable, Sendable {
 }
 
 public struct DistillAccountStatus: Equatable, Codable, Sendable {
+    public let id: String
     public let provider: DistillAccountProvider
+    public let label: String
+    public let legacy: Bool
     public let connected: Bool
     public let email: String?
+    public let connectionError: String?
+    public let quota: DistillAccountQuota?
 
-    public init(provider: DistillAccountProvider, connected: Bool, email: String? = nil) {
+    public init(provider: DistillAccountProvider, connected: Bool, email: String? = nil,
+                id: String? = nil, label: String? = nil, legacy: Bool = true,
+                connectionError: String? = nil, quota: DistillAccountQuota? = nil) {
+        self.id = id ?? provider.legacyID
         self.provider = provider
+        self.label = label ?? provider.displayName
+        self.legacy = legacy
         self.connected = connected
         self.email = email
+        self.connectionError = connectionError
+        self.quota = quota
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, provider, label, legacy, connected, email, quota
+        case connectionError = "connection_error"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        provider = try c.decode(DistillAccountProvider.self, forKey: .provider)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? provider.legacyID
+        label = try c.decodeIfPresent(String.self, forKey: .label) ?? provider.displayName
+        legacy = try c.decodeIfPresent(Bool.self, forKey: .legacy) ?? true
+        connected = try c.decodeIfPresent(Bool.self, forKey: .connected) ?? false
+        email = try c.decodeIfPresent(String.self, forKey: .email)
+        connectionError = try c.decodeIfPresent(String.self, forKey: .connectionError)
+        quota = try c.decodeIfPresent(DistillAccountQuota.self, forKey: .quota)
     }
 }
 
+public struct DistillAccountQuota: Equatable, Codable, Sendable {
+    public let accountID: String
+    public let checkedAt: String
+    public let fetchedAt: String?
+    public let status: String
+    public let remainingPercent: Double?
+    public let detail: Detail?
+
+    public init(accountID: String, checkedAt: String, fetchedAt: String? = nil, status: String,
+                remainingPercent: Double? = nil, detail: Detail? = nil) {
+        self.accountID = accountID
+        self.checkedAt = checkedAt
+        self.fetchedAt = fetchedAt
+        self.status = status
+        self.remainingPercent = remainingPercent
+        self.detail = detail
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id", checkedAt = "checked_at", fetchedAt = "fetched_at"
+        case status, remainingPercent = "remaining_percent", detail
+    }
+
+    public indirect enum Detail: Equatable, Codable, Sendable {
+        case object([String: Detail]), array([Detail]), string(String), number(Double), bool(Bool), null
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if c.decodeNil() { self = .null }
+            else if let value = try? c.decode(Bool.self) { self = .bool(value) }
+            else if let value = try? c.decode(Double.self) { self = .number(value) }
+            else if let value = try? c.decode(String.self) { self = .string(value) }
+            else if let value = try? c.decode([Detail].self) { self = .array(value) }
+            else { self = .object(try c.decode([String: Detail].self)) }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.singleValueContainer()
+            switch self {
+            case .object(let value): try c.encode(value)
+            case .array(let value): try c.encode(value)
+            case .string(let value): try c.encode(value)
+            case .number(let value): try c.encode(value)
+            case .bool(let value): try c.encode(value)
+            case .null: try c.encodeNil()
+            }
+        }
+    }
+}
+
+public enum DistillAutoStrategy: String, CaseIterable, Codable, Sendable {
+    case orderedFirst = "ordered_first", highestRemaining = "highest_remaining"
+}
+
+public struct DistillAutoOption: Equatable, Codable, Sendable {
+    public var id: String
+    public var accountID: String
+    public var mainModel: String
+    public var workerModel: String?
+
+    public init(id: String, accountID: String, mainModel: String, workerModel: String? = nil) {
+        self.id = id; self.accountID = accountID; self.mainModel = mainModel; self.workerModel = workerModel
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, accountID = "account_id", mainModel = "main_model", workerModel = "worker_model"
+    }
+}
+
+public struct DistillAutoRouting: Equatable, Codable, Sendable {
+    public var enabled: Bool
+    public var strategy: DistillAutoStrategy
+    public var options: [DistillAutoOption]
+
+    public init(enabled: Bool = false, strategy: DistillAutoStrategy = .orderedFirst, options: [DistillAutoOption] = []) {
+        self.enabled = enabled; self.strategy = strategy; self.options = options
+    }
+}
+
+public struct DistillAccountsState: Equatable, Sendable {
+    public let accounts: [DistillAccountStatus]
+    public let routing: DistillAutoRouting
+
+    public init(accounts: [DistillAccountStatus], routing: DistillAutoRouting) {
+        self.accounts = accounts; self.routing = routing
+    }
+}
+
+/// The disk shape is metadata only; credentials are read separately by descriptor.
+struct DistillAccountRegistry: Codable {
+    var version: Int
+    var accounts: [DistillAccountStatus]
+    var routing: DistillAutoRouting
+}
+
 public enum DistillAccountError: Error, Equatable, LocalizedError {
+    case updateRequired
     case cancelled
     case timedOut
     case failed(String)
 
     public var errorDescription: String? {
         switch self {
+        case .updateRequired: return "Update Distill to use named accounts and Auto routing."
         case .cancelled: return "Sign-in was cancelled."
         case .timedOut: return "Sign-in timed out. Please try again."
         case .failed(let message): return message
@@ -69,47 +185,20 @@ public enum DistillAccountError: Error, Equatable, LocalizedError {
     }
 }
 
-/// Reports and changes Distill's provider accounts (Distill 2.0.24 credential stores).
+/// Safe account metadata and operations; Distill CLI owns registry and credential mutations.
 public final class DistillAccounts: Sendable {
-    /// Status code + body of an OpenRouter exchange POST.
+    /// Status code and body of a host OAuth renewal POST.
     public typealias HTTPPost = @Sendable (_ url: URL, _ jsonBody: Data) async throws -> (data: Data, status: Int)
-
-    private static let openRouterAuthURL = "https://openrouter.ai/auth"
-    private static let openRouterExchangeURL = URL(string: "https://openrouter.ai/api/v1/auth/keys")!
 
     private let home: URL
     private let binaryPath: String
     private let environment: [String: String]
-    private let openURL: @Sendable (URL) -> Void
-    private let httpPost: HTTPPost
-    private let callbackTimeout: TimeInterval
 
-    public convenience init(
-        home: URL,
-        binaryPath: String,
-        environment: [String: String],
-        openURL: @escaping @Sendable (URL) -> Void,
-        httpPost: @escaping HTTPPost = DistillAccounts.urlSessionPost
-    ) {
-        self.init(
-            home: home, binaryPath: binaryPath, environment: environment,
-            openURL: openURL, httpPost: httpPost, callbackTimeout: 300)
-    }
-
-    init(
-        home: URL,
-        binaryPath: String,
-        environment: [String: String],
-        openURL: @escaping @Sendable (URL) -> Void,
-        httpPost: @escaping HTTPPost,
-        callbackTimeout: TimeInterval
-    ) {
+    public init(home: URL, binaryPath: String, environment: [String: String],
+                openURL: @escaping @Sendable (URL) -> Void) {
         self.home = home
         self.binaryPath = binaryPath
         self.environment = environment
-        self.openURL = openURL
-        self.httpPost = httpPost
-        self.callbackTimeout = callbackTimeout
     }
 
     // MARK: Status
@@ -118,16 +207,62 @@ public final class DistillAccounts: Sendable {
         Self.connectedAccounts(home: home)
     }
 
+    static func validID(_ id: String) -> Bool {
+        let bytes = Array(id.utf8)
+        func alphanumeric(_ byte: UInt8) -> Bool { (97...122).contains(byte) || (48...57).contains(byte) }
+        return (1...64).contains(bytes.count) && bytes.first.map(alphanumeric) == true
+            && bytes.allSatisfy { alphanumeric($0) || $0 == 95 || $0 == 45 }
+    }
+
+    static func readRegistry(home: URL) throws -> DistillAccountRegistry? {
+        let directory: PrivateDirectory
+        do { directory = try PrivateDirectory(home.resolvingSymlinksInPath(), create: false) }
+        catch DistillGuestCredentialError.writeFailed(_, let code) where code == ENOENT { return nil }
+        defer { directory.close() }
+        guard directory.entries().contains("accounts.json") else { return nil }
+        guard let data = directory.read("accounts.json"),
+              let registry = try? JSONDecoder().decode(DistillAccountRegistry.self, from: data),
+              registry.version == 1,
+              Set(registry.accounts.map(\.id)).count == registry.accounts.count,
+              registry.accounts.allSatisfy({ validID($0.id) && ($0.legacy
+                  ? $0.id == $0.provider.legacyID : !$0.id.hasPrefix("legacy-")) }) else {
+            throw DistillAccountError.failed("Distill account metadata cannot be read safely.")
+        }
+        return registry
+    }
+
     public static func connectedAccounts(home: URL) -> [DistillAccountStatus] {
-        DistillAccountProvider.allCases.map { provider in
-            let account = accountDetails(provider, home: home)
-            return DistillAccountStatus(provider: provider, connected: account.connected, email: account.email)
+        let legacy = DistillAccountProvider.allCases.map { DistillAccountStatus(provider: $0, connected: false) }
+        let registry: DistillAccountRegistry?
+        do { registry = try readRegistry(home: home) } catch { return legacy }
+        return (registry?.accounts ?? legacy).map { account in
+            let details = accountDetails(account, home: home)
+            return DistillAccountStatus(provider: account.provider, connected: details.connected, email: details.email,
+                id: account.id, label: account.label, legacy: account.legacy)
         }
     }
 
-    private static func accountDetails(_ provider: DistillAccountProvider, home: URL) -> (connected: Bool, email: String?) {
-        let url = home.appendingPathComponent(provider.credentialFileName)
-        guard let data = try? Data(contentsOf: url),
+    /// No named account is ever substituted for a legacy provider entry point.
+    public static func credentialHome(account: DistillAccountStatus, home: URL) throws -> URL {
+        guard validID(account.id), account.legacy ? account.id == account.provider.legacyID : !account.id.hasPrefix("legacy-") else {
+            throw DistillAccountError.failed("Invalid Distill account id.")
+        }
+        if account.legacy { return home }
+        let directory = try PrivateDirectory(home.resolvingSymlinksInPath(), create: false)
+        defer { directory.close() }
+        let accounts = try directory.child("accounts", create: false)
+        defer { accounts.close() }
+        let child = try accounts.child(account.id, create: false)
+        defer { child.close() }
+        return URL(fileURLWithPath: child.path, isDirectory: true)
+    }
+
+    private static func accountDetails(_ account: DistillAccountStatus, home: URL) -> (connected: Bool, email: String?) {
+        let provider = account.provider
+        guard let childHome = try? credentialHome(account: account, home: home),
+              let directory = try? PrivateDirectory(childHome, create: false) else { return (false, nil) }
+        defer { directory.close() }
+        guard let data = directory.read(provider.credentialFileName),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return (false, nil) }
         func nonEmpty(_ value: Any?) -> Bool {
@@ -153,32 +288,63 @@ public final class DistillAccounts: Sendable {
         }
     }
 
-    // MARK: Login / logout
-
-    public func login(
-        _ provider: DistillAccountProvider,
-        onURL: @escaping @Sendable (URL) -> Void
-    ) async throws {
-        guard let arguments = provider.cliLoginArguments else {
-            try await loginOpenRouter(onURL: onURL)
-            return
-        }
-        // `distill login` does not need a TTY (stdin is only read for pasted URLs when it is a terminal).
-        try await runCLI(arguments, onURL: onURL)
+    public func loadState() async throws -> DistillAccountsState {
+        let accounts: [DistillAccountStatus] = try await jsonCLI(["accounts", "list"])
+        let routing = try await loadRouting()
+        return DistillAccountsState(accounts: accounts, routing: routing)
     }
 
-    public func logout(_ provider: DistillAccountProvider) async throws {
-        guard let arguments = provider.cliLogoutArguments else {
-            let url = home.appendingPathComponent(provider.credentialFileName)
-            do {
-                try FileManager.default.removeItem(at: url)
-            } catch let error as CocoaError where error.code == .fileNoSuchFile {
-            } catch {
-                throw DistillAccountError.failed(error.localizedDescription)
-            }
-            return
+    public func loadRouting() async throws -> DistillAutoRouting {
+        try await jsonCLI(["accounts", "routing", "get"])
+    }
+
+    public func add(id: String, provider: DistillAccountProvider, label: String) async throws {
+        let _: DistillAccountStatus = try await jsonCLI(["accounts", "add", id, "--provider", provider.rawValue, "--label", label])
+    }
+
+    public func rename(id: String, label: String) async throws {
+        let _: DistillAccountStatus = try await jsonCLI(["accounts", "rename", id, "--label", label])
+    }
+
+    private struct MutationResult: Decodable { let ok: Bool }
+
+    private func mutate(_ arguments: [String], onURL: (@Sendable (URL) -> Void)? = nil) async throws {
+        let result: MutationResult = try await jsonCLI(arguments, onURL: onURL)
+        guard result.ok else { throw DistillAccountError.failed("Distill did not confirm the account operation.") }
+    }
+
+    public func remove(id: String) async throws { try await mutate(["accounts", "remove", id]) }
+    public func login(id: String, onURL: @escaping @Sendable (URL) -> Void) async throws {
+        try await mutate(["accounts", "login", id], onURL: onURL)
+    }
+    public func logout(id: String) async throws { try await mutate(["accounts", "logout", id]) }
+    public func refreshUsage(id: String) async throws -> DistillAccountQuota {
+        try await jsonCLI(["accounts", "usage", id])
+    }
+    public func saveRouting(_ routing: DistillAutoRouting) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("distill-routing-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("routing.json")
+        let privateDirectory = try PrivateDirectory(directory, create: false)
+        defer { privateDirectory.close() }
+        try privateDirectory.writeAtomically(JSONEncoder().encode(routing), to: "routing.json")
+        let saved: DistillAutoRouting = try await jsonCLI(["accounts", "routing", "set", "--file", file.path])
+        guard saved == routing else { throw DistillAccountError.failed("Distill did not confirm the saved Auto routing.") }
+    }
+
+    public func login(_ provider: DistillAccountProvider, onURL: @escaping @Sendable (URL) -> Void) async throws {
+        try await login(id: provider.legacyID, onURL: onURL)
+    }
+    public func logout(_ provider: DistillAccountProvider) async throws { try await logout(id: provider.legacyID) }
+
+    private func jsonCLI<T: Decodable>(_ arguments: [String], onURL: (@Sendable (URL) -> Void)? = nil) async throws -> T {
+        let data = try await runCLI(arguments, onURL: onURL)
+        guard let value = try? JSONDecoder().decode(T.self, from: data) else {
+            throw DistillAccountError.updateRequired
         }
-        try await runCLI(arguments, onURL: nil)
+        return value
     }
 
     // MARK: CLI child
@@ -186,20 +352,19 @@ public final class DistillAccounts: Sendable {
     private func runCLI(
         _ arguments: [String],
         onURL: (@Sendable (URL) -> Void)?
-    ) async throws {
+    ) async throws -> Data {
         if Task.isCancelled { throw DistillAccountError.cancelled }
 
         let process = Process()
-        let executablePath = FileManager.default.isExecutableFile(atPath: binaryPath)
-            ? binaryPath
-            : DistillProvisioner.resolveInstalledBinary(override: nil, environmentPath: environment["PATH"]) ?? binaryPath
-        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.executableURL = URL(fileURLWithPath: binaryPath)
         process.arguments = arguments
         var env = environment
         env["DISTILL_HOME"] = home.path
         process.environment = env
         process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
+        let outPipe = Pipe()
+        process.standardOutput = outPipe
+        let output = CLIOutput()
         let errPipe = Pipe()
         process.standardError = errPipe
 
@@ -217,6 +382,15 @@ public final class DistillAccounts: Sendable {
             }
         }
 
+        eofGroup.enter()
+        outPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                eofGroup.leave()
+            } else { output.append(data) }
+        }
+
         let exit = OneShot<Int32>()
         process.terminationHandler = { finished in
             let status = finished.terminationStatus
@@ -231,6 +405,7 @@ public final class DistillAccounts: Sendable {
             try process.run()
         } catch {
             errPipe.fileHandleForReading.readabilityHandler = nil
+            outPipe.fileHandleForReading.readabilityHandler = nil
             throw DistillAccountError.failed("Could not start distill: \(error.localizedDescription)")
         }
 
@@ -240,10 +415,18 @@ public final class DistillAccounts: Sendable {
             Self.terminate(process)
         }
 
+        errPipe.fileHandleForReading.readabilityHandler = nil
+        outPipe.fileHandleForReading.readabilityHandler = nil
         if Task.isCancelled { throw DistillAccountError.cancelled }
         guard status == 0 else {
-            throw DistillAccountError.failed(collector.lastLine ?? "distill exited with status \(status)")
+            let message = collector.lastLine ?? "distill exited with status \(status)"
+            if collector.requiresUpdate {
+                throw DistillAccountError.updateRequired
+            }
+            throw DistillAccountError.failed(message)
         }
+        guard let data = output.data else { throw DistillAccountError.failed("Distill account response exceeded its size limit.") }
+        return data
     }
 
     private static func terminate(_ process: Process) {
@@ -252,189 +435,6 @@ public final class DistillAccounts: Sendable {
         let pid = process.processIdentifier
         DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
             if process.isRunning { kill(pid, SIGKILL) }
-        }
-    }
-
-    // MARK: OpenRouter
-
-    /// Mirrors Distill's `openrouter_auth::run_tui_login`: PKCE S256 + random loopback callback path.
-    private func loginOpenRouter(onURL: @escaping @Sendable (URL) -> Void) async throws {
-        if Task.isCancelled { throw DistillAccountError.cancelled }
-
-        let verifier = Self.randomBase64URL()
-        let callbackPath = "/auth/callback/\(Self.randomBase64URL())"
-        let codeWaiter = OneShot<String>()
-        let listener = try makeListener(callbackPath: callbackPath, codeWaiter: codeWaiter)
-        defer { listener.cancel() }
-
-        let port = try await Self.waitUntilReady(listener)
-        guard let url = Self.authorizationURL(
-            callbackURL: "http://localhost:\(port)\(callbackPath)", verifier: verifier)
-        else { throw DistillAccountError.failed("Could not build the OpenRouter sign-in URL.") }
-
-        onURL(url)
-        openURL(url)
-
-        let timer = DispatchWorkItem { codeWaiter.finish(.failure(DistillAccountError.timedOut)) }
-        DispatchQueue.global().asyncAfter(deadline: .now() + callbackTimeout, execute: timer)
-        defer { timer.cancel() }
-        let code = try await withTaskCancellationHandler {
-            try await codeWaiter.wait()
-        } onCancel: {
-            codeWaiter.finish(.failure(DistillAccountError.cancelled))
-        }
-        listener.cancel()
-
-        let key = try await exchange(code: code, verifier: verifier)
-        try writeOpenRouterKey(key)
-    }
-
-    static func pkceChallenge(verifier: String) -> String {
-        base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
-    }
-
-    static func authorizationURL(callbackURL: String, verifier: String) -> URL? {
-        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-        let pairs = [
-            ("callback_url", callbackURL),
-            ("code_challenge", pkceChallenge(verifier: verifier)),
-            ("code_challenge_method", "S256"),
-            ("key_label", "Distill"),
-        ]
-        let query = pairs.map {
-            "\($0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: unreserved) ?? "")"
-        }.joined(separator: "&")
-        return URL(string: "\(openRouterAuthURL)?\(query)")
-    }
-
-    private static func base64URL(_ data: Data) -> String {
-        data.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-    }
-
-    private static func randomBase64URL() -> String {
-        var generator = SystemRandomNumberGenerator()
-        return base64URL(Data((0..<32).map { _ in UInt8.random(in: .min ... .max, using: &generator) }))
-    }
-
-    private func exchange(code: String, verifier: String) async throws -> String {
-        let body = try JSONSerialization.data(withJSONObject: [
-            "code": code,
-            "code_verifier": verifier,
-            "code_challenge_method": "S256",
-        ])
-        let response: (data: Data, status: Int)
-        do {
-            response = try await httpPost(Self.openRouterExchangeURL, body)
-        } catch is CancellationError {
-            throw DistillAccountError.cancelled
-        } catch {
-            throw DistillAccountError.failed(
-                "Could not exchange the OpenRouter authorization code: \(error.localizedDescription)")
-        }
-        if Task.isCancelled { throw DistillAccountError.cancelled }
-        guard (200..<300).contains(response.status) else {
-            throw DistillAccountError.failed(
-                "OpenRouter authorization failed (HTTP \(response.status)). Please try again.")
-        }
-        guard let object = try? JSONSerialization.jsonObject(with: response.data) as? [String: Any],
-              let key = object["key"] as? String
-        else { throw DistillAccountError.failed("Invalid OpenRouter authorization response.") }
-        guard !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw DistillAccountError.failed("OpenRouter returned an empty API key.")
-        }
-        return key
-    }
-
-    private func writeOpenRouterKey(_ key: String) throws {
-        do {
-            let data = try JSONSerialization.data(withJSONObject: ["key": key])
-            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-            let target = home.appendingPathComponent(DistillAccountProvider.openrouter.credentialFileName)
-            let temp = home.appendingPathComponent(".openrouter-auth.\(UUID().uuidString).tmp")
-            guard FileManager.default.createFile(
-                atPath: temp.path, contents: data, attributes: [.posixPermissions: 0o600])
-            else { throw CocoaError(.fileWriteUnknown) }
-            guard rename(temp.path, target.path) == 0 else {
-                let code = errno
-                try? FileManager.default.removeItem(at: temp)
-                throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
-            }
-        } catch {
-            throw DistillAccountError.failed("Could not save OpenRouter credentials: \(error.localizedDescription)")
-        }
-    }
-
-    private func makeListener(callbackPath: String, codeWaiter: OneShot<String>) throws -> NWListener {
-        let parameters = NWParameters.tcp
-        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
-        let listener: NWListener
-        do {
-            listener = try NWListener(using: parameters)
-        } catch {
-            throw DistillAccountError.failed("Could not start the local sign-in listener: \(error.localizedDescription)")
-        }
-        listener.newConnectionHandler = { connection in
-            Self.serve(connection, callbackPath: callbackPath, codeWaiter: codeWaiter)
-        }
-        return listener
-    }
-
-    private static func waitUntilReady(_ listener: NWListener) async throws -> UInt16 {
-        let ready = OneShot<UInt16>()
-        listener.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                if let port = listener.port?.rawValue { ready.finish(.success(port)) }
-            case .failed(let error):
-                ready.finish(.failure(DistillAccountError.failed(
-                    "Could not start the local sign-in listener: \(error.localizedDescription)")))
-            case .cancelled:
-                ready.finish(.failure(DistillAccountError.cancelled))
-            default:
-                break
-            }
-        }
-        listener.start(queue: .global())
-        return try await ready.wait()
-    }
-
-    private static func serve(_ connection: NWConnection, callbackPath: String, codeWaiter: OneShot<String>) {
-        connection.start(queue: .global())
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { data, _, _, _ in
-            var status = "404 Not Found"
-            var page = "Not found."
-            if let data, let request = String(data: data, encoding: .utf8),
-               let line = request.split(separator: "\r\n", maxSplits: 1).first {
-                let parts = line.split(separator: " ")
-                if parts.count >= 2, parts[0] == "GET",
-                   let components = URLComponents(string: "http://localhost" + parts[1]),
-                   components.path == callbackPath {
-                    let items = components.queryItems ?? []
-                    if items.contains(where: { $0.name == "error" }) {
-                        status = "200 OK"
-                        page = "Authorization was declined. You can close this tab."
-                        codeWaiter.finish(.failure(DistillAccountError.failed(
-                            "OpenRouter authorization was declined. Please try again.")))
-                    } else if let code = items.first(where: { $0.name == "code" })?.value,
-                              !code.trimmingCharacters(in: .whitespaces).isEmpty {
-                        status = "200 OK"
-                        page = "Authorization received. You can close this tab."
-                        codeWaiter.finish(.success(code))
-                    } else {
-                        status = "400 Bad Request"
-                        page = "Missing authorization code. Return to OpenRouter to finish signing in."
-                    }
-                }
-            }
-            let body = "<!doctype html><meta charset=utf-8><title>Distill</title><p>\(page)</p>"
-            let response = "HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\n"
-                + "Content-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
-            connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
-                connection.cancel()
-            })
         }
     }
 
@@ -484,10 +484,12 @@ private final class StderrCollector: @unchecked Sendable {
     private var pending = ""
     private var urlSent = false
     private var last: String?
+    private var unsupportedCLI = false
 
     init(onURL: (@Sendable (URL) -> Void)?) { self.onURL = onURL }
 
     var lastLine: String? { lock.withLock { last } }
+    var requiresUpdate: Bool { lock.withLock { unsupportedCLI } }
 
     func append(_ data: Data) {
         let lines: [String] = lock.withLock {
@@ -515,6 +517,9 @@ private final class StderrCollector: @unchecked Sendable {
         guard !line.isEmpty else { return }
         let found: URL? = lock.withLock {
             last = line
+            if line.contains("unrecognized subcommand") || line.contains("unexpected argument") {
+                unsupportedCLI = true
+            }
             guard !urlSent, let range = line.range(of: "https://") else { return nil }
             let token = line[range.lowerBound...].prefix { !$0.isWhitespace }
             guard let url = URL(string: String(token)) else { return nil }
@@ -523,4 +528,17 @@ private final class StderrCollector: @unchecked Sendable {
         }
         if let found { onURL?(found) }
     }
+}
+
+private final class CLIOutput: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bytes = Data()
+    private var overflow = false
+    func append(_ data: Data) {
+        lock.withLock {
+            guard !overflow, bytes.count + data.count <= 2 * 1024 * 1024 else { overflow = true; return }
+            bytes.append(data)
+        }
+    }
+    var data: Data? { lock.withLock { overflow ? nil : bytes } }
 }

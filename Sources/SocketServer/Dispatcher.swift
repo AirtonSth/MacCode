@@ -146,7 +146,10 @@ public protocol CommandRouting: AnyObject {
     /// `token_saver.digest.get` name kept until iOS bumps its treaty pin).
     func tokenSaverDigest() -> JSONValue?
     func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread
-    func listDistillAccounts() -> JSONValue
+    func listDistillAccounts() async -> JSONValue
+    func getDistillRouting() async throws -> JSONValue
+    func mutateDistillAccount(method: String, accountID: String?, provider: DistillAccountProvider?, label: String?) throws -> JSONValue
+    func setDistillRouting(_ routing: DistillAutoRouting) throws -> JSONValue
     func loginDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue
     func logoutDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue
     func cancelDistillAccountOperation() throws -> JSONValue
@@ -440,7 +443,10 @@ public extension CommandRouting {
     /// Test/fake hosts may omit the account usage digest entirely.
     func tokenSaverDigest() -> JSONValue? { nil }
     func setAgentWorkerModel(thread: AgentThreadID, model: String?) throws -> AgentThread { throw JSONRPCError.notSupported("Worker model selection") }
-    func listDistillAccounts() -> JSONValue { .object(["accounts": .array([]), "busy_provider": .null, "last_error": .null]) }
+    func listDistillAccounts() async -> JSONValue { .object(["accounts": .array([]), "routing": .null, "busy": .bool(false), "busy_account_id": .null, "busy_provider": .null, "last_error": .null]) }
+    func getDistillRouting() async throws -> JSONValue { .null }
+    func mutateDistillAccount(method: String, accountID: String?, provider: DistillAccountProvider?, label: String?) throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
+    func setDistillRouting(_ routing: DistillAutoRouting) throws -> JSONValue { throw JSONRPCError.notSupported("Distill Auto routing") }
     func loginDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
     func logoutDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
     func cancelDistillAccountOperation() throws -> JSONValue { throw JSONRPCError.notSupported("Distill account management") }
@@ -1052,6 +1058,11 @@ public final class JSONRPCDispatcher {
         "distill.accounts.login",
         "distill.accounts.logout",
         "distill.accounts.cancel",
+        "distill.accounts.add",
+        "distill.accounts.rename",
+        "distill.accounts.remove",
+        "distill.accounts.usage",
+        "distill.accounts.routing.set",
     ]
     private nonisolated static let canonicalImmediateEventMethods: Set<String> = Set([
         "agent.message.send",
@@ -4548,13 +4559,20 @@ public final class JSONRPCDispatcher {
             case "agent.providers.list":
                 return .init(id: id, result: encode(await router.listAgentProviderSnapshots()))
             case "distill.accounts.list":
-                return .init(id: id, result: router.listDistillAccounts())
-            case "distill.accounts.login":
-                guard let raw = params["provider"]?.stringValue, let provider = DistillAccountProvider(rawValue: raw) else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: try router.loginDistillAccount(provider))
-            case "distill.accounts.logout":
-                guard let raw = params["provider"]?.stringValue, let provider = DistillAccountProvider(rawValue: raw) else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: try router.logoutDistillAccount(provider))
+                return .init(id: id, result: await router.listDistillAccounts())
+            case "distill.accounts.routing.get":
+                return .init(id: id, result: try await router.getDistillRouting())
+            case "distill.accounts.routing.set":
+                guard let value = params["routing"],
+                      let routing = try? JSONDecoder().decode(DistillAutoRouting.self, from: JSONEncoder().encode(value)) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.setDistillRouting(routing))
+            case "distill.accounts.add", "distill.accounts.rename", "distill.accounts.remove", "distill.accounts.usage", "distill.accounts.login", "distill.accounts.logout":
+                if (req.method == "distill.accounts.login" || req.method == "distill.accounts.logout"), params["account_id"] == nil {
+                    guard let raw = params["provider"]?.stringValue, let provider = DistillAccountProvider(rawValue: raw) else { throw JSONRPCError.invalidParams }
+                    return .init(id: id, result: try req.method == "distill.accounts.login" ? router.loginDistillAccount(provider) : router.logoutDistillAccount(provider))
+                }
+                let provider = params["provider"]?.stringValue.flatMap(DistillAccountProvider.init(rawValue:))
+                return .init(id: id, result: try router.mutateDistillAccount(method: req.method, accountID: params["account_id"]?.stringValue, provider: provider, label: params["label"]?.stringValue))
             case "distill.accounts.cancel":
                 return .init(id: id, result: try router.cancelDistillAccountOperation())
             case "agent.run_as_users.list":
@@ -5120,7 +5138,7 @@ public final class JSONRPCDispatcher {
         "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
         "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
         "project.scripts",
-        "agent.models.list", "agent.providers.list", "distill.accounts.list", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
+        "agent.models.list", "agent.providers.list", "distill.accounts.list", "distill.accounts.routing.get", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
         "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list", "bot.attachment.list",
         "bot.routine.list", "bot.files.list", "bot.browser.state", "bot.guest.state",
         "bot.receipt.status", "bot.peer.receipt.status", "bot.attention.list",

@@ -14,6 +14,7 @@ private let appRouterLog = Logger(subsystem: "io.remotecode.appshell", category:
 
 private struct DistillAccountsPanelHost: View {
     @ObservedObject var controller: DistillAccountsController
+    let loadModels: () async -> [AgentModelDescriptor]
 
     var body: some View {
         DistillAccountsPanel(
@@ -29,16 +30,31 @@ private struct DistillAccountsPanelHost: View {
                     case .installing: return .installing
                     case .failed(let message): return .failed(message)
                     }
-                }()
+                }(),
+                busyAccountID: controller.busyAccountID,
+                isBusy: controller.isBusy,
+                routing: controller.routing,
+                models: controller.models,
+                routingLoaded: controller.hasLoadedState,
+                isRefreshing: controller.isRefreshing
             ),
-            login: controller.login,
-            logout: controller.logout,
             cancel: controller.cancel,
             openAgain: { NSWorkspace.shared.open($0) },
             dismissError: controller.dismissError,
-            retryInstall: controller.retryDistillInstall
+            retryInstall: controller.retryDistillInstall,
+            refreshAccounts: controller.refresh,
+            add: { controller.add(provider: $0, label: $1) },
+            rename: { controller.rename(accountID: $0, label: $1) },
+            connectAccount: { controller.login(accountID: $0) },
+            disconnectAccount: { controller.logout(accountID: $0) },
+            remove: { controller.remove(accountID: $0) },
+            refreshQuota: { controller.refreshUsage(accountID: $0) },
+            saveRouting: controller.saveRouting
         )
         .onAppear { controller.refresh() }
+        .task(id: controller.statuses.filter(\.connected).map(\.id) + [controller.routing.enabled ? "auto-enabled" : "auto-disabled"]) {
+            _ = await loadModels()
+        }
     }
 }
 
@@ -521,7 +537,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private var distillAccountsPanel: AnyView? {
         guard let controller = context?.distillAccountsController else { return nil }
-        return AnyView(DistillAccountsPanelHost(controller: controller))
+        return AnyView(DistillAccountsPanelHost(controller: controller, loadModels: { await self.listAgentModels(provider: .distill) }))
     }
     public weak var windowController: MainWindowController?
     /// H3: throttles terminal OSC title commits (persist + surface.renamed) per surface.
@@ -7239,12 +7255,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
-        await listAgentModels(provider: provider, runAsUser: nil)
+        if provider == .distill, let controller = context?.distillAccountsController {
+            return await controller.discoverModels { await self.listAgentModels(provider: provider, runAsUser: nil) }
+        }
+        return await listAgentModels(provider: provider, runAsUser: nil)
     }
 
     public func listAgentModels(
         provider: AgentProvider,
-        runAsUser: AgentRunAsUser?
+        runAsUser: AgentRunAsUser?,
+        forceCatalogRefresh: Bool = false
     ) async -> [AgentModelDescriptor] {
         let binary = configuredProviderBinary(provider) ?? provider.rawValue
         let binaryPath = Self.resolveProviderBinaryPath(binary: binary, runAsUser: runAsUser)
@@ -7285,7 +7305,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 discoveryCwd: cwd,
                 discoveryEnvironment: environment,
                 discoveryRunAsUser: runAsUser
-            ).listModels()
+            ).discoveryResult(forceRefresh: forceCatalogRefresh).models
         }
     }
 
@@ -7377,39 +7397,88 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return threadValue
     }
 
-    public func listDistillAccounts() -> JSONValue {
+    private func distillRoutingJSON(_ routing: DistillAutoRouting) -> JSONValue {
+        var value = jsonValue(routing).objectValue ?? [:]
+        value["options"] = .array(routing.options.map { option in
+            var row = jsonValue(option).objectValue ?? [:]
+            row["worker_model"] = option.workerModel.map(JSONValue.string) ?? .null
+            return .object(row)
+        })
+        return .object(value)
+    }
+
+    public func listDistillAccounts() async -> JSONValue {
         guard let controller = context?.distillAccountsController else {
-            return .object(["accounts": .array([]), "busy_provider": .null, "last_error": .null])
+            return .object(["accounts": .array([]), "routing": .null, "busy": .bool(false), "busy_account_id": .null, "busy_provider": .null, "last_error": .null])
         }
-        controller.refresh()
+        await controller.refreshAndWait()
         let rows = controller.statuses.map { status -> JSONValue in
-            var row: [String: JSONValue] = [
-                "provider": .string(status.provider.rawValue),
-                "display_name": .string(status.provider.displayName),
-                "connected": .bool(status.connected)
-            ]
-            if let email = status.email { row["email"] = .string(email) }
+            var row = jsonValue(status).objectValue ?? [:]
+            row["display_name"] = .string(status.provider.displayName)
+            row["email"] = status.email.map(JSONValue.string) ?? .null
+            row["connection_error"] = status.connectionError.map(JSONValue.string) ?? .null
+            row["quota"] = status.quota.map { jsonValue($0) } ?? .null
             return .object(row)
         }
         return .object([
             "accounts": .array(rows),
+            "routing": controller.hasLoadedState ? distillRoutingJSON(controller.routing) : .null,
+            "busy": .bool(controller.isBusy),
+            "busy_account_id": controller.busyAccountID.map(JSONValue.string) ?? .null,
             "busy_provider": controller.busyProvider.map { .string($0.rawValue) } ?? .null,
-            "last_error": controller.lastError.map { .string($0) } ?? .null
+            "last_error": controller.lastError.map(JSONValue.string) ?? .null
         ])
     }
 
-    public func loginDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue {
+    public func getDistillRouting() async throws -> JSONValue {
         guard let controller = context?.distillAccountsController else { throw LayoutError.workspaceNotFound }
-        guard controller.busyProvider == nil else { throw JSONRPCError(code: -32041, message: "A Distill account operation is already running.") }
-        controller.login(provider)
+        await controller.refreshAndWait()
+        guard controller.hasLoadedState, controller.stateError == nil else {
+            throw JSONRPCError(code: -32041, message: controller.stateError ?? "Accounts are still loading. Refresh and try again.")
+        }
+        return distillRoutingJSON(controller.routing)
+    }
+
+    public func mutateDistillAccount(method: String, accountID: String?, provider: DistillAccountProvider?, label: String?) throws -> JSONValue {
+        guard let controller = context?.distillAccountsController else { throw LayoutError.workspaceNotFound }
+        guard !controller.isBusy else { throw JSONRPCError(code: -32041, message: "A Distill account operation is already running.") }
+        if method == "distill.accounts.add" {
+            guard let provider, let label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw JSONRPCError.invalidParams }
+            controller.add(provider: provider, label: label)
+        } else {
+            guard let accountID, controller.statuses.contains(where: { $0.id == accountID }) else {
+                throw JSONRPCError(code: -32602, message: "Unknown Distill account. Refresh Accounts and try again.")
+            }
+            switch method {
+            case "distill.accounts.rename":
+                guard let label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw JSONRPCError.invalidParams }
+                controller.rename(accountID: accountID, label: label)
+            case "distill.accounts.remove": controller.remove(accountID: accountID)
+            case "distill.accounts.login": controller.login(accountID: accountID)
+            case "distill.accounts.logout": controller.logout(accountID: accountID)
+            case "distill.accounts.usage": controller.refreshUsage(accountID: accountID)
+            default: throw JSONRPCError.invalidParams
+            }
+        }
         return .object(["started": .bool(true)])
     }
 
-    public func logoutDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue {
+    public func setDistillRouting(_ routing: DistillAutoRouting) throws -> JSONValue {
         guard let controller = context?.distillAccountsController else { throw LayoutError.workspaceNotFound }
-        guard controller.busyProvider == nil else { throw JSONRPCError(code: -32041, message: "A Distill account operation is already running.") }
-        controller.logout(provider)
+        guard controller.hasLoadedState else { throw JSONRPCError(code: -32041, message: "Accounts are still loading. Refresh and try again.") }
+        guard !controller.isBusy else { throw JSONRPCError(code: -32041, message: "A Distill account operation is already running.") }
+        if let error = DistillRoutingValidation.error(routing, saved: controller.routing, accounts: controller.statuses, models: controller.models) {
+            throw JSONRPCError(code: -32602, message: error)
+        }
+        controller.saveRouting(routing)
         return .object(["started": .bool(true)])
+    }
+
+    public func loginDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue {
+        try mutateDistillAccount(method: "distill.accounts.login", accountID: provider.legacyID, provider: nil, label: nil)
+    }
+    public func logoutDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue {
+        try mutateDistillAccount(method: "distill.accounts.logout", accountID: provider.legacyID, provider: nil, label: nil)
     }
 
     public func cancelDistillAccountOperation() throws -> JSONValue {
@@ -7421,11 +7490,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func refreshDistillProviderCatalog() async {
         cachedProviderSnapshotsAt = nil
         providerProbeCache = providerProbeCache.filter { $0.key.provider != .distill }
+        _ = await listAgentProviderSnapshots(runAsUser: nil, forceCatalogRefresh: true)
         for surface in SurfaceRegistry.shared.all() {
             guard let agent = surface as? AgentAppSurface else { continue }
             await agent.viewModel.loadProviderSnapshots(forceCatalogRefresh: true)
         }
-        _ = await listAgentProviderSnapshots()
+        if let controller = context?.distillAccountsController {
+            _ = await controller.discoverModels {
+                await self.listAgentModels(provider: .distill, runAsUser: nil, forceCatalogRefresh: true)
+            }
+        }
     }
 
     /// Protocol/CommandRouting entry — probes as the app owner.
@@ -7435,7 +7509,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     /// Snapshot probe for Auto admission / Source UI. Pass `runAsUser` so binary
     /// + auth match the account Claude will actually run as through the helper.
-    public func listAgentProviderSnapshots(runAsUser: AgentRunAsUser?) async -> [AgentProviderSnapshot] {
+    public func listAgentProviderSnapshots(runAsUser: AgentRunAsUser?, forceCatalogRefresh: Bool = false) async -> [AgentProviderSnapshot] {
         listAgentProviderSnapshotsCallCountForTesting += 1
         var snapshots: [AgentProviderSnapshot] = []
         let configuredInstances = providerInstanceConfigs().filter { $0.provider.isSelectable }
@@ -7474,7 +7548,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         discoveryCwd: FileManager.default.currentDirectoryPath,
                         discoveryEnvironment: env,
                         discoveryRunAsUser: runAsUser
-                    ).discoveryResult()
+                    ).discoveryResult(forceRefresh: forceCatalogRefresh)
                     : nil
                 let models: [AgentModelDescriptor]
                 let liveCatalogVerified: Bool
@@ -7606,7 +7680,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     discoveryCwd: FileManager.default.currentDirectoryPath,
                     discoveryEnvironment: env,
                     discoveryRunAsUser: runAsUser
-                ).discoveryResult()
+                ).discoveryResult(forceRefresh: forceCatalogRefresh)
                 : nil
             let models: [AgentModelDescriptor]
             let liveCatalogVerified: Bool

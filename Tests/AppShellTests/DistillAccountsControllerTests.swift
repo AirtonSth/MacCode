@@ -2,6 +2,7 @@ import XCTest
 @testable import AppShell
 import AgentRuntime
 import SocketServer
+import CoreModel
 
 @MainActor
 final class DistillAccountsControllerTests: XCTestCase {
@@ -12,14 +13,37 @@ final class DistillAccountsControllerTests: XCTestCase {
         var delay = false
 
         func statuses() -> [DistillAccountStatus] { statusesValue }
-        func login(_ provider: DistillAccountProvider, onURL: @escaping @Sendable (URL) -> Void) async throws {
+        var routing = DistillAutoRouting()
+        var lastID: String?
+        var loadContinuation: CheckedContinuation<DistillAccountsState, Error>?
+        var holdLoad = false
+        var holdSave = false
+        var saveContinuation: CheckedContinuation<Void, Never>?
+        func loadState() async throws -> DistillAccountsState {
+            if holdLoad { return try await withCheckedThrowingContinuation { loadContinuation = $0 } }
+            return .init(accounts: statusesValue, routing: routing)
+        }
+        func add(id: String, provider: DistillAccountProvider, label: String) async throws {
+            lastID = id
+            statusesValue.append(.init(provider: provider, connected: false, id: id, label: label, legacy: false))
+        }
+        func rename(id: String, label: String) async throws { lastID = id }
+        func remove(id: String) async throws { lastID = id; statusesValue.removeAll { $0.id == id } }
+        func refreshUsage(id: String) async throws -> DistillAccountQuota { lastID = id; throw DistillAccountError.failed("Quota unavailable") }
+        func saveRouting(_ routing: DistillAutoRouting) async throws {
+            if holdSave { await withCheckedContinuation { saveContinuation = $0 } }
+            self.routing = routing
+        }
+        func login(id: String, onURL: @escaping @Sendable (URL) -> Void) async throws {
+            lastID = id
             loginCount += 1
             if delay { try await Task.sleep(nanoseconds: 10_000_000_000) }
             if fail { throw DistillAccountError.failed("login failed") }
-            statusesValue = statusesValue.map { $0.provider == provider ? DistillAccountStatus(provider: provider, connected: true) : $0 }
+            statusesValue = statusesValue.map { $0.id == id ? DistillAccountStatus(provider: $0.provider, connected: true, id: id, label: $0.label, legacy: $0.legacy) : $0 }
         }
-        func logout(_ provider: DistillAccountProvider) async throws {
-            statusesValue = statusesValue.map { $0.provider == provider ? DistillAccountStatus(provider: provider, connected: false) : $0 }
+        func logout(id: String) async throws {
+            lastID = id
+            statusesValue = statusesValue.map { $0.id == id ? DistillAccountStatus(provider: $0.provider, connected: false, id: id, label: $0.label, legacy: $0.legacy) : $0 }
         }
     }
 
@@ -119,7 +143,7 @@ final class DistillAccountsControllerTests: XCTestCase {
         let accounts = Accounts()
         let providerEvents = expectation(description: "agent.provider.updated carries account operation start, refresh, and end")
         providerEvents.expectedFulfillmentCount = 3
-        let eventToken = EventBus.shared.subscribe(since: nil) { event in
+        let eventToken = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
             guard event.kind == "agent.provider.updated",
                   event.payload.objectValue?["provider"] == .string("claude") else { return }
             providerEvents.fulfill()
@@ -146,4 +170,77 @@ final class DistillAccountsControllerTests: XCTestCase {
         XCTAssertEqual(controller.lastError, "login failed")
         XCTAssertNil(controller.busyProvider)
     }
+    func test_namedRowsUseExactIDAndRejectLateRefreshAfterCancel() async throws {
+        let accounts = Accounts()
+        accounts.statusesValue = [
+            .init(provider: .chatgpt, connected: false, id: "first", label: "Personal", legacy: false),
+            .init(provider: .chatgpt, connected: false, id: "second", label: "Work", legacy: false)
+        ]
+        let controller = DistillAccountsController(accounts: accounts)
+        controller.login(accountID: "second")
+        XCTAssertEqual(controller.busyAccountID, "second")
+        for _ in 0..<50 where controller.isBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(accounts.lastID, "second")
+        XCTAssertFalse(controller.statuses[0].connected)
+        XCTAssertTrue(controller.statuses[1].connected)
+        accounts.holdLoad = true
+        controller.refresh()
+        for _ in 0..<50 where accounts.loadContinuation == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        let late = accounts.loadContinuation
+        accounts.holdLoad = false
+        accounts.delay = true
+        controller.login(accountID: "first")
+        controller.cancel()
+        late?.resume(returning: .init(accounts: [], routing: .init(enabled: true)))
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(controller.statuses.count, 2)
+        XCTAssertFalse(controller.routing.enabled)
+        XCTAssertFalse(controller.isBusy)
+    }
+
+    func test_addGeneratesNamedIDAndQuotaFailureKeepsIdentity() async throws {
+        let accounts = Accounts()
+        let controller = DistillAccountsController(accounts: accounts)
+        controller.add(provider: .claude, label: "Work")
+        XCTAssertTrue(controller.isBusy)
+        for _ in 0..<50 where controller.isBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        let id = try XCTUnwrap(accounts.lastID)
+        XCTAssertNotNil(UUID(uuidString: id))
+        XCTAssertEqual(id, id.lowercased())
+        XCTAssertEqual(controller.statuses.last?.label, "Work")
+        controller.refreshUsage(accountID: id)
+        XCTAssertEqual(controller.busyAccountID, id)
+        for _ in 0..<50 where controller.isBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(controller.lastError, "Quota unavailable")
+        XCTAssertFalse(controller.isBusy)
+    }
+
+    func test_routingSaveStaysBusyWithoutAccountUntilAuthoritativeRefresh() async throws {
+        let accounts = Accounts()
+        accounts.holdSave = true
+        let controller = DistillAccountsController(accounts: accounts)
+        await controller.refreshAndWait()
+        _ = await controller.discoverModels {
+            [AgentModelDescriptor(id: "discovered", label: "Discovered", provider: .distill, accountProvider: "chatgpt")]
+        }
+        let draft = DistillAutoRouting(enabled: true, options: [.init(id: "option", accountID: "legacy-chatgpt", mainModel: "discovered")])
+        var invalid = draft
+        invalid.options[0].mainModel = "auto"
+        controller.saveRouting(invalid)
+        XCTAssertFalse(controller.isBusy)
+        XCTAssertNotNil(controller.lastError)
+        XCTAssertNil(accounts.saveContinuation)
+        controller.saveRouting(draft)
+        XCTAssertTrue(controller.isBusy)
+        XCTAssertNil(controller.busyAccountID)
+        XCTAssertNil(controller.busyProvider)
+        XCTAssertFalse(controller.routing.enabled)
+        for _ in 0..<50 where accounts.saveContinuation == nil { try await Task.sleep(nanoseconds: 10_000_000) }
+        accounts.saveContinuation?.resume()
+        for _ in 0..<50 where controller.isBusy { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(controller.routing, draft)
+        XCTAssertFalse(controller.isBusy)
+        XCTAssertNil(controller.lastError)
+    }
+
 }

@@ -495,4 +495,88 @@ final class DistillGuestCredentialsTests: XCTestCase {
             XCTAssertEqual(error as? DistillGuestCredentialError, .watchFailed(path: self.hostHome.path, errno: ENOTDIR))
         }
     }
+    func test_namedMirrorRenewsAndWatchesEachAccountWithoutLegacyCredentials_thenRemovesLogoutAndDeletedAccount() throws {
+        let accounts = ["one", "two"].map {
+            DistillAccountStatus(provider: .claude, connected: false, id: $0, label: $0, legacy: false)
+        }
+        var registry = DistillAccountRegistry(version: 1, accounts: accounts, routing: DistillAutoRouting())
+        try JSONEncoder().encode(registry).write(to: hostHome.appendingPathComponent("accounts.json"))
+        for account in accounts {
+            let folder = hostHome.appendingPathComponent("accounts/\(account.id)")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try JSONSerialization.data(withJSONObject: Self.claudeStore()).write(to: folder.appendingPathComponent("claude-auth.json"))
+        }
+        let host = hostHome!
+        let mirror = DistillGuestCredentialMirror(hostHome: host, refresh: { _ in XCTFail("No legacy renewal") },
+            refreshAccount: { account in
+                let directory = try DistillAccounts.credentialHome(account: account, home: host)
+                let data = try JSONSerialization.data(withJSONObject: Self.claudeStore(access: "renewed-\(account.id)"))
+                try data.write(to: directory.appendingPathComponent("claude-auth.json"), options: .atomic)
+            }, debounce: 0.02, refreshInterval: 0.1)
+        defer { mirror.endAll() }
+        try mirror.begin(runID: "named", guestDistillHome: guestHome, provider: .claude, accounts: accounts)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: guestHome.appendingPathComponent("claude-auth.json").path))
+        XCTAssertTrue(waitUntil {
+            (try? self.guestJSON("accounts/one/claude-auth.json")["access_token"] as? String) == "renewed-one"
+                && (try? self.guestJSON("accounts/two/claude-auth.json")["access_token"] as? String) == "renewed-two"
+        })
+        XCTAssertEqual(try guestJSON("accounts/one/claude-auth.json")["refresh_token"] as? String, "")
+        XCTAssertEqual(try guestJSON("accounts/two/claude-auth.json")["refresh_token"] as? String, "")
+        // Stop periodic renewal before logout: the real refresher never creates a missing credential.
+        mirror.end(runID: "named")
+        let watcher = DistillGuestCredentialMirror(hostHome: host, refresh: { _ in }, debounce: 0.02)
+        defer { watcher.endAll() }
+        try watcher.begin(runID: "watch", guestDistillHome: guestHome, provider: nil)
+        try FileManager.default.removeItem(at: host.appendingPathComponent("accounts/one/claude-auth.json"))
+        XCTAssertTrue(waitUntil {
+            !FileManager.default.fileExists(atPath: self.guestHome.appendingPathComponent("accounts/one/claude-auth.json").path)
+        })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: guestHome.appendingPathComponent("accounts/two/claude-auth.json").path))
+        registry.accounts.removeAll { $0.id == "one" }
+        try JSONEncoder().encode(registry).write(to: host.appendingPathComponent("accounts.json"), options: .atomic)
+        XCTAssertTrue(waitUntil {
+            !FileManager.default.fileExists(atPath: self.guestHome.appendingPathComponent("accounts/one").path)
+        })
+        watcher.endAll()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: guestHome.appendingPathComponent("accounts").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: guestHome.appendingPathComponent("accounts.json").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: host.appendingPathComponent("accounts/two/claude-auth.json").path))
+    }
+
+    func test_namedCopiesRejectNestedSymlinkAndCleanupNeverFollowsIt() throws {
+        let account = DistillAccountStatus(provider: .claude, connected: false, id: "one", label: "One", legacy: false)
+        let registry = DistillAccountRegistry(version: 1, accounts: [account], routing: DistillAutoRouting())
+        try JSONEncoder().encode(registry).write(to: hostHome.appendingPathComponent("accounts.json"))
+        let source = hostHome.appendingPathComponent("accounts/one")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let original = try JSONSerialization.data(withJSONObject: Self.claudeStore())
+        try original.write(to: source.appendingPathComponent("claude-auth.json"))
+        try FileManager.default.createDirectory(at: guestHome.appendingPathComponent("accounts"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: guestHome.appendingPathComponent("accounts/one"), withDestinationURL: source)
+        XCTAssertThrowsError(try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: guestHome))
+        try DistillGuestCredentials.removeCopies(guestDistillHome: guestHome)
+        XCTAssertEqual(try Data(contentsOf: source.appendingPathComponent("claude-auth.json")), original)
+    }
+
+    func test_namedAutoPreflightUsesRegistryAccountsAndSafeQuotaCopiesWithoutLegacyRoots() throws {
+        let account = DistillAccountStatus(provider: .chatgpt, connected: false, id: "work", label: "Work", legacy: false)
+        let routing = DistillAutoRouting(enabled: true, options: [DistillAutoOption(id: "r", accountID: "work", mainModel: "fixture")])
+        let registry = DistillAccountRegistry(version: 1, accounts: [account], routing: routing)
+        try JSONEncoder().encode(registry).write(to: hostHome.appendingPathComponent("accounts.json"))
+        let source = hostHome.appendingPathComponent("accounts/work")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: Self.codexStore).write(to: source.appendingPathComponent("codex-auth.json"))
+        let quota = DistillAccountQuota(accountID: "work", checkedAt: "2026-10-12T18:58:45.174778Z", status: "unavailable",
+            detail: .object(["refresh_token": .string("must-not-copy"), "usage": .number(2)]))
+        try JSONEncoder().encode(quota).write(to: source.appendingPathComponent("quota.json"))
+        let candidates = try DistillGuestCredentials.accountsForRun(model: "auto", hostConfig: "", hostHome: hostHome)
+        XCTAssertEqual(candidates.map(\.id), ["work"])
+        try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: guestHome)
+        let copied = try JSONDecoder().decode(DistillAccountQuota.self, from: Data(contentsOf: guestHome.appendingPathComponent("accounts/work/quota.json")))
+        XCTAssertNil(copied.remainingPercent)
+        XCTAssertEqual(copied.detail, .object(["usage": .number(2)]))
+        let saved = try JSONDecoder().decode(DistillAccountRegistry.self, from: Data(contentsOf: guestHome.appendingPathComponent("accounts.json")))
+        XCTAssertEqual(saved.routing, routing)
+    }
+
 }

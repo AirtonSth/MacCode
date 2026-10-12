@@ -65,13 +65,13 @@ public struct DistillHostCredentialRefresher: Sendable {
         let provider = DistillAccountProvider.claude
         guard let initial = try readStore(provider) else { throw DistillGuestCredentialError.notSignedIn(provider) }
         if try claudeIsFresh(initial) { return }
-        let lock = try await AuthFileLock.acquire(home: hostHome, provider: provider, timeout: lockTimeout)
-        defer { lock.release() }
-        // Another process may have refreshed while this one waited for the lock.
-        guard var store = try readStore(provider) else { throw DistillGuestCredentialError.notSignedIn(provider) }
-        if try claudeIsFresh(store) { return }
         let directory = try openHostDirectory()
         defer { directory.close() }
+        let lock = try await AuthFileLock.acquire(directory: directory, provider: provider, timeout: lockTimeout)
+        defer { lock.release() }
+        // Another process may have refreshed while this one waited for the lock.
+        guard var store = try readStore(provider, from: directory) else { throw DistillGuestCredentialError.notSignedIn(provider) }
+        if try claudeIsFresh(store) { return }
         guard let refreshToken = nonEmpty(store["refresh_token"]) else {
             throw DistillGuestCredentialError.refreshTokenMissing(provider)
         }
@@ -116,13 +116,13 @@ public struct DistillHostCredentialRefresher: Sendable {
         let provider = DistillAccountProvider.chatgpt
         guard let initial = try readStore(provider) else { throw DistillGuestCredentialError.notSignedIn(provider) }
         if try codexIsFresh(initial) { return }
-        let lock = try await AuthFileLock.acquire(home: hostHome, provider: provider, timeout: lockTimeout)
-        defer { lock.release() }
-        guard var store = try readStore(provider) else { throw DistillGuestCredentialError.notSignedIn(provider) }
-        if try codexIsFresh(store) { return }
-        guard var tokens = store["tokens"] as? [String: Any] else { return }
         let directory = try openHostDirectory()
         defer { directory.close() }
+        let lock = try await AuthFileLock.acquire(directory: directory, provider: provider, timeout: lockTimeout)
+        defer { lock.release() }
+        guard var store = try readStore(provider, from: directory) else { throw DistillGuestCredentialError.notSignedIn(provider) }
+        if try codexIsFresh(store) { return }
+        guard var tokens = store["tokens"] as? [String: Any] else { return }
         guard let refreshToken = nonEmpty(tokens["refresh_token"]) else {
             throw DistillGuestCredentialError.refreshTokenMissing(provider)
         }
@@ -210,9 +210,18 @@ public struct DistillHostCredentialRefresher: Sendable {
     // MARK: - Files
 
     private func readStore(_ provider: DistillAccountProvider) throws -> [String: Any]? {
-        let url = hostHome.appendingPathComponent(provider.credentialFileName)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        guard let data = try? Data(contentsOf: url) else { throw DistillGuestCredentialError.unreadable(provider) }
+        let directory: PrivateDirectory
+        do { directory = try openHostDirectory() }
+        catch DistillGuestCredentialError.writeFailed(_, let code) where code == ENOENT { return nil }
+        defer { directory.close() }
+        return try readStore(provider, from: directory)
+    }
+
+    private func readStore(_ provider: DistillAccountProvider, from directory: PrivateDirectory) throws -> [String: Any]? {
+        guard directory.entries().contains(provider.credentialFileName) else { return nil }
+        guard let data = directory.read(provider.credentialFileName) else {
+            throw DistillGuestCredentialError.unreadable(provider)
+        }
         if data.allSatisfy({ $0 == 0x20 || $0 == 0x0A || $0 == 0x0D || $0 == 0x09 }) { return nil }
         guard let store = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             throw DistillGuestCredentialError.unreadable(provider)
@@ -224,7 +233,14 @@ public struct DistillHostCredentialRefresher: Sendable {
     /// request, so a directory that cannot be written must fail first.
     /// `~/.distill` may be a symlink the user made; it is the user's own.
     private func openHostDirectory() throws -> PrivateDirectory {
-        try PrivateDirectory(hostHome.resolvingSymlinksInPath(), create: false)
+        if hostHome.deletingLastPathComponent().lastPathComponent == "accounts" {
+            let root = try PrivateDirectory(hostHome.deletingLastPathComponent().deletingLastPathComponent().resolvingSymlinksInPath(), create: false)
+            defer { root.close() }
+            let accounts = try root.child("accounts", create: false)
+            defer { accounts.close() }
+            return try accounts.child(hostHome.lastPathComponent, create: false)
+        }
+        return try PrivateDirectory(hostHome.resolvingSymlinksInPath(), create: false)
     }
 
     private func writeStore(
@@ -296,9 +312,10 @@ public struct DistillHostCredentialRefresher: Sendable {
 private struct AuthFileLock {
     let descriptor: Int32
 
-    static func acquire(home: URL, provider: DistillAccountProvider, timeout: TimeInterval) async throws -> AuthFileLock {
-        let path = home.appendingPathComponent("\(provider.credentialFileName).lock").path
-        let fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+    static func acquire(directory: PrivateDirectory, provider: DistillAccountProvider, timeout: TimeInterval) async throws -> AuthFileLock {
+        let name = "\(provider.credentialFileName).lock"
+        let path = "\(directory.path)/\(name)"
+        let fd = openat(directory.descriptor, name, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw DistillGuestCredentialError.writeFailed(path: path, errno: errno) }
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int(timeout * 1000)))
         while flock(fd, LOCK_EX | LOCK_NB) != 0 {

@@ -166,6 +166,73 @@ final class BotGuestRunResolverTests: XCTestCase {
         f.guestHome.appendingPathComponent(".rc-runs/\(runID.value.uuidString.lowercased()).lease")
     }
 
+    func test_namedOnlyAutoGuestPlanRenewsNamedHomeAndLaunchesAutoWithoutLegacyCredential() async throws {
+        let f = try await makeFixture()
+        try FileManager.default.removeItem(at: f.hostHome.appendingPathComponent("claude-auth.json"))
+        let folder = f.hostHome.appendingPathComponent("accounts/work")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data(#"{"access_token":"fixture","refresh_token":"host-only"}"#.utf8)
+            .write(to: folder.appendingPathComponent("claude-auth.json"))
+        let registry = #"{"version":1,"accounts":[{"id":"work","provider":"claude","label":"Work","legacy":false}],"routing":{"enabled":true,"strategy":"ordered_first","options":[{"id":"r","account_id":"work","main_model":"claude/claude-sonnet-4-5","worker_model":null}]}}"#
+        try registry.write(to: f.hostHome.appendingPathComponent("accounts.json"), atomically: true, encoding: .utf8)
+        var deps = f.deps
+        let homes = Recorder<URL>()
+        deps.refresh = { home, provider in
+            homes.append(home)
+            XCTAssertEqual(provider, .claude)
+        }
+        let resolver = BotGuestRunResolver(deps)
+        let thread = try makeThread(f)
+        let request = AgentRunRequest(threadId: thread.id, provider: .distill, model: "auto",
+            cwd: root.path, prompt: "Go", reasoningModel: "stale-worker")
+        let plan = try unwrapPlan(try await resolver.prepare(request) { _ in })
+        defer { resolver.endRunsForAppTermination() }
+        XCTAssertEqual(homes.values.map(\.path), [folder.path])
+        let modelIndex = try XCTUnwrap(plan.guestCommand.firstIndex(of: "--model"))
+        XCTAssertEqual(plan.guestCommand[modelIndex + 1], "auto")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.guestDistillHome.appendingPathComponent("claude-auth.json").path))
+        let data = try Data(contentsOf: f.guestDistillHome.appendingPathComponent("accounts/work/claude-auth.json"))
+        let credential = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(credential["refresh_token"] as? String, "")
+        await plan.finish(.completed).value
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.guestDistillHome.appendingPathComponent("accounts").path))
+    }
+
+    func test_namedGrokRenewalDelegatesToScopedHostCLIAndRechecksTheSameChildHome() async throws {
+        let f = try await makeFixture()
+        let folder = f.hostHome.appendingPathComponent("accounts/work")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data(#"{"https://auth.x.ai::fixture":{"key":"fake-access","refresh_token":"host-only"}}"#.utf8)
+            .write(to: folder.appendingPathComponent("auth.json"))
+        let registry = #"{"version":1,"accounts":[{"id":"work","provider":"grok","label":"Work","legacy":false}],"routing":{"enabled":true,"strategy":"ordered_first","options":[{"id":"r","account_id":"work","main_model":"grok-4.6","worker_model":null}]}}"#
+        try registry.write(to: f.hostHome.appendingPathComponent("accounts.json"), atomically: true, encoding: .utf8)
+        let binary = root.appendingPathComponent("fake-accounts-cli")
+        let log = root.appendingPathComponent("account-argv")
+        let script = """
+        #!/bin/sh
+        echo "$*" > "\(log.path)"
+        echo '{"account_id":"work","checked_at":"2026-10-12T18:58:45.174778Z","fetched_at":null,"status":"unavailable","remaining_percent":null,"detail":null}'
+        """
+        try script.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: binary.path)
+        let homes = Recorder<URL>()
+        var deps = f.deps
+        deps.hostBinary = { _ in binary.path }
+        deps.refresh = { home, provider in
+            XCTAssertEqual(provider, .grok)
+            homes.append(home)
+            if homes.values.count == 1 { throw DistillGuestCredentialError.grokLoginExpiring(expiresAt: Date()) }
+        }
+        let resolver = BotGuestRunResolver(deps)
+        defer { resolver.endRunsForAppTermination() }
+        let thread = try makeThread(f)
+        let req = AgentRunRequest(threadId: thread.id, provider: .distill, model: "auto", cwd: root.path, prompt: "Go")
+        let plan = try unwrapPlan(try await resolver.prepare(req) { _ in })
+        XCTAssertEqual(homes.values.map(\.path), [folder.path, folder.path])
+        XCTAssertEqual(try String(contentsOf: log, encoding: .utf8), "accounts usage work\n")
+        await plan.finish(.completed).value
+    }
+
     // MARK: - Routing
 
     func test_legacyVMThreadWithoutTheMarker_andAMarkedThreadMovedToTheMac_stayOnTheMac() async throws {

@@ -124,7 +124,12 @@ public enum AgentDistillModelCatalog {
         return shortLabel(models.first(where: { $0.id == model })?.label ?? model)
     }
 
-    public static func workerPillTitle(reasoningModel: String?, models: [AgentModelDescriptor], supportsSessionWorker: Bool, homePath: String?) -> String {
+    public static func concreteWorkerModels(_ models: [AgentModelDescriptor]) -> [AgentModelDescriptor] {
+        selectableModels(models).filter { $0.id != "auto" }
+    }
+
+    public static func workerPillTitle(reasoningModel: String?, models: [AgentModelDescriptor], supportsSessionWorker: Bool, homePath: String?, mainModel: String? = nil) -> String {
+        if mainModel == "auto" { return "Auto profile" }
         guard supportsSessionWorker else { return "\(configuredWorker(homePath: homePath).worker) (config)" }
         guard let reasoningModel, !reasoningModel.isEmpty else { return "Off" }
         return shortLabel(models.first(where: { $0.id == reasoningModel })?.label ?? reasoningModel)
@@ -432,10 +437,10 @@ public struct AgentDistillReasoningModelSection: View {
         self.onSelectReasoningEffort = onSelectReasoningEffort
     }
 
-    public var showsConfigFallback: Bool { configWorkerSummary != nil }
+    public var showsConfigFallback: Bool { mainModel != "auto" && configWorkerSummary != nil }
 
     public var body: some View {
-        let selectable = AgentDistillModelCatalog.selectableModels(reasoningModels)
+        let selectable = AgentDistillModelCatalog.concreteWorkerModels(reasoningModels)
         let eligible = selectable
         let trimmedQuery = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let isFiltering = !trimmedQuery.isEmpty
@@ -451,7 +456,11 @@ public struct AgentDistillReasoningModelSection: View {
                     .foregroundColor(DS.Palette.textSecondary)
             }
                 .accessibilityIdentifier("agent.distill.reasoningModel.section")
-            if let configWorkerSummary {
+            if mainModel == "auto" {
+                Text("Worker follows the selected Auto profile option. Change its Main and Worker pair in Accounts.")
+                    .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true).frame(width: rowWidth, alignment: .leading)
+            } else if let configWorkerSummary {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     Text(configWorkerSummary)
                         .font(DS.Font.caption)
@@ -693,7 +702,8 @@ public struct AgentDistillModelPills<StatusHeader: View, MainFooter: View>: View
             reasoningModel: reasoningModel,
             models: reasoningModels,
             supportsSessionWorker: supportsReasoningModelEffort,
-            homePath: homePath
+            homePath: homePath,
+            mainModel: mainModel
         )
     }
 
@@ -710,10 +720,10 @@ public struct AgentDistillModelPills<StatusHeader: View, MainFooter: View>: View
     private var workerPresentation: AgentModelPillPresentation {
         AgentModelPillPresentation(
             title: workerTitle,
-            effort: supportsReasoningModelEffort && reasoningModel != nil
+            effort: mainModel != "auto" && supportsReasoningModelEffort && reasoningModel != nil
                 ? reasoningEffortSelection.pickerDisplayName : nil,
             prefix: "Worker",
-            warning: AgentDistillModelCatalog.workerUnavailable(reasoningModel: reasoningModel, models: reasoningModels)
+            warning: mainModel != "auto" && AgentDistillModelCatalog.workerUnavailable(reasoningModel: reasoningModel, models: reasoningModels)
         )
     }
 

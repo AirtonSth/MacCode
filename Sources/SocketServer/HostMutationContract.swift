@@ -72,6 +72,11 @@ public enum HostMutationContract {
     distill.accounts.login
     distill.accounts.logout
     distill.accounts.cancel
+    distill.accounts.add
+    distill.accounts.rename
+    distill.accounts.remove
+    distill.accounts.usage
+    distill.accounts.routing.set
     fs.workspace.create_file
     fs.workspace.delete
     fs.workspace.rename
@@ -512,7 +517,11 @@ public enum HostMutationContract {
         case "settings.set": return [.string("key"), .string("value")]
         case "project.run_script": return [.uuid("workspace_id"), .string("name")]
         case "private.push_token.update": return [.pushTokenContract]
-        case "distill.accounts.login", "distill.accounts.logout": return [.stringEnum("provider", distillAccountProviders)]
+        case "distill.accounts.login", "distill.accounts.logout": return [.anyString(["account_id", "provider"], nonempty: true)]
+        case "distill.accounts.add": return [.stringEnum("provider", distillAccountProviders), .string("label", nonempty: true)]
+        case "distill.accounts.rename": return [.string("account_id", nonempty: true), .string("label", nonempty: true)]
+        case "distill.accounts.remove", "distill.accounts.usage": return [.string("account_id", nonempty: true)]
+        case "distill.accounts.routing.set": return [.object("routing")]
         default: return []
         }
     }

@@ -30,20 +30,27 @@ final class DistillAccountsTests: XCTestCase {
         if [ "$FAKE_MODE" = fail ]; then
           echo "noise" >&2; echo "boom: no browser   " >&2; echo "" >&2; exit 3
         fi
-        if [ "$1" = login ]; then
+        if [ "$FAKE_MODE" = old ]; then
+          echo "error: unrecognized subcommand 'accounts'" >&2
+          echo "For more information, try --help." >&2; exit 2
+        fi
+        if [ "$2" = login ]; then
           echo "Signing in..." >&2
           echo "  https://example.com/auth?x=1" >&2
           echo "  https://example.com/second" >&2
           if [ "$FAKE_MODE" = hang ]; then echo $$ > "$FAKE_PID"; exec sleep 30; fi
         fi
         case "$*" in
-          "login") echo '{"https://accounts.x.ai/sign-in":{"key":"k"}}' > "$DISTILL_HOME/auth.json";;
-          "login --chatgpt") echo '{"tokens":{"access_token":"t"}}' > "$DISTILL_HOME/codex-auth.json";;
-          "login --claude") echo '{"access_token":"t"}' > "$DISTILL_HOME/claude-auth.json";;
-          "logout") rm -f "$DISTILL_HOME/auth.json";;
-          "logout --chatgpt") rm -f "$DISTILL_HOME/codex-auth.json";;
-          "logout --claude") rm -f "$DISTILL_HOME/claude-auth.json";;
+          "accounts login legacy-grok") echo '{"https://accounts.x.ai/sign-in":{"key":"k"}}' > "$DISTILL_HOME/auth.json";;
+          "accounts login legacy-chatgpt") echo '{"tokens":{"access_token":"t"}}' > "$DISTILL_HOME/codex-auth.json";;
+          "accounts login legacy-claude") echo '{"access_token":"t"}' > "$DISTILL_HOME/claude-auth.json";;
+          "accounts login legacy-openrouter") echo '{"key":"k"}' > "$DISTILL_HOME/openrouter-auth.json";;
+          "accounts logout legacy-grok") rm -f "$DISTILL_HOME/auth.json";;
+          "accounts logout legacy-chatgpt") rm -f "$DISTILL_HOME/codex-auth.json";;
+          "accounts logout legacy-claude") rm -f "$DISTILL_HOME/claude-auth.json";;
+          "accounts logout legacy-openrouter") rm -f "$DISTILL_HOME/openrouter-auth.json";;
         esac
+        echo '{"ok":true}'
         exit 0
         """
         try body.write(to: script, atomically: true, encoding: .utf8)
@@ -54,22 +61,10 @@ final class DistillAccountsTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
-    private func makeAccounts(
-        mode: String = "ok",
-        openURL: @escaping @Sendable (URL) -> Void = { _ in },
-        httpPost: @escaping DistillAccounts.HTTPPost = { _, _ in (Data(), 500) },
-        callbackTimeout: TimeInterval = 300
-    ) -> DistillAccounts {
-        DistillAccounts(
-            home: home,
-            binaryPath: script.path,
-            environment: [
-                "PATH": "/usr/bin:/bin", "FAKE_MODE": mode,
-                "FAKE_LOG": log.path, "FAKE_PID": pidFile.path,
-            ],
-            openURL: openURL,
-            httpPost: httpPost,
-            callbackTimeout: callbackTimeout)
+    private func makeAccounts(mode: String = "ok") -> DistillAccounts {
+        DistillAccounts(home: home, binaryPath: script.path,
+            environment: ["PATH": "/usr/bin:/bin", "FAKE_MODE": mode, "FAKE_LOG": log.path, "FAKE_PID": pidFile.path],
+            openURL: { _ in })
     }
 
     private func logLines() -> [String] {
@@ -125,7 +120,8 @@ final class DistillAccountsTests: XCTestCase {
 
     func test_login_runsProviderArgvWithDistillHomeAndReportsFirstURL() async throws {
         let expected: [(DistillAccountProvider, String)] = [
-            (.grok, "login"), (.chatgpt, "login --chatgpt"), (.claude, "login --claude"),
+            (.grok, "accounts login legacy-grok"), (.chatgpt, "accounts login legacy-chatgpt"),
+            (.claude, "accounts login legacy-claude"), (.openrouter, "accounts login legacy-openrouter"),
         ]
         for (provider, argv) in expected {
             try? FileManager.default.removeItem(at: log)
@@ -142,16 +138,19 @@ final class DistillAccountsTests: XCTestCase {
         try write(#"{"https://accounts.x.ai/sign-in":{"key":"k"}}"#, to: "auth.json")
         try write(#"{"tokens":{"access_token":"t"}}"#, to: "codex-auth.json")
         try write(#"{"access_token":"t"}"#, to: "claude-auth.json")
+        try write(#"{"key":"fixture"}"#, to: "openrouter-auth.json")
         let accounts = makeAccounts()
         try await accounts.logout(.chatgpt)
-        XCTAssertEqual(logLines(), ["argv: logout --chatgpt", "home: \(home.path)"])
+        XCTAssertEqual(logLines(), ["argv: accounts logout legacy-chatgpt", "home: \(home.path)"])
         XCTAssertEqual(connected(accounts)[.chatgpt], false)
         XCTAssertEqual(connected(accounts)[.grok], true)
         XCTAssertEqual(connected(accounts)[.claude], true)
+        XCTAssertEqual(connected(accounts)[.openrouter], true)
         try await accounts.logout(.claude)
         try await accounts.logout(.grok)
+        try await accounts.logout(.openrouter)
         XCTAssertEqual(logLines().filter { $0.hasPrefix("argv:") },
-                       ["argv: logout --chatgpt", "argv: logout --claude", "argv: logout"])
+                       ["argv: accounts logout legacy-chatgpt", "argv: accounts logout legacy-claude", "argv: accounts logout legacy-grok", "argv: accounts logout legacy-openrouter"])
         XCTAssertTrue(connected(accounts).values.allSatisfy { !$0 })
     }
 
@@ -202,154 +201,68 @@ final class DistillAccountsTests: XCTestCase {
         throw XCTSkip("fake child never started")
     }
 
-    // MARK: OpenRouter
-
-    func test_pkceChallenge_isBase64URLOfSHA256WithoutPadding() {
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
-        XCTAssertEqual(
-            DistillAccounts.pkceChallenge(verifier: verifier),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
-        let challenge = DistillAccounts.pkceChallenge(verifier: "any verifier")
-        XCTAssertFalse(challenge.contains("="))
-        XCTAssertFalse(challenge.contains("+"))
-        XCTAssertFalse(challenge.contains("/"))
-        XCTAssertEqual(challenge.count, 43)
-    }
-
-    private func callbackURL(from url: URL) -> URL? {
-        URLComponents(url: url, resolvingAgainstBaseURL: false)?
-            .queryItems?.first { $0.name == "callback_url" }?.value.flatMap(URL.init(string:))
-    }
-
-    func test_openRouterLogin_endToEndWritesOwnerOnlyKey() async throws {
-        let opened = Box<URL>()
-        let posted = Box<Data>()
-        let accounts = makeAccounts(
-            openURL: { url in
-                opened.add(url)
-                guard let callback = self.callbackURL(from: url),
-                      var components = URLComponents(url: callback, resolvingAgainstBaseURL: false)
-                else { return }
-                components.queryItems = [URLQueryItem(name: "code", value: "auth-code")]
-                let target = components.url!
-                Task { _ = try? await URLSession.shared.data(from: target) }
-            },
-            httpPost: { url, body in
-                XCTAssertEqual(url.absoluteString, "https://openrouter.ai/api/v1/auth/keys")
-                posted.add(body)
-                return (Data(#"{"key":"sk-or-test"}"#.utf8), 200)
-            })
-        let reported = Box<URL>()
-        try await accounts.login(.openrouter) { reported.add($0) }
-
-        let url = try XCTUnwrap(opened.all.first)
-        XCTAssertEqual(reported.all, opened.all)
-        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
-        XCTAssertEqual(components.host, "openrouter.ai")
-        XCTAssertEqual(components.path, "/auth")
-        func query(_ name: String) -> String? { components.queryItems?.first { $0.name == name }?.value }
-        XCTAssertEqual(query("code_challenge_method"), "S256")
-        XCTAssertEqual(query("key_label"), "Distill")
-        let callback = try XCTUnwrap(query("callback_url"))
-        XCTAssertTrue(callback.hasPrefix("http://localhost:"), callback)
-        XCTAssertTrue(callback.contains("/auth/callback/"), callback)
-
-        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(posted.all.first)) as? [String: String])
-        XCTAssertEqual(body["code"], "auth-code")
-        XCTAssertEqual(body["code_challenge_method"], "S256")
-        let verifier = try XCTUnwrap(body["code_verifier"])
-        XCTAssertEqual(query("code_challenge"), DistillAccounts.pkceChallenge(verifier: verifier))
-
-        let file = home.appendingPathComponent("openrouter-auth.json")
-        let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: String]
-        XCTAssertEqual(saved, ["key": "sk-or-test"])
-        let mode = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int)
-        XCTAssertEqual(mode & 0o777, 0o600)
-        XCTAssertEqual(connected(accounts)[.openrouter], true)
-        let leftovers = try FileManager.default.contentsOfDirectory(atPath: home.path)
-        XCTAssertEqual(leftovers, ["openrouter-auth.json"])
-    }
-
-    func test_openRouterLogin_declinedCallbackFailsWithoutExchangeOrFile() async throws {
-        let exchanged = Box<Int>()
-        let accounts = makeAccounts(
-            openURL: { url in
-                guard let callback = self.callbackURL(from: url),
-                      var components = URLComponents(url: callback, resolvingAgainstBaseURL: false)
-                else { return }
-                components.queryItems = [URLQueryItem(name: "error", value: "access_denied")]
-                let target = components.url!
-                Task { _ = try? await URLSession.shared.data(from: target) }
-            },
-            httpPost: { _, _ in exchanged.add(1); return (Data(), 200) })
+    func test_oldCLIRequiresUpdateWithoutLegacyFallback() async {
         do {
-            try await accounts.login(.openrouter) { _ in }
-            XCTFail("expected failure")
-        } catch {
-            XCTAssertEqual(
-                error as? DistillAccountError,
-                .failed("OpenRouter authorization was declined. Please try again."))
-        }
-        XCTAssertTrue(exchanged.all.isEmpty)
-        XCTAssertEqual(connected(accounts)[.openrouter], false)
+            try await makeAccounts(mode: "old").login(id: "work") { _ in }
+            XCTFail("unsupported CLI must fail")
+        } catch { XCTAssertEqual(error as? DistillAccountError, .updateRequired) }
+        XCTAssertEqual(logLines().first, "argv: accounts login work")
     }
 
-    func test_openRouterLogin_exchangeHTTPErrorFailsAndWritesNothing() async throws {
-        let accounts = makeAccounts(
-            openURL: { url in
-                guard let callback = self.callbackURL(from: url),
-                      var components = URLComponents(url: callback, resolvingAgainstBaseURL: false)
-                else { return }
-                components.queryItems = [URLQueryItem(name: "code", value: "c")]
-                let target = components.url!
-                Task { _ = try? await URLSession.shared.data(from: target) }
-            },
-            httpPost: { _, _ in (Data(), 403) })
-        do {
-            try await accounts.login(.openrouter) { _ in }
-            XCTFail("expected failure")
-        } catch {
-            XCTAssertEqual(
-                error as? DistillAccountError,
-                .failed("OpenRouter authorization failed (HTTP 403). Please try again."))
+    func test_namedMetadataProbeKeepsSameProviderIdentitiesAndRejectsSymlink() throws {
+        let records = [
+            DistillAccountStatus(provider: .claude, connected: false, id: "one", label: "One", legacy: false),
+            DistillAccountStatus(provider: .claude, connected: false, id: "two", label: "Two", legacy: false),
+        ]
+        let registry = DistillAccountRegistry(version: 1, accounts: records, routing: DistillAutoRouting())
+        try JSONEncoder().encode(registry).write(to: home.appendingPathComponent("accounts.json"))
+        for id in ["one", "two"] {
+            let folder = home.appendingPathComponent("accounts/\(id)")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data(#"{"access_token":"fixture"}"#.utf8).write(to: folder.appendingPathComponent("claude-auth.json"))
         }
-        XCTAssertEqual(connected(accounts)[.openrouter], false)
+        XCTAssertEqual(makeAccounts().statuses().filter(\.connected).map(\.id), ["one", "two"])
+        let one = home.appendingPathComponent("accounts/one")
+        try FileManager.default.removeItem(at: one)
+        try FileManager.default.createSymbolicLink(at: one, withDestinationURL: home.appendingPathComponent("accounts/two"))
+        XCTAssertEqual(makeAccounts().statuses().filter(\.connected).map(\.id), ["two"])
     }
 
-    func test_openRouterLogin_timesOutWhenNoCallbackArrives() async {
-        let accounts = makeAccounts(callbackTimeout: 0.2)
-        do {
-            try await accounts.login(.openrouter) { _ in }
-            XCTFail("expected timeout")
-        } catch {
-            XCTAssertEqual(error as? DistillAccountError, .timedOut)
+    func test_realCLIAccountAndRoutingContractWithoutCredentials() async throws {
+        guard let binary = ProcessInfo.processInfo.environment["DISTILL_ACCOUNTS_TEST_BINARY"] else {
+            throw XCTSkip("Controller supplies DISTILL_ACCOUNTS_TEST_BINARY for the actual CLI contract proof")
         }
+        let accounts = DistillAccounts(home: home, binaryPath: binary,
+            environment: ["HOME": root.path, "GROK_HOME": home.path, "PATH": "/usr/bin:/bin",
+                "RC2_DISABLE_MANAGED_DISTILL_RECONCILE": "1", "GROK_DISABLE_AUTOUPDATER": "1",
+                "GROK_TELEMETRY_ENABLED": "false", "GROK_TELEMETRY_MIXPANEL_ENABLED": "false",
+                "GROK_TELEMETRY_TRACE_UPLOAD": "false", "GROK_FEEDBACK_ENABLED": "false",
+                "GROK_INSTRUMENTATION": "disabled", "OTEL_SDK_DISABLED": "true"],
+            openURL: { _ in XCTFail("No login/browser is allowed in this proof") })
+        try await accounts.add(id: "one", provider: .claude, label: "One")
+        try await accounts.add(id: "two", provider: .claude, label: "Two")
+        try await accounts.rename(id: "one", label: "Renamed")
+        let state = try await accounts.loadState()
+        XCTAssertEqual(state.accounts.filter { !$0.legacy }.map(\.id), ["one", "two"])
+        XCTAssertEqual(state.accounts.first { $0.id == "one" }?.label, "Renamed")
+        XCTAssertTrue(state.accounts.allSatisfy { !$0.connected })
+        let route = DistillAutoRouting(enabled: false, strategy: .highestRemaining,
+            options: [DistillAutoOption(id: "route", accountID: "two", mainModel: "fixture-main")])
+        try await accounts.saveRouting(route)
+        let saved = try await accounts.loadRouting()
+        XCTAssertEqual(saved, route)
+        try await accounts.remove(id: "one")
+        let after = try await accounts.loadState()
+        XCTAssertEqual(after.accounts.filter { !$0.legacy }.map(\.id), ["two"])
+        XCTAssertEqual(after.routing, route)
     }
 
-    func test_openRouterLogin_cancellationThrowsCancelled() async throws {
-        let started = Box<URL>()
-        let accounts = makeAccounts(openURL: { started.add($0) })
-        let task = Task { try await accounts.login(.openrouter) { _ in } }
-        let deadline = Date().addingTimeInterval(5)
-        while started.all.isEmpty, Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
-        XCTAssertFalse(started.all.isEmpty)
-        task.cancel()
-        do {
-            try await task.value
-            XCTFail("expected cancellation")
-        } catch {
-            XCTAssertEqual(error as? DistillAccountError, .cancelled)
-        }
-    }
-
-    func test_openRouterLogout_deletesOnlyItsFileAndToleratesMissing() async throws {
-        try write(#"{"key":"sk-or"}"#, to: "openrouter-auth.json")
-        try write(#"{"access_token":"t"}"#, to: "claude-auth.json")
-        let accounts = makeAccounts()
-        try await accounts.logout(.openrouter)
-        XCTAssertEqual(connected(accounts)[.openrouter], false)
-        XCTAssertEqual(connected(accounts)[.claude], true)
-        XCTAssertTrue(logLines().isEmpty, "OpenRouter logout must not spawn distill")
-        try await accounts.logout(.openrouter)
+    func test_quotaDecodesRFC3339AndRetainsUnknownAsNull() throws {
+        let data = Data(#"{"account_id":"work","checked_at":"2026-10-12T18:58:45.174778Z","fetched_at":null,"status":"unavailable","remaining_percent":null,"detail":null}"#.utf8)
+        let quota = try JSONDecoder().decode(DistillAccountQuota.self, from: data)
+        XCTAssertEqual(quota.accountID, "work")
+        XCTAssertNotNil(DistillHostCredentialRefresher.parseDate(quota.checkedAt))
+        XCTAssertNil(quota.remainingPercent)
+        XCTAssertNil(quota.fetchedAt)
     }
 }

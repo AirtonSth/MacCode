@@ -34,10 +34,14 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let requestsURL = root.appendingPathComponent("requests.jsonl")
         let harnessURL = root.appendingPathComponent("distill-agent")
+        let modelsURL = root.appendingPathComponent("models.json")
+        try #"{"availableModels":[{"modelId":"live-distill-model","name":"Live Distill Model"}],"currentModelId":"live-distill-model"}"#
+            .write(to: modelsURL, atomically: true, encoding: .utf8)
         let harness = """
         #!/usr/bin/env python3
         import json, pathlib, sys
         requests = pathlib.Path(\(String(reflecting: requestsURL.path)))
+        models = pathlib.Path(\(String(reflecting: modelsURL.path)))
         def record(value):
             with requests.open("a") as output:
                 output.write(json.dumps(value) + "\\n")
@@ -50,25 +54,45 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             if method == "initialize":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":True,"sessionCapabilities":{"resume":True},"promptCapabilities":{}}}})
             elif method == "session/new":
-                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"old-distill-session","models":{"availableModels":[{"modelId":"live-distill-model","name":"Live Distill Model"}],"currentModelId":"live-distill-model"}}})
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"sessionId":"old-distill-session","models":json.loads(models.read_text())}})
             elif method == "_x.ai/session/worker_model/set":
                 send({"jsonrpc":"2.0", "id":message["id"], "error":{"code":-32601,"message":"method not found"}})
         """
         try harness.write(to: harnessURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: harnessURL.path)
-        let result = await DistillACPAdapter(
+        let adapter = DistillACPAdapter(
             binaryNameOverride: harnessURL.path,
             discoveryCwd: root.path
-        ).discoveryResult()
+        )
+        let result = await adapter.discoveryResult()
 
         XCTAssertFalse(result.isFallback, "an old peer's live model catalog must survive optional-extension absence")
         XCTAssertEqual(result.models.map(\.id), ["live-distill-model"])
+        let otherCwd = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: otherCwd, withIntermediateDirectories: true)
+        let workspaceAdapter = DistillACPAdapter(binaryNameOverride: harnessURL.path, discoveryCwd: otherCwd.path)
+        let workspaceBefore = await workspaceAdapter.discoveryResult()
+        XCTAssertEqual(workspaceBefore.models.map(\.id), result.models.map(\.id))
+        // Account/routing state changes without changing the CLI executable or cache scope.
+        try Self.autoCatalog.write(to: modelsURL, atomically: true, encoding: .utf8)
+        let cached = await adapter.discoveryResult()
+        XCTAssertEqual(cached.models.map(\.id), ["live-distill-model"])
+        let refreshed = await adapter.discoveryResult(forceRefresh: true)
+        XCTAssertFalse(refreshed.isFallback)
+        XCTAssertEqual(refreshed.models.map(\.id), ["auto", "chatgpt/fixture-main"])
+        let shared = await DistillACPAdapter(binaryNameOverride: harnessURL.path, discoveryCwd: root.path).discoveryResult()
+        XCTAssertEqual(shared.models.map(\.id), refreshed.models.map(\.id))
+        let workspaceAfter = await workspaceAdapter.discoveryResult()
+        XCTAssertEqual(workspaceAfter.models.map(\.id), refreshed.models.map(\.id),
+                       "the picker in another working directory must discard the same account's old catalog")
         let methods = try String(contentsOf: requestsURL, encoding: .utf8)
             .split(whereSeparator: \.isNewline)
             .compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: String] }
             .compactMap { $0["method"] }
         XCTAssertFalse(methods.contains("_x.ai/session/worker_model/set"),
                        "discovery must not call an extension the peer did not advertise")
+        XCTAssertEqual(methods.filter { $0 == "session/new" }.count, 4,
+                       "forced refresh must replace the warm cache for subsequent adapters")
     }
 
     private func writeWorkerHarness(
@@ -94,7 +118,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             with requests.open("a") as output: output.write(json.dumps({"method":method,"params":params}) + "\\n")
             if method == "initialize":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{"protocolVersion":1,"agentCapabilities":\(initializeCapabilities)}})
-            elif method == "session/new":
+            elif method in ("session/new", "session/load"):
                 result = {"sessionId":"worker-session","models":\(sessionModels)}
                 extra = \(String(reflecting: sessionOpenJSON ?? ""))
                 if extra: result.update(json.loads(extra))
@@ -102,6 +126,10 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             elif method == "session/set_model":
                 fixed = \(String(reflecting: setModelResult ?? ""))
                 result = json.loads(fixed) if fixed else {"_meta":{"model":params.get("modelId"),"contextWindow":1000}}
+                if not fixed and params.get("modelId") == "auto":
+                    meta = params.get("_meta", {})
+                    active = "fixture-high" if meta.get("reasoningEffort") == "high" else "fixture-main"
+                    result["_meta"].update({"model":{"Ok":active},"canonicalModelId":"auto","reasoningEffort":meta.get("reasoningEffort","high"),"reasoningEffortAuto":meta.get("reasoningEffortAuto",False)})
                 send({"jsonrpc":"2.0", "id":message["id"], "result":result})
             elif method == "_x.ai/session/worker_model/set":
                 send({"jsonrpc":"2.0", "id":message["id"], "result":\(workerResult)})
@@ -128,6 +156,72 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
+    }
+
+    private static let autoCatalog = #"{"currentModelId":"chatgpt/fixture-main","availableModels":[{"modelId":"auto","name":"Auto"},{"modelId":"chatgpt/fixture-main","name":"Fixture","_meta":{"accountProvider":"chatgpt","reasoningEfforts":["low","high"]}}]}"#
+
+    func test_autoNewAndColdLoadKeepLogicalMainAndConcreteEffortWithoutManualWorkerReapplication() async throws {
+        let root = try makeTempRoot("distill-acp-auto-open")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root,
+            initializeCapabilities: #"{"_meta":{"x.ai/capabilities":{"sessionWorkerModel":True}}}"#, workerResult: "{}", sessionModels: Self.autoCatalog)
+        let client = try DistillACPClient(binary: harness.path, cwd: root.path)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        let opened = try await client.newSession(cwd: root.path, modelId: "auto",
+            mainEffortSelection: .fixed(.low), reasoningModel: "stale-worker")
+        XCTAssertEqual(opened.appliedMainModelId, "auto")
+        XCTAssertEqual(opened.currentModelId, "fixture-main")
+        XCTAssertEqual(opened.appliedMainEffortSelection, .fixed(.low))
+        let loaded = try await client.loadSession(sessionId: opened.sessionId, cwd: root.path, modelId: "auto",
+            mainEffortSelection: .fixed(.low), reasoningModel: nil)
+        XCTAssertEqual(loaded.appliedMainModelId, "auto")
+        XCTAssertEqual(loaded.currentModelId, "fixture-main")
+        let implicitEffort = try await client.loadSession(sessionId: opened.sessionId, cwd: root.path,
+            modelId: "auto", reasoningModel: "stale-worker")
+        XCTAssertEqual(implicitEffort.appliedMainModelId, "auto")
+        XCTAssertEqual(implicitEffort.currentModelId, "chatgpt/fixture-main")
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertFalse(requests.contains { $0["method"] as? String == DistillACPClient.workerModelSetMethod })
+        let bindings = requests.filter { $0["method"] as? String == "session/set_model" }
+        XCTAssertEqual(bindings.count, 2)
+        XCTAssertTrue(bindings.allSatisfy { ($0["params"] as? [String: Any])?["modelId"] as? String == "auto" })
+    }
+
+    func test_autoRepeatedTurnsDoNotRebindConcreteMainOrStaleWorker_andChangedEffortUsesConcreteCatalog() async throws {
+        let root = try makeTempRoot("distill-acp-auto-turns")
+        defer { try? FileManager.default.removeItem(at: root) }
+        // The selected route changes from a high-only model to a low-only model.
+        let changingCatalog = #"{"currentModelId":"chatgpt/fixture-high","availableModels":[{"modelId":"auto","name":"Auto"},{"modelId":"chatgpt/fixture-high","name":"High route","_meta":{"accountProvider":"chatgpt","reasoningEfforts":["high"]}},{"modelId":"chatgpt/fixture-main","name":"Low route","_meta":{"accountProvider":"chatgpt","reasoningEfforts":["low"]}}]}"#
+        let (harness, requestsURL) = try writeWorkerHarness(root: root,
+            initializeCapabilities: #"{"_meta":{"x.ai/capabilities":{"sessionWorkerModel":True}}}"#, workerResult: "{}", sessionModels: changingCatalog)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let thread = AgentThreadID()
+        func request(_ effort: AgentReasoningEffort, worker: String?) -> AgentRunRequest {
+            AgentRunRequest(threadId: thread, provider: .distill, model: "auto", cwd: root.path,
+                prompt: "Turn", reasoningModel: worker, distillMainEffortSelection: .fixed(effort))
+        }
+        let first = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(request(.high, worker: "stale-worker")) { first.append($0) }
+        _ = try await first.waitForFinish()
+        XCTAssertEqual(first.acceptedSessionModels.last?.model, "fixture-high")
+        let second = DistillACPAdapterEventBox()
+        _ = try await adapter.sendTurn(request(.high, worker: nil)) { second.append($0) }
+        _ = try await second.waitForFinish()
+        let third = DistillACPAdapterEventBox()
+        _ = try await adapter.sendTurn(request(.low, worker: "another-stale-worker")) { third.append($0) }
+        _ = try await third.waitForFinish()
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/new" }.count, 1)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/prompt" }.count, 3)
+        XCTAssertFalse(requests.contains { $0["method"] as? String == DistillACPClient.workerModelSetMethod })
+        let bindings = requests.filter { $0["method"] as? String == "session/set_model" }
+        XCTAssertEqual(bindings.count, 2, "Only opening and the changed effort bind Main")
+        XCTAssertTrue(bindings.allSatisfy { ($0["params"] as? [String: Any])?["modelId"] as? String == "auto" })
+        XCTAssertEqual(((bindings.last?["params"] as? [String: Any])?["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "low")
+        XCTAssertEqual(third.acceptedSessionModels.last?.model, "fixture-main")
+        XCTAssertFalse(DistillACPAdapter.isCrossModelFamilySwitch(from: "claude/actual", to: "auto"))
     }
 
     func test_initializeParsesSessionWorkerModelCapability() async throws {

@@ -199,12 +199,27 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 contentsOf: hostHome.appendingPathComponent("config.toml"), encoding: .utf8
             )) ?? ""
             let provider = DistillGuestCredentials.accountProvider(model: request.model, hostConfig: hostConfig)
-            try await deps.refresh(hostHome, provider)
+            let accounts = try DistillGuestCredentials.accountsForRun(
+                model: request.model, hostConfig: hostConfig, hostHome: hostHome)
+            if accounts.isEmpty { try await deps.refresh(hostHome, provider) }
+            else {
+                var prepared = false
+                var lastError: Error?
+                for account in accounts {
+                    do {
+                        try await Self.prepareAccount(account, hostHome: hostHome, binary: hostBinary,
+                            environment: hostEnvironment, refresh: deps.refresh)
+                        prepared = true
+                    } catch is CancellationError { throw CancellationError() }
+                    catch { lastError = error }
+                }
+                if !prepared, let lastError { throw lastError }
+            }
             try Task.checkCancellation()
             let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: botID)
             let guestDistillHome = DistillGuestCredentials.distillHome(guestHome: guestHome)
-            let mirror = mirror(hostHome: hostHome)
-            try mirror.begin(runID: runID, guestDistillHome: guestDistillHome, provider: provider)
+            let mirror = mirror(hostHome: hostHome, binary: hostBinary, environment: hostEnvironment)
+            try mirror.begin(runID: runID, guestDistillHome: guestDistillHome, provider: provider, accounts: accounts)
             undo.append { mirror.end(runID: runID) }
 
             let gateway = deps.gateway
@@ -381,13 +396,33 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
 
     // MARK: - Helpers
 
-    private func mirror(hostHome: URL) -> DistillGuestCredentialMirror {
+    /// Grok's scoped CLI owns its OIDC refresh chain; do not duplicate that transport in Swift.
+    private static func prepareAccount(
+        _ account: DistillAccountStatus, hostHome: URL, binary: String?, environment: [String: String],
+        refresh: @Sendable (URL, DistillAccountProvider?) async throws -> Void
+    ) async throws {
+        let credentialHome = try DistillAccounts.credentialHome(account: account, home: hostHome)
+        do { try await refresh(credentialHome, account.provider) }
+        catch DistillGuestCredentialError.grokLoginExpiring where !account.legacy {
+            guard let binary else { throw DistillGuestCredentialError.notSignedIn(.grok) }
+            let accounts = DistillAccounts(home: hostHome, binaryPath: binary, environment: environment, openURL: { _ in })
+            _ = try await accounts.refreshUsage(id: account.id)
+            // The CLI may retain a still-valid token outside its renewal window. Keep preflight honest.
+            try await refresh(credentialHome, account.provider)
+        }
+    }
+
+    private func mirror(hostHome: URL, binary: String?, environment: [String: String]) -> DistillGuestCredentialMirror {
         lock.withLock {
             if let mirror = mirrors[hostHome.path] { return mirror }
             let refresh = deps.refresh
             let mirror = DistillGuestCredentialMirror(
                 hostHome: hostHome,
                 refresh: { provider in try await refresh(hostHome, provider) },
+                refreshAccount: { account in
+                    try await Self.prepareAccount(account, hostHome: hostHome, binary: binary,
+                        environment: environment, refresh: refresh)
+                },
                 onRefreshFailure: { runIDs, _ in
                     guestResolverLog.error("bot.guest.credentials.refresh_failed runs=\(runIDs.count, privacy: .public)")
                 }
