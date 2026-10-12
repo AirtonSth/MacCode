@@ -42,7 +42,7 @@ enum AgentChatScrollGraphHop {
     }
 }
 
-/// Shared Agent App / Desk timeline viewport: pin, FAB, BOTTOM sentinel,
+/// Shared Agent App / Desk timeline viewport: pin, FAB, BOTTOM anchor,
 /// and AppKit follow. Callers own the rows.
 public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: View>: View {
 
@@ -103,13 +103,10 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
                         .accessibilityHidden(true)
 
                         content(columnWidth)
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id(AgentChatTimelineScrollChrome.bottomAnchorID)
                     }
                     .padding(.horizontal, horizontalPadding)
                     .padding(.vertical, verticalPadding)
+                    .id(AgentChatTimelineScrollChrome.bottomAnchorID)
                     .frame(width: viewport.size.width, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }

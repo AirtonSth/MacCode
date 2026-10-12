@@ -24,6 +24,7 @@ final class SidebarSnapshotTests: XCTestCase {
     func test_sidebarSnapshot_lightAppearance_rendersVisibleContent() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2SidebarSnapshotLight-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
         let (_, hostingView) = try await makeOffscreenSidebar(appSupport: appSupport, width: 320)
 
         NSAppearance.current = NSAppearance(named: .aqua)!
@@ -41,6 +42,15 @@ final class SidebarSnapshotTests: XCTestCase {
         // Restore default appearance.
         NSAppearance.current = nil
 
+        XCTAssertEqual(bitmap.size.width, 320)
+        XCTAssertEqual(bitmap.size.height, 860)
+        if let directory = ProcessInfo.processInfo.environment["REMOTE_CODE_SIDEBAR_LAYOUT_ARTIFACT_DIR"] {
+            let url = URL(fileURLWithPath: directory, isDirectory: true)
+                .appendingPathComponent("light-320pt-offscreen.png")
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try png.write(to: url, options: .atomic)
+        }
+
         XCTAssertGreaterThan(png.count, 12_000,
                              "light-mode sidebar snapshot must not be empty or blank -- " +
                              "a tiny file means nothing rendered (white-on-white readability regression)")
@@ -52,6 +62,7 @@ final class SidebarSnapshotTests: XCTestCase {
     func test_sidebarSnapshot_narrowWidth180pt_rendersWithoutCrash() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2SidebarSnapshotNarrow-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
         let (_, hostingView) = try await makeOffscreenSidebar(appSupport: appSupport, width: 180)
 
         RunLoop.main.run(until: Date().addingTimeInterval(0.2))
@@ -62,6 +73,15 @@ final class SidebarSnapshotTests: XCTestCase {
         hostingView.cacheDisplay(in: hostingView.bounds, to: bitmap)
         guard let png = bitmap.representation(using: .png, properties: [:]) else {
             return XCTFail("narrow (180pt) offscreen snapshot must encode as PNG")
+        }
+
+        XCTAssertEqual(bitmap.size.width, 180)
+        XCTAssertEqual(bitmap.size.height, 860)
+        if let directory = ProcessInfo.processInfo.environment["REMOTE_CODE_SIDEBAR_LAYOUT_ARTIFACT_DIR"] {
+            let url = URL(fileURLWithPath: directory, isDirectory: true)
+                .appendingPathComponent("narrow-180pt-offscreen.png")
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try png.write(to: url, options: .atomic)
         }
 
         XCTAssertGreaterThan(png.count, 1_000,
@@ -76,6 +96,7 @@ final class SidebarSnapshotTests: XCTestCase {
     func test_sidebarSnapshot_wideWidth560pt_rendersWithoutCrash() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2SidebarSnapshotWide-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
         let (_, hostingView) = try await makeOffscreenSidebar(appSupport: appSupport, width: 560)
 
         RunLoop.main.run(until: Date().addingTimeInterval(0.2))
@@ -86,6 +107,15 @@ final class SidebarSnapshotTests: XCTestCase {
         hostingView.cacheDisplay(in: hostingView.bounds, to: bitmap)
         guard let png = bitmap.representation(using: .png, properties: [:]) else {
             return XCTFail("wide (560pt) offscreen snapshot must encode as PNG")
+        }
+
+        XCTAssertEqual(bitmap.size.width, 560)
+        XCTAssertEqual(bitmap.size.height, 860)
+        if let directory = ProcessInfo.processInfo.environment["REMOTE_CODE_SIDEBAR_LAYOUT_ARTIFACT_DIR"] {
+            let url = URL(fileURLWithPath: directory, isDirectory: true)
+                .appendingPathComponent("wide-560pt-offscreen.png")
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try png.write(to: url, options: .atomic)
         }
 
         XCTAssertGreaterThan(png.count, 12_000,

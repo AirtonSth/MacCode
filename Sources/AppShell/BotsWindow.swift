@@ -3220,6 +3220,7 @@ public final class BotsViewModel: ObservableObject {
         didSet {
             selectedBotFallbackCache = nil
             refreshActiveBotCount()
+            publishRosterIfNeeded()
         }
     }
     /// Stored working-bot count so roster/Active Bots bodies never run the
@@ -3246,7 +3247,13 @@ public final class BotsViewModel: ObservableObject {
             publishRosterIfNeeded()
         }
     }
-    @Published public var selectedBotID: BotID?
+    @Published public var selectedBotID: BotID? {
+        didSet {
+            if selectedBotID != oldValue {
+                publishRosterIfNeeded()
+            }
+        }
+    }
     @Published public var screen: BotsScreen = .desk {
         didSet {
             let resolved = screen.resolvedDestination
