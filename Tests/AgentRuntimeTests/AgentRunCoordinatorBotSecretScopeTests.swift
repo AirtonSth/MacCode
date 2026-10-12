@@ -174,6 +174,36 @@ final class AgentRunCoordinatorBotSecretScopeTests: XCTestCase {
         XCTFail("run did not complete")
     }
 
+    func test_vmBotRequestIsNormalizedToFullAccessButLocalRequestIsUnchanged() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-bot-permissions-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let botID = BotID(UUID())
+        let vmThread = AgentThread(title: "VM bot", provider: .codex, model: "test", actor: .bot(botID), executionTarget: .vm)
+        let localThread = AgentThread(title: "Local", provider: .codex, model: "test")
+        try threadRepo.upsert(vmThread)
+        try threadRepo.upsert(localThread)
+        let adapter = ScopeRefreshingAdapter(provider: .codex)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+
+        for thread in [vmThread, localThread] {
+            let runID = AgentRunID()
+            _ = try await coordinator.startRun(.init(
+                runId: runID, threadId: thread.id, provider: .codex,
+                model: "test", cwd: tmp, prompt: "test", permissionMode: .supervised
+            ))
+            try await waitForRun(runID, in: runRepo)
+        }
+
+        XCTAssertEqual(adapter.requests.first(where: { $0.threadId == vmThread.id })?.permissionMode, .fullAccess)
+        XCTAssertEqual(adapter.requests.first(where: { $0.threadId == localThread.id })?.permissionMode, .supervised)
+    }
+
     func test_reusedProviderSessionsRefreshWhenBotSecretsChangeButReuseWhenUnchanged() async throws {
         for provider in [AgentProvider.claude, .codex, .grok] {
             let tmp = NSTemporaryDirectory() + "rc2-bot-secret-scope-" + provider.rawValue + "-" + UUID().uuidString

@@ -1186,6 +1186,39 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         isAutoContinuation: Bool = false,
         recordUserMessage: Bool = true
     ) async throws -> AgentRunID {
+        var normalizedRequest = request
+        if let thread = try threadRepo.get(id: request.threadId),
+           thread.actor.botID != nil,
+           thread.executionTarget == .vm,
+           request.permissionMode != .fullAccess {
+            normalizedRequest = AgentRunRequest(
+                runId: request.runId,
+                threadId: request.threadId,
+                provider: request.provider,
+                providerInstanceId: request.providerInstanceId,
+                model: request.model,
+                cwd: request.cwd,
+                prompt: request.prompt,
+                userMessageContent: request.userMessageContent,
+                attachments: request.attachments,
+                providerThreadId: request.providerThreadId,
+                permissionMode: .fullAccess,
+                reasoningEffort: request.reasoningEffort,
+                reasoningModel: request.reasoningModel,
+                distillMainEffortSelection: request.distillMainEffortSelection,
+                distillReasoningEffortSelection: request.distillReasoningEffortSelection,
+                distillUltracode: request.distillUltracode,
+                serviceTier: request.serviceTier,
+                interactionMode: request.interactionMode,
+                providerBinary: request.providerBinary,
+                environment: request.environment,
+                extraArgs: request.extraArgs,
+                runAsUser: request.runAsUser,
+                acceptancePermit: request.acceptancePermit,
+                contextSnapshot: request.contextSnapshot,
+                preparedContextSeed: request.preparedContextSeed
+            )
+        }
         let forkRecoveryPending = try threadRepo.hasRecoverableForkIntent(sourceThreadId: request.threadId)
         guard !forkRecoveryPending else {
             throw AgentProviderAdapterError.unsupported(
@@ -1357,7 +1390,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             AgentDelegationCapability.sha256Hex
         )
         let admittedRequest = try await requestAdmittingAutoRoute(
-            request,
+            normalizedRequest,
             routingSnapshot: routingSnapshot,
             delegationCapabilitySHA256: delegationCapabilitySHA256
         )

@@ -2416,7 +2416,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         runAsUser = selectedThread.runAsUser ?? AgentRunAsUser.current()
         selectedRunActor = selectedThread.actor
         model = manual.effectiveModel
-        permissionMode = selectedThread.permissionMode
+        permissionMode = linkedBotVMRequiresFullAccess ? .fullAccess : selectedThread.permissionMode
+        if linkedBotVMRequiresFullAccess, selectedThread.permissionMode != .fullAccess {
+            setPermissionMode(.fullAccess, for: id)
+        }
         reasoningEffort = manual.reasoningEffort
         reasoningModel = selectedThread.reasoningModel
         distillMainEffortSelection = manual.distillMainEffortSelection
@@ -4073,8 +4076,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if Self.shouldAssignIfChanged(current: model, next: manual.effectiveModel) {
             model = manual.effectiveModel
         }
-        if Self.shouldAssignIfChanged(current: permissionMode, next: selectedThread.permissionMode) {
-            permissionMode = selectedThread.permissionMode
+        let nextPermissionMode = linkedBotVMRequiresFullAccess ? .fullAccess : selectedThread.permissionMode
+        if linkedBotVMRequiresFullAccess, selectedThread.permissionMode != .fullAccess {
+            setPermissionMode(.fullAccess, for: id)
+        } else if Self.shouldAssignIfChanged(current: permissionMode, next: nextPermissionMode) {
+            permissionMode = nextPermissionMode
         }
         if Self.shouldAssignIfChanged(current: reasoningEffort, next: manual.reasoningEffort) {
             reasoningEffort = manual.reasoningEffort
@@ -6988,7 +6994,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    var linkedBotVMRequiresFullAccess: Bool {
+        guard selectedRunActor.botID != nil,
+              let selectedThreadId,
+              let thread = threads.first(where: { $0.id == selectedThreadId }) else { return false }
+        return thread.executionTarget == .vm
+    }
+
     public func setPermissionMode(_ mode: AgentPermissionMode) {
+        guard !linkedBotVMRequiresFullAccess || mode == .fullAccess else { return }
         guard !activeRunConfigurationLocked else { return }
         guard supportedPermissionModesForSelectedProvider.contains(mode) else {
             statusMessage = permissionModeUnavailableReason(mode) ?? "Permission mode is unavailable for this session."
@@ -9307,7 +9321,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             userMessageContent: display,
             attachments: attached,
             providerThreadId: resumeInterrupted ? nil : providerThreadId,
-            permissionMode: permissionMode,
+            permissionMode: linkedBotVMRequiresFullAccess ? .fullAccess : permissionMode,
             reasoningEffort: runReasoningEffort,
             reasoningModel: runReasoningModel,
             distillMainEffortSelection: runProvider == .distill
@@ -18450,7 +18464,7 @@ public struct AgentAppView: View {
     private var permissionMenu: some View {
         AgentPermissionCapsule(
             selected: vm.permissionMode,
-            modes: AgentPermissionMode.allCases,
+            modes: vm.linkedBotVMRequiresFullAccess ? [.fullAccess] : AgentPermissionMode.allCases,
             unavailableReason: { vm.permissionModeUnavailableReason($0) },
             disabled: vm.activeRunConfigurationLocked || !vm.selectedProviderCanRun,
             help: vm.providerExecutionUnavailableReason

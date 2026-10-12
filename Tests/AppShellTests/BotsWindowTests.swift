@@ -7769,6 +7769,29 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.permissionLabel(for: bot), AgentPermissionMode.autoAcceptEdits.displayName)
     }
 
+    func test_unlinkedDeskFooterKeepsRunAsUserUltracodePermissionAndLocationControls() throws {
+        // WHY: an empty thread still needs the execution controls before its first send.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let footerStart = try XCTUnwrap(source.range(of: "private var deskUnlinkedFooter: some View"))
+        let footer = source[footerStart.lowerBound...]
+        for identifier in [
+            "bots.desk.runAsUser.menu", "bots.desk.distill.ultracode",
+            "bots.desk.permission.menu", "bots.desk.execution.location",
+        ] {
+            XCTAssertTrue(footer.contains(identifier), "empty Desk footer must expose \\(identifier)")
+        }
+    }
+
+    func test_deskRoutingUltracodeRoundTripsAndMissingLegacyFieldDefaultsOff() throws {
+        let routing = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "main-a", distillUltracode: true)
+        let restored = try JSONDecoder().decode(BotDeskRouting.self, from: JSONEncoder().encode(routing))
+        XCTAssertTrue(restored.distillUltracode)
+        XCTAssertTrue(restored.modelSelection.distillUltracode, "first-thread model selection must receive Ultracode")
+
+        let legacy = Data(#"{"provider":"distill","providerInstanceID":"distill","model":"main-a","routingMode":"manual","permissionMode":"supervised"}"#.utf8)
+        XCTAssertFalse(try JSONDecoder().decode(BotDeskRouting.self, from: legacy).distillUltracode)
+    }
+
     func test_deskRoutingDecodesLegacyPayloadWithoutRunAsUser() throws {
         // WHY: adding runAsUser to persisted desk routing must not drop
         // existing UserDefaults payloads from before the field existed.

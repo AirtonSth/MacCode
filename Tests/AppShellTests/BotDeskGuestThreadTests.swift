@@ -87,11 +87,12 @@ final class BotDeskGuestThreadTests: XCTestCase {
 
     /// First send on a new desk conversation; returns its linked thread.
     private func firstSend(
-        _ f: Fixture, bot: BotDefinition, provider: AgentProvider, text: String = "first words"
+        _ f: Fixture, bot: BotDefinition, provider: AgentProvider, text: String = "first words", ultracode: Bool = false
     ) async throws -> AgentThread {
         f.vm.openDesk(bot)
         XCTAssertTrue(f.vm.createDeskThread())
         f.vm.setDeskProvider(provider)
+        f.vm.setDeskDistillUltracode(ultracode)
         XCTAssertTrue(f.vm.send(text), f.vm.errorMessage ?? "")
         let runner = provider == .distill ? f.distill : f.claude
         let started = await waitUntil { runner.requests.contains { $0.prompt.contains(text) } }
@@ -125,6 +126,46 @@ final class BotDeskGuestThreadTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         return predicate()
+    }
+
+    func test_dockerDeskForcesFullAccessForNewAndReusedThreads_butLocalKeepsSelection() async throws {
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: true)
+        f.vm.openDesk(bot)
+        f.vm.setDeskPermissionMode(.supervised)
+        XCTAssertEqual(f.vm.effectiveDeskPermissionMode, .fullAccess)
+        f.vm.setDeskPermissionMode(.supervised)
+        XCTAssertEqual(f.vm.deskRouting.permissionMode, .supervised, "VM UI downgrade must be rejected")
+
+        let thread = try await firstSend(f, bot: bot, provider: .distill)
+        XCTAssertEqual(thread.permissionMode, .fullAccess, "new VM thread must persist full access")
+        XCTAssertEqual(try XCTUnwrap(f.distill.requests.first).permissionMode, .fullAccess,
+                       "new VM run request must use full access")
+        await finishAll(f)
+        f.vm.selectDeskThread(try XCTUnwrap(f.vm.selectedConversation?.id))
+        f.vm.setDeskPermissionMode(.autoAcceptEdits)
+        XCTAssertTrue(f.vm.send("second words"))
+        let secondStarted = await waitUntil { f.distill.requests.contains { $0.prompt.contains("second words") } }
+        XCTAssertTrue(secondStarted)
+        XCTAssertEqual(try f.ctx.threadRepo.get(id: thread.id)?.permissionMode, .fullAccess,
+                       "reused VM thread must stay full access")
+        await finishAll(f)
+
+        let local = try f.vm.create(name: "Quinn", title: "Reviewer")
+        f.vm.openDesk(local)
+        f.vm.setDeskPermissionMode(.autoAcceptEdits)
+        XCTAssertEqual(f.vm.effectiveDeskPermissionMode, .autoAcceptEdits,
+                       "local Desk must preserve selected permission")
+    }
+
+    func test_firstDistillSendPersistsAndTransfersUltracodeSelection() async throws {
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: false)
+        let thread = try await firstSend(f, bot: bot, provider: .distill, ultracode: true)
+        XCTAssertTrue(thread.modelSelection.distillUltracode)
+        let request = try XCTUnwrap(f.distill.requests.first)
+        XCTAssertTrue(request.distillUltracode)
+        await finishAll(f)
     }
 
     func test_aNewDistillDeskThreadOfADockerBotIsLockedToTheGuestBeforeItsFirstRun() async throws {

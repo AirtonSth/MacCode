@@ -52,8 +52,14 @@ public struct BotDeskRouting: Equatable, Codable {
     public var reasoningModel: String?
     public var distillMainEffortSelection: AgentEffortSelection?
     public var distillReasoningEffortSelection: AgentEffortSelection?
+    public var distillUltracode: Bool
     public var serviceTier: AgentServiceTier
     public var runAsUser: AgentRunAsUser
+
+    private enum CodingKeys: String, CodingKey {
+        case provider, providerInstanceID, model, routingMode, permissionMode, reasoningEffort, reasoningModel
+        case distillMainEffortSelection, distillReasoningEffortSelection, distillUltracode, serviceTier, runAsUser
+    }
 
     public init(
         provider: AgentProvider = .defaultProvider,
@@ -65,6 +71,7 @@ public struct BotDeskRouting: Equatable, Codable {
         reasoningModel: String? = nil,
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
+        distillUltracode: Bool = false,
         serviceTier: AgentServiceTier = .auto,
         runAsUser: AgentRunAsUser? = nil
     ) {
@@ -77,6 +84,7 @@ public struct BotDeskRouting: Equatable, Codable {
         self.reasoningModel = reasoningModel
         self.distillMainEffortSelection = distillMainEffortSelection
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
+        self.distillUltracode = distillUltracode
         self.serviceTier = serviceTier
         self.runAsUser = runAsUser ?? AgentRunAsUser.current()
         migrateLegacyProvider()
@@ -108,6 +116,7 @@ public struct BotDeskRouting: Equatable, Codable {
         reasoningModel = try container.decodeIfPresent(String.self, forKey: .reasoningModel)
         distillMainEffortSelection = try container.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try container.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
+        distillUltracode = try container.decodeIfPresent(Bool.self, forKey: .distillUltracode) ?? false
         serviceTier = try container.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         runAsUser = try container.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
             ?? AgentRunAsUser.current()
@@ -145,6 +154,7 @@ public struct BotDeskRouting: Equatable, Codable {
             reasoningModel: thread.reasoningModel,
             distillMainEffortSelection: thread.modelSelection.distillMainEffortSelection,
             distillReasoningEffortSelection: thread.modelSelection.distillReasoningEffortSelection,
+            distillUltracode: thread.modelSelection.distillUltracode,
             serviceTier: thread.serviceTier,
             runAsUser: thread.runAsUser
         )
@@ -181,7 +191,8 @@ public struct BotDeskRouting: Equatable, Codable {
             distillMainEffortSelection: provider == .distill
                 ? (distillMainEffortSelection ?? .fixed(reasoningEffort)) : nil,
             distillReasoningEffortSelection: provider == .distill
-                ? (distillReasoningEffortSelection ?? .automatic) : nil
+                ? (distillReasoningEffortSelection ?? .automatic) : nil,
+            distillUltracode: provider == .distill && distillUltracode
         )
     }
 
@@ -7975,7 +7986,19 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func setDeskPermissionMode(_ mode: AgentPermissionMode) {
+        guard selectedBotExecutionTarget != .vm || mode == .fullAccess else { return }
         deskRouting.permissionMode = mode
+    }
+    public func setDeskDistillUltracode(_ enabled: Bool) {
+        deskRouting.distillUltracode = enabled
+    }
+    public var selectedBotExecutionTarget: ExecutionTarget {
+        guard let bot = selectedBotID.flatMap({ id in bots.first(where: { $0.id == id }) }),
+              let revision = try? currentRevision(for: bot) else { return .mac }
+        return BotExecutionDefault.target(for: revision)
+    }
+    public var effectiveDeskPermissionMode: AgentPermissionMode {
+        selectedBotExecutionTarget == .vm ? .fullAccess : deskRouting.permissionMode
     }
 
     public func setDeskRunAsUser(_ user: AgentRunAsUser) {
@@ -10521,6 +10544,10 @@ public final class BotsViewModel: ObservableObject {
         router: AppCommandRouter,
         markStarted: Bool = true
     ) throws -> (thread: AgentThread, conversation: BotConversation) {
+        var routing = routing
+        if BotExecutionDefault.target(for: try currentRevision(for: bot)) == .vm {
+            routing.permissionMode = .fullAccess
+        }
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
         var liveConversation = conversation
         // 1.8: Bot runs use BotHome as cwd (not "/") so provider file tools
@@ -10555,7 +10582,8 @@ public final class BotsViewModel: ObservableObject {
                     distillMainEffortSelection: routing.provider == .distill
                         ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
                     distillReasoningEffortSelection: routing.provider == .distill
-                        ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
+                        ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
+                    distillUltracode: routing.provider == .distill && routing.distillUltracode
                 )
                 try context.threadRepo.upsert(updated)
             }
@@ -10580,7 +10608,8 @@ public final class BotsViewModel: ObservableObject {
                     distillMainEffortSelection: routing.provider == .distill
                         ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
                     distillReasoningEffortSelection: routing.provider == .distill
-                        ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
+                        ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
+                    distillUltracode: routing.provider == .distill && routing.distillUltracode
                 ),
                 providerInstanceId: routing.providerInstanceID,
                 runAsUser: routing.runAsUser,
@@ -10681,7 +10710,10 @@ public final class BotsViewModel: ObservableObject {
             recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
             return nil
         }
-        let routing = routingOverride ?? frozenDeskRouting(for: conversation)
+        var routing = routingOverride ?? frozenDeskRouting(for: conversation)
+        if BotExecutionDefault.target(for: revision) == .vm {
+            routing.permissionMode = .fullAccess
+        }
         let prepared = try prepareSupervisedRun(
             bot: bot,
             conversation: conversation,
@@ -10883,7 +10915,8 @@ public final class BotsViewModel: ObservableObject {
                     distillMainEffortSelection: routing.provider == .distill
                         ? (routing.distillMainEffortSelection ?? .fixed(effort)) : nil,
                     distillReasoningEffortSelection: routing.provider == .distill
-                        ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
+                        ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
+                    distillUltracode: routing.provider == .distill && routing.distillUltracode
                 ),
                 providerInstanceId: routing.providerInstanceID,
                 attachments: attachments,
@@ -13247,9 +13280,7 @@ public struct BotsRootView: View {
                 onRemoveAttachment: { vm.removeAttachment($0) },
                 composerIdentifier: "bots.desk.composer",
                 sendIdentifier: "bots.desk.send",
-                leadingControls: vm.deskRouting.provider == .distill
-                    ? AnyView(deskUnlinkedModelPills)
-                    : nil,
+                leadingControls: AnyView(deskUnlinkedFooter),
                 suggestions: vm.composerSuggestions,
                 onApplySuggestion: { vm.applyComposerSuggestion($0) },
                 onCursorMoved: { vm.composerCursorOffset = $0 },
@@ -13257,6 +13288,44 @@ public struct BotsRootView: View {
                 onFileDrop: { vm.insertDroppedFilePaths($0) }
             )
         }
+    }
+
+    private var deskUnlinkedFooter: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: DS.Space.sm) {
+                AgentRunAsUserCapsule(
+                    usersProvider: { vm.availableRunAsUsers }, selected: vm.deskRunAsUser,
+                    runLocked: vm.deskRunIsLive, identityLocked: false,
+                    accessibilityIdentifier: "bots.desk.runAsUser.menu",
+                    onSelect: vm.setDeskRunAsUser,
+                    onAppear: { vm.refreshAvailableRunAsUsers() }
+                )
+                if vm.deskRouting.provider == .distill { deskUnlinkedModelPills }
+                if vm.deskRouting.provider == .distill {
+                    Toggle("Ultracode", isOn: Binding(
+                        get: { vm.deskRouting.distillUltracode }, set: vm.setDeskDistillUltracode
+                    ))
+                    .toggleStyle(.checkbox)
+                    .fixedSize()
+                    .accessibilityIdentifier("bots.desk.distill.ultracode")
+                }
+                AgentPermissionCapsule(
+                    selected: vm.effectiveDeskPermissionMode,
+                    modes: vm.selectedBotExecutionTarget == .vm ? [.fullAccess] : AgentPermissionMode.allCases,
+                    disabled: vm.deskRunIsLive,
+                    help: vm.selectedBotExecutionTarget == .vm ? "VM bots always run with full access" : "Permission mode",
+                    accessibilityIdentifier: "bots.desk.permission.menu",
+                    onSelect: vm.setDeskPermissionMode
+                )
+                AgentComposerCapsule {
+                    AgentComposerCapsuleLabel(icon: vm.selectedBotExecutionTarget == .vm ? "desktopcomputer" : "folder",
+                        title: vm.selectedBotExecutionTarget == .vm ? "VM" : "Local", chevron: false)
+                }
+                .accessibilityIdentifier("bots.desk.execution.location")
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        }
+        .scrollIndicators(.hidden)
     }
 
     private var deskUnlinkedModelPills: some View {
