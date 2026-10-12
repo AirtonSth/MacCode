@@ -4821,6 +4821,18 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(spec.frequency, .weekdays)
     }
 
+    func test_publishedRosterTracksSavedFleetAndSelectedSearchResult() throws {
+        let (_, vm, bot, _) = try makeDockerStudio()
+        vm.reload()
+
+        XCTAssertEqual(vm.publishedRoster.map(\.id), vm.fleet.map(\.id))
+        XCTAssertTrue(vm.publishedRoster.contains(where: { $0.id == bot.id }))
+
+        vm.searchText = "no matching teammate"
+        XCTAssertTrue(vm.fleet.contains(where: { $0.id == bot.id }))
+        XCTAssertTrue(vm.publishedRoster.contains(where: { $0.id == bot.id }))
+    }
+
     func test_searchKeepsSelectedVisible_becauseChatMustMatchTheRoster() throws {
         // WHY: searching "copy" hid the open teammate while Desk still painted
         // their chat. Keep the selected row in the list so dest and roster agree.
@@ -12251,6 +12263,293 @@ final class BotsWindowTests: XCTestCase {
         }
         XCTAssertTrue(forced, "second Desk Stop must invoke provider force teardown")
         _ = runner.finish(runID: runID, status: .cancelled, reply: nil)
+    }
+
+    func test_botsNativeOffscreenCapturesActualRootStates() async throws {
+        guard let outputDirectory = ProcessInfo.processInfo.environment["REMOTE_CODE_BOTS_CAPTURE_OUTPUT_DIRECTORY"] else {
+            throw XCTSkip("Set REMOTE_CODE_BOTS_CAPTURE_OUTPUT_DIRECTORY to write capture artifacts")
+        }
+        let directory = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let names = ["roster", "desk", "empty", "selected-row", "transcript", "scroll-control", "rail"]
+        var manifest: [[String: Any]] = []
+        var pngs: [String: Data] = [:]
+        var fixtureWindows: [NSWindow] = []
+        var fixtureAppSupports: [URL] = []
+        defer {
+            fixtureWindows.forEach { $0.close() }
+            fixtureAppSupports.forEach { try? FileManager.default.removeItem(at: $0) }
+        }
+        func allSubviews(of view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap(allSubviews)
+        }
+        func accessibilityDescendants(of element: Any) -> [any NSAccessibilityProtocol] {
+            guard let object = element as? any NSAccessibilityProtocol else { return [] }
+            return [object] + (object.accessibilityChildren() ?? []).flatMap(accessibilityDescendants(of:))
+        }
+        func scrollToBottomButton(in hosting: NSView) -> (any NSAccessibilityProtocol)? {
+            accessibilityDescendants(of: hosting).first {
+                $0.accessibilityIdentifier() == "agent.timeline.scrollToBottom"
+            }
+        }
+        for name in names {
+            let context: AppContext
+            let vm: BotsViewModel
+            let bot: BotDefinition?
+            let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+                .appendingPathComponent("rc-bots-capture-\(UUID().uuidString)", isDirectory: true)
+            fixtureAppSupports.append(appSupport)
+            context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+            vm = BotsViewModel(context: context)
+            if name == "empty" {
+                bot = nil
+            } else {
+                let docker = RecordingDocker()
+                vm.computerGuestService = BotComputerGuestService(
+                    appSupport: context.appSupportDirectory,
+                    docker: docker,
+                    observeAttempts: 1,
+                    observeDelay: 0
+                )
+                vm.dockerGuestReadyOverrideForTesting = true
+                let created = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+                vm.openStudio(created)
+                vm.studioDraft.desktopKind = .dockerDesktop
+                bot = try vm.saveStudio()
+            }
+            vm.reload()
+            if name == "empty" {
+                XCTAssertTrue(vm.bots.isEmpty, "empty capture must use an empty Bot database")
+            } else {
+                XCTAssertEqual(vm.bots.count, 1, "each capture state must own one Bot database")
+            }
+            if let bot {
+                vm.openDesk(bot)
+                if name == "desk" || name == "transcript" || name == "scroll-control" { _ = vm.createDeskThread() }
+            }
+            if name == "roster" || name == "empty" { vm.selectedBotID = nil }
+            if name == "transcript" || name == "scroll-control" {
+                let router = AppCommandRouter(context: context)
+                context.router = router
+                context.coordinator.replaceProvider(
+                    .claude,
+                    runner: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: String(repeating: "Native fixture assistant transcript content. ", count: 200)))
+                )
+                router.rememberProviderSnapshotsForSend([
+                    AgentProviderSnapshotFactory.snapshot(
+                        provider: .claude,
+                        models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                        binaryPath: "/usr/bin/true",
+                        authenticated: true,
+                        id: "claude"
+                    ),
+                ])
+                router.preflightListedProviderSnapshotsForTesting = false
+                vm.setDeskProvider(.claude)
+                let threadID = try await linkDeskThreadByFirstSend(
+                    vm,
+                    context: context,
+                    router: router,
+                    providerAlreadyInstalled: true
+                )
+                let transcriptLoaded = await waitUntil(timeout: 15) {
+                    guard let agent = vm.deskAgentVM, agent.selectedThreadId == threadID else { return false }
+                    let hasReply = agent.timeline.turns.flatMap(\.items).contains {
+                        $0.body.contains("Native fixture assistant transcript content.")
+                    }
+                    return hasReply
+                        && agent.status == .completed
+                        && !vm.deskSendInFlight
+                        && context.coordinator.activeRunId(threadId: threadID) == nil
+                }
+                XCTAssertTrue(transcriptLoaded, "\(name) must finish loading the hosted Agent thread transcript")
+                let transcriptText = vm.deskAgentVM?.timeline.turns.flatMap(\.items).map(\.body).joined(separator: "\\n") ?? ""
+                XCTAssertTrue(transcriptText.contains("Native fixture assistant transcript content."), "\(name) capture needs real selected-thread transcript content")
+                vm.isDeskSidePaneVisible = false
+            }
+            let rootView = BotsRootView(vm: vm, embedsRosterRail: true)
+            let sizingView = NSHostingView(rootView: rootView)
+            let fittingSize = sizingView.fittingSize
+            let captureWidth = max(1_600, ceil(fittingSize.width))
+            let hosting = NSHostingView(rootView: rootView.frame(width: captureWidth, height: 760))
+            hosting.frame = NSRect(x: 0, y: 0, width: captureWidth, height: 760)
+            hosting.wantsLayer = true
+            let window = NSWindow(contentRect: hosting.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = hosting
+            fixtureWindows.append(window)
+            window.orderBack(nil)
+            window.layoutIfNeeded()
+            hosting.layoutSubtreeIfNeeded()
+            try await Task.sleep(nanoseconds: 300_000_000)
+            if name == "scroll-control" {
+                let follower = try XCTUnwrap(allSubviews(of: hosting).first {
+                    $0 is AgentChatTimelineScrollFollower.FollowerView
+                } as? AgentChatTimelineScrollFollower.FollowerView, "scroll-control requires the actual timeline follower")
+                let scrollView = try XCTUnwrap(follower.enclosingScrollView, "timeline follower must attach to its enclosing scroll view")
+                let timelineRect = scrollView.convert(scrollView.bounds, to: hosting)
+                let document = try XCTUnwrap(scrollView.documentView)
+                XCTAssertGreaterThan(document.bounds.height, scrollView.contentView.bounds.height, "scroll-control transcript must extend beyond viewport")
+                let bottom = ScrollBottomGeometry.maxScrollOriginY(
+                    documentHeight: max(document.bounds.height, document.frame.height),
+                    visibleHeight: scrollView.contentView.bounds.height,
+                    isFlipped: document.isFlipped
+                )
+                scrollView.contentView.scroll(to: NSPoint(x: 0, y: bottom))
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+                try await Task.sleep(nanoseconds: 100_000_000)
+                let locationInWindow = scrollView.convert(
+                    NSPoint(x: scrollView.bounds.midX, y: scrollView.bounds.midY),
+                    to: nil
+                )
+                let locationOnScreen = window.convertPoint(toScreen: locationInWindow)
+                let cgEvent = try XCTUnwrap(CGEvent(
+                    scrollWheelEvent2Source: nil,
+                    units: .line,
+                    wheelCount: 1,
+                    wheel1: 8,
+                    wheel2: 0,
+                    wheel3: 0
+                ))
+                cgEvent.timestamp = CGEventTimestamp(ProcessInfo.processInfo.systemUptime * 1_000_000_000)
+                cgEvent.location = CGPoint(x: locationOnScreen.x, y: locationOnScreen.y)
+                cgEvent.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(NSEvent.Phase.began.rawValue))
+                cgEvent.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(NSEvent.Phase([]).rawValue))
+                let syntheticWheel = try XCTUnwrap(NSEvent(cgEvent: cgEvent))
+                let queuedWheel: NSEvent
+                if NSApp.currentEvent !== syntheticWheel {
+                    NSApp.postEvent(syntheticWheel, atStart: true)
+                    queuedWheel = try XCTUnwrap(NSApp.nextEvent(
+                        matching: .scrollWheel,
+                        until: Date().addingTimeInterval(1),
+                        inMode: .default,
+                        dequeue: true
+                    ), "posted synthetic wheel must be retrievable from the app event queue")
+                } else {
+                    queuedWheel = syntheticWheel
+                }
+                NotificationCenter.default.post(name: NSScrollView.willStartLiveScrollNotification, object: scrollView)
+                scrollView.scrollWheel(with: queuedWheel)
+                try await Task.sleep(nanoseconds: 300_000_000)
+                NotificationCenter.default.post(name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
+                try await Task.sleep(nanoseconds: 300_000_000)
+                await Task.yield()
+                window.layoutIfNeeded()
+                hosting.layoutSubtreeIfNeeded()
+                hosting.displayIfNeeded()
+                let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+                hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+                let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                XCTAssertGreaterThan(png.count, 10_000, "scroll-control screenshot must not be blank")
+                pngs[name] = png
+                let path = directory.appendingPathComponent("\(name).png")
+                try png.write(to: path, options: .atomic)
+                manifest.append(["state": "scroll-control-simulated-native-scroll", "event": "scrollWheel", "width": bitmap.pixelsWide, "height": bitmap.pixelsHigh, "selectedBotID": vm.selectedBotID?.description as Any? ?? NSNull(), "screen": vm.screen.rawValue, "file": path.lastPathComponent])
+                await Task.yield()
+                let scrollButton = scrollToBottomButton(in: hosting)
+                let beforeClickGap = ScrollBottomGeometry.gap(
+                    documentHeight: max(document.bounds.height, document.frame.height),
+                    visibleOriginY: scrollView.contentView.bounds.origin.y,
+                    visibleHeight: scrollView.contentView.bounds.height,
+                    isFlipped: document.isFlipped
+                )
+                XCTAssertGreaterThan(beforeClickGap, AgentChatTimelineScrollChrome.bottomRevealSlack, "viewport must be away from bottom before clicking scroll control")
+                if let scrollButton {
+                    XCTAssertTrue(scrollButton.accessibilityPerformPress(), "Scroll to latest message must support its real accessibility action")
+                } else {
+                    let buttonCenter = NSPoint(
+                        x: scrollView.bounds.maxX - 14 - 22,
+                        y: scrollView.isFlipped
+                            ? scrollView.bounds.maxY - AgentChatTimelineScrollChrome.scrollDownButtonBottomInset - 22
+                            : scrollView.bounds.minY + AgentChatTimelineScrollChrome.scrollDownButtonBottomInset + 22
+                    )
+                    let location = scrollView.convert(buttonCenter, to: nil)
+                    for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                        let event = try XCTUnwrap(NSEvent.mouseEvent(
+                            with: type,
+                            location: location,
+                            modifierFlags: [],
+                            timestamp: ProcessInfo.processInfo.systemUptime,
+                            windowNumber: window.windowNumber,
+                            context: nil,
+                            eventNumber: 1,
+                            clickCount: 1,
+                            pressure: type == .leftMouseDown ? 1 : 0
+                        ))
+                        window.sendEvent(event)
+                    }
+                }
+                let returnedToBottom = await waitUntil(timeout: 2) {
+                    ScrollBottomGeometry.gap(
+                        documentHeight: max(document.bounds.height, document.frame.height),
+                        visibleOriginY: scrollView.contentView.bounds.origin.y,
+                        visibleHeight: scrollView.contentView.bounds.height,
+                        isFlipped: document.isFlipped
+                    ) <= AgentChatTimelineScrollChrome.bottomRevealSlack
+                }
+                XCTAssertTrue(returnedToBottom, "Scroll to latest message must return transcript to bottom")
+                await Task.yield()
+                window.layoutIfNeeded()
+                hosting.layoutSubtreeIfNeeded()
+                hosting.displayIfNeeded()
+                let afterBitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+                hosting.cacheDisplay(in: hosting.bounds, to: afterBitmap)
+                let afterPNG = try XCTUnwrap(afterBitmap.representation(using: .png, properties: [:]))
+                XCTAssertGreaterThan(afterPNG.count, 10_000, "scroll-control after screenshot must not be blank")
+                try afterPNG.write(to: directory.appendingPathComponent("scroll-control-after.png"), options: .atomic)
+                manifest.append(["state": scrollButton == nil ? "scroll-control-native-window-click" : "scroll-control-ax-press", "event": scrollButton == nil ? "leftMouseDown+leftMouseUp" : "accessibilityPerformPress", "verification": "native viewport state; not AX-verified", "width": afterBitmap.pixelsWide, "height": afterBitmap.pixelsHigh, "selectedBotID": vm.selectedBotID?.description as Any? ?? NSNull(), "screen": vm.screen.rawValue, "file": "scroll-control-after.png"])
+                let selectedThreadID = try XCTUnwrap(vm.deskAgentVM?.selectedThreadId)
+                let previousDocumentHeight = max(document.bounds.height, document.frame.height)
+                XCTAssertTrue(vm.send("Native follow after rejoin"))
+                let appendedTurnCompleted = await waitUntil(timeout: 15) {
+                    guard let agent = vm.deskAgentVM, agent.selectedThreadId == selectedThreadID else { return false }
+                    let items = agent.timeline.turns.flatMap(\.items)
+                    return items.contains { $0.body.contains("Native fixture assistant transcript content.") }
+                        && agent.status == .completed
+                        && !vm.deskSendInFlight
+                        && context.coordinator.activeRunId(threadId: selectedThreadID) == nil
+                        && items.filter { $0.body.contains("Native fixture assistant transcript content.") }.count >= 2
+                }
+                XCTAssertTrue(appendedTurnCompleted, "second harmless prompt must complete on the selected thread")
+                let followedAppend = await waitUntil(timeout: 2) {
+                    hosting.layoutSubtreeIfNeeded()
+                    let height = max(document.bounds.height, document.frame.height)
+                    return height > previousDocumentHeight
+                        && ScrollBottomGeometry.gap(
+                            documentHeight: height,
+                            visibleOriginY: scrollView.contentView.bounds.origin.y,
+                            visibleHeight: scrollView.contentView.bounds.height,
+                            isFlipped: document.isFlipped
+                        ) <= AgentChatTimelineScrollChrome.bottomRevealSlack
+                }
+                XCTAssertTrue(followedAppend, "new completed transcript content must remain followed without another click")
+                await Task.yield()
+                window.layoutIfNeeded()
+                hosting.layoutSubtreeIfNeeded()
+                hosting.displayIfNeeded()
+                let appendedBitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+                hosting.cacheDisplay(in: hosting.bounds, to: appendedBitmap)
+                let appendedPNG = try XCTUnwrap(appendedBitmap.representation(using: .png, properties: [:]))
+                XCTAssertGreaterThan(appendedPNG.count, 10_000, "post-append screenshot must not be blank")
+                try appendedPNG.write(to: directory.appendingPathComponent("scroll-control-after-append.png"), options: .atomic)
+                manifest.append(["state": "scroll-control-after-append", "width": appendedBitmap.pixelsWide, "height": appendedBitmap.pixelsHigh, "selectedBotID": vm.selectedBotID?.description as Any? ?? NSNull(), "screen": vm.screen.rawValue, "file": "scroll-control-after-append.png"])
+            } else {
+                let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+                hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+                let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+                XCTAssertGreaterThan(png.count, 10_000, "\(name) screenshot must not be blank")
+                pngs[name] = png
+                let path = directory.appendingPathComponent("\(name).png")
+                try png.write(to: path, options: .atomic)
+                manifest.append(["state": name, "width": bitmap.pixelsWide, "height": bitmap.pixelsHigh, "selectedBotID": vm.selectedBotID?.description as Any? ?? NSNull(), "screen": vm.screen.rawValue, "file": path.lastPathComponent])
+            }
+            withExtendedLifetime(window) {}
+        }
+        for (lhs, rhs) in [("roster", "desk"), ("desk", "empty"), ("selected-row", "transcript"), ("transcript", "scroll-control"), ("rail", "selected-row")] {
+            XCTAssertNotEqual(pngs[lhs], pngs[rhs], "\(lhs) and \(rhs) must show distinct native states")
+        }
+        let data = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: directory.appendingPathComponent("manifest.json"), options: .atomic)
     }
 
     func test_filesLocationBarRendersFullStudioWidthOffscreen() throws {
