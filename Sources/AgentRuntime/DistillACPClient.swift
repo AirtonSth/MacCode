@@ -70,7 +70,8 @@ enum DistillACPFailureTaxonomy {
     static let incompatibleHistoryMarker = "[fresh-session:incompatible-history]"
     static let incompatibleHistoryMarkers = [
         "invalid `signature` in `thinking` block", "invalid signature in thinking block",
-        "encrypted_content", "history is incompatible", "history incompatible"
+        "encrypted_content", "encrypted content could not be decrypted or parsed",
+        "history is incompatible", "history incompatible"
     ]
 
     static func normalize(_ error: Error, context: DistillACPFailureContext) -> DistillACPFailure {
