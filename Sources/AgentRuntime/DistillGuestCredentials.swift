@@ -320,8 +320,9 @@ public enum DistillGuestCredentials {
 /// access token (Claude 8 h, Grok 6 h) with no Mac Distill renewing it, so
 /// every `refreshInterval` the mirror also asks `refresh` to renew the
 /// providers live runs use (a no-op unless the token is inside the refresh
-/// window) and re-syncs. The copies of a guest home are deleted when its last
-/// run ends.
+/// window), then the other signed-in ones their role models may use
+/// (`DistillHostCredentialRefresher.otherSignIns`, best effort), and re-syncs.
+/// The copies of a guest home are deleted when its last run ends.
 public final class DistillGuestCredentialMirror: @unchecked Sendable {
     /// Renews the Mac sign-in of one provider when it is close to expiry;
     /// production passes `DistillHostCredentialRefresher.prepare(provider:)`.
@@ -521,6 +522,9 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
         let refresh = self.refresh
         let refreshAccount = self.refreshAccount
         let accounts = Dictionary(runs.values.flatMap { $0.accounts ?? [] }.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let others = DistillHostCredentialRefresher.otherSignIns(
+            hostHome: hostHome,
+            excluding: Set(runs.values.compactMap(\.provider) + accounts.values.map(\.provider)))
         Task { [weak self] in
             var failures: [(DistillAccountProvider, Error)] = []
             for provider in providers {
@@ -530,6 +534,14 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
             if let refreshAccount {
                 for account in accounts.values {
                     do { try await refreshAccount(account) } catch { accountFailures.append((account.id, error)) }
+                }
+            }
+            // Best effort: no live run's own sign-in, so no run is told.
+            for provider in others {
+                do { try await refresh(provider) } catch {
+                    let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                    guestCredentialLog.error(
+                        "bot.guest.credentials.other_refresh_failed provider=\(provider.rawValue, privacy: .public) error=\(reason, privacy: .public)")
                 }
             }
             guard let self else { return }

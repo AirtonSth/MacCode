@@ -234,6 +234,35 @@ final class DistillHostCredentialRefresherTests: XCTestCase {
         try assertUntouched("claude-auth.json", before)
     }
 
+    func test_stopWhileTheTokenRequestIsInFlightStillStoresTheRotatedRefreshToken() async throws {
+        // WHY: Stop cancels the task that prepares a guest run. The server
+        // rotates the refresh token when it gets the request, so an answer
+        // that is dropped leaves a spent token in the file.
+        try writeClaude(expiresIn: 60)
+        let endpoint = TokenEndpoint()
+        endpoint.respond(status: 200, [
+            "access_token": "AT-CLAUDE-NEW", "refresh_token": "RT-CLAUDE-ROTATED", "expires_in": 28_800,
+        ])
+        let now = now
+        let refresher = DistillHostCredentialRefresher(hostHome: hostHome, httpPost: { url, body in
+            let reply = try await endpoint.post(url, body)
+            // Throws when its task is cancelled, as URLSession does.
+            try await Task.sleep(nanoseconds: 300_000_000)
+            return reply
+        }, now: { now }, lockTimeout: 2)
+
+        let run = Task { try await refresher.prepare(provider: .claude) }
+        for _ in 0..<400 where endpoint.requests.isEmpty { try await Task.sleep(nanoseconds: 5_000_000) }
+        XCTAssertEqual(endpoint.requests.count, 1, "positive control: the request is in flight when Stop arrives")
+        run.cancel()
+        _ = await run.result
+
+        let store = try hostJSON("claude-auth.json")
+        XCTAssertEqual(store["refresh_token"] as? String, "RT-CLAUDE-ROTATED",
+                       "the old refresh token is spent once the request is sent; dropping the answer forces a new login")
+        XCTAssertEqual(store["access_token"] as? String, "AT-CLAUDE-NEW")
+    }
+
     func test_aMacDistillHoldingTheLockBlocksTheRenewalInsteadOfRacingIt() async throws {
         try writeClaude(expiresIn: 60)
         let lock = open(hostHome.appendingPathComponent("claude-auth.json.lock").path, O_RDWR | O_CREAT, 0o600)

@@ -438,7 +438,7 @@ final class DistillGuestCredentialsTests: XCTestCase {
             (try? self.guestJSON("claude-auth.json")["access_token"] as? String) == "AT-CLAUDE-PERIODIC"
         }, "the periodic renewal must reach the live run's copy")
         XCTAssertEqual(try guestJSON("claude-auth.json")["refresh_token"] as? String, "")
-        XCTAssertEqual(Set(recorder.calls), [.claude], "only the accounts live runs use are renewed")
+        XCTAssertEqual(Set(recorder.calls), [.claude], "a sign-in with no credential file on the Mac is never asked for")
 
         mirror.end(runID: claudeRun)
         mirror.end(runID: keyRun)
@@ -464,6 +464,73 @@ final class DistillGuestCredentialsTests: XCTestCase {
         let failure = try XCTUnwrap(recorder.failures.first)
         XCTAssertEqual(failure.0, [grokRun], "only the run that needs the Grok sign-in is affected")
         if case .grokLoginExpiring = failure.1 {} else { XCTFail("the refresher's own error reaches the caller") }
+    }
+
+    func test_aLiveRunsOtherSignInsAreRenewedToo_onceAPass_andTheirFailureIsNoRunsFailure() throws {
+        // WHY: a Claude run's role models (worker, session summary, subagents)
+        // can be served by the ChatGPT sign-in. The guest's copy cannot renew
+        // itself, so a long run would lose that role when its token expires.
+        try writeAllHostAccounts()
+        let recorder = RefreshRecorder()
+        recorder.failing = [.chatgpt]
+        let mirror = DistillGuestCredentialMirror(
+            hostHome: hostHome, refresh: recorder.refresh, onRefreshFailure: recorder.report,
+            debounce: 0.05, refreshInterval: 0.1)
+        defer { mirror.endAll() }
+        try mirror.begin(runID: UUID().uuidString, guestDistillHome: guestHome, provider: .claude)
+
+        XCTAssertTrue(waitUntil { recorder.calls.filter { $0 == .chatgpt }.count >= 2 },
+                      "the ChatGPT sign-in must be renewed while a Claude run is live")
+        let calls = recorder.calls
+        XCTAssertEqual(Set(calls), [.claude, .chatgpt],
+                       "Grok is renewed by its own CLI and OpenRouter has nothing to renew: neither is asked for a Claude run")
+        XCTAssertTrue(zip(calls, calls.dropFirst()).allSatisfy { $0 != $1 },
+                      "a pass asks for each sign-in once (\(calls.map(\.rawValue)))")
+        XCTAssertEqual(calls.first, .claude, "the run's own sign-in is still renewed first")
+        XCTAssertTrue(recorder.failures.isEmpty,
+                      "the Claude run does not use the sign-in that failed: nothing to report for it")
+    }
+
+    func test_anAutoRunsRoutedSignInIsRenewedAsItsAccount_notAgainAsAnOtherSignIn() throws {
+        // WHY: an Auto run has no main-model provider; the Mac's own Claude
+        // sign-in it is routed over is renewed as its account. Asking for it
+        // again at provider level would hit the same credential file twice
+        // in one pass, and Claude rotates refresh tokens.
+        try writeAllHostAccounts()
+        let claude = DistillAccountStatus(provider: .claude, connected: false)
+        let chatgpt = DistillAccountStatus(provider: .chatgpt, connected: false)
+        // On disk: every pass reads the run's accounts from the registry again.
+        let registry = DistillAccountRegistry(version: 1, accounts: [claude, chatgpt], routing: DistillAutoRouting(
+            enabled: true, options: [DistillAutoOption(id: "r", accountID: claude.id, mainModel: "fixture")]))
+        try JSONEncoder().encode(registry).write(to: hostHome.appendingPathComponent("accounts.json"))
+        let recorder = RefreshRecorder()
+        let accountRecorder = RefreshRecorder()
+        let mirror = DistillGuestCredentialMirror(
+            hostHome: hostHome, refresh: recorder.refresh,
+            refreshAccount: { account in try await accountRecorder.refresh(account.provider) },
+            debounce: 0.05, refreshInterval: 0.1)
+        defer { mirror.endAll() }
+        try mirror.begin(runID: UUID().uuidString, guestDistillHome: guestHome, provider: nil, accounts: [claude])
+
+        XCTAssertTrue(waitUntil { recorder.calls.filter { $0 == .chatgpt }.count >= 2 },
+                      "the ChatGPT sign-in must be renewed while an Auto run over Claude is live")
+        XCTAssertEqual(Set(recorder.calls), [.chatgpt],
+                       "the routed Claude sign-in is the run's account: asked again as an 'other' sign-in, one pass would renew the same file twice")
+        XCTAssertEqual(Set(accountRecorder.calls), [.claude], "the run's routed account keeps the renewal it has today")
+    }
+
+    func test_otherSignInsAreTheSignedInOnesTheMacRenews_minusTheRunsOwn() throws {
+        XCTAssertEqual(DistillHostCredentialRefresher.otherSignIns(hostHome: hostHome, excluding: []), [],
+                       "a sign-in with no credential file is never asked for")
+        try writeAllHostAccounts()
+        XCTAssertEqual(Set(DistillHostCredentialRefresher.otherSignIns(hostHome: hostHome, excluding: [])),
+                       [.claude, .chatgpt], "Grok and OpenRouter are not renewed in Swift")
+        XCTAssertEqual(DistillHostCredentialRefresher.otherSignIns(hostHome: hostHome, excluding: [.claude]),
+                       [.chatgpt], "the run's own sign-in has its own strict renewal: never asked twice")
+        // Signed out (Distill leaves no token) or an API key: nothing to renew.
+        try writeHostData("claude-auth.json", Data())
+        try writeHost("codex-auth.json", ["OPENAI_API_KEY": "sk-fixture"])
+        XCTAssertEqual(DistillHostCredentialRefresher.otherSignIns(hostHome: hostHome, excluding: []), [])
     }
 
     func test_aFailedBeginRegistersNothingAndLeavesNoCopyBehind() throws {

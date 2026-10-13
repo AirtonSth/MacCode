@@ -70,10 +70,17 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         /// is asked for again). It does not depend on the VM, so it runs
         /// while the VM comes up.
         var probeHostVersion: @Sendable (_ hostBinary: String?) async -> Void = { _ in }
+        /// The Codex client version the Mac's Distill would name to ChatGPT
+        /// for a run with this host environment (`DistillCodexClientVersion`);
+        /// nil when it would use its built-in default. Runs while the VM
+        /// comes up, like `probeHostVersion`.
+        var codexClientVersion: @Sendable (_ hostEnvironment: [String: String]) async -> String? = { _ in nil }
         var gitIdentity: @Sendable () -> GitIdentity?
         /// The app's own environment, under the run's (DISTILL_HOME, model keys).
         var processEnvironment: [String: String] = ProcessInfo.processInfo.environment
         var heartbeatInterval: TimeInterval = BotGuestLeaseHeartbeat.interval
+        /// How long a run start waits for the other sign-ins to be renewed.
+        var otherSignInWait: TimeInterval = 3
         /// False in a process that does not own the app's bot guests (the
         /// scheduled-task agent): its guest threads fail instead of racing
         /// the app for the same bot.
@@ -175,6 +182,10 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             let hostBinary = deps.hostBinary(request)
             let probeHostVersion = deps.probeHostVersion
             let hostVersionProbe = Task { await probeHostVersion(hostBinary) }
+            // The same holds for the Codex version the guest asks ChatGPT as.
+            let hostEnvironment = deps.processEnvironment.merging(request.environment) { _, run in run }
+            let resolveCodexClientVersion = deps.codexClientVersion
+            let codexClientVersionProbe = Task { await resolveCodexClientVersion(hostEnvironment) }
             let vm = try await Self.blocking {
                 try vmPreparer.prepare(
                     botID: botID, threadID: request.threadId,
@@ -193,7 +204,6 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             try Task.checkCancellation()
 
             progress(.signingIn)
-            let hostEnvironment = deps.processEnvironment.merging(request.environment) { _, run in run }
             let hostHome = DistillProvisioner.homeURL(environment: hostEnvironment)
             let hostConfig = (try? String(
                 contentsOf: hostHome.appendingPathComponent("config.toml"), encoding: .utf8
@@ -206,6 +216,8 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 var prepared = false
                 var lastError: Error?
                 for account in accounts {
+                    // A token request is not cut by Stop, so it returns normally.
+                    try Task.checkCancellation()
                     do {
                         try await Self.prepareAccount(account, hostHome: hostHome, binary: hostBinary,
                             environment: hostEnvironment, refresh: deps.refresh)
@@ -214,6 +226,38 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                     catch { lastError = error }
                 }
                 if !prepared, let lastError { throw lastError }
+            }
+            // Best effort: the run's own sign-in is ready, so another one
+            // that cannot be renewed now must not stop it, and a slow one
+            // must not hold it. Waited for briefly, because the guest loads
+            // each account's models once, when it starts. Never cancelled,
+            // by Stop or by the wait ending: a renewal that is cut may
+            // already have spent the refresh token. A late renewal reaches
+            // the guest through the mirror's watcher.
+            let used = Set(accounts.map(\.provider) + [provider].compactMap { $0 })
+            let others = DistillHostCredentialRefresher.otherSignIns(hostHome: hostHome, excluding: used)
+            if !others.isEmpty {
+                let refresh = deps.refresh
+                let wait = deps.otherSignInWait
+                let (renewed, signal) = AsyncStream<Void>.makeStream()
+                Task {
+                    for other in others {
+                        do { try await refresh(hostHome, other) } catch {
+                            let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+                            guestResolverLog.error(
+                                "bot.guest.credentials.other_refresh_failed provider=\(other.rawValue, privacy: .public) error=\(reason, privacy: .public)"
+                            )
+                        }
+                    }
+                    signal.finish()
+                }
+                let deadline = Task {
+                    try? await Task.sleep(for: .milliseconds(Int(wait * 1000)))
+                    signal.finish()
+                }
+                // Ends when the renewals do, at the deadline, or on Stop.
+                for await _ in renewed {}
+                deadline.cancel()
             }
             try Task.checkCancellation()
             let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: botID)
@@ -246,7 +290,9 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 runID: runID,
                 gatewayToken: issued.token,
                 modelSecrets: rendered.secretEnvironment,
-                gitIdentity: deps.gitIdentity()
+                gitIdentity: deps.gitIdentity(),
+                // Nil (no `codex` on the Mac, or it did not answer) is normal.
+                codexClientVersion: await codexClientVersionProbe.value
             )
             let envFile = try DistillGuestEnvironment.writeEnvFile(
                 environment, runID: runID,
@@ -652,6 +698,13 @@ extension AppContext {
         let distillOverride = (try? settingsRepo.get("cli.distill.path")) ?? nil
         let barrier = botGuestLaunchBarrier
         if hostsGuestRuns {
+            // A guest run reads the Mac's `codex` version through the
+            // login-shell PATH, and nothing else starts that capture before
+            // the first agent turn. Unit tests never start the user's shell.
+            if !AppContext.isRunningUnitTests,
+               ProcessInfo.processInfo.environment["RC_LOGIN_SHELL_ENV_IMPORT"] != "0" {
+                LoginShellEnvironment.prewarm()
+            }
             // Unit tests never reach the user's Docker daemon.
             let sweepDocker: (any BotComputerDockerClienting)? = AppContext.isRunningUnitTests ? nil : docker
             let store = botStore
@@ -706,6 +759,13 @@ extension AppContext {
             },
             probeHostVersion: { hostBinary in
                 if let hostBinary { _ = await binaries.hostVersion(binary: hostBinary) }
+            },
+            codexClientVersion: { hostEnvironment in
+                // What the Mac's Distill is started with (ProviderSubprocessLauncher):
+                // the login-shell PATH is where `codex` usually is, a GUI app's has none.
+                await DistillCodexClientVersion.resolve(environment: CodexRunner.processEnvironment(
+                    overrides: hostEnvironment, purpose: .agentTurn(.distill)
+                ))
             },
             gitIdentity: { BotComputerGuestService.gitIdentity() },
             hostsGuestRuns: hostsGuestRuns

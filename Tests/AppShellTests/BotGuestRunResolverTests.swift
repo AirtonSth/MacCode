@@ -332,6 +332,286 @@ final class BotGuestRunResolverTests: XCTestCase {
         await plan.finish(.completed).value
     }
 
+    // MARK: - ChatGPT catalog parity
+
+    func test_theGuestAsksChatGPTAsTheMacsCodexClientVersion_resolvedWhileTheVMComesUp() async throws {
+        // WHY: the guest has no `codex`, so on its own it asks ChatGPT for
+        // models as Distill's default version and does not list the newest
+        // ones, which the picker (fed by the Mac's catalog) still offers:
+        // "Selected Distill model 'chatgpt/…' is not advertised".
+        let f = try await makeFixture()
+        let asked = Recorder<[String: String]>()
+        // Held like a `codex` that has not answered yet.
+        let probeHeld = OSAllocatedUnfairLock(initialState: true)
+        var deps = f.deps
+        deps.codexClientVersion = { environment in
+            asked.append(environment)
+            while probeHeld.withLock({ $0 }) { try? await Task.sleep(nanoseconds: 5_000_000) }
+            return "0.162.1"
+        }
+        let resolver = BotGuestRunResolver(deps)
+        let gate = DispatchSemaphore(value: 0)
+        f.vm.gate = gate
+        let req = request(try makeThread(f))
+        let run = Task { try await resolver.prepare(req) { _ in } }
+        // Both in flight: the VM start does not wait for `codex --version`
+        // (up to 3 s), and the probe does not wait for the VM.
+        try await waitUntil { asked.values.count == 1 && f.vm.calls.count == 1 }
+        XCTAssertEqual(f.vm.calls.count, 1, "the VM must start while the Codex version is still unanswered, not after it")
+        probeHeld.withLock { $0 = false }
+        gate.signal()
+        let plan = try unwrapPlan(try await run.value)
+
+        let host = try XCTUnwrap(asked.values.first)
+        XCTAssertEqual(host["DISTILL_HOME"], f.hostHome.path, "resolved from the environment the Mac's Distill would get")
+        XCTAssertEqual(host["PATH"], "/Users/someone/bin:/usr/bin", "the run's own PATH is where the Mac's Distill finds codex")
+        let env = try String(contentsOf: plan.envFileURL, encoding: .utf8)
+        XCTAssertTrue(env.contains("DISTILL_CODEX_CLIENT_VERSION=0.162.1\n"), "the guest must ask as the Mac's version")
+        XCTAssertFalse(env.contains("/Users/"), "no Mac path follows the version into the guest")
+        await plan.finish(.completed).value
+    }
+
+    func test_aMacWithoutCodex_orASlowOrBrokenProbe_stillRunsAndSetsNoClientVersion() async throws {
+        // WHY: most Macs have no codex; that is not a reason to refuse a run,
+        // and a made-up version would make the guest differ from the Mac.
+        let f = try await makeFixture()
+        let probes: [@Sendable ([String: String]) async -> String?] = [
+            f.deps.codexClientVersion, // the default: nothing to resolve
+            { _ in
+                try? await Task.sleep(nanoseconds: 300_000_000) // gave up on a hung codex
+                return nil
+            },
+            { _ in "0.162.1\nHOME=/Users/me" }, // not a version: dropped, never an invalid env file
+        ]
+        for probe in probes {
+            var deps = f.deps
+            deps.codexClientVersion = probe
+            let resolver = BotGuestRunResolver(deps)
+            let thread = try makeThread(f)
+            let req = request(thread)
+            let plan = try unwrapPlan(try await resolver.prepare(req) { _ in })
+            let env = try String(contentsOf: plan.envFileURL, encoding: .utf8)
+            XCTAssertFalse(env.contains("CODEX_CLIENT_VERSION"), "unresolved: the guest uses Distill's default, as the Mac does")
+            XCTAssertFalse(env.contains("/Users/"))
+            await plan.finish(.completed).value
+            _ = f.registry.releaseAndNextWaiting(runID: req.runId)
+        }
+    }
+
+    func test_theAppResolvesTheCodexClientVersionFromTheEnvironmentTheMacsDistillIsStartedWith() throws {
+        // WHY: every test above injects `codexClientVersion`, and its default
+        // resolves nothing, so the app's own wiring could be dropped (or given
+        // the GUI environment, whose PATH need not reach `codex`) with every
+        // test green and the guest back to Distill's default version. A built
+        // resolver cannot be asked what it was given, so the wiring is pinned
+        // in the source, as `BotSendStageIntervalPlacementTests` pins this file.
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Sources/AppShell/BotGuestRunResolver.swift"),
+            encoding: .utf8
+        )
+        var cursor = try XCTUnwrap(source.range(of: "func makeBotGuestRunResolver(")?.upperBound)
+        for marker in [
+            "codexClientVersion: { hostEnvironment in",
+            "DistillCodexClientVersion.resolve(environment: CodexRunner.processEnvironment(",
+            "overrides: hostEnvironment, purpose: .agentTurn(.distill)",
+        ] {
+            let found = try XCTUnwrap(
+                source[cursor...].range(of: marker),
+                "the app must resolve the guest's Codex client version from the login-shell environment the Mac's Distill gets; missing or out of order: \(marker)"
+            )
+            cursor = found.upperBound
+        }
+    }
+
+    // MARK: - Other sign-ins
+
+    private func signInToChatGPT(_ f: Fixture) throws {
+        try #"{"tokens":{"access_token":"at-codex","refresh_token":"rt-host-only"}}"#
+            .write(to: f.hostHome.appendingPathComponent("codex-auth.json"), atomically: true, encoding: .utf8)
+    }
+
+    func test_aClaudeRunAlsoRenewsTheChatGPTSignIn_butNoSignInThatIsMissingOrNotRenewedHere() async throws {
+        // WHY: a role model ([models] worker, session_summary, a subagent's)
+        // can be served by another sign-in. The guest's copy has no refresh
+        // token, so if the Mac does not renew it nobody does and that role
+        // fails mid-run once its access token expires.
+        let f = try await makeFixture()
+        try signInToChatGPT(f)
+        // Grok is renewed by its own CLI, OpenRouter has nothing to renew.
+        try #"{"https://auth.x.ai::fixture":{"key":"fake-access","refresh_token":"host-only"}}"#
+            .write(to: f.hostHome.appendingPathComponent("auth.json"), atomically: true, encoding: .utf8)
+        try #"{"key":"sk-or-fixture"}"#
+            .write(to: f.hostHome.appendingPathComponent("openrouter-auth.json"), atomically: true, encoding: .utf8)
+        let thread = try makeThread(f)
+        let plan = try unwrapPlan(try await f.resolver.prepare(request(thread)) { _ in })
+        XCTAssertEqual(f.refreshes.values, [.claude, .chatgpt],
+                       "the run's own sign-in first, then the other one a role model may use; each once")
+        await plan.finish(.completed).value
+    }
+
+    func test_aChatGPTRenewalFailureDoesNotStopAClaudeRun() async throws {
+        // WHY: the run's own sign-in is good; refusing the run because a
+        // sign-in it may never touch could not be renewed would be a regression.
+        let f = try await makeFixture()
+        try signInToChatGPT(f)
+        let asked = Recorder<DistillAccountProvider?>()
+        var deps = f.deps
+        deps.refresh = { _, provider in
+            asked.append(provider)
+            if provider == .chatgpt {
+                throw DistillGuestCredentialError.refreshRejected(.chatgpt, status: 401, code: "refresh_token_expired")
+            }
+        }
+        let resolver = BotGuestRunResolver(deps)
+        let thread = try makeThread(f)
+        let plan = try unwrapPlan(try await resolver.prepare(request(thread)) { _ in })
+        XCTAssertEqual(asked.values, [.claude, .chatgpt])
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: f.guestDistillHome.appendingPathComponent("claude-auth.json").path), "the run is prepared as before")
+        await plan.finish(.completed).value
+    }
+
+    func test_theRunsOwnSignInFailingStillFailsTheRun_andNothingElseIsRenewed() async throws {
+        // WHY: renewing the other sign-ins is an addition after the strict
+        // preflight, never a way around it.
+        let f = try await makeFixture()
+        try signInToChatGPT(f)
+        let asked = Recorder<DistillAccountProvider?>()
+        var deps = f.deps
+        deps.refresh = { _, provider in
+            asked.append(provider)
+            if provider == .claude {
+                throw DistillGuestCredentialError.refreshRejected(.claude, status: 401, code: "invalid_grant")
+            }
+        }
+        let resolver = BotGuestRunResolver(deps)
+        let thread = try makeThread(f)
+        let req = request(thread)
+        await assertUnavailable(containing: "Claude rejected the sign-in renewal on this Mac (HTTP 401, invalid_grant)") {
+            _ = try await resolver.prepare(req) { _ in }
+        }
+        XCTAssertEqual(asked.values, [.claude])
+        try await assertNothingLeft(f, req)
+    }
+
+    func test_stopWhileAnotherSignInIsRenewedStopsTheRunAtOnce_withoutCuttingThatRenewal() async throws {
+        // WHY: only a failed renewal is forgiven; a Stop is not a failure,
+        // and must not wait for a sign-in the run does not use. The renewal
+        // it leaves behind must still run to its end: a token request that
+        // is cut may already have spent the refresh token, and then that
+        // sign-in needs a new login.
+        let f = try await makeFixture()
+        try signInToChatGPT(f)
+        let asked = Recorder<DistillAccountProvider?>()
+        let cancelledAtEnd = Recorder<Bool>()
+        let held = OSAllocatedUnfairLock(initialState: true)
+        var deps = f.deps
+        deps.refresh = { _, provider in
+            asked.append(provider)
+            guard provider == .chatgpt else { return }
+            // In flight until released; 5 s at most, so a regression fails instead of hanging.
+            let limit = Date().addingTimeInterval(5)
+            while held.withLock({ $0 }), Date() < limit { try? await Task.sleep(nanoseconds: 5_000_000) }
+            cancelledAtEnd.append(Task.isCancelled)
+        }
+        let resolver = BotGuestRunResolver(deps)
+        let permit = AgentRunAcceptancePermit()
+        let req = request(try makeThread(f), permit: permit)
+        let run = Task { try await resolver.prepare(req) { _ in } }
+        try await waitUntil { asked.values == [.claude, .chatgpt] }
+        permit.invalidate() // what the coordinator's Stop does to a pending start
+        do {
+            let plan = try await run.value
+            XCTFail("a stopped run must not get a launch plan")
+            await plan?.finish(.cancelled).value
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertTrue(cancelledAtEnd.values.isEmpty, "Stop must not wait for the renewal of a sign-in the run does not use")
+        try await assertNothingLeft(f, req)
+        held.withLock { $0 = false }
+        try await waitUntil { cancelledAtEnd.values.count == 1 }
+        XCTAssertEqual(cancelledAtEnd.values, [false],
+                       "Stop must not cancel the renewal: a request that is cut can leave a spent refresh token on the Mac")
+    }
+
+    func test_aSignInTheRunDoesNotUseThatIsSlowToRenewDoesNotHoldTheRun() async throws {
+        // WHY: the token server of a sign-in this run may never use can hang
+        // (the request times out after 30 s). The run's own sign-in is ready,
+        // so the run must not sit in "signing in" for it; the renewal goes on
+        // and reaches the guest through the mirror.
+        let f = try await makeFixture()
+        try signInToChatGPT(f)
+        let cancelledAtEnd = Recorder<Bool>()
+        let held = OSAllocatedUnfairLock(initialState: true)
+        var deps = f.deps
+        deps.otherSignInWait = 0.05
+        deps.refresh = { _, provider in
+            guard provider == .chatgpt else { return }
+            // In flight until released; 5 s at most, so a regression fails instead of hanging.
+            let limit = Date().addingTimeInterval(5)
+            while held.withLock({ $0 }), Date() < limit { try? await Task.sleep(nanoseconds: 5_000_000) }
+            cancelledAtEnd.append(Task.isCancelled)
+        }
+        let resolver = BotGuestRunResolver(deps)
+        let plan = try unwrapPlan(try await resolver.prepare(request(try makeThread(f))) { _ in })
+        XCTAssertTrue(cancelledAtEnd.values.isEmpty, "the run is prepared while the other sign-in is still being renewed")
+        held.withLock { $0 = false }
+        try await waitUntil { cancelledAtEnd.values.count == 1 }
+        XCTAssertEqual(cancelledAtEnd.values, [false],
+                       "the wait ending must not cancel the renewal: a request that is cut can leave a spent refresh token on the Mac")
+        await plan.finish(.completed).value
+    }
+
+    func test_anAutoRunOverTheMacsOwnClaudeSignInAsksThatFileOnce_notAgainAsAnOtherSignIn() async throws {
+        // WHY: Auto has no main-model provider, so the routed sign-in is the
+        // run's own. Claude rotates refresh tokens: the same credential file
+        // must not be asked for a second time as an "other" sign-in.
+        let f = try await makeFixture()
+        try signInToChatGPT(f)
+        let registry = #"{"version":1,"accounts":[{"id":"legacy-claude","provider":"claude","label":"Claude","legacy":true},{"id":"legacy-chatgpt","provider":"chatgpt","label":"ChatGPT","legacy":true}],"routing":{"enabled":true,"strategy":"ordered_first","options":[{"id":"r","account_id":"legacy-claude","main_model":"claude/claude-sonnet-4-5","worker_model":null}]}}"#
+        try registry.write(to: f.hostHome.appendingPathComponent("accounts.json"), atomically: true, encoding: .utf8)
+        let asked = Recorder<String>()
+        var deps = f.deps
+        deps.refresh = { home, provider in asked.append("\(provider?.rawValue ?? "nil") \(home.path)") }
+        let resolver = BotGuestRunResolver(deps)
+        defer { resolver.endRunsForAppTermination() }
+        let thread = try makeThread(f)
+        let req = AgentRunRequest(threadId: thread.id, provider: .distill, model: "auto", cwd: root.path, prompt: "Go")
+        let plan = try unwrapPlan(try await resolver.prepare(req) { _ in })
+        XCTAssertEqual(asked.values, ["claude \(f.hostHome.path)", "chatgpt \(f.hostHome.path)"],
+                       "the routed Claude sign-in once, as the run's own, then the ChatGPT one; never the Claude file twice in one pass")
+        await plan.finish(.completed).value
+    }
+
+    func test_aNamedAccountRunRenewsEachCredentialFileOnce() async throws {
+        // WHY: Claude and ChatGPT rotate refresh tokens; the same file must
+        // not be asked for twice in one pass, and a named account keeps the
+        // renewal it has today.
+        let f = try await makeFixture()
+        try signInToChatGPT(f)
+        let folder = f.hostHome.appendingPathComponent("accounts/work")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data(#"{"access_token":"fixture","refresh_token":"host-only"}"#.utf8)
+            .write(to: folder.appendingPathComponent("claude-auth.json"))
+        let registry = #"{"version":1,"accounts":[{"id":"work","provider":"claude","label":"Work","legacy":false},{"id":"legacy-chatgpt","provider":"chatgpt","label":"ChatGPT","legacy":true}],"routing":{"enabled":true,"strategy":"ordered_first","options":[{"id":"r","account_id":"work","main_model":"claude/claude-sonnet-4-5","worker_model":null}]}}"#
+        try registry.write(to: f.hostHome.appendingPathComponent("accounts.json"), atomically: true, encoding: .utf8)
+        let asked = Recorder<String>()
+        var deps = f.deps
+        deps.refresh = { home, provider in asked.append("\(provider?.rawValue ?? "nil") \(home.path)") }
+        let resolver = BotGuestRunResolver(deps)
+        defer { resolver.endRunsForAppTermination() }
+        let thread = try makeThread(f)
+        let plan = try unwrapPlan(try await resolver.prepare(request(thread)) { _ in })
+        XCTAssertEqual(asked.values, ["claude \(folder.path)", "chatgpt \(f.hostHome.path)"],
+                       "the named Claude account as today, then the Mac's ChatGPT sign-in; each once")
+        await plan.finish(.completed).value
+    }
+
     // MARK: - Fail closed
 
     func test_cwdOutsideEveryMountFailsClosed_andLeavesNothingBehind() async throws {

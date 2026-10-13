@@ -37,14 +37,16 @@ final class DistillGuestEnvironmentTests: XCTestCase {
 
     private func build(
         modelSecrets: [String: String] = [:],
-        gitIdentity: GitIdentity? = GitIdentity(name: "Ada Lovelace", email: "ada@example.com")
+        gitIdentity: GitIdentity? = GitIdentity(name: "Ada Lovelace", email: "ada@example.com"),
+        codexClientVersion: String? = nil
     ) -> [String: String] {
         DistillGuestEnvironment.build(
             providerEnvironment: macProviderEnvironment,
             runID: runID,
             gatewayToken: "gw-token",
             modelSecrets: modelSecrets,
-            gitIdentity: gitIdentity
+            gitIdentity: gitIdentity,
+            codexClientVersion: codexClientVersion
         )
     }
 
@@ -109,6 +111,31 @@ final class DistillGuestEnvironmentTests: XCTestCase {
         let env = build()
         XCTAssertEqual(env["GROK_CLAUDE_MCPS_ENABLED"], "0")
         XCTAssertEqual(env["GROK_CURSOR_MCPS_ENABLED"], "0")
+    }
+
+    /// The guest has no `codex` to read a version from, so without the Mac's
+    /// it asks ChatGPT for models as Distill's default and misses the newest
+    /// ones the Mac lists (and the model picker offers).
+    func test_theMacsCodexClientVersionFollowsTheRunSoTheGuestListsTheSameChatGPTModels() {
+        XCTAssertEqual(build(codexClientVersion: "0.162.1")["DISTILL_CODEX_CLIENT_VERSION"], "0.162.1")
+        XCTAssertFalse(build().keys.contains("DISTILL_CODEX_CLIENT_VERSION"),
+                       "unresolved on the Mac: no variable at all, so the guest uses Distill's default as the Mac does")
+    }
+
+    /// The version is read from the Mac and let through the allowlist; it
+    /// must not become a way to write another line into the env file, and
+    /// a secret that shares its name must not choose what the guest asks as.
+    func test_onlyAVersionCanBeSetAsTheCodexClientVersion() throws {
+        for unsafe in ["0.162.1\nHOME=/Users/me", "", " 0.162.1", "latest"] {
+            let env = build(codexClientVersion: unsafe)
+            XCTAssertNil(env["DISTILL_CODEX_CLIENT_VERSION"], unsafe.debugDescription)
+            XCTAssertNoThrow(try DistillGuestEnvironment.envFileContents(env),
+                             "a value that is not a version is dropped; it must not fail the run")
+        }
+        let forged = ["DISTILL_CODEX_CLIENT_VERSION": "9.9.9"]
+        XCTAssertEqual(build(modelSecrets: forged, codexClientVersion: "0.162.1")["DISTILL_CODEX_CLIENT_VERSION"], "0.162.1")
+        XCTAssertNil(build(modelSecrets: forged)["DISTILL_CODEX_CLIENT_VERSION"],
+                     "the Mac resolved none, so the guest gets none")
     }
 
     /// A bare `KEY` line makes the docker CLI copy the Mac's own value of KEY,

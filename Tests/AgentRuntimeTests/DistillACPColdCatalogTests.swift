@@ -38,6 +38,54 @@ final class DistillACPColdCatalogTests: XCTestCase {
         XCTAssertFalse(methods.contains("session/prompt"))
     }
 
+    func test_aModelTheMacsDistillDoesNotListKeepsTheRefreshAdvice() async throws {
+        // WHY: on the Mac the picker and the run share one catalog, so
+        // refreshing it is the right advice; pinned so the VM wording below
+        // never leaks into Mac runs.
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (binary, _) = try writeHarness(root: root, models: ["chatgpt/gpt-6-luna"])
+        let client = try DistillACPClient(binary: binary.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        do {
+            _ = try await client.newSession(cwd: root.path, modelId: "chatgpt/gpt-6.1-sol")
+            XCTFail("a model the Mac's Distill does not list must not open a session")
+        } catch {
+            XCTAssertEqual(
+                (error as? DistillACPError)?.description,
+                "Selected Distill model 'chatgpt/gpt-6.1-sol' is not advertised. Refresh the model catalog and select one exact model.")
+        }
+    }
+
+    func test_aModelTheGuestsDistillDoesNotListSaysItIsTheBotsLinuxVM_andNothingElseIsRun() async throws {
+        // WHY: a guest thread's picker shows the Mac's catalog, so "refresh
+        // the model catalog" sends the user in a circle; the catalog that
+        // lacks the model is the Linux VM's. The exact match stays: no other
+        // model and no Mac run is substituted.
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // The harness stands in for `docker exec … distill` (it ignores its argv).
+        let (docker, log) = try writeHarness(root: root, models: ["chatgpt/gpt-6-luna"])
+        let plan = DistillGuestLaunchPlan(
+            runID: UUID().uuidString, dockerExecutable: docker.path, container: "c",
+            guestCwd: "/home/remotecode", guestCommand: [], envFileURL: root.appendingPathComponent("x.env"),
+            lease: nil, teardown: { _ in }, killGuest: {}, killGuestDetached: {}
+        )
+        let client = try DistillACPClient(guest: plan)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        do {
+            _ = try await client.newSession(cwd: "/home/remotecode", modelId: "chatgpt/gpt-6.1-sol")
+            XCTFail("a model the guest's Distill does not list must not open a session")
+        } catch {
+            XCTAssertEqual(
+                (error as? DistillACPError)?.description,
+                "The Distill in this bot's Linux VM does not list the model 'chatgpt/gpt-6.1-sol'. The model picker shows the Mac's catalog, which can list models the Linux VM does not. Select another model for this bot.")
+        }
+        XCTAssertEqual(try recorded(log).compactMap { $0["method"] as? String }, ["initialize", "_x.ai/models/list"])
+    }
+
     func test_ambiguousBareModelDoesNotSubstituteDefault() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }

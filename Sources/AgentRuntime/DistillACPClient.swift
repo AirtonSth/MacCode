@@ -825,6 +825,11 @@ public final class DistillACPClient: @unchecked Sendable {
         for selection in selections {
             let matches = Self.matchingModels(selection, in: models)
             guard matches.count == 1, let model = matches.first else {
+                // The picker of a guest thread lists the Mac's catalog, so
+                // refreshing it cannot help: say whose catalog lacks the model.
+                if matches.isEmpty, guest != nil {
+                    throw DistillACPError.unsupported("The Distill in this bot's Linux VM does not list the model '\(selection)'. The model picker shows the Mac's catalog, which can list models the Linux VM does not. Select another model for this bot.")
+                }
                 let reason = matches.isEmpty ? "is not advertised" : "matches multiple advertised models"
                 throw DistillACPError.unsupported("Selected Distill model '\(selection)' \(reason). Refresh the model catalog and select one exact model.")
             }

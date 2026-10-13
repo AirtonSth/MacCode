@@ -36,12 +36,21 @@ public enum DistillGuestEnvironment {
     ///   - providerEnvironment: what the same run would get on the Mac; only the
     ///     bot and thread identity and the bot's own secrets are taken from it.
     ///   - modelSecrets: `DistillGuestConfig.Rendered.secretEnvironment`.
+    ///   - codexClientVersion: `DistillCodexClientVersion.resolve` for the Mac
+    ///     run. Let through on purpose, for catalog parity: the
+    ///     ChatGPT backend lists models by the client version asking, the
+    ///     guest has no `codex` to read one from, and the model picker offers
+    ///     what the Mac's Distill lists. It is a version number, not a secret,
+    ///     so it needs no `[shell_environment_policy]` exclude. Nil, or a
+    ///     value that is not a version, sets nothing: the guest then uses
+    ///     Distill's built-in default.
     public static func build(
         providerEnvironment: [String: String],
         runID: String,
         gatewayToken: String,
         modelSecrets: [String: String],
-        gitIdentity: GitIdentity?
+        gitIdentity: GitIdentity?,
+        codexClientVersion: String? = nil
     ) -> [String: String] {
         var env = modelSecrets
         // Bot secrets the user gave this bot, as the Mac run would see them.
@@ -74,6 +83,10 @@ public enum DistillGuestEnvironment {
         // Cursor configs it finds; the guest's set is exactly its config.toml.
         env["GROK_CLAUDE_MCPS_ENABLED"] = "0"
         env["GROK_CURSOR_MCPS_ENABLED"] = "0"
+        // After the secrets, like every guest value: no model key or bot
+        // secret of the same name can set the version the guest asks as.
+        env[DistillCodexClientVersion.environmentKey] = codexClientVersion
+            .flatMap { DistillCodexClientVersion.isAcceptable($0) ? $0 : nil }
         env[runIDEnvironmentKey] = runID
         env[DistillGuestConfig.gatewayTokenEnvironmentKey] = gatewayToken
         return env

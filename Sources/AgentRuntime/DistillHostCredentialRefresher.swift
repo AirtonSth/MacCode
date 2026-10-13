@@ -59,6 +59,24 @@ public struct DistillHostCredentialRefresher: Sendable {
         }
     }
 
+    /// The sign-ins `prepare(provider:)` renews itself: Grok is only checked
+    /// (its own CLI renews it) and OpenRouter has nothing to renew.
+    static let renewedProviders: Set<DistillAccountProvider> = [.claude, .chatgpt]
+
+    /// The sign-ins in `hostHome` that a guest run's main model does not use
+    /// (`used`) but its role models can (`[models] worker`, `session_summary`,
+    /// `[subagents.models]` ...): those this refresher renews and that are
+    /// signed in. The guest cannot renew any of them, so the Mac does. Never
+    /// a provider in `used` and never a named account: each credential file
+    /// is asked for by one caller only.
+    public static func otherSignIns(
+        hostHome: URL, excluding used: Set<DistillAccountProvider>
+    ) -> [DistillAccountProvider] {
+        DistillAccounts.connectedAccounts(home: hostHome)
+            .filter { $0.legacy && $0.connected && renewedProviders.contains($0.provider) && !used.contains($0.provider) }
+            .map(\.provider)
+    }
+
     // MARK: - Claude (claude_auth.rs:506-580)
 
     private func refreshClaudeIfNeeded() async throws {
@@ -258,7 +276,9 @@ public struct DistillHostCredentialRefresher: Sendable {
     ) async throws -> (data: Data, status: Int) {
         let json = try JSONSerialization.data(withJSONObject: body)
         do {
-            return try await httpPost(url, json)
+            // Not cut by a cancelled caller (Stop while a run prepares): the
+            // request spends the refresh token, so its answer must be stored.
+            return try await Task { try await httpPost(url, json) }.value
         } catch {
             throw DistillGuestCredentialError.refreshFailed(provider, status: 0, code: nil)
         }
