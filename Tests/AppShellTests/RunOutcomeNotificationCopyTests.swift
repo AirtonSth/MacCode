@@ -1,3 +1,4 @@
+import Persistence
 import XCTest
 @testable import AppShell
 @testable import CoreModel
@@ -12,7 +13,7 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
 
     // MARK: - outcomeNotificationParts (pure helper)
 
-    func testCancelledOutcomeHasDistinctTitle() {
+    func testCancelledOutcomeTitleDoesNotExposePrivateTitle() {
         let parts = RemoteCodeNotificationContent.outcomeNotificationParts(
             threadId: "t1",
             displayTitle: "Build fix",
@@ -28,18 +29,18 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
             displayTitle: "Build fix",
             phase: .cancelled
         )
-        XCTAssertEqual(parts?.body, "Build fix was stopped before finishing.",
-                       "cancelled body must explain the run was stopped, not that an error occurred")
+        XCTAssertEqual(parts?.body, "Run was stopped before finishing.",
+                       "cancelled copy must explain manual stop without exposing the private title")
     }
 
-    func testCancelledOutcomeBodyInterpolatesDisplayTitle() {
+    func testCancelledOutcomeBodyDoesNotExposeDisplayTitle() {
         let parts = RemoteCodeNotificationContent.outcomeNotificationParts(
             threadId: "t2",
-            displayTitle: "My Task",
+            displayTitle: "Private task title",
             phase: .cancelled
         )
-        XCTAssertTrue(parts?.body.contains("My Task") == true,
-                      "cancelled body must contain the thread display title")
+        XCTAssertEqual(parts?.body, "Run was stopped before finishing.")
+        XCTAssertFalse(parts?.body.contains("Private task title") ?? true)
     }
 
     func testFailedOutcomeBodyDescribesError() {
@@ -48,7 +49,7 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
             displayTitle: "Build fix",
             phase: .failed
         )
-        XCTAssertEqual(parts?.body, "Build fix ended with an error.",
+        XCTAssertEqual(parts?.body, "Run ended with an error.",
                        "failed body must describe an error, distinct from a manual stop")
     }
 
@@ -58,7 +59,7 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
             displayTitle: "Build fix",
             phase: .completed
         )
-        XCTAssertEqual(parts?.body, "Build fix response is ready.",
+        XCTAssertEqual(parts?.body, "Run response is ready.",
                        "completed body must say response is ready, not an error or stop message")
     }
 
@@ -133,13 +134,56 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
             phase: .cancelled
         )
         XCTAssertEqual(content?.title, "Thread cancelled")
-        XCTAssertEqual(content?.body, "Refactor was stopped before finishing.")
+        XCTAssertEqual(content?.body, "Run was stopped before finishing.")
         XCTAssertEqual(content?.identifier, "thread.t1.cancelled",
                        "identifier must include 'cancelled' suffix so the notification replaces correctly in Notification Center")
         XCTAssertEqual(content?.threadIdentifier, "t1",
                        "threadIdentifier must be set so all outcome notifications for t1 stack in one group")
         XCTAssertEqual(content?.userInfo["outcome"], "cancelled")
         XCTAssertEqual(content?.userInfo["threadId"], "t1")
+    }
+
+    func testThreadOutcomeCarriesOnlyExactFinalMessageId() {
+        let messageID = UUID().uuidString
+        let content = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread",
+            runId: "run",
+            title: "Build",
+            phase: .completed,
+            finalMessageId: messageID
+        )
+        XCTAssertEqual(content?.userInfo["finalMessageId"], messageID)
+
+        let withoutMessage = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread",
+            runId: "run",
+            title: "Build",
+            phase: .completed
+        )
+        XCTAssertNil(withoutMessage?.userInfo["finalMessageId"])
+    }
+
+    func testGroupedOutcomesRouteToActivityWithoutSingularMessage() {
+        let first = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-one",
+            runId: "run-one",
+            title: "One",
+            phase: .completed,
+            finalMessageId: UUID().uuidString
+        )!
+        let second = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-two",
+            runId: "run-two",
+            title: "Two",
+            phase: .completed,
+            finalMessageId: UUID().uuidString
+        )!
+        let grouped = RemoteCodeNotificationContent.groupedOutcomes([first, second])!
+        XCTAssertNil(grouped.userInfo["threadId"])
+        XCTAssertNil(grouped.userInfo["runId"])
+        XCTAssertNil(grouped.userInfo["finalMessageId"])
+        XCTAssertEqual(grouped.userInfo["runIds"], "run-one,run-two")
+        XCTAssertEqual(grouped.userInfo["activityDestination"], "true")
     }
 
     func testThreadOutcomeFailedContentUnchanged() {
@@ -163,7 +207,7 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
             phase: .completed
         )
         XCTAssertEqual(content?.title, "Thread finished")
-        XCTAssertEqual(content?.body, "Build fix response is ready.")
+        XCTAssertEqual(content?.body, "Run response is ready.")
         XCTAssertEqual(content?.identifier, "thread.t3.completed")
         XCTAssertEqual(content?.threadIdentifier, "t3")
     }
@@ -174,8 +218,8 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
             title: nil,
             phase: .cancelled
         )
-        XCTAssertEqual(content?.body, "Thread was stopped before finishing.",
-                       "nil thread title must fall back to 'Thread' in the body")
+        XCTAssertEqual(content?.body, "Run was stopped before finishing.",
+                       "external notification copy must stay generic and avoid thread titles")
     }
 
     func testThreadOutcomeFallbackTitleWhenBlank() {
@@ -184,8 +228,8 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
             title: "   ",
             phase: .cancelled
         )
-        XCTAssertEqual(content?.body, "Thread was stopped before finishing.",
-                       "blank thread title must fall back to 'Thread' in the body")
+        XCTAssertEqual(content?.body, "Run was stopped before finishing.",
+                       "external notification copy must stay generic and avoid thread titles")
     }
 
     func testInterruptedMapsToFailedCopy() {
@@ -198,6 +242,54 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
         XCTAssertEqual(content?.title, "Thread failed",
                        "interrupted (provider crash) maps to failed copy, not cancelled, because the user did not stop it")
         XCTAssertEqual(content?.userInfo["outcome"], "failed")
+    }
+
+    func testPreferencesFilterByKindAndMutedWorkspace() {
+        var settings = AppSettings()
+        settings.notificationActionAlertsEnabled = true
+        settings.notificationCompletionAlertsEnabled = false
+        XCTAssertTrue(RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: true, workspaceId: "w1", settings: settings))
+        XCTAssertFalse(RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: false, workspaceId: "w1", settings: settings))
+        settings.notificationActionAlertsEnabled = false
+        settings.notificationCompletionAlertsEnabled = true
+        XCTAssertFalse(RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: true, workspaceId: "w1", settings: settings))
+        XCTAssertTrue(RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: false, workspaceId: "w1", settings: settings))
+        settings.notificationMutedWorkspaceIDs = ["w1"]
+        XCTAssertFalse(RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: false, workspaceId: "w1", settings: settings))
+        XCTAssertFalse(RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: true, workspaceId: "w1", settings: settings))
+    }
+
+    func testOutcomeCopyOmitsSensitiveTitleAndUsesRunIdentity() {
+        let content = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread",
+            runId: "run-2",
+            title: "secret command and summary",
+            phase: .completed
+        )
+        XCTAssertEqual(content?.identifier, "run.run-2.completed")
+        XCTAssertEqual(content?.userInfo["runId"], "run-2")
+        XCTAssertFalse(content?.body.contains("secret") ?? true)
+        XCTAssertFalse(content?.soundEnabled ?? true)
+        let replay = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread",
+            runId: "run-2",
+            title: "different private title",
+            phase: .completed
+        )
+        let retry = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread",
+            runId: "run-3",
+            title: "secret command and summary",
+            phase: .completed
+        )
+        XCTAssertEqual(content?.identifier, replay?.identifier)
+        XCTAssertNotEqual(content?.identifier, retry?.identifier)
     }
 
     // MARK: - Main-agent / subagent push policy
@@ -270,11 +362,12 @@ final class RunOutcomeNotificationCopyTests: XCTestCase {
             requestId: "r2",
             isNestedWorker: false
         )
-        XCTAssertEqual(content?.title, "Approve: Run command")
+        XCTAssertEqual(content?.title, "Action needed")
         XCTAssertEqual(content?.userInfo["threadId"], "main")
         XCTAssertEqual(content?.userInfo["workspaceId"], "ws-1")
         XCTAssertEqual(content?.userInfo["outcome"], "attention")
-        XCTAssertTrue(content?.body.contains("ship labels") == true)
+        XCTAssertEqual(content?.body, "A run needs your attention.")
+        XCTAssertFalse(content?.body.contains("ship labels") ?? true)
     }
 
     func testRunningPhaseNeverNotifiesEvenForMainAgent() {

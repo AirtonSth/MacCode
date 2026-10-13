@@ -156,7 +156,7 @@ final class AppIdentityNotificationTests: XCTestCase {
                           "Spacer must push Hide Sidebar into the right-side icon cluster")
         XCTAssertLessThan(newWorkspace.lowerBound, updates.lowerBound,
                           "the update/check action belongs below Settings, not above New Workspace")
-        XCTAssertTrue(source.contains("Text(title)\n                .font(DS.Font.body)"),
+        XCTAssertTrue(source.contains(".font(DS.Font.body)"),
                       "sidebar action labels must use the same base font size as normal workspace rows")
         XCTAssertFalse(source.contains("sidebarActionRow(symbol: \"gearshape\", title: \"Settings\")"),
                        "Settings must not move back into the full-width action row area")
@@ -215,7 +215,8 @@ final class AppIdentityNotificationTests: XCTestCase {
             phase: .completed
         )
         XCTAssertEqual(completed?.title, "Thread finished")
-        XCTAssertEqual(completed?.body, "Build fix response is ready.")
+        XCTAssertEqual(completed?.body, "Run response is ready.")
+        XCTAssertFalse(completed?.body.contains("Build fix") ?? true, "Notification copy must not expose the private thread title.")
         XCTAssertEqual(completed?.categoryIdentifier, "RemoteCodeThreadUpdate")
         XCTAssertEqual(completed?.userInfo["threadId"], "t1")
     }
@@ -658,8 +659,9 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(alert.pushToken, "apns-token")
         XCTAssertEqual(alert.idempotencyKey, "thread.thread-1.completed")
         XCTAssertEqual(alert.title, "Thread finished")
-        XCTAssertEqual(alert.body, "Build fix response is ready.",
+        XCTAssertEqual(alert.body, "Run response is ready.",
                        "terminal outcome notifications must be sent to the private backend with the paired iOS push target")
+        XCTAssertFalse(alert.body.contains("Build fix"), "Push copy must not expose the private thread title.")
         // The push must carry routing keys so a tap opens the exact thread, not
         // the default screen. workspaceId + threadId drive AppRouter.routeIntent.
         XCTAssertEqual(alert.data["workspaceId"], "ws-1")
@@ -864,9 +866,8 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(api.alertRequests.first?.title, "Thread finished")
     }
 
-    func testPrivateNotificationBridgeSuppressesFinishAlertWhenActivityUpdateArmed() async throws {
-        // WHY: with an activity_update courier (LA on Lock Screen), a second
-        // "Thread finished" banner is redundant — keep silent catch-up only.
+    func testPrivateNotificationBridgeUnrelatedActivityCannotSuppressFinishAlert() async throws {
+        // WHY: an armed activity may show another run, so it cannot cover this outcome.
         let dir = NSTemporaryDirectory() + "RC2PrivateBridgeLA-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
@@ -906,11 +907,10 @@ final class AppIdentityNotificationTests: XCTestCase {
         ))
         await bridge.deliverThreadOutcomeRemote(content, phase: .completed)
 
-        XCTAssertEqual(api.alertRequests.count, 1, "only silent catch-up, no visible finish banner")
-        let only = try XCTUnwrap(api.alertRequests.first)
-        XCTAssertTrue(only.silent)
-        XCTAssertEqual(only.data["rc2_catch_up"], "1")
-        XCTAssertNotEqual(only.title, "Thread finished")
+        XCTAssertEqual(api.alertRequests.count, 2, "unrelated activity must not hide this outcome banner")
+        XCTAssertFalse(try XCTUnwrap(api.alertRequests.first).silent)
+        XCTAssertEqual(api.alertRequests.first?.title, "Thread finished")
+        XCTAssertTrue(api.alertRequests.last?.silent == true, "silent catch-up remains enabled")
     }
 
     func testLiveActivitySnapshotContentStateMatchesOnDeviceSchemaKeys() throws {
@@ -952,10 +952,12 @@ final class AppIdentityNotificationTests: XCTestCase {
                      "only real run-lifecycle ends fire a terminal Live Activity push")
 
         let completed = PrivateLiveActivitySnapshot.terminal(threadId: "t1", title: "Build fix", phase: .completed)
+        XCTAssertEqual(completed?.title, "Run")
         XCTAssertEqual(completed?.phase, "completed")
         XCTAssertEqual(completed?.statusLine, "Finished")
         XCTAssertEqual(completed?.activeThreadCount, 0)
-        XCTAssertEqual(completed?.preview, "Build fix response is ready.")
+        XCTAssertEqual(completed?.preview, "Run response is ready.")
+        XCTAssertFalse(completed?.preview.contains("Build fix") ?? true, "Live Activity copy must not expose the private thread title or summary.")
         XCTAssertEqual(completed?.petState, "success")
         XCTAssertEqual(completed?.petFrame, 0)
 

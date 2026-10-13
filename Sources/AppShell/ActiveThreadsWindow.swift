@@ -80,6 +80,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
     @Published public private(set) var activeItems: [PetActiveThreadItem] = []
     @Published public private(set) var activeSurfaces: [ActiveSurfaceItem] = []
     @Published public private(set) var finishedItems: [FinishedThreadItem] = []
+    @Published var pendingActivityRoute: NotificationRouteIntent?
     @Published public var selectedTab: Tab = .active
     @Published public var errorMessage: String?
 
@@ -94,6 +95,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
     private var tabRefreshGeneration: UInt64 = 0
     private var navigationGeneration: UInt64 = 0
     fileprivate let deferHydration: Bool
+    var activityRouter: AppCommandRouter { router }
 
     public init(context: AppContext, router: AppCommandRouter, loadImmediately: Bool = true) {
         self.context = context
@@ -336,6 +338,75 @@ public final class ActiveThreadsViewModel: ObservableObject {
         openThread(item.threadID, workspaceID: item.workspaceID)
     }
 
+    func openEvidence(_ item: ActivityWireItem, path: String?) {
+        guard let threadUUID = item.thread_id.flatMap(UUID.init(uuidString:)),
+              let workspaceUUID = item.workspace_id.flatMap(UUID.init(uuidString:)),
+              let turnCount = item.checkpoint_turn_count, turnCount > 0,
+              let runUUID = item.run_id.flatMap(UUID.init(uuidString:)) else {
+            errorMessage = "This activity has no valid checkpoint destination."
+            return
+        }
+        openThread(
+            AgentThreadID(threadUUID), workspaceID: WorkspaceID(workspaceUUID),
+            checkpoint: (turnCount, AgentRunID(runUUID), path)
+        )
+    }
+
+    func openActivity(_ item: ActivityWireItem) {
+        if let notificationID = item.notification_id, item.bot_id == nil {
+            do {
+                guard let notification = try NotificationRepository(db: context.db).get(id: notificationID),
+                      let route = PetAttentionStore.notificationRoute(notification) else {
+                    errorMessage = "This activity has no valid destination."
+                    return
+                }
+                open(route)
+            } catch {
+                errorMessage = "Could not load activity destination: \(error.localizedDescription)"
+            }
+            return
+        }
+        if let botID = item.bot_id.flatMap(UUID.init(uuidString:)) {
+            do {
+                guard try router.openBotsDesk(botID: BotID(botID), conversationID: item.conversation_id.flatMap(UUID.init(uuidString:)).map(BotConversationID.init)) else {
+                    throw LayoutError.surfaceNotFound
+                }
+            } catch { errorMessage = "Could not open bot: \(error.localizedDescription)" }
+            return
+        }
+        if let threadID = item.thread_id.flatMap(UUID.init(uuidString:)) {
+            openThread(AgentThreadID(threadID), workspaceID: item.workspace_id.flatMap(UUID.init(uuidString:)).map(WorkspaceID.init), finalMessageID: item.final_message_id.flatMap(UUID.init(uuidString:)).map(AgentMessageID.init))
+            return
+        }
+        if let surfaceID = item.surface_id.flatMap(UUID.init(uuidString:)),
+           let workspaceID = item.workspace_id.flatMap(UUID.init(uuidString:)) {
+            open(.surface(surfaceID: SurfaceID(surfaceID), workspaceID: WorkspaceID(workspaceID)))
+            return
+        }
+        errorMessage = "This activity has no conversation destination."
+    }
+
+    private func open(_ route: PetAttentionRoute) {
+        do {
+            switch route {
+            case .agentThread(let threadID, let workspaceID): openThread(threadID, workspaceID: workspaceID)
+            case .surface(let surfaceID, let workspaceID):
+                guard let workspaceID else { errorMessage = "This activity has no valid destination."; return }
+                try router.selectWorkspace(workspaceID)
+                try router.focusSurface(workspace: workspaceID, surface: surfaceID)
+            case .workspace(let workspaceID): try router.selectWorkspace(workspaceID)
+            case .settings(let route):
+                guard let settings = (NSApp.delegate as? AppDelegate)?.settings,
+                      settings.show(route: route) else {
+                    errorMessage = "Could not open activity settings destination."
+                    return
+                }
+            case .botsDesk(let botID):
+                guard try router.openBotsDesk(botID: botID) else { throw LayoutError.surfaceNotFound }
+            }
+        } catch { errorMessage = "Could not open activity destination: \(error.localizedDescription)" }
+    }
+
     private func workspaceID(from route: PetAttentionRoute) -> WorkspaceID? {
         if case .agentThread(_, let workspaceID) = route {
             return workspaceID
@@ -343,10 +414,10 @@ public final class ActiveThreadsViewModel: ObservableObject {
         return nil
     }
 
-    private func openThread(_ threadID: AgentThreadID, workspaceID: WorkspaceID?) {
+    private func openThread(_ threadID: AgentThreadID, workspaceID: WorkspaceID?, finalMessageID: AgentMessageID? = nil, checkpoint: (Int, AgentRunID, String?)? = nil) {
         // Leave the shell destination first so the workspace cache can paint.
         router.windowController?.presentWorkspaceContent()
-        guard deferHydration else {
+        guard deferHydration || finalMessageID != nil || checkpoint != nil else {
             do { _ = try router.openAgentThread(thread: threadID, markRead: false) }
             catch { errorMessage = "Could not open thread: \(error.localizedDescription)" }
             return
@@ -364,8 +435,24 @@ public final class ActiveThreadsViewModel: ObservableObject {
                     self.navigationTask = nil
                 }
             }
-            do { _ = try self.router.openAgentThread(thread: threadID, markRead: false) }
-            catch { self.errorMessage = "Could not open thread: \(error.localizedDescription)" }
+            do {
+                let descriptor = try self.router.openAgentThread(thread: threadID, markRead: false)
+                if let finalMessageID {
+                    guard let surface = SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface else { throw LayoutError.surfaceNotFound }
+                    try await surface.viewModel.revealMessage(id: finalMessageID, expectedThreadID: threadID)
+                }
+                if let checkpoint {
+                    guard let surface = SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface else { throw LayoutError.surfaceNotFound }
+                    try await surface.viewModel.revealCheckpoint(
+                        checkpointTurnCount: checkpoint.0, expectedRunID: checkpoint.1, path: checkpoint.2
+                    )
+                    guard !Task.isCancelled, self.navigationGeneration == generation else { return }
+                }
+            } catch {
+                guard !(error is CancellationError), self.navigationGeneration == generation else { return }
+                if let revealError = error as? AgentAppSurfaceMessageRevealError, case .selectionChanged = revealError { return }
+                self.errorMessage = "Could not open thread: \(error.localizedDescription)"
+            }
         }
     }
 }
@@ -416,28 +503,20 @@ public struct ActiveThreadsRootView: View {
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            overviewHeader
-            tabBar
-            content
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            footerBar
-        }
-        .frame(minWidth: 980, minHeight: 680)
-        .background(DS.Palette.bg)
-        .alert("Active Threads", isPresented: Binding(
+        ActivityRootView(router: vm.activityRouter, route: vm.pendingActivityRoute, consumeRoute: {
+            vm.pendingActivityRoute = nil
+        }, openThread: { item in
+            vm.openActivity(item)
+        }, openEvidence: { item, path in
+            vm.openEvidence(item, path: path)
+        })
+        .alert("Could not open conversation", isPresented: Binding(
             get: { vm.errorMessage != nil },
             set: { if !$0 { vm.errorMessage = nil } }
         )) {
             Button("OK") { vm.errorMessage = nil }
         } message: {
             Text(vm.errorMessage ?? "")
-        }
-        .onAppear { vm.scheduleFreshnessPass() }
-        .onChange(of: vm.selectedTab) { tab in
-            if vm.deferHydration { vm.scheduleTabRefresh(tab) }
-            else if tab == .lastFinished { vm.reloadFinished() }
-            else { vm.reloadActive() }
         }
     }
 

@@ -95,19 +95,12 @@ public final class PetAttentionStore {
         guard try verifyRoute(item.route) else { return .routeRejected }
 
         switch item.source {
-        case .callback(let threadID, let requestID, let kind):
-            guard case .callback(_, let isStale) = item.kind, isStale else {
-                return .retainedBlocker
-            }
-            try callbackRepository.resolve(
-                threadId: threadID,
-                requestId: requestID,
-                kind: kind == .approval ? .approval : .userInput,
-                state: .acknowledged
-            )
-            return .marked
+        case .callback:
+            return .retainedBlocker
         case .agentThread(let threadID):
-            guard try threadRepository.get(id: threadID) != nil else { return .notFound }
+            guard !item.kind.needsUserAction else { return .retainedBlocker }
+            guard let thread = try threadRepository.get(id: threadID) else { return .notFound }
+            guard thread.status != .failed && thread.status != .interrupted else { return .retainedBlocker }
             try markAgentThreadReadMutation(threadID)
             return .marked
         case .notification(let id):
@@ -248,8 +241,24 @@ public final class PetAttentionStore {
 
     private func notificationItem(_ notification: AppNotification) -> PetAttentionItem? {
         guard let rawCategory = notification.category,
-              let category = PetNotificationCategory(rawValue: rawCategory) else { return nil }
+              let category = PetNotificationCategory(rawValue: rawCategory),
+              let route = Self.notificationRoute(notification) else { return nil }
         let presentation = category.presentation
+        return PetAttentionItem(
+            id: "notification:\(notification.id)",
+            kind: .notification(category),
+            title: presentation.title,
+            detail: presentation.detail,
+            workspaceName: workspaceName(for: notification.workspaceId),
+            createdAt: notification.createdAt,
+            route: route,
+            source: .notification(id: notification.id)
+        )
+    }
+
+    internal static func notificationRoute(_ notification: AppNotification) -> PetAttentionRoute? {
+        guard let rawCategory = notification.category,
+              let category = PetNotificationCategory(rawValue: rawCategory) else { return nil }
         let route: PetAttentionRoute
         switch category {
         case .providerUpdateFailed:
@@ -278,16 +287,7 @@ public final class PetAttentionStore {
             guard let surfaceID = notification.surfaceId else { return nil }
             route = .surface(surfaceID: surfaceID, workspaceID: notification.workspaceId)
         }
-        return PetAttentionItem(
-            id: "notification:\(notification.id)",
-            kind: .notification(category),
-            title: presentation.title,
-            detail: presentation.detail,
-            workspaceName: workspaceName(for: notification.workspaceId),
-            createdAt: notification.createdAt,
-            route: route,
-            source: .notification(id: notification.id)
-        )
+        return route
     }
 
     /// Decodes structured pending-request kind only; never surfaces title/detail payloads.

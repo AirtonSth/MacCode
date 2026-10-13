@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import UserNotifications
+import Persistence
 
 // MARK: - NotificationCenterClient DI seam (QA :96)
 
@@ -59,6 +60,16 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     // post after launch).
     private let authLock = NSLock()
     private var _authorized = false
+    private let postedIdentifiersLock = NSLock()
+    private var postedIdentifiers = Set<String>()
+    private let outcomeQueue = DispatchQueue(label: "io.remotecode.notifications.outcomes")
+    private var pendingOutcomes: [String: [RemoteCodeNotificationContent]] = [:]
+    private var pendingRemoteOutcomes: [String: [RemoteCodeNotificationContent]] = [:]
+    private var remoteOutcomeCallbacks: [String: (RemoteCodeNotificationContent) -> Void] = [:]
+    private var outcomeWorkItems: [String: DispatchWorkItem] = [:]
+    private var seenOutcomeIdentifiers = Set<String>()
+    private let scheduleOutcome: (TimeInterval, @escaping () -> Void) -> Void
+    private let canUseNotificationCenterForInstance: Bool
     private var authorized: Bool {
         get { authLock.lock(); defer { authLock.unlock() }; return _authorized }
         set { authLock.lock(); _authorized = newValue; authLock.unlock() }
@@ -87,12 +98,24 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
 
     private override init() {
         self.notificationCenterClient = LiveNotificationCenterClient()
+        self.canUseNotificationCenterForInstance = Self.canUseNotificationCenter
+        self.scheduleOutcome = { delay, action in
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: action)
+        }
         super.init()
     }
 
     /// Designated init for test injection. Not exposed via `shared`.
-    init(notificationCenterClient: any NotificationCenterClient) {
+    init(
+        notificationCenterClient: any NotificationCenterClient,
+        allowsNotificationCenterForTesting: Bool = false,
+        scheduleOutcome: @escaping (TimeInterval, @escaping () -> Void) -> Void = { delay, action in
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: action)
+        }
+    ) {
         self.notificationCenterClient = notificationCenterClient
+        self.canUseNotificationCenterForInstance = Self.canUseNotificationCenter || allowsNotificationCenterForTesting
+        self.scheduleOutcome = scheduleOutcome
         super.init()
     }
 
@@ -151,12 +174,58 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
             body: body ?? "",
             categoryIdentifier: category ?? "",
             threadIdentifier: "",
-            userInfo: userInfo
+            userInfo: userInfo,
+            soundEnabled: true
         )
     }
 
-    public func post(_ content: RemoteCodeNotificationContent) {
-        guard authorized, Self.canUseNotificationCenter else {
+    public func post(_ content: RemoteCodeNotificationContent, settings: AppSettings = AppSettings()) {
+        post(content.withSound(settings.notificationSoundEnabled))
+    }
+
+    public func postOutcomeGrouped(
+        _ content: RemoteCodeNotificationContent,
+        workspaceId: String?,
+        settings: AppSettings,
+        remoteDelivery: ((RemoteCodeNotificationContent) -> Void)? = nil
+    ) {
+        let key = workspaceId ?? "__no_workspace__"
+        outcomeQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.seenOutcomeIdentifiers.insert(content.identifier).inserted else { return }
+            let outcome = content.withSound(settings.notificationSoundEnabled)
+            self.pendingOutcomes[key, default: []].append(outcome)
+            if let remoteDelivery {
+                self.pendingRemoteOutcomes[key, default: []].append(outcome)
+                self.remoteOutcomeCallbacks[key] = remoteDelivery
+            }
+            guard self.outcomeWorkItems[key] == nil else { return }
+            let item = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                let contents = self.pendingOutcomes.removeValue(forKey: key) ?? []
+                let remoteContents = self.pendingRemoteOutcomes.removeValue(forKey: key) ?? []
+                let remoteDelivery = self.remoteOutcomeCallbacks.removeValue(forKey: key)
+                self.outcomeWorkItems.removeValue(forKey: key)
+                if let grouped = RemoteCodeNotificationContent.groupedOutcomes(contents) {
+                    self.post(grouped)
+                }
+                if let groupedRemote = RemoteCodeNotificationContent.groupedOutcomes(remoteContents) {
+                    remoteDelivery?(groupedRemote)
+                }
+            }
+            self.outcomeWorkItems[key] = item
+            self.scheduleOutcome(5) { [weak self] in
+                self?.outcomeQueue.async { item.perform() }
+            }
+        }
+    }
+
+    private func post(_ content: RemoteCodeNotificationContent) {
+        postedIdentifiersLock.lock()
+        let inserted = postedIdentifiers.insert(content.identifier).inserted
+        postedIdentifiersLock.unlock()
+        guard inserted else { return }
+        guard authorized, canUseNotificationCenterForInstance else {
             // Notify the caller so an in-app fallback can surface the result
             // when OS-level delivery is blocked (permission denied).
             DispatchQueue.main.async { [weak self] in

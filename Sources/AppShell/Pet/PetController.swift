@@ -3,6 +3,7 @@ import AgentRuntime
 import CoreModel
 import Foundation
 import Persistence
+import RemoteCodeTreaty
 import SocketServer
 import Surfaces
 
@@ -31,6 +32,9 @@ public final class PetController {
     private var companionTask: Task<Void, Never>?
     private var pendingCompanionCue: PetCompanionCue?
     private var attentionRefreshTask: Task<Void, Never>?
+    private var activityCountsObserver: UUID?
+    private var activitySurfaceGeneration: UInt64 = 0
+    private var activitySurfaceTask: Task<Void, Never>?
     private var idleTask: Task<Void, Never>?
     private var projectionWatermark: Int64?
     private var projectionErrorMessage: String?
@@ -170,6 +174,10 @@ public final class PetController {
 
     public func start() {
         guard eventSubscription == nil else { return }
+        let petModel = model
+        activityCountsObserver = PetActivityCountsProjection.shared.observe { global, _ in
+            petModel.apply(activityCounts: global)
+        }
         let subscription = EventBus.shared.subscribeFromCurrent(filter: .full) { [weak self] event in
             guard !Self.isPrefilteredNoiseKind(event.kind) else { return }
             DispatchQueue.main.async { self?.handle(event) }
@@ -199,11 +207,18 @@ public final class PetController {
     }
 
     public func stop() {
+        activitySurfaceGeneration &+= 1
+        activitySurfaceTask?.cancel()
+        activitySurfaceTask = nil
         windowController?.cancelActiveDrag()
         if let eventSubscription {
             EventBus.shared.unsubscribe(eventSubscription)
         }
         eventSubscription = nil
+        if let activityCountsObserver {
+            PetActivityCountsProjection.shared.removeObserver(activityCountsObserver)
+            self.activityCountsObserver = nil
+        }
         uninstallActiveRunProjectionObserver()
         transientTask?.cancel()
         transientTask = nil
@@ -397,8 +412,7 @@ public final class PetController {
         }
         windowController.onOpenItem = { [weak self] item in self?.open(item) }
         windowController.onOpenActiveThread = { [weak self] item in self?.openActive(item) }
-        windowController.onMarkAllViewed = { [weak self] in self?.markAllViewed() }
-        windowController.onOpenRemoteCode = { [weak self] in self?.showRemoteCode() }
+        windowController.onOpenRemoteCode = { [weak self] in self?.showActivity() }
         windowController.onOpenSettings = { [weak self] in
             _ = self?.openSettings(.general)
         }
@@ -886,6 +900,10 @@ public final class PetController {
     }
 
     private func refreshAttentionNow() {
+        PetActivityCountsProjection.shared.refresh(
+            router: router,
+            workspaceIDs: context.state.workspaces.keys.map { $0 }
+        )
         do {
             let previousCount = model.count
             let snapshot = try attentionStore.refresh(filter: attentionFilter(model.settings.petAttentionFilter))
@@ -910,14 +928,30 @@ public final class PetController {
         }
     }
 
-    /// Push pet-identical copy to the remote Live Activity (active + needs you + completed).
+    nonisolated static func decodeActivityPage(_ value: JSONValue) throws -> AgentActivityPage {
+        try AgentActivityPage.makeJSONDecoder().decode(AgentActivityPage.self, from: JSONEncoder().encode(value))
+    }
+
+    /// Push authoritative Activity copy. Offline reads must not retire an existing surface.
     private func publishLiveActivitySurface() {
-        let input = PetLiveActivityCopy.Input(
-            active: model.activeThreads,
-            needsYou: model.needsYouItems,
-            completed: model.completedItems
-        )
-        context.liveActivitySyncCoordinator.submitSurface(PetLiveActivityCopy.make(input))
+        activitySurfaceGeneration &+= 1
+        let owner = activitySurfaceGeneration
+        activitySurfaceTask?.cancel()
+        activitySurfaceTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if self.activitySurfaceGeneration == owner { self.activitySurfaceTask = nil } }
+            do {
+                let value = try await self.router.activityListOffMain(params: [
+                    "section": .string("all"), "limit": .number(50)
+                ])
+                guard !Task.isCancelled, self.activitySurfaceGeneration == owner else { return }
+                let page = try Self.decodeActivityPage(value)
+                self.context.liveActivitySyncCoordinator.submitSurface(PetLiveActivityCopy.makeActivity(page: page))
+            } catch {
+                guard !Task.isCancelled, self.activitySurfaceGeneration == owner else { return }
+                NSLog("Pet Live Activity projection unavailable; preserving current surface.")
+            }
+        }
     }
 
     private func attentionHydration(from snapshot: PetAttentionSnapshot) -> PetAttentionHydration {
@@ -1341,21 +1375,10 @@ public final class PetController {
         destinationWindowIsKeyForTests?(window) ?? window.isKeyWindow
     }
 
-    private func markAllViewed() {
-        do {
-            _ = try attentionStore.markAllRead()
-            model.routeError = nil
-            // Mark + dismiss only. Do not open Remote Code or re-present Ready for you.
-            windowController?.closePopover(restoringPreviousKeyWindow: false)
-            refreshAttentionNow()
-        } catch {
-            model.routeError = "Ready items could not be updated."
-        }
-    }
-
-    private func showRemoteCode() {
+    private func showActivity() {
         NSApplication.shared.activate(ignoringOtherApps: true)
         router.windowController?.show()
+        router.windowController?.presentActiveThreadsInMainContent()
         windowController?.closePopover(restoringPreviousKeyWindow: false)
     }
 

@@ -305,6 +305,10 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         }
     }
 
+    func listActivity(service: ActivityService, params: [String: JSONValue]) async throws -> JSONValue {
+        try await execute { try service.list(params) }
+    }
+
     public func message(id: AgentMessageID) async throws -> AgentMessage? {
         try await execute {
             try AgentMessageRepository(db: self.readDB).get(id: id)
@@ -3048,7 +3052,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     @discardableResult
-    public func openBotsDesk(botID: BotID) throws -> Bool {
+    public func openBotsDesk(botID: BotID, conversationID: BotConversationID? = nil) throws -> Bool {
         NSApplication.shared.activate(ignoringOtherApps: true)
         windowController?.show()
         windowController?.presentBotsInMainContent()
@@ -3056,7 +3060,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let vm = botsViewModel else { return false }
         guard let bot = vm.bots.first(where: { $0.id == botID })
                 ?? (context.flatMap { try? $0.botStore.get(id: botID) }) else { return false }
+        if let conversationID {
+            guard try context?.botStore.conversation(id: conversationID)?.botID == botID else { return false }
+        }
         vm.openDesk(bot)
+        if let conversationID { vm.selectDeskThread(conversationID) }
         windowController?.flushPendingRefresh()
         guard vm.selectedBotID == botID, vm.screen == .desk else { return false }
         guard let destination = windowController?.window else { return false }
@@ -7066,10 +7074,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
-    public func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String {
+    public func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, expectedRunID: UUID? = nil, path: String?) throws -> String {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let checkpoint = try ctx.turnCheckpointRepo.get(threadId: thread, checkpointTurnCount: checkpointTurnCount) else {
+            if expectedRunID != nil {
+                throw JSONRPCError(code: -32013, message: "Checkpoint diff is unavailable for the expected run.")
+            }
             throw LayoutError.workspaceNotFound
+        }
+        if let expectedRunID, checkpoint.runId.value != expectedRunID {
+            throw JSONRPCError(code: -32013, message: "Checkpoint diff is unavailable for the expected run.")
         }
         if let path {
             return checkpoint.fileDiffs.first(where: { $0.path == path })?.patch ?? ""
@@ -9196,6 +9210,47 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func openBotGuestDesktopInNewWindow(_ bot: BotID) {
         windowController?.openBotGuestDesktopInNewWindow(bot)
+    }
+
+    var activityWorkspaceOptions: [(id: String, name: String)] {
+        context?.state.workspaces.values.map { ($0.id.value.uuidString, $0.name) } ?? []
+    }
+
+    public func activityList(params: [String: JSONValue]) throws -> JSONValue {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        return try ActivityService(context: context).list(params)
+    }
+
+    public func activityListOffMain(params: [String: JSONValue]) async throws -> JSONValue {
+        guard let context else { throw JSONRPCError.internalError }
+        return try await agentAppReadGateway.listActivity(service: ActivityService(context: context), params: params)
+    }
+
+    public func activitySetViewed(params: [String: JSONValue]) throws -> JSONValue {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        let result = try ActivityService(context: context).setViewed(params)
+        let ids = result.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        if !ids.isEmpty {
+            EventBus.shared.publish(kind: .notificationRead, payload: .object([
+                "id": .string("activity:\(ids[0])"),
+                "activity_item_ids": .array(ids.map(JSONValue.string)),
+                "reason": .string("viewed")
+            ]))
+        }
+        return result
+    }
+
+    public func activityAcknowledge(params: [String: JSONValue]) throws -> JSONValue {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        let result = try ActivityService(context: context).acknowledge(params)
+        if result.objectValue?["acknowledged"]?.boolValue == true,
+           let id = result.objectValue?["item_id"]?.stringValue {
+            EventBus.shared.publish(kind: .notificationRead, payload: .object([
+                "id": .string("activity:\(id)"), "activity_item_ids": .array([.string(id)]),
+                "reason": .string("acknowledged")
+            ]))
+        }
+        return result
     }
 
     public func notificationCreate(

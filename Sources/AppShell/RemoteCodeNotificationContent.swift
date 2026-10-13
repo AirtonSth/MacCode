@@ -1,4 +1,5 @@
 import CoreModel
+import Persistence
 import Foundation
 import UserNotifications
 
@@ -9,6 +10,7 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
     public let categoryIdentifier: String
     public let threadIdentifier: String
     public let userInfo: [String: String]
+    public let soundEnabled: Bool
 
     public static let threadUpdateCategoryIdentifier = "RemoteCodeThreadUpdate"
     public static let openActionIdentifier = "thread.open"
@@ -28,6 +30,20 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
             guard let nodeId else { return false }
             let trimmed = nodeId.trimmingCharacters(in: .whitespacesAndNewlines)
             return !trimmed.isEmpty && trimmed != "root"
+        }
+
+        public static func allowsNotification(
+            isAction: Bool,
+            workspaceId: String?,
+            settings: AppSettings
+        ) -> Bool {
+            if let workspaceId,
+               settings.notificationMutedWorkspaceIDs.contains(where: {
+                   (UUID(uuidString: $0)?.uuidString ?? $0) == (UUID(uuidString: workspaceId)?.uuidString ?? workspaceId)
+               }) {
+                return false
+            }
+            return isAction ? settings.notificationActionAlertsEnabled : settings.notificationCompletionAlertsEnabled
         }
 
         public static func shouldNotifyThreadOutcome(
@@ -94,21 +110,21 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         case .completed:
             return (
                 title: "Thread finished",
-                body: "\(displayTitle) response is ready.",
+                body: "Run response is ready.",
                 identifierSuffix: "completed",
                 threadIdentifier: threadId
             )
         case .failed, .interrupted:
             return (
                 title: "Thread failed",
-                body: "\(displayTitle) ended with an error.",
+                body: "Run ended with an error.",
                 identifierSuffix: "failed",
                 threadIdentifier: threadId
             )
         case .cancelled:
             return (
                 title: "Thread cancelled",
-                body: "\(displayTitle) was stopped before finishing.",
+                body: "Run was stopped before finishing.",
                 identifierSuffix: "cancelled",
                 threadIdentifier: threadId
             )
@@ -119,22 +135,23 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
 
     public static func threadOutcome(
         threadId: String,
+        runId: String = "",
         workspaceId: String? = nil,
         title: String?,
         phase: AgentRunStatus,
-        isNestedWorker: Bool = false
+        isNestedWorker: Bool = false,
+        finalMessageId: String? = nil
     ) -> RemoteCodeNotificationContent? {
         guard AgentAppPushPolicy.shouldNotifyThreadOutcome(
             phase: phase,
             isNestedWorker: isNestedWorker
         ) else { return nil }
 
-        let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayTitle = (normalizedTitle?.isEmpty == false) ? normalizedTitle! : "Thread"
+        _ = title
 
         guard let parts = outcomeNotificationParts(
             threadId: threadId,
-            displayTitle: displayTitle,
+            displayTitle: "Run",
             phase: phase
         ) else { return nil }
 
@@ -148,16 +165,21 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
             "outcome": outcome,
             "category": Self.threadUpdateCategoryIdentifier,
         ]
+        if !runId.isEmpty { userInfo["runId"] = runId }
+        if let finalMessageId, !finalMessageId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            userInfo["finalMessageId"] = finalMessageId
+        }
         if let workspaceId, !workspaceId.trimmingCharacters(in: .whitespaces).isEmpty {
             userInfo["workspaceId"] = workspaceId
         }
         return RemoteCodeNotificationContent(
-            identifier: "thread.\(threadId).\(outcome)",
+            identifier: runId.isEmpty ? "thread.\(threadId).\(outcome)" : "run.\(runId).\(outcome)",
             title: parts.title,
             body: parts.body,
             categoryIdentifier: Self.threadUpdateCategoryIdentifier,
             threadIdentifier: parts.threadIdentifier,
-            userInfo: userInfo
+            userInfo: userInfo,
+            soundEnabled: false
         )
     }
 
@@ -174,12 +196,9 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         guard AgentAppPushPolicy.shouldNotifyUserAction(isNestedWorker: isNestedWorker) else {
             return nil
         }
-        let normalizedThread = threadTitle?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayThread = (normalizedThread?.isEmpty == false) ? normalizedThread! : "Thread"
-        let normalizedAction = actionTitle
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let action = normalizedAction.isEmpty ? "Action needed" : normalizedAction
+        _ = threadTitle
+        _ = actionTitle
+        let action = "Action needed"
         var userInfo: [String: String] = [
             "threadId": threadId,
             "outcome": "attention",
@@ -192,10 +211,44 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         return RemoteCodeNotificationContent(
             identifier: "thread.\(threadId).attention.\(requestId)",
             title: action,
-            body: "\(displayThread) needs your attention.",
+            body: "A run needs your attention.",
             categoryIdentifier: Self.threadUpdateCategoryIdentifier,
             threadIdentifier: threadId,
-            userInfo: userInfo
+            userInfo: userInfo,
+            soundEnabled: true
+        )
+    }
+
+    public static func groupedOutcomes(_ contents: [RemoteCodeNotificationContent]) -> RemoteCodeNotificationContent? {
+        guard let first = contents.first else { return nil }
+        guard contents.count > 1 else { return first }
+        var userInfo = first.userInfo
+        userInfo.removeValue(forKey: "threadId")
+        userInfo.removeValue(forKey: "runId")
+        userInfo.removeValue(forKey: "finalMessageId")
+        userInfo["activityDestination"] = "true"
+        userInfo["outcome"] = "completed"
+        userInfo["runIds"] = contents.compactMap { $0.userInfo["runId"] }.joined(separator: ",")
+        return RemoteCodeNotificationContent(
+            identifier: "workspace.\(first.userInfo["workspaceId"] ?? "none").runs.\(UUID().uuidString)",
+            title: "\(contents.count) runs completed",
+            body: "Runs are ready in Activity.",
+            categoryIdentifier: first.categoryIdentifier,
+            threadIdentifier: first.threadIdentifier,
+            userInfo: userInfo,
+            soundEnabled: first.soundEnabled
+        )
+    }
+
+    public func withSound(_ enabled: Bool) -> RemoteCodeNotificationContent {
+        RemoteCodeNotificationContent(
+            identifier: identifier,
+            title: title,
+            body: body,
+            categoryIdentifier: categoryIdentifier,
+            threadIdentifier: threadIdentifier,
+            userInfo: userInfo,
+            soundEnabled: enabled
         )
     }
 
@@ -203,7 +256,7 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        content.sound = .default
+        content.sound = soundEnabled ? .default : nil
         content.categoryIdentifier = categoryIdentifier
         content.threadIdentifier = threadIdentifier
         content.userInfo = userInfo

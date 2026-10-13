@@ -729,7 +729,7 @@ public final class ScheduledTaskScheduler {
         } catch {
             try? store.finish(runID: claim.run.id, status: .failed, errorSummary: String(describing: error))
             ScheduledTaskCrossProcess.notifyStoreChanged(reason: "failed")
-            SystemNotifier.shared.post(title: "Scheduled task failed", body: claim.task.title, category: nil)
+            notifyFailure(for: claim.run)
         }
     }
 
@@ -890,8 +890,23 @@ public final class ScheduledTaskScheduler {
     }
 
     nonisolated private func notifyFailure(for run: ScheduledTaskRun) {
-        let title = (try? store.get(id: run.taskID))?.title ?? "Scheduled task"
-        SystemNotifier.shared.post(title: "Scheduled task failed", body: title, category: nil)
+        let task = try? store.get(id: run.taskID)
+        let settings = SettingsStore(db: context.db).load()
+        guard RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: true,
+            workspaceId: task?.workspaceID.value.uuidString,
+            settings: settings
+        ) else { return }
+        let content = RemoteCodeNotificationContent(
+            identifier: "scheduled_task_run.\(run.id.uuidString).failed",
+            title: "Scheduled task failed",
+            body: "A scheduled task failed.",
+            categoryIdentifier: "",
+            threadIdentifier: "",
+            userInfo: ["activityItemId": "scheduled-occurrence:\(run.id.uuidString.lowercased())", "workspaceId": task?.workspaceID.value.uuidString ?? "", "outcome": "failed"],
+            soundEnabled: settings.notificationSoundEnabled
+        )
+        SystemNotifier.shared.post(content, settings: settings)
     }
 
     nonisolated private func reconcileNextRunDates(now: Date) throws {

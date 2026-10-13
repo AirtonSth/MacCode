@@ -41,6 +41,10 @@ final class SettingsStoreTests: XCTestCase {
         let d = s.load()
         XCTAssertEqual(d, AppSettings(), "absent settings must be the documented defaults")
         XCTAssertFalse(d.diffWordWrap)
+        XCTAssertTrue(d.notificationActionAlertsEnabled)
+        XCTAssertTrue(d.notificationCompletionAlertsEnabled)
+        XCTAssertFalse(d.notificationSoundEnabled)
+        XCTAssertEqual(d.notificationMutedWorkspaceIDs, [])
         XCTAssertEqual(d.sidebarSort, "updated")
         XCTAssertFalse(d.insomniaEnabled)
         XCTAssertTrue(d.insomniaAllowDisplaySleep)
@@ -74,6 +78,10 @@ final class SettingsStoreTests: XCTestCase {
             insomniaAllowDisplaySleep: false,
             insomniaAllowSystemSleepWhenDisplayClosed: true,
             insomniaAllowScreenSaverAfter45MinutesOfInactivity: false,
+            notificationActionAlertsEnabled: false,
+            notificationCompletionAlertsEnabled: false,
+            notificationSoundEnabled: true,
+            notificationMutedWorkspaceIDs: ["workspace-a", "workspace-b"],
             terminalFontSize: 16,
             petEnabled: true,
             petAnimationsEnabled: false,
@@ -98,6 +106,10 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(r.petSize, 1.5)
         XCTAssertEqual(r.petAttentionFilter, "needsYou")
         XCTAssertTrue(r.petReduceMotion)
+        XCTAssertFalse(r.notificationActionAlertsEnabled)
+        XCTAssertFalse(r.notificationCompletionAlertsEnabled)
+        XCTAssertTrue(r.notificationSoundEnabled)
+        XCTAssertEqual(r.notificationMutedWorkspaceIDs, ["workspace-a", "workspace-b"])
     }
 
     func test_updatePreservesOtherFields() throws {
@@ -154,6 +166,10 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(r.diffWordWrap, "older settings blobs must not be discarded when new Insomnia fields are absent")
         XCTAssertEqual(r.sidebarSort, "manual")
         XCTAssertFalse(r.insomniaEnabled)
+        XCTAssertTrue(r.notificationActionAlertsEnabled)
+        XCTAssertTrue(r.notificationCompletionAlertsEnabled)
+        XCTAssertFalse(r.notificationSoundEnabled)
+        XCTAssertEqual(r.notificationMutedWorkspaceIDs, [])
         XCTAssertTrue(r.insomniaAllowDisplaySleep)
         XCTAssertFalse(r.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertTrue(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)

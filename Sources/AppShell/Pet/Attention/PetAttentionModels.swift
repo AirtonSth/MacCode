@@ -92,14 +92,11 @@ public enum PetAttentionItemKind: Sendable, Equatable {
         }
     }
 
-    /// Mark all viewed dismisses every row except live provider approvals/questions,
-    /// which only an answer resolves.
+    /// Legacy bulk-viewability predicate; no Pet UI control exposes it.
     public var isBulkViewable: Bool {
         switch self {
-        case .callback(_, let isStale):
-            return isStale
-        case .agentOutcome, .notification:
-            return true
+        case .callback(_, let isStale): return isStale
+        case .agentOutcome, .notification: return true
         }
     }
 }

@@ -51,6 +51,10 @@ public struct AppSettingsKeys {
         "diffIgnoreWhitespace",
         "sidebarSort",
         "insomniaEnabled",
+        "notificationActionAlertsEnabled",
+        "notificationCompletionAlertsEnabled",
+        "notificationSoundEnabled",
+        "notificationMutedWorkspaceIDs",
         "insomniaAllowDisplaySleep",
         "insomniaAllowSystemSleepWhenDisplayClosed",
         "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
@@ -739,6 +743,29 @@ public final class SettingsViewModel: ObservableObject {
     public func setInsomniaAllowScreenSaverAfter45MinutesOfInactivity(_ on: Bool) {
         appSettings.insomniaAllowScreenSaverAfter45MinutesOfInactivity = on
         settingsStore.update { $0.insomniaAllowScreenSaverAfter45MinutesOfInactivity = on }
+    }
+
+    public func setNotificationActionAlertsEnabled(_ on: Bool) {
+        appSettings.notificationActionAlertsEnabled = on
+        settingsStore.update { $0.notificationActionAlertsEnabled = on }
+    }
+
+    public func setNotificationCompletionAlertsEnabled(_ on: Bool) {
+        appSettings.notificationCompletionAlertsEnabled = on
+        settingsStore.update { $0.notificationCompletionAlertsEnabled = on }
+    }
+
+    public func setNotificationSoundEnabled(_ on: Bool) {
+        appSettings.notificationSoundEnabled = on
+        settingsStore.update { $0.notificationSoundEnabled = on }
+    }
+
+    public func setNotificationWorkspaceMuted(_ workspaceID: String, muted: Bool) {
+        var ids = Set(appSettings.notificationMutedWorkspaceIDs)
+        if muted { ids.insert(workspaceID) } else { ids.remove(workspaceID) }
+        let value = ids.sorted()
+        appSettings.notificationMutedWorkspaceIDs = value
+        settingsStore.update { $0.notificationMutedWorkspaceIDs = value }
     }
 
     public func setTerminalFontSize(_ size: Double) {
@@ -2356,6 +2383,28 @@ extension SettingsView {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.danger)
                     .accessibilityIdentifier("settings.notifications.deniedNote")
+            }
+            Toggle("Action and failure alerts", isOn: Binding(
+                get: { vm.appSettings.notificationActionAlertsEnabled },
+                set: { vm.setNotificationActionAlertsEnabled($0) }
+            )).accessibilityIdentifier("settings.notifications.actionAlerts")
+            Toggle("Completion alerts", isOn: Binding(
+                get: { vm.appSettings.notificationCompletionAlertsEnabled },
+                set: { vm.setNotificationCompletionAlertsEnabled($0) }
+            )).accessibilityIdentifier("settings.notifications.completionAlerts")
+            Toggle("Play notification sound", isOn: Binding(
+                get: { vm.appSettings.notificationSoundEnabled },
+                set: { vm.setNotificationSoundEnabled($0) }
+            )).accessibilityIdentifier("settings.notifications.sound")
+            let workspaces = vm.context.state.workspaces.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            if !workspaces.isEmpty {
+                Text("Muted workspaces").font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textSecondary)
+                ForEach(workspaces) { workspace in
+                    Toggle(workspace.name, isOn: Binding(
+                        get: { vm.appSettings.notificationMutedWorkspaceIDs.contains(workspace.id.description) },
+                        set: { vm.setNotificationWorkspaceMuted(workspace.id.description, muted: $0) }
+                    ))
+                }
             }
         }
     }

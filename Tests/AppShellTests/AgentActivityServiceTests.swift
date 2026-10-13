@@ -1,0 +1,318 @@
+import XCTest
+@testable import AppShell
+import CoreModel
+import Persistence
+import RemoteCodeTreaty
+import SocketServer
+
+@MainActor
+final class AgentActivityServiceTests: XCTestCase {
+    func test_acknowledgingFailurePreservesFailedRunAndRemovesNeedsYou() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let run = try makeRun(context, thread: thread, status: .failed, at: 100)
+        try insertResult(context, runID: run.id)
+        XCTAssertEqual(try decodePage(service(context).list([:])).counts.needsYou, 1)
+
+        let response = try service(context).acknowledge(["item_id": .string("run:\(run.id.description)")])
+        XCTAssertEqual(response.objectValue?["acknowledged"]?.boolValue, true)
+        XCTAssertEqual(try context.runRepo.get(id: run.id)?.status, .failed)
+        let page = try decodePage(service(context).list([:]))
+        XCTAssertEqual(page.counts.finished, 1)
+        XCTAssertEqual(page.counts.needsYou, 0)
+        XCTAssertEqual(page.items.first?.state, .failed)
+    }
+
+    func test_durableRunWithoutCanonicalRuntimeIdentityIsNotReportedRunning() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let run = try makeRun(context, thread: thread, status: .running, at: 100)
+        let page = try decodePage(service(context).list([:]))
+        XCTAssertEqual(page.counts.running, 0)
+        XCTAssertEqual(page.items.first { $0.runID == run.id.value }?.state, .needsYou)
+    }
+
+    func test_pendingCallbackBlocksCanonicalRunFromRunningCountAndStaleCallbackExpires() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let running = try makeRun(context, thread: thread, status: .running, at: 100)
+        try context.providerPendingCallbackRepo.record(threadId: thread.id, request: pendingRequest("approval"))
+        try context.providerPendingCallbackRepo.record(threadId: thread.id, request: pendingRequest("stale"))
+        try context.providerPendingCallbackRepo.markStale(threadId: thread.id, requestId: "stale", kind: .approval, reason: "run ended")
+        let activity = service(context, activeRunID: running.id)
+
+        let page = try decodePage(activity.list([:]))
+        XCTAssertEqual(page.counts.running, 0)
+        XCTAssertTrue(page.items.contains { $0.runID == running.id.value && $0.blocking })
+        XCTAssertTrue(page.items.contains { $0.requestID == "approval" && $0.state == .waitingApproval })
+        XCTAssertTrue(page.items.contains { $0.requestID == "stale" && $0.state == .expired && $0.needsAction })
+        XCTAssertNil(page.items.first(where: { $0.requestID == "stale" })?.runID)
+    }
+
+    func test_notificationKeepsCustomIDUsesSafeTypeAndDedupesOnlyProvenRunOrRequest() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let run = try makeRun(context, thread: thread, status: .completed, at: 100)
+        try insertResult(context, runID: run.id)
+        let notifications = NotificationRepository(db: context.db)
+        try notifications.insert(AppNotification(id: "external:custom", title: "PRIVATE title", body: "PRIVATE body", category: PetNotificationCategory.gitCompleted.rawValue, createdAt: Date(timeIntervalSince1970: 500)))
+        try notifications.insert(AppNotification(id: "duplicate-run", title: "ignored", body: "{\"run_id\":\"\(run.id.description)\"}", category: PetNotificationCategory.gitCompleted.rawValue))
+        try notifications.insert(AppNotification(id: "duplicate-request", title: "ignored", body: "{\"request_id\":\"known-request\",\"thread_id\":\"\(thread.id.description)\"}", category: PetNotificationCategory.gitCompleted.rawValue))
+        try context.providerPendingCallbackRepo.record(threadId: thread.id, request: pendingRequest("known-request"))
+
+        let page = try decodePage(service(context, activeRunID: run.id).list([:]))
+        let notification = try XCTUnwrap(page.items.first { $0.id == "notification:external:custom" })
+        XCTAssertEqual(notification.title, PetNotificationCategory.gitCompleted.presentation.title)
+        XCTAssertEqual(notification.notificationID, "external:custom")
+        XCTAssertNil(notification.summary)
+        XCTAssertFalse(page.items.contains { $0.id == "notification:duplicate-run" })
+        XCTAssertFalse(page.items.contains { $0.id == "notification:duplicate-request" })
+        let serialized = String(decoding: try JSONEncoder().encode(page), as: UTF8.self)
+        XCTAssertFalse(serialized.contains("PRIVATE"))
+    }
+
+    func test_projectScriptRecorderSummaryKeepsCanonicalOutcomeAndExitCodeOnly() throws {
+        let context = try makeContext()
+        let workspaceID = WorkspaceID()
+        let surfaceID = SurfaceID()
+        let event = EventBus.Event(seq: 42, kind: "project.script.finished", payload: .object([
+            "workspace_id": .string(workspaceID.value.uuidString),
+            "surface_id": .string(surfaceID.value.uuidString),
+            "result": .string("failure"),
+            "exit_code": .number(7),
+            "name": .string("PRIVATE script"),
+            "output": .string("PRIVATE transcript")
+        ]), ts: 100)
+        let recorded = try XCTUnwrap(try PetTerminalNotificationRecorder(repository: NotificationRepository(db: context.db)).record(event: event))
+        let item = try XCTUnwrap(decodePage(service(context).list([:])).items.first { $0.notificationID == recorded.id })
+        XCTAssertEqual(item.state, .failed)
+        XCTAssertEqual(item.summary, "Project script failed (exit code 7)")
+        XCTAssertFalse(item.summary?.contains("PRIVATE") ?? true)
+    }
+
+    func test_scopedCountsAndFractionalCursorFreezeNewArrivals() throws {
+        let context = try makeContext()
+        let workspaceA = WorkspaceID()
+        let workspaceB = WorkspaceID()
+        let firstThread = try makeThread(context, workspace: workspaceA)
+        let secondThread = try makeThread(context, workspace: workspaceB)
+        _ = try makeRun(context, thread: firstThread, status: .completed, at: 100.125)
+        _ = try makeRun(context, thread: firstThread, status: .failed, at: 100.875)
+        _ = try makeRun(context, thread: secondThread, status: .completed, at: 100.5)
+        let activity = service(context)
+        let first = try decodePage(activity.list(["workspace_id": .string(workspaceA.description), "section": .string("finished"), "limit": .number(1)]))
+        XCTAssertEqual(first.counts.finished, 2)
+        XCTAssertEqual(first.items.count, 1)
+        let cursor = try XCTUnwrap(first.nextCursor)
+        _ = try makeRun(context, thread: firstThread, status: .completed, at: Date().addingTimeInterval(60).timeIntervalSince1970)
+        let next = try decodePage(activity.list(["workspace_id": .string(workspaceA.description), "section": .string("finished"), "limit": .number(1), "cursor": .string(cursor)]))
+        XCTAssertEqual(next.counts.finished, 2)
+        XCTAssertEqual(next.items.count, 1)
+        XCTAssertNotEqual(next.items.first?.id, first.items.first?.id)
+    }
+
+    func test_legacyTerminalRunViewedCreatesResultWithoutSummaryAndRestoreCanClear() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let run = try makeRun(context, thread: thread, status: .completed, at: 100)
+        let runItemID = "run:\(run.id.description)"
+
+        let viewed = try service(context).setViewed(["item_ids": .array([.string(runItemID)]), "viewed": .bool(true)])
+        XCTAssertEqual(viewed.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue), [runItemID])
+        let row = try XCTUnwrap(AgentRunResultRepository(db: context.db).get(runId: run.id))
+        XCTAssertNotNil(row.viewedAt)
+        XCTAssertNil(row.summary)
+
+        _ = try service(context).setViewed([
+            "item_ids": .array([.string(runItemID)]), "viewed": .bool(false),
+            "restore_viewed_at": .object([runItemID: .null])
+        ])
+        XCTAssertNil(try AgentRunResultRepository(db: context.db).get(runId: run.id)?.viewedAt)
+    }
+
+    func test_checkpointEvidenceLinksOnlyByExactRunID() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let first = try makeRun(context, thread: thread, status: .completed, at: 100)
+        let second = try makeRun(context, thread: thread, status: .completed, at: 101)
+        try insertCheckpoint(context, runID: first.id, threadID: thread.id, file: "first.swift", sequence: 1, turnID: "provider-turn-a")
+        try insertCheckpoint(context, runID: second.id, threadID: thread.id, file: "second.swift", sequence: 2, turnID: "provider-turn-b")
+
+        let page = try decodePage(service(context).list([:]))
+        let firstItem = try XCTUnwrap(page.items.first { $0.runID == first.id.value })
+        let secondItem = try XCTUnwrap(page.items.first { $0.runID == second.id.value })
+        XCTAssertEqual(firstItem.checkpointTurnCount, 1)
+        XCTAssertEqual(firstItem.changedFiles, ["first.swift"])
+        XCTAssertNil(firstItem.checkpointID)
+        XCTAssertEqual(secondItem.checkpointTurnCount, 2)
+        XCTAssertEqual(secondItem.changedFiles, ["second.swift"])
+        XCTAssertNil(secondItem.checkpointID)
+    }
+
+    func test_notificationViewedDoesNotCallFailureAcknowledgment() throws {
+        let context = try makeContext()
+        try NotificationRepository(db: context.db).insert(AppNotification(id: "custom-note", title: "safe", category: PetNotificationCategory.gitCompleted.rawValue))
+        let response = try service(context).setViewed(["item_ids": .array([.string("notification:custom-note")]), "viewed": .bool(true)])
+        XCTAssertEqual(response.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue), ["notification:custom-note"])
+        let note = try XCTUnwrap(NotificationRepository(db: context.db).list().first { $0.id == "custom-note" })
+        XCTAssertNil(note.readAt, "Viewing Activity does not resolve the canonical notification.")
+        XCTAssertNotNil(try decodePage(service(context).list([:])).items.first { $0.id == "notification:custom-note" }?.viewedAt)
+    }
+
+    func test_operationFailureViewedAndUndoNeverAcknowledgeWhileExplicitAckPreservesHistory() throws {
+        let context = try makeContext()
+        let repository = NotificationRepository(db: context.db)
+        try repository.insert(AppNotification(id: "git-failure", title: "private command", body: "{\"activity_summary\":\"Operation failed: password=private\"}", category: PetNotificationCategory.gitFailed.rawValue))
+        let activity = service(context)
+        let storedOperation = try XCTUnwrap(decodePage(activity.list([:])).items.first { $0.id == "notification:git-failure" })
+        XCTAssertEqual(storedOperation.summary, "Operation failed: [REDACTED]")
+        let id = "notification:git-failure"
+        let initial = try decodePage(activity.list([:]))
+        XCTAssertEqual(initial.counts.finished, 1)
+        XCTAssertEqual(initial.counts.needsYou, 1)
+        XCTAssertEqual(initial.counts.newResults, 1)
+        _ = try activity.setViewed(["item_ids": .array([.string(id)]), "viewed": .bool(true)])
+        let seen = try decodePage(activity.list([:]))
+        XCTAssertEqual(seen.counts.needsYou, 1, "Reading must not resolve a failure.")
+        XCTAssertEqual(seen.counts.newResults, 0)
+        XCTAssertEqual(seen.items.first?.state, .failed)
+        _ = try activity.setViewed(["item_ids": .array([.string(id)]), "viewed": .bool(false), "restore_viewed_at": .object([id: .null])])
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.newResults, 1)
+        _ = try activity.acknowledge(["item_id": .string(id)])
+        let acknowledged = try decodePage(activity.list([:]))
+        XCTAssertEqual(acknowledged.counts.needsYou, 0)
+        XCTAssertEqual(acknowledged.counts.finished, 1)
+        XCTAssertEqual(acknowledged.items.first?.state, .failed)
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(acknowledged), as: UTF8.self).contains("private"))
+    }
+
+    func test_botNotificationMetadataRoutesExactBotWithoutLinkedRun() throws {
+        let context = try makeContext()
+        let botID = UUID()
+        let notificationID = "bot-notification"
+        try NotificationRepository(db: context.db).insert(AppNotification(
+            id: notificationID, title: "private title", body: "private body", category: "RemoteCodeThreadUpdate"
+        ))
+        try BotAttentionNotificationMetadataStore(db: context.db).record(BotAttentionNotificationMetadata(
+            notificationID: notificationID, profileID: UUID().uuidString, hostID: UUID().uuidString,
+            attentionItemID: UUID().uuidString, botID: botID.uuidString, source: "test"
+        ))
+        let item = try XCTUnwrap(decodePage(service(context).list([:])).items.first { $0.id == "notification:\(notificationID)" })
+        XCTAssertEqual(item.botID, botID)
+        XCTAssertNil(item.runID)
+        XCTAssertNil(item.threadID)
+        XCTAssertNil(item.conversationID)
+    }
+
+    func test_unknownNotificationRemainsVisibleWithSafeCanonicalTitle() throws {
+        let context = try makeContext()
+        try NotificationRepository(db: context.db).insert(AppNotification(id: "thread-update", title: "private title", body: "private body", category: "RemoteCodeThreadUpdate"))
+        let item = try XCTUnwrap(decodePage(service(context).list([:])).items.first { $0.id == "notification:thread-update" })
+        XCTAssertEqual(item.title, "Notification")
+        XCTAssertFalse(item.needsAction)
+        XCTAssertNil(item.summary)
+    }
+
+    func test_fileConflictReadAtDoesNotBecomeActivitySeenState() throws {
+        let context = try makeContext()
+        let repository = NotificationRepository(db: context.db)
+        try repository.insert(AppNotification(id: "resolved-conflict", title: "safe", category: PetNotificationCategory.fileConflict.rawValue, readAt: Date(timeIntervalSince1970: 100)))
+        let item = try XCTUnwrap(decodePage(service(context).list([:])).items.first { $0.id == "notification:resolved-conflict" })
+        XCTAssertNil(item.viewedAt, "Canonical conflict resolution must not mark Activity result as seen.")
+        XCTAssertEqual(item.state, .completed)
+        XCTAssertFalse(item.needsAction)
+    }
+
+    func test_unresolvedFileConflictReadViaActivityRemainsNeedsYou() throws {
+        let context = try makeContext()
+        let repository = NotificationRepository(db: context.db)
+        try repository.insert(AppNotification(id: "unresolved-conflict", title: "safe", category: PetNotificationCategory.fileConflict.rawValue))
+        let activity = service(context)
+        _ = try activity.setViewed(["item_ids": .array([.string("notification:unresolved-conflict")]), "viewed": .bool(true)])
+        let item = try XCTUnwrap(decodePage(activity.list([:])).items.first { $0.id == "notification:unresolved-conflict" })
+        XCTAssertEqual(item.state, .needsYou)
+        XCTAssertTrue(item.needsAction)
+    }
+
+    func test_resurfacedNotificationStartsNewActivityOccurrence() throws {
+        let context = try makeContext()
+        let repository = NotificationRepository(db: context.db)
+        let old = AppNotification(id: "resurface", title: "safe", category: PetNotificationCategory.gitFailed.rawValue)
+        try repository.insert(old)
+        let activity = service(context)
+        _ = try activity.setViewed(["item_ids": .array([.string("notification:resurface")]), "viewed": .bool(true)])
+        XCTAssertNotNil(try decodePage(activity.list([:])).items.first { $0.id == "notification:resurface" }?.viewedAt)
+        try repository.resurface(AppNotification(id: "resurface", title: "safe", category: PetNotificationCategory.gitFailed.rawValue, createdAt: Date().addingTimeInterval(10)))
+        XCTAssertNil(try decodePage(activity.list([:])).items.first { $0.id == "notification:resurface" }?.viewedAt)
+    }
+
+    func test_fileConflictSurvivesReadAndCannotBeAcknowledgedAsAnOutcome() throws {
+        let context = try makeContext()
+        let repository = NotificationRepository(db: context.db)
+        try repository.insert(AppNotification(id: "conflict", title: "private file", category: PetNotificationCategory.fileConflict.rawValue))
+        let activity = service(context)
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 1)
+        _ = try activity.setViewed(["item_ids": .array([.string("notification:conflict")]), "viewed": .bool(true)])
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 1, "Viewing conflict must not resolve canonical conflict state.")
+        XCTAssertThrowsError(try activity.acknowledge(["item_id": .string("notification:conflict")]))
+        try repository.dismiss(id: "conflict")
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 0)
+    }
+
+    private func makeContext() throws -> AppContext {
+        try AppContext(channel: .debug, appSupportOverride: NSTemporaryDirectory() + "activity-" + UUID().uuidString)
+    }
+    private func makeThread(_ context: AppContext, workspace: WorkspaceID? = nil) throws -> AgentThread {
+        let thread = AgentThread(workspaceId: workspace, title: "Activity test", provider: .codex, model: "test")
+        try context.threadRepo.upsert(thread)
+        return thread
+    }
+    private func makeRun(_ context: AppContext, thread: AgentThread, status: AgentRunStatus, at time: TimeInterval) throws -> AgentRun {
+        let date = Date(timeIntervalSince1970: time)
+        let run = AgentRun(threadId: thread.id, provider: .codex, model: "test", status: status, startedAt: date, finishedAt: status == .running || status == .pending ? nil : date)
+        try context.runRepo.upsert(run)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let stamp = formatter.string(from: date)
+        let statement = try context.db.prepare("UPDATE agent_runs SET started_at = ?, finished_at = ? WHERE id = ?;")
+        try statement.bind(1, stamp)
+        try statement.bind(2, run.finishedAt == nil ? nil : stamp)
+        try statement.bind(3, run.id.description)
+        _ = try statement.step()
+        return run
+    }
+    private func insertResult(_ context: AppContext, runID: AgentRunID) throws {
+        let statement = try context.db.prepare("INSERT OR IGNORE INTO agent_run_results(run_id) VALUES (?);")
+        try statement.bind(1, runID.description)
+        _ = try statement.step()
+    }
+    private func insertCheckpoint(_ context: AppContext, runID: AgentRunID, threadID: AgentThreadID, file: String, sequence: Int, turnID: String? = nil) throws {
+        let turnID = turnID ?? UUID().uuidString
+        let files = [AgentTurnCheckpointFile(path: file, kind: "modified", additions: 1, deletions: 0)]
+        let filesJSON = String(decoding: try JSONEncoder().encode(files), as: UTF8.self)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let statement = try context.db.prepare("""
+            INSERT INTO agent_turn_checkpoints(thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, completed_at, created_at)
+            VALUES (?, ?, ?, ?, 'test-ref', 'ready', ?, ?, ?);
+            """)
+        try statement.bind(1, threadID.description)
+        try statement.bind(2, runID.description)
+        try statement.bind(3, turnID)
+        try statement.bind(4, sequence)
+        try statement.bind(5, filesJSON)
+        try statement.bind(6, formatter.string(from: Date()))
+        try statement.bind(7, formatter.string(from: Date()))
+        _ = try statement.step()
+    }
+    private func pendingRequest(_ id: String) -> AssistantPendingRequest {
+        AssistantPendingRequest(id: id, turnId: nil, kind: .commandExecution, title: "not exposed", createdAtMs: 1)
+    }
+    private func service(_ context: AppContext, activeRunID: AgentRunID? = nil) -> ActivityService {
+        ActivityService(context: context, activeRunIDProvider: { _ in activeRunID })
+    }
+    private func decodePage(_ value: JSONValue) throws -> AgentActivityPage {
+        let decoder = AgentActivityPage.makeJSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(AgentActivityPage.self, from: JSONEncoder().encode(value))
+    }
+}

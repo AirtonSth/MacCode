@@ -54,7 +54,9 @@ public enum Schema {
     static let botConversationRoutingSchemaVersion = 89
     /// v90 adds agent_threads.parent_thread_id / is_ephemeral for forked and side threads.
     static let threadForkColumnsSchemaVersion = 90
-    public static let currentVersion: Int = threadForkColumnsSchemaVersion
+    /// v91 adds durable per-run result and read/acknowledgment projection.
+    private static let agentRunResultsSchemaVersion = 91
+    public static let currentVersion: Int = agentRunResultsSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1810,6 +1812,25 @@ public enum Schema {
         SchemaStep(threadForkColumnsSchemaVersion, """
         ALTER TABLE agent_threads ADD COLUMN parent_thread_id TEXT;
         ALTER TABLE agent_threads ADD COLUMN is_ephemeral INTEGER NOT NULL DEFAULT 0;
+        """),
+        SchemaStep(agentRunResultsSchemaVersion, """
+        CREATE TABLE IF NOT EXISTS agent_run_results (
+            run_id TEXT PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
+            final_message_id TEXT,
+            summary TEXT,
+            viewed_at TEXT,
+            attention_acknowledged_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_run_results_viewed
+            ON agent_run_results(viewed_at, run_id);
+        INSERT OR IGNORE INTO agent_run_results(run_id)
+            SELECT id FROM agent_runs
+            WHERE status IN ('completed', 'failed', 'cancelled', 'interrupted');
+        CREATE TABLE IF NOT EXISTS activity_notification_state (
+            item_id TEXT PRIMARY KEY,
+            viewed_at TEXT,
+            acknowledged_at TEXT
+        );
         """),
     ]
 

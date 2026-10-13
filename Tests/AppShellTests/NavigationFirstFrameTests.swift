@@ -201,13 +201,16 @@ extension ActiveThreadsWindowTests {
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
-                .appendingPathComponent("Sources/AppShell/ActiveThreadsWindow.swift"),
+                .appendingPathComponent("Sources/AppShell/ActivityWindow.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(source.contains("loadImmediately: Bool = true"))
-        XCTAssertTrue(source.contains("public func scheduleFreshnessPass()"))
-        XCTAssertTrue(source.contains(".onAppear { vm.scheduleFreshnessPass() }"))
-        XCTAssertTrue(source.contains("navigationTask"))
+        XCTAssertTrue(source.contains(".onAppear {") && source.contains("else { model.refreshAfterFrame() }"),
+                      "ActivityRootView owns its deferred initial refresh")
+        XCTAssertTrue(source.contains("if !applyingInitialTabChoice { refreshAfterFrame() }"),
+                      "tab changes must refresh the selected Activity section after acknowledgement")
+        XCTAssertTrue(source.contains("func refreshAfterFrame()"))
+        XCTAssertTrue(source.contains("Self.listParams(tab: self.tab"),
+                      "refresh must request the currently selected Activity section")
     }
 
     func test_activeThreadsTabSwitchUsesScopedDeferredRefresh_becauseOnlyVisibleProjectionNeedsHydration() throws {
@@ -216,17 +219,15 @@ extension ActiveThreadsWindowTests {
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
-                .appendingPathComponent("Sources/AppShell/ActiveThreadsWindow.swift"),
+                .appendingPathComponent("Sources/AppShell/ActivityWindow.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(source.contains("public func scheduleTabRefresh(_ tab: Tab)"))
-        XCTAssertTrue(source.contains("tabRefreshGeneration &+= 1"))
-        XCTAssertTrue(source.contains("self.selectedTab == tab"))
-        XCTAssertTrue(source.contains("vm.scheduleTabRefresh(tab)"))
-        XCTAssertFalse(
-            source.contains("if vm.deferHydration { vm.scheduleFreshnessPass() }"),
-            "switching tabs must not rebuild both active and finished projections"
-        )
+        XCTAssertTrue(source.contains("var tab: Tab { didSet"),
+                      "tab choice must publish before its freshness request")
+        XCTAssertTrue(source.contains("if !applyingInitialTabChoice { refreshAfterFrame() }"))
+        XCTAssertTrue(source.contains("func refreshAfterFrame()"))
+        XCTAssertTrue(source.contains("Self.listParams(tab: self.tab"),
+                      "freshness must request the currently selected Activity section")
     }
 
     func test_activeThreadOpenDefersExactRoute() throws {

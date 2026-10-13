@@ -225,8 +225,7 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
         phase: AgentRunStatus,
         now: Date = Date()
     ) -> PrivateLiveActivitySnapshot? {
-        let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayTitle = (normalizedTitle?.isEmpty == false) ? normalizedTitle! : "Thread"
+        let displayTitle = "Run"
         let mappedPhase: String
         let petState: String
         let statusLine: String
@@ -1390,23 +1389,8 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         _ content: RemoteCodeNotificationContent,
         phase: AgentRunStatus
     ) async {
-        // F5: only a card that is active for this phone hides the banner; the wake below is inside the hourly budget.
-        let armed = isLiveActivityActiveForPushTarget()
-        guard RemoteCodeNotificationContent.AgentAppPushPolicy
-            .shouldDeliverRemoteFinishAlert(
-                phase: phase,
-                liveActivityUpdateChannelArmed: armed
-            ) else {
-            Self.log.info(
-                "remote_finish_alert_suppressed reason=live_activity_channel_armed phase=\(String(describing: phase), privacy: .public) id=\(content.identifier, privacy: .public)"
-            )
-            await deliverSilentCatchUp(
-                hostHint: content.userInfo["workspaceId"] ?? content.identifier,
-                force: true,
-                coalesceClass: .other
-            )
-            return
-        }
+        guard RemoteCodeNotificationContent.AgentAppPushPolicy.shouldNotifyThreadOutcome(phase: phase, isNestedWorker: false) else { return }
+        // ponytail: Keep alerts until a durable receipt proves same-occurrence Live Activity coverage.
         await deliver(content)
     }
 

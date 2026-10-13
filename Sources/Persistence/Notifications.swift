@@ -54,21 +54,28 @@ public final class NotificationRepository {
     /// Durable replay uses `insertIfAbsent` instead so an acknowledged historical
     /// event cannot resurrect itself during startup recovery.
     public func resurface(_ n: AppNotification) throws {
-        let st = try db.prepare("""
-            INSERT INTO notifications(id, workspace_id, surface_id, title, body, category, created_at, read_at, dismissed_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                workspace_id=excluded.workspace_id,
-                surface_id=excluded.surface_id,
-                title=excluded.title,
-                body=excluded.body,
-                category=excluded.category,
-                created_at=excluded.created_at,
-                read_at=excluded.read_at,
-                dismissed_at=excluded.dismissed_at;
-        """)
-        try bind(n, to: st)
-        _ = try st.step()
+        try db.performSync { database in
+            try database.transaction {
+                let st = try database.prepare("""
+                    INSERT INTO notifications(id, workspace_id, surface_id, title, body, category, created_at, read_at, dismissed_at)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        workspace_id=excluded.workspace_id,
+                        surface_id=excluded.surface_id,
+                        title=excluded.title,
+                        body=excluded.body,
+                        category=excluded.category,
+                        created_at=excluded.created_at,
+                        read_at=excluded.read_at,
+                        dismissed_at=excluded.dismissed_at;
+                """)
+                try bind(n, to: st)
+                _ = try st.step()
+                let activityState = try database.prepare("DELETE FROM activity_notification_state WHERE item_id = ?;")
+                try activityState.bind(1, n.id)
+                _ = try activityState.step()
+            }
+        }
     }
 
     private func bind(_ notification: AppNotification, to statement: SQLiteStatement) throws {
@@ -87,6 +94,13 @@ public final class NotificationRepository {
     /// prevent unbounded query cost on long-lived installs where dismissed rows
     /// accumulate indefinitely (dismissed rows are excluded by the WHERE clause
     /// but un-dismissed rows are not pruned elsewhere).
+    public func get(id: String) throws -> AppNotification? {
+        let st = try db.prepare("SELECT id, workspace_id, surface_id, title, body, category, created_at, read_at, dismissed_at FROM notifications WHERE id = ? LIMIT 1;")
+        try st.bind(1, id)
+        guard try st.step() else { return nil }
+        return decode(st)
+    }
+
     public func list(workspaceId: WorkspaceID? = nil, unreadOnly: Bool = false, limit: Int = 200) throws -> [AppNotification] {
         var sql = "SELECT id, workspace_id, surface_id, title, body, category, created_at, read_at, dismissed_at FROM notifications WHERE dismissed_at IS NULL"
         if workspaceId != nil { sql += " AND workspace_id = ?" }
@@ -98,21 +112,25 @@ public final class NotificationRepository {
         try st.bind(p, Int64(max(1, limit)))
         var out: [AppNotification] = []
         while try st.step() {
-            let wid = (st.columnText(1)).flatMap { UUID(uuidString: $0) }.map { WorkspaceID($0) }
-            let sid = (st.columnText(2)).flatMap { UUID(uuidString: $0) }.map { SurfaceID($0) }
-            out.append(AppNotification(
-                id: st.columnText(0) ?? "",
-                workspaceId: wid,
-                surfaceId: sid,
-                title: st.columnText(3) ?? "",
-                body: st.columnText(4),
-                category: st.columnText(5),
-                createdAt: iso.date(from: st.columnText(6) ?? "") ?? Date(),
-                readAt: (st.columnText(7)).flatMap { iso.date(from: $0) },
-                dismissedAt: (st.columnText(8)).flatMap { iso.date(from: $0) }
-            ))
+            out.append(decode(st))
         }
         return out
+    }
+
+    private func decode(_ st: SQLiteStatement) -> AppNotification {
+        let wid = st.columnText(1).flatMap { UUID(uuidString: $0) }.map(WorkspaceID.init)
+        let sid = st.columnText(2).flatMap { UUID(uuidString: $0) }.map(SurfaceID.init)
+        return AppNotification(
+            id: st.columnText(0) ?? "",
+            workspaceId: wid,
+            surfaceId: sid,
+            title: st.columnText(3) ?? "",
+            body: st.columnText(4),
+            category: st.columnText(5),
+            createdAt: iso.date(from: st.columnText(6) ?? "") ?? Date(),
+            readAt: st.columnText(7).flatMap { iso.date(from: $0) },
+            dismissedAt: st.columnText(8).flatMap { iso.date(from: $0) }
+        )
     }
 
     public func markRead(id: String) throws {

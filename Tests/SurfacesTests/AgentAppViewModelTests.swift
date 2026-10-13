@@ -5694,6 +5694,108 @@ final class AgentAppViewModelTests: XCTestCase {
                       "every body stays hydrated — no eviction that would change a row's height on scroll")
     }
 
+    func test_revealMessagePagesToExactOlderRunFinalInsteadOfNewestRun() async throws {
+        // WHY: Activity targets durable run-message IDs; paging must expose that exact older run,
+        // not substitute the newest final from a later run in the same thread.
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "two runs")
+        let threadID = try XCTUnwrap(vm.selectedThreadId)
+        let base = Date(timeIntervalSince1970: 2_000_000)
+        let olderRun = AgentRunID()
+        let newerRun = AgentRunID()
+        let olderFinal = AgentMessage(
+            id: AgentMessageID(olderRun.value), threadId: threadID, role: .assistant,
+            content: "older final", createdAt: base
+        )
+        try vm.messageRepo.append(olderFinal)
+        for index in 0..<(AgentAppViewModel.messageHistoryPageLimit - 1) {
+            try vm.messageRepo.append(AgentMessage(
+                threadId: threadID, role: .user, content: "between \(index)",
+                createdAt: base.addingTimeInterval(Double(index + 1))
+            ))
+        }
+        let newerFinal = AgentMessage(
+            id: AgentMessageID(newerRun.value), threadId: threadID, role: .assistant,
+            content: "newer final", createdAt: base.addingTimeInterval(30)
+        )
+        try vm.messageRepo.append(newerFinal)
+        vm.selectThread(threadID, markRead: false)
+
+        try await vm.revealMessage(id: olderFinal.id)
+
+        XCTAssertTrue(vm.messages.contains(where: { $0.id == olderFinal.id }))
+        XCTAssertEqual(vm.messageScrollTarget?.anchor, "message-\(olderFinal.id.value.uuidString)")
+        XCTAssertNotEqual(vm.messageScrollTarget?.anchor, "message-\(newerFinal.id.value.uuidString)")
+    }
+
+    func test_revealMessageRejectsSelectionChangedDuringLookup() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "A")
+        let threadA = try XCTUnwrap(vm.selectedThreadId)
+        let message = AgentMessage(threadId: threadA, role: .user, content: "target")
+        try vm.messageRepo.append(message)
+        let threadB = AgentThread(workspaceId: vm.workspaceID, title: "B", provider: .codex, model: "gpt-5.5")
+        try vm.threadRepo.upsert(threadB)
+
+        let lookupStarted = expectation(description: "lookup paused")
+        var releaseLookup: CheckedContinuation<Void, Never>?
+        vm.beforeMessageRevealLookupForTesting = {
+            lookupStarted.fulfill()
+            await withCheckedContinuation { releaseLookup = $0 }
+        }
+        let reveal = Task { @MainActor in
+            try await vm.revealMessage(id: message.id)
+        }
+        await fulfillment(of: [lookupStarted])
+        vm.selectThread(threadB.id, markRead: false)
+        releaseLookup?.resume()
+        do {
+            try await reveal.value
+            XCTFail("newer selection must reject stale reveal")
+        } catch let error as AgentAppSurfaceMessageRevealError {
+            guard case .selectionChanged = error else { return XCTFail("unexpected reveal error: \(error)") }
+        }
+        XCTAssertEqual(vm.selectedThreadId, threadB.id)
+        XCTAssertNil(vm.messageScrollTarget)
+    }
+
+    func test_revealMessageRejectsMismatchedExpectedThreadBeforeSelection() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "selected")
+        let selected = try XCTUnwrap(vm.selectedThreadId)
+        let other = AgentThread(workspaceId: vm.workspaceID, title: "other", provider: .codex, model: "gpt-5.5")
+        try vm.threadRepo.upsert(other)
+        let message = AgentMessage(threadId: other.id, role: .user, content: "target")
+        try vm.messageRepo.append(message)
+
+        do {
+            try await vm.revealMessage(id: message.id, expectedThreadID: selected)
+            XCTFail("mismatched expected thread must reject reveal")
+        } catch let error as AgentAppSurfaceMessageRevealError {
+            guard case .messageNotFound(let id) = error else { return XCTFail("unexpected reveal error: \(error)") }
+            XCTAssertEqual(id, message.id)
+        }
+        XCTAssertEqual(vm.selectedThreadId, selected)
+        XCTAssertNil(vm.messageScrollTarget)
+    }
+
+    func test_revealMessageMissingIDThrowsInsteadOfChoosingNewest() async throws {
+        // WHY: deleted Activity targets must report failure, never jump to a plausible but wrong message.
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "missing target")
+        let missingID = AgentMessageID()
+        do {
+            try await vm.revealMessage(id: missingID)
+            XCTFail("missing message must return explicit error")
+        } catch let error as AgentAppSurfaceMessageRevealError {
+            guard case .messageNotFound(let id) = error else {
+                return XCTFail("unexpected reveal error: \(error)")
+            }
+            XCTAssertEqual(id, missingID)
+        }
+        XCTAssertNil(vm.messageScrollTarget)
+    }
+
     // MARK: First message page state (pending / failed are not "No messages")
 
     /// The transcript's empty-placeholder decision, fed from the view model
@@ -8492,6 +8594,94 @@ final class AgentAppViewModelTests: XCTestCase {
         }
         XCTAssertEqual(checkpointRepo.fullRowListReadCountForTesting, 2,
                        "the checkpoint browser must let users inspect the file-level diff before choosing rollback")
+
+        XCTAssertEqual(vm.checkpointRevealGeneration, 0)
+        try await vm.revealCheckpoint(checkpointTurnCount: 1, expectedRunID: runId, path: "Sources/App.swift")
+        XCTAssertEqual(vm.selectedCheckpointPath, "Sources/App.swift")
+        XCTAssertEqual(vm.selectedCheckpointTurnCount, 1)
+        XCTAssertEqual(vm.checkpointRevealGeneration, 1,
+                       "a successful explicit reveal must notify the view to force the plan sidebar visible")
+        do {
+            try await vm.revealCheckpoint(checkpointTurnCount: 1, expectedRunID: AgentRunID(), path: "Sources/App.swift")
+            XCTFail("a checkpoint from another run must not be revealed")
+        } catch is AgentAppSurfaceCheckpointRevealError {
+            XCTAssertEqual(vm.selectedCheckpointPath, "Sources/App.swift")
+            XCTAssertEqual(vm.checkpointRevealGeneration, 1,
+                           "a rejected reveal must not change sidebar intent")
+        }
+    }
+
+    func test_checkpointPreviewRejectsStaleSameCountAndPathRequest() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-checkpoint-race-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "checkpoint race", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        let threadID = thread.id
+        let firstRun = AgentRunID()
+        let secondRun = AgentRunID()
+        try runRepo.upsert(AgentRun(id: firstRun, threadId: threadID, provider: .codex, model: "gpt-5.5", status: .completed))
+        try runRepo.upsert(AgentRun(id: secondRun, threadId: threadID, provider: .codex, model: "gpt-5.5", status: .completed))
+        let first = AgentTurnCheckpointSummary(
+            threadId: threadID, runId: firstRun, turnId: "first", checkpointTurnCount: 1,
+            checkpointRef: "first", status: .ready,
+            files: [AgentTurnCheckpointFile(path: "Sources/App.swift", kind: "modified", additions: 1, deletions: 0)],
+            diffPatch: "+first",
+            fileDiffs: [AgentTurnCheckpointFileDiff(path: "Sources/App.swift", patch: "+first")],
+            completedAt: Date(timeIntervalSince1970: 1)
+        )
+        let second = AgentTurnCheckpointSummary(
+            threadId: threadID, runId: secondRun, turnId: "second", checkpointTurnCount: 1,
+            checkpointRef: "second", status: .ready,
+            files: [AgentTurnCheckpointFile(path: "Sources/App.swift", kind: "modified", additions: 1, deletions: 0)],
+            diffPatch: "+second",
+            fileDiffs: [AgentTurnCheckpointFileDiff(path: "Sources/App.swift", patch: "+second")],
+            completedAt: Date(timeIntervalSince1970: 2)
+        )
+        try checkpointRepo.upsert(first)
+        try checkpointRepo.upsert(second)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID, cwd: tmp, coordinator: coordinator,
+            threadRepo: threadRepo, messageRepo: messageRepo, checkpointRepo: checkpointRepo
+        )
+        vm.selectThread(threadID, markRead: false)
+        await vm.waitForSelectThreadHydrationForTesting()
+        vm.checkpoints = [first, second]
+
+        let firstFetchStarted = expectation(description: "first preview fetch paused")
+        var releaseFirstFetch: CheckedContinuation<Void, Never>?
+        defer {
+            releaseFirstFetch?.resume()
+            releaseFirstFetch = nil
+        }
+        var shouldPauseFirstFetch = true
+        vm.beforeCheckpointPreviewFetchForTesting = { _ in
+            guard shouldPauseFirstFetch else { return }
+            shouldPauseFirstFetch = false
+            firstFetchStarted.fulfill()
+            await withCheckedContinuation { releaseFirstFetch = $0 }
+        }
+        vm.selectedCheckpointTurnCount = nil
+        vm.showPlanSidebar = true
+        vm.selectCheckpoint(first, path: "Sources/App.swift")
+        await fulfillment(of: [firstFetchStarted], timeout: 2)
+        guard releaseFirstFetch != nil else { return XCTFail("first preview fetch did not start") }
+        vm.selectCheckpoint(second, path: "Sources/App.swift")
+        try await waitForCondition(timeout: 2.0) { vm.checkpointDiffPreview.contains("+second") }
+        releaseFirstFetch?.resume()
+        releaseFirstFetch = nil
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertTrue(vm.checkpointDiffPreview.contains("+second"))
+        XCTAssertNil(vm.checkpointStatusMessage)
     }
 
     func test_selectThreadLoadsQueueAndDropsStaleOpenBundles() async throws {

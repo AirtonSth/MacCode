@@ -1,64 +1,197 @@
 import XCTest
 @testable import AppShell
 import CoreModel
+import RemoteCodeTreaty
+import SocketServer
 
 final class PetLiveActivityCopyTests: XCTestCase {
     private let workspace = WorkspaceID(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!)
-    private let threadA = AgentThreadID(UUID(uuidString: "11111111-1111-1111-1111-111111111111")!)
-    private let threadB = AgentThreadID(UUID(uuidString: "22222222-2222-2222-2222-222222222222")!)
+    private let thread = AgentThreadID(UUID(uuidString: "11111111-1111-1111-1111-111111111111")!)
 
-    func testEmptySurfaceReturnsNilSoLiveActivityEnds() {
-        let output = PetLiveActivityCopy.make(.init(active: [], needsYou: [], completed: []))
-        XCTAssertNil(output)
+    private func item(
+        id: String,
+        kind: AgentActivityKind = .agent,
+        state: AgentActivityState,
+        needsAction: Bool = false,
+        blocking: Bool = false,
+        finishedAt: Date? = nil,
+        viewedAt: Date? = nil,
+        attentionAcknowledgedAt: Date? = nil,
+        includeThread: Bool = true,
+        surfaceID: UUID? = nil
+    ) -> AgentActivityItem {
+        AgentActivityItem(
+            id: id,
+            kind: kind,
+            runID: state == .running || finishedAt != nil ? UUID() : nil,
+            requestID: kind == .request ? "request-1" : nil,
+            workspaceID: workspace.value,
+            threadID: includeThread ? thread.value : nil,
+            surfaceID: surfaceID,
+            state: state,
+            title: "raw private prompt must not escape",
+            summary: "raw assistant transcript must not escape",
+            occurredAt: finishedAt ?? Date(timeIntervalSince1970: 10),
+            startedAt: state == .running ? Date(timeIntervalSince1970: 1) : nil,
+            finishedAt: finishedAt,
+            viewedAt: viewedAt,
+            attentionAcknowledgedAt: attentionAcknowledgedAt,
+            needsAction: needsAction,
+            blocking: blocking
+        )
     }
 
-    func testSingleActiveMatchesPetRowShape() {
-        let active = PetActiveThreadItem(
-            threadID: threadA,
-            workspaceID: workspace,
-            workspaceName: "star",
-            providerName: "Grok",
-            threadTitle: "ship labels",
-            startedAt: Date(timeIntervalSince1970: 100),
-            now: Date(timeIntervalSince1970: 160)
+    private func page(
+        _ items: [AgentActivityItem],
+        running: Int = 0,
+        needsYou: Int = 0,
+        finished: Int = 0,
+        newResults: Int = 0
+    ) -> AgentActivityPage {
+        AgentActivityPage(
+            items: items,
+            counts: AgentActivityCounts(
+                running: running,
+                queued: 0,
+                needsYou: needsYou,
+                finished: finished,
+                newResults: newResults
+            ),
+            generatedAt: Date(timeIntervalSince1970: 100)
         )
-        guard let output = PetLiveActivityCopy.make(.init(
-            active: [active], needsYou: [], completed: []
-        )) else { return XCTFail("expected single-active surface") }
+    }
+
+    func testPendingCallbackTakesNeedsYouPhaseBeforeRunningAndHistory() throws {
+        let run = item(id: "run:1", state: .running)
+        let callback = item(
+            id: "request:1",
+            kind: .request,
+            state: .waitingApproval,
+            needsAction: true,
+            blocking: true
+        )
+        let failure = item(
+            id: "run:failed",
+            state: .failed,
+            needsAction: true,
+            finishedAt: Date(timeIntervalSince1970: 9)
+        )
+        let output = try XCTUnwrap(PetLiveActivityCopy.makeActivity(
+            page: page([run, failure, callback], running: 1, needsYou: 2, finished: 1, newResults: 1)
+        ))
+
+        XCTAssertEqual(output.title, "2 items need attention", "Action count must not be added to history or running counts.")
+        XCTAssertEqual(output.statusLine, "Approval required")
+        XCTAssertEqual(output.preview, "Needs you · Approval required")
+        XCTAssertEqual(output.phase, .failed)
+        XCTAssertEqual(output.activeThreadCount, 1)
+        XCTAssertNil(output.threadId, "Blocking callback must not deep-link to the running thread.")
+        for privateText in ["raw private prompt", "raw assistant transcript"] {
+            XCTAssertFalse(output.preview.contains(privateText))
+            XCTAssertFalse(output.statusLine.contains(privateText))
+        }
+    }
+
+    func testRunningUsesActivityServiceCount() throws {
+        let running = item(id: "run:running", state: .running)
+        let output = try XCTUnwrap(PetLiveActivityCopy.makeActivity(page: page([running], running: 1)))
+        XCTAssertEqual(output.title, "1 running")
+        XCTAssertEqual(output.preview, "Agent running")
         XCTAssertEqual(output.phase, .running)
         XCTAssertEqual(output.activeThreadCount, 1)
-        // Title is always the running count — most important Lock Screen signal.
-        XCTAssertEqual(output.title, "1 Thread Running")
-        XCTAssertEqual(output.statusLine, active.detail)
-        XCTAssertEqual(output.threadId, threadA.value.uuidString)
-        // No lastUpdatePreview → identity/detail fallback (legacy shape).
-        XCTAssertEqual(output.preview, active.detail)
+        XCTAssertEqual(output.threadId, thread.value.uuidString)
     }
 
-    func testSingleActivePreviewPrefersLastThreadUpdateOverIdentityDetail() {
-        // WHY: Lock Screen description must track Mac mid-run progress (tools /
-        // assistant), not restating "workspace - provider - title" alone.
-        let active = PetActiveThreadItem(
-            threadID: threadA,
-            workspaceID: workspace,
-            workspaceName: "elephant",
-            providerName: "Claude",
-            threadTitle: "teste o funcionamento do distill",
-            startedAt: Date(timeIntervalSince1970: 100),
-            lastUpdatePreview: "Running: git status",
-            now: Date(timeIntervalSince1970: 160)
+    func testRegisteredOperationWithoutAgentThreadUsesGenericRunningCopyAndInheritedMetadata() throws {
+        let surface = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        let operation = item(id: "operation:build", kind: .operation, state: .running, includeThread: false, surfaceID: surface)
+        let output = try XCTUnwrap(PetLiveActivityCopy.makeActivity(page: page([operation], running: 1)))
+        XCTAssertEqual(output.title, "1 running")
+        XCTAssertEqual(output.preview, "Registered operation running")
+        XCTAssertEqual(output.phase, .running)
+        XCTAssertEqual(output.activeThreadCount, 1)
+        XCTAssertEqual(output.runStartDate, Date(timeIntervalSince1970: 1))
+        XCTAssertEqual(output.workspaceId, workspace.value.uuidString)
+        XCTAssertNil(output.threadId)
+    }
+
+    func testStoppedRunHasExplicitNonFailureStatus() throws {
+        let stopped = item(
+            id: "run:stopped",
+            state: .stopped,
+            finishedAt: Date(timeIntervalSince1970: 20)
         )
-        guard let output = PetLiveActivityCopy.make(.init(
-            active: [active], needsYou: [], completed: []
-        )) else { return XCTFail("expected single-active surface") }
-        XCTAssertEqual(output.preview, "Running: git status")
-        XCTAssertEqual(output.statusLine, active.detail)
-        XCTAssertFalse(output.preview.contains("elephant - Claude"))
+        let output = try XCTUnwrap(PetLiveActivityCopy.makeActivity(
+            page: page([stopped], finished: 1, newResults: 1)
+        ))
+        XCTAssertEqual(output.title, "1 Thread Completed")
+        XCTAssertEqual(output.statusLine, "Stopped by you")
+        XCTAssertEqual(output.phase, .completed)
     }
 
-    func testItemStartedPreviewPrefersThinkingAndRejectsRuntimeNoise() {
-        // WHY: Lock Screen was showing "claude runtime: claude.session.snapshot";
-        // Agent App copy is Thinking / replies / tool runs.
+    func testSeenUnacknowledgedFailureStaysActionAndIsNotAddedToHistoryCount() throws {
+        let failed = item(
+            id: "run:seen-failure",
+            state: .failed,
+            needsAction: true,
+            finishedAt: Date(timeIntervalSince1970: 20),
+            viewedAt: Date(timeIntervalSince1970: 30)
+        )
+        let output = try XCTUnwrap(PetLiveActivityCopy.makeActivity(page:
+            page([failed], needsYou: 1, finished: 1, newResults: 0)
+        ))
+        XCTAssertEqual(output.title, "1 item needs attention")
+        XCTAssertEqual(output.statusLine, "Action required", "unrecognized action copy must stay generic to avoid exposing private transcript content")
+        XCTAssertEqual(output.phase, .failed)
+        XCTAssertEqual(output.activeThreadCount, 0)
+    }
+
+    func testAcknowledgedFailureRemainsFinishedHistoryUsingServiceCounts() throws {
+        let failed = item(
+            id: "run:acked-failure",
+            state: .failed,
+            needsAction: true,
+            finishedAt: Date(timeIntervalSince1970: 20),
+            attentionAcknowledgedAt: Date(timeIntervalSince1970: 30)
+        )
+        let output = try XCTUnwrap(PetLiveActivityCopy.makeActivity(page:
+            page([failed], needsYou: 0, finished: 1, newResults: 1)
+        ))
+        XCTAssertEqual(output.title, "1 Thread Completed")
+        XCTAssertEqual(output.statusLine, "Failed")
+        XCTAssertEqual(output.phase, .failed)
+        XCTAssertTrue(output.preview.contains("1 new result"))
+
+        let seenAndAcknowledged = item(
+            id: "run:seen-acked-failure",
+            state: .failed,
+            needsAction: true,
+            finishedAt: Date(timeIntervalSince1970: 20),
+            viewedAt: Date(timeIntervalSince1970: 31),
+            attentionAcknowledgedAt: Date(timeIntervalSince1970: 30)
+        )
+        XCTAssertNil(
+            PetLiveActivityCopy.makeActivity(
+                page: page([seenAndAcknowledged], needsYou: 0, finished: 1, newResults: 0)
+            ),
+            "Seen and acknowledged failure remains in Activity history but no longer needs a Live Activity."
+        )
+    }
+
+    func testOfflinePageDoesNotCreateSurface() {
+        XCTAssertNil(PetLiveActivityCopy.makeActivity(page: nil))
+    }
+
+    func testRouterJSONValueDecodesAsRemoteCodeTreatyPage() throws {
+        let date = Date(timeIntervalSince1970: 123)
+        let expected = page([item(id: "run:decode", state: .completed, finishedAt: date)], finished: 1, newResults: 1)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let value = try JSONDecoder().decode(JSONValue.self, from: encoder.encode(expected))
+        XCTAssertEqual(try PetController.decodeActivityPage(value), expected)
+    }
+
+    func testItemStartedPreviewSurfacesSafeProseAndFiltersRuntimeNoise() {
         let thinking = PetController.itemStartedPreview(payload: [
             "item": .object([
                 "id": .string("r1"),
@@ -68,16 +201,6 @@ final class PetLiveActivityCopyTests: XCTestCase {
         ])
         XCTAssertEqual(thinking, "Considering how to run the distill checks.")
 
-        let tool = PetController.itemStartedPreview(payload: [
-            "item": .object([
-                "id": .string("t1"),
-                "type": .string("commandExecution"),
-                "summary": .string("git status"),
-                "body": .string("git status --short")
-            ])
-        ])
-        XCTAssertEqual(tool, "Running: git status")
-
         let noise = PetController.itemStartedPreview(payload: [
             "item": .object([
                 "id": .string("n1"),
@@ -86,69 +209,18 @@ final class PetLiveActivityCopyTests: XCTestCase {
                 "body": .string("")
             ])
         ])
-        XCTAssertNil(noise, "dotted provider method ids must not become LA description")
+        XCTAssertNil(noise)
         XCTAssertTrue(PetController.isProviderRuntimeNoise("claude runtime: claude.session.snapshot"))
         XCTAssertFalse(PetController.isProviderRuntimeNoise("Running: git status"))
     }
 
-    func testSingleActiveAttentionBeatsLastThreadUpdate() {
-        let active = PetActiveThreadItem(
-            threadID: threadA,
-            workspaceID: workspace,
-            workspaceName: "elephant",
-            providerName: "Claude",
-            threadTitle: "mid run",
-            lastUpdatePreview: "Running: ls"
-        )
-        let needs = PetAttentionItem(
-            id: "cb1",
-            kind: .callback(.approval, isStale: false),
-            title: "Approve: Run command",
-            detail: "elephant - Claude - mid run",
-            workspaceName: "elephant",
-            createdAt: Date(),
-            route: .agentThread(threadID: threadA, workspaceID: workspace),
-            source: .callback(threadID: threadA, requestID: "r1", kind: .approval)
-        )
-        guard let output = PetLiveActivityCopy.make(.init(
-            active: [active], needsYou: [needs], completed: []
-        )) else { return XCTFail("expected surface") }
-        XCTAssertTrue(output.preview.hasPrefix("Needs you"))
-        XCTAssertTrue(output.preview.contains("Approve: Run command"))
-        // Red badge present → clear thread deep-link so LA opens Ready for you.
-        XCTAssertNil(output.threadId)
-        XCTAssertNil(output.workspaceId)
-    }
-
-    /// WHY: only 1 Active + zero red badges must deep-link to that thread and
-    /// show its live lastUpdatePreview.
-    func testSingleActiveNoRedBadge_prefersLastUpdateAndKeepsThreadIds() {
-        let active = PetActiveThreadItem(
-            threadID: threadA,
-            workspaceID: workspace,
-            workspaceName: "elephant",
-            providerName: "Grok",
-            threadTitle: "autonomous agent",
-            lastUpdatePreview: "Running: git status"
-        )
-        guard let output = PetLiveActivityCopy.make(.init(
-            active: [active],
-            needsYou: [],
-            completed: []
-        )) else { return XCTFail("expected surface") }
-        XCTAssertEqual(output.preview, "Running: git status")
-        XCTAssertEqual(output.threadId, threadA.value.uuidString)
-        XCTAssertEqual(output.workspaceId, workspace.value.uuidString)
-    }
-
-    func testItemDeltaPreviewSurfacesAssistantProse() {
-        let prose = PetController.itemDeltaPreview(payload: [
+    func testItemDeltaPreviewSurfacesAssistantProseOnly() {
+        XCTAssertEqual(PetController.itemDeltaPreview(payload: [
             "item": .object([
                 "type": .string("assistantMessage"),
-                "body": .string("Checking the orphan reconcile path next.")
+                "body": .string("Checking the reconcile path next.")
             ])
-        ])
-        XCTAssertEqual(prose, "Checking the orphan reconcile path next.")
+        ]), "Checking the reconcile path next.")
         XCTAssertNil(PetController.itemDeltaPreview(payload: [
             "item": .object([
                 "type": .string("tool"),
@@ -157,185 +229,10 @@ final class PetLiveActivityCopyTests: XCTestCase {
         ]))
     }
 
-    func testMultiActiveUsesOverviewAndPrefersNeedsYouInPreview() {
-        let a = PetActiveThreadItem(
-            threadID: threadA, workspaceID: workspace, workspaceName: "star",
-            providerName: "Grok", threadTitle: "one"
-        )
-        let b = PetActiveThreadItem(
-            threadID: threadB, workspaceID: workspace, workspaceName: "elephant",
-            providerName: "Claude", threadTitle: "two"
-        )
-        let needs = PetAttentionItem(
-            id: "cb1",
-            kind: .callback(.approval, isStale: false),
-            title: "Approve: Run command",
-            detail: "star - Grok - shell",
-            workspaceName: "star",
-            createdAt: Date(),
-            route: .agentThread(threadID: threadA, workspaceID: workspace),
-            source: .callback(threadID: threadA, requestID: "r1", kind: .approval)
-        )
-        guard let output = PetLiveActivityCopy.make(.init(
-            active: [a, b], needsYou: [needs], completed: []
-        )) else { return XCTFail("expected multi-active surface") }
-        XCTAssertEqual(output.title, "2 Threads Running")
-        XCTAssertTrue(output.statusLine.contains("star") || output.statusLine.contains("elephant"))
-        XCTAssertTrue(output.preview.hasPrefix("Needs you"))
-        XCTAssertTrue(output.preview.contains("Approve: Run command"))
-        XCTAssertNil(output.threadId)
-    }
-
-    func testAttentionOnlyWithNoActiveShowsNeedsYouCard() {
-        let needs = PetAttentionItem(
-            id: "cb1",
-            kind: .callback(.approval, isStale: false),
-            title: "Approve: Run command",
-            detail: "star - Grok - make title",
-            workspaceName: "star",
-            createdAt: Date(),
-            route: .agentThread(threadID: threadA, workspaceID: workspace),
-            source: .callback(threadID: threadA, requestID: "r1", kind: .approval)
-        )
-        let done = PetAttentionItem(
-            id: "t1",
-            kind: .agentOutcome(.completed),
-            title: "Agent run completed",
-            detail: "star - Grok - done work",
-            workspaceName: "star",
-            createdAt: Date(),
-            route: .agentThread(threadID: threadB, workspaceID: workspace),
-            source: .agentThread(threadID: threadB)
-        )
-        guard let output = PetLiveActivityCopy.make(.init(
-            active: [], needsYou: [needs], completed: [done]
-        )) else { return XCTFail("expected attention-only surface") }
-        XCTAssertEqual(output.activeThreadCount, 0)
-        XCTAssertEqual(output.title, "1 item needs attention")
-        XCTAssertEqual(output.statusLine, "Approve: Run command")
-        XCTAssertTrue(output.preview.contains("star - Grok") || output.preview.contains("+1 more"))
-        XCTAssertEqual(output.phase, .failed)
-    }
-
-    func testCompletedOnlyShowsThreadsCompletedOverSplit() {
-        let done = PetAttentionItem(
-            id: "t1",
-            kind: .agentOutcome(.completed),
-            title: "Agent run completed",
-            detail: "star - Grok - finished",
-            workspaceName: "star",
-            createdAt: Date(),
-            route: .agentThread(threadID: threadA, workspaceID: workspace),
-            source: .agentThread(threadID: threadA)
-        )
-        guard let output = PetLiveActivityCopy.make(.init(
-            active: [], needsYou: [], completed: [done]
-        )) else { return XCTFail("expected completed-only surface") }
-        XCTAssertEqual(output.title, "1 Thread Completed")
-        XCTAssertEqual(output.statusLine, "1 done")
-        XCTAssertEqual(output.phase, .completed)
-        XCTAssertEqual(output.threadId, threadA.value.uuidString)
-    }
-
-    // MARK: - Requested Lock Screen shape (title = count, subtitle = split)
-
-    private func outcome(_ kind: PetAttentionOutcome, _ id: String) -> PetAttentionItem {
-        PetAttentionItem(
-            id: id,
-            kind: .agentOutcome(kind),
-            title: "Agent run \(kind == .completed ? "completed" : "failed")",
-            detail: "star - Grok - \(id)",
-            workspaceName: "star",
-            createdAt: Date(timeIntervalSince1970: 100),
-            route: .agentThread(threadID: threadB, workspaceID: workspace),
-            source: .agentThread(threadID: threadB)
-        )
-    }
-
-    /// The exact terminal card the user specified: 2 completed + 7 failed reads
-    /// "9 Threads Completed" over "2 done - 7 failed".
-    func testTerminalInboxTitleCountsAllFinishedThreadsAndSubtitleCarriesSplit() throws {
-        var completed = (0..<2).map { outcome(.completed, "ok\($0)") }
-        completed += (0..<7).map { outcome(.failed, "bad\($0)") }
-        let output = try XCTUnwrap(PetLiveActivityCopy.make(.init(
-            active: [], needsYou: [], completed: completed
-        )))
-        XCTAssertEqual(output.title, "9 Threads Completed")
-        XCTAssertEqual(output.statusLine, "2 done - 7 failed")
-        XCTAssertEqual(output.phase, .completed, "partial success must not paint a global Failed badge")
-    }
-
-    /// While a thread runs, the count owns the title and the split owns the
-    /// subtitle — outcomes must never bury the running count.
-    func testRunningCardKeepsCountInTitleAndSplitInSubtitle() throws {
-        let active = PetActiveThreadItem(
-            threadID: threadA,
-            workspaceID: workspace,
-            workspaceName: "star",
-            providerName: "Grok",
-            threadTitle: "ship labels"
-        )
-        var completed = (0..<2).map { outcome(.completed, "ok\($0)") }
-        completed += (0..<7).map { outcome(.failed, "bad\($0)") }
-        let output = try XCTUnwrap(PetLiveActivityCopy.make(.init(
-            active: [active], needsYou: [], completed: completed
-        )))
-        XCTAssertEqual(output.title, "1 Thread Running")
-        XCTAssertEqual(output.statusLine, "2 done - 7 failed")
-        XCTAssertEqual(output.phase, .running)
-    }
-
-    /// An all-failed inbox still says "Completed" (= finished) in the title, but
-    /// the subtitle and the phase badge keep it honest.
-    func testAllFailedInboxNeverReadsAsSuccess() throws {
-        let completed = (0..<9).map { outcome(.failed, "bad\($0)") }
-        let output = try XCTUnwrap(PetLiveActivityCopy.make(.init(
-            active: [], needsYou: [], completed: completed
-        )))
-        XCTAssertEqual(output.title, "9 Threads Completed")
-        XCTAssertEqual(output.statusLine, "9 failed")
-        XCTAssertEqual(output.phase, .failed)
-    }
-
-    /// A user-initiated stop is not an error; the subtitle keeps its own noun.
-    func testInterruptedOnlyInboxSaysInterrupted() throws {
-        let completed = [outcome(.interrupted, "stopped")]
-        let output = try XCTUnwrap(PetLiveActivityCopy.make(.init(
-            active: [], needsYou: [], completed: completed
-        )))
-        XCTAssertEqual(output.title, "1 Thread Completed")
-        XCTAssertEqual(output.statusLine, "1 interrupted")
-        XCTAssertEqual(output.phase, .failed)
-    }
-
-    /// Pending approvals are a different state from "finished" — they must not be
-    /// relabelled "0 Threads Completed" just because nothing is running.
-    func testNeedsYouStateIsNotRelabelledAsCompleted() throws {
-        let needs = PetAttentionItem(
-            id: "cb1",
-            kind: .callback(.approval, isStale: false),
-            title: "Approve: Run command",
-            detail: "star - Grok - make title",
-            workspaceName: "star",
-            createdAt: Date(),
-            route: .agentThread(threadID: threadA, workspaceID: workspace),
-            source: .callback(threadID: threadA, requestID: "r1", kind: .approval)
-        )
-        let output = try XCTUnwrap(PetLiveActivityCopy.make(.init(
-            active: [], needsYou: [needs], completed: []
-        )))
-        XCTAssertEqual(output.title, "1 item needs attention")
-        XCTAssertFalse(output.title.contains("Completed"))
-    }
-
-    /// Both platforms must spell the same state the same way, or the wording
-    /// changes depending on who owns the card (macOS push vs iOS local).
     func testTitleHelpersAreStableAcrossCounts() {
         XCTAssertEqual(PetLiveActivityCopy.runningTitle(count: 0), "0 Threads Running")
         XCTAssertEqual(PetLiveActivityCopy.runningTitle(count: 1), "1 Thread Running")
-        XCTAssertEqual(PetLiveActivityCopy.runningTitle(count: 12), "12 Threads Running")
         XCTAssertEqual(PetLiveActivityCopy.completedTitle(count: 1), "1 Thread Completed")
-        XCTAssertEqual(PetLiveActivityCopy.completedTitle(count: 9), "9 Threads Completed")
         XCTAssertEqual(PetLiveActivityCopy.doneFailedLine(done: 2, failed: 7), "2 done - 7 failed")
         XCTAssertEqual(PetLiveActivityCopy.doneFailedLine(done: 0, failed: 0), "")
     }

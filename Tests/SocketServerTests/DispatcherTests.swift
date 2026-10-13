@@ -841,11 +841,14 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     }
     var agentCheckpointDiffCallCount = 0
     var stubAgentCheckpointDiff: String?
-    func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String {
+    func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, expectedRunID: UUID? = nil, path: String?) throws -> String {
         agentCheckpointDiffCallCount += 1
         if let stubAgentCheckpointDiff { return stubAgentCheckpointDiff }
         guard let checkpoint = checkpointStore.first(where: { $0.threadId == thread && $0.checkpointTurnCount == checkpointTurnCount }) else {
             return ""
+        }
+        if let expectedRunID, checkpoint.runId.value != expectedRunID {
+            throw JSONRPCError(code: -32013, message: "Checkpoint diff is unavailable for the expected run.")
         }
         if let path { return checkpoint.fileDiffs.first(where: { $0.path == path })?.patch ?? "" }
         return checkpoint.diffPatch ?? checkpoint.fileDiffs.map(\.patch).joined(separator: "\n")
@@ -2959,6 +2962,49 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNotNil(list.result)
         XCTAssertEqual(diff.result, .string("@@ README\n+changed\n"),
                        "per-turn file diffs must be reachable over RPC so clients can inspect a specific agent turn without relying on current git state")
+    }
+
+    @MainActor
+    func test_agentCheckpointDiff_expectedRunIDRejectsReplacementButLegacyRemainsCompatible() async {
+        // WHY: checkpoint turn counts can be reused after revert, so stale run identity must not expose replacement diff.
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: nil, title: "replacement", provider: .codex, model: "gpt-5.5")
+        let expectedRun = AgentRunID()
+        let replacementRun = AgentRunID()
+        router.threadStore = [thread]
+        router.checkpointStore = [AgentTurnCheckpointSummary(
+            threadId: thread.id,
+            runId: replacementRun,
+            turnId: "replacement-turn",
+            checkpointTurnCount: 1,
+            checkpointRef: "replacement-ref",
+            status: .ready,
+            files: [],
+            diffPatch: "replacement diff",
+            fileDiffs: []
+        )]
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let common: [String: JSONValue] = [
+            "thread_id": .string(thread.id.value.uuidString),
+            "checkpoint_turn_count": .number(1)
+        ]
+
+        var staleParams = common
+        staleParams["expected_run_id"] = .string(expectedRun.value.uuidString)
+        let stale = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.checkpoint.diff", params: staleParams))
+        XCTAssertEqual(stale.error?.code, -32013)
+        XCTAssertEqual(stale.error?.message, "Checkpoint diff is unavailable for the expected run.")
+        XCTAssertNil(stale.result)
+
+        var matchingParams = common
+        matchingParams["expected_run_id"] = .string(replacementRun.value.uuidString)
+        let matching = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.checkpoint.diff", params: matchingParams))
+        XCTAssertNil(matching.error)
+        XCTAssertEqual(matching.result, .string("replacement diff"))
+
+        let legacy = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "agent.checkpoint.diff", params: common))
+        XCTAssertNil(legacy.error)
+        XCTAssertEqual(legacy.result, .string("replacement diff"))
     }
 
     @MainActor

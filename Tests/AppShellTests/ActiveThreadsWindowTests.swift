@@ -13,10 +13,10 @@ final class ActiveThreadsWindowTests: XCTestCase {
             .appendingPathComponent(relative)
     }
 
-    func test_sidebarPlacesActiveThreadsImmediatelyAfterNewWorkspace_beforeScheduleTasks() throws {
+    func test_sidebarPlacesActivityImmediatelyAfterNewWorkspace_beforeScheduleTasks() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.newWorkspace\")"))
-        let activeThreads = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.activeThreads\")"))
+        let activeThreads = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.activity\")"))
         let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
         XCTAssertLessThan(reportBug.lowerBound, newWorkspace.lowerBound,
@@ -25,17 +25,15 @@ final class ActiveThreadsWindowTests: XCTestCase {
         XCTAssertLessThan(activeThreads.lowerBound, scheduleTasks.lowerBound)
     }
 
-    func test_sidebarActiveThreadsBadgeUsesPetFormatter_becauseCountMustMatchPetBlueBadge() throws {
+    func test_sidebarActivityUsesServiceCountsAndExplicitLabels() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("PetActiveThreadCountFormatter.badgeText(count: vm.activeThreadCount)"),
-                      "sidebar badge must reuse PetActiveThreadCountFormatter so 0/1/99+ stay consistent")
-        XCTAssertTrue(source.contains("badgeIsBlue: true"),
-                      "Active Threads badge must be Pet-blue")
-        XCTAssertTrue(source.contains("activeThreadCount"),
-                      "sidebar must publish live activeThreadCount for the badge")
-        XCTAssertNil(PetActiveThreadCountFormatter.badgeText(count: 0))
-        XCTAssertEqual(PetActiveThreadCountFormatter.badgeText(count: 2), "2")
-        XCTAssertEqual(PetActiveThreadCountFormatter.badgeText(count: 100), "99+")
+        XCTAssertTrue(source.contains("vm.activityCounts.running"))
+        XCTAssertTrue(source.contains("vm.activityCounts.needsYou"))
+        XCTAssertTrue(source.contains("title: vm.activityCounts.isAvailable"))
+        XCTAssertTrue(source.contains("\\(vm.activityCounts.running) running · \\(vm.activityCounts.needsYou) need you"))
+        XCTAssertTrue(source.contains(".accessibilityLabel(vm.activityCounts.isAvailable"))
+        XCTAssertTrue(source.contains("Activity, \\(vm.activityCounts.running) running, \\(vm.activityCounts.needsYou) need you"))
+        XCTAssertFalse(source.contains("PetActiveThreadCountFormatter.badgeText(count: vm.activeThreadCount)"))
     }
 
     func test_activeThreadsOpensInMainContent_notDetachedWindow() throws {

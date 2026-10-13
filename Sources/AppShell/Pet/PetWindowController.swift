@@ -261,20 +261,15 @@ private struct PetSpriteView: View {
 
             VStack {
                 HStack(alignment: .top) {
-                    if let badge = model.activeBadgeText {
-                        petBadge(
-                            text: badge,
-                            color: Color.blue,
-                            accessibilityIdentifier: "pet.activeBadge"
-                        )
-                    }
                     Spacer(minLength: 0)
                     if let badge = model.badgeText {
-                        petBadge(
-                            text: badge,
-                            color: Color.red,
-                            accessibilityIdentifier: "pet.badge"
-                        )
+                        Text("\(badge) need you")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Capsule().fill(Color.red))
+                            .accessibilityIdentifier("pet.needsYouBadge")
                     }
                 }
                 Spacer(minLength: 0)
@@ -289,24 +284,13 @@ private struct PetSpriteView: View {
         .accessibilityIdentifier("pet.status")
     }
 
-    private func petBadge(text: String, color: Color, accessibilityIdentifier: String) -> some View {
-        Text(text)
-            .font(.system(size: 12, weight: .bold, design: .rounded))
-            .foregroundStyle(.white)
-            .padding(.horizontal, text == "99+" ? 6 : 7)
-            .frame(minWidth: 24, minHeight: 24)
-            .background(Circle().fill(color))
-            .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 1.5))
-            .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
-            .accessibilityIdentifier(accessibilityIdentifier)
-    }
+
 }
 
 private struct PetAttentionPopoverView: View {
     @ObservedObject var model: PetViewModel
     let onOpen: (PetAttentionItem) -> Void
     let onOpenActive: (PetActiveThreadItem) -> Void
-    let onMarkAll: () -> Void
     let onOpenApp: () -> Void
     let onClose: () -> Void
     let contentWidth: CGFloat
@@ -315,7 +299,7 @@ private struct PetAttentionPopoverView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Ready for you")
+                    Text("Activity")
                         .font(.title2.weight(.semibold))
                     Text(model.accessibilityValue)
                         .font(.subheadline)
@@ -336,49 +320,15 @@ private struct PetAttentionPopoverView: View {
 
             Divider()
 
-            if model.isPopoverEmpty {
-                VStack(alignment: .leading, spacing: 12) {
-                    Label("Nothing needs attention", systemImage: "checkmark.circle")
-                        .font(.body.weight(.medium))
-                    Button("Open Remote Code") { onOpenApp() }
-                        .buttonStyle(.borderedProminent)
-                        .accessibilityIdentifier("pet.openRemoteCode")
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(18)
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        activeGroupedSection(Array(model.activeThreads.prefix(50)))
-                        attentionGroupedSection(
-                            "Needs you",
-                            items: Array(model.needsYouItems.prefix(50))
-                        )
-                        attentionGroupedSection(
-                            "Completed",
-                            items: Array(model.completedItems.prefix(50))
-                        )
-                    }
-                }
-                .frame(maxHeight: 390)
-
-                if !model.items.isEmpty {
-                    Divider()
-                    HStack {
-                        if model.items.count > 50 {
-                            Button("Open Activity") { onOpenApp() }
-                                .buttonStyle(.plain)
-                        }
-                        Spacer()
-                        Button("Mark all viewed") { onMarkAll() }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(Color.accentColor)
-                            .accessibilityIdentifier("pet.markAllViewed")
-                    }
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 14)
-                }
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Review work and requests in Activity.")
+                    .foregroundStyle(.secondary)
+                Button("Open Activity") { onOpenApp() }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("pet.openActivity")
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(18)
 
             if let routeError = model.routeError {
                 Text(routeError)
@@ -551,7 +501,6 @@ public final class PetWindowController: NSObject {
 
     public var onOpenItem: ((PetAttentionItem) -> Void)?
     public var onOpenActiveThread: ((PetActiveThreadItem) -> Void)?
-    public var onMarkAllViewed: (() -> Void)?
     public var onOpenRemoteCode: (() -> Void)?
     public var onOpenSettings: (() -> Void)?
     public var onHidePet: (() -> Void)?
@@ -736,7 +685,7 @@ public final class PetWindowController: NSObject {
         }
         hosting.imageProvider = { [weak self] in self?.model.currentFrame?.displayImage }
         hosting.attentionBadgeVisibleProvider = { [weak self] in self?.model.badgeText != nil }
-        hosting.activeBadgeVisibleProvider = { [weak self] in self?.model.activeBadgeText != nil }
+        hosting.activeBadgeVisibleProvider = { false }
         hosting.accessibilityValueProvider = { [weak self] in
             self?.model.accessibilityValue ?? "Pet status unavailable"
         }
@@ -780,7 +729,6 @@ public final class PetWindowController: NSObject {
             model: model,
             onOpen: { [weak self] in self?.onOpenItem?($0) },
             onOpenActive: { [weak self] in self?.onOpenActiveThread?($0) },
-            onMarkAll: { [weak self] in self?.onMarkAllViewed?() },
             onOpenApp: { [weak self] in self?.onOpenRemoteCode?() },
             onClose: { [weak self] in self?.closePopover() },
             contentWidth: contentWidth
