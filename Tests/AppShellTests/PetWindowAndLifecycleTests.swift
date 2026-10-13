@@ -441,7 +441,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertEqual(
             model.activeBadgeText,
             "2",
-            "The internal legacy count remains independent; no blue badge is rendered."
+            "The running badge is independent of the ready-counter preference."
         )
         XCTAssertNil(model.badgeText)
 

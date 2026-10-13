@@ -1620,6 +1620,7 @@ struct TailcatConnectionBadge: View {
 public struct SidebarRootView: View {
     @ObservedObject var vm: SidebarViewModel
     var botsVM: BotsViewModel?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showsInsomniaOptions = false
     /// Toggled to true to programmatically focus the filter field (Cmd+F).
     @State private var filterFocusRequest: Bool = false
@@ -2290,10 +2291,11 @@ public struct SidebarRootView: View {
     /// the pure `SidebarViewModel.workspaceRowAccessibilityValue(...)` helper.
     private func workspaceRowAccessibilityValue(
         ws: Workspace,
+        busy: Bool,
         checked: Bool,
         pinned: Bool
     ) -> String {
-        let busyDesc: String? = nil
+        let busyDesc = busy ? vm.busyTooltip(for: ws) : nil
         let activity = vm.workspaceActivityCounts[ws.id.description].map(Self.workspaceActivityLabel)
         return SidebarViewModel.workspaceRowAccessibilityValue(
             busyDescription: busyDesc,
@@ -2347,6 +2349,7 @@ public struct SidebarRootView: View {
         let checked = vm.selectedWorkspaceIDs.contains(ws.id)
         let desc = ws.metadata["description"]
         let pinned = ws.metadata["pinned"] == "true"
+        let busy = vm.isWorkspaceBusy(ws)
         let highlightTone = SidebarSelectionHighlightResolver().resolve(workspace: ws, isSelected: selected, isChecked: checked)
         Button {
             let flags = NSEvent.modifierFlags
@@ -2381,7 +2384,28 @@ public struct SidebarRootView: View {
                     }
                 }
                 Spacer(minLength: 0)
+                // The counts line says how much; the spinner says it is happening now.
+                if busy {
+                    // UX-SIDEBAR-P3-BUSYTIP: use the per-workspace busy
+                    // source description instead of the generic label so
+                    // VoiceOver and tooltip convey agent-run vs terminal.
+                    DSBusySpinner(label: vm.busyTooltip(for: ws) ?? "Workspace busy")
+                } else if vm.completedWorkspaces.contains(ws.id) {
+                    // UX-SIDEBAR-COMPLETED-DOT: the action finished — a small success
+                    // dot takes the spinner's slot until the user opens the workspace.
+                    Circle()
+                        .fill(DS.Palette.success)
+                        .frame(width: 7, height: 7)
+                        .frame(width: 16, height: 16)
+                        .help("Action completed")
+                        .accessibilityLabel("Action completed")
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
+                }
             }
+            // UX-SIDEBAR-COMPLETED-DOT: fade/scale the spinner→dot swap in subtly
+            // (reduced-motion shows it instantly).
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.2),
+                       value: vm.completedWorkspaces.contains(ws.id))
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 38)
             .background(
@@ -2416,7 +2440,7 @@ public struct SidebarRootView: View {
         // name + status in one focused element rather than a string of
         // context-free sub-elements (number pill, icon-only pin state, etc).
         .accessibilityLabel(ws.name)
-        .accessibilityValue(workspaceRowAccessibilityValue(ws: ws, checked: checked, pinned: pinned))
+        .accessibilityValue(workspaceRowAccessibilityValue(ws: ws, busy: busy, checked: checked, pinned: pinned))
         .accessibilityIdentifier("sidebar.workspaceRow.\(ws.id.value.uuidString)")
         .onDrag {
             vm.draggingWorkspaceID = ws.id

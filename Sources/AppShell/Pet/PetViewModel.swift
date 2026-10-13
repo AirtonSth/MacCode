@@ -29,7 +29,7 @@ public final class PetViewModel: ObservableObject {
         )
     }
 
-    /// Compatibility value for older internal callers; no blue badge renders.
+    /// Blue badge: unique active agent threads. Not gated by the ready-counter setting.
     public var activeBadgeText: String? {
         PetActiveThreadCountFormatter.badgeText(count: activeThreadCount)
     }

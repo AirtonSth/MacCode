@@ -261,6 +261,18 @@ private struct PetSpriteView: View {
 
             VStack {
                 HStack(alignment: .top) {
+                    // Blue says work is running right now; the red capsule says what waits on you.
+                    if let badge = model.activeBadgeText {
+                        Text(badge)
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, badge == "99+" ? 6 : 7)
+                            .frame(minWidth: 24, minHeight: 24)
+                            .background(Circle().fill(Color.blue))
+                            .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 1.5))
+                            .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                            .accessibilityIdentifier("pet.activeBadge")
+                    }
                     Spacer(minLength: 0)
                     if let badge = model.badgeText {
                         Text("\(badge) need you")
@@ -319,6 +331,18 @@ private struct PetAttentionPopoverView: View {
             .padding(18)
 
             Divider()
+
+            // What is running right now stays one glance away; everything else lives in Activity.
+            if !model.activeThreads.isEmpty {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        activeGroupedSection(Array(model.activeThreads.prefix(50)))
+                    }
+                }
+                .frame(maxHeight: 260)
+
+                Divider()
+            }
 
             VStack(alignment: .leading, spacing: 10) {
                 Text("Review work and requests in Activity.")
@@ -685,7 +709,7 @@ public final class PetWindowController: NSObject {
         }
         hosting.imageProvider = { [weak self] in self?.model.currentFrame?.displayImage }
         hosting.attentionBadgeVisibleProvider = { [weak self] in self?.model.badgeText != nil }
-        hosting.activeBadgeVisibleProvider = { false }
+        hosting.activeBadgeVisibleProvider = { [weak self] in self?.model.activeBadgeText != nil }
         hosting.accessibilityValueProvider = { [weak self] in
             self?.model.accessibilityValue ?? "Pet status unavailable"
         }
