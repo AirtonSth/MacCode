@@ -9243,12 +9243,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func activityAcknowledge(params: [String: JSONValue]) throws -> JSONValue {
         guard let context else { throw LayoutError.workspaceNotFound }
         let result = try ActivityService(context: context).acknowledge(params)
-        if result.objectValue?["acknowledged"]?.boolValue == true,
-           let id = result.objectValue?["item_id"]?.stringValue {
+        let acknowledged = result.objectValue?["acknowledged"]?.boolValue == true
+        let ids = result.objectValue?["item_id"]?.stringValue.map { [$0] }
+            ?? result.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        if !ids.isEmpty {
             EventBus.shared.publish(kind: .notificationRead, payload: .object([
-                "id": .string("activity:\(id)"), "activity_item_ids": .array([.string(id)]),
-                "reason": .string("acknowledged")
+                "id": .string("activity:\(ids[0])"), "activity_item_ids": .array(ids.map(JSONValue.string)),
+                "reason": .string(acknowledged ? "acknowledged" : "reopened")
             ]))
+            if ids.contains(where: { $0.hasPrefix("bot-attention:") }) {
+                EventBus.shared.publish(kind: .botsAttentionChanged, payload: .object([:]))
+            }
         }
         return result
     }

@@ -76,7 +76,8 @@ enum ActivityOriginProjection {
                 occurredAt: item.createdAt,
                 needsAction: true,
                 botID: item.botID.value,
-                conversationID: item.conversationID?.value
+                conversationID: item.conversationID?.value,
+                originLabel: conversation.flatMap { PetAttentionRedactor.safeContextLabel($0.title) }.map { "Bot conversation: \($0)" }
             )
         }
         let scheduledState = try db.performSync { database -> [String: (Date?, Date?)] in

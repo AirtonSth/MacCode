@@ -266,45 +266,94 @@ final class ActivityService: @unchecked Sendable {
     }
 
     func acknowledge(_ params: [String: JSONValue]) throws -> JSONValue {
-        guard let id = params["item_id"]?.stringValue else { throw JSONRPCError.invalidParams }
-        if id.hasPrefix("run:"), let uuid = UUID(uuidString: String(id.dropFirst(4))) {
-            guard try AgentRunResultRepository(db: db).acknowledgeFailure(runId: AgentRunID(uuid)) else {
+        if let id = params["item_id"]?.stringValue {
+            guard try setAcknowledged([id], acknowledged: true) == [id] else { throw JSONRPCError.invalidParams }
+            return .object(["acknowledged": .bool(true), "item_id": .string(id)])
+        }
+        guard let rawIDs = params["item_ids"]?.arrayValue, rawIDs.count <= 200,
+              rawIDs.allSatisfy({ $0.stringValue != nil }) else { throw JSONRPCError.invalidParams }
+        let ids = rawIDs.compactMap(\.stringValue)
+        guard Set(ids).count == ids.count else { throw JSONRPCError.invalidParams }
+        let acknowledged = params["acknowledged"]?.boolValue ?? true
+        let updated = try setAcknowledged(ids, acknowledged: acknowledged)
+        return .object(["acknowledged": .bool(acknowledged), "updated_ids": .array(updated.map(JSONValue.string))])
+    }
+
+    /// Returns the ids whose acknowledgment changed, in request order. Items that are no
+    /// longer eligible are skipped; ids of a kind that cannot be acknowledged throw.
+    private func setAcknowledged(_ ids: [String], acknowledged: Bool) throws -> [String] {
+        var runIDs = [AgentRunID: String]()
+        var botAttentionIDs = [BotAttentionItemID: String]()
+        var scheduledIDs = [String]()
+        var notificationIDs = [String]()
+        for id in ids {
+            if id.hasPrefix("run:"), let uuid = UUID(uuidString: String(id.dropFirst(4))) {
+                runIDs[AgentRunID(uuid)] = id
+            } else if id.hasPrefix("bot-attention:"), let uuid = UUID(uuidString: String(id.dropFirst("bot-attention:".count))) {
+                botAttentionIDs[BotAttentionItemID(uuid)] = id
+            } else if id.hasPrefix("scheduled-occurrence:") {
+                scheduledIDs.append(String(id.dropFirst("scheduled-occurrence:".count)))
+            } else if id.hasPrefix("notification:") {
+                notificationIDs.append(String(id.dropFirst("notification:".count)))
+            } else {
                 throw JSONRPCError.invalidParams
             }
-        } else if id.hasPrefix("scheduled-occurrence:") {
-            let occurrenceID = String(id.dropFirst("scheduled-occurrence:".count))
-            try db.performSync { database in
-                try database.transaction {
-                    let occurrence = try database.prepare("SELECT status FROM scheduled_task_runs WHERE id = ? AND agent_run_id IS NULL;")
-                    try occurrence.bind(1, occurrenceID)
-                    guard try occurrence.step(), occurrence.columnText(0) == "failed" else { throw JSONRPCError.invalidParams }
-                    let acknowledge = try database.prepare("INSERT INTO activity_notification_state(item_id, acknowledged_at) VALUES (?, ?) ON CONFLICT(item_id) DO UPDATE SET acknowledged_at = excluded.acknowledged_at;")
-                    try acknowledge.bind(1, "activity:scheduled-occurrence:\(occurrenceID)")
-                    try acknowledge.bind(2, Self.isoFractionalString(Date()))
-                    _ = try acknowledge.step()
-                }
-            }
-        } else if id.hasPrefix("notification:") {
-            let notificationID = String(id.dropFirst("notification:".count))
-            try db.performSync { db in
-                try db.transaction {
-                    let note = try db.prepare("SELECT category, read_at FROM notifications WHERE id = ? AND dismissed_at IS NULL;")
-                    try note.bind(1, notificationID)
-                    guard try note.step(), let category = note.columnText(0).flatMap(PetNotificationCategory.init(rawValue:)),
-                          Self.notificationFailureCategories.contains(category) else { throw JSONRPCError.invalidParams }
-                    let priorViewed = note.columnText(1)
-                    note.reset()
-                    let acknowledge = try db.prepare("INSERT INTO activity_notification_state(item_id, viewed_at, acknowledged_at) VALUES (?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET acknowledged_at = excluded.acknowledged_at;")
-                    try acknowledge.bind(1, notificationID)
-                    try acknowledge.bind(2, priorViewed)
-                    try acknowledge.bind(3, Self.isoFractionalString(Date()))
-                    _ = try acknowledge.step()
-                }
-            }
-        } else {
-            throw JSONRPCError.invalidParams
         }
-        return .object(["acknowledged": .bool(true), "item_id": .string(id)])
+        let stamp = acknowledged ? Date() : nil
+        var updated = Set<String>()
+        for runID in try AgentRunResultRepository(db: db).setFailureAcknowledged(runIds: Array(runIDs.keys), at: stamp) {
+            if let id = runIDs[runID] { updated.insert(id) }
+        }
+        for itemID in try BotStore(db: db).setAttentionAcknowledged(ids: Array(botAttentionIDs.keys), at: stamp) {
+            if let id = botAttentionIDs[itemID] { updated.insert(id) }
+        }
+        if !scheduledIDs.isEmpty || !notificationIDs.isEmpty {
+            let timestamp = stamp.map(Self.isoFractionalString)
+            let changed = try db.performSync { database in
+                try database.transaction {
+                    var changed = [String]()
+                    let reopen = try database.prepare("UPDATE activity_notification_state SET acknowledged_at = NULL WHERE item_id = ?;")
+                    let occurrence = try database.prepare("SELECT status FROM scheduled_task_runs WHERE id = ? AND agent_run_id IS NULL;")
+                    let acknowledgeOccurrence = try database.prepare("INSERT INTO activity_notification_state(item_id, acknowledged_at) VALUES (?, ?) ON CONFLICT(item_id) DO UPDATE SET acknowledged_at = excluded.acknowledged_at;")
+                    for occurrenceID in scheduledIDs {
+                        try occurrence.bind(1, occurrenceID)
+                        let failed = try occurrence.step() && occurrence.columnText(0) == "failed"
+                        occurrence.reset()
+                        guard failed else { continue }
+                        let statement = timestamp == nil ? reopen : acknowledgeOccurrence
+                        try statement.bind(1, "activity:scheduled-occurrence:\(occurrenceID)")
+                        if let timestamp { try statement.bind(2, timestamp) }
+                        _ = try statement.step()
+                        statement.reset()
+                        changed.append("scheduled-occurrence:\(occurrenceID)")
+                    }
+                    let note = try database.prepare("SELECT category, read_at FROM notifications WHERE id = ? AND dismissed_at IS NULL;")
+                    let acknowledgeNote = try database.prepare("INSERT INTO activity_notification_state(item_id, viewed_at, acknowledged_at) VALUES (?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET acknowledged_at = excluded.acknowledged_at;")
+                    for notificationID in notificationIDs {
+                        try note.bind(1, notificationID)
+                        let isFailure = try note.step() && note.columnText(0).flatMap(PetNotificationCategory.init(rawValue:)).map(Self.notificationFailureCategories.contains) == true
+                        let priorViewed = isFailure ? note.columnText(1) : nil
+                        note.reset()
+                        guard isFailure else { continue }
+                        if let timestamp {
+                            try acknowledgeNote.bind(1, notificationID)
+                            try acknowledgeNote.bind(2, priorViewed)
+                            try acknowledgeNote.bind(3, timestamp)
+                            _ = try acknowledgeNote.step()
+                            acknowledgeNote.reset()
+                        } else {
+                            try reopen.bind(1, notificationID)
+                            _ = try reopen.step()
+                            reopen.reset()
+                        }
+                        changed.append("notification:\(notificationID)")
+                    }
+                    return changed
+                }
+            }
+            updated.formUnion(changed)
+        }
+        return ids.filter(updated.contains)
     }
 
     private struct RunRow {

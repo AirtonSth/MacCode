@@ -72,19 +72,34 @@ public final class AgentRunResultRepository: @unchecked Sendable {
     /// Acknowledgment is valid only while canonical run status remains failed or interrupted.
     @discardableResult
     public func acknowledgeFailure(runId: AgentRunID, at date: Date = Date()) throws -> Bool {
-        try db.performSync { database in
+        try !setFailureAcknowledged(runIds: [runId], at: date).isEmpty
+    }
+
+    /// Batch acknowledgment in one transaction; a nil date reopens the failure.
+    /// Returns only runs whose canonical status is still failed or interrupted.
+    public func setFailureAcknowledged(runIds: [AgentRunID], at date: Date?) throws -> [AgentRunID] {
+        guard !runIds.isEmpty else { return [] }
+        return try db.performSync { database in
             try database.transaction {
                 let eligible = try database.prepare("SELECT 1 FROM agent_runs WHERE id = ? AND (status IN ('failed', 'interrupted') OR (status = 'cancelled' AND COALESCE(terminal_reason, '') != 'userStop')); ")
-                try eligible.bind(1, runId.description)
-                guard try eligible.step() else { return false }
                 let ensure = try database.prepare("INSERT OR IGNORE INTO agent_run_results(run_id) VALUES (?);")
-                try ensure.bind(1, runId.description)
-                _ = try ensure.step()
                 let statement = try database.prepare("UPDATE agent_run_results SET attention_acknowledged_at = ? WHERE run_id = ?;")
-                try statement.bind(1, isoFractional.string(from: date))
-                try statement.bind(2, runId.description)
-                _ = try statement.step()
-                return true
+                var updated: [AgentRunID] = []
+                for runId in runIds {
+                    try eligible.bind(1, runId.description)
+                    let isEligible = try eligible.step()
+                    eligible.reset()
+                    guard isEligible else { continue }
+                    try ensure.bind(1, runId.description)
+                    _ = try ensure.step()
+                    ensure.reset()
+                    try statement.bind(1, date.map(isoFractional.string(from:)))
+                    try statement.bind(2, runId.description)
+                    _ = try statement.step()
+                    statement.reset()
+                    updated.append(runId)
+                }
+                return updated
             }
         }
     }

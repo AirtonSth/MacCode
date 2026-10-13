@@ -123,7 +123,7 @@ final class ActivityWindowModelTests: XCTestCase {
                 listCalls += 1
                 return self.page(acknowledged ? [] : [self.item("failed", state: "failed", needsAction: true)])
             },
-            setViewed: { _ in self.updated([]) },
+            setViewed: { params in self.updated(params["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []) },
             acknowledge: { _ in acknowledged = true; return .object([:]) }
         ), defaults: defaults)
         model.refreshAfterFrame()
@@ -154,7 +154,7 @@ final class ActivityWindowModelTests: XCTestCase {
         let routedFailure = self.item("routed-failure", state: "failed", needsAction: true)
         let resolved = ActivityViewModel(service: ActivityClient(
             list: { _ in resolvedListCalls += 1; return self.page(didAcknowledge ? [] : [routedFailure]) },
-            setViewed: { _ in self.updated([]) },
+            setViewed: { params in self.updated(params["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []) },
             acknowledge: { _ in didAcknowledge = true; return .object([:]) }
         ), defaults: resolvedDefaults)
         resolved.applyRoute(intent: NotificationRouteIntent(threadId: nil, workspaceId: nil, opensActivity: true, activityItemId: "routed-failure"))
@@ -194,6 +194,8 @@ final class ActivityWindowModelTests: XCTestCase {
         run.started_at = "2026-10-12T12:00:00.000Z"
         run.finished_at = "2026-10-12T12:04:12.000Z"
         XCTAssertEqual(run.durationLabel, "4m 12s")
+        run.finished_at = "2026-10-12T16:05:00Z"
+        XCTAssertEqual(run.durationLabel, "4h 5m", "an hours-long run must not read as hundreds of minutes")
         run.finished_at = "2026-10-12T11:59:00Z"
         XCTAssertNil(run.durationLabel, "invalid timestamp order must never fabricate elapsed time")
     }
@@ -207,7 +209,7 @@ final class ActivityWindowModelTests: XCTestCase {
         XCTAssertFalse(item("request", kind: "request", state: "failed").isMarkable)
     }
 
-    func testDetailViewedMutationExcludesRequestAndUndoRestoresNilTimestamp() {
+    func testDetailViewedMutationExcludesRequestAndMarkUnreadClearsTimestampWithoutUndoBanner() {
         let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
         var mutations: [[String: JSONValue]] = []
         let model = ActivityViewModel(service: ActivityClient(
@@ -223,9 +225,22 @@ final class ActivityWindowModelTests: XCTestCase {
         XCTAssertTrue(mutations.isEmpty, "opening a result must not mark it seen before detail mounts")
         model.detailPresented(result)
         XCTAssertEqual(mutations.first?["item_ids"]?.arrayValue?.compactMap(\.stringValue), ["run:one"])
-        model.undoViewed()
+        XCTAssertEqual(mutations.first?["viewed"]?.boolValue, true)
+        XCTAssertNotNil(model.detail?.viewed_at, "the host-confirmed read state must show before the refresh returns")
+        XCTAssertNil(model.batchStatus, "reading one result by opening it must not raise an Undo banner")
+        XCTAssertNil(model.undoCount)
+
+        var request = result
+        request.kind = "request"
+        model.openDetail(request)
+        model.detailPresented(request)
+        XCTAssertEqual(mutations.count, 1, "a request has no read state to mutate")
+
+        var read = result
+        read.viewed_at = "2026-10-12T12:00:00Z"
+        model.markUnread(read)
         XCTAssertEqual(mutations.count, 2)
-        XCTAssertEqual(mutations.last?["restore_viewed_at"]?.objectValue?["run:one"], .null)
+        XCTAssertEqual(mutations.last?["viewed"]?.boolValue, false)
         XCTAssertEqual(mutations.last?["item_ids"]?.arrayValue?.compactMap(\.stringValue), ["run:one"])
     }
 
@@ -236,6 +251,8 @@ final class ActivityWindowModelTests: XCTestCase {
         defaults.set("needle", forKey: "activity.search")
         defaults.set("workspace", forKey: "activity.workspace")
         var listCalls = 0
+        // Sampled at the mutation: the refresh that follows the batch lists again and must not race this count.
+        var listCallsBeforeMutation = 0
         var mutationCalls: [[String: JSONValue]] = []
         let first = page((0..<50).map { item("run-\($0)", at: "2026-10-12T11:59:00Z") }, cursor: "next")
         let second = page([
@@ -254,6 +271,7 @@ final class ActivityWindowModelTests: XCTestCase {
                 return listCalls == 1 ? first : second
             },
             setViewed: { params in
+                if mutationCalls.isEmpty { listCallsBeforeMutation = listCalls }
                 mutationCalls.append(params)
                 let ids = params["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
                 XCTAssertLessThanOrEqual(ids.count, 200)
@@ -264,7 +282,7 @@ final class ActivityWindowModelTests: XCTestCase {
         model.period = .week
         model.markCurrentResultsSeen()
         await waitUntil("batch completion") { !model.batchRunning }
-        XCTAssertEqual(listCalls, 2, "batch must page beyond the visible 50 rows")
+        XCTAssertEqual(listCallsBeforeMutation, 2, "batch must page beyond the visible 50 rows")
         XCTAssertEqual(mutationCalls.count, 1)
         let changed = mutationCalls[0]["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
         XCTAssertEqual(changed.count, 51)
@@ -272,7 +290,7 @@ final class ActivityWindowModelTests: XCTestCase {
         XCTAssertFalse(changed.contains("request-callback"), "request callbacks are not bulk-marked as viewed")
         XCTAssertEqual(model.undoCount, 51)
 
-        model.undoViewed()
+        model.undoLastAction()
         XCTAssertEqual(mutationCalls.count, 2)
         let undo = mutationCalls[1]
         XCTAssertEqual(undo["viewed"]?.boolValue, false)
@@ -300,7 +318,7 @@ final class ActivityWindowModelTests: XCTestCase {
         model.markCurrentResultsSeen()
         await waitUntil("batch completion") { !model.batchRunning }
         XCTAssertTrue(changedIDs.isEmpty, "response-time arrivals must stay outside click-time batch")
-        XCTAssertEqual(model.batchStatus, "No unseen results matched this filter.")
+        XCTAssertEqual(model.batchStatus, "No unread results match this filter.")
     }
 
     func testBatchPartialResponseReportsExactCountAndUndoOnlyUpdatedIDs() async {
@@ -325,7 +343,7 @@ final class ActivityWindowModelTests: XCTestCase {
         XCTAssertEqual(model.undoCount, 20)
         XCTAssertTrue(model.error?.contains("20") == true, "partial host result must report successful count")
         XCTAssertEqual(mutations.count, 1, "stop after host reports partial update")
-        model.undoViewed()
+        model.undoLastAction()
         XCTAssertEqual(mutations.count, 2)
         let ids = mutations[1]["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
         XCTAssertEqual(ids.count, 20)
@@ -416,5 +434,210 @@ final class ActivityWindowModelTests: XCTestCase {
         failing.refreshAfterFrame()
         await waitUntil("offline error") { failing.error != nil }
         XCTAssertNotNil(failing.error, "offline refresh must not look like successful empty results")
+    }
+
+    private func echoViewed(_ params: [String: JSONValue]) -> JSONValue {
+        updated(params["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+    }
+
+    func testOnlyFailuresAndBotRequestsCanBeClearedSoAnswersAndConflictsStayOpen() {
+        XCTAssertTrue(item("run:failed", state: "failed", needsAction: true).isClearable)
+        XCTAssertTrue(item("run:interrupted", state: "interrupted", needsAction: true).isClearable)
+        XCTAssertTrue(item("bot-attention:one", kind: "request", state: "waiting_answer").isClearable,
+                      "a bot request stays in its conversation, so leaving Needs you loses nothing")
+        XCTAssertFalse(item("request:thread:approval", kind: "request", state: "waiting_approval").isClearable,
+                       "a live provider approval must be answered, never cleared")
+        XCTAssertFalse(item("notification:conflict", kind: "notification", state: "needs_you", needsAction: true).isClearable,
+                       "a file conflict is resolved canonically, not from Activity")
+        XCTAssertFalse(item("run:acknowledged", state: "failed", needsAction: false).isClearable,
+                       "an already cleared failure has nothing left to clear")
+        XCTAssertFalse(item("bot-attention:one", kind: "request", state: "waiting_answer").isUnread,
+                       "a request has no read state, so it must never show as a new result")
+        XCTAssertEqual(item("run:orphan", state: "needs_you").statusLabel, "Needs attention",
+                       "the raw wire state must not reach the screen")
+    }
+
+    func testClearingSelectedNeedsYouItemRemovesItAdvancesSelectionAndUndoRestoresExactState() async {
+        let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
+        defaults.set("needsYou", forKey: "activity.tab")
+        let first = item("run:first", state: "failed", needsAction: true)
+        let second = item("run:second", viewed: "2026-10-12T10:00:00Z", state: "failed", needsAction: true)
+        var cleared = Set<String>()
+        var acknowledgeCalls: [[String: JSONValue]] = []
+        var viewedCalls: [[String: JSONValue]] = []
+        let model = ActivityViewModel(service: ActivityClient(
+            list: { _ in
+                let open = [first, second].filter { !cleared.contains($0.id) }
+                return self.page(open, counts: ActivityWireCounts(needs_you: open.count))
+            },
+            setViewed: { params in viewedCalls.append(params); return self.echoViewed(params) },
+            acknowledge: { params in
+                acknowledgeCalls.append(params)
+                if let id = params["item_id"]?.stringValue { cleared.insert(id); return .object(["acknowledged": .bool(true), "item_id": .string(id)]) }
+                let ids = params["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                if params["acknowledged"]?.boolValue == false { cleared.subtract(ids) }
+                return self.updated(ids)
+            }
+        ), defaults: defaults)
+        model.refreshAfterFrame()
+        await waitUntil("Needs you loaded") { model.page.items.count == 2 && !model.loading }
+        model.openDetail(first)
+
+        model.acknowledge(first)
+
+        XCTAssertEqual(model.page.items.map(\.id), ["run:second"], "the cleared row must leave on the click turn, before the refresh")
+        XCTAssertEqual(model.page.counts.needs_you, 1)
+        XCTAssertEqual(model.selectedID, "run:second", "triage continues on the neighbor instead of dropping the selection")
+        XCTAssertEqual(acknowledgeCalls.first?["item_id"]?.stringValue, "run:first")
+        XCTAssertEqual(viewedCalls.first?["item_ids"]?.arrayValue?.compactMap(\.stringValue), ["run:first"],
+                       "a cleared failure must not linger as a new result in Finished")
+        XCTAssertEqual(model.undoCount, 1)
+        await waitUntil("refresh after clear") { !model.loading }
+
+        model.undoLastAction()
+
+        XCTAssertEqual(acknowledgeCalls.last?["acknowledged"]?.boolValue, false)
+        XCTAssertEqual(acknowledgeCalls.last?["item_ids"]?.arrayValue?.compactMap(\.stringValue), ["run:first"])
+        XCTAssertEqual(viewedCalls.last?["restore_viewed_at"]?.objectValue?["run:first"], .null,
+                       "undo must return the result to unread, exactly as it was")
+        XCTAssertNil(model.undoCount)
+        await waitUntil("undo refresh") { model.page.items.count == 2 && !model.loading }
+        XCTAssertNil(model.error)
+    }
+
+    func testClearAllCoversEveryPageOfTheFilterButNeverAnswersRequestsOrTouchesLaterArrivals() async {
+        let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
+        defaults.set("needsYou", forKey: "activity.tab")
+        defaults.set("workspace", forKey: "activity.workspace")
+        let firstPage = (0..<50).map { item("run:\($0)", state: "failed", needsAction: true) }
+        let secondPage = [
+            item("run:50", viewed: "2026-10-12T09:00:00Z", state: "interrupted", needsAction: true),
+            item("bot-attention:question", kind: "request", state: "waiting_answer"),
+            item("request:thread:approval", kind: "request", state: "waiting_approval"),
+            item("notification:conflict", kind: "notification", state: "needs_you", needsAction: true),
+            item("run:late", at: "2026-10-12T12:01:00Z", state: "failed", needsAction: true),
+            item("run:raced", state: "failed", needsAction: true)
+        ]
+        var acknowledged: [String] = []
+        var viewed: [String] = []
+        var batchDone = false
+        let model = ActivityViewModel(service: ActivityClient(
+            list: { params in
+                XCTAssertEqual(params["section"]?.stringValue, "needs_you")
+                XCTAssertEqual(params["workspace_id"]?.stringValue, "workspace")
+                if batchDone { return self.page([]) }
+                return params["cursor"] == nil ? self.page(firstPage, cursor: "next") : self.page(secondPage)
+            },
+            setViewed: { params in
+                viewed += params["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                return self.echoViewed(params)
+            },
+            acknowledge: { params in
+                let ids = params["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? []
+                XCTAssertLessThanOrEqual(ids.count, 200)
+                XCTAssertEqual(params["acknowledged"]?.boolValue, true)
+                acknowledged += ids
+                batchDone = true
+                return self.updated(ids.filter { $0 != "run:raced" })
+            }
+        ), defaults: defaults)
+
+        model.clearCurrentNeedsYou()
+        XCTAssertTrue(model.batchRunning, "the click must be acknowledged before any host work")
+        await waitUntil("clear all completion") { !model.batchRunning }
+
+        XCTAssertEqual(acknowledged.count, 53)
+        XCTAssertTrue(acknowledged.contains("bot-attention:question"))
+        XCTAssertFalse(acknowledged.contains("request:thread:approval"), "clearing must never stand in for answering an approval")
+        XCTAssertFalse(acknowledged.contains("notification:conflict"), "a conflict keeps its canonical resolution")
+        XCTAssertFalse(acknowledged.contains("run:late"), "arrivals after the click stay in Needs you")
+        XCTAssertFalse(viewed.contains("run:50"), "an already read result needs no read mutation")
+        XCTAssertFalse(viewed.contains("bot-attention:question"), "a request has no read state")
+        XCTAssertFalse(viewed.contains("run:raced"), "an item the host did not clear must keep its unread state")
+        XCTAssertEqual(viewed.count, 50)
+        XCTAssertEqual(model.undoCount, 52, "Undo covers exactly what the host confirmed")
+        XCTAssertEqual(model.batchStatus, "Cleared 52 from Needs you.")
+        XCTAssertNil(model.error, "an item another client already resolved is not a failure")
+    }
+
+    func testClearFailureIsReportedAndSurvivesTheNextRefreshWhileNothingIsRemoved() async {
+        let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
+        defaults.set("needsYou", forKey: "activity.tab")
+        let failed = item("run:failed", state: "failed", needsAction: true)
+        var listCalls = 0
+        let model = ActivityViewModel(service: ActivityClient(
+            list: { _ in listCalls += 1; return self.page([failed], counts: ActivityWireCounts(needs_you: 1)) },
+            setViewed: { params in self.echoViewed(params) },
+            acknowledge: { _ in throw NSError(domain: "host", code: 9, userInfo: [NSLocalizedDescriptionKey: "host rejected"]) }
+        ), defaults: defaults)
+        model.refreshAfterFrame()
+        await waitUntil("Needs you loaded") { model.page.items.count == 1 && !model.loading }
+
+        model.acknowledge(failed)
+
+        XCTAssertEqual(model.error, "host rejected")
+        XCTAssertEqual(model.page.items.map(\.id), ["run:failed"], "a rejected clear must not look cleared")
+        XCTAssertEqual(model.page.counts.needs_you, 1)
+        XCTAssertNil(model.undoCount)
+        let callsBefore = listCalls
+        model.refreshAfterFrame()
+        await waitUntil("follow-up refresh") { listCalls > callsBefore && !model.loading }
+        XCTAssertEqual(model.error, "host rejected", "a successful refresh must not erase an action failure the user has not seen")
+    }
+
+    func testRefreshKeepsThePagedDepthSoALiveEventDoesNotThrowTheReaderBackToPageOne() async {
+        let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
+        defaults.set("finished", forKey: "activity.tab")
+        let first = (0..<50).map { item("run:\($0)") }
+        let second = (50..<60).map { item("run:\($0)") }
+        var requests: [String?] = []
+        let model = ActivityViewModel(service: ActivityClient(
+            list: { params in
+                requests.append(params["cursor"]?.stringValue)
+                return params["cursor"] == nil ? self.page(first, cursor: "page-2") : self.page(second)
+            },
+            setViewed: { params in self.echoViewed(params) }, acknowledge: { _ in .object([:]) }
+        ), defaults: defaults)
+        model.refreshAfterFrame()
+        await waitUntil("first page") { model.page.items.count == 50 && !model.loading }
+        XCTAssertEqual(requests, [nil], "a first load fetches one page only")
+        model.loadMore()
+        await waitUntil("second page") { model.page.items.count == 60 && !model.loading }
+        requests.removeAll()
+
+        model.refreshAfterFrame()
+        await waitUntil("refresh settled") { requests.count == 2 && !model.loading }
+
+        XCTAssertEqual(requests, [nil, "page-2"])
+        XCTAssertEqual(model.page.items.count, 60, "rows the reader paged to must survive a refresh")
+        XCTAssertFalse(model.cursorAvailable)
+    }
+
+    func testCompactAgeNeverShowsNegativeTimeAndSwitchesUnitsAtReadableBoundaries() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func age(_ seconds: TimeInterval) -> String { ActivityTimeLabel.compact(now.addingTimeInterval(-seconds), now: now) }
+        XCTAssertEqual(age(-120), "now", "a host clock ahead of this Mac must not render a negative age")
+        XCTAssertEqual(age(59), "now")
+        XCTAssertEqual(age(60), "1m")
+        XCTAssertEqual(age(3_599), "59m")
+        XCTAssertEqual(age(3_600), "1h")
+        XCTAssertEqual(age(86_399), "23h")
+        XCTAssertEqual(age(86_400), "1d")
+        XCTAssertEqual(age(6 * 86_400 + 86_399), "6d")
+        let older = age(40 * 86_400)
+        XCTAssertFalse(older.hasSuffix("d"), "beyond a week the row shows a date, not a growing day count")
+        XCTAssertFalse(older.isEmpty)
+    }
+
+    func testListSummaryHidesHostPlaceholderAndFallsBackToTheFailureReason() {
+        var run = item("run:one", state: "failed", needsAction: true)
+        run.summary = ActivityWireItem.missingSummary
+        XCTAssertNil(run.listSummary, "a placeholder repeated on every row is noise, not information")
+        run.error = "Provider exited\nwith status 1"
+        XCTAssertEqual(run.listSummary, "Provider exited with status 1", "a multi-line reason must not stretch the row")
+        run.summary = "Added validation"
+        XCTAssertEqual(run.listSummary, "Added validation")
+        run.title = "  \n  "
+        XCTAssertEqual(run.displayTitle, "Untitled", "a blank title must still give the row a readable name")
     }
 }

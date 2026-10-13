@@ -40,10 +40,31 @@ struct ActivityWireItem: Codable, Identifiable, Equatable, Sendable {
         let interval = finish.timeIntervalSince(start)
         guard interval.isFinite, interval >= 0, interval < Double(Int.max) else { return nil }
         let seconds = Int(interval)
-        return "\(seconds / 60)m \(seconds % 60)s"
+        return seconds >= 3_600 ? "\(seconds / 3_600)h \(seconds % 3_600 / 60)m" : "\(seconds / 60)m \(seconds % 60)s"
     }
     var isNew: Bool { viewed_at == nil }
     var isMarkable: Bool { kind != "request" && ["completed", "failed", "interrupted", "stopped"].contains(state) }
+    /// Requests have no read state, so only markable results can be unread.
+    var isUnread: Bool { isMarkable && isNew }
+    /// Clearing removes the item from Needs you only: a failure stays in Finished and a
+    /// bot request stays in its conversation. Approvals, questions and conflicts are
+    /// resolved where they live, never cleared here.
+    var isClearable: Bool {
+        guard needs_action else { return false }
+        return id.hasPrefix("bot-attention:") || (kind != "request" && (state == "failed" || state == "interrupted"))
+    }
+    var occurredDate: Date? { ActivityViewModel.parseDate(occurred_at) }
+    var displayTitle: String {
+        let collapsed = title.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return collapsed.isEmpty ? "Untitled" : collapsed
+    }
+    /// Host placeholder for a terminal run without a summary; honest in the detail, noise in a list.
+    static let missingSummary = "No summary available for this run"
+    var listSummary: String? {
+        let line = summary == Self.missingSummary ? error : summary ?? error
+        let collapsed = line?.split(whereSeparator: \.isWhitespace).joined(separator: " ") ?? ""
+        return collapsed.isEmpty ? nil : collapsed
+    }
     var statusLabel: String {
         switch state {
         case "completed": "Completed"
@@ -55,9 +76,26 @@ struct ActivityWireItem: Codable, Identifiable, Equatable, Sendable {
         case "queued": "Queued"
         case "running": "Running"
         case "expired": "Request expired"
+        case "needs_you": "Needs attention"
         default: state.capitalized
         }
     }
+}
+
+enum ActivityTimeLabel {
+    /// Compact age for list rows: "now", "12m", "3h", "2d", then a short date.
+    /// A timestamp ahead of the clock reads as "now" instead of a negative age.
+    static func compact(_ date: Date, now: Date = Date(), calendar: Calendar = .current) -> String {
+        let seconds = now.timeIntervalSince(date)
+        if seconds < 60 { return "now" }
+        if seconds < 3_600 { return "\(Int(seconds / 60))m" }
+        if seconds < 86_400 { return "\(Int(seconds / 3_600))h" }
+        if seconds < 7 * 86_400 { return "\(Int(seconds / 86_400))d" }
+        let sameYear = calendar.component(.year, from: date) == calendar.component(.year, from: now)
+        return date.formatted(sameYear ? .dateTime.month(.abbreviated).day() : .dateTime.month(.abbreviated).year())
+    }
+
+    static func full(_ date: Date) -> String { date.formatted(date: .abbreviated, time: .shortened) }
 }
 
 struct ActivityWireCounts: Codable, Equatable, Sendable {
@@ -167,6 +205,8 @@ final class ActivityViewModel: ObservableObject {
     private var generation: UInt64 = 0
     private var task: Task<Void, Never>?
     private var undoSnapshot: [String: String?] = [:]
+    private var undoCleared: [String] = []
+    private var errorIsFromRefresh = false
     private var needsInitialTabChoice = false
     private var applyingInitialTabChoice = false
     private var scrollRestored = false
@@ -317,14 +357,26 @@ final class ActivityViewModel: ObservableObject {
         task = Task { @MainActor [weak self] in
             await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
             guard let self, !Task.isCancelled, self.generation == request else { return }
+            let depth = min(self.page.items.count, Self.refreshDepthLimit)
             self.cursor = nil
             self.activeSince = self.period.since
             self.loading = true
-            self.error = nil
+            if self.errorIsFromRefresh { self.error = nil }
             do {
                 let params = Self.listParams(tab: self.tab, search: self.search, outcome: self.outcome, workspaceID: self.workspaceID, since: self.activeSince)
-                let next = try Self.decodePage(try await self.service.list(params))
+                var next = try Self.decodePage(try await self.service.list(params))
                 guard !Task.isCancelled, self.generation == request else { return }
+                // Keep the depth already paged to, so a refresh never truncates the list under the reader.
+                var depthCursors = Set<String>()
+                while next.items.count < depth, let pageCursor = next.next_cursor, depthCursors.insert(pageCursor).inserted {
+                    var pageParams = params
+                    pageParams["cursor"] = .string(pageCursor)
+                    let more = try Self.decodePage(try await self.service.list(pageParams))
+                    guard !Task.isCancelled, self.generation == request else { return }
+                    next.items += more.items
+                    next.next_cursor = more.next_cursor
+                    next.generated_at = more.generated_at
+                }
                 self.page = next
                 self.hasSuccessfulSnapshot = true
                 if let selectedID = self.selectedID {
@@ -346,6 +398,7 @@ final class ActivityViewModel: ObservableObject {
                         guard !Task.isCancelled, self.generation == request else { return }
                         self.page.items += targetPage.items
                         self.cursor = targetPage.next_cursor
+                        self.page.next_cursor = targetPage.next_cursor
                         self.page.generated_at = targetPage.generated_at
                         self.persistPage()
                         if let target = targetPage.items.first(where: { $0.id == targetID }) {
@@ -355,7 +408,7 @@ final class ActivityViewModel: ObservableObject {
                         }
                     }
                     guard !Task.isCancelled, self.generation == request else { return }
-                    if self.detail == nil { self.error = "Requested activity result was not found." }
+                    if self.detail == nil { self.error = "Requested activity result was not found."; self.errorIsFromRefresh = true }
                 } else if let selectedID = self.selectedID, self.detail == nil {
                     self.selectedID = nil
                     self.scrollID = nil
@@ -374,6 +427,7 @@ final class ActivityViewModel: ObservableObject {
             } catch {
                 guard self.generation == request else { return }
                 self.error = error.localizedDescription
+                self.errorIsFromRefresh = true
             }
             if self.generation == request { self.loading = false; self.task = nil }
         }
@@ -393,10 +447,11 @@ final class ActivityViewModel: ObservableObject {
                 guard self.generation == request else { return }
                 self.page.items += next.items
                 self.cursor = next.next_cursor
+                self.page.next_cursor = next.next_cursor
                 self.page.generated_at = next.generated_at
                 self.persistPage()
             } catch {
-                if self.generation == request { self.error = error.localizedDescription }
+                if self.generation == request { self.error = error.localizedDescription; self.errorIsFromRefresh = true }
             }
             if self.generation == request { self.loading = false; self.task = nil }
         }
@@ -409,6 +464,15 @@ final class ActivityViewModel: ObservableObject {
         detail = item
     }
 
+    /// Leaves the pushed detail of a narrow window. The scroll anchor stays, so the list
+    /// returns to the same place and the same row can be opened again.
+    func closeDetail() {
+        requestedTargetID = nil
+        selectedID = nil
+        detail = nil
+        scrollRestored = false
+    }
+
     func restoreScrollAnchor() -> String? {
         defer { scrollRestored = true }
         return scrollID ?? selectedID
@@ -419,49 +483,70 @@ final class ActivityViewModel: ObservableObject {
     }
 
     func detailPresented(_ item: ActivityWireItem) {
-        guard detail?.id == item.id, item.isNew, item.isMarkable else { return }
-        setViewed([item], viewed: true)
+        guard detail?.id == item.id, item.isUnread else { return }
+        setViewed(item, viewed: true)
+    }
+
+    func markRead(_ item: ActivityWireItem) { setViewed(item, viewed: true) }
+    func markUnread(_ item: ActivityWireItem) { setViewed(item, viewed: false) }
+
+    /// Filters captured on the click turn, so a bulk action never follows a later filter change.
+    private struct BatchScope {
+        let params: [String: JSONValue]
+        let clickTime: Date
+    }
+
+    private var batchScope: BatchScope {
+        BatchScope(params: Self.listParams(tab: tab, search: search, outcome: outcome, workspaceID: workspaceID, since: period.since), clickTime: Date())
+    }
+
+    /// Pages the whole scope from one frozen snapshot. Items that arrived after the click stay out.
+    private func collect(_ scope: BatchScope, where matches: (ActivityWireItem) -> Bool) async throws -> [ActivityWireItem] {
+        var params = scope.params
+        var result = try Self.decodePage(try await service.list(params))
+        guard let generatedAt = result.generated_at.flatMap(Self.parseDate) else { throw ActivityBatchError.invalidCutoff }
+        let cutoff = min(scope.clickTime, generatedAt)
+        var cursors = Set<String>()
+        var seen = Set<String>()
+        var items: [ActivityWireItem] = []
+        while true {
+            for item in result.items where matches(item) {
+                guard let time = Self.parseDate(item.occurred_at) else { throw ActivityBatchError.invalidItemDate(item.id) }
+                if time <= cutoff, seen.insert(item.id).inserted { items.append(item) }
+            }
+            guard let next = result.next_cursor else { break }
+            guard cursors.insert(next).inserted else { throw ActivityBatchError.repeatedCursor }
+            params["cursor"] = .string(next)
+            result = try Self.decodePage(try await service.list(params))
+        }
+        return items
+    }
+
+    private func beginBatch(_ status: String) {
+        batchRunning = true
+        batchStatus = status
+        error = nil
+        undoSnapshot = [:]
+        undoCleared = []
+        undoCount = nil
     }
 
     func markCurrentResultsSeen() {
         guard !batchRunning else { return }
-        batchRunning = true
-        batchStatus = "Collecting matching results…"
-        error = nil
-        undoSnapshot = [:]
-        undoCount = nil
-        let snapshotTab = tab
-        let snapshotSearch = search
-        let snapshotOutcome = outcome
-        let snapshotWorkspace = workspaceID
-        let snapshotSince = period.since
-        let clickTime = Date()
+        beginBatch("Collecting unread results…")
+        let scope = batchScope
         Task { @MainActor [weak self] in
             guard let self else { return }
             await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
-            var snapshots: [String: String?] = [:]
             var updated = Set<String>()
             do {
-                var params = Self.listParams(tab: snapshotTab, search: snapshotSearch, outcome: snapshotOutcome, workspaceID: snapshotWorkspace, since: snapshotSince)
-                var result = try Self.decodePage(try await self.service.list(params))
-                guard let generatedAt = result.generated_at.flatMap(Self.parseDate) else { throw ActivityBatchError.invalidCutoff }
-                let cutoff = min(clickTime, generatedAt)
-                var cursors = Set<String>()
-                while true {
-                    for item in result.items where item.isMarkable && item.isNew {
-                        guard let time = Self.parseDate(item.occurred_at) else { throw ActivityBatchError.invalidItemDate(item.id) }
-                        if time <= cutoff { snapshots[item.id] = item.viewed_at }
-                    }
-                    guard let next = result.next_cursor else { break }
-                    guard cursors.insert(next).inserted else { throw ActivityBatchError.repeatedCursor }
-                    params["cursor"] = .string(next)
-                    result = try Self.decodePage(try await self.service.list(params))
-                }
-                guard !snapshots.isEmpty else {
-                    self.batchStatus = "No unseen results matched this filter."
+                let items = try await self.collect(scope) { $0.isUnread }
+                guard !items.isEmpty else {
+                    self.batchStatus = "No unread results match this filter."
                     self.batchRunning = false
                     return
                 }
+                let snapshots = Dictionary(items.map { ($0.id, $0.viewed_at) }, uniquingKeysWith: { first, _ in first })
                 let ids = snapshots.keys.sorted()
                 for start in stride(from: 0, to: ids.count, by: 200) {
                     let chunk = Array(ids[start..<min(start + 200, ids.count)])
@@ -470,68 +555,187 @@ final class ActivityViewModel: ObservableObject {
                     updated.formUnion(chunkUpdated)
                     self.undoSnapshot = snapshots.filter { updated.contains($0.key) }
                     self.undoCount = updated.count
+                    self.applyViewed(chunkUpdated, viewedAt: Self.timestamp(Date()))
                     if chunkUpdated.count != chunk.count { throw ActivityBatchError.partial(updated: updated.count, total: ids.count) }
                 }
-                self.batchStatus = "Marked \(updated.count) results seen."
+                self.batchStatus = "Marked \(updated.count) as read."
                 self.refreshAfterFrame()
             } catch {
                 if !self.undoSnapshot.isEmpty {
-                    self.batchStatus = "Marked \(self.undoSnapshot.count) results before failure. Undo restores marked results."
+                    self.batchStatus = "Marked \(self.undoSnapshot.count) as read before a failure. Undo restores them."
                 }
-                self.error = error.localizedDescription
+                self.fail(error)
             }
             self.batchRunning = false
         }
     }
 
-    private func setViewed(_ items: [ActivityWireItem], viewed: Bool) {
-        let candidates = items.filter(\.isMarkable)
-        guard !candidates.isEmpty else { return }
-        var captured: [String: String?] = [:]
-        do {
-            for start in stride(from: 0, to: candidates.count, by: 200) {
-                let chunk = Array(candidates[start..<min(start + 200, candidates.count)])
-                let response = try service.setViewed(["item_ids": .array(chunk.map { .string($0.id) }), "viewed": .bool(viewed)])
-                let returned = Self.updatedIDs(response).intersection(chunk.map(\.id))
-                for item in chunk where returned.contains(item.id) { captured[item.id] = item.viewed_at }
-                if returned.count != chunk.count { throw ActivityBatchError.partial(updated: captured.count, total: candidates.count) }
+    /// Clears every clearable item in the current filter from Needs you. Items the host no
+    /// longer considers open are skipped, so the status reports what actually changed.
+    func clearCurrentNeedsYou() {
+        guard !batchRunning else { return }
+        beginBatch("Collecting items to clear…")
+        let scope = batchScope
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
+            do {
+                let items = try await self.collect(scope) { $0.isClearable }
+                guard !items.isEmpty else {
+                    self.batchStatus = "Nothing to clear in this filter."
+                    self.batchRunning = false
+                    return
+                }
+                for start in stride(from: 0, to: items.count, by: 200) {
+                    let chunk = Array(items[start..<min(start + 200, items.count)])
+                    let cleared = try self.clear(chunk)
+                    self.applyCleared(cleared)
+                }
+                self.batchStatus = self.undoCleared.isEmpty ? "Nothing needed clearing." : "Cleared \(self.undoCleared.count) from Needs you."
+                self.refreshAfterFrame()
+            } catch {
+                if !self.undoCleared.isEmpty {
+                    self.batchStatus = "Cleared \(self.undoCleared.count) before a failure. Undo restores them."
+                }
+                self.fail(error)
             }
-            if viewed {
-                undoSnapshot = captured
-                undoCount = captured.count
-                batchStatus = "Marked \(captured.count) results seen."
-            }
-            refreshAfterFrame()
-        } catch {
-            if viewed && !captured.isEmpty { undoSnapshot = captured; undoCount = captured.count }
-            self.error = error.localizedDescription
+            self.batchRunning = false
         }
     }
 
-    func undoViewed() {
-        let snapshot = undoSnapshot
-        guard !snapshot.isEmpty else { return }
+    /// Acknowledges up to 200 items and marks the unread ones read, recording both for Undo.
+    private func clear(_ items: [ActivityWireItem]) throws -> Set<String> {
+        let ids = items.map(\.id)
+        let response = try service.acknowledge(["item_ids": .array(ids.map(JSONValue.string)), "acknowledged": .bool(true)])
+        let cleared = Self.updatedIDs(response).intersection(ids)
+        undoCleared += ids.filter(cleared.contains)
+        undoCount = undoCleared.count
+        let unread = items.filter { cleared.contains($0.id) && $0.isUnread }
+        guard !unread.isEmpty else { return cleared }
+        let unreadIDs = unread.map(\.id)
+        let viewed = Self.updatedIDs(try service.setViewed(["item_ids": .array(unreadIDs.map(JSONValue.string)), "viewed": .bool(true)])).intersection(unreadIDs)
+        for item in unread where viewed.contains(item.id) { undoSnapshot[item.id] = item.viewed_at }
+        if viewed.count != unread.count { throw ActivityBatchError.partial(updated: viewed.count, total: unread.count) }
+        return cleared
+    }
+
+    func acknowledge(_ item: ActivityWireItem) {
+        guard item.isClearable else { return }
+        do {
+            _ = try service.acknowledge(["item_id": .string(item.id)])
+        } catch {
+            fail(error)
+            return
+        }
+        undoSnapshot = [:]
+        undoCleared = [item.id]
+        undoCount = 1
+        batchStatus = "Cleared from Needs you."
+        applyCleared([item.id])
+        do {
+            if item.isUnread {
+                let viewed = Self.updatedIDs(try service.setViewed(["item_ids": .array([.string(item.id)]), "viewed": .bool(true)]))
+                guard viewed.contains(item.id) else { throw ActivityBatchError.partial(updated: 0, total: 1) }
+                undoSnapshot[item.id] = item.viewed_at
+            }
+            refreshAfterFrame()
+        } catch { fail(error) }
+    }
+
+    private func setViewed(_ item: ActivityWireItem, viewed: Bool) {
+        guard item.isMarkable else { return }
+        do {
+            let response = try service.setViewed(["item_ids": .array([.string(item.id)]), "viewed": .bool(viewed)])
+            guard Self.updatedIDs(response).contains(item.id) else { throw ActivityBatchError.partial(updated: 0, total: 1) }
+            applyViewed([item.id], viewedAt: viewed ? Self.timestamp(Date()) : nil)
+            refreshAfterFrame()
+        } catch { fail(error) }
+    }
+
+    /// Mirrors a mutation the host already confirmed, so the row answers before the refresh returns.
+    private func applyViewed(_ ids: Set<String>, viewedAt: String?) {
+        guard !ids.isEmpty else { return }
+        for index in page.items.indices where ids.contains(page.items[index].id) { page.items[index].viewed_at = viewedAt }
+        if let current = detail, ids.contains(current.id) { detail?.viewed_at = viewedAt }
+    }
+
+    private func applyCleared(_ ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        page.counts.needs_you = max(0, page.counts.needs_you - ids.count)
+        guard tab == .needsYou else {
+            for index in page.items.indices where ids.contains(page.items[index].id) { page.items[index].needs_action = false }
+            if let current = detail, ids.contains(current.id) { detail?.needs_action = false }
+            return
+        }
+        // Advance to the neighbor so triage continues without re-aiming.
+        var successor: ActivityWireItem?
+        if let selectedID, ids.contains(selectedID), let index = page.items.firstIndex(where: { $0.id == selectedID }) {
+            successor = page.items[(index + 1)...].first { !ids.contains($0.id) }
+                ?? page.items[..<index].last { !ids.contains($0.id) }
+        }
+        let selectionCleared = selectedID.map(ids.contains) ?? false
+        page.items.removeAll { ids.contains($0.id) }
+        guard selectionCleared else { return }
+        if let successor { openDetail(successor) } else { selectedID = nil; scrollID = nil; detail = nil }
+    }
+
+    private func fail(_ error: Error) {
+        self.error = error.localizedDescription
+        errorIsFromRefresh = false
+    }
+
+    func undoLastAction() {
+        let viewedSnapshot = undoSnapshot
+        let cleared = undoCleared
+        guard !viewedSnapshot.isEmpty || !cleared.isEmpty else { return }
+        var reopened = Set<String>()
         var restored = Set<String>()
         do {
-            let ids = snapshot.keys.sorted()
+            for start in stride(from: 0, to: cleared.count, by: 200) {
+                let chunk = Array(cleared[start..<min(start + 200, cleared.count)])
+                let response = try service.acknowledge(["item_ids": .array(chunk.map(JSONValue.string)), "acknowledged": .bool(false)])
+                let chunkReopened = Self.updatedIDs(response).intersection(chunk)
+                reopened.formUnion(chunkReopened)
+                if chunkReopened.count != chunk.count { throw ActivityBatchError.partial(updated: reopened.count, total: cleared.count) }
+            }
+            let ids = viewedSnapshot.keys.sorted()
             for start in stride(from: 0, to: ids.count, by: 200) {
                 let chunk = Array(ids[start..<min(start + 200, ids.count)])
-                let restore = Dictionary(uniqueKeysWithValues: chunk.map { id in (id, (snapshot[id] ?? nil).map(JSONValue.string) ?? .null) })
+                let restore = Dictionary(uniqueKeysWithValues: chunk.map { id in (id, (viewedSnapshot[id] ?? nil).map(JSONValue.string) ?? .null) })
                 let response = try service.setViewed(["item_ids": .array(chunk.map(JSONValue.string)), "viewed": .bool(false), "restore_viewed_at": .object(restore)])
                 let chunkRestored = Self.updatedIDs(response).intersection(chunk)
                 restored.formUnion(chunkRestored)
                 if chunkRestored.count != chunk.count { throw ActivityBatchError.partial(updated: restored.count, total: ids.count) }
             }
             undoSnapshot.removeAll()
+            undoCleared.removeAll()
             undoCount = nil
-            batchStatus = "Restored \(restored.count) results to their previous seen state."
+            batchStatus = cleared.isEmpty ? "Restored \(restored.count) to unread." : "Restored \(reopened.count) to Needs you."
             refreshAfterFrame()
         } catch {
-            undoSnapshot = snapshot.filter { !restored.contains($0.key) }
-            undoCount = undoSnapshot.count
-            self.error = error.localizedDescription
-            if !undoSnapshot.isEmpty { batchStatus = "Restored \(restored.count); \(undoSnapshot.count) still need Undo." }
+            undoCleared = cleared.filter { !reopened.contains($0) }
+            undoSnapshot = viewedSnapshot.filter { !restored.contains($0.key) }
+            let remaining = Set(undoCleared).union(undoSnapshot.keys).count
+            undoCount = remaining == 0 ? nil : remaining
+            if remaining > 0 { batchStatus = "Undo stopped early; \(remaining) still need Undo." }
+            fail(error)
         }
+    }
+
+    func dismissStatus() {
+        batchStatus = nil
+        undoSnapshot.removeAll()
+        undoCleared.removeAll()
+        undoCount = nil
+    }
+
+    var hasActiveFilters: Bool { !search.isEmpty || !workspaceID.isEmpty || !outcome.isEmpty || period != .all }
+
+    func clearFilters() {
+        if !search.isEmpty { search = "" }
+        if !workspaceID.isEmpty { workspaceID = "" }
+        if !outcome.isEmpty { outcome = "" }
+        if period != .all { period = .all }
     }
 
     private static func listParams(tab: Tab, search: String, outcome: String, workspaceID: String, since: String?) -> [String: JSONValue] {
@@ -550,29 +754,34 @@ final class ActivityViewModel: ObservableObject {
         Set(value.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue) ?? [])
     }
 
-    fileprivate static func parseDate(_ value: String) -> Date? {
-        let withFractions = ISO8601DateFormatter()
-        withFractions.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return withFractions.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+    private static let refreshDepthLimit = 200
+    // ISO8601DateFormatter is documented thread-safe; shared so rows do not allocate one per render.
+    nonisolated(unsafe) private static let fractionalDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    nonisolated(unsafe) private static let plainDateFormatter = ISO8601DateFormatter()
+
+    nonisolated fileprivate static func parseDate(_ value: String) -> Date? {
+        fractionalDateFormatter.date(from: value) ?? plainDateFormatter.date(from: value)
     }
 
-    func acknowledge(_ item: ActivityWireItem) {
-        guard item.state == "failed" || item.state == "interrupted" else { return }
-        do {
-            _ = try service.acknowledge(["item_id": .string(item.id)])
-            refreshAfterFrame()
-        } catch { self.error = error.localizedDescription }
-    }
+    private static func timestamp(_ date: Date) -> String { fractionalDateFormatter.string(from: date) }
 }
 
 struct ActivityRootView: View {
     @StateObject private var model: ActivityViewModel
     @State private var narrowDetail = false
+    @State private var searchFocusRequest = false
     let openThread: (ActivityWireItem) -> Void
     let openEvidence: (ActivityWireItem, String?) -> Void
     private let workspaceOptions: () -> [(id: String, name: String)]
     let route: NotificationRouteIntent?
     let consumeRoute: () -> Void
+
+    /// Below this width the list and the detail take turns instead of sitting side by side.
+    private static let compactWidth: CGFloat = 720
 
     init(router: AppCommandRouter, route: NotificationRouteIntent? = nil, consumeRoute: @escaping () -> Void = {}, openThread: @escaping (ActivityWireItem) -> Void = { _ in }, openEvidence: @escaping (ActivityWireItem, String?) -> Void = { _, _ in }) {
         _model = StateObject(wrappedValue: ActivityViewModel(router: router))
@@ -583,30 +792,40 @@ struct ActivityRootView: View {
         workspaceOptions = { router.activityWorkspaceOptions }
     }
 
+    /// Renders a prepared model without a router: offscreen layout proofs and worst-case data.
+    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }) {
+        _model = StateObject(wrappedValue: model)
+        openThread = { _ in }
+        openEvidence = { _, _ in }
+        route = nil
+        consumeRoute = {}
+        self.workspaceOptions = workspaceOptions
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
-            HStack(spacing: DS.Space.sm) {
-                ForEach(ActivityViewModel.Tab.allCases) { tab in
-                    AgentListFilterChip(title: tab.title, count: count(for: tab), selected: model.tab == tab, identifier: "activity.tab.\(tab.rawValue)") { model.tab = tab }
-                }
-                Spacer()
-                if model.undoCount != nil { Button("Undo") { model.undoViewed() } }
-                if model.tab == .finished {
-                    Button(model.batchRunning ? "Collecting…" : "Mark results seen") { model.markCurrentResultsSeen() }
-                        .disabled(model.batchRunning)
-                }
-                if let status = model.batchStatus { Text(status).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).lineLimit(2) }
-            }.padding(.horizontal, DS.Space.xl).padding(.bottom, DS.Space.md)
-            HStack(spacing: 0) {
-                list.frame(minWidth: 220, idealWidth: 310, maxWidth: narrowDetail ? .infinity : 390)
-                if !narrowDetail, let detail = model.detail {
-                    Rectangle().fill(DS.Palette.line).frame(width: 1)
-                    detailView(detail).frame(maxWidth: .infinity, maxHeight: .infinity)
+            tabBar
+            if let error = model.error { errorBanner(error) }
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            GeometryReader { proxy in
+                if proxy.size.width < Self.compactWidth {
+                    if narrowDetail, let item = model.detail { compactDetail(item) } else { list }
+                } else {
+                    HStack(spacing: 0) {
+                        list.frame(width: min(max(proxy.size.width * 0.36, 340), 460))
+                        Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
+                        if let item = model.detail {
+                            detailView(item)
+                        } else {
+                            DSEmptyState(icon: "rectangle.righthalf.inset.filled", title: "Nothing selected", subtitle: "Select an item to see its result and what you can do next.")
+                        }
+                    }
                 }
             }
-            if model.loading || model.batchRunning { ProgressView().controlSize(.small).padding(DS.Space.sm) }
+            if let status = model.batchStatus { statusStrip(status).transition(.opacity) }
         }
+        .animation(DS.Motion.micro, value: model.batchStatus != nil)
         .frame(minWidth: 540, minHeight: 420)
         .background(DS.Palette.bg)
         .onAppear {
@@ -616,9 +835,6 @@ struct ActivityRootView: View {
         .onChange(of: route) { _, next in
             if let next { apply(next) }
         }
-        .alert("Activity could not be updated", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.dismissError() } })) {
-            Button("OK") { model.dismissError() }
-        } message: { Text(model.error ?? "") }
     }
 
     private func apply(_ route: NotificationRouteIntent) {
@@ -627,24 +843,28 @@ struct ActivityRootView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            Text("Activity").font(DS.Font.title.weight(.semibold)).foregroundColor(DS.Palette.text)
-            if model.hasSuccessfulSnapshot {
-                Text("\(model.page.counts.running) running · \(model.page.counts.needs_you) need you · \(model.page.counts.finished) finished")
-                    .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
-            } else {
-                Text("Activity counts unavailable")
-                    .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.md) {
+                Text("Activity").font(DS.Font.title.weight(.semibold)).foregroundColor(DS.Palette.text)
+                if !model.hasSuccessfulSnapshot {
+                    Text("Activity counts unavailable").font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
+                }
+                Spacer()
+                // Fixed slot: the spinner must not move the header when it appears.
+                ZStack {
+                    if model.loading || model.batchRunning { DSBusySpinner(label: "Updating activity", identifier: "activity.busy") }
+                }.frame(width: 16, height: 16)
             }
-            HStack {
-                TextField("Search title, workspace, or summary", text: $model.search).textFieldStyle(.roundedBorder)
+            HStack(spacing: DS.Space.md) {
+                SidebarSearchField(placeholder: "Search title or summary", text: $model.search, focusRequest: $searchFocusRequest, accessibilityIdentifier: "activity.search")
+                    .frame(minWidth: 160, maxWidth: 420)
                 Picker("Workspace", selection: $model.workspaceID) {
                     Text("All workspaces").tag("")
                     ForEach(workspaces, id: \.id) { workspace in Text(workspace.name).tag(workspace.id) }
-                }.frame(width: 170)
+                }.labelsHidden().frame(width: 170)
                 Picker("Period", selection: $model.period) {
                     ForEach(ActivityViewModel.Period.allCases) { period in Text(period.title).tag(period) }
-                }.frame(width: 145)
+                }.labelsHidden().frame(width: 145)
                 if model.tab == .finished {
                     Picker("Outcome", selection: $model.outcome) {
                         Text("All outcomes").tag("")
@@ -652,108 +872,291 @@ struct ActivityRootView: View {
                         Text("Failed").tag("failed")
                         Text("Interrupted").tag("interrupted")
                         Text("Stopped by you").tag("stopped")
-                    }.frame(width: 150)
+                    }.labelsHidden().frame(width: 150)
                 }
+                Spacer(minLength: 0)
             }
-        }.padding(DS.Space.xl)
+        }.padding(.horizontal, DS.Space.xl).padding(.top, DS.Space.xl).padding(.bottom, DS.Space.lg)
     }
 
-    private var list: some View {
-        VStack {
-            if narrowDetail, let item = model.detail {
-                HStack { Button("Back to activity") { narrowDetail = false }; Spacer() }
-                    .padding(.horizontal, DS.Space.md)
-                detailView(item)
-            } else {
-                if let error = model.error {
-                    HStack {
-                        Text(model.showingCachedResults ? "Showing saved results. Update failed: \(error)" : "Update failed: \(error)")
-                            .font(DS.Font.caption).foregroundColor(DS.Palette.danger).lineLimit(2)
-                        Button("Retry") { model.refreshAfterFrame() }
-                    }.padding(DS.Space.sm)
-                }
-                if model.page.items.isEmpty && !model.loading && model.error == nil && model.hasSuccessfulSnapshot {
-                    DSEmptyState(icon: "tray", title: "No activity", subtitle: "Results and requests will appear here.")
-                } else if !model.page.items.isEmpty {
-                    ScrollViewReader { proxy in
-                        List {
-                            if model.tab == .running {
-                                if !model.runningItems.isEmpty {
-                                    Section("Running") {
-                                        ForEach(model.runningItems) { item in activityRow(item) }
-                                    }
-                                }
-                                if !model.queuedItems.isEmpty {
-                                    Section("Queued · \(model.page.counts.queued)") {
-                                        ForEach(model.queuedItems) { item in activityRow(item) }
-                                    }
-                                }
-                            } else {
-                                ForEach(model.page.items) { item in activityRow(item) }
-                            }
-                        }.listStyle(.plain).accessibilityIdentifier("activity.list")
-                            .onAppear { let anchor = model.restoreScrollAnchor(); if let anchor { proxy.scrollTo(anchor, anchor: .center) } }
-                            .onChange(of: model.selectedID) { id in if let id { proxy.scrollTo(id, anchor: .center) } }
-                    }
-                    if model.cursorAvailable { Button("Load more") { model.loadMore() }.padding(.bottom, DS.Space.sm) }
-                }
+    private var tabBar: some View {
+        // Wide windows keep one row; a narrow one stacks the bulk actions under the tabs instead of wrapping labels.
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: DS.Space.sm) { tabs; Spacer(minLength: DS.Space.lg); bulkActions }
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                HStack(spacing: DS.Space.sm) { tabs }
+                HStack(spacing: DS.Space.sm) { bulkActions }
             }
-        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, DS.Space.xl).padding(.bottom, DS.Space.lg)
+    }
+
+    private var tabs: some View {
+        ForEach(ActivityViewModel.Tab.allCases) { tab in
+            AgentListFilterChip(title: tab.title, count: count(for: tab), selected: model.tab == tab, identifier: "activity.tab.\(tab.rawValue)") { model.tab = tab }
+                .fixedSize()
+        }
     }
 
     @ViewBuilder
-    private func activityRow(_ item: ActivityWireItem) -> some View {
-        Button { model.openDetail(item); narrowDetail = true } label: { row(item) }
-            .buttonStyle(.plain).id(item.id)
-            .onAppear { model.didDisplay(item.id) }
+    private var bulkActions: some View {
+        if model.tab != .running {
+            Button("Mark all as read") { model.markCurrentResultsSeen() }
+                .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning).fixedSize()
+                .help("Marks every result in this filter as read. Nothing is removed.")
+                .accessibilityIdentifier("activity.markAllRead")
+        }
+        if model.tab == .needsYou {
+            Button("Clear all") { model.clearCurrentNeedsYou() }
+                .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning || model.page.counts.needs_you == 0).fixedSize()
+                .help("Clears failures and bot requests in this filter from Needs you. Results stay in Finished; approvals and questions stay until answered.")
+                .accessibilityIdentifier("activity.clearAll")
+        }
     }
 
-    private func row(_ item: ActivityWireItem) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
-            HStack {
-                Text(item.title).font(DS.Font.body.weight(.semibold)).foregroundColor(DS.Palette.text).lineLimit(2)
-                Spacer()
-                Text(item.statusLabel).font(DS.Font.caption).foregroundColor(color(item.state))
+    private func errorBanner(_ error: String) -> some View {
+        HStack(spacing: DS.Space.md) {
+            Image(systemName: "exclamationmark.triangle.fill").font(DS.Font.body).foregroundColor(DS.Palette.danger).accessibilityHidden(true)
+            Text(model.showingCachedResults ? "Showing saved results. Update failed: \(error)" : "Update failed: \(error)")
+                .font(DS.Font.bodyDense).foregroundColor(DS.Palette.text).lineLimit(3)
+            Spacer(minLength: DS.Space.md)
+            Button("Retry") { model.refreshAfterFrame() }.buttonStyle(DSSecondaryButtonStyle())
+            DSIconButton("xmark", help: "Dismiss error") { model.dismissError() }.packed()
+        }
+        .padding(.horizontal, DS.Space.xl).padding(.vertical, DS.Space.md)
+        .background(DS.Palette.danger.opacity(0.12))
+        .accessibilityIdentifier("activity.error")
+    }
+
+    private func statusStrip(_ status: String) -> some View {
+        HStack(spacing: DS.Space.md) {
+            Text(status).font(DS.Font.bodyDense).foregroundColor(DS.Palette.text).lineLimit(2)
+            Spacer(minLength: DS.Space.md)
+            if model.undoCount != nil {
+                Button("Undo") { model.undoLastAction() }
+                    .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning)
+                    .accessibilityIdentifier("activity.undo")
             }
-            Text([item.workspace_name, item.provider, item.origin_label].compactMap { $0 }.joined(separator: " · ")).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-            if let summary = item.summary { Text(summary).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).lineLimit(2) }
-            if item.isNew { Text("New result").font(DS.Font.caption.weight(.semibold)).foregroundColor(DS.Palette.text) }
-        }.padding(.vertical, DS.Space.xs).accessibilityElement(children: .combine)
+            DSIconButton("xmark", help: "Dismiss") { model.dismissStatus() }.packed()
+        }
+        .padding(.horizontal, DS.Space.xl).padding(.vertical, DS.Space.md)
+        .background(DS.Palette.surfaceOverlay)
+        .overlay(alignment: .top) { Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline) }
+        .accessibilityIdentifier("activity.status")
+    }
+
+    private var selection: Binding<String?> {
+        Binding(get: { model.selectedID }, set: { id in
+            guard let id, let item = model.page.items.first(where: { $0.id == id }) else { return }
+            model.openDetail(item)
+            narrowDetail = true
+        })
+    }
+
+    @ViewBuilder
+    private var list: some View {
+        if model.page.items.isEmpty {
+            if model.loading || model.error != nil || !model.hasSuccessfulSnapshot {
+                // No safe cache for this filter yet: hold the layout, the header owns progress and errors.
+                DS.Palette.bg.frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if model.hasActiveFilters {
+                DSEmptyState(icon: "magnifyingglass", title: "No matches", subtitle: "Nothing in \(model.tab.title) matches this search and these filters.") {
+                    Button("Clear filters") { model.clearFilters() }.buttonStyle(DSSecondaryButtonStyle())
+                }
+            } else {
+                emptyState
+            }
+        } else {
+            ScrollViewReader { proxy in
+                List(selection: selection) {
+                    if model.tab == .running {
+                        if !model.runningItems.isEmpty {
+                            Section("Running") {
+                                ForEach(model.runningItems) { item in activityRow(item) }
+                            }
+                        }
+                        if !model.queuedItems.isEmpty {
+                            Section("Queued · \(model.page.counts.queued)") {
+                                ForEach(model.queuedItems) { item in activityRow(item) }
+                            }
+                        }
+                    } else {
+                        ForEach(model.page.items) { item in activityRow(item) }
+                    }
+                    if model.cursorAvailable { loadMoreRow }
+                }
+                .listStyle(.plain).scrollContentBackground(.hidden).background(DS.Palette.bg)
+                .accessibilityIdentifier("activity.list")
+                .onDeleteCommand { if let item = model.detail, item.isClearable { model.acknowledge(item) } }
+                .onAppear { let anchor = model.restoreScrollAnchor(); if let anchor { proxy.scrollTo(anchor, anchor: .center) } }
+                .onChange(of: model.selectedID) { _, id in if let id { proxy.scrollTo(id) } }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var emptyState: some View {
+        switch model.tab {
+        case .running: DSEmptyState(icon: "moon.zzz", title: "Nothing running", subtitle: "Agent runs and project scripts in progress appear here.")
+        case .needsYou: DSEmptyState(icon: "checkmark.circle", title: "You're all caught up", subtitle: "Approvals, questions, and failures that need you appear here.")
+        case .finished: DSEmptyState(icon: "tray", title: "No results yet", subtitle: "Finished runs and their results appear here.")
+        }
+    }
+
+    private var loadMoreRow: some View {
+        HStack(spacing: DS.Space.md) {
+            Text("Showing \(model.page.items.count) of \(count(for: model.tab))")
+                .font(DS.Font.caption).monospacedDigit().foregroundColor(DS.Palette.textSecondary)
+            Spacer()
+            Button(model.loading ? "Loading…" : "Load more") { model.loadMore() }
+                .buttonStyle(DSSecondaryButtonStyle()).disabled(model.loading)
+        }
+        .padding(.vertical, DS.Space.sm)
+        .listRowSeparator(.hidden)
+    }
+
+    private func activityRow(_ item: ActivityWireItem) -> some View {
+        ActivityRow(
+            item: item,
+            toggleRead: { item.isUnread ? model.markRead(item) : model.markUnread(item) },
+            clear: { model.acknowledge(item) },
+            open: canOpen(item) ? { openThread(item) } : nil,
+            openLabel: openLabel(item)
+        )
+        .id(item.id)
+        .listRowSeparatorTint(DS.Palette.line)
+        .onAppear { model.didDisplay(item.id) }
+    }
+
+    private func compactDetail(_ item: ActivityWireItem) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button { narrowDetail = false; model.closeDetail() } label: { Label("Activity", systemImage: "chevron.left") }
+                    .buttonStyle(DSSecondaryButtonStyle()).keyboardShortcut(.cancelAction)
+                Spacer()
+            }.padding(.horizontal, DS.Space.xl).padding(.vertical, DS.Space.md)
+            detailView(item)
+        }
     }
 
     private func detailView(_ item: ActivityWireItem) -> some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: DS.Space.md) {
-                Text(item.title).font(DS.Font.title.weight(.semibold)).foregroundColor(DS.Palette.text)
-                DSPill(item.statusLabel, tone: item.state == "failed" ? .danger : item.state == "completed" ? .success : .neutral)
-                Text(item.workspace_name ?? "Workspace unavailable").foregroundColor(DS.Palette.textSecondary)
-                if let origin = item.origin_label { Text(origin).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary) }
-                if let provider = item.provider { Text(provider).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary) }
-                Text(item.kind == "agent" ? "Agent summary" : "Result").font(DS.Font.body.weight(.semibold)).foregroundColor(DS.Palette.text)
-                Text(item.summary ?? "No summary available for this run.").font(DS.Font.body).foregroundColor(DS.Palette.text)
-                Text(item.occurred_at).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-                if let duration = item.durationLabel { Text("Duration \(duration)").font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary) }
-                if let error = item.error { Text(error).foregroundColor(DS.Palette.danger) }
-                if item.thread_id != nil || item.bot_id != nil || item.surface_id != nil || item.notification_id != nil {
-                    Button(item.bot_id != nil ? "Open bot" : item.surface_id != nil && item.thread_id == nil ? "Open terminal" : "Open destination") { openThread(item) }
-                    if item.checkpoint_turn_count != nil, item.thread_id != nil, item.workspace_id != nil, item.run_id != nil {
-                        Button("View changes") { openEvidence(item, nil) }
-                    }
-                }
-                if !item.changed_files.isEmpty {
-                    Text("Changes").font(DS.Font.body.weight(.semibold))
-                    ForEach(item.changed_files, id: \.self) { path in
-                        if item.checkpoint_turn_count != nil, item.thread_id != nil, item.workspace_id != nil, item.run_id != nil {
-                            Button("View \(path)") { openEvidence(item, path) }
-                        } else {
-                            Text(path).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+            VStack(alignment: .leading, spacing: DS.Space.xxl) {
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    Text(item.displayTitle).font(DS.Font.title2).foregroundColor(DS.Palette.text)
+                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: DS.Space.md) {
+                        DSPill(item.statusLabel, tone: ActivityStatusStyle.tone(item.state))
+                        if let date = item.occurredDate {
+                            Text(ActivityTimeLabel.full(date)).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                        }
+                        if let duration = item.durationLabel {
+                            Text("Duration \(duration)").font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
                         }
                     }
                 }
-                if item.state == "failed" || item.state == "interrupted" { Button("Acknowledge failure") { model.acknowledge(item) } }
-                if item.state == "waiting_approval" || item.state == "waiting_answer" { Text("Open the request in its canonical conversation to respond.").foregroundColor(DS.Palette.textSecondary) }
-            }.frame(maxWidth: .infinity, alignment: .leading).padding(DS.Space.xl)
-        }.onAppear { model.detailPresented(item) }
+                detailActions(item)
+                detailFacts(item)
+                if item.kind != "request" || item.summary != nil {
+                    detailSection(item.kind == "agent" ? "Agent summary" : "Result") {
+                        Text(item.summary ?? "No summary available for this run.").font(DS.Font.body).foregroundColor(DS.Palette.text)
+                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if let error = item.error, !error.isEmpty {
+                    detailSection("Error") {
+                        Text(error).font(DS.Font.bodyDense).foregroundColor(DS.Palette.danger)
+                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                            .padding(DS.Space.lg).frame(maxWidth: .infinity, alignment: .leading)
+                            .background(DS.Palette.danger.opacity(0.10))
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+                    }
+                }
+                if !item.changed_files.isEmpty {
+                    detailSection("Changes") {
+                        ForEach(item.changed_files, id: \.self) { path in
+                            if canViewChanges(item) {
+                                Button { openEvidence(item, path) } label: {
+                                    Text(path).font(DS.Font.monoSmall).lineLimit(1).truncationMode(.middle)
+                                }.buttonStyle(.link).help(path).accessibilityLabel("View \(path)")
+                            } else {
+                                Text(path).font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
+                                    .lineLimit(1).truncationMode(.middle).help(path)
+                            }
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(DS.Space.xxxl)
+        }
+        .task(id: item.id) { model.detailPresented(item) }
+    }
+
+    @ViewBuilder
+    private func detailActions(_ item: ActivityWireItem) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.md) {
+                if canOpen(item) {
+                    Button(openLabel(item)) { openThread(item) }.buttonStyle(DSPrimaryButtonStyle())
+                }
+                if canOpen(item), canViewChanges(item) {
+                    Button("View changes") { openEvidence(item, nil) }.buttonStyle(DSSecondaryButtonStyle())
+                }
+                if item.isClearable {
+                    Button("Clear") { model.acknowledge(item) }.buttonStyle(DSSecondaryButtonStyle())
+                        .help(item.kind == "request" ? "Removes this from Needs you. The request stays in the bot's conversation." : "Removes this from Needs you. The result stays in Finished.")
+                }
+                if item.isMarkable, !item.isNew {
+                    Button("Mark as unread") { model.markUnread(item) }.buttonStyle(DSSecondaryButtonStyle())
+                        .keyboardShortcut("u", modifiers: [.command, .shift])
+                }
+            }
+            if item.state == "waiting_approval" || item.state == "waiting_answer" {
+                Text("Open the conversation to respond. It leaves Needs you once answered.")
+                    .font(DS.Font.bodyDense).foregroundColor(DS.Palette.textSecondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func detailFacts(_ item: ActivityWireItem) -> some View {
+        let facts = [("Workspace", item.workspace_name), ("Provider", item.provider), ("Origin", item.origin_label)]
+            .compactMap { label, value in value.flatMap { $0.isEmpty ? nil : (label, $0) } }
+        if !facts.isEmpty {
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: DS.Space.xl, verticalSpacing: DS.Space.sm) {
+                ForEach(facts, id: \.0) { label, value in
+                    GridRow {
+                        Text(label).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                        Text(value).font(DS.Font.body).foregroundColor(DS.Palette.text)
+                            .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+    }
+
+    private func detailSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            Text(title).font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
+            content()
+        }
+    }
+
+    private func canOpen(_ item: ActivityWireItem) -> Bool {
+        item.thread_id != nil || item.bot_id != nil || item.surface_id != nil || item.notification_id != nil
+    }
+
+    private func canViewChanges(_ item: ActivityWireItem) -> Bool {
+        item.checkpoint_turn_count != nil && item.thread_id != nil && item.workspace_id != nil && item.run_id != nil
+    }
+
+    private func openLabel(_ item: ActivityWireItem) -> String {
+        if item.bot_id != nil { return "Open bot" }
+        if item.thread_id != nil { return "Open conversation" }
+        return item.surface_id != nil ? "Open terminal" : "Open destination"
     }
 
     private var workspaces: [(id: String, name: String)] {
@@ -773,15 +1176,131 @@ struct ActivityRootView: View {
         case .finished: model.page.counts.finished
         }
     }
+}
 
-    private func color(_ state: String) -> Color {
+/// Text never carries state alone: every status pairs a symbol with its color.
+private enum ActivityStatusStyle {
+    static func symbol(_ state: String) -> String {
         switch state {
-        case "running": .blue
+        case "running": "circle.dotted"
+        case "queued": "clock"
+        case "completed": "checkmark.circle.fill"
+        case "failed": "xmark.octagon.fill"
+        case "interrupted": "exclamationmark.triangle.fill"
+        case "stopped": "stop.circle"
+        case "waiting_approval": "hand.raised.fill"
+        case "waiting_answer": "questionmark.bubble.fill"
+        default: "exclamationmark.bubble.fill"
+        }
+    }
+
+    static func color(_ state: String) -> Color {
+        switch state {
+        case "running": DS.Palette.accent
         case "failed", "interrupted": DS.Palette.danger
         case "completed": DS.Palette.success
-        case "stopped": DS.Palette.textSecondary
+        case "stopped", "queued": DS.Palette.textSecondary
         default: DS.Palette.warning
         }
+    }
+
+    static func tone(_ state: String) -> DSPill.Tone {
+        switch state {
+        case "running": .accent
+        case "failed", "interrupted": .danger
+        case "completed": .success
+        case "stopped", "queued": .neutral
+        default: .warning
+        }
+    }
+}
+
+private struct ActivityRow: View {
+    let item: ActivityWireItem
+    let toggleRead: () -> Void
+    let clear: () -> Void
+    let open: (() -> Void)?
+    let openLabel: String
+    @State private var hovering = false
+    @Environment(\.backgroundProminence) private var prominence
+
+    /// Trailing slot shared by the age and the hover actions, so hovering never re-truncates the title.
+    private static let trailingWidth: CGFloat = 58
+
+    private var secondary: Color { prominence == .increased ? DS.Palette.text : DS.Palette.textSecondary }
+    private var stateColor: Color { prominence == .increased ? DS.Palette.text : ActivityStatusStyle.color(item.state) }
+    private var showsActions: Bool { hovering && (item.isMarkable || item.isClearable) }
+    private var facts: String { [item.workspace_name, item.provider, item.origin_label].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ") }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: DS.Space.md) {
+            Circle().fill(item.isUnread ? DS.Palette.accent : Color.clear)
+                .frame(width: 7, height: 7).padding(.top, DS.Space.xs)
+            Image(systemName: ActivityStatusStyle.symbol(item.state))
+                .font(.system(size: 13, weight: .semibold)).foregroundColor(stateColor).frame(width: 16)
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                HStack(alignment: .firstTextBaseline, spacing: DS.Space.md) {
+                    Text(item.displayTitle).font(item.isUnread ? DS.Font.bodyStrong : DS.Font.body)
+                        .foregroundColor(DS.Palette.text).lineLimit(1)
+                    Spacer(minLength: 0)
+                    trailing
+                }
+                HStack(alignment: .firstTextBaseline, spacing: DS.Space.md) {
+                    Text(facts.isEmpty ? item.statusLabel : facts).font(DS.Font.caption)
+                        .foregroundColor(facts.isEmpty ? stateColor : secondary).lineLimit(1)
+                    Spacer(minLength: 0)
+                    if !facts.isEmpty { Text(item.statusLabel).font(DS.Font.caption).foregroundColor(stateColor).lineLimit(1).layoutPriority(1) }
+                }
+                if let summary = item.listSummary {
+                    Text(summary).font(DS.Font.caption).foregroundColor(secondary).lineLimit(2)
+                }
+            }
+        }
+        .padding(.vertical, DS.Space.sm)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .help(item.displayTitle)
+        .contextMenu {
+            if let open { Button(openLabel, action: open) }
+            if item.isMarkable { Button(item.isUnread ? "Mark as Read" : "Mark as Unread", action: toggleRead) }
+            if item.isClearable { Button("Clear from Needs You", action: clear) }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel([item.displayTitle, item.statusLabel, facts, item.listSummary ?? ""].filter { !$0.isEmpty }.joined(separator: ", "))
+        .accessibilityValue(item.isUnread ? "Unread" : "")
+        .accessibilityActions {
+            if let open { Button(openLabel, action: open) }
+            if item.isMarkable { Button(item.isUnread ? "Mark as read" : "Mark as unread", action: toggleRead) }
+            if item.isClearable { Button("Clear from Needs you", action: clear) }
+        }
+    }
+
+    private var trailing: some View {
+        ZStack(alignment: .trailing) {
+            if let date = item.occurredDate {
+                Text(ActivityTimeLabel.compact(date)).font(DS.Font.caption).monospacedDigit()
+                    .foregroundColor(secondary).opacity(showsActions ? 0 : 1)
+                    .help(ActivityTimeLabel.full(date))
+            }
+            if showsActions {
+                HStack(spacing: 0) {
+                    if item.isMarkable {
+                        DSIconButton(item.isUnread ? "envelope.open" : "envelope.badge", help: item.isUnread ? "Mark as read" : "Mark as unread", action: toggleRead).packed()
+                    }
+                    if item.isClearable {
+                        DSIconButton("archivebox", help: "Clear from Needs you", action: clear).packed()
+                    }
+                }
+            }
+        }.frame(width: Self.trailingWidth, height: 16, alignment: .trailing)
+    }
+}
+
+private extension DSIconButton {
+    /// Collapses the 44pt hit box to the glyph so a dense row keeps its height.
+    func packed() -> some View {
+        padding(.horizontal, -DSIconButton.visualPackInset)
+            .padding(.vertical, -(DSIconButton.hitTargetSize - DSIconButton.visualSize.height) / 2)
     }
 }
 

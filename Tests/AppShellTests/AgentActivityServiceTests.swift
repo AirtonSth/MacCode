@@ -23,6 +23,52 @@ final class AgentActivityServiceTests: XCTestCase {
         XCTAssertEqual(page.items.first?.state, .failed)
     }
 
+    func test_batchAcknowledgeClearsFailuresAndBotRequestsSkipsWhatCannotBeClearedAndReopenRestoresNeedsYou() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let failed = try makeRun(context, thread: thread, status: .failed, at: 100)
+        let completed = try makeRun(context, thread: thread, status: .completed, at: 200)
+        let bot = try context.botStore.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let conversation = BotConversation(botID: bot.id, title: "Deploy check", attentionState: .needsAttention)
+        try context.botStore.upsertConversation(conversation)
+        let attention = BotAttentionItem(botID: bot.id, conversationID: conversation.id, kind: .question, title: "private question", detail: "token=private")
+        try context.botStore.upsertAttention(attention)
+        try NotificationRepository(db: context.db).insert(AppNotification(id: "conflict", title: "private file", category: PetNotificationCategory.fileConflict.rawValue))
+        let activity = service(context)
+
+        let before = try decodePage(activity.list(["section": .string("needs_you")]))
+        XCTAssertEqual(before.counts.needsYou, 3)
+        let botItem = try XCTUnwrap(before.items.first { $0.id.hasPrefix("bot-attention:") })
+        XCTAssertEqual(botItem.originLabel, "Bot conversation: Deploy check", "a bot request must say which conversation is waiting")
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(before), as: UTF8.self).contains("private"))
+
+        let failedID = "run:\(failed.id.description)"
+        let ids = [failedID, botItem.id, "run:\(completed.id.description)", "notification:conflict"]
+        let response = try activity.acknowledge(["item_ids": .array(ids.map(JSONValue.string))])
+        XCTAssertEqual(response.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue), [failedID, botItem.id],
+                       "a completed run and an unresolved conflict have nothing to acknowledge")
+        let cleared = try decodePage(activity.list([:]))
+        XCTAssertEqual(cleared.counts.needsYou, 1, "the conflict still needs its canonical resolution")
+        XCTAssertEqual(cleared.counts.finished, 2, "clearing must never remove a result from history")
+        XCTAssertEqual(cleared.items.first { $0.runID == failed.id.value }?.state, .failed)
+        XCTAssertNotNil(try context.botStore.listAttention(includeAcknowledged: true).first { $0.id == attention.id }?.acknowledgedAt)
+
+        let reopened = try activity.acknowledge(["item_ids": .array([.string(failedID), .string(botItem.id)]), "acknowledged": .bool(false)])
+        XCTAssertEqual(reopened.objectValue?["acknowledged"]?.boolValue, false)
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 3, "Undo must put every cleared item back in Needs you")
+    }
+
+    func test_batchAcknowledgeRejectsKindsThatMustBeAnsweredAndMalformedBatches() throws {
+        let context = try makeContext()
+        let activity = service(context)
+        XCTAssertThrowsError(try activity.acknowledge(["item_ids": .array([.string("request:thread:approval")])]),
+                             "a provider approval is answered in its conversation, never acknowledged in bulk")
+        XCTAssertThrowsError(try activity.acknowledge(["item_ids": .array([.string("notification:a"), .string("notification:a")])]))
+        XCTAssertThrowsError(try activity.acknowledge(["item_ids": .array((0...200).map { .string("notification:\($0)") })]))
+        XCTAssertThrowsError(try activity.acknowledge([:]))
+        XCTAssertEqual(try activity.acknowledge(["item_ids": .array([])]).objectValue?["updated_ids"]?.arrayValue?.count, 0)
+    }
+
     func test_durableRunWithoutCanonicalRuntimeIdentityIsNotReportedRunning() throws {
         let context = try makeContext()
         let thread = try makeThread(context)

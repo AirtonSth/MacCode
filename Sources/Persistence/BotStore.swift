@@ -1148,6 +1148,37 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    /// Batch acknowledgment in one transaction; a nil date reopens the items.
+    /// Returns only ids that still exist.
+    public func setAttentionAcknowledged(ids: [BotAttentionItemID], at date: Date?) throws -> [BotAttentionItemID] {
+        guard !ids.isEmpty else { return [] }
+        return try db.performSync { database in
+            try database.transaction {
+                let exists = try database.prepare("SELECT 1 FROM bot_attention_items WHERE id = ?;")
+                let statement = try database.prepare("""
+                    UPDATE bot_attention_items
+                    SET acknowledged_at = CASE WHEN ? IS NULL THEN NULL ELSE COALESCE(acknowledged_at, ?) END
+                    WHERE id = ?;
+                    """)
+                var updated: [BotAttentionItemID] = []
+                for id in ids {
+                    let key = id.value.uuidString.lowercased()
+                    try exists.bind(1, key)
+                    let found = try exists.step()
+                    exists.reset()
+                    guard found else { continue }
+                    try statement.bind(1, string(date))
+                    try statement.bind(2, string(date))
+                    try statement.bind(3, key)
+                    _ = try statement.step()
+                    statement.reset()
+                    updated.append(id)
+                }
+                return updated
+            }
+        }
+    }
+
     /// Causal proof from `TerminalTransitionLedger` for the one-way legacy
     /// `Run cancelled` repair. Missing or mismatched proof preserves the row.
     public struct LegacyUserStopLedgerProof: Equatable, Sendable {
