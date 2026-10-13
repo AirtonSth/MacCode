@@ -95,6 +95,78 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                        "forced refresh must replace the warm cache for subsequent adapters")
     }
 
+    func test_discoveryKeepsTheInitializeCatalogWhenTheModelLessSessionIsRefused_becauseThePickerMustKeepAutoAndAccountModels() async throws {
+        // WHY: a Distill with no routable account answers the model-less
+        // session/new with auth_required. Discovery only needs that session for
+        // mode ids; throwing away the catalog initialize already returned would
+        // replace "auto" and every subscription model in the picker with the
+        // static built-in list.
+        let root = try makeTempRoot("distill-acp-discovery-auth-required")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requests) = try writeDiscoveryHarness(
+            root: root,
+            initializeReply: #"{"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":True,"promptCapabilities":{"embeddedContext":True},"_meta":{"x.ai/capabilities":{"sessionWorkerModel":True}}},"_meta":{"modelState":json.loads(catalog)}}}"#
+        )
+
+        let result = await DistillACPAdapter(binaryNameOverride: harness.path, discoveryCwd: root.path).discoveryResult()
+
+        XCTAssertEqual(try recordedRequests(requests).compactMap { $0["method"] as? String }, ["initialize", "session/new"],
+                       "the refused session/new is the path under test")
+        XCTAssertFalse(result.isFallback, "a live catalog from initialize is not the static fallback")
+        XCTAssertEqual(result.models.map(\.id), ["auto", "chatgpt/fixture-main"])
+        XCTAssertEqual(result.models.last?.accountProvider, "chatgpt",
+                       "the picker groups subscription models by this account metadata")
+        XCTAssertEqual(result.models.last?.supportedReasoningEfforts, [.low, .high])
+        XCTAssertTrue(result.capabilities.supportsDistillReasoningModelEffort, "capabilities come from initialize")
+        XCTAssertEqual(result.capabilities.supportedAttachmentKinds, [.file], "capabilities come from initialize")
+        // No session, no advertised modes: same as a session that omits them.
+        XCTAssertEqual(result.interactionModes, [.default, .plan])
+        XCTAssertEqual(result.permissionModes, DistillACPAdapter.defaultPermissionModes)
+    }
+
+    func test_discoveryStillFallsBackWhenInitializeFails_becauseThereIsNoLiveCatalogToKeep() async throws {
+        // WHY: the session/new failure is tolerated only because initialize
+        // already produced a catalog; without one the picker must say it is
+        // showing the built-in list.
+        let root = try makeTempRoot("distill-acp-discovery-init-failure")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeDiscoveryHarness(
+            root: root,
+            initializeReply: #"{"error":{"code":-32603,"message":"Internal error"}}"#
+        )
+
+        let result = await DistillACPAdapter(binaryNameOverride: harness.path, discoveryCwd: root.path).discoveryResult()
+
+        XCTAssertTrue(result.isFallback)
+        XCTAssertEqual(result.models, DistillRunner.listModels(installedVersion: nil))
+        XCTAssertEqual(result.capabilities, .conservative)
+    }
+
+    /// A peer whose model-less session/new is refused with ACP `auth_required`.
+    /// `initializeReply` is a Python dict literal merged into the JSON-RPC reply.
+    private func writeDiscoveryHarness(root: URL, initializeReply: String) throws -> (harness: URL, requests: URL) {
+        let requestsURL = root.appendingPathComponent("requests.jsonl")
+        let harnessURL = root.appendingPathComponent("distill-agent")
+        let harness = """
+        #!/usr/bin/env python3
+        import json, pathlib, sys
+        requests = pathlib.Path(\(String(reflecting: requestsURL.path)))
+        catalog = \(String(reflecting: Self.autoCatalog))
+        def send(message, reply): print(json.dumps({"jsonrpc":"2.0", "id":message["id"], **reply}), flush=True)
+        for line in sys.stdin:
+            message = json.loads(line)
+            method = message.get("method")
+            with requests.open("a") as output: output.write(json.dumps({"method":method}) + "\\n")
+            if method == "initialize":
+                send(message, \(initializeReply))
+            elif method == "session/new":
+                send(message, {"error":{"code":-32000,"message":"Authentication required"}})
+        """
+        try harness.write(to: harnessURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: harnessURL.path)
+        return (harnessURL, requestsURL)
+    }
+
     private func writeWorkerHarness(
         root: URL,
         initializeCapabilities: String,

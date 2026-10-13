@@ -215,8 +215,34 @@ public enum DistillGuestCredentials {
                 if destination.read("quota.json") != safe { try destination.writeAtomically(safe, to: "quota.json") }
             } else { destination.remove("quota.json") }
         }
-        let data = try JSONEncoder().encode(registry)
+        let data = try JSONEncoder().encode(GuestRegistry(registry))
         if guest.read("accounts.json") != data { try guest.writeAtomically(data, to: "accounts.json") }
+    }
+
+    /// `accounts.json` exactly as Distill defines it. `DistillAccountStatus`
+    /// would add its own `connected` to every account: a registry key Distill
+    /// does not define, which a strict reader refuses along with the whole
+    /// registry, failing every session in the guest. Distill 2.0.42 ignores an
+    /// extra account key; the guest's file still carries only its own format.
+    private struct GuestRegistry: Encodable {
+        struct Account: Encodable {
+            let id: String
+            let provider: DistillAccountProvider
+            let label: String
+            let legacy: Bool
+        }
+
+        let version: Int
+        let accounts: [Account]
+        let routing: DistillAutoRouting
+
+        init(_ registry: DistillAccountRegistry) {
+            version = registry.version
+            accounts = registry.accounts.map {
+                Account(id: $0.id, provider: $0.provider, label: $0.label, legacy: $0.legacy)
+            }
+            routing = registry.routing
+        }
     }
 
     /// Preserve only the typed quota fields in the authoritative CLI contract.

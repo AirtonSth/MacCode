@@ -388,12 +388,21 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             )
             defer { client.stop() }
             let initialized = try await client.initialize()
-            let opened = try await client.newSession(
-                cwd: discoveryCwd,
-                reasoningModelSelectionSupported: false
-            )
-            let discovered = Self.mergeModelCatalogs(initialized.models, opened.models)
-            let modeIDs = Set(opened.availableModes.map(\.id))
+            // The model-less session only adds its catalog and mode ids. Distill
+            // can refuse it (auth_required when no account is routable); that
+            // must not discard the catalog and capabilities initialize returned.
+            let opened: DistillACPSessionOpenResult?
+            do {
+                opened = try await client.newSession(
+                    cwd: discoveryCwd,
+                    reasoningModelSelectionSupported: false
+                )
+            } catch {
+                distillAcpLog.error("Distill discovery session/new failed: \(String(describing: error), privacy: .public)")
+                opened = nil
+            }
+            let discovered = Self.mergeModelCatalogs(initialized.models, opened?.models ?? [])
+            let modeIDs = Set(opened?.availableModes.map(\.id) ?? [])
             // Live distill builds often omit `modes.availableModes` from session/new
             // while still accepting session/set_mode for the CLI wire IDs
             // (default / acceptEdits / bypassPermissions / plan). Live canary
@@ -403,7 +412,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             // (fail-closed for Plan if plan is absent from the catalog).
             let interactionModes = Self.interactionModes(
                 availableModeIDs: modeIDs,
-                advertisedPlanModeID: opened.planModeId
+                advertisedPlanModeID: opened?.planModeId
             )
             let permissionModes = Self.permissionModes(from: modeIDs)
             // Attachment kinds for iOS/macOS pickers.

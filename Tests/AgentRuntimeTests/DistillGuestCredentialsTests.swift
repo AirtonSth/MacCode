@@ -646,4 +646,46 @@ final class DistillGuestCredentialsTests: XCTestCase {
         XCTAssertEqual(saved.routing, routing)
     }
 
+    func test_guestRegistryCarriesOnlyTheRegistryAccountKeys_becauseAStatusKeyIsNotPartOfDistillsRegistry() throws {
+        // WHY: accounts.json is Distill's format. RemoteCode's own status key
+        // on an account ("connected") is not part of it, and a Distill that
+        // reads the registry strictly answers "Invalid account registry" and
+        // refuses every session in the bot's VM, for every model.
+        let accounts: [[String: Any]] = [
+            ["id": "legacy-claude", "provider": "claude", "label": "claude (default)", "legacy": true],
+            ["id": "work", "provider": "chatgpt", "label": "Work", "legacy": false],
+            ["id": "home", "provider": "claude", "label": "Home", "legacy": false],
+        ]
+        let withWorker: [String: Any] = [
+            "id": "r1", "account_id": "work", "main_model": "chatgpt/fixture-main", "worker_model": "chatgpt/fixture-worker",
+        ]
+        let withoutWorker: [String: Any] = ["id": "r2", "account_id": "home", "main_model": "claude/fixture-main"]
+        // The shape Distill itself writes: an unset worker model is `null`.
+        try writeHost("accounts.json", [
+            "version": 1,
+            "accounts": accounts,
+            "routing": [
+                "enabled": true, "strategy": "highest_remaining",
+                "options": [withWorker, withoutWorker.merging(["worker_model": NSNull()]) { $1 }],
+            ],
+        ])
+
+        try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: guestHome)
+
+        let guest = try guestJSON("accounts.json")
+        XCTAssertEqual(Set(guest.keys), ["version", "accounts", "routing"])
+        XCTAssertEqual(guest["version"] as? Int, 1)
+        let guestAccounts = try XCTUnwrap(guest["accounts"] as? [[String: Any]])
+        for account in guestAccounts {
+            XCTAssertEqual(Set(account.keys), ["id", "provider", "label", "legacy"],
+                           "Distill rejects the whole registry for any other account key")
+        }
+        XCTAssertEqual(guestAccounts as NSArray, accounts as NSArray)
+        // Distill reads an absent worker model the same as `null`.
+        let routing: [String: Any] = [
+            "enabled": true, "strategy": "highest_remaining", "options": [withWorker, withoutWorker],
+        ]
+        XCTAssertEqual(guest["routing"] as? NSDictionary, routing as NSDictionary)
+    }
+
 }
