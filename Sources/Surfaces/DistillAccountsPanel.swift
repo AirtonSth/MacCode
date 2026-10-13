@@ -61,16 +61,39 @@ public struct DistillAccountsPanelPresentation: Equatable {
     }
 
     public static func quotaText(_ quota: DistillAccountQuota?) -> String {
-        guard let quota else { return "Quota unknown" }
-        let value = quota.remainingPercent.map { "\(Int($0.rounded()))% remaining" } ?? "Remaining quota unknown"
+        quotaPresentation(quota, connected: true, connectionError: nil).text
+    }
+
+    static func quotaPresentation(_ quota: DistillAccountQuota?, connected: Bool, connectionError: String?,
+                                  now: Date = Date()) -> (text: String, remainingPercent: Double?) {
+        guard let quota else { return ("Quota unknown", nil) }
+        func date(_ timestamp: String?) -> Date? {
+            guard let timestamp else { return nil }
+            // CLI/chrono RFC3339 includes fractional seconds; older snapshots may omit them.
+            let parser = ISO8601DateFormatter()
+            parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return parser.date(from: timestamp) ?? ISO8601DateFormatter().date(from: timestamp)
+        }
+        let remaining = quota.remainingPercent.flatMap { $0.isFinite && (0...100).contains($0) ? $0 : nil }
+        let value = remaining.map { "\(Int($0.rounded()))% remaining" } ?? "Remaining quota unknown"
+        let fetched = date(quota.fetchedAt)
+        let age = fetched.map { now.timeIntervalSince($0) }
+        let fresh = age.map { (0...300).contains($0) } ?? false
+        let current = quota.status == "available" && fresh && connected && connectionError == nil
+        let updated = fetched.map { "Updated \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "Update time unknown"
+        let future = (age ?? 0) < 0
+        let freshness = fetched == nil || future ? "Quota freshness unknown" : (current ? "Saved quota" : "Stale")
         switch quota.status {
-        case "available": return "Saved quota · \(value) · Updated \(quota.fetchedAt ?? quota.checkedAt)"
-        case "stale": return "Stale · \(value) · Updated \(quota.fetchedAt ?? quota.checkedAt)"
-        case "loading": return "Refreshing quota…"
-        case "unsupported": return "Quota unavailable for this provider"
+        case "available", "stale":
+            return ("\(freshness) · \(value) · \(updated)\(future ? " (future timestamp)" : "")", current ? remaining : nil)
+        case "loading": return ("Refreshing quota…", nil)
+        case "unsupported": return ("Quota unavailable for this provider", nil)
         default:
-            if let fetchedAt = quota.fetchedAt { return "Stale · \(value) · Updated \(fetchedAt) · Refresh unavailable" }
-            return "Quota unavailable · Checked \(quota.checkedAt)"
+            if quota.fetchedAt != nil {
+                return ("\(freshness) · \(value) · \(updated)\(future ? " (future timestamp)" : "") · Refresh unavailable", nil)
+            }
+            let checked = date(quota.checkedAt)?.formatted(date: .abbreviated, time: .shortened) ?? "Unknown"
+            return ("Quota unavailable · Checked \(checked)", nil)
         }
     }
 }
@@ -89,13 +112,17 @@ public struct DistillAccountsPanel: View {
     public let remove: (String) -> Void
     public let refreshQuota: (String) -> Void
     public let saveRouting: (DistillAutoRouting) -> Void
+    @Environment(\.dismiss) private var dismiss
     @State private var newProvider = DistillAccountProvider.chatgpt
     @State private var newLabel = ""
+    @State private var showingAddAccount = false
+    @State private var showingRouting = false
     @State private var renameAccount: DistillAccountStatus?
     @State private var renamedLabel = ""
     @State private var confirmation: DistillAccountStatus?
     @State private var removing = false
     @State private var draft: DistillAutoRouting?
+    @State private var confirmingDiscard = false
 
     public init(presentation: DistillAccountsPanelPresentation,
                 cancel: @escaping () -> Void, openAgain: @escaping (URL) -> Void, dismissError: @escaping () -> Void,
@@ -120,6 +147,7 @@ public struct DistillAccountsPanel: View {
     }
 
     private var currentDraft: DistillAutoRouting { draft ?? presentation.routing }
+    private var hasChanges: Bool { currentDraft != presentation.routing }
     private var validationError: String? {
         DistillRoutingValidation.error(currentDraft, saved: presentation.routing, accounts: presentation.statuses, models: presentation.models)
     }
@@ -129,15 +157,35 @@ public struct DistillAccountsPanel: View {
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: DS.Space.md) {
-                    accountsCard.frame(minWidth: 330)
-                    routingCard.frame(minWidth: 330)
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
+            HStack {
+                Text("Accounts & Auto").font(DS.Font.title2)
+                Spacer()
+                Button("Done") {
+                    if hasChanges { confirmingDiscard = true } else { dismiss() }
+                }.keyboardShortcut(.cancelAction).frame(minHeight: 44).disabled(presentation.isBusy)
+            }
+            .confirmationDialog("Discard unsaved profile changes?", isPresented: $confirmingDiscard, titleVisibility: .visible) {
+                Button("Discard changes", role: .destructive) { draft = nil; dismiss() }
+                Button("Keep editing", role: .cancel) {}
+            }
+            GeometryReader { proxy in
+                if proxy.size.width >= 720 {
+                    HStack(alignment: .top, spacing: DS.Space.xl) {
+                        ScrollView { accountsCard }
+                        ScrollView { routingCard }
+                    }
+                } else {
+                    VStack(spacing: DS.Space.lg) {
+                        Picker("Settings section", selection: $showingRouting) {
+                            Text("Accounts").tag(false)
+                            Text("Auto routing").tag(true)
+                        }.pickerStyle(.segmented).labelsHidden()
+                        ScrollView {
+                            if showingRouting { routingCard } else { accountsCard }
+                        }
+                    }
                 }
-                ScrollView {
-                    VStack(alignment: .leading, spacing: DS.Space.md) { accountsCard; routingCard }
-                }.frame(maxHeight: 560)
             }
             if let error = presentation.lastError {
                 HStack {
@@ -149,8 +197,34 @@ public struct DistillAccountsPanel: View {
                     }
                 }.padding(DS.Space.sm)
             }
+            routingFooter
         }
-        .font(DS.Font.caption)
+        .font(DS.Font.body)
+        .foregroundStyle(DS.Palette.text)
+        .interactiveDismissDisabled(hasChanges || presentation.isBusy)
+        .sheet(isPresented: $showingAddAccount) {
+            VStack(alignment: .leading, spacing: DS.Space.xl) {
+                Text("Add account").font(DS.Font.title3)
+                Picker("Provider", selection: $newProvider) {
+                    ForEach(DistillAccountProvider.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                }.frame(minHeight: 44)
+                TextField("Account label", text: $newLabel).frame(minHeight: 44)
+                    .accessibilityLabel("Account label")
+                Text("Give this account a name, then connect to sign in.")
+                    .foregroundStyle(DS.Palette.textSecondary)
+                HStack {
+                    Button("Cancel") { showingAddAccount = false }.keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Add account") {
+                        add(newProvider, newLabel.trimmingCharacters(in: .whitespacesAndNewlines))
+                        showingAddAccount = false
+                    }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                        .disabled(unavailable || newLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }.frame(minHeight: 44)
+            }.padding(DS.Space.xxl).frame(width: 360)
+                .font(DS.Font.body).foregroundStyle(DS.Palette.text)
+                .background(DS.Palette.bg)
+        }
         .sheet(isPresented: Binding(get: { renameAccount != nil }, set: { if !$0 { renameAccount = nil } })) {
             VStack(alignment: .leading, spacing: DS.Space.md) {
                 Text("Rename \(renameAccount?.provider.displayName ?? "account")").font(DS.Font.body)
@@ -163,6 +237,8 @@ public struct DistillAccountsPanel: View {
                     }.keyboardShortcut(.defaultAction).frame(minHeight: 44).disabled(renamedLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }.padding(DS.Space.md).frame(minWidth: 300)
+                .font(DS.Font.body).foregroundStyle(DS.Palette.text)
+                .background(DS.Palette.bg)
         }
         .confirmationDialog("\(removing ? "Remove" : "Disconnect") \(confirmation?.label ?? "account")?",
                             isPresented: Binding(get: { confirmation != nil }, set: { if !$0 { confirmation = nil } }), titleVisibility: .visible) {
@@ -178,32 +254,25 @@ public struct DistillAccountsPanel: View {
     }
 
     private var accountsCard: some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
             HStack {
-                Text("Accounts").font(DS.Font.body).fontWeight(.semibold)
+                Text("Accounts").font(DS.Font.title3)
                 Spacer()
                 Button("Refresh", action: refreshAccounts).frame(minHeight: 44).disabled(presentation.isBusy || presentation.isRefreshing)
             }
             Text("Connect accounts to make their models available to Main, Worker and Auto.").foregroundStyle(DS.Palette.textSecondary)
             installNotice
             if presentation.isRefreshing { HStack { ProgressView().controlSize(.small); Text("Refreshing accounts…") } }
-            Picker("Provider", selection: $newProvider) {
-                ForEach(DistillAccountProvider.allCases, id: \.self) { Text($0.displayName).tag($0) }
+            Button { newLabel = ""; showingAddAccount = true } label: {
+                Label("Add account", systemImage: "plus")
             }.frame(minHeight: 44).disabled(unavailable)
-            HStack {
-                TextField("Account label", text: $newLabel).frame(minHeight: 44)
-                Button("Add") {
-                    add(newProvider, newLabel.trimmingCharacters(in: .whitespacesAndNewlines))
-                }.frame(minWidth: 44, minHeight: 44)
-                    .disabled(unavailable || newLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
             if presentation.statuses.isEmpty { Text("Add an account, then choose Connect to sign in.").foregroundStyle(DS.Palette.textSecondary) }
             ForEach(presentation.statuses, id: \.id) { account in
                 Divider()
                 accountRow(account)
             }
-        }.padding(DS.Space.md).frame(maxWidth: .infinity, alignment: .leading)
-            .background(DS.Palette.surfaceRaised).clipShape(RoundedRectangle(cornerRadius: DS.Radius.control))
+        }.padding(DS.Space.xl).frame(maxWidth: .infinity, alignment: .leading)
+            .background(DS.Palette.surfaceRaised).clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
             .accessibilityIdentifier("agent.accounts.card")
     }
 
@@ -219,13 +288,23 @@ public struct DistillAccountsPanel: View {
     }
 
     private func accountRow(_ account: DistillAccountStatus) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
+        let quota = DistillAccountsPanelPresentation.quotaPresentation(
+            account.quota, connected: account.connected, connectionError: account.connectionError
+        )
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
             Text("\(account.provider.displayName) · \(account.label)").fontWeight(.semibold).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             Label(account.connected ? (account.email.map { "Connected · \($0)" } ?? "Connected") : "Not connected", systemImage: account.connected ? "checkmark.circle.fill" : "circle")
                 .foregroundStyle(account.connected ? DS.Palette.success : DS.Palette.textSecondary)
                 .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
             if let error = account.connectionError { Text(error).foregroundStyle(DS.Palette.warning).textSelection(.enabled) }
-            Text(DistillAccountsPanelPresentation.quotaText(account.quota)).foregroundStyle(DS.Palette.textSecondary).textSelection(.enabled)
+            Text(quota.text).font(DS.Font.bodyDense)
+                .foregroundStyle(DS.Palette.textSecondary).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if let remaining = quota.remainingPercent {
+                ProgressView(value: remaining, total: 100).tint(DS.Palette.accent)
+                    .accessibilityLabel("Saved remaining quota")
+                    .accessibilityValue("\(Int(remaining.rounded())) percent")
+            }
             if presentation.busyAccountID == account.id {
                 HStack {
                     ProgressView().controlSize(.small).accessibilityLabel("Account operation in progress")
@@ -234,30 +313,44 @@ public struct DistillAccountsPanel: View {
                 }
             } else {
                 HStack {
-                    Button(account.connected ? "Disconnect" : "Connect") {
-                        if account.connected { removing = false; confirmation = account } else { connectAccount(account.id) }
+                    if !account.connected {
+                        Button("Connect") { connectAccount(account.id) }.frame(minHeight: 44)
+                    }
+                    Spacer(minLength: 0)
+                    Menu("Account actions") {
+                        Button("Refresh quota") { refreshQuota(account.id) }.disabled(!account.connected)
+                        Button("Rename") { renamedLabel = account.label; renameAccount = account }
+                        Divider()
+                        if account.connected {
+                            Button("Disconnect…", role: .destructive) { removing = false; confirmation = account }
+                        }
+                        Button("Remove…", role: .destructive) { removing = true; confirmation = account }
                     }.frame(minHeight: 44)
-                    Button("Refresh quota") { refreshQuota(account.id) }.frame(minHeight: 44).disabled(!account.connected)
-                }.disabled(unavailable)
-                HStack {
-                    Button("Rename") { renamedLabel = account.label; renameAccount = account }.frame(minHeight: 44)
-                    Button("Remove") { removing = true; confirmation = account }.frame(minHeight: 44)
+                        .accessibilityLabel("Account actions for \(account.provider.displayName) · \(account.label)")
+                        .help("Actions for \(account.provider.displayName) · \(account.label)")
                 }.disabled(unavailable)
             }
         }.accessibilityElement(children: .contain).accessibilityIdentifier("agent.accounts.\(account.id)")
     }
 
     private var routingCard: some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            Text("Auto routing").font(DS.Font.body).fontWeight(.semibold)
-            Text(!presentation.routingLoaded ? "Loading saved profile…" : (presentation.routing.enabled ? "Saved profile enabled" : "Saved profile disabled")).foregroundStyle(DS.Palette.textSecondary)
-            Text("Choose Auto in Main to use this profile. Existing conversations keep their selected model. Worker follows the selected Auto option.")
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
+            Text("Auto routing").font(DS.Font.title3)
+            Text("Choose Auto in Main to use this profile. Worker uses this route’s setting.")
                 .foregroundStyle(DS.Palette.textSecondary).fixedSize(horizontal: false, vertical: true)
             Toggle("Enable profile", isOn: Binding(get: { currentDraft.enabled }, set: { var value = currentDraft; value.enabled = $0; draft = value })).frame(minHeight: 44)
             Picker("Strategy", selection: Binding(get: { currentDraft.strategy }, set: { var value = currentDraft; value.strategy = $0; draft = value })) {
                 Text("First available in order").tag(DistillAutoStrategy.orderedFirst)
                 Text("Highest remaining quota").tag(DistillAutoStrategy.highestRemaining)
             }.frame(minHeight: 44)
+            Text(currentDraft.strategy == .orderedFirst
+                 ? "Try connected accounts in the order below."
+                 : "Prefer the connected account with the highest known remaining quota.")
+                .font(DS.Font.bodyDense).foregroundStyle(DS.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if currentDraft.options.isEmpty {
+                Text("Add an option to choose an account and its models.").foregroundStyle(DS.Palette.textSecondary)
+            }
             ForEach(currentDraft.options, id: \.id) { option in routeRow(option) }
             Button("Add option") {
                 let account = presentation.statuses.first
@@ -266,17 +359,34 @@ public struct DistillAccountsPanel: View {
                 value.options.append(.init(id: UUID().uuidString.lowercased(), accountID: account?.id ?? "", mainModel: model?.id ?? ""))
                 draft = value
             }.frame(minHeight: 44)
-            if let error = validationError { Text(error).foregroundStyle(DS.Palette.warning).fixedSize(horizontal: false, vertical: true) }
-            HStack {
-                Button("Cancel") { draft = nil }.frame(minHeight: 44).disabled(draft == nil)
-                Button("Save") { saveRouting(currentDraft) }.frame(minHeight: 44).disabled(draft == nil || validationError != nil)
+        }.disabled(unavailable).padding(DS.Space.xl).frame(maxWidth: .infinity, alignment: .leading)
+            .background(DS.Palette.surfaceRaised).clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
+            .accessibilityIdentifier("agent.accounts.routing")
+    }
+
+    private var routingFooter: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            Divider()
+            if let error = validationError {
+                Text(error).foregroundStyle(DS.Palette.warning).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: DS.Space.lg) {
+                Text(!presentation.routingLoaded ? "Loading saved profile…" :
+                     (hasChanges ? "Unsaved changes" : "Saved profile · \(presentation.routing.enabled ? "Enabled" : "Disabled")"))
+                    .foregroundStyle(hasChanges ? DS.Palette.warning : DS.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
                 if presentation.isBusy, presentation.busyAccountID == nil {
                     ProgressView().controlSize(.small).accessibilityLabel("Saving accounts or routing")
                 }
+                if hasChanges {
+                    Button("Cancel") { draft = nil }.frame(minHeight: 44).disabled(unavailable)
+                    Button("Save profile") { saveRouting(currentDraft) }
+                        .buttonStyle(.borderedProminent).frame(minHeight: 44)
+                        .disabled(unavailable || validationError != nil)
+                }
             }
-        }.disabled(unavailable).padding(DS.Space.md).frame(maxWidth: .infinity, alignment: .leading)
-            .background(DS.Palette.surfaceRaised).clipShape(RoundedRectangle(cornerRadius: DS.Radius.control))
-            .accessibilityIdentifier("agent.accounts.routing")
+        }.accessibilityIdentifier("agent.accounts.routing.footer")
     }
 
     private func editOption(_ id: String, _ edit: (inout DistillAutoOption) -> Void) {
@@ -294,9 +404,18 @@ public struct DistillAccountsPanel: View {
         let account = presentation.statuses.first { $0.id == option.accountID }
         let models = DistillRoutingValidation.models(for: account, catalog: presentation.models)
         let index = currentDraft.options.firstIndex { $0.id == option.id } ?? 0
-        return VStack(alignment: .leading, spacing: DS.Space.xs) {
-            Divider()
-            Text("Option \(index + 1)").fontWeight(.semibold)
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack {
+                Text("Option \(index + 1)").font(DS.Font.bodyStrong)
+                Spacer()
+                Menu("Option actions") {
+                    Button("Move up") { moveOption(option.id, offset: -1) }.disabled(index == 0)
+                    Button("Move down") { moveOption(option.id, offset: 1) }.disabled(index == currentDraft.options.count - 1)
+                    Button("Remove option", role: .destructive) { var value = currentDraft; value.options.removeAll { $0.id == option.id }; draft = value }
+                }.frame(minHeight: 44)
+                    .accessibilityLabel("Actions for option \(index + 1)")
+            }
+            Text("Account").font(DS.Font.bodyStrong)
             Picker("Account", selection: Binding(get: { option.accountID }, set: { id in
                 editOption(option.id) {
                     $0.accountID = id
@@ -306,21 +425,20 @@ public struct DistillAccountsPanel: View {
             })) {
                 if account == nil { Text("Choose account").tag(option.accountID) }
                 ForEach(presentation.statuses, id: \.id) { Text("\($0.provider.displayName) · \($0.label)").tag($0.id) }
-            }.frame(maxWidth: .infinity, minHeight: 44).help(account.map { "\($0.provider.displayName) · \($0.label)" } ?? "Choose account")
+            }.labelsHidden().frame(maxWidth: .infinity, minHeight: 44).help(account.map { "\($0.provider.displayName) · \($0.label)" } ?? "Choose account")
+            Text("Main").font(DS.Font.bodyStrong)
             Picker("Main", selection: Binding(get: { option.mainModel }, set: { model in editOption(option.id) { $0.mainModel = model } })) {
                 if !models.contains(where: { $0.id == option.mainModel }) { Text(option.mainModel.isEmpty ? "Choose model" : "Unavailable: \(option.mainModel)").tag(option.mainModel) }
                 ForEach(models, id: \.id) { Text($0.label).tag($0.id) }
-            }.frame(maxWidth: .infinity, minHeight: 44).help(option.mainModel)
+            }.labelsHidden().frame(maxWidth: .infinity, minHeight: 44).help(option.mainModel)
+            Text("Worker").font(DS.Font.bodyStrong).foregroundStyle(DS.Palette.textSecondary)
             Picker("Worker", selection: Binding(get: { option.workerModel ?? "" }, set: { model in editOption(option.id) { $0.workerModel = model.isEmpty ? nil : model } })) {
                 Text("Same as Main").tag("")
                 if let worker = option.workerModel, !models.contains(where: { $0.id == worker }) { Text("Unavailable: \(worker)").tag(worker) }
                 ForEach(models, id: \.id) { Text($0.label).tag($0.id) }
-            }.frame(maxWidth: .infinity, minHeight: 44).help(option.workerModel ?? "Same as Main")
-            HStack {
-                Button("Move up") { moveOption(option.id, offset: -1) }.disabled(index == 0)
-                Button("Move down") { moveOption(option.id, offset: 1) }.disabled(index == currentDraft.options.count - 1)
-                Button("Remove") { var value = currentDraft; value.options.removeAll { $0.id == option.id }; draft = value }
-            }.buttonStyle(.bordered).controlSize(.large)
-        }.accessibilityElement(children: .contain).accessibilityIdentifier("agent.accounts.routing.\(option.id)")
+            }.labelsHidden().frame(maxWidth: .infinity, minHeight: 44).help(option.workerModel ?? "Same as Main")
+        }.padding(DS.Space.lg).background(DS.Palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
+            .accessibilityElement(children: .contain).accessibilityIdentifier("agent.accounts.routing.\(option.id)")
     }
 }

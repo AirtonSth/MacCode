@@ -12631,6 +12631,7 @@ public struct AgentAppView: View {
     }
     @ObservedObject var vm: AgentAppViewModel
     private let accountPanel: AnyView?
+    @State private var showingAccounts = false
     private let layout: AgentAppViewLayout
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var announcedUndoToasts: Set<Date> = []
@@ -15035,6 +15036,16 @@ public struct AgentAppView: View {
             .onChange(of: vm.showPlanSidebar) { _ in
                 applyAdaptiveSidebars(width: proxy.size.width, event: .structural)
             }
+            .sheet(isPresented: $showingAccounts) {
+                if let accountPanel {
+                    accountPanel
+                        .padding(DS.Space.xxl)
+                        // A native sheet can ignore idealWidth; size it to the available host surface.
+                        .frame(width: min(820, proxy.size.width), height: min(640, proxy.size.height))
+                        .background(DS.Palette.bg)
+                        .foregroundStyle(DS.Palette.text)
+                }
+            }
         }
         .background(DS.Palette.bg)
         .background(newThreadShortcut)
@@ -15416,6 +15427,14 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textSecondary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
+            if accountPanel != nil {
+                Button { showingAccounts = true } label: {
+                    Label("Accounts", systemImage: "person.crop.circle")
+                }
+                .buttonStyle(.bordered).controlSize(.small)
+                .help("Manage Distill accounts and Auto routing")
+                .accessibilityIdentifier("agent.accounts.open")
+            }
             botScreenControls
             // Unified working phase strip (replaces separate awaiting/shell/status pills).
             workingPhaseStrip
@@ -16701,8 +16720,10 @@ public struct AgentAppView: View {
                 title: vm.embedding?.emptyConversationTitle ?? "No messages",
                 subtitle: vm.embedding?.emptyConversationSubtitle ?? "Start a new agent run."
             ) {
-                if let accountPanel {
-                    accountPanel.frame(maxWidth: 420)
+                if accountPanel != nil {
+                    Button("Accounts & Auto") { showingAccounts = true }
+                        .buttonStyle(.bordered).frame(minHeight: 44)
+                        .accessibilityIdentifier("agent.accounts.open.empty")
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)

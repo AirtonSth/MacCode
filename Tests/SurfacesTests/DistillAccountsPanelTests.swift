@@ -54,7 +54,20 @@ final class DistillAccountsPanelTests: XCTestCase {
         let text = DistillAccountsPanelPresentation.quotaText(quota)
         XCTAssertTrue(text.contains("Stale"))
         XCTAssertTrue(text.contains("73%"))
-        XCTAssertTrue(text.contains("2026-10-12T11:00:00Z"))
+        let updated = try Date("2026-10-12T11:00:00Z", strategy: .iso8601)
+        XCTAssertTrue(text.contains(updated.formatted(date: .abbreviated, time: .shortened)))
+    }
+
+    func test_fractionalQuotaRequiresFreshConnectedSnapshot() throws {
+        let now = try Date("2026-10-12T19:00:00Z", strategy: .iso8601)
+        let quota = DistillAccountQuota(accountID: "work", checkedAt: "2026-10-12T18:58:45.174778Z",
+                                       fetchedAt: "2026-10-12T18:58:45.174778Z", status: "available", remainingPercent: 73)
+        let fresh = DistillAccountsPanelPresentation.quotaPresentation(quota, connected: true, connectionError: nil, now: now)
+        XCTAssertEqual(fresh.remainingPercent, 73)
+        XCTAssertNil(DistillAccountsPanelPresentation.quotaPresentation(quota, connected: false, connectionError: nil, now: now).remainingPercent)
+        let expired = DistillAccountsPanelPresentation.quotaPresentation(quota, connected: true, connectionError: nil, now: now.addingTimeInterval(300))
+        XCTAssertNil(expired.remainingPercent)
+        XCTAssertTrue(expired.text.hasPrefix("Stale"))
     }
 
 }
