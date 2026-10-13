@@ -357,26 +357,16 @@ final class ActivityViewModel: ObservableObject {
         task = Task { @MainActor [weak self] in
             await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
             guard let self, !Task.isCancelled, self.generation == request else { return }
-            let depth = min(self.page.items.count, Self.refreshDepthLimit)
+            // Ask for the depth already paged to in one request, so a refresh never truncates the list under the reader.
+            let depth = min(max(self.page.items.count, Self.pageSize), Self.batchPageSize)
             self.cursor = nil
             self.activeSince = self.period.since
             self.loading = true
             if self.errorIsFromRefresh { self.error = nil }
             do {
-                let params = Self.listParams(tab: self.tab, search: self.search, outcome: self.outcome, workspaceID: self.workspaceID, since: self.activeSince)
-                var next = try Self.decodePage(try await self.service.list(params))
+                let params = Self.listParams(tab: self.tab, search: self.search, outcome: self.outcome, workspaceID: self.workspaceID, since: self.activeSince, limit: depth)
+                let next = try Self.decodePage(try await self.service.list(params))
                 guard !Task.isCancelled, self.generation == request else { return }
-                // Keep the depth already paged to, so a refresh never truncates the list under the reader.
-                var depthCursors = Set<String>()
-                while next.items.count < depth, let pageCursor = next.next_cursor, depthCursors.insert(pageCursor).inserted {
-                    var pageParams = params
-                    pageParams["cursor"] = .string(pageCursor)
-                    let more = try Self.decodePage(try await self.service.list(pageParams))
-                    guard !Task.isCancelled, self.generation == request else { return }
-                    next.items += more.items
-                    next.next_cursor = more.next_cursor
-                    next.generated_at = more.generated_at
-                }
                 self.page = next
                 self.hasSuccessfulSnapshot = true
                 if let selectedID = self.selectedID {
@@ -497,7 +487,7 @@ final class ActivityViewModel: ObservableObject {
     }
 
     private var batchScope: BatchScope {
-        BatchScope(params: Self.listParams(tab: tab, search: search, outcome: outcome, workspaceID: workspaceID, since: period.since), clickTime: Date())
+        BatchScope(params: Self.listParams(tab: tab, search: search, outcome: outcome, workspaceID: workspaceID, since: period.since, limit: Self.batchPageSize), clickTime: Date())
     }
 
     /// Pages the whole scope from one frozen snapshot. Items that arrived after the click stay out.
@@ -738,8 +728,8 @@ final class ActivityViewModel: ObservableObject {
         if period != .all { period = .all }
     }
 
-    private static func listParams(tab: Tab, search: String, outcome: String, workspaceID: String, since: String?) -> [String: JSONValue] {
-        var params: [String: JSONValue] = ["section": .string(tab.wireValue), "search": .string(search), "limit": .number(50)]
+    private static func listParams(tab: Tab, search: String, outcome: String, workspaceID: String, since: String?, limit: Int = pageSize) -> [String: JSONValue] {
+        var params: [String: JSONValue] = ["section": .string(tab.wireValue), "search": .string(search), "limit": .number(Double(limit))]
         if !outcome.isEmpty { params["outcome"] = .string(outcome) }
         if !workspaceID.isEmpty { params["workspace_id"] = .string(workspaceID) }
         if let since { params["since"] = .string(since) }
@@ -754,8 +744,15 @@ final class ActivityViewModel: ObservableObject {
         Set(value.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue) ?? [])
     }
 
-    private static let refreshDepthLimit = 200
-    // ISO8601DateFormatter is documented thread-safe; shared so rows do not allocate one per render.
+    private static let pageSize = 50
+    /// Host cap per request. A bulk action reads its whole filter in pages this large:
+    /// every page recomputes the full Activity projection on the host, so 50 at a time
+    /// turned 1,400 results into 28 full passes.
+    private static let batchPageSize = 500
+    // Rows parse a timestamp per render: the format styles are the fast path, and the shared
+    // formatters (documented thread-safe) keep the old result for anything the styles reject.
+    nonisolated private static let fractionalDateStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+    nonisolated private static let plainDateStyle = Date.ISO8601FormatStyle()
     nonisolated(unsafe) private static let fractionalDateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -764,7 +761,8 @@ final class ActivityViewModel: ObservableObject {
     nonisolated(unsafe) private static let plainDateFormatter = ISO8601DateFormatter()
 
     nonisolated fileprivate static func parseDate(_ value: String) -> Date? {
-        fractionalDateFormatter.date(from: value) ?? plainDateFormatter.date(from: value)
+        (try? fractionalDateStyle.parse(value)) ?? (try? plainDateStyle.parse(value))
+            ?? fractionalDateFormatter.date(from: value) ?? plainDateFormatter.date(from: value)
     }
 
     private static func timestamp(_ date: Date) -> String { fractionalDateFormatter.string(from: date) }
@@ -901,16 +899,17 @@ struct ActivityRootView: View {
 
     @ViewBuilder
     private var bulkActions: some View {
-        if model.tab != .running {
+        // One bulk action per tab: reading never empties Needs you, so offering it there only misleads.
+        if model.tab == .finished {
             Button("Mark all as read") { model.markCurrentResultsSeen() }
-                .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning).fixedSize()
-                .help("Marks every result in this filter as read. Nothing is removed.")
+                .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning || !model.hasUnreadResults).fixedSize()
+                .help(model.hasUnreadResults ? "Marks every result in this filter as read. Nothing is removed." : "Every result in this filter is already read.")
                 .accessibilityIdentifier("activity.markAllRead")
         }
         if model.tab == .needsYou {
             Button("Clear all") { model.clearCurrentNeedsYou() }
                 .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning || model.page.counts.needs_you == 0).fixedSize()
-                .help("Clears failures and bot requests in this filter from Needs you. Results stay in Finished; approvals and questions stay until answered.")
+                .help("Clears failures and bot requests in this filter from Needs you and marks them read. Results stay in Finished; approvals and questions stay until answered.")
                 .accessibilityIdentifier("activity.clearAll")
         }
     }
@@ -1308,5 +1307,7 @@ extension ActivityViewModel {
     var runningItems: [ActivityWireItem] { page.items.filter { $0.state != "queued" } }
     var queuedItems: [ActivityWireItem] { page.items.filter { $0.state == "queued" } }
     var cursorAvailable: Bool { cursor != nil }
+    /// The host count covers the whole filter; the loaded rows cover a result the count cannot see yet.
+    var hasUnreadResults: Bool { page.counts.new_results > 0 || page.items.contains(where: \.isUnread) }
     func dismissError() { error = nil }
 }

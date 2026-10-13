@@ -266,7 +266,10 @@ final class ActivityWindowModelTests: XCTestCase {
                 XCTAssertEqual(params["section"]?.stringValue, "finished")
                 XCTAssertEqual(params["search"]?.stringValue, "needle")
                 XCTAssertEqual(params["workspace_id"]?.stringValue, "workspace")
-                XCTAssertEqual(params["limit"]?.intValue, 50)
+                // The first two calls are the batch; the refresh that follows asks for an ordinary page.
+                if listCalls <= 2 {
+                    XCTAssertEqual(params["limit"]?.intValue, 500, "each page is a full host pass, so a bulk read must not walk the filter 50 rows at a time")
+                }
                 XCTAssertNotNil(params["since"]?.stringValue)
                 return listCalls == 1 ? first : second
             },
@@ -585,32 +588,51 @@ final class ActivityWindowModelTests: XCTestCase {
         XCTAssertEqual(model.error, "host rejected", "a successful refresh must not erase an action failure the user has not seen")
     }
 
-    func testRefreshKeepsThePagedDepthSoALiveEventDoesNotThrowTheReaderBackToPageOne() async {
+    func testRefreshAsksForThePagedDepthInOneRequestSoALiveEventDoesNotThrowTheReaderBackToPageOne() async {
         let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
         defaults.set("finished", forKey: "activity.tab")
-        let first = (0..<50).map { item("run:\($0)") }
-        let second = (50..<60).map { item("run:\($0)") }
-        var requests: [String?] = []
+        let all = (0..<60).map { item("run:\($0)") }
+        var requests: [[String: JSONValue]] = []
         let model = ActivityViewModel(service: ActivityClient(
             list: { params in
-                requests.append(params["cursor"]?.stringValue)
-                return params["cursor"] == nil ? self.page(first, cursor: "page-2") : self.page(second)
+                requests.append(params)
+                if params["cursor"] != nil { return self.page(Array(all[50...])) }
+                return (params["limit"]?.intValue ?? 50) >= 60 ? self.page(all) : self.page(Array(all[..<50]), cursor: "page-2")
             },
             setViewed: { params in self.echoViewed(params) }, acknowledge: { _ in .object([:]) }
         ), defaults: defaults)
         model.refreshAfterFrame()
         await waitUntil("first page") { model.page.items.count == 50 && !model.loading }
-        XCTAssertEqual(requests, [nil], "a first load fetches one page only")
+        XCTAssertEqual(requests.map { $0["limit"]?.intValue }, [50], "a first load asks for one ordinary page")
         model.loadMore()
         await waitUntil("second page") { model.page.items.count == 60 && !model.loading }
         requests.removeAll()
 
         model.refreshAfterFrame()
-        await waitUntil("refresh settled") { requests.count == 2 && !model.loading }
+        await waitUntil("refresh settled") { !requests.isEmpty && !model.loading }
 
-        XCTAssertEqual(requests, [nil, "page-2"])
+        XCTAssertEqual(requests.count, 1, "the host recomputes everything per request, so depth must not cost extra passes")
+        XCTAssertEqual(requests.first?["limit"]?.intValue, 60)
+        XCTAssertNil(requests.first?["cursor"])
         XCTAssertEqual(model.page.items.count, 60, "rows the reader paged to must survive a refresh")
         XCTAssertFalse(model.cursorAvailable)
+    }
+
+    func testMarkAllAsReadIsOnlyOfferedWhileTheFilterHoldsSomethingUnread() async {
+        let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
+        defaults.set("finished", forKey: "activity.tab")
+        var response = page([item("run:read", viewed: "2026-10-12T10:00:00Z")], counts: ActivityWireCounts(finished: 1, new_results: 0))
+        let model = ActivityViewModel(service: ActivityClient(
+            list: { _ in response }, setViewed: { params in self.echoViewed(params) }, acknowledge: { _ in .object([:]) }
+        ), defaults: defaults)
+        model.refreshAfterFrame()
+        await waitUntil("read results") { model.page.items.count == 1 && !model.loading }
+        XCTAssertFalse(model.hasUnreadResults, "with nothing unread the action must read as unavailable, not run and report nothing")
+
+        response = page([item("run:read", viewed: "2026-10-12T10:00:00Z")], counts: ActivityWireCounts(finished: 80, new_results: 3))
+        model.refreshAfterFrame()
+        await waitUntil("host count") { model.page.counts.new_results == 3 && !model.loading }
+        XCTAssertTrue(model.hasUnreadResults, "unread results beyond the loaded rows still count")
     }
 
     func testCompactAgeNeverShowsNegativeTimeAndSwitchesUnitsAtReadableBoundaries() {

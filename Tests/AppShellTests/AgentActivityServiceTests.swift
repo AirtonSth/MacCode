@@ -69,6 +69,26 @@ final class AgentActivityServiceTests: XCTestCase {
         XCTAssertEqual(try activity.acknowledge(["item_ids": .array([])]).objectValue?["updated_ids"]?.arrayValue?.count, 0)
     }
 
+    func test_bulkPageReturnsAWholeFilterInOnePassAndStaysCapped() throws {
+        let context = try makeContext()
+        let repository = NotificationRepository(db: context.db)
+        for index in 0..<120 {
+            try repository.insert(AppNotification(id: "note-\(index)", title: "safe", category: PetNotificationCategory.gitCompleted.rawValue, createdAt: Date(timeIntervalSince1970: Double(1_000 + index))))
+        }
+        let activity = service(context)
+        XCTAssertEqual(try decodePage(activity.list(["section": .string("finished")])).items.count, 50, "an ordinary page stays small")
+        let bulk = try decodePage(activity.list(["section": .string("finished"), "limit": .number(500)]))
+        XCTAssertEqual(bulk.items.count, 120, "a bulk action must be able to read its filter without one full recompute per 50 rows")
+        XCTAssertNil(bulk.nextCursor)
+        XCTAssertEqual(bulk.items.first?.id, "notification:note-119", "the larger page keeps newest-first order")
+        for index in 120..<520 {
+            try repository.insert(AppNotification(id: "note-\(index)", title: "safe", category: PetNotificationCategory.gitCompleted.rawValue, createdAt: Date(timeIntervalSince1970: Double(1_000 + index))))
+        }
+        let capped = try decodePage(activity.list(["section": .string("finished"), "limit": .number(5_000)]))
+        XCTAssertEqual(capped.items.count, 500, "the response size stays bounded whatever a client asks for")
+        XCTAssertNotNil(capped.nextCursor)
+    }
+
     func test_durableRunWithoutCanonicalRuntimeIdentityIsNotReportedRunning() throws {
         let context = try makeContext()
         let thread = try makeThread(context)

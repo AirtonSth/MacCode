@@ -453,23 +453,30 @@ final class ActivityService: @unchecked Sendable {
     private static func activityOrder(_ lhs: AgentActivityItem, _ rhs: AgentActivityItem) -> Bool {
         lhs.occurredAt == rhs.occurredAt ? lhs.id < rhs.id : lhs.occurredAt > rhs.occurredAt
     }
-    nonisolated private static func isoFractionalString(_ date: Date) -> String {
+    // One list parses several thousand timestamps. A formatter per call made that take over a
+    // second, and ISO8601DateFormatter itself costs ~100 µs a parse, so the format styles go
+    // first; the formatters (documented thread-safe) stay as the fallback for odd inputs.
+    private static let fractionalStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+    private static let plainStyle = Date.ISO8601FormatStyle()
+    private static let fractionalFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        return formatter
+    }()
+    private static let plainFormatter = ISO8601DateFormatter()
+
+    nonisolated private static func isoFractionalString(_ date: Date) -> String {
+        fractionalFormatter.string(from: date)
     }
     nonisolated fileprivate static func parseDate(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+        (try? plainStyle.parse(value)) ?? (try? fractionalStyle.parse(value))
+            ?? fractionalFormatter.date(from: value) ?? plainFormatter.date(from: value)
     }
     private static func json<T: Encodable>(_ value: T) throws -> JSONValue {
         let encoder = JSONEncoder()
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         encoder.dateEncodingStrategy = .custom { date, output in
             var container = output.singleValueContainer()
-            try container.encode(formatter.string(from: date))
+            try container.encode(fractionalFormatter.string(from: date))
         }
         return try JSONDecoder().decode(JSONValue.self, from: encoder.encode(value))
     }
@@ -496,7 +503,8 @@ private struct ActivityFilter {
         cursor = params["cursor"]?.stringValue
         let requested = params["limit"]?.intValue ?? 50
         guard requested > 0 else { throw JSONRPCError.invalidParams }
-        limit = min(requested, 50)
+        // Bulk actions read a whole filter; 500 per page keeps that to a few passes.
+        limit = min(requested, 500)
     }
     func matches(_ item: AgentActivityItem) -> Bool {
         if let workspaceID, item.workspaceID != workspaceID { return false }

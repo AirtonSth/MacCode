@@ -134,10 +134,19 @@ enum ActivityOriginProjection {
         return ActivityOriginSnapshot(labelsByRunID: labels, botRequests: requests, scheduledOccurrences: scheduledOccurrences)
     }
 
+    // Shared and style-first: every scheduled occurrence parses three timestamps on each
+    // Activity list, and ISO8601DateFormatter costs ~100 µs a parse.
+    private static let fractionalStyle = Date.ISO8601FormatStyle(includingFractionalSeconds: true)
+    private static let plainStyle = Date.ISO8601FormatStyle()
+    private static let fractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let plainFormatter = ISO8601DateFormatter()
+
     private static func parseDate(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let plain = ISO8601DateFormatter()
-        return fractional.date(from: raw) ?? plain.date(from: raw)
+        (try? plainStyle.parse(raw)) ?? (try? fractionalStyle.parse(raw))
+            ?? fractionalFormatter.date(from: raw) ?? plainFormatter.date(from: raw)
     }
 }
