@@ -419,6 +419,9 @@ public struct AgentAppEmbedding {
     /// The pinned thread's row when the host read it on this same turn, so
     /// the first paint does not read it again. Later reloads read the store.
     public let pinnedThread: AgentThread?
+    /// False for a host that mounts the conversation without a composer: it must never
+    /// write the thread's draft, or closing it would replace what the real chat holds.
+    public let ownsComposerDraft: Bool
 
     public init(
         pinnedThreadId: AgentThreadID,
@@ -430,8 +433,10 @@ public struct AgentAppEmbedding {
         composerPlaceholder: String? = nil,
         emptyConversationTitle: String? = nil,
         emptyConversationSubtitle: String? = nil,
-        pinnedThread: AgentThread? = nil
+        pinnedThread: AgentThread? = nil,
+        ownsComposerDraft: Bool = true
     ) {
+        self.ownsComposerDraft = ownsComposerDraft
         self.pinnedThreadId = pinnedThreadId
         self.executionCwd = executionCwd
         self.promptTransform = promptTransform
@@ -2147,6 +2152,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func persistComposerDraft(for threadId: AgentThreadID) {
+        guard embedding?.ownsComposerDraft != false else { return }
         cancelPendingComposerDraftPersistence()
         let draft = makeComposerDraft(for: threadId)
         cacheComposerDraft(draft)
@@ -2159,6 +2165,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// draft restorable if the user switches back before the write lands, and
     /// dispose() re-persists on close.
     private func stashComposerDraftOffMain(for threadId: AgentThreadID) {
+        guard embedding?.ownsComposerDraft != false else { return }
         cancelPendingComposerDraftPersistence()
         let draft = makeComposerDraft(for: threadId)
         cacheComposerDraft(draft)
@@ -2166,6 +2173,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func scheduleComposerDraftPersistence(for threadId: AgentThreadID) {
+        guard embedding?.ownsComposerDraft != false else { return }
         let draft = makeComposerDraft(for: threadId)
         cacheComposerDraft(draft)
         cancelPendingComposerDraftPersistence()
@@ -12719,11 +12727,14 @@ public struct AgentAppViewLayout: Equatable {
     public var showsThreadRail: Bool
     public var showsHeader: Bool
     public var showsPlanSidebar: Bool
+    /// False for a host that shows the conversation but sends from elsewhere (Activity).
+    public var showsComposer: Bool
 
-    public init(showsThreadRail: Bool = true, showsHeader: Bool = true, showsPlanSidebar: Bool = true) {
+    public init(showsThreadRail: Bool = true, showsHeader: Bool = true, showsPlanSidebar: Bool = true, showsComposer: Bool = true) {
         self.showsThreadRail = showsThreadRail
         self.showsHeader = showsHeader
         self.showsPlanSidebar = showsPlanSidebar
+        self.showsComposer = showsComposer
     }
 
     public static let standard = AgentAppViewLayout()
@@ -15489,7 +15500,8 @@ public struct AgentAppView: View {
             // F1: render the composer inside a scope that observes only the composer
             // text, so a keystroke re-renders the composer subtree and NOT this body
             // (which builds the whole transcript).
-            if vm.isLegacyProviderThread {
+            // The legacy banner explains a locked composer and offers a new chat; it belongs with the composer.
+            if vm.isLegacyProviderThread, layout.showsComposer {
                 legacyProviderBanner
             }
             if vm.selectedThreadBotUnavailable {
@@ -15501,12 +15513,14 @@ public struct AgentAppView: View {
             if vm.vmUnavailableBotID != nil {
                 BotVMUnavailableBanner(vm: vm)
             }
-            ComposerReactiveScope(composerState: vm.composerState) {
-                composer
-                    .disabled(vm.isLegacyProviderThread || vm.selectedThreadBotUnavailable)
-                    .onChange(of: vm.composerState.focusTick) { _ in
-                        collapseTranscriptForNewTurn()
-                    }
+            if layout.showsComposer {
+                ComposerReactiveScope(composerState: vm.composerState) {
+                    composer
+                        .disabled(vm.isLegacyProviderThread || vm.selectedThreadBotUnavailable)
+                        .onChange(of: vm.composerState.focusTick) { _ in
+                            collapseTranscriptForNewTurn()
+                        }
+                }
             }
         }
         .background(DS.Palette.bg)

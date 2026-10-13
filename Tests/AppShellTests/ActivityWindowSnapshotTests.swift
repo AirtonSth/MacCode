@@ -1,5 +1,8 @@
 import AppKit
+import CoreModel
+import Persistence
 import SwiftUI
+import Surfaces
 import XCTest
 @testable import AppShell
 import SocketServer
@@ -57,7 +60,8 @@ final class ActivityWindowSnapshotTests: XCTestCase {
 
     private func render(
         _ name: String, items: [ActivityWireItem], counts: ActivityWireCounts, cursor: String? = nil,
-        size: CGSize, selecting selected: String? = nil, failing: Bool = false, clearAll: Bool = false
+        size: CGSize, selecting selected: String? = nil, failing: Bool = false, clearAll: Bool = false,
+        makeConversation: @escaping (ActivityWireItem) -> AgentAppViewModel? = { _ in nil }
     ) async throws -> NSBitmapImageRep {
         let defaults = UserDefaults(suiteName: "activity-snapshot-\(UUID())")!
         defaults.set("needsYou", forKey: "activity.tab")
@@ -86,7 +90,7 @@ final class ActivityWindowSnapshotTests: XCTestCase {
             while model.error == nil, clock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
         }
 
-        let hosting = NSHostingView(rootView: ActivityRootView(model: model, workspaceOptions: { [("workspace", "star")] })
+        let hosting = NSHostingView(rootView: ActivityRootView(model: model, workspaceOptions: { [("workspace", "star")] }, makeConversation: makeConversation)
             .frame(width: size.width, height: size.height))
         hosting.frame = NSRect(origin: .zero, size: size)
         hosting.wantsLayer = true
@@ -130,6 +134,44 @@ final class ActivityWindowSnapshotTests: XCTestCase {
         XCTAssertGreaterThan(inkSamples(in: bitmap, columns: 0...0.28), 150, "the list must paint rows on the left")
         XCTAssertGreaterThan(inkSamples(in: bitmap, columns: 0.4...1), 150,
                              "a wide window must show the selected result beside the list instead of an empty canvas")
+    }
+
+    func testChatItemOpensItsLiveConversationInTheDetailPaneWithoutAComposerOrDraftWrites() async throws {
+        let directory = NSTemporaryDirectory() + "activity-conversation-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let thread = AgentThread(workspaceId: WorkspaceID(), title: "Star - Task 1", provider: .codex, model: "gpt-5")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "Deploy the staging build and report back."))
+        try context.messageRepo.append(AgentMessage(threadId: thread.id, role: .assistant, content: "Staging is deployed. All 214 checks passed and the smoke test is green."))
+        let drafts = AgentThreadDraftRepository(db: context.db)
+        try drafts.upsert(AgentThreadDraft(threadId: thread.id, providerInstanceId: "codex", text: "unsent reply"))
+
+        var chat = item("run:chat", state: "completed", title: "Star - Task 1", summary: "Staging deployed")
+        chat.thread_id = thread.id.value.uuidString
+        var orphan = chat
+        orphan.thread_id = UUID().uuidString
+        var threadless = chat
+        threadless.thread_id = nil
+        XCTAssertNil(router.makeActivityConversation(orphan), "a deleted thread has no conversation; the summary stays")
+        XCTAssertNil(router.makeActivityConversation(threadless), "an item without a thread is not a chat")
+
+        let conversation = try XCTUnwrap(router.makeActivityConversation(chat))
+        XCTAssertEqual(conversation.embedding?.pinnedThreadId, thread.id, "the pane must show exactly the item's thread")
+        XCTAssertEqual(conversation.selectedThreadId, thread.id)
+        conversation.dispose()
+        XCTAssertEqual(try drafts.get(threadId: thread.id, providerInstanceId: "codex")?.text, "unsent reply",
+                       "closing the Activity pane must never replace the draft the real chat holds")
+
+        var made: [String] = []
+        let bitmap = try await render(
+            "chat-conversation", items: [chat], counts: ActivityWireCounts(finished: 1), size: CGSize(width: 1_300, height: 800),
+            selecting: "run:chat", makeConversation: { item in made.append(item.id); return router.makeActivityConversation(item) }
+        )
+        XCTAssertEqual(made, ["run:chat"], "one conversation per selected thread, built once")
+        XCTAssertGreaterThan(inkSamples(in: bitmap, columns: 0.4...1), 150, "the conversation must paint in the detail pane")
     }
 
     func testNarrowWindowKeepsListReadableAtMinimumWidth() async throws {

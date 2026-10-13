@@ -772,8 +772,11 @@ struct ActivityRootView: View {
     @StateObject private var model: ActivityViewModel
     @State private var narrowDetail = false
     @State private var searchFocusRequest = false
+    /// The one live conversation the detail pane holds; rebuilt only when the selected thread changes.
+    @State private var conversation: (threadID: String, viewModel: AgentAppViewModel)?
     let openThread: (ActivityWireItem) -> Void
     let openEvidence: (ActivityWireItem, String?) -> Void
+    private let makeConversation: (ActivityWireItem) -> AgentAppViewModel?
     private let workspaceOptions: () -> [(id: String, name: String)]
     let route: NotificationRouteIntent?
     let consumeRoute: () -> Void
@@ -785,16 +788,18 @@ struct ActivityRootView: View {
         _model = StateObject(wrappedValue: ActivityViewModel(router: router))
         self.openThread = openThread
         self.openEvidence = openEvidence
+        makeConversation = { [weak router] item in router?.makeActivityConversation(item) }
         self.route = route
         self.consumeRoute = consumeRoute
         workspaceOptions = { router.activityWorkspaceOptions }
     }
 
     /// Renders a prepared model without a router: offscreen layout proofs and worst-case data.
-    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }) {
+    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }, makeConversation: @escaping (ActivityWireItem) -> AgentAppViewModel? = { _ in nil }) {
         _model = StateObject(wrappedValue: model)
         openThread = { _ in }
         openEvidence = { _, _ in }
+        self.makeConversation = makeConversation
         route = nil
         consumeRoute = {}
         self.workspaceOptions = workspaceOptions
@@ -814,7 +819,7 @@ struct ActivityRootView: View {
                         list.frame(width: min(max(proxy.size.width * 0.36, 340), 460))
                         Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
                         if let item = model.detail {
-                            detailView(item)
+                            detailPane(item)
                         } else {
                             DSEmptyState(icon: "rectangle.righthalf.inset.filled", title: "Nothing selected", subtitle: "Select an item to see its result and what you can do next.")
                         }
@@ -829,9 +834,26 @@ struct ActivityRootView: View {
         .onAppear {
             if let route { apply(route) }
             else { model.refreshAfterFrame() }
+            syncConversation()
+        }
+        .onDisappear {
+            conversation?.viewModel.dispose()
+            conversation = nil
         }
         .onChange(of: route) { _, next in
             if let next { apply(next) }
+        }
+        .onChange(of: model.detail?.thread_id) { _, _ in syncConversation() }
+    }
+
+    /// Holds the conversation of the selected thread, built on the selection turn so it
+    /// mounts with the click. The one it replaces stops observing its runs.
+    private func syncConversation() {
+        let threadID = model.detail?.thread_id
+        guard conversation?.threadID != threadID else { return }
+        conversation?.viewModel.dispose()
+        conversation = model.detail.flatMap { item in
+            threadID.flatMap { id in makeConversation(item).map { (id, $0) } }
         }
     }
 
@@ -1035,8 +1057,47 @@ struct ActivityRootView: View {
                     .buttonStyle(DSSecondaryButtonStyle()).keyboardShortcut(.cancelAction)
                 Spacer()
             }.padding(.horizontal, DS.Space.xl).padding(.vertical, DS.Space.md)
+            detailPane(item)
+        }
+    }
+
+    /// A chat opens as its conversation; anything without a thread keeps the summary.
+    @ViewBuilder
+    private func detailPane(_ item: ActivityWireItem) -> some View {
+        if let conversation, conversation.threadID == item.thread_id {
+            VStack(spacing: 0) {
+                conversationHeader(item)
+                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+                AgentAppView(
+                    vm: conversation.viewModel,
+                    layout: AgentAppViewLayout(showsThreadRail: false, showsHeader: false, showsPlanSidebar: false, showsComposer: false)
+                )
+                .id(conversation.threadID)
+            }
+            .task(id: item.id) { model.detailPresented(item) }
+            .accessibilityIdentifier("activity.conversation")
+        } else {
             detailView(item)
         }
+    }
+
+    private func conversationHeader(_ item: ActivityWireItem) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            Text(item.displayTitle).font(DS.Font.title3).foregroundColor(DS.Palette.text).lineLimit(2).help(item.displayTitle)
+            HStack(spacing: DS.Space.md) {
+                DSPill(item.statusLabel, tone: ActivityStatusStyle.tone(item.state))
+                if let date = item.occurredDate {
+                    Text(ActivityTimeLabel.full(date)).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                }
+                let facts = [item.workspace_name, item.provider, item.origin_label].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+                if !facts.isEmpty {
+                    Text(facts).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).lineLimit(1).help(facts)
+                }
+            }
+            detailActions(item)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, DS.Space.xl).padding(.vertical, DS.Space.lg)
     }
 
     private func detailView(_ item: ActivityWireItem) -> some View {
@@ -1113,7 +1174,7 @@ struct ActivityRootView: View {
                         .keyboardShortcut("u", modifiers: [.command, .shift])
                 }
             }
-            if item.state == "waiting_approval" || item.state == "waiting_answer" {
+            if item.state == "waiting_approval" || item.state == "waiting_answer", conversation?.threadID != item.thread_id {
                 Text("Open the conversation to respond. It leaves Needs you once answered.")
                     .font(DS.Font.bodyDense).foregroundColor(DS.Palette.textSecondary)
             }
