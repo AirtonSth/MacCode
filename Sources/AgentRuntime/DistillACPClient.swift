@@ -893,7 +893,7 @@ public final class DistillACPClient: @unchecked Sendable {
             meta["modelId"] = trimmedModel
         }
         if let reasoningEffort,
-           let wire = wireReasoningEffort(reasoningEffort, modelId: trimmedModel) {
+           let wire = trimmedModel == "auto" ? reasoningEffort.rawValue : wireReasoningEffort(reasoningEffort, modelId: trimmedModel) {
             meta["reasoningEffort"] = wire
         }
         if !meta.isEmpty {
@@ -924,6 +924,8 @@ public final class DistillACPClient: @unchecked Sendable {
             timeout: 20
         )
         var opened = try Self.openResult(result, fallbackSessionId: nil)
+        let isAuto = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) == "auto"
+        if isAuto { opened.appliedMainModelId = "auto" }
         if let mainEffortSelection {
             let requestedModel = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let mainModelId = requestedModel.isEmpty ? (opened.currentModelId ?? "") : requestedModel
@@ -932,9 +934,10 @@ public final class DistillACPClient: @unchecked Sendable {
                 modelId: mainModelId,
                 reasoningEffort: mainEffortSelection.effort,
                 reasoningEffortAuto: mainEffortSelection.isAutomatic,
-                advertisedEfforts: opened.catalogEfforts(for: mainModelId)
+                advertisedEfforts: opened.catalogEfforts(for: isAuto ? opened.currentModelId : mainModelId)
             )
-            guard applied.isAutomatic == mainEffortSelection.isAutomatic,
+            guard !isAuto || applied.canonicalModelId == "auto",
+                  applied.isAutomatic == mainEffortSelection.isAutomatic,
                   mainEffortSelection.effort == nil || applied.effort == mainEffortSelection.effort else {
                 throw DistillACPError.unsupported("Distill did not confirm the requested Main-model effort")
             }
@@ -944,7 +947,7 @@ public final class DistillACPClient: @unchecked Sendable {
                 opened.appliedMainEffortSelection = mainEffortSelection
             }
         }
-        if reasoningModelSelectionSupported {
+        if reasoningModelSelectionSupported && !isAuto {
             let applied = try await setReasoningModel(
                 sessionId: opened.sessionId,
                 modelId: reasoningModel,
@@ -994,6 +997,8 @@ public final class DistillACPClient: @unchecked Sendable {
             timeout: 60
         )
         var opened = try Self.openResult(result, fallbackSessionId: sessionId)
+        let isAuto = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) == "auto"
+        if isAuto { opened.appliedMainModelId = "auto" }
         if let mainEffortSelection {
             let requestedModel = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let mainModelId = requestedModel.isEmpty ? (opened.currentModelId ?? "") : requestedModel
@@ -1002,9 +1007,10 @@ public final class DistillACPClient: @unchecked Sendable {
                 modelId: mainModelId,
                 reasoningEffort: mainEffortSelection.effort,
                 reasoningEffortAuto: mainEffortSelection.isAutomatic,
-                advertisedEfforts: opened.catalogEfforts(for: mainModelId)
+                advertisedEfforts: opened.catalogEfforts(for: isAuto ? opened.currentModelId : mainModelId)
             )
-            guard applied.isAutomatic == mainEffortSelection.isAutomatic,
+            guard !isAuto || applied.canonicalModelId == "auto",
+                  applied.isAutomatic == mainEffortSelection.isAutomatic,
                   mainEffortSelection.effort == nil || applied.effort == mainEffortSelection.effort else {
                 throw DistillACPError.unsupported("Distill did not confirm the requested Main-model effort")
             }
@@ -1014,7 +1020,7 @@ public final class DistillACPClient: @unchecked Sendable {
                 opened.appliedMainEffortSelection = mainEffortSelection
             }
         }
-        if reasoningModelSelectionSupported {
+        if reasoningModelSelectionSupported && !isAuto {
             let applied = try await setReasoningModel(
                 sessionId: opened.sessionId,
                 modelId: reasoningModel,
@@ -1229,7 +1235,8 @@ public final class DistillACPClient: @unchecked Sendable {
             meta["reasoningEffortAuto"] = reasoningEffortAuto
         }
         if let reasoningEffort {
-            guard let wireEffort = Self.wireReasoningEffort(
+            // Auto chooses its route while binding; the previous route's catalog is not authoritative.
+            guard let wireEffort = modelId == "auto" ? reasoningEffort.rawValue : Self.wireReasoningEffort(
                 reasoningEffort, modelId: modelId, advertisedEfforts: advertisedEfforts
             ) else {
                 throw DistillACPError.unsupported("Selected Main model does not advertise that effort")
@@ -1870,7 +1877,9 @@ public final class DistillACPClient: @unchecked Sendable {
                 supportsCustomModel: metadata["supportsCustomModel"] as? Bool
                     ?? raw["supportsCustomModel"] as? Bool
                     ?? true,
-                contextWindowTokens: contextWindow
+                contextWindowTokens: contextWindow,
+                accountProvider: (metadata["accountProvider"] as? String)
+                    .flatMap { DistillAccountProvider(rawValue: $0)?.rawValue }
             )
         }
     }

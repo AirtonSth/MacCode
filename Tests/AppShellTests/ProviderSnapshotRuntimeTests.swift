@@ -287,7 +287,11 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             if printf '%s' "$line" | grep -q '"method":"initialize"'; then
               printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"sessionCapabilities":{}}}}\n' "$id"
             elif printf '%s' "$line" | grep -q '"method":"session.*new"'; then
-              printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"snapshot-session","models":{"currentModelId":"distill-negotiated","availableModels":[{"modelId":"distill-negotiated","name":"Distill Negotiated"}]},"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"},{"id":"bypassPermissions","name":"Full access"}]}}}\n' "$id"
+              models='[{"modelId":"distill-negotiated","name":"Distill Negotiated","_meta":{"accountProvider":"chatgpt"}}]'
+              if [ -f "$0.auto-enabled" ]; then
+                models='[{"modelId":"distill-negotiated","name":"Distill Negotiated","_meta":{"accountProvider":"chatgpt"}},{"modelId":"auto","name":"Auto"},{"modelId":"new-account-model","name":"New account model","_meta":{"accountProvider":"chatgpt"}}]'
+              fi
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"snapshot-session","models":{"currentModelId":"distill-negotiated","availableModels":%s},"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"},{"id":"bypassPermissions","name":"Full access"}]}}}\n' "$id" "$models"
             fi
           done
           exit 0
@@ -296,6 +300,12 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         """#.write(to: fakeDistill, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeDistill.path)
 
+        let previousDistillHome = getenv("DISTILL_HOME").map { String(cString: $0) }
+        setenv("DISTILL_HOME", dir.appendingPathComponent("distill-home").path, 1)
+        defer {
+            if let previousDistillHome { setenv("DISTILL_HOME", previousDistillHome, 1) }
+            else { unsetenv("DISTILL_HOME") }
+        }
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
@@ -317,6 +327,20 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertFalse(distill.modelListIsFallback)
         XCTAssertNotNil(distill.modelDiscoveryCacheKey,
                         "the snapshot must retain the opaque binary/account discovery identity")
+        let warmedModels = await router.listAgentModels(provider: .distill)
+        XCTAssertEqual(warmedModels.map(\.id), ["distill-negotiated"])
+        try Data().write(to: URL(fileURLWithPath: fakeDistill.path + ".auto-enabled"))
+        let stillCached = await router.listAgentProviderSnapshots()
+        XCTAssertEqual(stillCached.first { $0.provider == .distill }?.models.map(\.id), ["distill-negotiated"],
+                       "fixture data changes must not accidentally invalidate the binary/cwd/environment cache key")
+        await router.refreshDistillProviderCatalog()
+        let refreshed = await router.listAgentProviderSnapshots()
+        let expectedIDs = ["distill-negotiated", "auto", "new-account-model"]
+        XCTAssertEqual(refreshed.first { $0.provider == .distill }?.models.map(\.id), expectedIDs,
+                       "the account/profile refresh path must bypass the warmed300-second snapshot catalog")
+        XCTAssertEqual(ctx.distillAccountsController.models.map(\.id), expectedIDs,
+                       "Accounts model choices must also refresh rather than depend on an earlier SwiftUI task")
+        XCTAssertEqual(ctx.distillAccountsController.models.last?.accountProvider, "chatgpt")
     }
 
     func test_distillSnapshotKeepsFallbackCatalogMarkedAsFallbackWhenACPLaunchFails() async throws {

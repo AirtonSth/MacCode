@@ -429,4 +429,36 @@ final class DistillHostCredentialRefresherTests: XCTestCase {
         XCTAssertEqual(DistillHostCredentialRefresher.parseDate(DistillHostCredentialRefresher.formatDate(date))!
             .timeIntervalSince1970, date.timeIntervalSince1970, accuracy: 0.001)
     }
+    func test_twoNamedClaudeAccountsRenewInTheirOwnHomesWithoutChangingSiblingOrLegacyCredential() async throws {
+        try writeClaude(expiresIn: 86_400)
+        let legacy = try Data(contentsOf: hostHome.appendingPathComponent("claude-auth.json"))
+        let endpoint = TokenEndpoint()
+        endpoint.respond(status: 200, ["access_token": "renewed", "refresh_token": "rotated", "expires_in": 86_400])
+        let now = now
+        for id in ["one", "two"] {
+            let folder = hostHome.appendingPathComponent("accounts/\(id)")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let store: [String: Any] = ["access_token": "expired-\(id)", "refresh_token": "refresh-\(id)",
+                                       "expires_at": iso(now.addingTimeInterval(-1))]
+            try JSONSerialization.data(withJSONObject: store).write(to: folder.appendingPathComponent("claude-auth.json"))
+        }
+        let sibling = hostHome.appendingPathComponent("accounts/two/claude-auth.json")
+        let beforeSibling = try Data(contentsOf: sibling)
+        let first = DistillHostCredentialRefresher(hostHome: hostHome.appendingPathComponent("accounts/one"),
+            httpPost: endpoint.post, now: { now })
+        try await first.prepare(provider: .claude)
+        XCTAssertEqual(try Data(contentsOf: sibling), beforeSibling)
+        let second = DistillHostCredentialRefresher(hostHome: sibling.deletingLastPathComponent(),
+            httpPost: endpoint.post, now: { now })
+        try await second.prepare(provider: .claude)
+        XCTAssertEqual(endpoint.requests.compactMap { $0.body["refresh_token"] as? String }, ["refresh-one", "refresh-two"])
+        XCTAssertEqual(try Data(contentsOf: hostHome.appendingPathComponent("claude-auth.json")), legacy)
+        for id in ["one", "two"] {
+            let data = try Data(contentsOf: hostHome.appendingPathComponent("accounts/\(id)/claude-auth.json"))
+            let store = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(store["access_token"] as? String, "renewed")
+            XCTAssertEqual(store["refresh_token"] as? String, "rotated")
+        }
+    }
+
 }

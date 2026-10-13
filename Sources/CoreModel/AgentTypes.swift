@@ -926,6 +926,7 @@ public struct AgentModelDescriptor: Codable, Sendable, Equatable, Hashable {
     public let supportsServiceTier: Bool
     public let supportsCustomModel: Bool
     public let contextWindowTokens: Int?
+    public let accountProvider: String?
 
     public init(
         id: String,
@@ -935,7 +936,8 @@ public struct AgentModelDescriptor: Codable, Sendable, Equatable, Hashable {
         supportedReasoningEfforts: [AgentReasoningEffort]? = nil,
         supportsServiceTier: Bool = false,
         supportsCustomModel: Bool = false,
-        contextWindowTokens: Int? = nil
+        contextWindowTokens: Int? = nil,
+        accountProvider: String? = nil
     ) {
         self.id = id
         self.label = label
@@ -945,10 +947,11 @@ public struct AgentModelDescriptor: Codable, Sendable, Equatable, Hashable {
         self.supportsServiceTier = supportsServiceTier
         self.supportsCustomModel = supportsCustomModel
         self.contextWindowTokens = contextWindowTokens
+        self.accountProvider = accountProvider
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, label, provider, supportsReasoning, supportedReasoningEfforts, supportsServiceTier, supportsCustomModel, contextWindowTokens
+        case id, label, provider, supportsReasoning, supportedReasoningEfforts, supportsServiceTier, supportsCustomModel, contextWindowTokens, accountProvider
     }
 
     public init(from decoder: Decoder) throws {
@@ -962,6 +965,7 @@ public struct AgentModelDescriptor: Codable, Sendable, Equatable, Hashable {
         supportsServiceTier = try c.decodeIfPresent(Bool.self, forKey: .supportsServiceTier) ?? false
         supportsCustomModel = try c.decodeIfPresent(Bool.self, forKey: .supportsCustomModel) ?? false
         contextWindowTokens = try c.decodeIfPresent(Int.self, forKey: .contextWindowTokens)
+        accountProvider = try c.decodeIfPresent(String.self, forKey: .accountProvider)
     }
 
     /// Compact context label for pills and picker rows ("128k ctx"). Nil when unknown.

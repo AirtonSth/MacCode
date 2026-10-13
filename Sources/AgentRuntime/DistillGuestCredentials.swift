@@ -95,6 +95,16 @@ public enum DistillGuestCredentials {
     /// file is not a JSON object (copying it raw could carry a refresh token).
     static func guestCopy(_ provider: DistillAccountProvider, hostData: Data) -> Data? {
         guard var root = (try? JSONSerialization.jsonObject(with: hostData)) as? [String: Any] else { return nil }
+        func stripped(_ value: Any) -> Any {
+            if let object = value as? [String: Any] {
+                return object.mapValues(stripped).reduce(into: [String: Any]()) { result, item in
+                    result[item.key] = item.key.lowercased() == "refresh_token" ? "" : item.value
+                }
+            }
+            if let array = value as? [Any] { return array.map(stripped) }
+            return value
+        }
+        root = stripped(root) as? [String: Any] ?? [:]
         switch provider {
         case .claude:
             // Distill requires the key: without it the file does not parse and
@@ -129,6 +139,8 @@ public enum DistillGuestCredentials {
         let directory = try PrivateDirectory(guestDistillHome, create: true)
         defer { directory.close() }
         var result = SyncResult()
+        let host = try? PrivateDirectory(hostHome.resolvingSymlinksInPath(), create: false)
+        defer { host?.close() }
         for provider in DistillAccountProvider.allCases {
             let name = provider.credentialFileName
             let hostFile = hostHome.appendingPathComponent(name)
@@ -136,7 +148,7 @@ public enum DistillGuestCredentials {
                 if directory.remove(name) { result.removed.append(provider) }
                 continue
             }
-            guard let hostData = try? Data(contentsOf: hostFile),
+            guard let hostData = host?.read(name),
                   let copy = guestCopy(provider, hostData: hostData) else {
                 directory.remove(name)
                 result.unreadable.append(provider)
@@ -150,7 +162,97 @@ public enum DistillGuestCredentials {
             try directory.writeAtomically(copy, to: name)
             result.written.append(provider)
         }
+        try syncNamed(hostHome: hostHome, host: host, guest: directory)
         return result
+    }
+
+    private static func syncNamed(hostHome: URL, host: PrivateDirectory?, guest: PrivateDirectory) throws {
+        let registry: DistillAccountRegistry?
+        do { registry = try DistillAccounts.readRegistry(home: hostHome) }
+        catch {
+            guest.remove("accounts.json")
+            guest.removeTree("accounts")
+            throw error
+        }
+        guard let registry else {
+            guest.remove("accounts.json")
+            guest.removeTree("accounts")
+            return
+        }
+        let target = try guest.child("accounts", create: true)
+        defer { target.close() }
+        let source = try? host?.child("accounts", create: false)
+        defer { source?.close() }
+        let ids = Set(registry.accounts.map(\.id))
+        for entry in target.entries() where !ids.contains(entry) { target.removeTree(entry) }
+        for account in registry.accounts {
+            let destination = try target.child(account.id, create: true)
+            defer { destination.close() }
+            let origin = try? source?.child(account.id, create: false)
+            defer { origin?.close() }
+            // A removed provider file must also remove its stale backups/locks.
+            if !account.legacy {
+                let name = account.provider.credentialFileName
+                if let data = origin?.read(name), let copy = guestCopy(account.provider, hostData: data) {
+                    if destination.read(name) != copy { try destination.writeAtomically(copy, to: name) }
+                } else {
+                    for entry in destination.entries() where entry == name || entry.hasPrefix(name + ".") {
+                        destination.removeTree(entry)
+                    }
+                }
+            }
+            if let data = origin?.read("quota.json"),
+               let quota = try? JSONDecoder().decode(DistillAccountQuota.self, from: data),
+               quota.accountID == account.id,
+               ["available", "unavailable", "unsupported"].contains(quota.status),
+               DistillHostCredentialRefresher.parseDate(quota.checkedAt) != nil,
+               quota.fetchedAt == nil || quota.fetchedAt.flatMap(DistillHostCredentialRefresher.parseDate) != nil,
+               quota.remainingPercent == nil || (0...100).contains(quota.remainingPercent ?? -1) {
+                let safeQuota = DistillAccountQuota(accountID: quota.accountID, checkedAt: quota.checkedAt,
+                    fetchedAt: quota.fetchedAt, status: quota.status, remainingPercent: quota.remainingPercent,
+                    detail: safeQuotaDetail(quota.detail))
+                let safe = try JSONEncoder().encode(safeQuota)
+                if destination.read("quota.json") != safe { try destination.writeAtomically(safe, to: "quota.json") }
+            } else { destination.remove("quota.json") }
+        }
+        let data = try JSONEncoder().encode(registry)
+        if guest.read("accounts.json") != data { try guest.writeAtomically(data, to: "accounts.json") }
+    }
+
+    /// Preserve only the typed quota fields in the authoritative CLI contract.
+    private static func safeQuotaDetail(_ detail: DistillAccountQuota.Detail?) -> DistillAccountQuota.Detail? {
+        guard let detail else { return nil }
+        switch detail {
+        case .object(let fields):
+            let allowed: Set<String> = ["rate_limit", "additional_rate_limits", "primary_window", "secondary_window",
+                "allowed", "limit_reached", "used_percent", "limit_window_seconds", "reset_after_seconds", "reset_at",
+                "five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus", "utilization", "resets_at",
+                "usage", "limit", "limit_remaining", "credit_usage_percent"]
+            return .object(fields.filter { allowed.contains($0.key) }.compactMapValues(safeQuotaDetail))
+        case .array(let values): return .array(values.compactMap { safeQuotaDetail($0) })
+        case .string(let value):
+            return DistillHostCredentialRefresher.parseDate(value) == nil ? nil : .string(value)
+        case .number, .bool, .null: return detail
+        }
+    }
+
+    /// Accounts this run may use. Distill remains the routing/eligibility authority.
+    public static func accountsForRun(model: String?, hostConfig: String, hostHome: URL) throws -> [DistillAccountStatus] {
+        let registry = try DistillAccounts.readRegistry(home: hostHome)
+        let connected = DistillAccounts.connectedAccounts(home: hostHome).filter(\.connected)
+        if model?.trimmingCharacters(in: .whitespacesAndNewlines) == "auto" {
+            guard let registry, registry.routing.enabled else {
+                throw DistillAccountError.failed("Enable and save Distill Auto routing before running Auto.")
+            }
+            let ids = Set(registry.routing.options.map(\.accountID))
+            let accounts = connected.filter { ids.contains($0.id) }
+            guard !accounts.isEmpty else { throw DistillAccountError.failed("No connected account is available for Distill Auto routing.") }
+            return accounts
+        }
+        guard let provider = accountProvider(model: model, hostConfig: hostConfig) else { return [] }
+        let accounts = connected.filter { $0.provider == provider }
+        // Preserve the legacy preflight error when no managed account exists.
+        return accounts.isEmpty ? [DistillAccountStatus(provider: provider, connected: false)] : accounts
     }
 
     /// Deletes every credential copy (and Distill's locks, temp and corrupt
@@ -163,6 +265,9 @@ public enum DistillGuestCredentials {
             return
         }
         defer { directory.close() }
+        directory.remove("accounts.json")
+        directory.remove("accounts.json.lock")
+        directory.removeTree("accounts")
         let names = DistillAccountProvider.allCases.map(\.credentialFileName)
         for entry in directory.entries() where entry.hasPrefix(temporaryPrefix)
             || names.contains(where: { entry == $0 || entry.hasPrefix($0 + ".") }) {
@@ -221,6 +326,7 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
     /// Renews the Mac sign-in of one provider when it is close to expiry;
     /// production passes `DistillHostCredentialRefresher.prepare(provider:)`.
     public typealias Refresh = @Sendable (DistillAccountProvider) async throws -> Void
+    public typealias AccountRefresh = @Sendable (DistillAccountStatus) async throws -> Void
     /// A periodic renewal failed: these runs keep copies that stop working
     /// when their access token expires. Called on the mirror's queue.
     public typealias RefreshFailure = @Sendable (_ runIDs: [String], _ error: Error) -> Void
@@ -228,10 +334,12 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
     private struct Run {
         var home: URL
         var provider: DistillAccountProvider?
+        var accounts: [DistillAccountStatus]?
     }
 
     private let hostHome: URL
     private let refresh: Refresh
+    private let refreshAccount: AccountRefresh?
     private let onRefreshFailure: RefreshFailure?
     private let debounce: TimeInterval
     private let refreshInterval: TimeInterval
@@ -239,6 +347,7 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
     private let queue = DispatchQueue(label: "io.remotecode.distill.guest-credentials")
     private var runs: [String: Run] = [:]
     private var source: DispatchSourceFileSystemObject?
+    private var accountSources: [DispatchSourceFileSystemObject] = []
     private var pending: DispatchWorkItem?
     private var timer: DispatchSourceTimer?
     private var refreshing = false
@@ -246,12 +355,14 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
     public init(
         hostHome: URL,
         refresh: @escaping Refresh,
+        refreshAccount: AccountRefresh? = nil,
         onRefreshFailure: RefreshFailure? = nil,
         debounce: TimeInterval = 0.5,
         refreshInterval: TimeInterval = 5 * 60
     ) {
         self.hostHome = hostHome
         self.refresh = refresh
+        self.refreshAccount = refreshAccount
         self.onRefreshFailure = onRefreshFailure
         self.debounce = debounce
         self.refreshInterval = refreshInterval
@@ -259,6 +370,7 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
 
     deinit {
         source?.cancel()
+        accountSources.forEach { $0.cancel() }
         timer?.cancel()
     }
 
@@ -269,14 +381,16 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
     /// wrote is left behind.
     @discardableResult
     public func begin(
-        runID: String, guestDistillHome: URL, provider: DistillAccountProvider?
+        runID: String, guestDistillHome: URL, provider: DistillAccountProvider?, accounts: [DistillAccountStatus]? = nil
     ) throws -> DistillGuestCredentials.SyncResult {
         try queue.sync {
             let home = guestDistillHome.standardizedFileURL
             do {
-                let result = try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: home)
+                // Watch before the initial copy so changes during that copy are observed.
                 if source == nil { try startWatching() }
-                runs[runID] = Run(home: home, provider: provider)
+                let result = try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: home)
+                runs[runID] = Run(home: home, provider: provider, accounts: accounts?.isEmpty == true ? nil : accounts)
+                watchAccounts()
                 if timer == nil { startTimer() }
                 return result
             } catch {
@@ -320,6 +434,8 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
         pending = nil
         source?.cancel()
         source = nil
+        accountSources.forEach { $0.cancel() }
+        accountSources = []
         timer?.cancel()
         timer = nil
     }
@@ -351,6 +467,32 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
         source.resume()
     }
 
+    /// Directory watches catch nested atomic credential replacements, including new/deleted accounts.
+    private func watchAccounts() {
+        accountSources.forEach { $0.cancel() }
+        accountSources = []
+        guard let root = try? PrivateDirectory(hostHome.resolvingSymlinksInPath(), create: false) else { return }
+        defer { root.close() }
+        guard let accounts = try? root.child("accounts", create: false) else { return }
+        defer { accounts.close() }
+        func watch(_ directory: PrivateDirectory) {
+            let fd = dup(directory.descriptor)
+            guard fd >= 0 else { return }
+            let watcher = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd,
+                eventMask: [.write, .rename, .delete], queue: queue)
+            watcher.setEventHandler { [weak self] in self?.scheduleResync() }
+            watcher.setCancelHandler { close(fd) }
+            accountSources.append(watcher)
+            watcher.resume()
+        }
+        watch(accounts)
+        for id in accounts.entries() where DistillAccounts.validID(id) {
+            guard let child = try? accounts.child(id, create: false) else { continue }
+            watch(child)
+            child.close()
+        }
+    }
+
     private func startTimer() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + refreshInterval, repeating: refreshInterval)
@@ -363,21 +505,39 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
         if source == nil { try? startWatching() }
         guard !refreshing else { return }
         refreshing = true
+        let connected = DistillAccounts.connectedAccounts(home: hostHome).filter(\.connected)
+        let routing = (try? DistillAccounts.readRegistry(home: hostHome))?.routing
+        let autoIDs = Set(routing?.enabled == true ? routing?.options.map(\.accountID) ?? [] : [])
+        for id in Array(runs.keys) {
+            guard var run = runs[id], run.accounts != nil else { continue }
+            run.accounts = connected.filter { account in
+                run.provider.map { account.provider == $0 } ?? autoIDs.contains(account.id)
+            }
+            runs[id] = run
+        }
         let providers = DistillAccountProvider.allCases.filter { provider in
-            runs.values.contains { $0.provider == provider }
+            runs.values.contains { $0.accounts == nil && $0.provider == provider }
         }
         let refresh = self.refresh
+        let refreshAccount = self.refreshAccount
+        let accounts = Dictionary(runs.values.flatMap { $0.accounts ?? [] }.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         Task { [weak self] in
             var failures: [(DistillAccountProvider, Error)] = []
             for provider in providers {
                 do { try await refresh(provider) } catch { failures.append((provider, error)) }
             }
+            var accountFailures: [(String, Error)] = []
+            if let refreshAccount {
+                for account in accounts.values {
+                    do { try await refreshAccount(account) } catch { accountFailures.append((account.id, error)) }
+                }
+            }
             guard let self else { return }
-            self.queue.async { self.finishRefresh(failures) }
+            self.queue.async { self.finishRefresh(failures, accountFailures: accountFailures) }
         }
     }
 
-    private func finishRefresh(_ failures: [(DistillAccountProvider, Error)]) {
+    private func finishRefresh(_ failures: [(DistillAccountProvider, Error)], accountFailures: [(String, Error)]) {
         refreshing = false
         for (provider, error) in failures {
             let affected = runs.filter { $0.value.provider == provider }.map(\.key).sorted()
@@ -385,6 +545,10 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
             guestCredentialLog.error(
                 "bot.guest.credentials.refresh_failed provider=\(provider.rawValue, privacy: .public) runs=\(affected.count, privacy: .public)")
             onRefreshFailure?(affected, error)
+        }
+        for (id, error) in accountFailures {
+            let affected = runs.filter { ($0.value.accounts ?? []).contains { $0.id == id } }.map(\.key).sorted()
+            if !affected.isEmpty { onRefreshFailure?(affected, error) }
         }
         // Also covers a renewal the watcher missed.
         resyncAll()
@@ -398,6 +562,7 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
     }
 
     private func resyncAll() {
+        watchAccounts()
         pending = nil
         for home in Set(runs.values.map(\.home)) {
             do {
@@ -439,6 +604,46 @@ public struct PrivateDirectory {
             throw DistillGuestCredentialError.writeFailed(path: path, errno: code)
         }
         descriptor = fd
+    }
+
+    private init(path: String, descriptor: Int32) {
+        self.path = path
+        self.descriptor = descriptor
+    }
+
+    /// Nested managed paths must be opened relative to the already trusted parent.
+    func child(_ name: String, create: Bool) throws -> PrivateDirectory {
+        guard name != ".", name != "..", !name.contains("/"), !name.isEmpty else {
+            throw DistillGuestCredentialError.unsafeDirectory(path: path)
+        }
+        var fd = openat(descriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        if fd < 0, errno == ENOENT, create {
+            if mkdirat(descriptor, name, 0o700) != 0, errno != EEXIST {
+                throw DistillGuestCredentialError.writeFailed(path: "\(path)/\(name)", errno: errno)
+            }
+            fd = openat(descriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard fd >= 0 else {
+            if errno == ELOOP || errno == ENOTDIR {
+                throw DistillGuestCredentialError.unsafeDirectory(path: "\(path)/\(name)")
+            }
+            throw DistillGuestCredentialError.writeFailed(path: "\(path)/\(name)", errno: errno)
+        }
+        if create, fchmod(fd, 0o700) != 0 {
+            let code = errno
+            Darwin.close(fd)
+            throw DistillGuestCredentialError.writeFailed(path: "\(path)/\(name)", errno: code)
+        }
+        return PrivateDirectory(path: "\(path)/\(name)", descriptor: fd)
+    }
+
+    /// Used only for the owned accounts mirror; symlinks are unlinked, never traversed.
+    func removeTree(_ name: String) {
+        if let directory = try? child(name, create: false) {
+            for entry in directory.entries() { directory.removeTree(entry) }
+            directory.close()
+            unlinkat(descriptor, name, AT_REMOVEDIR)
+        } else { remove(name) }
     }
 
     public func close() { Darwin.close(descriptor) }

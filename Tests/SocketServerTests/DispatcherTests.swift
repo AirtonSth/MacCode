@@ -8,11 +8,24 @@ import AgentRuntime
 class FakeRouter: CommandRouting, TerminalCommandRouting {
     var workspaces: [Workspace] = []
     var window = AppWindow()
+    var distillAccountID: String?
+    var distillMutationMethod: String?
+    var distillRouting = DistillAutoRouting()
     var distillLoginProvider: DistillAccountProvider?
     var distillLogoutProvider: DistillAccountProvider?
     var distillAccountsPayload: JSONValue = .object(["accounts": .array([]), "busy_provider": .null, "last_error": .null])
 
-    func listDistillAccounts() -> JSONValue { distillAccountsPayload }
+    func listDistillAccounts() async -> JSONValue { distillAccountsPayload }
+    func getDistillRouting() async throws -> JSONValue { .object(["enabled": .bool(distillRouting.enabled)]) }
+    func mutateDistillAccount(method: String, accountID: String?, provider: DistillAccountProvider?, label: String?) throws -> JSONValue {
+        distillMutationMethod = method
+        distillAccountID = accountID
+        return .object(["started": .bool(true)])
+    }
+    func setDistillRouting(_ routing: DistillAutoRouting) throws -> JSONValue {
+        distillRouting = routing
+        return .object(["started": .bool(true)])
+    }
     func loginDistillAccount(_ provider: DistillAccountProvider) throws -> JSONValue {
         distillLoginProvider = provider
         return .object(["started": .bool(true)])
@@ -936,7 +949,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         }
     }
     func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
-        [AgentModelDescriptor(id: "x", label: "X", provider: provider)]
+        [AgentModelDescriptor(id: "x", label: "X", provider: provider, accountProvider: provider == .distill ? "chatgpt" : nil)]
     }
     func listAgentProviderSnapshots() async -> [AgentProviderSnapshot] {
         [
@@ -1177,6 +1190,32 @@ final class DispatcherTests: XCTestCase {
             XCTAssertTrue(HostMutationContract.methods.contains(method))
         }
         XCTAssertTrue(JSONRPCDispatcher.isReadOnlyBatchMethod("distill.accounts.list"))
+        let catalog = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(11), method: "agent.models.list", params: ["provider": .string("distill")]))
+        XCTAssertEqual(catalog.result?.arrayValue?.first?.objectValue?["accountProvider"], .string("chatgpt"))
+        let named = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(6), method: "distill.accounts.login", params: ["account_id": .string("second-chatgpt")]))
+        XCTAssertEqual(named.result, .object(["started": .bool(true)]))
+        XCTAssertEqual(router.distillAccountID, "second-chatgpt")
+        let routing: JSONValue = .object(["enabled": .bool(true), "strategy": .string("ordered_first"), "options": .array([.object(["id": .string("option"), "account_id": .string("second-chatgpt"), "main_model": .string("discovered"), "worker_model": .null])])])
+        let saved = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(7), method: "distill.accounts.routing.set", params: ["routing": routing]))
+        XCTAssertEqual(saved.result, .object(["started": .bool(true)]))
+        XCTAssertEqual(router.distillRouting.options.first?.accountID, "second-chatgpt")
+        XCTAssertNil(router.distillRouting.options.first?.workerModel)
+        let read = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(8), method: "distill.accounts.routing.get", params: nil))
+        XCTAssertEqual(read.result, .object(["enabled": .bool(true)]))
+        XCTAssertTrue(JSONRPCDispatcher.isReadOnlyBatchMethod("distill.accounts.routing.get"))
+        XCTAssertFalse(HostMutationContract.methods.contains("distill.accounts.routing.get"))
+        let context = MutationRequestContext(ownerFingerprint: "owner", hostId: "host", bootEpoch: 1)
+        for method in ["distill.accounts.add", "distill.accounts.rename", "distill.accounts.remove", "distill.accounts.usage", "distill.accounts.routing.set"] {
+            XCTAssertTrue(HostMutationContract.methods.contains(method))
+            XCTAssertFalse(JSONRPCDispatcher.isReadOnlyBatchMethod(method))
+            let denied = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(9), method: method, params: [:]), mutationContext: context)
+            XCTAssertEqual(denied.error?.code, -32097, method)
+        }
+        XCTAssertNoThrow(try HostMutationContract.preflight(method: "distill.accounts.login", params: ["account_id": .string("second-chatgpt")]))
+        XCTAssertThrowsError(try HostMutationContract.preflight(method: "distill.accounts.rename", params: ["account_id": .string("second-chatgpt"), "label": .string("")]))
+        let invalidRouting = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(10), method: "distill.accounts.routing.set", params: ["routing": .object(["enabled": .string("true")])]))
+        XCTAssertNotNil(invalidRouting.error)
+
     }
 
     @MainActor

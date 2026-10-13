@@ -176,4 +176,12 @@ final class AgentDistillModelPickerRedesignTests: XCTestCase {
         XCTAssertEqual(legacy.accessibilityLabel, "Model gpt-5.5, effort Medium, tier Fast")
         XCTAssertEqual(AgentModelPillPresentation(title: "Auto").accessibilityLabel, "Auto model routing")
     }
+    func test_autoWorkerFollowsProfileAndManualWorkerExcludesLogicalAuto() {
+        let models = [distillModel("auto", label: "Auto"), distillModel("concrete", label: "Concrete")]
+        XCTAssertEqual(AgentDistillModelCatalog.workerPillTitle(reasoningModel: "old-worker", models: models, supportsSessionWorker: true, homePath: nil, mainModel: "auto"), "Auto profile")
+        XCTAssertEqual(AgentDistillModelCatalog.concreteWorkerModels(models).map(\.id), ["concrete"])
+        XCTAssertEqual(AgentDistillModelCatalog.workerPillTitle(reasoningModel: "concrete", models: models, supportsSessionWorker: true, homePath: nil, mainModel: "concrete"), "Concrete")
+        XCTAssertEqual(AgentDistillModelCatalog.selectableModels(models).map(\.id), ["auto", "concrete"])
+    }
+
 }

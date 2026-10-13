@@ -107,10 +107,11 @@ public final class DistillRunner: AgentProviderRunner, @unchecked Sendable {
         return args
     }
 
-    /// Return only provider-advertised levels. Stale/shared picker values are
-    /// clamped to the selected model's deepest supported level; `max` is never
-    /// emitted because no catalog reasoning model advertises it.
+    /// Manual models retain their static effort normalization. Auto is
+    /// validated by Distill after it selects the concrete route.
     static func effortArgs(_ effort: AgentReasoningEffort, model: String = "") -> [String] {
+        // Auto's concrete route is selected by Distill; let that runtime validate the requested effort.
+        if model == "auto" { return ["--reasoning-effort", effort.rawValue] }
         guard let effective = normalizedReasoningEffort(effort, model: model) else { return [] }
         return ["--reasoning-effort", effective.rawValue]
     }
@@ -129,7 +130,7 @@ public final class DistillRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     static func modelSupportsReasoningEffort(_ model: String) -> Bool {
-        !supportedReasoningEfforts(for: model).isEmpty
+        model == "auto" || !supportedReasoningEfforts(for: model).isEmpty
     }
 
     static func terminalStatus(

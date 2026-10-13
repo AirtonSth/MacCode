@@ -292,7 +292,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private let maxReadableBytes: Int64
     private let lock = NSLock()
     private static let discoveryCacheLock = NSLock()
-    private static var sharedDiscoveryCache: [String: (result: DistillACPDiscoveryResult, fetchedAt: Date)] = [:]
+    private static let discoveryAccountEnvironmentKeys = ["HOME", "DISTILL_HOME", "GROK_HOME", "REMOTE_CODE_INSTANCE"]
+    private static var sharedDiscoveryCache: [String: (result: DistillACPDiscoveryResult, fetchedAt: Date, scope: String)] = [:]
+    private static var discoveryCacheGenerations: [String: UInt64] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
     /// Set by AppShell after the adapter is built; nil runs everything on the Mac.
     private var guestLaunchResolver: DistillGuestLaunchResolving?
@@ -357,14 +359,21 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         return ModelListResult(models: discovery.models, isFallback: discovery.isFallback)
     }
 
-    public func discoveryResult() async -> DistillACPDiscoveryResult {
+    /// Refresh this account's catalog across working directories after account or routing changes.
+    public func discoveryResult(forceRefresh: Bool = false) async -> DistillACPDiscoveryResult {
         let now = Date()
         let cacheKey = Self.discoveryCacheKey(
             binary: binaryNameOverride ?? DistillProvisioner.binaryName,
             cwd: discoveryCwd,
             environment: discoveryEnvironment
         )
-        if let cached = Self.cachedDiscovery(for: cacheKey),
+        let scope = Self.discoveryCacheKey(
+            binary: binaryNameOverride ?? DistillProvisioner.binaryName,
+            cwd: "",
+            environment: discoveryEnvironment.filter { Self.discoveryAccountEnvironmentKeys.contains($0.key) }
+        )
+        let generation = Self.discoveryCacheGeneration(for: scope, invalidating: forceRefresh)
+        if !forceRefresh, let cached = Self.cachedDiscovery(for: cacheKey),
            now.timeIntervalSince(cached.fetchedAt) < modelCacheTTL {
             return cached.result
         }
@@ -454,7 +463,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 discoveryCacheKey: cacheKey
             )
         }
-        Self.storeDiscovery(result, for: cacheKey, fetchedAt: now, ttl: modelCacheTTL)
+        Self.storeDiscovery(result, for: cacheKey, scope: scope, generation: generation, fetchedAt: now, ttl: modelCacheTTL)
         return result
     }
 
@@ -492,7 +501,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
         let modified = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         let environmentKeys = environment.keys.sorted().joined(separator: "\u{1f}")
-        let accountSelectors = ["HOME", "DISTILL_HOME", "GROK_HOME", "REMOTE_CODE_INSTANCE"]
+        let accountSelectors = discoveryAccountEnvironmentKeys
             .map { "\($0)=\(environment[$0] ?? "")" }
             .joined(separator: "\u{1f}")
         let input = "distill-acp-v1\u{1e}\(resolvedBinary)\u{1e}\(size)\u{1e}\(modified)\u{1e}\(cwd)\u{1e}\(environmentKeys)\u{1e}\(accountSelectors)"
@@ -520,21 +529,37 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private static func cachedDiscovery(for key: String) -> (result: DistillACPDiscoveryResult, fetchedAt: Date)? {
         discoveryCacheLock.lock()
         defer { discoveryCacheLock.unlock() }
-        return sharedDiscoveryCache[key]
+        guard let cached = sharedDiscoveryCache[key] else { return nil }
+        return (cached.result, cached.fetchedAt)
+    }
+
+    private static func discoveryCacheGeneration(for scope: String, invalidating: Bool) -> UInt64 {
+        discoveryCacheLock.lock()
+        defer { discoveryCacheLock.unlock() }
+        if invalidating {
+            discoveryCacheGenerations[scope, default: 0] &+= 1
+            sharedDiscoveryCache = sharedDiscoveryCache.filter { $0.value.scope != scope }
+        }
+        return discoveryCacheGenerations[scope, default: 0]
     }
 
     private static func storeDiscovery(
         _ result: DistillACPDiscoveryResult,
         for key: String,
+        scope: String,
+        generation: UInt64,
         fetchedAt: Date,
         ttl: TimeInterval
     ) {
         discoveryCacheLock.lock()
         defer { discoveryCacheLock.unlock() }
+        guard discoveryCacheGenerations[scope, default: 0] == generation else { return }
+        // A discovery started before a forced refresh must not replace its newer result.
+        if let cached = sharedDiscoveryCache[key], cached.fetchedAt > fetchedAt { return }
         sharedDiscoveryCache = sharedDiscoveryCache.filter {
             fetchedAt.timeIntervalSince($0.value.fetchedAt) < max(ttl, 1)
         }
-        sharedDiscoveryCache[key] = (result, fetchedAt)
+        sharedDiscoveryCache[key] = (result, fetchedAt, scope)
     }
 
     public func startSession(
@@ -582,7 +607,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             if existing.historyIncompatible || retiredProviderThreadIds.contains(existing.providerThreadId) {
                 return .incompatibleHistory
             }
-            let previousModel = existing.mainModelSelection ?? existing.model
+            let previousModel = existing.mainModelSelection == "auto" && request.model != "auto"
+                ? existing.model : (existing.mainModelSelection ?? existing.model)
             return Self.isCrossModelFamilySwitch(from: previousModel, to: request.model)
                 ? .modelFamilySwitch(from: previousModel)
                 : nil
@@ -621,7 +647,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     static func isCrossModelFamilySwitch(from previousModel: String?, to nextModel: String) -> Bool {
         let previous = previousModel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let next = nextModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !previous.isEmpty, !next.isEmpty else { return false }
+        guard !previous.isEmpty, !next.isEmpty, previous != "auto", next != "auto" else { return false }
         return modelFamily(of: previous) != modelFamily(of: next)
     }
 
@@ -1218,10 +1244,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 capabilities: capabilities,
                 mapper: mapper,
                 model: opened.currentModelId ?? request.model,
-                mainModelSelection: opened.appliedMainModelId,
-                reasoningEffort: seededEffort,
+                mainModelSelection: request.model.trimmingCharacters(in: .whitespacesAndNewlines) == "auto"
+                    ? "auto" : opened.appliedMainModelId,
+                reasoningEffort: request.model.trimmingCharacters(in: .whitespacesAndNewlines) == "auto"
+                    ? (opened.appliedMainEffortSelection?.effort ?? seededEffort) : seededEffort,
                 mainEffortSelection: opened.appliedMainEffortSelection,
-                reasoningModel: capabilities.sessionWorkerModel ? request.reasoningModel : nil,
+                reasoningModel: capabilities.sessionWorkerModel && request.model.trimmingCharacters(in: .whitespacesAndNewlines) != "auto"
+                    ? request.reasoningModel : nil,
                 reasoningModelEffortSelection: opened.appliedReasoningModelEffortSelection,
                 advertisesReasoningEffortConfig: opened.advertisesReasoningEffortConfig,
                 advertisedEfforts: advertisedEfforts,
@@ -1359,7 +1388,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 ?? .automatic
             let reasoningEffortChanged = normalizedReasoningModel != nil
                 && currentReasoningEffortSelection != requestedReasoningEffortSelection
-            let reasoningModelChanged = session.capabilities.sessionWorkerModel
+            let reasoningModelChanged = model != "auto" && session.capabilities.sessionWorkerModel
                 && (currentReasoningModel != normalizedReasoningModel || reasoningEffortChanged)
             let confirmedCurrentMainModel = currentMainModelSelection ?? currentModel
             let mainModelChanged = !model.isEmpty && model != confirmedCurrentMainModel
@@ -1406,7 +1435,39 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     session.reasoningModelEffortSelection = appliedEffortSelection
                 }
             }
-            if request.distillMainEffortSelection == nil {
+            if model == "auto" {
+                // First let Distill select the route, then validate its concrete catalog's effort.
+                if mainModelChanged {
+                    let applied = try await session.client.setModel(sessionId: session.providerThreadId, modelId: "auto")
+                    guard applied.canonicalModelId == "auto" else {
+                        throw AgentProviderAdapterError.unsupported("Distill did not confirm Auto routing; prompt was not sent")
+                    }
+                    synchronized {
+                        session.model = applied.activeModelId
+                        session.mainModelSelection = "auto"
+                        session.reasoningEffort = applied.effort
+                        session.mainEffortSelection = nil
+                    }
+                }
+                let selection = request.distillMainEffortSelection ?? requestedMainEffort.map { AgentEffortSelection.fixed($0) }
+                if let selection, selection != synchronized({ session.mainEffortSelection }) {
+                    let applied = try await session.client.setModel(
+                        sessionId: session.providerThreadId, modelId: "auto",
+                        reasoningEffort: selection.effort, reasoningEffortAuto: selection.isAutomatic,
+                        advertisedEfforts: session.catalogEfforts(for: synchronized { session.model })
+                    )
+                    guard applied.canonicalModelId == "auto", applied.isAutomatic == selection.isAutomatic,
+                          selection.effort == nil || applied.effort == selection.effort else {
+                        throw AgentProviderAdapterError.unsupported("Distill did not confirm Auto Main effort; prompt was not sent")
+                    }
+                    synchronized {
+                        session.model = applied.activeModelId
+                        session.mainModelSelection = "auto"
+                        session.reasoningEffort = applied.effort
+                        session.mainEffortSelection = selection
+                    }
+                }
+            } else if request.distillMainEffortSelection == nil {
                 switch DistillACPClient.modelEffortBind(
                     requestModel: request.model,
                     sessionModel: session.model,
@@ -1561,7 +1622,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                                     let release = session.heldThreadStarted
                                     session.holdsThreadStartedUntilPromptAccepted = false
                                     session.heldThreadStarted = false
-                                    let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    let requestedModel = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    let model = requestedModel == "auto" ? session.model : requestedModel
                                     let report = !model.isEmpty && session.reportedAcceptedModel != model
                                     if report { session.reportedAcceptedModel = model }
                                     return (release, report ? model : nil)

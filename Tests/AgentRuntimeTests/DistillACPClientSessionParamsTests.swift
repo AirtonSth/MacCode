@@ -4,6 +4,33 @@ import CoreModel
 import Persistence
 
 final class DistillACPClientSessionParamsTests: XCTestCase {
+    func test_autoLogicalModelPassesThroughLocalAndGuestLaunchAndSessionMetadata() throws {
+        let request = AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "auto", cwd: "/tmp", prompt: "Go", reasoningEffort: .low)
+        let expected = ["agent", "--model", "auto", "--reasoning-effort", "low", "--no-leader", "stdio"]
+        XCTAssertEqual(try DistillACPClient.launchArguments(for: request), expected)
+        XCTAssertEqual(try DistillGuestLaunchPlan.guestCommand(binaryPath: "/guest/distill", for: request),
+                       ["/guest/distill", "--no-auto-update"] + expected)
+        let headless = DistillRunner.buildArgs(request)
+        let modelIndex = try XCTUnwrap(headless.firstIndex(of: "--model"))
+        XCTAssertEqual(headless[modelIndex + 1], "auto")
+        let effortIndex = try XCTUnwrap(headless.firstIndex(of: "--reasoning-effort"))
+        XCTAssertEqual(headless[effortIndex + 1], "low")
+        let params = DistillACPClient.sessionOpenParams(cwd: "/tmp", mcpServers: [], modelId: "auto", reasoningEffort: .low)
+        XCTAssertEqual((params["_meta"] as? [String: Any])?["modelId"] as? String, "auto")
+        XCTAssertEqual((params["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "low")
+    }
+
+    func test_accountProviderIsCopiedOnlyFromTrustedACPMetadata() {
+        let models = DistillACPClient.modelDescriptors(from: ["availableModels": [
+            ["modelId": "unrelated-name", "_meta": ["accountProvider": "chatgpt"]],
+            ["modelId": "chatgpt/untrusted", "_meta": ["accountProvider": "unknown"]],
+            ["modelId": "claude/without-authority"],
+        ]])
+        XCTAssertEqual(models[0].accountProvider, "chatgpt")
+        XCTAssertNil(models[1].accountProvider)
+        XCTAssertNil(models[2].accountProvider)
+    }
+
     func test_sessionNewUsesDistillMetaModelAndReasoningEffortWireFields() {
         let params = DistillACPClient.sessionOpenParams(
             cwd: "/tmp",

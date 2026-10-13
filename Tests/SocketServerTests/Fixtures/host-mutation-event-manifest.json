@@ -109,6 +109,11 @@
     {"method": "distill.accounts.login", "family": "agent-execution", "risk": "lowMutation", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
     {"method": "distill.accounts.logout", "family": "agent-execution", "risk": "destructive", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
     {"method": "distill.accounts.cancel", "family": "agent-execution", "risk": "lowMutation", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
+    {"method": "distill.accounts.add", "family": "agent-execution", "risk": "lowMutation", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
+    {"method": "distill.accounts.rename", "family": "agent-execution", "risk": "lowMutation", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
+    {"method": "distill.accounts.remove", "family": "agent-execution", "risk": "destructive", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
+    {"method": "distill.accounts.usage", "family": "agent-execution", "risk": "lowMutation", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
+    {"method": "distill.accounts.routing.set", "family": "agent-execution", "risk": "lowMutation", "eventKinds": [], "readbackMethods": ["distill.accounts.list"]},
 
     {"method": "fs.workspace.create_file", "family": "files", "risk": "lowMutation", "eventKinds": ["fs.workspace.changed"], "readbackMethods": ["fs.workspace.list", "fs.workspace.read"]},
     {"method": "fs.workspace.delete", "family": "files", "risk": "destructive", "eventKinds": ["fs.workspace.changed"], "readbackMethods": ["fs.workspace.list"]},
