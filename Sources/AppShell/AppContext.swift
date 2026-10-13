@@ -167,6 +167,9 @@ public final class AppContext {
     public let botGuestLaunchBarrier = DistillGuestLaunchBarrier()
     /// Decides and prepares in-guest Distill runs; quit ends the ones it owns.
     private(set) var botGuestRunResolver: BotGuestRunResolver?
+    /// The Distill update schedule (`startDistillAutoUpdates`); nil in a
+    /// process that must not touch the user's Distill.
+    var distillAutoUpdates: Task<Void, Never>?
     /// One per app so every bot shares the guest distill cache and its downloads.
     public lazy var distillGuestBinaries = DistillGuestBinaryProvisioner(
         guestToolsRoot: BotComputerGuestSpec.guestToolsURL(appSupport: appSupportDirectory)

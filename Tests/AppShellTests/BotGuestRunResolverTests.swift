@@ -1018,6 +1018,23 @@ final class BotGuestRunResolverTests: XCTestCase {
         await plan.finish(.completed).value
     }
 
+    func test_launchSweep_trimsTheGuestDistillCacheBeforeAdmittingGuestRuns() async throws {
+        // WHY: the cache trim deletes old guest builds. A run admitted before
+        // it finished could be handed the path of a build the trim then
+        // deletes, so the barrier must open only after it.
+        let appSupport = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-launch-trim-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let barrier = DistillGuestLaunchBarrier()
+        let trimmed = Recorder<Bool>()
+        BotGuestLaunchSweep.run(docker: nil, appSupport: appSupport, botIDs: [], barrier: barrier, beforeOpening: {
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            trimmed.append(true)
+        })
+        try await barrier.wait()
+        XCTAssertEqual(trimmed.values, [true], "guest runs were admitted before the cache trim finished")
+    }
+
     func test_quit_endsALiveGuestRun_deletesItsSignInCopyEnvFileAndLease_andNothingIsCopiedAgain() async throws {
         // WHY: after quit nothing renews the sign-in copies or the lease; the
         // agent must not keep running with the user's accounts, and the copies

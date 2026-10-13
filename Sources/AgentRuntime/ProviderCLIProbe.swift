@@ -273,10 +273,38 @@ public enum ProviderCLIProbe {
         case .codex, .claude, .grok, .distill:
             arguments = ["update"]
         }
+        let binaryPath = provider == .distill ? distillUpdateBinary(binaryPath) : binaryPath
         guard let result = run(binaryPath: binaryPath, arguments: arguments, environment: environment, timeoutSeconds: timeoutSeconds, retention: .suffix) else {
             return UpdateResult(ok: false, status: -1, stdout: "", stderr: "provider update command failed to start or timed out")
         }
         return UpdateResult(ok: result.status == 0, status: result.status, stdout: result.renderedStdout, stderr: result.renderedStderr)
+    }
+
+    /// `distill update --check --json`: asks whether a newer release exists and
+    /// installs nothing. nil when the command did not start or timed out.
+    public static func distillUpdateCheck(
+        binaryPath: String, environment: [String: String] = [:], timeoutSeconds: TimeInterval = 15.0
+    ) -> (status: Int32, stdout: String)? {
+        run(
+            binaryPath: distillUpdateBinary(binaryPath), arguments: ["update", "--check", "--json"],
+            environment: environment, timeoutSeconds: timeoutSeconds
+        ).map { ($0.status, $0.stdout) }
+    }
+
+    /// The path to run `distill update` through. Distill finds its release
+    /// install from the path it was started with (`<root>/bin|downloads/<file>`
+    /// beside `<root>/.distill-release`) and does not follow symlinks, so a
+    /// release reached through a symlink elsewhere reports itself as not
+    /// managed: the check asks nothing and `update` exits 0 without installing.
+    static func distillUpdateBinary(_ binaryPath: String) -> String {
+        func inReleaseInstall(_ url: URL) -> Bool {
+            FileManager.default.fileExists(atPath: url.deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent(".distill-release").path)
+        }
+        let invoked = URL(fileURLWithPath: binaryPath)
+        guard !inReleaseInstall(invoked) else { return binaryPath }
+        let resolved = invoked.resolvingSymlinksInPath()
+        return inReleaseInstall(resolved) ? resolved.path : binaryPath
     }
 
     static func run(

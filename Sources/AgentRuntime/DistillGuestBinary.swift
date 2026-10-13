@@ -64,7 +64,8 @@ public enum DistillGuestBinaryError: LocalizedError, Equatable {
 /// A verified Linux distill binary cached on the host, and where the guest sees it.
 public struct DistillGuestBinary: Equatable, Sendable {
     public let version: DistillVersion
-    /// The version this run wanted. Differs from `version` only while that one downloads.
+    /// The version this run wanted. Differs from `version` only when that one
+    /// could not be downloaded in time.
     public let requestedVersion: DistillVersion
     public let assetName: String
     public let hostURL: URL
@@ -84,6 +85,13 @@ public actor DistillGuestBinaryProvisioner {
     public static let minimumVersion = DistillVersion(2, 0, 31)
     public static let releaseBaseURL = "https://github.com/samuelfaj/distill/releases/download"
     public static let versionProbeTimeout: TimeInterval = 5
+    /// How long guest runs wait for their version to download before they run
+    /// an older cached one. The asset is ~224 MB: two minutes covers a line of
+    /// about 15 Mbit/s, and the run shows "preparing the agent" meanwhile. The
+    /// bound is per download, counted from the first run that waits on it:
+    /// on a slower line later runs fall back at once instead of each waiting
+    /// two minutes, and get the new version once the download lands.
+    public static let downloadWaitBound: TimeInterval = 120
 
     /// Writes the body of `url` to `destination`; throws on a non-2xx response.
     public typealias Fetch = @Sendable (_ url: URL, _ destination: URL) async throws -> Void
@@ -99,18 +107,23 @@ public actor DistillGuestBinaryProvisioner {
     private let root: URL
     private let fetch: Fetch
     private let versionProbe: VersionProbe
+    private let downloadWait: TimeInterval
     private var hostVersions: [FileStamp: DistillVersion] = [:]
     private var verified: [FileStamp: String] = [:]
     private var inflight: [String: Task<DistillGuestBinary, Error>] = [:]
+    /// When the runs waiting on an in-flight download stop waiting, by download key.
+    private var waitDeadlines: [String: Date] = [:]
 
     public init(
         guestToolsRoot: URL,
         fetch: @escaping Fetch = DistillGuestBinaryProvisioner.urlSessionFetch,
-        versionProbe: @escaping VersionProbe = DistillGuestBinaryProvisioner.processVersionProbe
+        versionProbe: @escaping VersionProbe = DistillGuestBinaryProvisioner.processVersionProbe,
+        downloadWait: TimeInterval = DistillGuestBinaryProvisioner.downloadWaitBound
     ) {
         self.root = guestToolsRoot
         self.fetch = fetch
         self.versionProbe = versionProbe
+        self.downloadWait = downloadWait
     }
 
     // MARK: Pure policy
@@ -174,8 +187,13 @@ public actor DistillGuestBinaryProvisioner {
     }
 
     /// The binary a guest run launches. When the wanted version is not cached
-    /// yet, its download starts and a cached older version at or above the
-    /// minimum is used meanwhile; with none cached, waits for the download.
+    /// yet, the run waits for its download, so a bot does not run an outdated
+    /// distill right after a host update. Only when the download fails or
+    /// outlasts `downloadWait` (counted once per download, from the first run
+    /// that waits on it; a prefetch nobody waited for is not counted) is a
+    /// cached older version at or above the minimum used; with none cached,
+    /// the run keeps waiting or fails.
+    /// The download is shared: neither the bound nor a stopped run cancels it.
     public func resolve(hostBinary: String?, dockerArch: String) async throws -> DistillGuestBinary {
         let asset = try Self.assetName(dockerArch: dockerArch)
         var host: DistillVersion?
@@ -185,10 +203,48 @@ public actor DistillGuestBinaryProvisioner {
             return cached
         }
         let download = startDownload(version: wanted, asset: asset)
+        let key = Self.downloadKey(version: wanted, asset: asset)
+        let deadline = waitDeadlines[key] ?? Date().addingTimeInterval(downloadWait)
+        waitDeadlines[key] = deadline
+        let outcome = await Self.outcome(of: download, within: deadline.timeIntervalSinceNow)
+        try Task.checkCancellation()
+        let reason: String
+        switch outcome {
+        case .success(let binary)?: return binary
+        case .failure(let error)?: reason = "its download failed: \(error.localizedDescription)"
+        case nil: reason = "its download outlasted the \(Int(downloadWait)) s wait and continues"
+        }
         if let fallback = await newestCachedBinary(asset: asset, excluding: wanted, requested: wanted) {
+            NSLog("distill guest binary: the bot runs the older distill \(fallback.version) instead of \(wanted): \(reason)")
             return fallback
         }
-        return try await download.value
+        if case .failure(let error)? = outcome { throw error }
+        // Without a bound the wait ends early only when the run is stopped.
+        guard let late = await Self.outcome(of: download, within: nil) else { throw CancellationError() }
+        return try late.get()
+    }
+
+    /// The result of `download`, or nil when `seconds` pass first or the
+    /// waiting task is cancelled. `download` itself is never cancelled.
+    private static func outcome(
+        of download: Task<DistillGuestBinary, Error>, within seconds: TimeInterval?
+    ) async -> Result<DistillGuestBinary, Error>? {
+        let (results, signal) = AsyncStream<Result<DistillGuestBinary, Error>>.makeStream()
+        Task {
+            signal.yield(await download.result)
+            signal.finish()
+        }
+        let deadline = seconds.map { seconds in
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                signal.finish()
+            }
+        }
+        var outcome: Result<DistillGuestBinary, Error>?
+        // Ends when the download does, at the deadline, or when the run is stopped.
+        for await result in results { outcome = result }
+        deadline?.cancel()
+        return outcome
     }
 
     /// Downloads `version` if it is not cached; returns the cached or new binary.
@@ -213,6 +269,21 @@ public actor DistillGuestBinaryProvisioner {
         }
     }
 
+    /// The Docker architectures with a cached guest build, of any version:
+    /// the ones this Mac's bot VMs run, known without asking Docker.
+    public func cachedArchitectures() -> [String] {
+        let prefix = "distill-linux-"
+        var found = Set<String>()
+        for directory in cachedVersionDirectories().values {
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+            for file in files where file.hasPrefix(prefix) {
+                let arch = String(file.dropFirst(prefix.count))
+                if (try? Self.assetName(dockerArch: arch)) == file { found.insert(arch) }
+            }
+        }
+        return found.sorted()
+    }
+
     /// Keeps `current` and the newest older version; removes other cached
     /// versions and abandoned partial downloads. Must not run while a guest
     /// may be executing a removed version.
@@ -226,6 +297,14 @@ public actor DistillGuestBinaryProvisioner {
         if inflight.isEmpty {
             try? fm.removeItem(at: partialDirectory)
         }
+    }
+
+    /// The launch trim for the host's current version. An unreadable host
+    /// version removes nothing: `guestVersion(host: nil)` is the minimum, and
+    /// collecting for it would delete every newer build, the fallbacks included.
+    public func collectGarbage(hostBinary: String) async {
+        guard let host = await hostVersion(binary: hostBinary) else { return }
+        collectGarbage(current: Self.guestVersion(host: host))
     }
 
     // MARK: Cache
@@ -293,8 +372,12 @@ public actor DistillGuestBinaryProvisioner {
 
     // MARK: Download
 
+    private static func downloadKey(version: DistillVersion, asset: String) -> String {
+        "\(version)/\(asset)"
+    }
+
     private func startDownload(version: DistillVersion, asset: String) -> Task<DistillGuestBinary, Error> {
-        let key = "\(version)/\(asset)"
+        let key = Self.downloadKey(version: version, asset: asset)
         if let running = inflight[key] { return running }
         let task = Task { [fetch, root] () throws -> DistillGuestBinary in
             do {
@@ -311,10 +394,12 @@ public actor DistillGuestBinaryProvisioner {
 
     private func finishDownload(key: String) {
         inflight[key] = nil
+        waitDeadlines[key] = nil
     }
 
     private func finishDownload(key: String, version: DistillVersion, asset: String, url: URL, hex: String) -> DistillGuestBinary {
         inflight[key] = nil
+        waitDeadlines[key] = nil
         if let stamp = Self.stamp(path: url.path) { verified[stamp] = hex }
         return binary(version: version, asset: asset, requested: version, url: url)
     }

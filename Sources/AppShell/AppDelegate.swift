@@ -430,6 +430,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         startDiagnosticsHeartbeat()
         logDiagnosticsHeartbeat(reason: "launch")
         checkForUpdatesAfterOpeningApp()
+        // Only schedules: the first Distill update check runs off the main
+        // actor, well after this frame.
+        context?.startDistillAutoUpdates()
 
         // PERF (cold launch): the first frame has now painted (show() above), so
         // the "Restoring workspaces..." affordance can animate while the heavy,
@@ -640,6 +643,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         logDiagnosticsHeartbeat(reason: "will_terminate")
         stopInProcessScheduledTaskScheduler()
         removeScheduledTaskStoreObserver()
+        context?.stopDistillAutoUpdates()
         disableInsomniaForAppClose()
         // Token Saver was removed, so quit only purges what older builds
         // installed (and reinstalls the always-on routing); it never installs

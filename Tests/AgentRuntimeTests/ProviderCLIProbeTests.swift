@@ -188,6 +188,79 @@ final class ProviderCLIProbeTests: XCTestCase {
                        "provider update actions must execute the provider-native update command with the selected instance environment")
     }
 
+    /// The automatic Distill updater decides from this output alone, so the
+    /// probe must ask the check (never plain `update`, which installs), keep
+    /// stderr out of the JSON, report the exit status, and give nothing back
+    /// for a check that hangs instead of holding the updater.
+    func test_distillUpdateCheckRunsTheCheckOnlyAndReturnsItsStdoutAndStatus() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let binary = dir.appendingPathComponent("distill")
+        try """
+        #!/bin/sh
+        if [ "$*" = "update --check --json" ] && [ "$DISTILL_HOME" = "\(dir.path)" ]; then
+          if [ "$RC_TEST_HANG" = "1" ]; then sleep 5; fi
+          printf 'progress noise\\n' >&2
+          printf '{"updateAvailable":false}\\n'
+          exit 3
+        fi
+        printf 'installed\\n'
+        exit 0
+        """.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let result = try XCTUnwrap(ProviderCLIProbe.distillUpdateCheck(
+            binaryPath: binary.path, environment: ["DISTILL_HOME": dir.path]
+        ))
+        XCTAssertEqual(result.stdout, "{\"updateAvailable\":false}\n")
+        XCTAssertEqual(result.status, 3)
+        XCTAssertNil(ProviderCLIProbe.distillUpdateCheck(
+            binaryPath: binary.path, environment: ["DISTILL_HOME": dir.path, "RC_TEST_HANG": "1"], timeoutSeconds: 0.2
+        ))
+        XCTAssertNil(ProviderCLIProbe.distillUpdateCheck(binaryPath: dir.appendingPathComponent("missing").path))
+    }
+
+    /// Distill refuses to update when started through a symlink outside its
+    /// release install: the check asks nothing and `update` exits 0 without
+    /// installing, so the app would stay on an old release while reporting
+    /// success. Both commands must run through the install the symlink leads
+    /// to; the default layout and a source build are run as they were given.
+    func test_distillUpdateRunsThroughTheReleaseInstallASymlinkLeadsTo() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: dir) }
+        let root = dir.appendingPathComponent("root", isDirectory: true)
+        for sub in ["root/bin", "root/downloads", "elsewhere", "source"] {
+            try fm.createDirectory(at: dir.appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        try Data("samuelfaj/distill\n".utf8).write(to: root.appendingPathComponent(".distill-release"))
+        let script = "#!/bin/sh\nprintf '%s\\n' \"$0\"\n"
+        let release = root.appendingPathComponent("downloads/distill-x")
+        let sourceBuild = dir.appendingPathComponent("source/distill")
+        for file in [release, sourceBuild] {
+            try script.write(to: file, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        }
+        let managed = root.appendingPathComponent("bin/distill")
+        try fm.createSymbolicLink(atPath: managed.path, withDestinationPath: "../downloads/distill-x")
+        let outside = dir.appendingPathComponent("elsewhere/distill")
+        try fm.createSymbolicLink(atPath: outside.path, withDestinationPath: managed.path)
+
+        func checked(_ path: String) -> String? {
+            ProviderCLIProbe.distillUpdateCheck(binaryPath: path)?.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        func updated(_ path: String) -> String {
+            ProviderCLIProbe.update(provider: .distill, binaryPath: path).stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let inInstall = release.resolvingSymlinksInPath().path
+        XCTAssertEqual(checked(outside.path), inInstall)
+        XCTAssertEqual(updated(outside.path), inInstall)
+        XCTAssertEqual(checked(managed.path), managed.path)
+        XCTAssertEqual(updated(managed.path), managed.path)
+        XCTAssertEqual(checked(sourceBuild.path), sourceBuild.path)
+        XCTAssertEqual(updated(sourceBuild.path), sourceBuild.path)
+    }
+
     func test_failingUpdatePreservesTerminalStderrDiagnosticAndVisibleTruncationNotice() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

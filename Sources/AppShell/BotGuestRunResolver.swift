@@ -708,6 +708,11 @@ extension AppContext {
             // Unit tests never reach the user's Docker daemon.
             let sweepDocker: (any BotComputerDockerClienting)? = AppContext.isRunningUnitTests ? nil : docker
             let store = botStore
+            // Unit tests never run the user's Distill.
+            let trimGuestCache: @Sendable () async -> Void = AppContext.isRunningUnitTests ? {} : {
+                guard let host = DistillProvisioner.resolveInstalledBinary(override: distillOverride) else { return }
+                await binaries.collectGarbage(hostBinary: host)
+            }
             DispatchQueue.global(qos: .utility).async {
                 var botIDs: [BotID] = []
                 if sweepDocker != nil {
@@ -722,7 +727,8 @@ extension AppContext {
                     }
                 }
                 BotGuestLaunchSweep.run(
-                    docker: sweepDocker, appSupport: appSupport, botIDs: botIDs, barrier: barrier
+                    docker: sweepDocker, appSupport: appSupport, botIDs: botIDs, barrier: barrier,
+                    beforeOpening: trimGuestCache
                 )
             }
         }
@@ -781,16 +787,22 @@ enum BotGuestLaunchSweep {
     /// copies, env files, leases), then opens `barrier`, so no guest run
     /// starts before its bot's leftovers are gone and the cleanup never
     /// touches a new run (whose tools run under `bash -lc` too).
-    /// `docker` nil skips the in-guest step.
+    /// `docker` nil skips the in-guest step. `beforeOpening` trims the guest
+    /// distill cache after the leftovers are ended and before `barrier`
+    /// opens, the only moment no guest executes a cached build.
     static func run(
         docker: (any BotComputerDockerClienting)?,
         appSupport: URL,
         botIDs: [BotID],
-        barrier: DistillGuestLaunchBarrier
+        barrier: DistillGuestLaunchBarrier,
+        beforeOpening: @escaping @Sendable () async -> Void = {}
     ) {
         if let docker { endLeftoverRuns(docker: docker, appSupport: appSupport, botIDs: botIDs) }
         removeLeftovers(appSupport: appSupport)
-        Task { await barrier.open() }
+        Task {
+            await beforeOpening()
+            await barrier.open()
+        }
     }
 
     /// Ends what a previous session of this app left running in the

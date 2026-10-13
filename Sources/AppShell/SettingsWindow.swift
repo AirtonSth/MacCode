@@ -1008,6 +1008,10 @@ public final class SettingsViewModel: ObservableObject {
                 let detail = stderr.isEmpty ? stdout : stderr
                 providerUpdateMessages[provider] = detail.isEmpty ? "Update failed with status \(status)." : "Update failed with status \(status): \(detail)"
             }
+        } catch let error as JSONRPCError where error.code == AppCommandRouter.providerUpdateAlreadyRunningCode {
+            // The automatic Distill update (or another surface) holds the
+            // update lock: an update is in progress, not failed.
+            providerUpdateMessages[provider] = "\(providerDisplayName(provider)) is already updating."
         } catch {
             providerUpdateMessages[provider] = "Update failed: \(error)"
         }

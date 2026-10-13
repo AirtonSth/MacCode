@@ -8010,24 +8010,51 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return Array(Set(names)).sorted()
     }
 
-    public func updateAgentProvider(provider: AgentProvider, providerInstanceId: String?) async throws -> JSONValue {
-        let binary = providerBinary(provider: provider, instanceId: providerInstanceId) ?? provider.rawValue
+    /// `updateAgentProvider` fails with this code while the same update runs.
+    static let providerUpdateAlreadyRunningCode = -32041
+
+    /// The binary and environment `updateAgentProvider` updates; nil when the
+    /// CLI is not installed.
+    func providerUpdateTarget(
+        provider: AgentProvider, instanceId: String?
+    ) -> (binaryPath: String, environment: [String: String])? {
+        let binary = providerBinary(provider: provider, instanceId: instanceId) ?? provider.rawValue
         let binaryPath = (provider == .distill
             ? ProcessLocator.resolveDistillAgent(binary)
             : ProcessLocator.resolve(binary)) ?? ""
-        guard !binaryPath.isEmpty else {
+        guard !binaryPath.isEmpty else { return nil }
+        return (binaryPath, providerEnvironment(provider: provider, instanceId: instanceId))
+    }
+
+    public func updateAgentProvider(provider: AgentProvider, providerInstanceId: String?) async throws -> JSONValue {
+        try await updateAgentProvider(
+            provider: provider, providerInstanceId: providerInstanceId, timeoutSeconds: 120, announcesFailure: true
+        )
+    }
+
+    /// `timeoutSeconds` bounds the provider's `update` process; its tree is
+    /// killed on expiry. `announcesFailure` false returns a failed update
+    /// without publishing it: the event raises a "Provider update failed"
+    /// alert, which is for an update the user asked for.
+    func updateAgentProvider(
+        provider: AgentProvider, providerInstanceId: String?, timeoutSeconds: TimeInterval, announcesFailure: Bool
+    ) async throws -> JSONValue {
+        guard let (binaryPath, env) = providerUpdateTarget(provider: provider, instanceId: providerInstanceId) else {
             throw JSONRPCError(code: -32040, message: "\(provider.rawValue) CLI binary is unavailable.")
         }
-        let env = providerEnvironment(provider: provider, instanceId: providerInstanceId)
         let key = ProviderProbeCacheKey(provider: provider, binaryPath: binaryPath, environment: env)
         guard !providerUpdateLocks.contains(key) else {
-            throw JSONRPCError(code: -32041, message: "\(provider.rawValue) update is already running.")
+            throw JSONRPCError(
+                code: Self.providerUpdateAlreadyRunningCode, message: "\(provider.rawValue) update is already running."
+            )
         }
         providerUpdateLocks.insert(key)
         defer { providerUpdateLocks.remove(key) }
 
         let result = await ProviderCLIProbe.runOffCooperativePool {
-            ProviderCLIProbe.update(provider: provider, binaryPath: binaryPath, environment: env)
+            ProviderCLIProbe.update(
+                provider: provider, binaryPath: binaryPath, environment: env, timeoutSeconds: timeoutSeconds
+            )
         }
         providerProbeCache.removeValue(forKey: key)
         let response = JSONValue.object([
@@ -8039,11 +8066,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "stdout": .string(result.stdout),
             "stderr": .string(result.stderr)
         ])
-        EventBus.shared.publish(kind: .agentProviderUpdated, payload: .object([
-            "provider": .string(provider.rawValue),
-            "ok": .bool(result.ok),
-            "status": .number(Double(result.status))
-        ]))
+        if result.ok || announcesFailure {
+            EventBus.shared.publish(kind: .agentProviderUpdated, payload: .object([
+                "provider": .string(provider.rawValue),
+                "ok": .bool(result.ok),
+                "status": .number(Double(result.status))
+            ]))
+        }
         return response
     }
 

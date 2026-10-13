@@ -233,6 +233,22 @@ extension AppCommandRouter {
         }
     }
 
+    /// After a host update: starts the guest download for every architecture
+    /// this Mac's bot VMs already run, whether or not Docker is up. A Mac that
+    /// never ran a bot VM downloads nothing; its first VM is covered by
+    /// `guestDistillPrefetch` when Docker comes up.
+    func guestDistillFollowHostUpdate() -> @Sendable () async -> Void {
+        guard let ctx = context else { return {} }
+        let provisioner = ctx.distillGuestBinaries
+        let override = (try? ctx.settingsRepo.get("cli.distill.path")) ?? nil
+        return {
+            guard let host = DistillProvisioner.resolveInstalledBinary(override: override) else { return }
+            for arch in await provisioner.cachedArchitectures() {
+                provisioner.prefetch(hostBinary: host, dockerArch: arch)
+            }
+        }
+    }
+
     /// nil on success; otherwise the user-facing failure.
     func provisionBotVM(_ botID: BotID) async -> String? {
         guard let appSupport = context?.appSupportDirectory else { return "Contexto indisponível." }
