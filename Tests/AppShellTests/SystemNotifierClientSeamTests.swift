@@ -1,3 +1,4 @@
+import Persistence
 import XCTest
 import UserNotifications
 @testable import AppShell
@@ -12,6 +13,7 @@ final class FakeNotificationCenterClient: NotificationCenterClient, @unchecked S
     private var _addedRequests: [UNNotificationRequest] = []
     private var _authorizationGranted: Bool
     private var _authorizationCallCount = 0
+    var addCompletionExpectation: XCTestExpectation?
 
     var addedRequests: [UNNotificationRequest] {
         lock.lock(); defer { lock.unlock() }; return _addedRequests
@@ -27,6 +29,7 @@ final class FakeNotificationCenterClient: NotificationCenterClient, @unchecked S
     func add(_ request: UNNotificationRequest, withCompletionHandler: ((Error?) -> Void)?) {
         lock.lock(); _addedRequests.append(request); lock.unlock()
         withCompletionHandler?(nil)
+        addCompletionExpectation?.fulfill()
     }
     func setDelegate(_ delegate: UNUserNotificationCenterDelegate?) {}
     func setNotificationCategories(_ categories: Set<UNNotificationCategory>) {}
@@ -115,6 +118,142 @@ final class SystemNotifierClientSeamTests: XCTestCase {
         XCTAssertEqual(fake.authorizationCallCount, 1,
             "requestAuthorization must route through the injected NotificationCenterClient " +
             "so the call is observable and testable without a bundled .app")
+    }
+
+    func test_threeWorkspaceOutcomesProduceOneGroupedRequestWithAllRunIDs() {
+        let fake = FakeNotificationCenterClient()
+        let added = expectation(description: "grouped request added")
+        fake.addCompletionExpectation = added
+        let scheduled = expectation(description: "group window scheduled")
+        var flush: (() -> Void)?
+        let notifier = SystemNotifier(notificationCenterClient: fake, allowsNotificationCenterForTesting: true) { delay, action in
+            XCTAssertEqual(delay, 5)
+            flush = action
+            scheduled.fulfill()
+        }
+        notifier.setAuthorizedForTesting(true)
+        for runId in ["run-1", "run-2", "run-3"] {
+            let outcome = RemoteCodeNotificationContent.threadOutcome(
+                threadId: "thread-\(runId)", runId: runId, workspaceId: "workspace-1",
+                title: "private title", phase: .completed)!
+            notifier.postOutcomeGrouped(outcome, workspaceId: "workspace-1", settings: AppSettings())
+        }
+        wait(for: [scheduled], timeout: 1)
+        flush?()
+        wait(for: [added], timeout: 1)
+        XCTAssertEqual(fake.addedRequests.count, 1)
+        XCTAssertEqual(fake.addedRequests.first?.content.title, "3 runs completed")
+        XCTAssertEqual(fake.addedRequests.first?.content.userInfo["runIds"] as? String, "run-1,run-2,run-3")
+        XCTAssertEqual(fake.addedRequests.first?.content.userInfo["workspaceId"] as? String, "workspace-1")
+        XCTAssertFalse(fake.addedRequests.first?.content.body.contains("private title") ?? true)
+    }
+
+    func test_duplicateOutcomeInSameBatchCountsOnce() {
+        let fake = FakeNotificationCenterClient()
+        let added = expectation(description: "grouped request added")
+        fake.addCompletionExpectation = added
+        let scheduled = expectation(description: "group window scheduled")
+        var flush: (() -> Void)?
+        let notifier = SystemNotifier(notificationCenterClient: fake, allowsNotificationCenterForTesting: true) { _, action in
+            flush = action
+            scheduled.fulfill()
+        }
+        notifier.setAuthorizedForTesting(true)
+        let duplicate = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-run-1", runId: "run-1", workspaceId: "workspace-1",
+            title: nil, phase: .completed)!
+        notifier.postOutcomeGrouped(duplicate, workspaceId: "workspace-1", settings: AppSettings())
+        notifier.postOutcomeGrouped(duplicate, workspaceId: "workspace-1", settings: AppSettings())
+        let second = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-run-2", runId: "run-2", workspaceId: "workspace-1",
+            title: nil, phase: .completed)!
+        notifier.postOutcomeGrouped(second, workspaceId: "workspace-1", settings: AppSettings())
+        wait(for: [scheduled], timeout: 1)
+        flush?()
+        wait(for: [added], timeout: 1)
+
+        XCTAssertEqual(fake.addedRequests.count, 1)
+        XCTAssertEqual(fake.addedRequests.first?.content.title, "2 runs completed")
+        XCTAssertEqual(fake.addedRequests.first?.content.userInfo["runIds"] as? String, "run-1,run-2")
+    }
+
+    func test_replayedOutcomeAfterFlushDoesNotNotifyAgain() {
+        let fake = FakeNotificationCenterClient()
+        let firstAdded = expectation(description: "first request added")
+        fake.addCompletionExpectation = firstAdded
+        let scheduled = expectation(description: "first group window scheduled")
+        let replayProcessed = expectation(description: "replay processed before next occurrence")
+        var flushes: [() -> Void] = []
+        let notifier = SystemNotifier(notificationCenterClient: fake, allowsNotificationCenterForTesting: true) { _, action in
+            flushes.append(action)
+            if flushes.count == 1 { scheduled.fulfill() }
+            if flushes.count == 2 { replayProcessed.fulfill() }
+        }
+        notifier.setAuthorizedForTesting(true)
+        let outcome = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-run-1", runId: "run-1", workspaceId: "workspace-1",
+            title: nil, phase: .completed)!
+        notifier.postOutcomeGrouped(outcome, workspaceId: "workspace-1", settings: AppSettings())
+        wait(for: [scheduled], timeout: 1)
+        flushes[0]()
+        wait(for: [firstAdded], timeout: 1)
+
+        let secondAdded = expectation(description: "distinct request added")
+        fake.addCompletionExpectation = secondAdded
+        notifier.postOutcomeGrouped(outcome, workspaceId: "workspace-1", settings: AppSettings())
+        let distinctOutcome = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-run-2", runId: "run-2", workspaceId: "workspace-1",
+            title: nil, phase: .completed)!
+        notifier.postOutcomeGrouped(distinctOutcome, workspaceId: "workspace-1", settings: AppSettings())
+        wait(for: [replayProcessed], timeout: 1)
+        flushes[1]()
+        wait(for: [secondAdded], timeout: 1)
+        XCTAssertEqual(fake.addedRequests.count, 2)
+        XCTAssertEqual(fake.addedRequests.map(\.identifier), ["run.run-1.completed", "run.run-2.completed"])
+    }
+
+    func test_mixedOutcomesRemoteGroupContainsOnlyEligibleIDsAndDedupes() {
+        let fake = FakeNotificationCenterClient()
+        let localAdded = expectation(description: "local grouped request added")
+        fake.addCompletionExpectation = localAdded
+        let scheduled = expectation(description: "group window scheduled")
+        let remoteDelivered = expectation(description: "eligible remote group delivered")
+        var flush: (() -> Void)?
+        var remoteGroups: [RemoteCodeNotificationContent] = []
+        let notifier = SystemNotifier(notificationCenterClient: fake, allowsNotificationCenterForTesting: true) { _, action in
+            flush = action
+            scheduled.fulfill()
+        }
+        notifier.setAuthorizedForTesting(true)
+        let localOnly = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-local", runId: "local", workspaceId: "workspace-1",
+            title: nil, phase: .completed)!
+        let eligible = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-remote", runId: "remote", workspaceId: "workspace-1",
+            title: nil, phase: .completed)!
+        notifier.postOutcomeGrouped(localOnly, workspaceId: "workspace-1", settings: AppSettings())
+        notifier.postOutcomeGrouped(eligible, workspaceId: "workspace-1", settings: AppSettings()) { grouped in
+            remoteGroups.append(grouped)
+            remoteDelivered.fulfill()
+        }
+        let secondEligible = RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-remote-2", runId: "remote-2", workspaceId: "workspace-1",
+            title: nil, phase: .completed)!
+        notifier.postOutcomeGrouped(secondEligible, workspaceId: "workspace-1", settings: AppSettings()) { grouped in
+            remoteGroups.append(grouped)
+            remoteDelivered.fulfill()
+        }
+        notifier.postOutcomeGrouped(eligible, workspaceId: "workspace-1", settings: AppSettings()) { grouped in
+            remoteGroups.append(grouped)
+        }
+        wait(for: [scheduled], timeout: 1)
+        flush?()
+        wait(for: [localAdded, remoteDelivered], timeout: 1)
+
+        XCTAssertEqual(fake.addedRequests.count, 1)
+        XCTAssertEqual(fake.addedRequests.first?.content.userInfo["runIds"] as? String, "local,remote,remote-2")
+        XCTAssertEqual(remoteGroups.count, 1)
+        XCTAssertEqual(remoteGroups.first?.userInfo["runIds"] as? String, "remote,remote-2")
     }
 
     // MARK: - production default unchanged

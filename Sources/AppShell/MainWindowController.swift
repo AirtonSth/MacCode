@@ -1324,6 +1324,11 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         shellLog.debug("shellContentMode=scheduledTasks")
     }
 
+    func openActivityRoute(intent: NotificationRouteIntent) {
+        presentActiveThreadsInMainContent()
+        activeThreadsViewModel?.pendingActivityRoute = intent
+    }
+
     /// Active Threads shell destination: live actives + recent finished runs.
     func presentActiveThreadsInMainContent() {
         guard shellContentMode != .activeThreads else {

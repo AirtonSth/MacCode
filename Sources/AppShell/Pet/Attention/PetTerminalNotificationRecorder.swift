@@ -26,17 +26,20 @@ public struct PetTerminalNotificationRecorder {
         workspaceID: WorkspaceID?,
         surfaceID: SurfaceID?,
         createdAt: Date,
-        replaying: Bool = false
+        replaying: Bool = false,
+        activitySummary: String? = nil
     ) throws -> AppNotification {
         let category = Self.category(for: kind)
         let presentation = category.presentation
         let statefulSSHSurfaceID = kind == .sshUnexpectedDisconnect ? surfaceID : nil
+        let summary = activitySummary ?? Self.activitySummary(for: kind)
+        let body = try summary.map { try JSONEncoder().encode(["activity_summary": $0]) }.map { String(decoding: $0, as: UTF8.self) }
         let notification = AppNotification(
             id: statefulSSHSurfaceID.map { Self.sshDisconnectID($0) } ?? "pet.event.\(eventSequence)",
             workspaceId: workspaceID,
             surfaceId: surfaceID,
             title: presentation.title,
-            body: nil,
+            body: body,
             category: category.rawValue,
             createdAt: createdAt
         )
@@ -93,7 +96,8 @@ public struct PetTerminalNotificationRecorder {
             workspaceID: terminal.workspaceID,
             surfaceID: terminal.surfaceID,
             createdAt: terminal.createdAt,
-            replaying: replaying
+            replaying: replaying,
+            activitySummary: Self.eventActivitySummary(event, kind: terminal.kind)
         )
     }
 
@@ -148,6 +152,26 @@ public struct PetTerminalNotificationRecorder {
             surfaceID: surfaceID,
             createdAt: Date(timeIntervalSince1970: event.ts)
         )
+    }
+
+    private static func eventActivitySummary(_ event: EventBus.Event, kind: PetTerminalNotificationKind) -> String? {
+        guard event.kind == "project.script.finished",
+              case .object(let payload) = event.payload,
+              let summary = activitySummary(for: kind) else { return nil }
+        guard let exitCode = payload["exit_code"]?.intValue else { return summary }
+        return "\(summary) (exit code \(exitCode))"
+    }
+
+    private static func activitySummary(for kind: PetTerminalNotificationKind) -> String? {
+        switch kind {
+        case .gitDelivery(.succeeded): return "Git delivery succeeded"
+        case .gitDelivery(.failed): return "Git delivery failed"
+        case .projectScript(.succeeded): return "Project script succeeded"
+        case .projectScript(.failed): return "Project script failed"
+        case .sshTransfer(.succeeded): return "SSH transfer completed"
+        case .sshTransfer(.failed): return "SSH transfer failed"
+        default: return nil
+        }
     }
 
     private static func category(for kind: PetTerminalNotificationKind) -> PetNotificationCategory {

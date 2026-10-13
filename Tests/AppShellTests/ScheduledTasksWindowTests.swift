@@ -89,10 +89,10 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertEqual(ScheduledTaskEditorDraft(task: persistedTask, now: now).routingMode, .manual)
     }
 
-    func test_sidebarPlacesScheduleTasksAfterActiveThreads_becauseNavigationOrderIsContractual() throws {
+    func test_sidebarPlacesScheduleTasksAfterActivity_becauseNavigationOrderIsContractual() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.newWorkspace\")"))
-        let activeThreads = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.activeThreads\")"))
+        let activeThreads = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.activity\")"))
         let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))
         let updateControl = try XCTUnwrap(source.range(of: "if vm.showsUpdateControl"))

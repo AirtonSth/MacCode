@@ -6593,6 +6593,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         let result = try runRepo.persistTerminalGraph(
             assistantMessage: pending.assistantMessage,
+            finalMessageId: pending.assistantMessage?.id ?? priorAssistantMessageId,
             run: run,
             thread: thread,
             providerSession: providerSession

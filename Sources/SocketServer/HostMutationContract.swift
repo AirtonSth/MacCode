@@ -47,6 +47,8 @@ public enum HostMutationContract {
     agent.thread.configure
     agent.thread.execution.configure
     agent.thread.mark_read
+    agent.activity.viewed.set
+    agent.activity.acknowledge
     agent.thread.prepare_pr
     agent.thread.rollback
     agent.thread.select

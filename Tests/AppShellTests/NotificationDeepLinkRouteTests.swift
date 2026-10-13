@@ -35,7 +35,7 @@ final class NotificationDeepLinkRouteTests: XCTestCase {
 
         XCTAssertNotNil(intent,
             "a payload with a valid threadId UUID must always produce an intent — missing workspaceId is not a failure")
-        XCTAssertEqual(intent?.threadId.value, threadUUID,
+        XCTAssertEqual(intent?.threadId?.value, threadUUID,
             "intent threadId must match the exact UUID from the payload")
         XCTAssertNil(intent?.workspaceId,
             "when workspaceId is absent from the payload, intent.workspaceId must be nil so the router uses thread lookup")
@@ -51,10 +51,32 @@ final class NotificationDeepLinkRouteTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(intent?.threadId.value, threadUUID,
+        XCTAssertEqual(intent?.threadId?.value, threadUUID,
             "intent must carry the exact thread UUID from the payload")
         XCTAssertEqual(intent?.workspaceId?.value, workspaceUUID,
             "intent must carry the exact workspace UUID so the router can pre-select the correct workspace tab")
+    }
+
+    func testFinalMessageIdIsPreservedAsExactRouteTarget() {
+        let threadID = UUID()
+        let messageID = UUID()
+        let intent = AppDelegate.routeFromNotification(userInfo: [
+            "threadId": threadID.uuidString,
+            "finalMessageId": messageID.uuidString
+        ])
+        XCTAssertEqual(intent?.threadId?.value, threadID)
+        XCTAssertEqual(intent?.finalMessageId?.value, messageID)
+        XCTAssertFalse(intent?.opensActivity ?? true)
+    }
+
+    func testGroupedActivityRouteDoesNotCarryFirstThreadOrMessage() {
+        let intent = AppDelegate.routeFromNotification(userInfo: [
+            "activityDestination": "true",
+            "finalMessageId": UUID().uuidString
+        ])
+        XCTAssertNotNil(intent)
+        XCTAssertTrue(intent?.opensActivity ?? false)
+        XCTAssertNil(intent?.threadId)
     }
 
     // MARK: - Missing threadId
@@ -112,7 +134,7 @@ final class NotificationDeepLinkRouteTests: XCTestCase {
 
         XCTAssertNotNil(intent,
             "a valid threadId with a malformed workspaceId must still produce an intent — the thread can be found without a workspace hint")
-        XCTAssertEqual(intent?.threadId.value, threadUUID)
+        XCTAssertEqual(intent?.threadId?.value, threadUUID)
         XCTAssertNil(intent?.workspaceId,
             "a malformed workspaceId must fall back to nil so the router uses thread-based lookup rather than crashing")
     }
@@ -155,7 +177,7 @@ final class NotificationDeepLinkRouteTests: XCTestCase {
             "intents for different thread UUIDs must not be equal — equality is required for stable navigation deduplication")
     }
 
-    func test_openNotificationRoute_usesCanonicalExactThreadRoute_andMarksRead() throws {
+    func test_openNotificationRoute_usesCanonicalExactThreadRoute_withoutMarkingRead() throws {
         let dir = NSTemporaryDirectory() + "RC2NotificationRoute-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: context)
@@ -189,7 +211,7 @@ final class NotificationDeepLinkRouteTests: XCTestCase {
 
         XCTAssertEqual(surface.viewModel.selectedThreadId, thread.id,
             "notification taps must use the same exact-surface binding route as the pet")
-        XCTAssertFalse(try XCTUnwrap(context.threadRepo.get(id: thread.id)).hasUnread,
-            "a notification item is read only after its exact thread opened")
+        XCTAssertTrue(try XCTUnwrap(context.threadRepo.get(id: thread.id)).hasUnread,
+            "routing must not mark a thread read before the user views it")
     }
 }

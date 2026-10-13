@@ -19,7 +19,7 @@ final class LockedISO8601Formatter: @unchecked Sendable {
 let iso = LockedISO8601Formatter(ISO8601DateFormatter())
 /// Accept fractional ISO-8601 on read so checkpoint keyset timestamps that
 /// store sub-second precision still decode correctly on legacy list/detail paths.
-private let isoFractional = LockedISO8601Formatter({
+let isoFractional = LockedISO8601Formatter({
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     return formatter
@@ -5485,6 +5485,7 @@ public final class AgentRunRepository: @unchecked Sendable {
     /// same assistant/event identities is idempotent.
     public func persistTerminalGraph(
         assistantMessage: AgentMessage?,
+        finalMessageId: AgentMessageID? = nil,
         run: AgentRun,
         thread: AgentThread?,
         providerSession: ProviderSessionRuntime?,
@@ -5492,6 +5493,17 @@ public final class AgentRunRepository: @unchecked Sendable {
     ) throws -> TerminalCommitResult {
         try db.performSync { database in
             try database.transaction {
+                let runThread = try database.prepare("SELECT thread_id FROM agent_runs WHERE id = ? LIMIT 1;")
+                try runThread.bind(1, run.id.description)
+                guard try runThread.step(), runThread.columnText(0) == run.threadId.description else {
+                    throw SQLiteError.execute("Terminal run thread identity is missing or changed.")
+                }
+                if let assistantMessage, assistantMessage.threadId != run.threadId {
+                    throw SQLiteError.execute("Terminal assistant message does not belong to run thread.")
+                }
+                if let finalMessageId, let assistantMessage, finalMessageId != assistantMessage.id {
+                    throw SQLiteError.execute("Explicit terminal message identity conflicts with supplied message.")
+                }
                 var assistantMessageId: AgentMessageID?
                 var insertedAssistantMessage = false
                 if let assistantMessage {
@@ -5557,12 +5569,35 @@ public final class AgentRunRepository: @unchecked Sendable {
                     try ProviderSessionRuntimeRepository(db: database).upsert(providerSession)
                 }
 
+                let resultMessageId = finalMessageId ?? assistantMessageId
+                let resultSummary: String?
+                if let resultMessageId {
+                    let exactMessage = try database.prepare("""
+                        SELECT content FROM agent_messages
+                        WHERE id = ? AND thread_id = ? AND role = 'assistant'
+                        LIMIT 1;
+                        """)
+                    try exactMessage.bind(1, resultMessageId.description)
+                    try exactMessage.bind(2, run.threadId.description)
+                    guard try exactMessage.step() else {
+                        throw SQLiteError.execute("Terminal result message is missing or belongs to another thread.")
+                    }
+                    resultSummary = exactMessage.columnText(0)
+                } else {
+                    resultSummary = nil
+                }
+                try AgentRunResultRepository(db: database).upsertTerminal(
+                    runId: run.id,
+                    finalMessageId: resultMessageId,
+                    summary: resultSummary
+                )
+
                 if let streamEvent {
                     try persistStreamEventIdempotently(db: database, runId: run.id, item: streamEvent)
                 }
 
                 return TerminalCommitResult(
-                    assistantMessageId: assistantMessageId,
+                    assistantMessageId: resultMessageId,
                     insertedAssistantMessage: insertedAssistantMessage
                 )
             }

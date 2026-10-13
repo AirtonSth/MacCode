@@ -367,11 +367,11 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             source: .notification(id: "outcome-1")
         )
         model.apply(snapshot: PetAttentionSnapshot(items: [callback, outcome]))
+        XCTAssertNil(model.badgeText, "Pet attention rows do not classify Activity service counts.")
+        model.apply(activityCounts: PetActivityCounts(running: 0, needsYou: 2, newResults: 1))
 
         XCTAssertEqual(model.badgeText, "2")
-        XCTAssertEqual(model.accessibilityValue, "2 items need attention")
-        XCTAssertEqual(model.needsYouItems.map(\.id), ["callback-1"])
-        XCTAssertEqual(model.completedItems.map(\.id), ["outcome-1"])
+        XCTAssertEqual(model.accessibilityValue, "Activity: 0 running, 2 items need attention")
 
         let many = (0..<100).map { index in
             PetAttentionItem(
@@ -385,6 +385,8 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             )
         }
         model.apply(snapshot: PetAttentionSnapshot(items: many))
+        XCTAssertEqual(model.badgeText, "2", "Legacy item count must not replace service counts.")
+        model.apply(activityCounts: PetActivityCounts(running: 0, needsYou: 100, newResults: 0))
         XCTAssertEqual(model.badgeText, "99+")
         model.apply(settings: AppSettings(petEnabled: true, petReadyCounterEnabled: false))
         XCTAssertNil(model.badgeText)
@@ -426,11 +428,12 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         }
 
         model.apply(activeThreads: projected)
+        model.apply(activityCounts: PetActivityCounts(running: 2, needsYou: 0, newResults: 0))
         XCTAssertEqual(model.activeBadgeText, "2")
         XCTAssertEqual(model.activeThreadCount, 2)
         XCTAssertEqual(
             model.accessibilityValue,
-            "2 active agent threads"
+            "Activity: 2 running, No items need attention"
         )
         XCTAssertFalse(model.isPopoverEmpty)
 
@@ -438,7 +441,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertEqual(
             model.activeBadgeText,
             "2",
-            "Active blue badge must remain visible when the red ready counter is disabled."
+            "The internal legacy count remains independent; no blue badge is rendered."
         )
         XCTAssertNil(model.badgeText)
 
@@ -454,17 +457,17 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         model.apply(snapshot: PetAttentionSnapshot(items: [attention]))
         XCTAssertEqual(
             model.accessibilityValue,
-            "2 active agent threads. 1 item needs attention"
+            "Activity: 2 running, No items need attention"
         )
 
         model.apply(activeThreads: [])
         XCTAssertNil(model.activeBadgeText)
-        XCTAssertEqual(model.accessibilityValue, "1 item needs attention")
+        XCTAssertEqual(model.accessibilityValue, "Activity: 2 running, No items need attention")
         XCTAssertFalse(model.isPopoverEmpty)
 
         model.apply(snapshot: PetAttentionSnapshot(items: []))
         XCTAssertTrue(model.isPopoverEmpty)
-        XCTAssertEqual(model.accessibilityValue, "No items need attention")
+        XCTAssertEqual(model.accessibilityValue, "Activity: 2 running, No items need attention")
     }
 
     func test_activeThreadProjectorKeepsAuthoritativeMembershipWhenMetadataIsMissing() {
@@ -1675,9 +1678,8 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertFalse(controller.windowControllerForTests.isPopoverVisible)
     }
 
-    /// WHY: "Mark all viewed" must clear completed outcomes and dismiss Ready for you only.
-    /// Leaving the empty popover open (or re-opening it) is the failure mode users hit after bulk clear.
-    func test_markAllViewed_marksOutcomesAndClosesPopoverWithoutReopening() throws {
+    /// WHY: viewing Activity must not mark results read or resolve attention as a side effect.
+    func test_petDoesNotBulkMarkResultsSeenOrResolveAttention() throws {
         let directory = NSTemporaryDirectory() + "RC2PetMarkAllDismiss-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
         let router = AppCommandRouter(context: context)
@@ -1712,16 +1714,10 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         controller.windowControllerForTests.openPopoverForTests()
         XCTAssertTrue(controller.windowControllerForTests.isPopoverVisible)
 
-        controller.windowControllerForTests.onMarkAllViewed?()
-
-        XCTAssertFalse(
-            controller.windowControllerForTests.isPopoverVisible,
-            "Mark all viewed must close Ready for you; it must not leave or reopen the empty panel."
-        )
-        XCTAssertEqual(controller.modelForTests.count, 0)
-        XCTAssertFalse(try XCTUnwrap(context.threadRepo.get(id: thread.id)).hasUnread)
-        XCTAssertTrue(try repository.list(unreadOnly: true).isEmpty)
-        XCTAssertNil(controller.modelForTests.routeError)
+        XCTAssertEqual(controller.modelForTests.count, 2)
+        XCTAssertTrue(controller.windowControllerForTests.isPopoverVisible)
+        XCTAssertTrue(try XCTUnwrap(context.threadRepo.get(id: thread.id)).hasUnread)
+        XCTAssertEqual(try repository.list(unreadOnly: true).count, 1)
     }
 
     func test_noiseDoesNotPostponeIdleSleep() async throws {

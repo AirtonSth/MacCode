@@ -29,6 +29,10 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
             "diffIgnoreWhitespace",
             "sidebarSort",
             "insomniaEnabled",
+            "notificationActionAlertsEnabled",
+            "notificationCompletionAlertsEnabled",
+            "notificationSoundEnabled",
+            "notificationMutedWorkspaceIDs",
             "insomniaAllowDisplaySleep",
             "insomniaAllowSystemSleepWhenDisplayClosed",
             "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
@@ -84,6 +88,16 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
                        "setSidebarSort must update appSettings immediately")
         XCTAssertEqual(SettingsStore(db: ctx.db).load().sidebarSort, "created",
                        "setSidebarSort must persist the value so reload() sees it")
+
+        vm.setNotificationActionAlertsEnabled(false)
+        vm.setNotificationCompletionAlertsEnabled(false)
+        vm.setNotificationSoundEnabled(true)
+        vm.setNotificationWorkspaceMuted("workspace-a", muted: true)
+        let notifications = SettingsStore(db: ctx.db).load()
+        XCTAssertFalse(notifications.notificationActionAlertsEnabled)
+        XCTAssertFalse(notifications.notificationCompletionAlertsEnabled)
+        XCTAssertTrue(notifications.notificationSoundEnabled)
+        XCTAssertEqual(notifications.notificationMutedWorkspaceIDs, ["workspace-a"])
 
         // Terminal base font
         vm.setTerminalFontSize(16)

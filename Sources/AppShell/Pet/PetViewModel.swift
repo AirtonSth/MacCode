@@ -10,6 +10,7 @@ public final class PetViewModel: ObservableObject {
     @Published public private(set) var count = 0
     @Published public private(set) var activeThreads: [PetActiveThreadItem] = []
     @Published public private(set) var activeThreadCount = 0
+    @Published private(set) var activityCounts = PetActivityCounts.zero
     @Published public private(set) var settings: AppSettings
     @Published public var routeError: String?
 
@@ -19,32 +20,25 @@ public final class PetViewModel: ObservableObject {
         self.settings = settings
     }
 
-    /// Red badge: attention/ready items. Gated by petReadyCounterEnabled.
+    /// Single external indicator, gated by the existing ready-counter preference.
     public var badgeText: String? {
-        PetAttentionCountFormatter.badgeText(
-            count: count,
+        guard activityCounts.isAvailable else { return nil }
+        return PetAttentionCountFormatter.badgeText(
+            count: activityCounts.needsYou,
             isEnabled: settings.petReadyCounterEnabled
         )
     }
 
-    /// Blue badge: unique active agent threads. Not gated by the ready-counter setting.
+    /// Compatibility value for older internal callers; no blue badge renders.
     public var activeBadgeText: String? {
         PetActiveThreadCountFormatter.badgeText(count: activeThreadCount)
     }
 
     public var accessibilityValue: String {
-        PetActiveThreadCountFormatter.combinedAccessibilityValue(
-            activeCount: activeThreadCount,
-            attentionCount: count
-        )
-    }
-
-    public var needsYouItems: [PetAttentionItem] {
-        items.filter { $0.kind.needsUserAction }
-    }
-
-    public var completedItems: [PetAttentionItem] {
-        items.filter { !$0.kind.needsUserAction }
+        guard activityCounts.isAvailable else { return "Activity status unavailable" }
+        let running = activityCounts.running == 1 ? "1 running" : "\(activityCounts.running) running"
+        let needsYou = PetAttentionCountFormatter.accessibilityValue(count: activityCounts.needsYou)
+        return "Activity: \(running), \(needsYou)"
     }
 
     public var isPopoverEmpty: Bool {
@@ -68,6 +62,10 @@ public final class PetViewModel: ObservableObject {
     public func apply(activeThreads: [PetActiveThreadItem]) {
         self.activeThreads = activeThreads
         activeThreadCount = activeThreads.count
+    }
+
+    func apply(activityCounts: PetActivityCounts) {
+        self.activityCounts = activityCounts
     }
 
     public func apply(settings: AppSettings) {

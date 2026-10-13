@@ -19,6 +19,16 @@ public enum AgentChatTimelineHistoryLayout {
 }
 
 /// Shared Agent App / Desk timeline viewport constants.
+public struct AgentChatTimelineScrollTarget: Equatable {
+    public let anchor: String
+    public let requestID: UUID
+
+    public init(anchor: String, requestID: UUID = UUID()) {
+        self.anchor = anchor
+        self.requestID = requestID
+    }
+}
+
 public enum AgentChatTimelineScrollChrome {
     public static let bottomAnchorID = "BOTTOM"
     public static let bottomRevealSlack: CGFloat = 4
@@ -50,6 +60,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
     public let followToken: Int
     public let scrollToBottomIdentifier: String
     public let accessibilityIdentifier: String
+    public let scrollTarget: AgentChatTimelineScrollTarget?
     public let horizontalPadding: CGFloat
     public let verticalPadding: CGFloat
     public let columnGutter: CGFloat
@@ -67,6 +78,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
         followToken: Int,
         scrollToBottomIdentifier: String,
         accessibilityIdentifier: String,
+        scrollTarget: AgentChatTimelineScrollTarget? = nil,
         horizontalPadding: CGFloat = 22,
         verticalPadding: CGFloat = 32,
         columnGutter: CGFloat = 44,
@@ -77,6 +89,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
         self.followToken = followToken
         self.scrollToBottomIdentifier = scrollToBottomIdentifier
         self.accessibilityIdentifier = accessibilityIdentifier
+        self.scrollTarget = scrollTarget
         self.horizontalPadding = horizontalPadding
         self.verticalPadding = verticalPadding
         self.columnGutter = columnGutter
@@ -148,6 +161,14 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
             .onChange(of: followToken) { _ in
                 scheduleScrollToBottom(proxy, force: false)
             }
+            .onChange(of: scrollTarget) { target in
+                guard let target else { return }
+                sticksToBottom = false
+                scrollScheduler.followGeneration &+= 1
+                DispatchQueue.main.async {
+                    proxy.scrollTo(target.anchor, anchor: .center)
+                }
+            }
         }
         .accessibilityIdentifier(accessibilityIdentifier)
     }
@@ -202,6 +223,7 @@ public extension AgentChatTimelineScrollContainer where FollowOverlay == EmptyVi
         followToken: Int,
         scrollToBottomIdentifier: String,
         accessibilityIdentifier: String,
+        scrollTarget: AgentChatTimelineScrollTarget? = nil,
         horizontalPadding: CGFloat = 22,
         verticalPadding: CGFloat = 32,
         columnGutter: CGFloat = 44,
@@ -212,6 +234,7 @@ public extension AgentChatTimelineScrollContainer where FollowOverlay == EmptyVi
             followToken: followToken,
             scrollToBottomIdentifier: scrollToBottomIdentifier,
             accessibilityIdentifier: accessibilityIdentifier,
+            scrollTarget: scrollTarget,
             horizontalPadding: horizontalPadding,
             verticalPadding: verticalPadding,
             columnGutter: columnGutter,

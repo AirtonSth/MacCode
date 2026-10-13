@@ -1,3 +1,4 @@
+import RemoteCodeTreaty
 import XCTest
 import Darwin
 import CryptoKit
@@ -1902,6 +1903,11 @@ final class HTTPServerTests: XCTestCase {
             let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
             publicAgent = obj?["agent"] as? [String: Any]
             XCTAssertEqual(
+                publicAgent?["agent_activity"] as? NSDictionary,
+                ["protocol_version": 1] as NSDictionary,
+                "public capability is advisory and must advertise agent activity v1"
+            )
+            XCTAssertEqual(
                 publicAgent?["plan_notes"] as? NSDictionary,
                 expected,
                 "public /v1/capabilities must expose exact plan_notes advertisement"
@@ -1924,6 +1930,11 @@ final class HTTPServerTests: XCTestCase {
             let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
             let embedded = obj?["capabilities"] as? [String: Any]
             let agent = embedded?["agent"] as? [String: Any]
+            XCTAssertEqual(
+                agent?["agent_activity"] as? NSDictionary,
+                ["protocol_version": 1] as NSDictionary,
+                "authenticated capability must match public advisory"
+            )
             XCTAssertEqual(
                 agent?["plan_notes"] as? NSDictionary,
                 expected,
@@ -1992,6 +2003,27 @@ final class HTTPServerTests: XCTestCase {
         )
         XCTAssertEqual(httpData, systemData,
                        "HTTP and system.capabilities plan_notes must be byte-identical after canonicalization")
+    }
+
+    func test_agentActivityCapabilityDecodesAdditively() throws {
+        let legacy = Data(#"{"providers":[],"supports_stream_events":true,"supports_resume":true}"#.utf8)
+        let decoded = try JSONDecoder().decode(HostCapabilities.Agent.self, from: legacy)
+        XCTAssertNil(decoded.agentActivity)
+
+        let current = Data(#"{"providers":[],"supports_stream_events":true,"supports_resume":true,"agent_activity":{"protocol_version":1}}"#.utf8)
+        XCTAssertEqual(try JSONDecoder().decode(HostCapabilities.Agent.self, from: current).agentActivity?.protocolVersion, 1)
+    }
+
+    @MainActor
+    func test_agentActivityCapabilityMatchesAuthenticatedRPCAuthority() async throws {
+        let httpAgent = DirectHTTPServer.capabilitiesPayload(loopbackOnly: true)["agent"] as? [String: Any]
+        let httpActivity = httpAgent?["agent_activity"] as? [String: Any]
+        let response = await JSONRPCDispatcher(router: FakeRouter()).dispatch(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "system.capabilities", params: nil
+        ))
+        let rpcActivity = response.result?.objectValue?["agent"]?.objectValue?["agent_activity"]
+        XCTAssertEqual(httpActivity? ["protocol_version"] as? Int, 1)
+        XCTAssertEqual(rpcActivity, .object(["protocol_version": .number(1)]))
     }
 
     private func connectLocalhost(port: UInt16) throws -> Int32 {

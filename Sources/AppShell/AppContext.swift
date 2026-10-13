@@ -53,6 +53,11 @@ final class ProjectScriptRunRegistry: @unchecked Sendable {
         lock.unlock()
     }
 
+    func activeSnapshot() -> [(workspaceID: WorkspaceID, surfaceID: SurfaceID, name: String, startedAt: Date)] {
+        lock.lock(); defer { lock.unlock() }
+        return entries.map { ($0.value.workspaceID, $0.key, $0.value.name, $0.value.startedAt) }
+    }
+
     func consumeTerminalDeath(surfaceID: SurfaceID, health: TerminalRuntimeHealth) -> ProjectScriptRunOutcome? {
         guard !health.processAlive else { return nil }
         // PTY EOF closes the descriptor before the asynchronous reaper owns an
@@ -1161,24 +1166,43 @@ public final class AppContext {
                 // Main agent only: nested/subagent workers must not fire
                 // system or private push banners (parent owns user-facing UX).
                 let chrome = (try? self.threadRepo.listChrome(ids: [tid]))?[tid]
+                let notificationSettings = SettingsStore(db: self.db).load()
                 if let content = RemoteCodeNotificationContent.threadOutcome(
                     threadId: tid.value.uuidString,
+                    runId: rid.value.uuidString,
                     workspaceId: chrome?.workspaceId?.value.uuidString,
                     title: chrome?.title,
                     phase: status,
-                    isNestedWorker: self.isNestedAgentWorker(runId: rid, threadId: tid)
+                    isNestedWorker: self.isNestedAgentWorker(runId: rid, threadId: tid),
+                    finalMessageId: ((try? AgentRunResultRepository(db: self.db).get(runId: rid)) ?? nil)?.finalMessageId?.description
                 ) {
-                    // Mac desktop toast always. Remote iOS banner is suppressed
-                    // when Live Activity already covers Lock Screen (attention
-                    // path still uses deliver(_:) and is never gated here).
-                    SystemNotifier.shared.post(content)
-                    // No phone banner and no catch-up for a side thread either.
-                    if !isSideThread {
-                        Task {
-                            await self.privateNotificationBridge.deliverThreadOutcomeRemote(
+                    let isFailureOrInterrupted = status == .failed || status == .interrupted
+                    let isUserStop = status == .cancelled
+                    let allowed = RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+                        isAction: isFailureOrInterrupted || isUserStop,
+                        workspaceId: chrome?.workspaceId?.value.uuidString,
+                        settings: notificationSettings
+                    )
+                    if allowed {
+                        if isFailureOrInterrupted {
+                            SystemNotifier.shared.post(content, settings: notificationSettings)
+                        } else if !isUserStop {
+                            SystemNotifier.shared.postOutcomeGrouped(
                                 content,
-                                phase: status
+                                workspaceId: chrome?.workspaceId?.value.uuidString,
+                                settings: notificationSettings,
+                                remoteDelivery: !isSideThread && status == .completed ? { [weak bridge = self.privateNotificationBridge] grouped in
+                                    Task { await bridge?.deliverThreadOutcomeRemote(grouped, phase: .completed) }
+                                } : nil
                             )
+                        }
+                        if !isSideThread && status != .completed {
+                            Task {
+                                await self.privateNotificationBridge.deliverThreadOutcomeRemote(
+                                    content,
+                                    phase: status
+                                )
+                            }
                         }
                     }
                 }
@@ -1652,6 +1676,7 @@ public final class AppContext {
     ) {
         let nested = isNestedAgentWorker(runId: runId, threadId: threadId)
         let chrome = (try? threadRepo.listChrome(ids: [threadId]))?[threadId]
+        let notificationSettings = SettingsStore(db: db).load()
         guard let content = RemoteCodeNotificationContent.userActionNeeded(
             threadId: threadId.value.uuidString,
             workspaceId: chrome?.workspaceId?.value.uuidString,
@@ -1660,7 +1685,12 @@ public final class AppContext {
             requestId: requestId,
             isNestedWorker: nested
         ) else { return }
-        SystemNotifier.shared.post(content)
+        guard RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: true,
+            workspaceId: chrome?.workspaceId?.value.uuidString,
+            settings: notificationSettings
+        ) else { return }
+        SystemNotifier.shared.post(content, settings: notificationSettings)
         Task {
             await privateNotificationBridge.deliver(content)
         }

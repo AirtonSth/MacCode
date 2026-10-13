@@ -342,8 +342,8 @@ final class PetAttentionStoreTests: XCTestCase {
         let staleItem = try XCTUnwrap(fixture.store.refresh().items.first)
         XCTAssertEqual(
             try fixture.store.openAndMarkRead(itemID: staleItem.id) { _ in true },
-            .marked,
-            "Opening the exact recovery destination acknowledges a stale callback without invoking it."
+            .retainedBlocker,
+            "Viewing a stale request must not acknowledge or resolve it; use its canonical action."
         )
         XCTAssertEqual(
             try fixture.callbacks.get(
@@ -351,9 +351,30 @@ final class PetAttentionStoreTests: XCTestCase {
                 requestId: "approval-keep",
                 kind: .approval
             )?.state,
-            .acknowledged
+            .stale
         )
-        XCTAssertTrue(try fixture.store.refresh().items.isEmpty)
+        XCTAssertEqual(try fixture.store.refresh().items.map(\.id), [staleItem.id])
+    }
+
+    func test_viewingFailedOutcomeNeverAcknowledgesItsNeedsYouState() throws {
+        let fixture = try fixture()
+        let workspaceID = WorkspaceID(UUID())
+        let failed = thread(
+            id: "EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE",
+            workspaceID: workspaceID,
+            status: .failed,
+            updatedAt: 500,
+            hasUnread: true
+        )
+        try fixture.threads.upsert(failed)
+        let item = try XCTUnwrap(fixture.store.refresh().items.first)
+
+        XCTAssertEqual(
+            try fixture.store.openAndMarkRead(itemID: item.id) { _ in true },
+            .retainedBlocker
+        )
+        XCTAssertTrue(try XCTUnwrap(fixture.threads.get(id: failed.id)).hasUnread)
+        XCTAssertEqual(try XCTUnwrap(fixture.threads.get(id: failed.id)).status, .failed)
     }
 
     func test_openAndMarkRead_preservesNotificationRouteMetadata() throws {
@@ -792,7 +813,7 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertEqual(first, second)
         XCTAssertEqual(first.id, "pet.event.42")
         XCTAssertEqual(first.title, "SSH transfer failed")
-        XCTAssertNil(first.body)
+        XCTAssertEqual(first.body, "{\"activity_summary\":\"SSH transfer failed\"}")
         XCTAssertEqual(first.category, PetNotificationCategory.sshTransferFailed.rawValue)
         XCTAssertEqual(try fixture.notifications.list().count, 1)
 
@@ -981,7 +1002,7 @@ final class PetAttentionStoreTests: XCTestCase {
 
         XCTAssertEqual(recorded.id, "pet.event.9")
         XCTAssertEqual(recorded.title, "Git delivery failed")
-        XCTAssertNil(recorded.body)
+        XCTAssertEqual(recorded.body, "{\"activity_summary\":\"Git delivery failed\"}")
         XCTAssertEqual(recorded.workspaceId, workspaceID)
         XCTAssertEqual(recorded.surfaceId, surfaceID)
         XCTAssertNil(try recorder.record(event: EventBus.Event(

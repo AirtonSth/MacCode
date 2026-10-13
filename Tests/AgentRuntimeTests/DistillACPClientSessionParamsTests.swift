@@ -76,6 +76,20 @@ final class DistillACPClientSessionParamsTests: XCTestCase {
         }
     }
 
+    func test_modelResolutionUsesExactQualifiedIDThenOnlyUniqueProviderAlias() {
+        let models = [
+            AgentModelDescriptor(id: "chatgpt/gpt-6-luna", label: "Luna", provider: .distill),
+            AgentModelDescriptor(id: "openai/gpt-6-luna", label: "Luna", provider: .distill),
+        ]
+
+        XCTAssertEqual(
+            DistillACPClient.matchingModels("chatgpt/gpt-6-luna", in: models).map(\.id),
+            ["chatgpt/gpt-6-luna"]
+        )
+        XCTAssertEqual(DistillACPClient.matchingModels("gpt-6-luna", in: models).count, 2)
+        XCTAssertTrue(DistillACPClient.matchingModels("other/gpt-6-luna", in: models).isEmpty)
+    }
+
     func test_sessionNewOmitsUnavailableModelAndEffort() {
         let params = DistillACPClient.sessionOpenParams(cwd: "/tmp", mcpServers: [])
 

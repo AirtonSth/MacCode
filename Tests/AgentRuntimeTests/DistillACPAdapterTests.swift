@@ -872,6 +872,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                     fail(message["id"], {"message":"upstream rejected the request","http_status":401})
                 elif "FAIL_SIGNATURE" in text:
                     fail(message["id"], {"message":"API error (status 400 Bad Request): invalid_request_error: messages.1.content.3: Invalid `signature` in `thinking` block","http_status":400})
+                elif "FAIL_ENCRYPTED" in text:
+                    fail(message["id"], {"message":"API error (status 400 Bad Request): invalid_request_error: The encrypted content for item rs_test_encrypted could not be verified. Reason: Encrypted content could not be decrypted or parsed.","http_status":400})
                 elif "FAIL_BARE" in text:
                     send({"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"some-other-session","promptId":"p0","stopReason":"error","agentResult":"stale failure from another session"}})
                     send({"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":session,"promptId":"p1","stopReason":"error","agentResult":"API error (status 404 Not Found): Provider returned error"}})
@@ -1125,6 +1127,52 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                        "the coordinator persists the rejection so Retry after a restart opens a new session too")
         let prompts = try recordedRequests(requestsURL).filter { $0["method"] as? String == "session/prompt" }
         XCTAssertEqual(prompts.map { $0["sessionId"] as? String }, ["distill-session-1", "distill-session-2"])
+    }
+
+    func test_rejectedEncryptedContentRetriesFreshWithLocalHistoryOnSameThread() async throws {
+        // Reusing rejected encrypted history repeats the 400; only an explicit retry may start a replacement.
+        let root = try makeTempRoot("distill-acp-encrypted-history")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let thread = AgentThreadID()
+        let failed = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            distillRequest(thread: thread, model: "chatgpt/gpt-6.1-sol", prompt: "FAIL_ENCRYPTED", root: root)
+        ) { failed.append($0) }
+        let failedFinished = try await failed.waitForFinish()
+        XCTAssertEqual(failedFinished.status, .failed)
+        let error = try XCTUnwrap(failed.errors.last)
+        XCTAssertTrue(error.hasPrefix(DistillACPFailureTaxonomy.incompatibleHistoryMarker), error)
+        XCTAssertTrue(error.contains("Encrypted content could not be decrypted or parsed"), error)
+        XCTAssertEqual(failed.rejectedSessionIds, ["distill-session-1"],
+                       "Rejection must persist so restart cannot reload the invalid session.")
+        XCTAssertEqual(try recordedRequests(requestsURL).filter { $0["method"] as? String == "session/prompt" }.count, 1,
+                       "Recovery must not automatically repeat possibly consequential work.")
+
+        var retryRequest = distillRequest(
+            thread: thread, model: "chatgpt/gpt-6.1-sol", prompt: "Retry request", root: root,
+            providerThreadId: failedFinished.providerThreadId
+        )
+        retryRequest.priorConversationTail = [
+            AgentMessage(threadId: thread, role: .user, content: "Prior task context"),
+            AgentMessage(threadId: thread, role: .assistant, content: "Previously verified result")
+        ]
+        let retry = DistillACPAdapterEventBox()
+        _ = try await adapter.sendTurn(retryRequest) { retry.append($0) }
+        let retried = try await retry.waitForFinish()
+        XCTAssertEqual(retried.status, .completed)
+        XCTAssertEqual(retried.providerThreadId, "distill-session-2")
+        XCTAssertEqual(retry.noticeSummaries,
+                       [DistillACPAdapter.incompatibleHistoryNotice + DistillACPAdapter.handoffCarriedNoticeSuffix])
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertFalse(requests.contains { $0["method"] as? String == "session/load" })
+        let prompts = requests.filter { $0["method"] as? String == "session/prompt" }
+        XCTAssertEqual(prompts.map { $0["sessionId"] as? String }, ["distill-session-1", "distill-session-2"])
+        let retryText = try XCTUnwrap(prompts.last?["text"] as? String)
+        XCTAssertTrue(retryText.contains("Prior task context") && retryText.contains("Previously verified result"),
+                      "Replacement must carry local text history, not rejected encrypted provider items.")
     }
 
     func test_longThreadHandoffCarriesNewestMessagesBeyondRCSEEDLimits() async throws {

@@ -1388,6 +1388,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "attachment_get_v1": true,
             // agent.account.usage.get (stored per-provider account usage, no probe).
             "account_usage_get_v1": true,
+            // agent.activity protocol_version 1.
+            "agent_activity": ["protocol_version": 1],
         ]
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject

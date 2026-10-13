@@ -70,7 +70,8 @@ enum DistillACPFailureTaxonomy {
     static let incompatibleHistoryMarker = "[fresh-session:incompatible-history]"
     static let incompatibleHistoryMarkers = [
         "invalid `signature` in `thinking` block", "invalid signature in thinking block",
-        "encrypted_content", "history is incompatible", "history incompatible"
+        "encrypted_content", "encrypted content could not be decrypted or parsed",
+        "history is incompatible", "history incompatible"
     ]
 
     static func normalize(_ error: Error, context: DistillACPFailureContext) -> DistillACPFailure {
@@ -547,6 +548,8 @@ public final class DistillACPClient: @unchecked Sendable {
     private var nextId = 1
     private var pending: [Int: Pending] = [:]
     private var stderrBuffer = Data()
+    private var modelCatalog: [AgentModelDescriptor] = []
+    private var modelCatalogAdvertised = false
     private var stopped = false
     /// Set on `writeQueue` once stdin is closed; later writes fail instead of
     /// reaching a descriptor number the system may have reused.
@@ -774,7 +777,60 @@ public final class DistillACPClient: @unchecked Sendable {
 
     public func initialize(clientVersion: String = "0.0.0") async throws -> DistillACPInitializeResult {
         let result = try await requestJSONObject(method: "initialize", params: Self.initializeParams(clientVersion: clientVersion), timeout: 15)
-        return try DistillACPInitializeResult.parse(result)
+        let initialized = try DistillACPInitializeResult.parse(result)
+        lock.withLock {
+            modelCatalog = initialized.models
+            modelCatalogAdvertised = !initialized.models.isEmpty
+                || (result["_meta"] as? JSONObject)?["modelState"] != nil
+        }
+        return initialized
+    }
+
+    static let modelCatalogListMethod = "_x.ai/models/list"
+
+    func refreshModelCatalog() async throws -> [AgentModelDescriptor] {
+        let result = try await requestJSONObject(method: Self.modelCatalogListMethod, params: [:], timeout: 10)
+        let descriptors = Self.modelDescriptors(from: (result["result"] as? JSONObject) ?? result)
+        guard !descriptors.isEmpty else {
+            throw DistillACPError.unsupported("Distill model catalog refresh returned no models")
+        }
+        lock.withLock { modelCatalog = descriptors; modelCatalogAdvertised = true }
+        return descriptors
+    }
+
+    func resolveSelectedModel(_ selected: String?, catalog: [AgentModelDescriptor]) async throws -> String? {
+        let value = selected?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !value.isEmpty else { return nil }
+        return try await resolveSelectedModels([value], catalog: catalog)[value]
+    }
+
+    private func resolveSelectedModels(_ selections: [String], catalog: [AgentModelDescriptor] = []) async throws -> [String: String] {
+        let snapshot = lock.withLock { (catalog.isEmpty ? modelCatalog : catalog, modelCatalogAdvertised) }
+        if selections.isEmpty {
+            if snapshot.1 && snapshot.0.isEmpty { _ = try await refreshModelCatalog() }
+            return [:]
+        }
+        guard snapshot.1 || !snapshot.0.isEmpty else {
+            return Dictionary(uniqueKeysWithValues: Set(selections).map { ($0, $0) })
+        }
+        var models = snapshot.0
+        if selections.contains(where: { Self.matchingModels($0, in: models).isEmpty }) {
+            do {
+                models = try await refreshModelCatalog()
+            } catch {
+                throw DistillACPError.unsupported("Could not refresh the Distill catalog for the selected model. Retry while connected. (\(error.localizedDescription))")
+            }
+        }
+        var resolved = [String: String]()
+        for selection in selections {
+            let matches = Self.matchingModels(selection, in: models)
+            guard matches.count == 1, let model = matches.first else {
+                let reason = matches.isEmpty ? "is not advertised" : "matches multiple advertised models"
+                throw DistillACPError.unsupported("Selected Distill model '\(selection)' \(reason). Refresh the model catalog and select one exact model.")
+            }
+            resolved[selection] = model.id
+        }
+        return resolved
     }
 
     public static func sessionMCPServers(
@@ -912,6 +968,12 @@ public final class DistillACPClient: @unchecked Sendable {
         reasoningModelEffortSelection: AgentEffortSelection? = nil,
         reasoningModelSelectionSupported: Bool = true
     ) async throws -> DistillACPSessionOpenResult {
+        let requestedMain = modelId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedWorker = reasoningModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selections = [requestedMain, reasoningModelSelectionSupported ? requestedWorker : nil].compactMap { $0 }.filter { !$0.isEmpty }
+        let resolved = try await resolveSelectedModels(selections)
+        let modelId = requestedMain.flatMap { resolved[$0] ?? ($0.isEmpty ? nil : $0) }
+        let reasoningModel = requestedWorker.map { resolved[$0] ?? $0 }
         let result = try await requestJSONObject(
             method: "session/new",
             params: Self.sessionOpenParams(
@@ -982,6 +1044,12 @@ public final class DistillACPClient: @unchecked Sendable {
         reasoningModelEffortSelection: AgentEffortSelection? = nil,
         reasoningModelSelectionSupported: Bool = true
     ) async throws -> DistillACPSessionOpenResult {
+        let requestedMain = modelId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedWorker = reasoningModel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selections = [requestedMain, reasoningModelSelectionSupported ? requestedWorker : nil].compactMap { $0 }.filter { !$0.isEmpty }
+        let resolved = try await resolveSelectedModels(selections)
+        let modelId = requestedMain.flatMap { resolved[$0] ?? ($0.isEmpty ? nil : $0) }
+        let reasoningModel = requestedWorker.map { resolved[$0] ?? $0 }
         let params = Self.sessionOpenParams(
             cwd: sessionCwd(cwd),
             mcpServers: sessionMCPServers(),
@@ -1059,6 +1127,16 @@ public final class DistillACPClient: @unchecked Sendable {
             efforts += currentModelEfforts.filter { !efforts.contains($0) }
         }
         return efforts
+    }
+
+    static func matchingModels(_ value: String, in models: [AgentModelDescriptor]) -> [AgentModelDescriptor] {
+        let exact = models.filter { $0.id == value }
+        if !exact.isEmpty { return exact }
+        guard !value.contains("/") else { return [] }
+        return models.filter { model in
+            let id = model.id
+            return id.hasSuffix("/" + value) && id.split(separator: "/").count == 2
+        }
     }
 
     /// Same model when equal or when one is the other's provider-qualified form.
@@ -1173,7 +1251,7 @@ public final class DistillACPClient: @unchecked Sendable {
         effortSelection: AgentEffortSelection? = nil,
         advertisedEfforts: [AgentReasoningEffort] = []
     ) async throws -> ReasoningModelSelectionResult {
-        let trimmedModel = modelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trimmedModel = try await resolveSelectedModel(modelId, catalog: []) ?? ""
         let effortValue: Any
         if let effortSelection, !trimmedModel.isEmpty {
             if let effort = effortSelection.effort {
@@ -1229,6 +1307,7 @@ public final class DistillACPClient: @unchecked Sendable {
         reasoningEffortAuto: Bool? = nil,
         advertisedEfforts: [AgentReasoningEffort] = []
     ) async throws -> MainModelSelectionResult {
+        let modelId = try await resolveSelectedModel(modelId, catalog: []) ?? modelId
         var params: JSONObject = ["sessionId": sessionId, "modelId": modelId]
         var meta: JSONObject = [:]
         if let reasoningEffortAuto {

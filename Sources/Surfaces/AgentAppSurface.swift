@@ -762,6 +762,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var checkpoints: [AgentTurnCheckpointSummary] = []
     @Published public var selectedCheckpointTurnCount: Int?
     @Published public var selectedCheckpointPath: String?
+    @Published public private(set) var checkpointRevealGeneration = 0
     @Published public var checkpointDiffPreview: String = ""
     @Published public var checkpointStatusMessage: String?
     /// B3: durable, managed attachments attached to the next message.
@@ -829,6 +830,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// True while an older-page keyset load is in flight (UI disable / spinner).
     /// Derived from `loadingOlderGeneration != 0` for ownership-safe clears.
     @Published public private(set) var isLoadingOlderMessages = false
+    @Published public private(set) var messageScrollTarget: AgentChatTimelineScrollTarget?
     /// Monotonic owner token for the active older-page load (0 = idle).
     /// Stale Tasks must not clear a newer load's flag (SSHRemoteView pattern).
     private var loadingOlderGeneration: UInt64 = 0
@@ -878,7 +880,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // UX-XPLAT-REVERT-UNDO: drops the transient checkpoint-revert undo toast when
     // the undo window lapses. Cancelled on a new revert, on undo, or on teardown.
     private var checkpointRevertUndoExpiryTask: Task<Void, Never>?
+    private var checkpointPreviewGeneration: UInt64 = 0
+    var beforeCheckpointPreviewFetchForTesting: (@MainActor (UInt64) async -> Void)?
     private var messageHistoryLoadTask: Task<Void, Never>?
+    private var olderMessageLoadTask: Task<Void, Never>?
+    private var messageRevealGeneration: UInt64 = 0
+    private var olderMessageLoadFailure: String?
     private var botPeerReconciliationTask: Task<Void, Never>?
     /// Waiting peer markup polls at 5s. Tests override this (keep the field writable).
     var botPeerReconciliationIntervalNanoseconds: UInt64 = 5_000_000_000
@@ -1201,6 +1208,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Below this the archive saves little and restore cost is not worth it.
     var hiddenArchiveMinimumHotTextBytes = 1 << 20
     var beforeHiddenArchiveCommitForTesting: (() async -> Void)?
+    var beforeMessageRevealLookupForTesting: (() async -> Void)?
     var hiddenTimelineIsArchivedForTesting: Bool { hiddenTimelineArchive != nil }
     var coldRestoreIsInFlightForTesting: Bool { coldRestoreTask != nil }
     var visibilitySessionForTesting: AgentVisibilitySession { visibilitySession }
@@ -3362,14 +3370,55 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return !next.contains(where: { $0.checkpointTurnCount == selected })
     }
 
+    public func revealCheckpoint(checkpointTurnCount: Int, expectedRunID: AgentRunID, path: String?) async throws {
+        guard let threadId = selectedThreadId, let checkpointRepo else {
+            throw AgentAppSurfaceCheckpointRevealError.notFound
+        }
+        let generation = selectThreadOpenGeneration
+        let repository = checkpointRepo
+        let fetched = try await Task.detached(priority: .userInitiated) {
+            try repository.get(threadId: threadId, checkpointTurnCount: checkpointTurnCount)
+        }.value
+        guard !Task.isCancelled, selectThreadOpenGeneration == generation, selectedThreadId == threadId else {
+            throw CancellationError()
+        }
+        guard let fetched, fetched.runId == expectedRunID,
+              path == nil || fetched.files.contains(where: { $0.path == path }) else {
+            throw AgentAppSurfaceCheckpointRevealError.notFound
+        }
+        let summary = checkpoints.first(where: { $0.checkpointTurnCount == checkpointTurnCount && $0.runId == expectedRunID })
+            ?? AgentTurnCheckpointSummary(
+                threadId: fetched.threadId, runId: fetched.runId, turnId: fetched.turnId,
+                checkpointTurnCount: fetched.checkpointTurnCount, checkpointRef: fetched.checkpointRef,
+                status: fetched.status, files: fetched.files, completedAt: fetched.completedAt
+            )
+        guard summary.runId == expectedRunID else { throw AgentAppSurfaceCheckpointRevealError.notFound }
+        if !checkpoints.contains(where: { $0.checkpointTurnCount == checkpointTurnCount && $0.runId == expectedRunID }) {
+            checkpoints.append(summary)
+        }
+        showPlanSidebar = true
+        selectCheckpoint(summary, path: path, fetchedCheckpoint: fetched)
+        checkpointRevealGeneration += 1
+    }
+
     public func selectCheckpoint(_ checkpoint: AgentTurnCheckpointSummary, path: String?) {
+        selectCheckpoint(checkpoint, path: path, fetchedCheckpoint: nil)
+    }
+
+    private func selectCheckpoint(
+        _ checkpoint: AgentTurnCheckpointSummary,
+        path: String?,
+        fetchedCheckpoint: AgentTurnCheckpointSummary?
+    ) {
         selectedCheckpointTurnCount = checkpoint.checkpointTurnCount
         selectedCheckpointPath = path
         checkpointStatusMessage = nil
         loadCheckpointDiffPreview(
             threadId: selectedThreadId,
             checkpointTurnCount: checkpoint.checkpointTurnCount,
-            path: path
+            expectedRunID: checkpoint.runId,
+            path: path,
+            fetchedCheckpoint: fetchedCheckpoint
         )
     }
 
@@ -3381,8 +3430,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func loadCheckpointDiffPreview(
         threadId: AgentThreadID?,
         checkpointTurnCount: Int,
-        path: String?
+        expectedRunID: AgentRunID,
+        path: String?,
+        fetchedCheckpoint: AgentTurnCheckpointSummary? = nil
     ) {
+        checkpointPreviewGeneration &+= 1
+        let generation = checkpointPreviewGeneration
         guard let threadId, let checkpointRepo else {
             checkpointDiffPreview = ""
             return
@@ -3393,12 +3446,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         checkpointDiffPreview = ""
         Task { @MainActor [weak self] in
-            let fetched = await Task.detached(priority: .userInitiated) {
-                try? checkpointRepo.get(threadId: threadId, checkpointTurnCount: checkpointTurnCount)
-            }.value
+            await self?.beforeCheckpointPreviewFetchForTesting?(generation)
+            let fetched: AgentTurnCheckpointSummary?
+            if let fetchedCheckpoint {
+                fetched = fetchedCheckpoint
+            } else {
+                fetched = await Task.detached(priority: .userInitiated) {
+                    try? checkpointRepo.get(threadId: threadId, checkpointTurnCount: checkpointTurnCount)
+                }.value
+            }
             guard let self, !self.isDisposed,
+                  self.checkpointPreviewGeneration == generation,
                   self.selectedThreadId == threadId,
-                  self.selectedCheckpointTurnCount == checkpointTurnCount else { return }
+                  self.selectedCheckpointTurnCount == checkpointTurnCount,
+                  self.selectedCheckpointPath == path else { return }
+            guard let fetched, fetched.runId == expectedRunID,
+                  path == nil || fetched.files.contains(where: { $0.path == path }) else {
+                self.checkpointStatusMessage = "Checkpoint is no longer available."
+                return
+            }
             self.checkpointDiffPreview = Self.checkpointDiffPreviewText(from: fetched, path: path)
         }
     }
@@ -3427,7 +3493,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard showPlanSidebar,
               let threadId = selectedThreadId,
               let turnCount = selectedCheckpointTurnCount else { return }
-        loadCheckpointDiffPreview(threadId: threadId, checkpointTurnCount: turnCount, path: selectedCheckpointPath)
+        guard let checkpoint = checkpoints.first(where: { $0.checkpointTurnCount == turnCount }) else {
+            checkpointStatusMessage = "Checkpoint is no longer available."
+            checkpointDiffPreview = ""
+            return
+        }
+        loadCheckpointDiffPreview(threadId: threadId, checkpointTurnCount: turnCount, expectedRunID: checkpoint.runId, path: selectedCheckpointPath)
     }
 
     nonisolated public static func canRevertCheckpoint(
@@ -4366,6 +4437,74 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         await messageHistoryLoadTask?.value
     }
 
+    func waitForOlderMessageLoad() async {
+        await olderMessageLoadTask?.value
+    }
+
+    public func revealMessage(
+        id: AgentMessageID,
+        expectedThreadID: AgentThreadID? = nil
+    ) async throws {
+        messageRevealGeneration &+= 1
+        let generation = messageRevealGeneration
+        let selectionGeneration = selectThreadOpenGeneration
+        let originallySelectedThreadID = selectedThreadId
+        messageScrollTarget = nil
+        await beforeMessageRevealLookupForTesting?()
+        let repository = messageRepo
+        let targetMessage = await Task.detached(priority: .userInitiated) {
+            try? repository.get(id: id)
+        }.value
+        guard messageRevealGeneration == generation else {
+            throw AgentAppSurfaceMessageRevealError.selectionChanged
+        }
+        guard let targetMessage else {
+            throw AgentAppSurfaceMessageRevealError.messageNotFound(id)
+        }
+        guard expectedThreadID == nil || targetMessage.threadId == expectedThreadID else {
+            throw AgentAppSurfaceMessageRevealError.messageNotFound(id)
+        }
+        guard selectThreadOpenGeneration == selectionGeneration,
+              selectedThreadId == originallySelectedThreadID else {
+            throw AgentAppSurfaceMessageRevealError.selectionChanged
+        }
+
+        if selectedThreadId != targetMessage.threadId {
+            selectThread(targetMessage.threadId, markRead: false)
+        }
+        let openGeneration = selectThreadOpenGeneration
+        await waitForMessageHistoryLoad()
+        guard messageRevealGeneration == generation,
+              selectThreadOpenGeneration == openGeneration,
+              selectedThreadId == targetMessage.threadId else {
+            throw AgentAppSurfaceMessageRevealError.selectionChanged
+        }
+        if let failure = messagePageLoadFailureMessage {
+            throw AgentAppSurfaceMessageRevealError.historyLoadFailed(failure)
+        }
+
+        while !messages.contains(where: { $0.id == id }), messageHistoryIsPartial {
+            let previousCount = messages.count
+            if !isLoadingOlderMessages { loadOlderMessages() }
+            await waitForOlderMessageLoad()
+            guard messageRevealGeneration == generation,
+                  selectThreadOpenGeneration == openGeneration,
+                  selectedThreadId == targetMessage.threadId else {
+                throw AgentAppSurfaceMessageRevealError.selectionChanged
+            }
+            if let failure = olderMessageLoadFailure {
+                throw AgentAppSurfaceMessageRevealError.historyLoadFailed(failure)
+            }
+            if messages.count == previousCount { break }
+        }
+        guard messages.contains(where: { $0.id == id }) else {
+            throw AgentAppSurfaceMessageRevealError.messageNotFound(id)
+        }
+        messageScrollTarget = AgentChatTimelineScrollTarget(
+            anchor: "message-\(id.value.uuidString)"
+        )
+    }
+
     /// Text of the failed-read banner; nil when the read did not fail.
     public var messagePageLoadFailureMessage: String? {
         if case .failed(let message) = messagePageLoadState { return message }
@@ -4464,10 +4603,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         loadingOlderGeneration &+= 1
         let myGeneration = loadingOlderGeneration
         isLoadingOlderMessages = true
+        olderMessageLoadFailure = nil
         let repository = messageRepo
         let cursor = AgentMessageCursor(createdAt: oldest.createdAt, id: oldest.id)
         let expectedThread = threadId
-        Task { @MainActor [weak self] in
+        olderMessageLoadTask = Task { @MainActor [weak self] in
             defer {
                 // Only the live owner clears. Stale gens leave a newer load alone.
                 if let self,
@@ -4490,7 +4630,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     myGeneration: myGeneration,
                     currentGeneration: self.loadingOlderGeneration
                   ) else { return }
-            guard let loaded = payload.page else { return }
+            guard let loaded = payload.page else {
+                self.olderMessageLoadFailure = payload.failure ?? "Could not load older messages"
+                return
+            }
             self.messages = Self.mergeOlderMessagePage(
                 older: loaded.rows,
                 current: self.messages
@@ -15046,6 +15189,10 @@ public struct AgentAppView: View {
                         .foregroundStyle(DS.Palette.text)
                 }
             }
+            .onChange(of: vm.checkpointRevealGeneration) { _ in
+                planSidebarIntent = .forcedVisible
+                applyAdaptiveSidebars(width: proxy.size.width, event: .structural)
+            }
         }
         .background(DS.Palette.bg)
         .background(newThreadShortcut)
@@ -15715,7 +15862,8 @@ public struct AgentAppView: View {
             rejoinToken: vm.focusTick &+ timelineThreadRejoinEpoch,
             followToken: workDisclosureLayoutEpoch,
             scrollToBottomIdentifier: "agent.timeline.scrollToBottom",
-            accessibilityIdentifier: "agent.timeline"
+            accessibilityIdentifier: "agent.timeline",
+            scrollTarget: vm.messageScrollTarget
         ) { timelineColumnWidth in
                         // AA-25: materialize the merged entries ONCE per body; the
                         // property rebuilt two whole-thread dictionaries each read
@@ -20061,6 +20209,25 @@ private struct AgentThreadDropDelegate: DropDelegate {
 }
 
 
+public enum AgentAppSurfaceCheckpointRevealError: LocalizedError {
+    case notFound
+    public var errorDescription: String? { "Checkpoint not found for this run and file." }
+}
+
+public enum AgentAppSurfaceMessageRevealError: LocalizedError {
+    case messageNotFound(AgentMessageID)
+    case historyLoadFailed(String)
+    case selectionChanged
+
+    public var errorDescription: String? {
+        switch self {
+        case .messageNotFound(let id): return "Message not found: \(id.value.uuidString)"
+        case .historyLoadFailed(let message): return message
+        case .selectionChanged: return "Message reveal superseded by a newer thread selection or request"
+        }
+    }
+}
+
 @MainActor
 public final class AgentAppSurface: NSObject, Surface {
     public private(set) var descriptor: SurfaceDescriptor
@@ -20092,6 +20259,10 @@ public final class AgentAppSurface: NSObject, Surface {
         ])
         self.view = container
         super.init()
+    }
+
+    public func revealMessage(id: AgentMessageID) async throws {
+        try await viewModel.revealMessage(id: id)
     }
 
     public func focus() {

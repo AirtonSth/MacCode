@@ -142,6 +142,10 @@ public protocol CommandRouting: AnyObject {
     func sshFilesRemoteListAsync(surface: SurfaceID, path: String?) async throws -> JSONValue
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
+    func activityList(params: [String: JSONValue]) throws -> JSONValue
+    func activityListOffMain(params: [String: JSONValue]) async throws -> JSONValue
+    func activitySetViewed(params: [String: JSONValue]) throws -> JSONValue
+    func activityAcknowledge(params: [String: JSONValue]) throws -> JSONValue
     /// Sticky account usage digest for deterministic iOS pull (deprecated
     /// `token_saver.digest.get` name kept until iOS bumps its treaty pin).
     func tokenSaverDigest() -> JSONValue?
@@ -263,7 +267,7 @@ public protocol CommandRouting: AnyObject {
         before: AgentTurnCheckpointCursor?,
         expectedCatalogRevision: Int64?
     ) async throws -> AgentTurnCheckpointPage
-    func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String
+    func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, expectedRunID: UUID?, path: String?) throws -> String
     func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary
     func stopAgentRun(thread: AgentThreadID) throws
     func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot?
@@ -396,6 +400,10 @@ public protocol CommandRouting: AnyObject {
 }
 
 public extension CommandRouting {
+    func activityList(params: [String: JSONValue]) throws -> JSONValue { throw JSONRPCError.notSupported("agent.activity.list") }
+    func activityListOffMain(params: [String: JSONValue]) async throws -> JSONValue { try activityList(params: params) }
+    func activitySetViewed(params: [String: JSONValue]) throws -> JSONValue { throw JSONRPCError.notSupported("agent.activity.viewed.set") }
+    func activityAcknowledge(params: [String: JSONValue]) throws -> JSONValue { throw JSONRPCError.notSupported("agent.activity.acknowledge") }
     func listManualActions(thread: AgentThreadID) throws -> [ManualActionSnapshot] { [] }
     func pendingManualActions(for threads: [AgentThread]) -> [AgentThreadID: ManualActionSnapshot] { [:] }
     func resolveManualAction(thread: AgentThreadID, id: UUID, resolution: ManualActionResolution, note: String?) async throws -> ManualActionResolveOutcome {
@@ -2626,7 +2634,8 @@ public final class JSONRPCDispatcher {
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
                     "attachment_get_v1": .bool(true),
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
-                    "account_usage_get_v1": .bool(true)
+                    "account_usage_get_v1": .bool(true),
+                    "agent_activity": .object(["protocol_version": .number(1)])
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {
@@ -4070,6 +4079,12 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: try await router.getAgentAttachment(request))
             case "agent.account.usage.get":
                 return .init(id: id, result: try await router.getAgentAccountUsage())
+            case "agent.activity.list":
+                return .init(id: id, result: try await router.activityListOffMain(params: params))
+            case "agent.activity.viewed.set":
+                return .init(id: id, result: try router.activitySetViewed(params: params))
+            case "agent.activity.acknowledge":
+                return .init(id: id, result: try router.activityAcknowledge(params: params))
             case "agent.manual_action.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let actions = try router.listManualActions(thread: tid)
@@ -4282,6 +4297,15 @@ public final class JSONRPCDispatcher {
                 // the iOS fake (which uses checkpoint_turn_count) stayed green.
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let turnCount = (params["turn_count"] ?? params["checkpoint_turn_count"])?.intValue else { throw JSONRPCError.invalidParams }
+                let expectedRunID: UUID?
+                if let rawExpectedRunID = params["expected_run_id"] {
+                    guard let value = rawExpectedRunID.stringValue, let parsed = UUID(uuidString: value) else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    expectedRunID = parsed
+                } else {
+                    expectedRunID = nil
+                }
                 // Opt-in v1 caps validated before the checkpoint patch load so a
                 // malformed cellular request never pays for a full unbounded diff.
                 // Shares GitDiffBoundedResponse with git.diff (one clip algorithm).
@@ -4289,6 +4313,7 @@ public final class JSONRPCDispatcher {
                 let diff = try router.agentCheckpointDiff(
                     thread: tid,
                     checkpointTurnCount: turnCount,
+                    expectedRunID: expectedRunID,
                     path: params["path"]?.stringValue
                 )
                 if let caps {
@@ -5041,6 +5066,8 @@ public final class JSONRPCDispatcher {
     static func mapDomainError(_ error: Error, method: String) -> JSONRPCError {
         let verbose = String(describing: error)
         switch error {
+        case let error as JSONRPCError:
+            return error
         case let error as AgentRoutingRevisionError:
             let expected: Int
             let actual: Int

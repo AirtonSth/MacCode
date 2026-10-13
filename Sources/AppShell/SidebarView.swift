@@ -219,6 +219,9 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var isBotsSelected: Bool = false
     /// Host-authoritative active agent thread count for the sidebar badge.
     @Published public private(set) var activeThreadCount: Int = 0
+    @Published private(set) var activityCounts = PetActivityCounts.zero
+    @Published private(set) var workspaceActivityCounts: [String: PetActivityCounts] = [:]
+    private var activityCountsObserver: UUID?
     /// Fired when the user activates a workspace row so the shell can leave
     /// the Schedule Tasks / Active Threads main-content destination.
     var onWorkspaceContentActivated: (() -> Void)?
@@ -353,6 +356,10 @@ public final class SidebarViewModel: ObservableObject {
         // :95 -- Wire the default AppKit prompter after self is available.
         // Tests replace workspacePrompter with a fake before calling any prompt path.
         workspacePrompter = AppKitWorkspacePrompter(viewModel: self)
+        activityCountsObserver = PetActivityCountsProjection.shared.observe { [weak self] global, workspaces in
+            self?.activityCounts = global
+            self?.workspaceActivityCounts = workspaces
+        }
         reload()
         reloadInsomnia()
         reloadAccountUsage()
@@ -372,6 +379,9 @@ public final class SidebarViewModel: ObservableObject {
             ProviderUsageCrossProcess.removeObserver(accountUsageDistributedObserver)
         }
         accountUsageReloadTask?.cancel()
+        if let activityCountsObserver {
+            Task { @MainActor in PetActivityCountsProjection.shared.removeObserver(activityCountsObserver) }
+        }
         powerMonitor.stop()
         insomniaPower.releaseProcessAssertions()
     }
@@ -406,8 +416,6 @@ public final class SidebarViewModel: ObservableObject {
                 selectedWorkspaceIDs = nextIDs
             }
         }
-        // Live Active Threads badge: host projection count, same source as Pet.
-        // Primary threads only — delegated bot-peer runs show under Subagents.
         refreshActiveCount()
         // PF-13: the account blob is peeked once at mount. Later rereads are
         // driven by `.rc2PrivateAccountChanged`, not every refreshFromState.
@@ -416,14 +424,10 @@ public final class SidebarViewModel: ObservableObject {
         }
     }
 
-    /// Active threads plus busy terminals; cheap, no repository reads.
+    /// Refresh shared server counts after the current UI turn.
     func refreshActiveCount() {
-        guard let ctx = context else { return }
-        let next = ctx.coordinator.primaryActiveThreadIdsSnapshot().count
-            + ActiveSurfaceProjector.currentItems(context: ctx).count
-        if next != activeThreadCount {
-            activeThreadCount = next
-        }
+        guard let router else { return }
+        PetActivityCountsProjection.shared.refresh(router: router, workspaceIDs: workspaces.map(\.id))
     }
 
     /// UX-SIDEBAR-COMPLETED-DOT: detect workspaces whose action just finished and
@@ -1135,12 +1139,14 @@ public final class SidebarViewModel: ObservableObject {
     nonisolated public static func workspaceRowAccessibilityValue(
         busyDescription: String?,
         unreadCount: Int,
+        activityDescription: String? = nil,
         pinned: Bool,
         checked: Bool
     ) -> String {
         var parts: [String] = []
         if let desc = busyDescription { parts.append(desc) }
         if unreadCount > 0 { parts.append("\(unreadCount) unread") }
+        if let activityDescription, !activityDescription.isEmpty { parts.append(activityDescription) }
         if pinned { parts.append("pinned") }
         if checked { parts.append("selected") }
         return parts.joined(separator: ", ")
@@ -1547,11 +1553,19 @@ struct SidebarActionRow: View {
                 .font(.system(size: 16, weight: highlight ? .semibold : .regular))
                 .frame(width: 20, height: 20)
                 .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.accent : DS.Palette.text))
-            Text(title)
-                .font(DS.Font.body)
-                .fontWeight(highlight ? .semibold : .regular)
-                .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.text : DS.Palette.text))
-                .lineLimit(1)
+            Group {
+                let lines = title.split(separator: "\n", maxSplits: 1).map(String.init)
+                if lines.count == 2 {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(lines[0]).font(DS.Font.body).lineLimit(1)
+                        Text(lines[1]).font(DS.Font.caption2).lineLimit(1)
+                    }
+                } else {
+                    Text(title).font(DS.Font.body).lineLimit(1)
+                }
+            }
+            .fontWeight(highlight ? .semibold : .regular)
+            .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.text : DS.Palette.text))
             Spacer(minLength: 0)
             if let badgeText {
                 Text(badgeText)
@@ -1606,7 +1620,6 @@ struct TailcatConnectionBadge: View {
 public struct SidebarRootView: View {
     @ObservedObject var vm: SidebarViewModel
     var botsVM: BotsViewModel?
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showsInsomniaOptions = false
     /// Toggled to true to programmatically focus the filter field (Cmd+F).
     @State private var filterFocusRequest: Bool = false
@@ -1735,20 +1748,18 @@ public struct SidebarRootView: View {
                 Button(action: onOpenActiveThreads) {
                     SidebarActionRow(
                         symbol: "bolt.horizontal.circle",
-                        title: "Active Threads",
-                        isSelected: vm.isActiveThreadsSelected,
-                        badgeText: PetActiveThreadCountFormatter.badgeText(count: vm.activeThreadCount),
-                        badgeIsBlue: true
+                        title: vm.activityCounts.isAvailable
+                            ? "Activity\n\(vm.activityCounts.running) running · \(vm.activityCounts.needsYou) need you"
+                            : "Activity\nActivity unavailable",
+                        isSelected: vm.isActiveThreadsSelected
                     )
                 }
                 .buttonStyle(.plain)
-                .help(PetActiveThreadCountFormatter.activeItemsAccessibilityValue(count: vm.activeThreadCount))
-                .accessibilityIdentifier("sidebar.activeThreads")
-                .accessibilityLabel(
-                    vm.activeThreadCount > 0
-                        ? PetActiveThreadCountFormatter.activeItemsAccessibilityValue(count: vm.activeThreadCount)
-                        : "Active Threads"
-                )
+                .help(vm.activityCounts.isAvailable ? "\(vm.activityCounts.running) running · \(vm.activityCounts.needsYou) need you" : "Activity status unavailable")
+                .accessibilityIdentifier("sidebar.activity")
+                .accessibilityLabel(vm.activityCounts.isAvailable
+                    ? "Activity, \(vm.activityCounts.running) running, \(vm.activityCounts.needsYou) need you"
+                    : "Activity, status unavailable")
                 .accessibilityAddTraits(vm.isActiveThreadsSelected ? .isSelected : [])
 
                 Button(action: onOpenScheduledTasks) {
@@ -2279,17 +2290,27 @@ public struct SidebarRootView: View {
     /// the pure `SidebarViewModel.workspaceRowAccessibilityValue(...)` helper.
     private func workspaceRowAccessibilityValue(
         ws: Workspace,
-        busy: Bool,
         checked: Bool,
         pinned: Bool
     ) -> String {
-        let busyDesc = busy ? vm.busyTooltip(for: ws) : nil
+        let busyDesc: String? = nil
+        let activity = vm.workspaceActivityCounts[ws.id.description].map(Self.workspaceActivityLabel)
         return SidebarViewModel.workspaceRowAccessibilityValue(
             busyDescription: busyDesc,
-            unreadCount: ws.notificationsUnread,
+            unreadCount: 0,
+            activityDescription: activity,
             pinned: pinned,
             checked: checked
         )
+    }
+
+    static func workspaceActivityLabel(_ counts: PetActivityCounts) -> String {
+        guard counts.isAvailable else { return "Activity unavailable" }
+        if counts.running > 0 || counts.needsYou > 0 {
+            return [counts.running > 0 ? "\(counts.running) running" : nil, counts.needsYou > 0 ? "\(counts.needsYou) needs you" : nil]
+                .compactMap { $0 }.joined(separator: " · ")
+        }
+        return counts.newResults > 0 ? "New result" : ""
     }
 
     // MARK: Row highlight helpers
@@ -2326,7 +2347,6 @@ public struct SidebarRootView: View {
         let checked = vm.selectedWorkspaceIDs.contains(ws.id)
         let desc = ws.metadata["description"]
         let pinned = ws.metadata["pinned"] == "true"
-        let busy = vm.isWorkspaceBusy(ws)
         let highlightTone = SidebarSelectionHighlightResolver().resolve(workspace: ws, isSelected: selected, isChecked: checked)
         Button {
             let flags = NSEvent.modifierFlags
@@ -2351,37 +2371,17 @@ public struct SidebarRootView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(ws.name).font(selected ? DS.Font.bodyStrong : DS.Font.body)
                         .foregroundColor(DS.Palette.text).lineLimit(1)
-                    if let d = desc, !d.isEmpty {
+                    let activity = vm.workspaceActivityCounts[ws.id.description].map(Self.workspaceActivityLabel) ?? ""
+                    if !activity.isEmpty {
+                        Text(activity).font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                    } else if let d = desc, !d.isEmpty {
                         Text(d).font(DS.Font.caption2)
                             .foregroundColor(DS.Palette.textTertiary).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 0)
-                if busy {
-                    let busyLabel = vm.busyTooltip(for: ws) ?? "Workspace busy"
-                    // UX-SIDEBAR-P3-BUSYTIP: use the per-workspace busy
-                    // source description instead of the generic label so
-                    // VoiceOver and tooltip convey agent-run vs terminal.
-                    DSBusySpinner(label: busyLabel)
-                } else if vm.completedWorkspaces.contains(ws.id) {
-                    // UX-SIDEBAR-COMPLETED-DOT: the action finished — a small success
-                    // dot takes the spinner's slot until the user opens the workspace.
-                    Circle()
-                        .fill(DS.Palette.success)
-                        .frame(width: 7, height: 7)
-                        .frame(width: 16, height: 16)
-                        .help("Action completed")
-                        .accessibilityLabel("Action completed")
-                        .transition(.scale(scale: 0.4).combined(with: .opacity))
-                }
-                if ws.notificationsUnread > 0 {
-                    DSPill("\(ws.notificationsUnread)", tone: .accent)
-                }
             }
-            // UX-SIDEBAR-COMPLETED-DOT: fade/scale the spinner→dot swap in subtly
-            // (reduced-motion shows it instantly).
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.2),
-                       value: vm.completedWorkspaces.contains(ws.id))
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 38)
             .background(
@@ -2416,7 +2416,7 @@ public struct SidebarRootView: View {
         // name + status in one focused element rather than a string of
         // context-free sub-elements (number pill, icon-only pin state, etc).
         .accessibilityLabel(ws.name)
-        .accessibilityValue(workspaceRowAccessibilityValue(ws: ws, busy: busy, checked: checked, pinned: pinned))
+        .accessibilityValue(workspaceRowAccessibilityValue(ws: ws, checked: checked, pinned: pinned))
         .accessibilityIdentifier("sidebar.workspaceRow.\(ws.id.value.uuidString)")
         .onDrag {
             vm.draggingWorkspaceID = ws.id

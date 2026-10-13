@@ -548,8 +548,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Schedule store commits (including Run Now) reload Agent App rails.
     func installScheduledTaskStoreObserver() {
         removeScheduledTaskStoreObserver()
-        scheduledTaskStoreObserver = ScheduledTaskCrossProcess.observeStoreChanged { [weak self] _ in
+        scheduledTaskStoreObserver = ScheduledTaskCrossProcess.observeStoreChanged { [weak self] reason in
             self?.reloadAgentSurfacesFromScheduledStoreChange()
+            EventBus.shared.publish(kind: .botSchedulerUpdated, payload: .object([
+                "source": .string("scheduled_tasks"),
+                "reason": .string(reason ?? "changed"),
+            ]))
         }
     }
 
@@ -2086,18 +2090,40 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     // MARK: - Notification deep-link routing
 
+    private var notificationRouteGeneration = UUID()
+
     private func handleNotificationResponse(_ response: UNNotificationResponse) {
         let userInfo = response.notification.request.content.userInfo
         let stringInfo = Dictionary(userInfo.compactMap { (k, v) -> (String, String)? in
             guard let ks = k as? String, let vs = v as? String else { return nil }
             return (ks, vs)
         }, uniquingKeysWith: { a, _ in a })
+        notificationRouteGeneration = UUID()
+        let generation = notificationRouteGeneration
         guard let intent = Self.routeFromNotification(userInfo: stringInfo) else { return }
+        if intent.opensActivity {
+            windowController?.openActivityRoute(intent: intent)
+            return
+        }
+        guard let threadId = intent.threadId else { return }
         do {
-            try openNotificationRoute(intent)
+            let surface = try openNotificationRoute(intent)
+            guard let messageID = intent.finalMessageId else { return }
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.notificationRouteGeneration == generation,
+                      let agent = SurfaceRegistry.shared.surface(surface.id) as? AgentAppSurface,
+                      agent.viewModel.selectedThreadId == threadId else { return }
+                do {
+                    try await agent.viewModel.revealMessage(id: messageID, expectedThreadID: threadId)
+                } catch {
+                    NSLog("RemoteCode notification target missing thread=%@ message=%@ error=%@",
+                          threadId.value.uuidString, messageID.description, error.localizedDescription)
+                }
+            }
         } catch {
             NSLog("RemoteCode notification route failed thread=%@ error=%@",
-                  intent.threadId.value.uuidString, error.localizedDescription)
+                  threadId.value.uuidString, error.localizedDescription)
         }
     }
 
@@ -2108,19 +2134,35 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     @discardableResult
     func openNotificationRoute(_ intent: NotificationRouteIntent) throws -> SurfaceDescriptor {
         guard let router else { throw LayoutError.workspaceNotFound }
-        return try router.openAgentThread(thread: intent.threadId, markRead: true)
+        guard let threadId = intent.threadId else { throw LayoutError.workspaceNotFound }
+        return try router.openAgentThread(thread: threadId, markRead: false)
     }
 
     /// Pure mapper: notification userInfo -> RouteIntent.
     /// Returns nil when `threadId` key is absent or not a valid UUID.
     /// `workspaceId` is optional; absent or invalid value yields nil workspace.
     public static func routeFromNotification(userInfo: [String: String]) -> NotificationRouteIntent? {
-        guard let raw = userInfo["threadId"],
-              let uuid = UUID(uuidString: raw) else { return nil }
+        let activityItemId = userInfo["activityItemId"].flatMap { value -> String? in
+            guard value.utf8.count <= 256,
+                  ["run:", "notification:", "scheduled-occurrence:"].contains(where: value.hasPrefix) else { return nil }
+            return value
+        }
+        let opensActivity = userInfo["activityDestination"] == "true" || activityItemId != nil
+        let threadId = userInfo["threadId"].flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
+        guard opensActivity || threadId != nil else { return nil }
         let workspaceId = userInfo["workspaceId"]
             .flatMap { UUID(uuidString: $0) }
             .map { WorkspaceID($0) }
-        return NotificationRouteIntent(threadId: AgentThreadID(uuid), workspaceId: workspaceId)
+        let finalMessageId = opensActivity
+            ? nil
+            : userInfo["finalMessageId"].flatMap(UUID.init(uuidString:)).map(AgentMessageID.init)
+        return NotificationRouteIntent(
+            threadId: threadId,
+            workspaceId: workspaceId,
+            finalMessageId: finalMessageId,
+            opensActivity: opensActivity,
+            activityItemId: activityItemId
+        )
     }
 
     /// GAP-4: publish `_remotecode._tcp` so the iOS app can find this
@@ -2218,12 +2260,24 @@ final class BonjourDelegate: NSObject, NetServiceDelegate {
 /// the notification payload does not carry `workspaceId` — the router
 /// can still find the thread by ID alone.
 public struct NotificationRouteIntent: Equatable {
-    public let threadId: AgentThreadID
+    public let threadId: AgentThreadID?
     public let workspaceId: WorkspaceID?
+    public let finalMessageId: AgentMessageID?
+    public let opensActivity: Bool
+    public let activityItemId: String?
 
-    public init(threadId: AgentThreadID, workspaceId: WorkspaceID?) {
+    public init(
+        threadId: AgentThreadID?,
+        workspaceId: WorkspaceID?,
+        finalMessageId: AgentMessageID? = nil,
+        opensActivity: Bool = false,
+        activityItemId: String? = nil
+    ) {
         self.threadId = threadId
         self.workspaceId = workspaceId
+        self.finalMessageId = finalMessageId
+        self.opensActivity = opensActivity
+        self.activityItemId = activityItemId
     }
 }
 

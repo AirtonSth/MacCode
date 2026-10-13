@@ -2353,6 +2353,31 @@ public struct AgentRun: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+public struct AgentRunResult: Codable, Sendable, Equatable, Identifiable {
+    public let runId: AgentRunID
+    public let finalMessageId: AgentMessageID?
+    public let summary: String?
+    public var viewedAt: Date?
+    public var attentionAcknowledgedAt: Date?
+
+    public var id: AgentRunID { runId }
+
+    public init(
+        runId: AgentRunID,
+        finalMessageId: AgentMessageID? = nil,
+        summary: String? = nil,
+        viewedAt: Date? = nil,
+        attentionAcknowledgedAt: Date? = nil
+    ) {
+        self.runId = runId
+        self.finalMessageId = finalMessageId
+        self.summary = summary.map(AssistantToolMarkupSanitizer.strip)
+            .map { String($0.prefix(500)) }
+        self.viewedAt = viewedAt
+        self.attentionAcknowledgedAt = attentionAcknowledgedAt
+    }
+}
+
 public struct ProviderSessionRuntime: Codable, Sendable, Equatable {
     public let threadId: AgentThreadID
     public var provider: AgentProvider
