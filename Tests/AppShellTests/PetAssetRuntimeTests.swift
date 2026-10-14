@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import CoreGraphics
 import CryptoKit
 import ImageIO
@@ -146,6 +147,28 @@ final class PetAssetRuntimeTests: XCTestCase {
         let reloadedBlink = try atlas.idleMicroActionFrame(action: .blink, index: 2)
         XCTAssertFalse(blink.image === reloadedBlink.image,
             "switching idle micro-action rows must release the prior action's frame cache")
+    }
+
+    func test_animationFramesRepublishOnlyTheFrameModel() throws {
+        // WHY: the sprite ticks at 2-7 fps whenever an agent runs. When the frame was a
+        // @Published PetViewModel property, every tick re-ran the badges, the accessibility
+        // value and an open popover. Only the sprite image may change per frame.
+        let atlas = try PetAtlas.bundled()
+        let model = PetViewModel(settings: AppSettings(petEnabled: true))
+        var modelChanges = 0
+        var frameChanges = 0
+        let modelSink = model.objectWillChange.sink { modelChanges += 1 }
+        let frameSink = model.frameModel.objectWillChange.sink { frameChanges += 1 }
+        defer { modelSink.cancel(); frameSink.cancel() }
+
+        for tick in 0..<50 {
+            let frame = try atlas.frame(state: .coding, index: tick % 8)
+            model.setFrame(frame)
+            XCTAssertTrue(model.currentImage === frame.appKitImage)
+        }
+
+        XCTAssertEqual(modelChanges, 0)
+        XCTAssertEqual(frameChanges, 50)
     }
 
     func test_perfProof_repeatedAnimationFrameBridge() throws {

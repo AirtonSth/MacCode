@@ -39,6 +39,7 @@ final class PetActivityCountsProjection {
     private var latestWorkspaceIDs: Set<WorkspaceID> = []
     private weak var latestRouter: AppCommandRouter?
     private var eventSubscription: UUID?
+    private(set) var completedRefreshCountForTests = 0
 
     func observe(_ observer: @escaping (PetActivityCounts, [String: PetActivityCounts]) -> Void) -> UUID {
         let id = UUID()
@@ -102,28 +103,28 @@ final class PetActivityCountsProjection {
             }
             guard let router, !Task.isCancelled, self.latestRouter === router else { return }
             do {
-                let globalPage = try await Self.load(router: router, workspaceID: nil)
+                let counts = try await router.activityCountsOffMain()
                 var workspacePages: [String: PetActivityCounts] = [:]
                 for workspaceID in requestedWorkspaceIDs {
-                    guard !Task.isCancelled, self.generation == request else { return }
-                    if let counts = globalPage.workspaceCounts {
-                        workspacePages[workspaceID.value.uuidString] = PetActivityCounts(counts[workspaceID.value.uuidString] ?? ActivityCounts(running: 0, queued: 0, needsYou: 0, finished: 0, newResults: 0))
-                    } else {
-                        let workspacePage = try await Self.load(router: router, workspaceID: workspaceID.value.uuidString)
-                        workspacePages[workspaceID.value.uuidString] = PetActivityCounts(workspacePage.counts)
-                    }
+                    workspacePages[workspaceID.value.uuidString] = PetActivityCounts(counts.byWorkspace[workspaceID.value.uuidString] ?? ActivityCounts(running: 0, queued: 0, needsYou: 0, finished: 0, newResults: 0))
                 }
                 guard !Task.isCancelled, self.generation == request else { return }
-                self.global = PetActivityCounts(globalPage.counts)
-                self.byWorkspace = workspacePages
-                for observer in self.observers.values { observer(self.global, self.byWorkspace) }
+                self.publish(global: PetActivityCounts(counts.global), byWorkspace: workspacePages)
             } catch {
                 guard !Task.isCancelled, self.generation == request, self.latestRouter === router else { return }
-                self.global = Self.unavailable(self.global)
-                self.byWorkspace = self.byWorkspace.mapValues(Self.unavailable)
-                for observer in self.observers.values { observer(self.global, self.byWorkspace) }
+                self.publish(global: Self.unavailable(self.global), byWorkspace: self.byWorkspace.mapValues(Self.unavailable))
             }
         }
+    }
+
+    /// Sidebar and Pet observers rebuild their views on every call, so a refresh that
+    /// lands on the counts they already show must not reach them.
+    private func publish(global: PetActivityCounts, byWorkspace: [String: PetActivityCounts]) {
+        completedRefreshCountForTests &+= 1
+        guard global != self.global || byWorkspace != self.byWorkspace else { return }
+        self.global = global
+        self.byWorkspace = byWorkspace
+        for observer in observers.values { observer(global, byWorkspace) }
     }
 
     private static func unavailable(_ counts: PetActivityCounts) -> PetActivityCounts {
@@ -133,12 +134,5 @@ final class PetActivityCountsProjection {
             newResults: counts.newResults,
             isAvailable: false
         )
-    }
-
-    private static func load(router: AppCommandRouter, workspaceID: String?) async throws -> ActivityPage {
-        var params: [String: JSONValue] = ["limit": .number(1)]
-        if let workspaceID { params["workspace_id"] = .string(workspaceID) }
-        let value = try await router.activityListOffMain(params: params)
-        return try ActivityPage.makeJSONDecoder().decode(ActivityPage.self, from: JSONEncoder().encode(value))
     }
 }

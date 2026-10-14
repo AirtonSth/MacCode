@@ -2,10 +2,16 @@ import AppKit
 import Persistence
 import SwiftUI
 
+/// The sprite frame lives apart from PetViewModel so a 2-7 fps animation tick redraws
+/// only the image, not the badges, accessibility value or popover that observe the model.
+@MainActor
+final class PetFrameModel: ObservableObject {
+    @Published fileprivate(set) var image: NSImage?
+}
+
 @MainActor
 public final class PetViewModel: ObservableObject {
     @Published public private(set) var animationState: PetAnimationState = .idle
-    @Published public private(set) var currentImage: NSImage?
     @Published public private(set) var items: [PetAttentionItem] = []
     @Published public private(set) var count = 0
     @Published public private(set) var activeThreads: [PetActiveThreadItem] = []
@@ -15,6 +21,8 @@ public final class PetViewModel: ObservableObject {
     @Published public var routeError: String?
 
     private(set) var currentFrame: PetAtlasFrame?
+    let frameModel = PetFrameModel()
+    public var currentImage: NSImage? { frameModel.image }
 
     public init(settings: AppSettings) {
         self.settings = settings
@@ -51,7 +59,7 @@ public final class PetViewModel: ObservableObject {
 
     func setFrame(_ frame: PetAtlasFrame) {
         currentFrame = frame
-        currentImage = frame.appKitImage
+        frameModel.image = frame.appKitImage
     }
 
     public func apply(snapshot: PetAttentionSnapshot) {
@@ -60,11 +68,13 @@ public final class PetViewModel: ObservableObject {
     }
 
     public func apply(activeThreads: [PetActiveThreadItem]) {
+        guard activeThreads != self.activeThreads else { return }
         self.activeThreads = activeThreads
         activeThreadCount = activeThreads.count
     }
 
     func apply(activityCounts: PetActivityCounts) {
+        guard activityCounts != self.activityCounts else { return }
         self.activityCounts = activityCounts
     }
 

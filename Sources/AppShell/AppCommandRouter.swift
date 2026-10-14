@@ -309,6 +309,10 @@ public final class AgentAppReadGateway: @unchecked Sendable {
         try await execute { try service.list(params) }
     }
 
+    func activityCounts(service: ActivityService) async throws -> (global: AgentActivityCounts, byWorkspace: [String: AgentActivityCounts]) {
+        try await execute { try service.counts() }
+    }
+
     public func message(id: AgentMessageID) async throws -> AgentMessage? {
         try await execute {
             try AgentMessageRepository(db: self.readDB).get(id: id)
@@ -9256,6 +9260,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func activityListOffMain(params: [String: JSONValue]) async throws -> JSONValue {
         guard let context else { throw JSONRPCError.internalError }
         return try await agentAppReadGateway.listActivity(service: ActivityService(context: context), params: params)
+    }
+
+    func activityCountsOffMain() async throws -> (global: AgentActivityCounts, byWorkspace: [String: AgentActivityCounts]) {
+        guard let context else { throw JSONRPCError.internalError }
+        return try await agentAppReadGateway.activityCounts(service: ActivityService(context: context))
     }
 
     public func activitySetViewed(params: [String: JSONValue]) throws -> JSONValue {

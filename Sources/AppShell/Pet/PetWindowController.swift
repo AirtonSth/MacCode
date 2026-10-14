@@ -243,21 +243,30 @@ enum PetScreenGeometry {
     }
 }
 
+/// Observes only the frame, so animation ticks never re-run PetSpriteView's body.
+private struct PetSpriteFrameView: View {
+    @ObservedObject var frame: PetFrameModel
+
+    var body: some View {
+        if let image = frame.image {
+            Image(nsImage: image)
+                .resizable()
+                .interpolation(.none)
+                .aspectRatio(contentMode: .fit)
+                .accessibilityHidden(true)
+        } else {
+            Color.clear
+        }
+    }
+}
+
 private struct PetSpriteView: View {
     @ObservedObject var model: PetViewModel
     let onActivate: () -> Void
 
     var body: some View {
         ZStack {
-            if let image = model.currentImage {
-                Image(nsImage: image)
-                    .resizable()
-                    .interpolation(.none)
-                    .aspectRatio(contentMode: .fit)
-                    .accessibilityHidden(true)
-            } else {
-                Color.clear
-            }
+            PetSpriteFrameView(frame: model.frameModel)
 
             VStack {
                 HStack(alignment: .top) {
@@ -1006,9 +1015,11 @@ public final class PetWindowController: NSObject {
             self?.updateMousePassThrough(at: NSEvent.mouseLocation)
             return event
         }
+        // Global monitor handlers run on the main thread; filter there instead of hopping
+        // a Task per mouse move made anywhere on screen.
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { [weak self] _ in
             let point = NSEvent.mouseLocation
-            Task { @MainActor in self?.enqueueGlobalMouseMove(at: point) }
+            MainActor.assumeIsolated { self?.handleGlobalMouseMove(at: point) }
         }
     }
 
@@ -1024,6 +1035,14 @@ public final class PetWindowController: NSObject {
     }
 
     func enqueueGlobalMouseMoveForTests(_ point: CGPoint) {
+        handleGlobalMouseMove(at: point)
+    }
+
+    /// Moves outside the panel matter only to restore input after the panel was left
+    /// ignoring events; once it accepts events again they change nothing, so they stop here.
+    private func handleGlobalMouseMove(at point: CGPoint) {
+        guard let panel = petPanel else { return }
+        guard panel.ignoresMouseEvents || panel.frame.insetBy(dx: -2, dy: -2).contains(point) else { return }
         enqueueGlobalMouseMove(at: point)
     }
 
@@ -1052,12 +1071,13 @@ public final class PetWindowController: NSObject {
     private func updateMousePassThrough(at screenPoint: CGPoint) {
         guard let panel = petPanel, panel.isVisible, let spriteView else { return }
         guard panel.frame.contains(screenPoint), !spriteView.didDrag else {
-            panel.ignoresMouseEvents = false
+            if panel.ignoresMouseEvents { panel.ignoresMouseEvents = false }
             return
         }
         let windowPoint = panel.convertPoint(fromScreen: screenPoint)
         let localPoint = spriteView.convert(windowPoint, from: nil)
-        panel.ignoresMouseEvents = !spriteView.isOpaque(at: localPoint)
+        let ignores = !spriteView.isOpaque(at: localPoint)
+        if panel.ignoresMouseEvents != ignores { panel.ignoresMouseEvents = ignores }
     }
 
     private func installPopoverMonitors() {

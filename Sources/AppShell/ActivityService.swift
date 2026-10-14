@@ -34,12 +34,53 @@ final class ActivityService: @unchecked Sendable {
 
     }
 
+    /// Database-only seam for parity tests and benches over a copy of real data.
+    init(db: SQLiteDB, readDB: SQLiteDB, activeRunIDProvider: @escaping (AgentThreadID) -> AgentRunID? = { _ in nil }) {
+        self.db = db
+        self.readDB = readDB
+        workspaceNames = [:]
+        self.activeRunIDProvider = activeRunIDProvider
+        registeredScripts = []
+    }
+
     func list(_ params: [String: JSONValue]) throws -> JSONValue {
         let filter = try ActivityFilter(params: params)
         let snapshotAt = filter.cursor.flatMap(ActivityCursor.init(rawValue:))?.snapshotAt ?? Date()
         let cursor = filter.cursor.flatMap(ActivityCursor.init(rawValue:))
         guard filter.cursor == nil || cursor != nil else { throw JSONRPCError.invalidParams }
 
+        var items = try projectedItems(filter: filter, snapshotAt: snapshotAt, includeDisplayDetail: true)
+        items.sort(by: Self.activityOrder)
+        let counts = Self.counts(for: items)
+        let byWorkspace = Self.workspaceCounts(for: items)
+        let selected: [AgentActivityItem]
+        switch filter.section {
+        case "running": selected = items.filter { $0.state == .queued || ($0.state == .running && !$0.blocking) }
+        case "needs_you": selected = items.filter(\.needsAction)
+        case "finished": selected = items.filter { Self.isTerminal($0.state) }
+        default: selected = items
+        }
+        let page = selected.filter { item in
+            guard let cursor else { return true }
+            return item.occurredAt < cursor.occurredAt || (item.occurredAt == cursor.occurredAt && item.id > cursor.id)
+        }
+        let limited = Array(page.prefix(filter.limit))
+        let next = page.count > filter.limit
+            ? limited.last.map { ActivityCursor(occurredAt: $0.occurredAt, id: $0.id, snapshotAt: snapshotAt).rawValue }
+            : nil
+        return try Self.json(AgentActivityPage(items: limited, nextCursor: next, counts: counts, generatedAt: snapshotAt, workspaceCounts: byWorkspace))
+    }
+
+    /// The same `counts` and `workspaceCounts` an unfiltered `list` returns, for the Pet and
+    /// sidebar indicators. It builds the identical items so the numbers cannot drift from the
+    /// Activity window, but skips what only a page shows: checkpoint files, redacted
+    /// notification summaries, the sort and the JSON encoding.
+    func counts() throws -> (global: AgentActivityCounts, byWorkspace: [String: AgentActivityCounts]) {
+        let items = try projectedItems(filter: ActivityFilter(params: [:]), snapshotAt: Date(), includeDisplayDetail: false)
+        return (Self.counts(for: items), Self.workspaceCounts(for: items))
+    }
+
+    private func projectedItems(filter: ActivityFilter, snapshotAt: Date, includeDisplayDetail: Bool) throws -> [AgentActivityItem] {
         let threads = try AgentThreadRepository(db: readDB).list().filter { !$0.isEphemeral && !AgentThreadTitle.isSubagentThreadTitle($0.title) }
         let threadByID = Dictionary(uniqueKeysWithValues: threads.map { ($0.id.description, $0) })
         let runs = try allRuns(threadByID: threadByID)
@@ -60,7 +101,7 @@ final class ActivityService: @unchecked Sendable {
             try resultRepository.list(runIds: Array(runs[start..<min(start + 500, runs.count)].map(\.runID)))
         }
         let resultByRun = Dictionary(uniqueKeysWithValues: resultRows.map { ($0.runId.description, $0) })
-        let checkpointByRun = try checkpointEvidence(runIDs: runs.map(\.runID))
+        let checkpointByRun = includeDisplayDetail ? try checkpointEvidence(runIDs: runs.map(\.runID)) : [:]
 
         var items = runs.compactMap { row -> AgentActivityItem? in
             guard let thread = threadByID[row.threadID.description] else { return nil }
@@ -135,7 +176,7 @@ final class ActivityService: @unchecked Sendable {
                 id: "notification:\(note.id)", kind: .notification, notificationID: note.id, workspaceID: note.workspaceId?.value,
                 surfaceID: note.surfaceId?.value, state: isFailure ? .failed : (isResolutionRequired ? .needsYou : .completed), title: title,
                 workspaceName: note.workspaceId.flatMap { workspaceNames[$0] },
-                summary: category == nil ? nil : (Self.notificationSummary(payload.activitySummary) ?? category?.presentation.detail),
+                summary: category == nil || !includeDisplayDetail ? nil : (Self.notificationSummary(payload.activitySummary) ?? category?.presentation.detail),
                 occurredAt: note.createdAt, finishedAt: isResolutionRequired ? nil : note.createdAt,
                 viewedAt: state?.viewedAt,
                 attentionAcknowledgedAt: isFailure ? state?.acknowledgedAt : nil,
@@ -147,28 +188,7 @@ final class ActivityService: @unchecked Sendable {
         items.append(contentsOf: registeredScripts)
         items.append(contentsOf: origins.botRequests)
         items.append(contentsOf: origins.scheduledOccurrences)
-        items = items.filter { $0.occurredAt <= snapshotAt && filter.matches($0) }
-        items.sort(by: Self.activityOrder)
-        let counts = Self.counts(for: items)
-        let byWorkspace = Dictionary(grouping: items.compactMap { item in
-            item.workspaceID.map { ($0.uuidString, item) }
-        }, by: { $0.0 }).mapValues { Self.counts(for: $0.map { $0.1 }) }
-        let selected: [AgentActivityItem]
-        switch filter.section {
-        case "running": selected = items.filter { $0.state == .queued || ($0.state == .running && !$0.blocking) }
-        case "needs_you": selected = items.filter(\.needsAction)
-        case "finished": selected = items.filter { Self.isTerminal($0.state) }
-        default: selected = items
-        }
-        let page = selected.filter { item in
-            guard let cursor else { return true }
-            return item.occurredAt < cursor.occurredAt || (item.occurredAt == cursor.occurredAt && item.id > cursor.id)
-        }
-        let limited = Array(page.prefix(filter.limit))
-        let next = page.count > filter.limit
-            ? limited.last.map { ActivityCursor(occurredAt: $0.occurredAt, id: $0.id, snapshotAt: snapshotAt).rawValue }
-            : nil
-        return try Self.json(AgentActivityPage(items: limited, nextCursor: next, counts: counts, generatedAt: snapshotAt, workspaceCounts: byWorkspace))
+        return items.filter { $0.occurredAt <= snapshotAt && filter.matches($0) }
     }
 
     func setViewed(_ params: [String: JSONValue]) throws -> JSONValue {
@@ -445,6 +465,11 @@ final class ActivityService: @unchecked Sendable {
             finished: items.filter { Self.isTerminal($0.state) }.count,
             newResults: items.filter { $0.finishedAt != nil && $0.viewedAt == nil }.count
         )
+    }
+    private static func workspaceCounts(for items: [AgentActivityItem]) -> [String: AgentActivityCounts] {
+        Dictionary(grouping: items.compactMap { item in
+            item.workspaceID.map { ($0.uuidString, item) }
+        }, by: { $0.0 }).mapValues { Self.counts(for: $0.map { $0.1 }) }
     }
 
     private static func isTerminal(_ state: AgentActivityState) -> Bool {

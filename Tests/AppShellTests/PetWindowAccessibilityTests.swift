@@ -360,14 +360,41 @@ final class PetWindowAccessibilityTests: XCTestCase {
     func test_globalMouseMovesCoalesceToLatestSynchronouslyCapturedPoint() async throws {
         let controller = try controller()
         defer { controller.stop() }
+        controller.show()
+        // Moves over the pet are the ones that decide pass-through, so they still coalesce.
+        let frame = try XCTUnwrap(controller.petPanelForTests).frame
+        let points = [0.25, 0.5, 0.75].map { CGPoint(x: frame.minX + frame.width * $0, y: frame.minY + frame.height * $0) }
 
-        controller.enqueueGlobalMouseMoveForTests(CGPoint(x: 10, y: 20))
-        controller.enqueueGlobalMouseMoveForTests(CGPoint(x: 30, y: 40))
-        controller.enqueueGlobalMouseMoveForTests(CGPoint(x: 50, y: 60))
+        points.forEach(controller.enqueueGlobalMouseMoveForTests)
         try await Task.sleep(nanoseconds: 10_000_000)
 
-        XCTAssertEqual(controller.lastProcessedGlobalMousePointForTests, CGPoint(x: 50, y: 60))
+        XCTAssertEqual(controller.lastProcessedGlobalMousePointForTests, points[2])
         XCTAssertEqual(controller.globalMouseMoveProcessCountForTests, 1)
+    }
+
+    func test_globalMouseMovesAwayFromThePetDoNoWorkUnlessInputMustBeRestored() async throws {
+        // WHY: the global monitor sees every mouse move in every app while the pet is shown.
+        // A move far from the pet cannot change pass-through when the panel already accepts
+        // events, so it must not schedule main-actor work; but when the panel was left
+        // ignoring events, the first move away must still turn input back on.
+        let controller = try controller()
+        defer { controller.stop() }
+        controller.show()
+        let panel = try XCTUnwrap(controller.petPanelForTests)
+        XCTAssertFalse(panel.ignoresMouseEvents)
+        let far = CGPoint(x: panel.frame.maxX + 400, y: panel.frame.maxY + 400)
+
+        for offset in 0..<50 {
+            controller.enqueueGlobalMouseMoveForTests(CGPoint(x: far.x + CGFloat(offset), y: far.y))
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        XCTAssertEqual(controller.globalMouseMoveProcessCountForTests, 0)
+
+        panel.ignoresMouseEvents = true
+        controller.enqueueGlobalMouseMoveForTests(far)
+        try await Task.sleep(nanoseconds: 10_000_000)
+        XCTAssertEqual(controller.globalMouseMoveProcessCountForTests, 1)
+        XCTAssertFalse(panel.ignoresMouseEvents, "leaving the pet must restore normal input as before")
     }
 
     private func attentionItem(kind: PetAttentionItemKind) -> PetAttentionItem {

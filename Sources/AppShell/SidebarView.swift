@@ -357,8 +357,10 @@ public final class SidebarViewModel: ObservableObject {
         // Tests replace workspacePrompter with a fake before calling any prompt path.
         workspacePrompter = AppKitWorkspacePrompter(viewModel: self)
         activityCountsObserver = PetActivityCountsProjection.shared.observe { [weak self] global, workspaces in
-            self?.activityCounts = global
-            self?.workspaceActivityCounts = workspaces
+            // Each @Published write rebuilds the whole sidebar; write only what changed.
+            guard let self else { return }
+            if self.activityCounts != global { self.activityCounts = global }
+            if self.workspaceActivityCounts != workspaces { self.workspaceActivityCounts = workspaces }
         }
         reload()
         reloadInsomnia()
