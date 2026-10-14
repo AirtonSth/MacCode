@@ -198,6 +198,53 @@ final class AccountUsageSidebarTests: XCTestCase {
         )
     }
 
+    func test_popoverSessionLine_neverShowsContextWindowFillAsSessionLimit() throws {
+        // WHY: currentSessionTokens/LimitTokens are a local run's context-window
+        // fill, not the provider's session limit. The popover once printed them as
+        // "Session used 37%" next to a faint "not loaded" ring that explains itself
+        // as "no data yet" — the same provider must not read two ways.
+        let usage = ProviderTokenUsage(provider: .grok, currentSessionTokens: 370_000, currentSessionLimitTokens: 1_000_000)
+        XCTAssertNil(AccountUsageDisplay.ringProgress(usage, now: now))
+        XCTAssertEqual(
+            AccountUsageDisplay.sessionCaption(
+                effectiveSessionUsedPercent: usage.effectiveSessionUsedPercent(now: now),
+                effectiveWeeklyUsedPercent: usage.effectiveWeeklyUsedPercent(now: now)
+            ),
+            "Session usage not loaded"
+        )
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let control = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/AccountUsageSidebarControl.swift"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(control.contains("currentSessionLimitTokens"), "the popover row must not feed context-window fill into the session line")
+    }
+
+    func test_ringProgress_matchesTheTodayPercentSentToTheIOSRings() throws {
+        // WHY: the Mac rings and the paired iPhone rings draw the same account.
+        // If either side changes its rule alone, one account reads two ways.
+        let soon = Date().addingTimeInterval(3_600)
+        let snapshot = ProviderUsageSnapshot(period: .sevenDays, providers: [
+            ProviderTokenUsage(provider: .claude, currentSessionUsedPercent: 12, currentSessionResetsAt: soon, weeklyUsedPercent: 90, weeklyResetsAt: soon),
+            ProviderTokenUsage(provider: .codex, currentSessionUsedPercent: 70, currentSessionResetsAt: Date().addingTimeInterval(-60), weeklyUsedPercent: 42, weeklyResetsAt: soon),
+            ProviderTokenUsage(provider: .grok)
+        ])
+        AccountUsageWidgetDigest.resetLastBodyForTesting()
+        AccountUsageWidgetDigest.publish(subscribed: true, snapshot: snapshot, isRefreshing: false)
+        let body = try XCTUnwrap(AccountUsageWidgetDigest.lastCachedBody())
+        guard case .object(let today)? = body["today"] else { return XCTFail("missing today scope") }
+        for provider in AccountUsageDisplay.providers {
+            let ring = AccountUsageDisplay.ringProgress(AccountUsageDisplay.usage(for: provider, in: snapshot))
+            var sent: Double?
+            if case .number(let percent)? = today["\(provider.rawValue)_used_percent"] { sent = percent }
+            XCTAssertEqual(sent == nil, ring == nil, "\(provider): loaded on one side only")
+            if let sent, let ring {
+                XCTAssertEqual(ring * 100, sent, accuracy: 0.0001, "\(provider) ring and iOS today percent diverge")
+            }
+        }
+    }
+
     func test_weeklyCaption_withoutProviderPercent_doesNotInventALimit() {
         // WHY: the old card divided local tokens by a made-up 1M weekly limit.
         // Without a provider-reported percentage there is no honest figure.

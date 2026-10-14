@@ -58,12 +58,11 @@ public enum AccountUsageDisplay {
 
     /// Session caption. When the provider reported no live session window,
     /// the weekly figure is shown under an explained label instead of a bare
-    /// "Session used 0%".
+    /// "Session used 0%". A local run's context-window fill is not the
+    /// provider's session limit, so it is never shown under that label.
     public static func sessionCaption(
         effectiveSessionUsedPercent: Double?,
-        effectiveWeeklyUsedPercent: Double?,
-        currentSessionTokens: Int = 0,
-        currentSessionLimitTokens: Int = 0
+        effectiveWeeklyUsedPercent: Double?
     ) -> String {
         if let sessionPercent = effectiveSessionUsedPercent {
             return "Session used \(formatPercent(sessionPercent / 100.0))"
@@ -71,11 +70,7 @@ public enum AccountUsageDisplay {
         if let weeklyPercent = effectiveWeeklyUsedPercent {
             return "Week used \(formatPercent(weeklyPercent / 100.0)) (no session data)"
         }
-        guard currentSessionLimitTokens > 0 else { return "Session usage not loaded" }
-        let progress = currentSessionTokens > 0
-            ? min(max(Double(currentSessionTokens) / Double(currentSessionLimitTokens), 0), 1)
-            : 0
-        return "Session used \(formatPercent(progress))"
+        return "Session usage not loaded"
     }
 
     public static func weeklyCaption(effectiveWeeklyUsedPercent: Double?) -> String {
@@ -201,9 +196,7 @@ struct AccountUsageSidebarControl: View {
             }
             Text(AccountUsageDisplay.sessionCaption(
                 effectiveSessionUsedPercent: usage.effectiveSessionUsedPercent(),
-                effectiveWeeklyUsedPercent: usage.effectiveWeeklyUsedPercent(),
-                currentSessionTokens: usage.currentSessionTokens,
-                currentSessionLimitTokens: usage.currentSessionLimitTokens
+                effectiveWeeklyUsedPercent: usage.effectiveWeeklyUsedPercent()
             ))
             .font(DS.Font.caption)
             .foregroundColor(DS.Palette.textSecondary)
