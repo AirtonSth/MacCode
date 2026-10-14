@@ -150,6 +150,95 @@ final class AccountUsageLocalSignalTests: XCTestCase {
         )
     }
 
+    /// WHY: "Account usage updated just now" promises Claude was asked. A
+    /// timer tick inside the Claude CLI interval does not ask Claude. When the
+    /// popover opened during such a tick, the popover's own request was
+    /// dropped as busy and the tick's settle stamped a Claude percent up to an
+    /// hour old as fresh. The popover must wait for a refresh that probes Claude.
+    func test_detailsProbe_doesNotSettleOnAPeriodicTickThatSkippedClaude() async throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2AccountUsageDetailsSkip-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let refresher = SteppedAccountUsageRefresher()
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport.path,
+            accountUsageRefresher: refresher
+        )
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "tok",
+            refreshToken: "ref",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid",
+                subscribed: true
+            )
+        ))
+        let viewModel = SidebarViewModel(
+            context: context,
+            router: router,
+            insomniaPower: FakeInsomniaPowerManager(),
+            powerMonitor: FakeExternalPowerMonitor()
+        )
+        viewModel.reload()
+        var now = Date(timeIntervalSince1970: 1_800_000_000)
+        context.accountUsageNow = { now }
+        var settles = 0
+        let observer = NotificationCenter.default.addObserver(
+            forName: .rc2AccountUsageRefreshSettled, object: nil, queue: nil
+        ) { _ in settles += 1 }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        // Minute 0: a tick probes Claude, so the next ticks fall inside the interval.
+        context.refreshPeriodicAccountUsage()
+        let firstStarted = await waitUntilAsync { await refresher.requests.count == 1 }
+        XCTAssertTrue(firstStarted)
+        await refresher.releaseNext()
+        let firstSettled = await waitUntil { settles == 1 }
+        XCTAssertTrue(firstSettled)
+
+        // Minute 5: a tick that skips the Claude CLI is in flight when the popover opens.
+        now = now.addingTimeInterval(5 * 60)
+        context.refreshPeriodicAccountUsage()
+        let tickStarted = await waitUntilAsync { await refresher.requests.count == 2 }
+        XCTAssertTrue(tickStarted)
+        let tickProbesClaude = await refresher.requests.last?.allowClaudeCLIProbe
+        XCTAssertEqual(tickProbesClaude, false, "precondition: this tick does not ask Claude")
+        viewModel.refreshAccountUsageForDetails()
+        XCTAssertTrue(viewModel.accountUsageIsRefreshing)
+        // The popover registers its observer and asks from a MainActor Task.
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        await refresher.releaseNext()
+        let tickSettled = await waitUntil { settles == 2 }
+        XCTAssertTrue(tickSettled)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertNil(
+            viewModel.accountUsageLastUpdated,
+            "a tick that never asked Claude must not stamp the popover's \"updated just now\""
+        )
+        XCTAssertTrue(viewModel.accountUsageIsRefreshing, "the popover is still waiting for Claude")
+
+        let detailsStarted = await waitUntilAsync { await refresher.requests.count == 3 }
+        XCTAssertTrue(detailsStarted, "the popover's own refresh must still run once the tick clears")
+        let details = await refresher.requests.last
+        XCTAssertEqual(details?.allowClaudeCLIProbe, true)
+        XCTAssertEqual(details?.allowClaudeUsageScreen, true)
+        await refresher.releaseNext()
+        let stamped = await waitUntil { viewModel.accountUsageLastUpdated != nil }
+        XCTAssertTrue(stamped, "the refresh that asked Claude settles the popover")
+        XCTAssertFalse(viewModel.accountUsageIsRefreshing)
+        XCTAssertEqual(
+            ProviderUsageStore(appSupportDirectory: context.appSupportDirectory)
+                .load().providers.first { $0.provider == .claude }?.weeklyUsedPercent,
+            55
+        )
+    }
+
     /// WHY: usage-changed fires during agent runs. Rewriting an equal
     /// snapshot @Published value rebuilt the always-on sidebar.
     func test_unchangedUsageReload_doesNotPublishSidebar() async throws {
@@ -199,6 +288,47 @@ final class AccountUsageLocalSignalTests: XCTestCase {
             released = true
             for waiter in waiters { waiter.resume() }
             waiters.removeAll()
+        }
+    }
+
+    /// Holds each full refresh until `releaseNext()`. Claude answers only a
+    /// request allowed to launch its CLI, as with a stale Claude Code cache.
+    private actor SteppedAccountUsageRefresher: ProviderAccountUsageRefreshing {
+        private(set) var requests: [ProviderAccountUsageRefreshRequest] = []
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        private var releases = 0
+
+        func refreshAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
+            requests.append(request)
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                if releases > 0 {
+                    releases -= 1
+                    continuation.resume()
+                } else {
+                    waiters.append(continuation)
+                }
+            }
+            var usages = [AssistantAccountUsage(
+                provider: .codex, weeklyUsedPercent: 10, weeklyWindowDurationMinutes: 10_080
+            )]
+            if request.allowClaudeCLIProbe {
+                usages.append(AssistantAccountUsage(
+                    provider: .claude, weeklyUsedPercent: 55, weeklyWindowDurationMinutes: 10_080
+                ))
+            }
+            return usages
+        }
+
+        func grokAccountUsage(_ request: ProviderAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+            nil
+        }
+
+        func releaseNext() {
+            if waiters.isEmpty {
+                releases += 1
+            } else {
+                waiters.removeFirst().resume()
+            }
         }
     }
 

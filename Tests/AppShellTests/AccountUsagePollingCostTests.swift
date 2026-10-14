@@ -120,6 +120,8 @@ final class AccountUsagePollingCostTests: XCTestCase {
             refresher: ProviderAccountUsageRefresher(timeoutSeconds: 3, jsonAPIFetcher: { _, _ in nil }),
             name: "CLITicks"
         )
+        // Never Claude Code's real cache: a fresh one answers without the CLI.
+        context.claudeUsageCacheURL = dir.appendingPathComponent("missing-claude.json")
         try context.settingsRepo.set("cli.claude.path", script.path)
         try context.settingsRepo.set("cli.codex.path", dir.appendingPathComponent("missing-codex").path)
 

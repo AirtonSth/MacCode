@@ -282,8 +282,14 @@ public final class AppContext {
     /// many allowed refreshes in a row got no Claude answer.
     private var lastClaudeUsageCLIProbeAt: Date?
     private var claudeUsageCLIProbeMisses = 0
+    /// Whether the in-flight full refresh may launch the Claude CLI, and an
+    /// explicit refresh that arrived while it may not; that one runs next.
+    private var accountUsageRefreshProbesClaude = false
+    private var queuedClaudeAccountUsageRefresh: (reason: String, includeGrok: Bool)?
     /// Injectable so tests can step through the Claude CLI interval.
     var accountUsageNow: () -> Date = Date.init
+    /// Injectable so tests never answer from the real `~/.claude.json`.
+    var claudeUsageCacheURL: URL = AppContext.defaultClaudeUsageCacheURL
     private let accountUsagePublishes = AccountUsagePublishLedger()
     private var usageNotificationTask: Task<Void, Never>?
     private var lastUsageNotificationAt: Date = .distantPast
@@ -2036,6 +2042,13 @@ public final class AppContext {
             return
         }
         guard accountUsageRefreshTask == nil else {
+            // A timer tick inside the Claude CLI interval never asks Claude, so
+            // its settle cannot answer an explicit refresh (the popover would
+            // stamp "updated just now" on an old Claude percent). Run it next.
+            if reason != "periodic", !accountUsageRefreshProbesClaude {
+                queuedClaudeAccountUsageRefresh = (reason, includeGrok)
+                return
+            }
             publishAccountUsageRefresh(state: "skipped", reason: reason, detail: "busy")
             return
         }
@@ -2068,6 +2081,7 @@ public final class AppContext {
         if claudeCLIProbeDue {
             lastClaudeUsageCLIProbeAt = now
         }
+        accountUsageRefreshProbesClaude = claudeCLIProbeDue
         accountUsageRefreshCount += 1
         publishAccountUsageRefresh(state: "started", reason: reason, detail: nil)
 
@@ -2080,7 +2094,7 @@ public final class AppContext {
             grokBinary: grokBinary?.isEmpty == false ? grokBinary! : "grok",
             grokAuthFileURL: Self.defaultGrokAuthFileURL,
             claudeAuthFileURL: Self.defaultClaudeAuthFileURL,
-            claudeUsageCacheURL: Self.defaultClaudeUsageCacheURL,
+            claudeUsageCacheURL: claudeUsageCacheURL,
             allowClaudeCLIProbe: claudeCLIProbeDue,
             allowClaudeUsageScreen: !isPeriodic,
             codexAuthFileURL: Self.defaultCodexAuthFileURL,
@@ -2137,8 +2151,13 @@ public final class AppContext {
                 // Only a real provider probe settles the details refresh. The
                 // generic `.rc2AccountUsageChanged` is also posted by local
                 // provider-usage writes, so waiting on it stamped a fresh
-                // "updated just now" for a probe still running.
-                NotificationCenter.default.post(name: .rc2AccountUsageRefreshSettled, object: nil)
+                // "updated just now" for a probe still running. A run that
+                // skipped the Claude CLI says so: it settles no details refresh.
+                NotificationCenter.default.post(
+                    name: .rc2AccountUsageRefreshSettled,
+                    object: nil,
+                    userInfo: ["claudeProbed": claudeCLIProbeDue]
+                )
                 if let periodicCycleID,
                    self.periodicAccountUsageCycle?.id == periodicCycleID {
                     self.periodicAccountUsageCycle?.otherProvidersFinished = true
@@ -2147,8 +2166,13 @@ public final class AppContext {
                     }
                     _ = self.reconcilePeriodicGrokMissIfReady(cycleID: periodicCycleID)
                 }
-                self.publishAccountUsageDigestFromDisk(isRefreshing: false)
+                let queued = self.queuedClaudeAccountUsageRefresh
+                self.queuedClaudeAccountUsageRefresh = nil
+                self.publishAccountUsageDigestFromDisk(isRefreshing: queued != nil)
                 self.accountUsageRefreshTask = nil
+                if let queued {
+                    self.refreshAccountUsage(reason: queued.reason, includeGrok: queued.includeGrok)
+                }
             }
         }
     }

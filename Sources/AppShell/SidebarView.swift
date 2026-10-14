@@ -586,7 +586,10 @@ public final class SidebarViewModel: ObservableObject {
                     forName: .rc2AccountUsageRefreshSettled,
                     object: nil,
                     queue: .main
-                ) { _ in
+                ) { note in
+                    // A timer tick that skipped the Claude CLI did not refresh
+                    // Claude; the details refresh queued behind it does.
+                    guard note.userInfo?["claudeProbed"] as? Bool != false else { return }
                     if let o = observer { NotificationCenter.default.removeObserver(o) }
                     observer = nil
                     continuation.resume(returning: true)
