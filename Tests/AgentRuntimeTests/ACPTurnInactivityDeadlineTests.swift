@@ -13,32 +13,51 @@ final class ACPTurnInactivityDeadlineTests: XCTestCase {
         var all: [UInt64] { lock.withLock { times } }
     }
 
+    /// Polls instead of sleeping a fixed time: a loaded host may wake the timer late.
+    private func waitForFires(_ fires: Fires, count: Int, within seconds: TimeInterval = 5) async throws {
+        let end = Date().addingTimeInterval(seconds)
+        while fires.all.count < count, Date() < end {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
     func test_refreshesKeepItQuietThenItFiresOnceAWindowAfterTheLastOne() async throws {
+        // A 1 s window against 50 ms refreshes leaves a 20x margin, so one late
+        // Task.sleep wake on a host loaded by parallel worktrees cannot open a
+        // real quiet gap and fire legitimately.
+        let timeout: TimeInterval = 1
         let fires = Fires()
-        let deadline = ACPTurnInactivityDeadline(timeout: 0.2) { fires.record() }
+        let deadline = ACPTurnInactivityDeadline(timeout: timeout) { fires.record() }
         defer { deadline.cancel() }
         var lastRefresh: UInt64 = 0
-        for _ in 0..<8 {  // 0.4 s of activity, twice the window
+        var longestGap: UInt64 = 0
+        for _ in 0..<24 {  // ~1.2 s of activity, longer than the window
             deadline.refresh()
-            lastRefresh = DispatchTime.now().uptimeNanoseconds
+            let now = DispatchTime.now().uptimeNanoseconds
+            if lastRefresh != 0 { longestGap = max(longestGap, now &- lastRefresh) }
+            lastRefresh = now
             try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if Double(longestGap) / 1_000_000_000 >= timeout * 0.9 {
+            throw XCTSkip("host stalled \(longestGap / 1_000_000) ms between refreshes; a fire would be legitimate")
         }
         XCTAssertTrue(fires.all.isEmpty, "activity inside the window must not fire")
 
-        try await Task.sleep(nanoseconds: 500_000_000)
+        try await waitForFires(fires, count: 1)
+        try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(fires.all.count, 1, "quiet past the window fires exactly once")
         let quiet = Double((fires.all.first ?? 0) &- lastRefresh) / 1_000_000_000
-        XCTAssertGreaterThanOrEqual(quiet, 0.19, "it must wait a full window after the last event")
+        XCTAssertGreaterThanOrEqual(quiet, timeout - 0.01, "it must wait a full window after the last event")
     }
 
     func test_refreshAfterExpiryArmsAgainAndCancelSilencesIt() async throws {
         let fires = Fires()
         let deadline = ACPTurnInactivityDeadline(timeout: 0.05) { fires.record() }
         deadline.refresh()
-        try await Task.sleep(nanoseconds: 200_000_000)
+        try await waitForFires(fires, count: 1)
         XCTAssertEqual(fires.all.count, 1)
         deadline.refresh()
-        try await Task.sleep(nanoseconds: 200_000_000)
+        try await waitForFires(fires, count: 2)
         XCTAssertEqual(fires.all.count, 2, "a refresh after expiry must arm a new window")
 
         deadline.refresh()

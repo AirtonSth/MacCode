@@ -192,8 +192,9 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         }
         XCTAssertEqual(box.assistantText.count, FakeGrokACPPeer.burstChunkCount, "every burst chunk must stream")
         XCTAssertEqual(box.finishedCount, 0, "the 900 s inactivity bound must not fire mid-burst")
-        XCTAssertLessThanOrEqual(adapter.turnWatchdogTimersScheduledForTesting, 1,
-                                 "\(FakeGrokACPPeer.burstChunkCount) events must reuse one inactivity timer")
+        // Exactly one: zero would mean the turn lost its inactivity bound.
+        XCTAssertEqual(adapter.turnWatchdogTimersScheduledForTesting, 1,
+                       "\(FakeGrokACPPeer.burstChunkCount) events must reuse one inactivity timer")
     }
 
     func test_cancelUsesACPNotificationAndReturnsProviderIdentity() async throws {

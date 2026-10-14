@@ -1428,8 +1428,40 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertEqual(events.assistantText.count, 2_000, "every burst chunk must stream")
-        XCTAssertLessThanOrEqual(adapter.turnWatchdogTimersScheduledForTesting, 1,
-                                 "2,000 events must reuse one inactivity timer")
+        // Exactly one: zero would mean the turn lost its inactivity bound.
+        XCTAssertEqual(adapter.turnWatchdogTimersScheduledForTesting, 1,
+                       "2,000 events must reuse one inactivity timer")
+    }
+
+    func test_turnInactivityWatchdogFinishesAQuietTurnAfterAStreamBurst() async throws {
+        // WHY: when session/prompt never returns, the inactivity watchdog is the
+        // only thing that ends the turn and releases Working. The burst test only
+        // counts timers; this pins that stream events really arm the single
+        // deadline, that a burst never trips it, and that quiet fires it once.
+        let root = try makeTempRoot("distill-acp-watchdog-fires")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(
+            binaryNameOverride: harness.path,
+            cancellationGracePeriod: 0.05,
+            turnInactivityTimeout: 1
+        )
+        defer { adapter.stopAll() }
+
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            distillRequest(thread: AgentThreadID(), model: "claude/claude-opus-5-5", prompt: "BURST_HANG", root: root)
+        ) { events.append($0) }
+        let finished = try await events.waitForFinish(timeout: 15)
+        XCTAssertEqual(events.assistantText.count, 2_000,
+                       "the window must not fire while the burst is still streaming")
+        XCTAssertEqual(finished.status, .completed,
+                       "streamed text with no open tool call resolves as completed")
+        XCTAssertTrue(events.hasWatchdogSynthesizedMarker,
+                      "only the inactivity watchdog can end a turn whose prompt never returns")
+        XCTAssertEqual(adapter.turnWatchdogTimersScheduledForTesting, 1)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(events.finishedCount, 1, "the watchdog must terminate the turn exactly once")
     }
 
     func test_historyRetentionGrowsWithItsEventsInsteadOfPreallocatingTheWindow() {
@@ -1534,6 +1566,24 @@ private final class DistillACPAdapterEventBox: @unchecked Sendable {
             guard case .event(.itemDelta(_, let body, _, _)) = event else { return nil }
             return body
         }.joined()
+    }
+
+    var finishedCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return values.filter {
+            if case .finished = $0 { return true }
+            return false
+        }.count
+    }
+
+    var hasWatchdogSynthesizedMarker: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return values.contains {
+            if case .event(.providerRuntime(let runtime)) = $0 {
+                return runtime.method == "grok.turn.watchdog.synthesized"
+            }
+            return false
+        }
     }
 
     private func finishResult() -> (status: AgentRunStatus, finalMessage: String?, providerThreadId: String?)? {
