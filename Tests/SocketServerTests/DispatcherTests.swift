@@ -997,7 +997,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     var gitDiffCallCount = 0
     /// When set, returned instead of shelling out to real git (keeps Dispatcher contract tests hermetic).
     var stubGitDiff: String?
-    func gitStatus(workspace: WorkspaceID) throws -> GitSummary { GitDiff.summary(in: gitCwd) }
+    func gitStatus(workspace: WorkspaceID) throws -> GitSummary { try XCTUnwrap(GitDiff.summary(in: gitCwd)) }
     func gitBranches(workspace: WorkspaceID) throws -> GitBranches { GitDiff.branches(in: gitCwd) }
     func gitCheckout(workspace: WorkspaceID, branch: String) throws -> GitActionResult { GitDiff.checkout(in: gitCwd, branch: branch) }
     func gitCreateBranch(workspace: WorkspaceID, name: String) throws -> GitActionResult { GitDiff.createBranch(in: gitCwd, name: name) }

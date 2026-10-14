@@ -25,7 +25,8 @@ final class GitDiffRunCommandBoundTests: XCTestCase {
 
     func test_runCommand_stopsAStuckReadOnlyProbeAtItsDeadline() {
         // A hung probe (fsmonitor, credential helper) must not pin the branch
-        // chip's thread forever; the failure reaches the existing error paths.
+        // chip's thread forever. `timedOut` lets callers report it as
+        // unavailable rather than as empty output (tests below).
         let started = Date()
         let result = GitDiff.runCommand(
             ["sh", "-c", "/bin/sleep 30"],
@@ -35,8 +36,68 @@ final class GitDiffRunCommandBoundTests: XCTestCase {
         )
         let elapsed = Date().timeIntervalSince(started)
         XCTAssertEqual(result.exit, -1)
+        XCTAssertTrue(result.timedOut)
         XCTAssertTrue(result.stderr.contains("timed out"), result.stderr)
         XCTAssertLessThan(elapsed, 3)
+    }
+
+    /// WHY: a probe killed at its deadline came back as exit -1 with whatever
+    /// stdout it had read, and `summary` ignores exit codes, so a timed-out
+    /// `diff --numstat` / `ls-files` read as a clean tree. The Agent header,
+    /// the Diff panel and the persisted `.ready` checkpoint then said "no
+    /// changes" while the edits were still on disk.
+    func test_summary_whenAProbeTimesOut_isUnavailable_notACleanTree() throws {
+        let repo = try makeDirtyRepoWithStalledFSMonitor()
+        defer { try? FileManager.default.removeItem(atPath: repo) }
+
+        GitDiff.readOnlyCommandTimeoutForTesting = 0.5
+        let started = Date()
+        let stalled = GitDiff.summary(in: repo)
+        let elapsed = Date().timeIntervalSince(started)
+        GitDiff.readOnlyCommandTimeoutForTesting = nil
+        XCTAssertNil(stalled, "a summary built from killed probes must be unavailable, not isGitRepo with files == []")
+        XCTAssertLessThan(elapsed, 1.5, "the first killed probe ends the summary; the rest are not each waited out")
+
+        // The same tree read without the stall: what the timed-out read hid.
+        shell(["git", "-C", repo, "config", "--unset", "core.fsmonitor"])
+        let fresh = try XCTUnwrap(GitDiff.summary(in: repo))
+        XCTAssertEqual(Set(fresh.files.map(\.path)), ["a.txt", "new.txt"])
+    }
+
+    /// WHY: `diff` / `diffAll` only flagged truncation, so a diff killed
+    /// partway (or before any output) came back looking complete, and a
+    /// checkpoint stored it as the turn's patch.
+    func test_diffAndDiffAll_whenTheyTimeOut_sayTheOutputIsIncomplete() throws {
+        let repo = try makeDirtyRepoWithStalledFSMonitor()
+        defer { try? FileManager.default.removeItem(atPath: repo) }
+
+        GitDiff.readOnlyCommandTimeoutForTesting = 0.5
+        defer { GitDiff.readOnlyCommandTimeoutForTesting = nil }
+        let patch = GitDiff.diff(in: repo, path: nil)
+        let perFile = GitDiff.diffAll(in: repo, paths: ["a.txt"])
+        XCTAssertTrue(patch.contains(GitDiff.timeoutNotice), patch)
+        XCTAssertTrue(perFile["a.txt"]?.contains(GitDiff.timeoutNotice) == true, "\(perFile)")
+    }
+
+    /// WHY: the drain checked its stop flag before every read, so a reader
+    /// that ran more than the 0.25 s grace after git exited (a loaded
+    /// machine, the separately queued stderr drain) dropped bytes git had
+    /// already written: a short diff or a lost error, with exit 0 and no
+    /// truncation flag.
+    func test_readCapped_keepsBufferedBytes_whenTheReaderRunsAfterTheGrace() throws {
+        let pipe = Pipe()
+        pipe.fileHandleForWriting.write(Data("diff --git a/x b/x\n".utf8))
+        // The write end stays open, as when a descendant holds it, so only
+        // the stop can end this read.
+        let control = PipeDrainControl()
+        control.finishRoot()
+        Thread.sleep(forTimeInterval: BoundedPipeDrain.defaultTimeout + 0.1)
+        XCTAssertTrue(control.shouldStop)
+
+        let result = GitDiff.readCapped(pipe.fileHandleForReading, maxBytes: 1024, control: control)
+
+        XCTAssertEqual(String(decoding: result.data, as: UTF8.self), "diff --git a/x b/x\n")
+        XCTAssertFalse(result.truncated)
     }
 
     func test_onlyReadOnlyGitCommandsGetADeadline() {
@@ -48,5 +109,33 @@ final class GitDiffRunCommandBoundTests: XCTestCase {
         for args in [["commit", "-m", "x"], ["push"], ["fetch", "--prune"], ["pull", "--ff-only"], ["checkout", "main"], ["add", "-A"], ["stash", "push"]] {
             XCTAssertNil(GitDiff.timeout(forGitArguments: args), "\(args)")
         }
+    }
+
+    /// A repo with a modified and an untracked file whose fsmonitor hook
+    /// sleeps: `rev-parse` stays fast while `diff` and `ls-files` stall.
+    private func makeDirtyRepoWithStalledFSMonitor() throws -> String {
+        let repo = NSTemporaryDirectory() + "rc2-git-timeout-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: repo, withIntermediateDirectories: true)
+        shell(["git", "init", "-q", "-b", "main", repo])
+        shell(["git", "-C", repo, "config", "user.email", "t@t.t"])
+        shell(["git", "-C", repo, "config", "user.name", "test"])
+        try "one\n".write(toFile: repo + "/a.txt", atomically: true, encoding: .utf8)
+        shell(["git", "-C", repo, "add", "a.txt"])
+        shell(["git", "-C", repo, "commit", "-q", "-m", "init"])
+        try "one\ntwo\n".write(toFile: repo + "/a.txt", atomically: true, encoding: .utf8)
+        try "new\n".write(toFile: repo + "/new.txt", atomically: true, encoding: .utf8)
+        let hook = repo + "/.git/slow-fsmonitor.sh"
+        try "#!/bin/sh\nsleep 30\n".write(toFile: hook, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook)
+        shell(["git", "-C", repo, "config", "core.fsmonitor", hook])
+        return repo
+    }
+
+    private func shell(_ args: [String]) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        p.arguments = args
+        try? p.run()
+        p.waitUntilExit()
     }
 }

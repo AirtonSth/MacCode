@@ -199,7 +199,8 @@ final class DiffPanelAsyncLoadTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         try seed(dir)
 
-        let (summary, branches) = await DiffPanelViewModel.performLoad(cwd: dir)
+        let (loaded, branches) = await DiffPanelViewModel.performLoad(cwd: dir)
+        let summary = try XCTUnwrap(loaded)
 
         XCTAssertTrue(summary.isGitRepo,
                       "performLoad must return the real git summary for a valid repo")
@@ -215,7 +216,8 @@ final class DiffPanelAsyncLoadTests: XCTestCase {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: dir) }
 
-        let (summary, branches) = await DiffPanelViewModel.performLoad(cwd: dir)
+        let (loaded, branches) = await DiffPanelViewModel.performLoad(cwd: dir)
+        let summary = try XCTUnwrap(loaded)
 
         XCTAssertFalse(summary.isGitRepo,
                        "performLoad on a non-git directory must return isGitRepo:false " +

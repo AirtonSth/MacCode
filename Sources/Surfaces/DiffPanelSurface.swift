@@ -18,7 +18,8 @@ public enum GitPanelMode: String, CaseIterable, Sendable {
 /// unit tests can inject a fake that never shells out to real git.
 /// Production code defaults to `LiveGitClient` which delegates to `GitDiff`.
 public protocol GitClient: Sendable {
-    func summary(in cwd: String) -> GitSummary
+    /// `nil` when git timed out (see `GitDiff.summary`).
+    func summary(in cwd: String) -> GitSummary?
     func branches(in cwd: String) -> GitBranches
     func log(in cwd: String, limit: Int) -> [GitCommit]
     func diff(in cwd: String, path: String?, ignoreWhitespace: Bool) -> String
@@ -40,7 +41,7 @@ public protocol GitClient: Sendable {
 /// Live implementation that delegates every call to the real `GitDiff` enum.
 public struct LiveGitClient: GitClient {
     public init() {}
-    public func summary(in cwd: String) -> GitSummary { GitDiff.summary(in: cwd) }
+    public func summary(in cwd: String) -> GitSummary? { GitDiff.summary(in: cwd) }
     public func branches(in cwd: String) -> GitBranches { GitDiff.branches(in: cwd) }
     public func log(in cwd: String, limit: Int) -> [GitCommit] { GitDiff.log(in: cwd, limit: limit) }
     public func diff(in cwd: String, path: String?, ignoreWhitespace: Bool) -> String { GitDiff.diff(in: cwd, path: path, ignoreWhitespace: ignoreWhitespace) }
@@ -387,8 +388,11 @@ public final class DiffPanelViewModel: ObservableObject {
             self.branches = GitBranches(current: nil, locals: [])
             self.isLoading = true
         } else {
-            self.summary = gitClient.summary(in: cwd)
+            let loaded = gitClient.summary(in: cwd)
+            self.summary = loaded ?? GitSummary(isGitRepo: false, branch: nil, dirty: false,
+                                                files: [], totalAdditions: 0, totalDeletions: 0)
             self.branches = gitClient.branches(in: cwd)
+            if loaded == nil { self.lastError = GitDiff.summaryTimedOutMessage }
         }
         if let s = settings?.load() {
             // Set within init → property observers don't fire (no echo write).
@@ -401,7 +405,7 @@ public final class DiffPanelViewModel: ObservableObject {
             Task { [weak self] in
                 let (s, b) = await DiffPanelViewModel.performLoad(cwd: cwdCopy, gitClient: gc)
                 guard let self else { return }
-                self.summary = s
+                self.applySummary(s)
                 self.branches = b
                 self.isLoading = false
             }
@@ -412,7 +416,7 @@ public final class DiffPanelViewModel: ObservableObject {
     /// actor. Pure coordination helper; exposed `internal` so the new test
     /// can verify load state without hitting real git.
     nonisolated static func performLoad(cwd: String,
-                                        gitClient: any GitClient = LiveGitClient()) async -> (GitSummary, GitBranches) {
+                                        gitClient: any GitClient = LiveGitClient()) async -> (GitSummary?, GitBranches) {
         await withCheckedContinuation { cont in
             DispatchQueue.global().async {
                 let s = gitClient.summary(in: cwd)
@@ -540,8 +544,19 @@ public final class DiffPanelViewModel: ObservableObject {
         let gc = gitClient
         DispatchQueue.global().async { [weak self] in
             let s = gc.summary(in: cwd)
-            DispatchQueue.main.async { self?.summary = s }
+            DispatchQueue.main.async { self?.applySummary(s) }
         }
+    }
+
+    /// A timed-out git read keeps the last loaded list and says so in the
+    /// banner instead of showing a clean tree.
+    private func applySummary(_ s: GitSummary?) {
+        guard let s else {
+            lastError = GitDiff.summaryTimedOutMessage
+            lastErrorRaw = nil
+            return
+        }
+        summary = s
     }
 
     /// Refresh-button entry point: one background pass that reloads
@@ -558,7 +573,7 @@ public final class DiffPanelViewModel: ObservableObject {
             let log = gc.log(in: cwd, limit: 100)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.summary = s
+                self.applySummary(s)
                 self.branches = b
                 self.commits = log
                 self.historyLoaded = true
@@ -1026,7 +1041,7 @@ public final class DiffPanelViewModel: ObservableObject {
             let log = gc.log(in: cwd, limit: 100)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.summary = s
+                if let s { self.summary = s }
                 self.branches = b
                 self.commits = log
                 self.isBusy = false
@@ -1043,6 +1058,8 @@ public final class DiffPanelViewModel: ObservableObject {
                     self.lastErrorRaw = r.message
                     self.lastError = gc.humanizeError(r.message)
                 }
+                // A failed action keeps its own banner.
+                if s == nil, r.ok { self.applySummary(nil) }
             }
         }
     }

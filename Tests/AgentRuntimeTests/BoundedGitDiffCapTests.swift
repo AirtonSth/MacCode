@@ -181,7 +181,7 @@ final class BoundedGitDiffCapTests: XCTestCase {
         }
         try body.write(toFile: dir + "/big.txt", atomically: true, encoding: .utf8)
 
-        let summary = GitDiff.summary(in: dir)
+        let summary = try XCTUnwrap(GitDiff.summary(in: dir))
         XCTAssertTrue(summary.isGitRepo)
         XCTAssertTrue(summary.dirty)
         XCTAssertTrue(summary.files.contains { $0.path == "big.txt" && $0.status == .modified },

@@ -28,7 +28,7 @@ final class AgentGitHeaderLoadTests: XCTestCase {
         setenv("PATH", shimDir + ":" + originalPath, 1)
         defer { setenv("PATH", originalPath, 1) }
 
-        let header = AgentAppViewModel.loadGitHeader(cwd: shimDir)
+        let header = try XCTUnwrap(AgentAppViewModel.loadGitHeader(cwd: shimDir))
 
         let calls = (try String(contentsOfFile: log, encoding: .utf8)).split(separator: "\n")
         NSLog("[perf-proof] agent git header spawns=%d", calls.count)

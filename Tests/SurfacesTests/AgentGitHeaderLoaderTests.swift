@@ -92,4 +92,26 @@ final class AgentGitHeaderLoaderTests: XCTestCase {
         pump { done == 2 }
         XCTAssertEqual(done, 2)
     }
+
+    /// WHY: a load whose git probe timed out has no trustworthy header;
+    /// publishing it showed "no changes" as if fresh. The tab keeps what it
+    /// showed, and the workspace is not left marked busy for the next refresh.
+    func test_timedOutLoadDeliversNothing_andTheNextLoadStillRuns() {
+        let gate = Gate()
+        let loader = AgentGitHeaderLoader(load: { _ in
+            let n = gate.enter()
+            return n == 1 ? nil : Self.header(n)
+        })
+        let owner = NSObject()
+        var received: [String?] = []
+        loader.load(cwd: "/repo", owner: owner) { received.append($0.branch) }
+        pump { gate.count == 1 }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(received, [], "a timed-out load must not replace the header")
+
+        loader.load(cwd: "/repo", owner: owner) { received.append($0.branch) }
+        pump { !received.isEmpty }
+        XCTAssertEqual(gate.count, 2)
+        XCTAssertEqual(received, ["b2"])
+    }
 }

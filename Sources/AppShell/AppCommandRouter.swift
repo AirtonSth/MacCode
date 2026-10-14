@@ -8257,7 +8257,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func gitStatus(workspace: WorkspaceID) throws -> GitSummary {
-        GitDiff.summary(in: try workspaceCwd(workspace))
+        guard let summary = GitDiff.summary(in: try workspaceCwd(workspace)) else {
+            throw JSONRPCError(code: -32000, message: GitDiff.summaryTimedOutMessage)
+        }
+        return summary
     }
     public func gitBranches(workspace: WorkspaceID) throws -> GitBranches {
         GitDiff.branches(in: try workspaceCwd(workspace))

@@ -35,11 +35,11 @@ final class GitDiffTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
     }
 
-    func test_summary_inNonGitDir_isNotRepo() {
+    func test_summary_inNonGitDir_isNotRepo() throws {
         let dir = NSTemporaryDirectory() + UUID().uuidString
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(atPath: dir) }
-        let s = GitDiff.summary(in: dir)
+        let s = try XCTUnwrap(GitDiff.summary(in: dir))
         XCTAssertFalse(s.isGitRepo)
         XCTAssertTrue(s.files.isEmpty)
     }
@@ -52,7 +52,7 @@ final class GitDiffTests: XCTestCase {
         run(["git", "-C", dir, "commit", "-q", "-m", "init"])
         try "modified\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
         try "new\n".write(toFile: dir + "/b.txt", atomically: true, encoding: .utf8)
-        let s = GitDiff.summary(in: dir)
+        let s = try XCTUnwrap(GitDiff.summary(in: dir))
         XCTAssertTrue(s.isGitRepo)
         XCTAssertTrue(s.dirty)
         XCTAssertTrue(s.files.contains { $0.path == "a.txt" && $0.status == .modified })
@@ -104,7 +104,7 @@ final class GitDiffTests: XCTestCase {
         try "new\n".write(toFile: dir + "/b.txt", atomically: true, encoding: .utf8)
         let r = GitDiff.commit(in: dir, message: "wip changes")
         XCTAssertTrue(r.ok, "commit failed: \(r.message)")
-        XCTAssertFalse(GitDiff.summary(in: dir).dirty,
+        XCTAssertFalse(try XCTUnwrap(GitDiff.summary(in: dir)).dirty,
                        "working tree must be clean after a stage-all commit")
         XCTAssertTrue(GitDiff.log(in: dir).contains { $0.subject == "wip changes" })
     }
@@ -214,7 +214,7 @@ final class GitDiffTests: XCTestCase {
         try "fresh\n".write(toFile: dir + "/e.txt", atomically: true, encoding: .utf8) // untracked
         let r = GitDiff.commit(in: dir, message: "remove a, add e")
         XCTAssertTrue(r.ok, "stage-all (git add -A) must include deletions + untracked: \(r.message)")
-        let s = GitDiff.summary(in: dir)
+        let s = try XCTUnwrap(GitDiff.summary(in: dir))
         XCTAssertFalse(s.dirty, "tree must be clean after committing every change class")
         XCTAssertFalse(s.files.contains { $0.path == "a.txt" }, "deleted file must be gone")
     }

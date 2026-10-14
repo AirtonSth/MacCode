@@ -24,7 +24,7 @@ final class GitRepoFixtureUsageTests: XCTestCase {
             .commit(file: "readme.txt", content: "original\n", message: "init")
             .writeUnstaged(file: "readme.txt", content: "changed\n")
 
-        let summary = GitDiff.summary(in: fixture.path)
+        let summary = try XCTUnwrap(GitDiff.summary(in: fixture.path))
 
         XCTAssertTrue(summary.isGitRepo,
                       "fixture must produce a valid git repository")
@@ -60,7 +60,7 @@ final class GitRepoFixtureUsageTests: XCTestCase {
                       "original branch must still be visible in the local branch list")
 
         // Untracked contract: writeUnstaged on a new file makes the repo dirty.
-        let summary = GitDiff.summary(in: fixture.path)
+        let summary = try XCTUnwrap(GitDiff.summary(in: fixture.path))
         XCTAssertTrue(summary.dirty,
                       "an untracked file on a feature branch must make the repo dirty")
         XCTAssertTrue(summary.files.contains { $0.path == "feature.txt" && $0.status == .untracked },

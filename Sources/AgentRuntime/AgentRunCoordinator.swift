@@ -7023,7 +7023,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let summary: AgentTurnCheckpointSummary
         if let cwd, !cwd.isEmpty {
             let gitSummary = GitDiff.summary(in: cwd)
-            if gitSummary.isGitRepo {
+            if let gitSummary, gitSummary.isGitRepo {
                 let files = gitSummary.files.map {
                     AgentTurnCheckpointFile(
                         path: $0.path,
@@ -7044,6 +7044,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     diffPatch: GitDiff.diff(in: cwd, path: nil),
                     fileDiffs: captureFileDiffs(files: files, cwd: cwd),
                     assistantMessageId: identity.assistantMessageId,
+                    completedAt: identity.completedAt
+                )
+            } else if gitSummary == nil {
+                // A timed-out probe is not an empty change list: never `.ready`.
+                summary = AgentTurnCheckpointSummary(
+                    threadId: identity.threadId,
+                    runId: identity.runId,
+                    turnId: identity.turnId,
+                    checkpointTurnCount: identity.checkpointTurnCount,
+                    checkpointRef: identity.checkpointRef,
+                    status: .error,
+                    files: [],
+                    assistantMessageId: identity.assistantMessageId,
+                    errorMessage: GitDiff.summaryTimedOutMessage,
                     completedAt: identity.completedAt
                 )
             } else {

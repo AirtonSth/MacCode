@@ -182,15 +182,31 @@ public enum GitDiff {
     public typealias FileEntry = GitFileEntry
     public typealias Summary = GitSummary
 
-    public static func summary(in cwd: String) -> GitSummary {
-        guard isGit(cwd) else {
+    /// `nil` when a git probe timed out: its partial output would read as a
+    /// clean tree (or "not a repo"), so callers keep what they showed before
+    /// or report the failure instead.
+    public static func summary(in cwd: String) -> GitSummary? {
+        guard let repo = isGitProbe(cwd) else { return nil }
+        guard repo else {
             return GitSummary(isGitRepo: false, branch: nil, dirty: false, files: [], totalAdditions: 0, totalDeletions: 0)
         }
-        let branch = run(["rev-parse", "--abbrev-ref", "HEAD"], cwd: cwd).stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Numstat over uncommitted changes (staged + unstaged combined).
-        let numstat = run(["diff", "--numstat", "HEAD"], cwd: cwd).stdout
-        let nameStatus = run(["diff", "--name-status", "HEAD"], cwd: cwd).stdout
-        let untracked = run(["ls-files", "--others", "--exclude-standard"], cwd: cwd).stdout
+        var probes: [ProcessResult] = []
+        for args in [
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            // Numstat over uncommitted changes (staged + unstaged combined).
+            ["diff", "--numstat", "HEAD"],
+            ["diff", "--name-status", "HEAD"],
+            ["ls-files", "--others", "--exclude-standard"],
+        ] {
+            let r = run(args, cwd: cwd)
+            // The rest would likely stall the same way; one deadline is enough.
+            if r.timedOut { return nil }
+            probes.append(r)
+        }
+        let branch = probes[0].stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let numstat = probes[1].stdout
+        let nameStatus = probes[2].stdout
+        let untracked = probes[3].stdout
 
         var statusMap: [String: GitFileStatus] = [:]
         var renameOldPath: [String: String] = [:]
@@ -259,7 +275,9 @@ public enum GitDiff {
     }
 
     public static func diff(in cwd: String, path: String?, ignoreWhitespace: Bool = false) -> String {
-        guard isGit(cwd) else { return "" }
+        // A timed-out probe is unknown, not "not a repo": run the diff, which
+        // carries its own timeout notice.
+        guard isGitProbe(cwd) != false else { return "" }
         var args = ["diff", "HEAD", "--no-color"]
         if ignoreWhitespace { args.append("-w") }
         if let path { args.append("--"); args.append(path) }
@@ -278,10 +296,15 @@ public enum GitDiff {
     /// Binary files appear in the output (`Binary files a/f and b/f differ`)
     /// and are preserved verbatim in the returned slice.
     public static func diffAll(in cwd: String, paths: [String]) -> [String: String] {
-        guard isGit(cwd), !paths.isEmpty else { return [:] }
+        guard isGitProbe(cwd) != false, !paths.isEmpty else { return [:] }
         let args = ["diff", "HEAD", "--no-color", "--"] + paths
-        let combined = decoratedStdout(run(args, cwd: cwd))
-        return Self.splitCombinedDiff(combined)
+        let result = run(args, cwd: cwd)
+        var byPath = Self.splitCombinedDiff(decoratedStdout(result))
+        // Files the killed diff never reached must not read as "no diff".
+        if result.timedOut {
+            for path in paths where byPath[path] == nil { byPath[path] = timeoutNotice }
+        }
+        return byPath
     }
 
     /// Splits the stdout of a `git diff` invocation that covers multiple files
@@ -598,14 +621,14 @@ public enum GitDiff {
 
     public static func deliveryPlan(in cwd: String, copy: GitDeliveryCopy?) -> GitDeliveryPlan {
         let summary = self.summary(in: cwd)
-        guard summary.isGitRepo else {
+        guard let summary, summary.isGitRepo else {
             return GitDeliveryPlan(
                 branchName: "",
                 commitMessage: "",
                 pullRequestTitle: "",
                 pullRequestBody: "",
                 pullRequestURL: nil,
-                phases: [GitDeliveryPhase(name: "inspect", status: .blocked, detail: "Not a git repository.")]
+                phases: [GitDeliveryPhase(name: "inspect", status: .blocked, detail: summary == nil ? summaryTimedOutMessage : "Not a git repository.")]
             )
         }
         let fallbackCommitMessage = suggestCommitMessage(summary)
@@ -648,9 +671,9 @@ public enum GitDiff {
     public static func deliver(in cwd: String, copy: GitDeliveryCopy?, environment: [String: String]?) -> GitDeliveryResult {
         let plan = deliveryPlan(in: cwd, copy: copy)
         let summary = self.summary(in: cwd)
-        guard summary.isGitRepo else {
+        guard let summary, summary.isGitRepo else {
             return GitDeliveryResult(ok: false, plan: plan, phases: [
-                GitDeliveryPhase(name: "inspect", status: .failed, detail: "Not a git repository.")
+                GitDeliveryPhase(name: "inspect", status: .failed, detail: summary == nil ? summaryTimedOutMessage : "Not a git repository.")
             ], pullRequestURL: nil)
         }
         guard !summary.files.isEmpty else {
@@ -1023,7 +1046,13 @@ public enum GitDiff {
     }
 
     public static func isGit(_ cwd: String) -> Bool {
+        isGitProbe(cwd) == true
+    }
+
+    /// `nil` when the probe timed out.
+    private static func isGitProbe(_ cwd: String) -> Bool? {
         let r = run(["rev-parse", "--is-inside-work-tree"], cwd: cwd)
+        if r.timedOut { return nil }
         return r.exit == 0 && r.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
     }
 
@@ -1033,6 +1062,9 @@ public enum GitDiff {
     /// Peak retained git stderr (diagnostics). Still drained to EOF.
     static let stderrCaptureMaxBytes = 1 * 1024 * 1024
     static let truncationNotice = "\n[RemoteCode] git output truncated; showing the captured prefix.\n"
+    static let timeoutNotice = "\n[RemoteCode] git timed out and was stopped; this output is incomplete.\n"
+    /// Shown where a changed-files list could not be refreshed.
+    public static let summaryTimedOutMessage = "git timed out; the changed files were not refreshed."
 
     struct ProcessResult {
         let exit: Int32
@@ -1040,19 +1072,23 @@ public enum GitDiff {
         let stderr: String
         let stdoutTruncated: Bool
         let stderrTruncated: Bool
+        /// Killed at its read-only deadline; stdout holds only what was read.
+        let timedOut: Bool
 
         init(
             exit: Int32,
             stdout: String,
             stderr: String,
             stdoutTruncated: Bool = false,
-            stderrTruncated: Bool = false
+            stderrTruncated: Bool = false,
+            timedOut: Bool = false
         ) {
             self.exit = exit
             self.stdout = stdout
             self.stderr = stderr
             self.stdoutTruncated = stdoutTruncated
             self.stderrTruncated = stderrTruncated
+            self.timedOut = timedOut
         }
     }
 
@@ -1081,13 +1117,14 @@ public enum GitDiff {
     /// repo or reach the network (commit hooks, push, fetch, pull, checkout)
     /// have no deadline: cutting them off could leave work half done.
     static let readOnlyCommandTimeout: TimeInterval = 60
+    nonisolated(unsafe) static var readOnlyCommandTimeoutForTesting: TimeInterval?
     private static let readOnlySubcommands: Set<String> = [
         "rev-parse", "diff", "ls-files", "for-each-ref", "log", "show", "symbolic-ref",
     ]
 
     static func timeout(forGitArguments args: [String]) -> TimeInterval? {
         guard let subcommand = args.first, readOnlySubcommands.contains(subcommand) else { return nil }
-        return readOnlyCommandTimeout
+        return readOnlyCommandTimeoutForTesting ?? readOnlyCommandTimeout
     }
 
     /// Decode a prefix-capped capture without turning a mid-character cut
@@ -1127,7 +1164,6 @@ public enum GitDiff {
         }
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
-            if control?.shouldStop == true { break }
             let count = Darwin.read(fd, &buffer, buffer.count)
             if count > 0 {
                 acc.append(Data(buffer.prefix(count)))
@@ -1136,6 +1172,9 @@ public enum GitDiff {
             if count == 0 { break }
             if errno == EINTR { continue }
             guard errno == EAGAIN || errno == EWOULDBLOCK else { break }
+            // Stop only once the pipe is empty: bytes git wrote before it
+            // exited are kept even if this thread ran late.
+            if control?.shouldStop == true { break }
             // Data and EOF wake poll at once; the timeout only bounds how long
             // a stop request waits.
             var pollDescriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
@@ -1146,8 +1185,10 @@ public enum GitDiff {
     }
 
     private static func decoratedStdout(_ r: ProcessResult) -> String {
-        guard r.stdoutTruncated else { return r.stdout }
-        return r.stdout + truncationNotice
+        var stdout = r.stdout
+        if r.stdoutTruncated { stdout += truncationNotice }
+        if r.timedOut { stdout += timeoutNotice }
+        return stdout
     }
 
     static func runCommand(
@@ -1220,7 +1261,8 @@ public enum GitDiff {
             stdout: decodeCapturedUTF8(outCapped.data),
             stderr: stderr,
             stdoutTruncated: outCapped.truncated,
-            stderrTruncated: errBox.truncated
+            stderrTruncated: errBox.truncated,
+            timedOut: timedOut.isSet
         )
         logCommand(args, result: r, elapsed: Date().timeIntervalSince(started))
         return r

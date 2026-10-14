@@ -9,7 +9,7 @@ import AgentRuntime
 /// Call counts let tests assert that spinner states, race guards,
 /// and failure paths call the right methods the right number of times.
 final class FakeGitClient: GitClient, @unchecked Sendable {
-    var stubbedSummary: GitSummary
+    var stubbedSummary: GitSummary?
     var stubbedBranches: GitBranches
     var stubbedLog: [GitCommit]
     var stubbedDiff: String
@@ -29,7 +29,7 @@ final class FakeGitClient: GitClient, @unchecked Sendable {
     var actionCallCount: Int { lock.lock(); defer { lock.unlock() }; return _actionCallCount }
 
     init(
-        summary: GitSummary = GitSummary(isGitRepo: true, branch: "main", dirty: false,
+        summary: GitSummary? = GitSummary(isGitRepo: true, branch: "main", dirty: false,
                                          files: [], totalAdditions: 0, totalDeletions: 0),
         branches: GitBranches = GitBranches(current: "main", locals: ["main"]),
         log: [GitCommit] = [],
@@ -51,7 +51,7 @@ final class FakeGitClient: GitClient, @unchecked Sendable {
         self.stubbedHumanizeError = humanizeError
     }
 
-    func summary(in cwd: String) -> GitSummary {
+    func summary(in cwd: String) -> GitSummary? {
         lock.lock(); _summaryCallCount += 1; lock.unlock()
         return stubbedSummary
     }
@@ -199,6 +199,26 @@ final class DiffPanelGitClientSeamTests: XCTestCase {
         XCTAssertEqual(vm.lastErrorRaw, "fatal: remote not found",
             "lastErrorRaw must preserve the original stderr " +
             "so 'Copy details' can recover the full git message")
+    }
+
+    /// WHY: a git status that timed out has no file list. Shown as a clean
+    /// tree it said "no changes" while the agent's edits were still on disk.
+    /// The panel keeps the list it had and says the refresh failed.
+    func test_timedOutSummary_keepsTheLastListAndSaysSo() {
+        let dirty = GitSummary(
+            isGitRepo: true, branch: "main", dirty: true,
+            files: [GitFileEntry(path: "a.swift", oldPath: nil, status: .modified, additions: 1, deletions: 0, binary: false)],
+            totalAdditions: 1, totalDeletions: 0
+        )
+        let fake = FakeGitClient(summary: dirty)
+        let vm = DiffPanelViewModel(cwd: "/fake", gitClient: fake)
+        fake.stubbedSummary = nil
+
+        vm.refresh()
+        waitUntil("timeout surfaces") { vm.lastError != nil }
+
+        XCTAssertEqual(vm.lastError, GitDiff.summaryTimedOutMessage)
+        XCTAssertEqual(vm.summary, dirty, "the last loaded list stays; it is never replaced by a clean tree")
     }
 
     func test_localGitOutcome_reportsOnlyCanonicalKindAndBooleanResult() {

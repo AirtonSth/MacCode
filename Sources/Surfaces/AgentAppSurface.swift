@@ -1140,8 +1140,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// `summary` already reads the branch. `GitDiff.branches` repeated isGit
     /// and rev-parse and listed every local ref only for `.current`; this keeps
     /// its detached-HEAD rule ("HEAD" means no branch). 5 git spawns, not 8.
-    nonisolated static func loadGitHeader(cwd: String) -> (branch: String?, summary: GitSummary) {
-        let summary = GitDiff.summary(in: cwd)
+    /// `nil` when git timed out: the header keeps what it showed.
+    nonisolated static func loadGitHeader(cwd: String) -> (branch: String?, summary: GitSummary)? {
+        guard let summary = GitDiff.summary(in: cwd) else { return nil }
         return (summary.branch == "HEAD" ? nil : summary.branch, summary)
     }
 

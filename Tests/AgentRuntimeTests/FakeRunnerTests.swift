@@ -340,6 +340,54 @@ final class FakeRunnerTests: XCTestCase {
         XCTFail("non-git completed run must still record an explicit missing checkpoint")
     }
 
+    /// WHY: when a git probe was killed at its read-only deadline, enrichment
+    /// persisted `.ready` with `files == []`, a checkpoint saying the turn
+    /// changed nothing. A timed-out read must be recorded as an error.
+    func test_coordinatorRecordsErrorCheckpointWhenGitTimesOut() async throws {
+        let appSupport = NSTemporaryDirectory() + "rc2-checkpoint-db-" + UUID().uuidString
+        let repoDir = try mkTmpRepo()
+        defer {
+            try? FileManager.default.removeItem(atPath: appSupport)
+            try? FileManager.default.removeItem(atPath: repoDir)
+        }
+        try "hello\nchanged\n".write(toFile: repoDir + "/README.md", atomically: true, encoding: .utf8)
+        // `diff` and `ls-files` stall on this hook; `rev-parse` does not.
+        let hook = repoDir + "/.git/slow-fsmonitor.sh"
+        try "#!/bin/sh\nsleep 30\n".write(toFile: hook, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook)
+        runShell(["git", "-C", repoDir, "config", "core.fsmonitor", hook])
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let checkpointRepo = AgentTurnCheckpointRepository(db: db)
+        let thread = AgentThread(title: "checkpoint", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(runRepo: AgentRunRepository(db: db),
+                                              messageRepo: AgentMessageRepository(db: db),
+                                              threadRepo: threadRepo,
+                                              checkpointRepo: checkpointRepo,
+                                              providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "OK"))])
+
+        // Enrichment runs in a detached task, so the deadline is set globally.
+        GitDiff.readOnlyCommandTimeoutForTesting = 0.5
+        defer { GitDiff.readOnlyCommandTimeoutForTesting = nil }
+        _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id, provider: .codex, model: "fake-model", cwd: repoDir, prompt: "hi"))
+        var enriched: AgentTurnCheckpointSummary?
+        let deadline = Date().addingTimeInterval(10)
+        while enriched == nil, Date() < deadline {
+            if let checkpoint = (try? checkpointRepo.list(threadId: thread.id))?.first,
+               checkpoint.status != .missing || checkpoint.errorMessage != nil {
+                enriched = checkpoint
+            } else {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+        }
+
+        let checkpoint = try XCTUnwrap(enriched, "the completed run must still be enriched")
+        XCTAssertEqual(checkpoint.status, .error, "a timed-out read must never be a ready checkpoint")
+        XCTAssertEqual(checkpoint.errorMessage, GitDiff.summaryTimedOutMessage)
+        XCTAssertTrue(checkpoint.files.isEmpty)
+    }
+
     func test_revertThreadToCheckpointRestoresWorkspaceAndRollsBackProvider() async throws {
         let appSupport = NSTemporaryDirectory() + "rc2-checkpoint-revert-db-" + UUID().uuidString
         let repoDir = try mkTmpRepo(prefix: "rc2-checkpoint-revert-repo-")
