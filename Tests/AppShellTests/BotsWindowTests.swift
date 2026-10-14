@@ -8647,6 +8647,85 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(restored.isDeskThreadRailVisible)
     }
 
+    func test_createDeskThreadKeepsRailAndInspectorHidden_becausePlusMustNotOpenSidebars() throws {
+        // WHY: the header + and the FAB exist so the user can start a thread
+        // without opening the THREADS column. Forcing it open also overwrote
+        // the saved hide choice, so the next launch came back with it shown.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .grok)
+        vm.openDesk(piper)
+        vm.isDeskThreadRailVisible = false
+        vm.isDeskSidePaneVisible = false
+
+        XCTAssertTrue(vm.createDeskThread())
+
+        XCTAssertFalse(vm.isDeskThreadRailVisible, "+ must not open the threads rail")
+        XCTAssertFalse(vm.isDeskSidePaneVisible, "+ must not open the inspector")
+        XCTAssertEqual(vm.selectedConversation?.title, "New thread", "the chat still moves to the new thread")
+        XCTAssertEqual(vm.conversations.count, 1)
+        XCTAssertFalse(
+            BotsViewModel(context: context).isDeskThreadRailVisible,
+            "the hidden choice must survive reopen"
+        )
+    }
+
+    func test_routineTestRunKeepsHiddenThreadRail_becauseTestRunMustNotOpenSidebars() throws {
+        // WHY: a test run starts its own thread through the same path as +.
+        // It must not open the rail nor rewrite the saved hide choice.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.saveRoutine()
+        let routine = try XCTUnwrap(vm.routines.first)
+        vm.isDeskThreadRailVisible = false
+
+        vm.requestRoutineTestRun(id: routine.definition.id)
+
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.deskMessages.filter { $0.role == .user }.map(\.text), [routine.definition.prompt])
+        XCTAssertFalse(vm.isDeskThreadRailVisible, "a test run must not open the threads rail")
+        XCTAssertFalse(
+            BotsViewModel(context: context).isDeskThreadRailVisible,
+            "the hidden choice must survive reopen"
+        )
+    }
+
+    func test_deskNewThreadFABSitsOnTheChatColumn_becauseAHiddenRailMustNotHideIt() throws {
+        // WHY: the user keeps the THREADS rail hidden. A + inside the rail
+        // would never show; the FAB lives on the chat column, outside the
+        // rail branch, and runs the same action and copy as the other +.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let fabStart = try XCTUnwrap(source.range(of: "private var deskNewThreadFAB: some View {"))
+        let fabRest = source[fabStart.upperBound...]
+        let fabEnd = fabRest.range(of: "\n    private ")?.lowerBound ?? fabRest.endIndex
+        let fab = String(source[fabStart.lowerBound..<fabEnd])
+        XCTAssertTrue(fab.contains("vm.createDeskThread()"), "one action for every +")
+        XCTAssertTrue(fab.contains("bots.desk.thread.new.fab"))
+        XCTAssertTrue(fab.contains(".help(AgentChatThreadRailCopy.newHelp)"))
+        XCTAssertTrue(fab.contains(".accessibilityLabel(AgentChatThreadRailCopy.newHelp)"))
+        XCTAssertFalse(fab.contains("isDeskThreadRailVisible"), "the FAB must not touch panel visibility")
+
+        let chatStart = try XCTUnwrap(source.range(of: "private func deskChat"))
+        let chatRest = source[chatStart.upperBound...]
+        let chatEnd = chatRest.range(of: "\n    private func deskUnlinkedComposer")?.lowerBound ?? chatRest.endIndex
+        let chat = String(source[chatStart.lowerBound..<chatEnd])
+        let mount = try XCTUnwrap(chat.range(of: "deskNewThreadFAB"), "the chat column must mount the FAB")
+        let timeline = try XCTUnwrap(chat.range(of: "bots.desk.timeline"))
+        let inspector = try XCTUnwrap(chat.range(of: "if vm.isDeskSidePaneVisible"))
+        XCTAssertLessThan(timeline.lowerBound, mount.lowerBound, "mounted on the chat column, after the rail branch")
+        XCTAssertLessThan(mount.lowerBound, inspector.lowerBound, "not inside the inspector branch")
+
+        let rail = try XCTUnwrap(source.range(of: "private var deskThreadRail: some View {"))
+        let railRest = source[rail.upperBound...]
+        let railEnd = railRest.range(of: "\n    private ")?.lowerBound ?? railRest.endIndex
+        XCTAssertFalse(String(source[rail.lowerBound..<railEnd]).contains("deskNewThreadFAB"),
+                       "inside the rail it would vanish with the rail")
+    }
+
     func test_clearAllDeskThreadsDeletesOnlyThatBot_becauseClearAllMustNotWipeTheFleet() throws {
         // WHY: dest Clear All is this teammate's dest list, not every bot
         // and not Agent App workspace threads.

@@ -5014,9 +5014,8 @@ public final class BotsViewModel: ObservableObject {
     @discardableResult
     public func createDeskThread() -> Bool {
         guard let bot = selectedBot else { return false }
-        if !isDeskThreadRailVisible {
-            isDeskThreadRailVisible = true
-        }
+        // No rail reveal: every + (header, rail, FAB) and test runs keep the
+        // user's panel layout and its saved hide choice.
         let conversation = BotConversation(botID: bot.id, title: "New thread")
         do {
             try botStore.upsertConversation(conversation)
@@ -13069,6 +13068,29 @@ public struct BotsRootView: View {
         }
     }
 
+    /// Floating + on the chat column, so a new conversation starts while the
+    /// THREADS rail is hidden. Same action and copy as the header and rail +.
+    /// Raised surface, not accent: it must not compete with scroll-to-latest.
+    private var deskNewThreadFAB: some View {
+        Button {
+            vm.createDeskThread()
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(DS.Palette.text)
+                .frame(width: DSIconButton.hitTargetSize, height: DSIconButton.hitTargetSize)
+                .dsHoverFill(cornerRadius: DSIconButton.hitTargetSize / 2)
+                .background(DS.Palette.surfaceOverlay)
+                .clipShape(Circle())
+                .overlay(Circle().strokeBorder(DS.Palette.lineStrong, lineWidth: DS.Border.hairline))
+                .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
+        }
+        .buttonStyle(.plain)
+        .help(AgentChatThreadRailCopy.newHelp)
+        .accessibilityLabel(AgentChatThreadRailCopy.newHelp)
+        .accessibilityIdentifier("bots.desk.thread.new.fab")
+    }
+
     /// Visual gap between Desk header glyphs. DSIconButton lays out at
     /// 44pt so the 26pt icon can keep a 44pt hit box; subtract that extra
     /// so the glyphs sit `DS.Space.xs` apart like workspace header icons.
@@ -13207,6 +13229,12 @@ public struct BotsRootView: View {
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("bots.desk.timeline")
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Mid-trailing: the top holds banners with trailing buttons
+            // (Full access, Undo), the bottom the composer and scroll-to-latest.
+            .overlay(alignment: .trailing) {
+                deskNewThreadFAB
+                    .padding(.trailing, DS.Space.xl)
+            }
             if vm.isDeskSidePaneVisible {
                 DSResizeDivider(axis: .vertical, help: "Resize inspector") { delta in
                     // Divider reports + when the pointer moves right. This
