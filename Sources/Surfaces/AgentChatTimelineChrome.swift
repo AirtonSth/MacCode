@@ -33,6 +33,8 @@ public enum AgentChatTimelineScrollChrome {
     public static let bottomAnchorID = "BOTTOM"
     public static let bottomRevealSlack: CGFloat = 4
     public static let scrollDownButtonBottomInset: CGFloat = 22
+    /// Gap between scroll-to-latest and a trailing accessory stacked under it.
+    public static let trailingAccessorySpacing: CGFloat = DS.Space.sm
 }
 
 /// Hop off the current AttributeGraph transaction before touching SwiftUI
@@ -134,7 +136,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
                 // SwiftUI's ScrollEnvironmentStorage while AttributeGraph
                 // still tracks `isScrollViewTransformClippingEnabled`.
                 .overlay(alignment: .bottomTrailing) {
-                    VStack(alignment: .trailing, spacing: DS.Space.sm) {
+                    VStack(alignment: .trailing, spacing: AgentChatTimelineScrollChrome.trailingAccessorySpacing) {
                         if showScrollDownButton {
                             Button {
                                 rejoin(proxy)

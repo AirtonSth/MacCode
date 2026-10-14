@@ -12620,11 +12620,13 @@ final class BotsWindowTests: XCTestCase {
                 if let scrollButton {
                     XCTAssertTrue(scrollButton.accessibilityPerformPress(), "Scroll to latest message must support its real accessibility action")
                 } else {
+                    // The Desk's new-thread FAB sits under scroll-to-latest in
+                    // the same corner, so the arrow is one 44pt slot higher.
+                    let rise = AgentChatTimelineScrollChrome.scrollDownButtonBottomInset
+                        + 44 + AgentChatTimelineScrollChrome.trailingAccessorySpacing + 22
                     let buttonCenter = NSPoint(
                         x: scrollView.bounds.maxX - 14 - 22,
-                        y: scrollView.isFlipped
-                            ? scrollView.bounds.maxY - AgentChatTimelineScrollChrome.scrollDownButtonBottomInset - 22
-                            : scrollView.bounds.minY + AgentChatTimelineScrollChrome.scrollDownButtonBottomInset + 22
+                        y: scrollView.isFlipped ? scrollView.bounds.maxY - rise : scrollView.bounds.minY + rise
                     )
                     let location = scrollView.convert(buttonCenter, to: nil)
                     for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
