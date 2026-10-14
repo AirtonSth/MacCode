@@ -2143,10 +2143,10 @@ public final class AppContext {
         let periodicCycleID = includeGrok ? nil : periodicAccountUsageCycle?.id
         // WHY: on macOS the Claude OAuth token is in the Keychain (not read), so
         // unless Claude Code's own usage cache is fresh, Claude usage means
-        // launching `claude -p /usage`: ~10 CPU-s and ~600 MB each time. A timer
-        // tick launches it at most once per interval (longer after misses) and
-        // never falls back to the interactive PTY; launch and an opened usage
-        // panel still probe right away.
+        // launching `claude -p /usage`: ~5 CPU-s and ~450 MB each time. A timer
+        // tick launches it at most once per interval (longer after misses), so
+        // the ring is at most one interval old instead of one minute; launch and
+        // an opened usage panel still probe right away.
         let isPeriodic = reason == "periodic"
         let now = accountUsageNow()
         let claudeCLIProbeDue = !isPeriodic || lastClaudeUsageCLIProbeAt.map {
@@ -2172,7 +2172,7 @@ public final class AppContext {
             claudeAuthFileURL: Self.defaultClaudeAuthFileURL,
             claudeUsageCacheURL: claudeUsageCacheURL,
             allowClaudeCLIProbe: claudeCLIProbeDue,
-            allowClaudeUsageScreen: !isPeriodic,
+            allowClaudeUsageScreen: claudeCLIProbeDue,
             codexAuthFileURL: Self.defaultCodexAuthFileURL,
             includeGrok: includeGrok,
             cwd: state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
@@ -2423,8 +2423,9 @@ public final class AppContext {
     }
 
     /// Shortest gap between Claude usage CLI launches from the periodic timer;
-    /// doubles after each launch that got no answer, up to 4×.
-    static let claudeUsageCLIProbeInterval: TimeInterval = 15 * 60
+    /// doubles after each launch that got no answer, up to 4×. Short enough
+    /// that Claude used outside RemoteCode shows in the ring within minutes.
+    static let claudeUsageCLIProbeInterval: TimeInterval = 5 * 60
 
     static var defaultCodexAuthFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser

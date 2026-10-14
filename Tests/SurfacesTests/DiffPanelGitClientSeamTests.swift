@@ -51,8 +51,13 @@ final class FakeGitClient: GitClient, @unchecked Sendable {
         self.stubbedHumanizeError = humanizeError
     }
 
+    /// When set, answers `summary(in:)` instead of `stubbedSummary`, with the
+    /// 1-based call number, so a test can hold one read while another lands.
+    var summaryProvider: ((Int) -> GitSummary?)?
+
     func summary(in cwd: String) -> GitSummary? {
-        lock.lock(); _summaryCallCount += 1; lock.unlock()
+        lock.lock(); _summaryCallCount += 1; let call = _summaryCallCount; lock.unlock()
+        if let summaryProvider { return summaryProvider(call) }
         return stubbedSummary
     }
     func branches(in cwd: String) -> GitBranches { stubbedBranches }
@@ -219,6 +224,51 @@ final class DiffPanelGitClientSeamTests: XCTestCase {
 
         XCTAssertEqual(vm.lastError, GitDiff.summaryTimedOutMessage)
         XCTAssertEqual(vm.summary, dirty, "the last loaded list stays; it is never replaced by a clean tree")
+    }
+
+    /// WHY: the timeout banner says the list is stale. Once a later read lands
+    /// the list is fresh again, so a banner left up would call fresh data stale.
+    func test_timeoutBannerClearsWhenALaterReadLands() {
+        let fake = FakeGitClient()
+        let vm = DiffPanelViewModel(cwd: "/fake", gitClient: fake)
+        fake.stubbedSummary = nil
+        vm.refresh()
+        waitUntil("timeout surfaces") { vm.lastError == GitDiff.summaryTimedOutMessage }
+
+        let fresh = GitSummary(isGitRepo: true, branch: "main", dirty: true,
+                               files: [GitFileEntry(path: "b.swift", oldPath: nil, status: .added,
+                                                    additions: 2, deletions: 0, binary: false)],
+                               totalAdditions: 2, totalDeletions: 0)
+        fake.stubbedSummary = fresh
+        vm.refresh()
+        waitUntil("fresh list lands") { vm.summary == fresh }
+        XCTAssertNil(vm.lastError, "a fresh list must not sit under a 'not refreshed' banner")
+    }
+
+    /// WHY: FSEvents, Refresh and git actions overlap. A slow read that times
+    /// out after a newer read already landed must not put the banner (or its
+    /// older list) over the newer state.
+    func test_readThatLandsAfterANewerOneIsDropped() {
+        let fake = FakeGitClient()
+        let vm = DiffPanelViewModel(cwd: "/fake", gitClient: fake)
+        let baseline = fake.summaryCallCount
+        let release = DispatchSemaphore(value: 0)
+        let fresh = GitSummary(isGitRepo: true, branch: "main", dirty: true,
+                               files: [GitFileEntry(path: "c.swift", oldPath: nil, status: .modified,
+                                                    additions: 1, deletions: 1, binary: false)],
+                               totalAdditions: 1, totalDeletions: 1)
+        fake.summaryProvider = { call in
+            if call == baseline + 1 { release.wait(); return nil } // slow read, then times out
+            return fresh
+        }
+        vm.refresh()
+        waitUntil("slow read started") { fake.summaryCallCount == baseline + 1 }
+        vm.refresh()
+        waitUntil("newer read lands") { vm.summary == fresh }
+        release.signal()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3)) // let the slow read land
+        XCTAssertNil(vm.lastError, "the older timed-out read landed last but is older than what is shown")
+        XCTAssertEqual(vm.summary, fresh)
     }
 
     func test_localGitOutcome_reportsOnlyCanonicalKindAndBooleanResult() {

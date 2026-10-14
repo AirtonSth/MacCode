@@ -402,10 +402,11 @@ public final class DiffPanelViewModel: ObservableObject {
         if asyncLoad {
             let cwdCopy = cwd
             let gc = gitClient
+            let generation = nextSummaryGeneration()
             Task { [weak self] in
                 let (s, b) = await DiffPanelViewModel.performLoad(cwd: cwdCopy, gitClient: gc)
                 guard let self else { return }
-                self.applySummary(s)
+                self.applySummary(s, generation: generation)
                 self.branches = b
                 self.isLoading = false
             }
@@ -542,21 +543,40 @@ public final class DiffPanelViewModel: ObservableObject {
     public func refresh() {
         let cwd = self.cwd
         let gc = gitClient
+        let generation = nextSummaryGeneration()
         DispatchQueue.global().async { [weak self] in
             let s = gc.summary(in: cwd)
-            DispatchQueue.main.async { self?.applySummary(s) }
+            DispatchQueue.main.async { self?.applySummary(s, generation: generation) }
         }
     }
 
+    /// Summary reads overlap (FSEvents, Refresh, git actions). Each takes a
+    /// generation; a read that lands after a newer one already applied is
+    /// dropped, so a slow or timed-out read never covers fresher state.
+    private var requestedSummaryGeneration = 0
+    private var appliedSummaryGeneration = 0
+
+    private func nextSummaryGeneration() -> Int {
+        requestedSummaryGeneration += 1
+        return requestedSummaryGeneration
+    }
+
     /// A timed-out git read keeps the last loaded list and says so in the
-    /// banner instead of showing a clean tree.
-    private func applySummary(_ s: GitSummary?) {
+    /// banner instead of showing a clean tree. The next read that lands
+    /// clears that banner (and only that one; action failures keep theirs).
+    private func applySummary(_ s: GitSummary?, generation: Int) {
+        guard generation > appliedSummaryGeneration else { return }
+        appliedSummaryGeneration = generation
         guard let s else {
             lastError = GitDiff.summaryTimedOutMessage
             lastErrorRaw = nil
             return
         }
         summary = s
+        if lastError == GitDiff.summaryTimedOutMessage {
+            lastError = nil
+            lastErrorRaw = nil
+        }
     }
 
     /// Refresh-button entry point: one background pass that reloads
@@ -567,13 +587,14 @@ public final class DiffPanelViewModel: ObservableObject {
         let cwd = self.cwd
         let gc = gitClient
         isLoading = true
+        let generation = nextSummaryGeneration()
         DispatchQueue.global().async { [weak self] in
             let s = gc.summary(in: cwd)
             let b = gc.branches(in: cwd)
             let log = gc.log(in: cwd, limit: 100)
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.applySummary(s)
+                self.applySummary(s, generation: generation)
                 self.branches = b
                 self.commits = log
                 self.historyLoaded = true
@@ -1034,6 +1055,7 @@ public final class DiffPanelViewModel: ObservableObject {
         let gc = gitClient
         isBusy = true
         actionSuccess = nil
+        let generation = nextSummaryGeneration()
         DispatchQueue.global().async { [weak self] in
             let r = op(cwd)
             let s = gc.summary(in: cwd)
@@ -1041,7 +1063,6 @@ public final class DiffPanelViewModel: ObservableObject {
             let log = gc.log(in: cwd, limit: 100)
             DispatchQueue.main.async {
                 guard let self else { return }
-                if let s { self.summary = s }
                 self.branches = b
                 self.commits = log
                 self.isBusy = false
@@ -1059,7 +1080,7 @@ public final class DiffPanelViewModel: ObservableObject {
                     self.lastError = gc.humanizeError(r.message)
                 }
                 // A failed action keeps its own banner.
-                if s == nil, r.ok { self.applySummary(nil) }
+                if s != nil || r.ok { self.applySummary(s, generation: generation) }
             }
         }
     }

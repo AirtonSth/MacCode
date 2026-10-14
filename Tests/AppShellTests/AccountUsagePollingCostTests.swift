@@ -142,8 +142,9 @@ final class AccountUsagePollingCostTests: XCTestCase {
     }
 
     /// WHY: the CLI interval must still let a periodic tick reach Claude every
-    /// 15 minutes, back off while Claude keeps not answering (signed out, CLI
-    /// broken), recover after an answer, and never offer the interactive PTY.
+    /// 5 minutes (the ring has no age label, so it must not drift far behind),
+    /// back off while Claude keeps not answering (signed out, CLI broken),
+    /// recover after an answer, and offer the PTY fallback only on a due tick.
     func test_periodicClaudeCLIProbeRunsEveryIntervalAndBacksOffAfterMisses() async throws {
         let refresher = ScriptedRefresher(full: [
             AssistantAccountUsage(provider: .codex, weeklyUsedPercent: 10, weeklyWindowDurationMinutes: 10_080)
@@ -157,27 +158,27 @@ final class AccountUsagePollingCostTests: XCTestCase {
             guard await runPeriodicTick(context) else { return nil }
             let requests = await refresher.fullRequests
             XCTAssertEqual(requests.count, before + 1)
-            XCTAssertEqual(requests.last?.allowClaudeUsageScreen, false,
-                           "a timer tick never opens the interactive Claude PTY")
+            XCTAssertEqual(requests.last?.allowClaudeUsageScreen, requests.last?.allowClaudeCLIProbe,
+                           "a timer tick opens the Claude PTY fallback only when it may probe Claude")
             return requests.last?.allowClaudeCLIProbe
         }
 
-        // Claude never answers: each miss doubles the 15 minute gap, capped at 60.
+        // Claude never answers: each miss doubles the 5 minute gap, capped at 20.
         var allowedAt: [Double] = []
         for minute in stride(from: 0.0, through: 180, by: 5) {
             if await tick(atMinute: minute) == true { allowedAt.append(minute) }
         }
-        XCTAssertEqual(allowedAt, [0, 30, 90, 150])
+        XCTAssertEqual(allowedAt, [0, 10, 30, 50, 70, 90, 110, 130, 150, 170])
 
-        // One answer resets the interval to 15 minutes.
+        // One answer resets the interval to 5 minutes.
         await refresher.setFull([
             AssistantAccountUsage(provider: .claude, weeklyUsedPercent: 20, weeklyWindowDurationMinutes: 10_080)
         ])
         let answered = await tick(atMinute: 225)
         XCTAssertEqual(answered, true)
-        let early = await tick(atMinute: 235)
+        let early = await tick(atMinute: 229)
         XCTAssertEqual(early, false)
-        let next = await tick(atMinute: 240)
+        let next = await tick(atMinute: 230)
         XCTAssertEqual(next, true)
 
         // An explicit refresh always may probe, with the PTY fallback.

@@ -301,7 +301,8 @@ final class PaneActionTests: XCTestCase {
             "newly active workspace titles must not compile N durable gets"
         )
 
-        XCTAssertTrue(source.contains("let chrome = (try? self.threadRepo.listChrome(ids: [tid]))?[tid]"))
+        // Run-finished notification: chrome probe, read off the MainActor.
+        XCTAssertTrue(source.contains("chrome: (try? threadRepo.listChrome(ids: [threadId]))?[threadId]"))
         XCTAssertTrue(source.contains("let chrome = (try? threadRepo.listChrome(ids: [threadId]))?[threadId]"))
     }
 
