@@ -3938,6 +3938,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return next
     }
 
+    /// The bot routine scheduler fires through the paired authority, so the
+    /// Mac timer and iOS `bot.routine.run` share one executor and one runtime.
+    var botRoutineAuthority: BotRemoteControlAuthority? { try? pairedBotAuthority() }
+
     private func pairedBotAuthority() throws -> BotRemoteControlAuthority {
         if let pairedBotRemote { return pairedBotRemote }
         guard let ctx = context else {
@@ -4084,6 +4088,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 adoptAsDeskRoute: routingValues.map(Self.pairedRouteKeepsItsProvider) ?? false
             )
             return Self.foundationObject(result.objectValue ?? [:])
+        }
+        created.onRoutineSend = { [weak self] routine in
+            guard let vm = self?.botsViewModel else {
+                throw BotRemoteControlAuthority.Error(
+                    code: -32091,
+                    message: "Bot runtime is unavailable."
+                )
+            }
+            return Self.foundationObject(try vm.enqueueScheduledRoutine(routine).objectValue ?? [:])
         }
         created.onConversationRoutingSet = { [weak self] id, conversationID, routingValues in
             guard let vm = self?.botsViewModel else {

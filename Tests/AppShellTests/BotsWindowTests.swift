@@ -5767,7 +5767,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNotNil(updated.activation.lastTestRunRequestedAt)
         XCTAssertFalse(updated.activation.isEnabled, "Test run must not silently enable a schedule")
         XCTAssertFalse(vm.isAutonomyActive)
-        XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("App-closed schedules stay off"))
+        XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("only while RemoteCode is open"))
     }
 
     func test_routineTestRunCreatesANewConversationForEveryExecution() throws {

@@ -6949,20 +6949,62 @@ public final class BotsViewModel: ObservableObject {
             // Each task execution owns a fresh conversation and provider session.
             guard createDeskThread() else { return }
             if let spec {
-                deskRouting.provider = spec.provider
-                deskRouting.providerInstanceID = spec.providerInstanceID
-                deskRouting.model = spec.model
-                deskRouting.routingMode = spec.provider == .distill ? .manual : spec.routingMode
-                deskRouting.reasoningEffort = spec.reasoningEffort
-                deskRouting.reasoningModel = spec.reasoningModel
-                deskRouting.distillMainEffortSelection = spec.provider == .distill
-                    ? (spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)) : nil
-                deskRouting.distillReasoningEffortSelection = spec.provider == .distill
-                    ? (spec.distillReasoningEffortSelection ?? .automatic) : nil
+                deskRouting = Self.routineRouting(spec, base: deskRouting)
             }
             _ = send(instruction)
         } catch {
             errorMessage = String(describing: error)
+        }
+    }
+
+    /// The route a task execution runs: its schedule spec over `base`. Test
+    /// run and the scheduled fire build the same route.
+    static func routineRouting(_ spec: BotScheduleSpec, base: BotDeskRouting) -> BotDeskRouting {
+        var routing = base
+        routing.provider = spec.provider
+        routing.providerInstanceID = spec.providerInstanceID
+        routing.model = spec.model
+        routing.routingMode = spec.provider == .distill ? .manual : spec.routingMode
+        routing.reasoningEffort = spec.reasoningEffort
+        routing.reasoningModel = spec.reasoningModel
+        routing.distillMainEffortSelection = spec.provider == .distill
+            ? (spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)) : nil
+        routing.distillReasoningEffortSelection = spec.provider == .distill
+            ? (spec.distillReasoningEffortSelection ?? .automatic) : nil
+        return routing
+    }
+
+    /// A scheduled slot or a paired Run now: a NEW conversation sends the
+    /// Instruction on the task's route, kept as that conversation's desk
+    /// route for follow-ups. The user's selection and panels stay as they are.
+    func enqueueScheduledRoutine(_ routine: BotRoutine) throws -> JSONValue {
+        try enqueueHostMessage(
+            botID: routine.definition.botID,
+            text: routine.definition.prompt,
+            conversationID: nil,
+            routing: routine.definition.scheduleSpec.map { Self.routineRouting($0, base: BotDeskRouting()) },
+            adoptAsDeskRoute: true
+        )
+    }
+
+    /// Before a scheduled send, a Docker bot whose computer is stopped waits
+    /// (bounded) for it to come up, instead of losing the slot to "not ready".
+    /// Nil when the send can go ahead; otherwise why the computer is not up.
+    func awaitGuestForScheduledSend(botID: BotID, timeout: TimeInterval) async -> String? {
+        guard dockerGuestReadyOverrideForTesting == nil,
+              let bot = try? botStore.get(id: botID),
+              let revision = try? currentRevision(for: bot),
+              (desktopKindOverrideForTesting ?? resolvedDesktopKind(revision.desktopKind)) == .dockerDesktop,
+              !isGuestRunning(botID) else { return nil }
+        if guestLaunchState(for: botID) != .starting {
+            presentGuestDesktop(botID: botID)
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if isGuestRunning(botID) { return nil }
+            if case .failed(let reason) = guestLaunchState(for: botID) { return reason }
+            guard Date() < deadline else { return "The bot computer did not start in time." }
+            try? await Task.sleep(nanoseconds: 500_000_000)
         }
     }
 

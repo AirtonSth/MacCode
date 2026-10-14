@@ -85,6 +85,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// runs the conversation's own desk route (or the resolved Distill default)
     /// and reports it back as `effective_routing`.
     public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]?) throws -> [String: Any])?
+    /// A routine execution (scheduled slot or `bot.routine.run`): the same
+    /// host send as `bot.send`, in a new conversation on the routine's own
+    /// route. Returns the send's `bot_id`, `conversation_id` and `run_id`.
+    public var onRoutineSend: ((BotRoutine) throws -> [String: Any])?
     /// `bot.routing.set` with `conversation_id`: the host adopts the route as
     /// that conversation's desk route and returns the resolved route.
     public var onConversationRoutingSet: ((BotID, BotConversationID, [String: Any]) throws -> [String: Any])?
@@ -112,6 +116,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private var peerReceipts: [String: [String: Any]] = [:]
     private var schedulerRuns: [[String: Any]] = []
     private var routineRuntime: [String: [String: Any]] = [:]
+    /// True at launch and after automatic runs were paused: the next tick
+    /// skips slots missed meanwhile instead of catching them up.
+    private var routineSlotsNeedReseed = true
     private var filesLocation: [String: String] = [:]
     private var fileGenerations: [String: Int] = [:]
     private var fileCAS: [String: String] = [:]
@@ -327,6 +334,228 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return canonicalLeft == canonicalRight
     }
 
+    // MARK: - Routine scheduler
+
+    /// A routine slot a tick claimed. It is spent once claimed: start it with
+    /// `startRoutineFire` or record why it could not start.
+    public struct RoutineFire: Sendable, Equatable {
+        public let routine: BotRoutine
+        public let scheduledAt: Date
+    }
+
+    /// The in-process timer's period. A slot missed by less than one tick
+    /// still fires after a relaunch, a pause, or an edit.
+    public static let routineTickInterval: TimeInterval = 30
+
+    /// Claims every due routine slot with one store read, off the main thread.
+    /// The claim writes `last_slot_at` and the next `next_run_at` before any
+    /// run starts, so an overlapping tick or a relaunch never fires a slot twice.
+    public func claimDueRoutines(now: Date = Date()) throws -> [RoutineFire] {
+        lock.lock()
+        defer { lock.unlock() }
+        let pass = try claimDueRoutinesLocked(now: now)
+        if pass.changed { persistSidecar() }
+        return pass.claims
+    }
+
+    /// Starts a claimed slot as a real Bot run and records what happened:
+    /// `started` with its run, or `failed` with the reason. Never `completed`.
+    @discardableResult
+    public func startRoutineFire(_ fire: RoutineFire, now: Date = Date()) -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+        let started = startRoutineLocked(fire.routine, scheduledAt: fire.scheduledAt, hostID: nil, now: now)
+        persistSidecar()
+        return started.run
+    }
+
+    /// A claimed slot that never reached the send (its bot computer did not
+    /// come up) is recorded as failed, never dropped.
+    @discardableResult
+    public func failRoutineFire(_ fire: RoutineFire, reason: String, now: Date = Date()) -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+        let failed = recordRoutineRunLocked(
+            routineRunRecord(fire.routine, scheduledAt: fire.scheduledAt, now: now, error: reason),
+            routine: fire.routine,
+            hostID: nil,
+            now: now
+        )
+        persistSidecar()
+        return failed.run
+    }
+
+    private func claimDueRoutinesLocked(now: Date) throws -> (claims: [RoutineFire], changed: Bool) {
+        // Automatic runs follow the Schedule Tasks switch; after a pause the
+        // first tick skips what the pause missed. `reload`: the switch is
+        // written through another SettingsStore, whose cache is not ours.
+        guard settings.reload().isBotAutonomyActive else {
+            routineSlotsNeedReseed = true
+            return ([], false)
+        }
+        let skipMissed = routineSlotsNeedReseed
+        routineSlotsNeedReseed = false
+        let routines = try store.listEnabledRoutines()
+        let floor = now.addingTimeInterval(-Self.routineTickInterval)
+        var changed = false
+        // A disabled or deleted routine has no next run, so enabling it again
+        // starts at its next slot, not at one it skipped while off.
+        let enabledKeys = Set(routines.map { $0.definition.id.value.uuidString.lowercased() })
+        for (key, runtime) in routineRuntime
+        where !enabledKeys.contains(key) && runtime["next_run_at"] is Double {
+            routineRuntime[key]?["next_run_at"] = NSNull()
+            changed = true
+        }
+        var claims: [RoutineFire] = []
+        for routine in routines {
+            let definition = routine.definition
+            let key = definition.id.value.uuidString.lowercased()
+            var runtime = routineRuntime[key] ?? [:]
+            let scheduleKey = definition.scheduleSpecJSON + "\n" + definition.scheduleNote
+            var due = (runtime["next_run_at"] as? Double).map(Date.init(timeIntervalSince1970:))
+            if due == nil || runtime["schedule_key"] as? String != scheduleKey {
+                // New, enabled again, or edited: the first slot after the edit
+                // (or after the last tick), never an older one.
+                due = nextRunDate(definition: definition, enabled: true, after: max(definition.updatedAt, floor))
+                runtime["schedule_key"] = scheduleKey
+            } else if skipMissed, let stale = due, stale < floor {
+                // Missed while RemoteCode was closed or paused: skip, do not catch up.
+                due = nextRunDate(definition: definition, enabled: true, after: floor)
+            }
+            if let slot = due, slot <= now {
+                if runtime["last_slot_at"] as? Double != slot.timeIntervalSince1970 {
+                    runtime["last_slot_at"] = slot.timeIntervalSince1970
+                    claims.append(RoutineFire(routine: routine, scheduledAt: slot))
+                }
+                // A late slot (wake from sleep) fires once; the next one is
+                // after now, so it never replays.
+                due = nextRunDate(
+                    definition: definition,
+                    enabled: true,
+                    after: max(slot.addingTimeInterval(ScheduledTaskOccurrenceCalculator.spentOccurrenceAdvance), now)
+                )
+            }
+            runtime["next_run_at"] = dateValue(due)
+            if !NSDictionary(dictionary: runtime).isEqual(to: routineRuntime[key] ?? [:]) {
+                routineRuntime[key] = runtime
+                changed = true
+            }
+        }
+        return (claims, changed)
+    }
+
+    private func routineRunRecord(
+        _ routine: BotRoutine,
+        scheduledAt: Date?,
+        now: Date,
+        error: String? = nil
+    ) -> [String: Any] {
+        var run: [String: Any] = [
+            "routine_id": routine.definition.id.value.uuidString.lowercased(),
+            "bot_id": routine.definition.botID.value.uuidString.lowercased(),
+            "executed_at": now.timeIntervalSince1970,
+            "automatic": scheduledAt != nil,
+            "schedule_spec_json": routine.definition.scheduleSpecJSON,
+        ]
+        if let scheduledAt { run["scheduled_at"] = scheduledAt.timeIntervalSince1970 }
+        if let error {
+            run["result"] = "failed"
+            run["error"] = error
+        }
+        return run
+    }
+
+    private func startRoutineLocked(
+        _ routine: BotRoutine,
+        scheduledAt: Date?,
+        hostID: String?,
+        now: Date
+    ) -> (run: [String: Any], notification: [String: Any]?) {
+        var run = routineRunRecord(routine, scheduledAt: scheduledAt, now: now)
+        do {
+            guard let onRoutineSend else {
+                throw Error(code: -32091, message: "Bot runtime is unavailable.")
+            }
+            let sent = try onRoutineSend(routine)
+            guard let runID = sent["run_id"] as? String, !runID.isEmpty,
+                  let conversationID = sent["conversation_id"] as? String, !conversationID.isEmpty else {
+                throw Error(code: -32091, message: "Bot runtime did not start a run.")
+            }
+            run["run_id"] = runID
+            run["conversation_id"] = conversationID
+            run["result"] = "started"
+        } catch let error as Error {
+            run = routineRunRecord(routine, scheduledAt: scheduledAt, now: now, error: error.message)
+        } catch {
+            run = routineRunRecord(routine, scheduledAt: scheduledAt, now: now, error: String(describing: error))
+        }
+        return recordRoutineRunLocked(run, routine: routine, hostID: hostID, now: now)
+    }
+
+    /// The routine's runtime (what `bot.routine.list` shows), its attention
+    /// item, and on failure a Mac Activity item plus the paired notification.
+    private func recordRoutineRunLocked(
+        _ run: [String: Any],
+        routine: BotRoutine,
+        hostID: String?,
+        now: Date
+    ) -> (run: [String: Any], notification: [String: Any]?) {
+        let definition = routine.definition
+        let routineKey = definition.id.value.uuidString.lowercased()
+        let botID = definition.botID.value.uuidString.lowercased()
+        let error = run["error"] as? String
+        schedulerRuns.append(run)
+        var runtime = routineRuntime[routineKey] ?? [:]
+        runtime["last_run_id"] = run["run_id"] ?? NSNull()
+        runtime["last_execution_at"] = now.timeIntervalSince1970
+        runtime["last_result"] = run["result"] ?? NSNull()
+        runtime["last_error"] = error ?? NSNull()
+        runtime["last_conversation_id"] = run["conversation_id"] ?? NSNull()
+        routineRuntime[routineKey] = runtime
+        let automatic = run["automatic"] as? Bool == true
+        let item = canonicalAttentionItem([
+            "id": UUID().uuidString.lowercased(),
+            "bot_id": botID,
+            "conversation_id": run["conversation_id"] ?? NSNull(),
+            "run_id": run["run_id"] ?? NSNull(),
+            "state": error == nil ? "working" : "needs_attention",
+            "finished_at": NSNull(),
+            "ownership": "primary",
+            "primary": true,
+            "delegated": false,
+            "title": definition.name,
+            "detail": error.map { "Scheduled task did not start: \($0)" }
+                ?? (automatic ? "Scheduled task started" : "Task run started"),
+            "source": "routine",
+        ], hostID: hostID)
+        attention[botID] = item
+        guard let error else {
+            botRemoteControlLog.info(
+                "bot_routine.started routine=\(routineKey, privacy: .public) bot=\(botID, privacy: .public) automatic=\(automatic, privacy: .public)"
+            )
+            return (run, nil)
+        }
+        botRemoteControlLog.error(
+            "bot_routine.fire_failed routine=\(routineKey, privacy: .public) bot=\(botID, privacy: .public) automatic=\(automatic, privacy: .public) error=\(error, privacy: .public)"
+        )
+        var notification: [String: Any]?
+        do {
+            try store.upsertAttention(BotAttentionItem(
+                botID: definition.botID,
+                kind: .blocked,
+                title: "Scheduled task did not start",
+                detail: "\(definition.name): \(error)",
+                createdAt: now
+            ))
+            notification = try persistAttentionNotification(item, now: now)
+        } catch {
+            botRemoteControlLog.error(
+                "bot_routine.fire_failure_unsurfaced routine=\(routineKey, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+        }
+        return (run, notification)
+    }
+
     private func synchronizeDurableNeedsAttention() throws {
         let items = try store.listAttention(includeAcknowledged: true)
         var changed = false
@@ -353,12 +582,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     /// A `working` bot.send item whose run this process does not track (a host
     /// relaunch drops `liveRuns`) can never reach `settleRuntime`. Close it from
-    /// the run's durable terminal status.
+    /// the run's durable terminal status. A routine run is never in `liveRuns`.
     private func settleOrphanedWorkingAttention(now: Date) {
         var changed = false
         for (botID, item) in attention {
             guard item["state"] as? String == "working",
-                  item["source"] as? String == "bot",
+                  ["bot", "routine"].contains(item["source"] as? String ?? ""),
                   let runID = item["run_id"] as? String,
                   (liveRuns[botID]?["run_id"] as? String).map({ runtimeIDsMatch($0, runID) }) != true,
                   let terminal = terminalRunStatus(runID: runID) else { continue }
@@ -1628,50 +1857,21 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         ])
     }
 
+    /// iOS Run now: the phone's Test run. A real send in a new conversation;
+    /// the receipt fails with the reason when the run could not start.
     private func routineRun(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         let bot = try requireBot(params)
         guard let routineID = string(params, "routine_id"),
               let routineUUID = UUID(uuidString: routineID),
-              try store.listRoutines(botID: bot.id).contains(where: {
+              let routine = try store.listRoutines(botID: bot.id).first(where: {
                   $0.definition.id == BotRoutineID(routineUUID)
               }) else { throw Error.routineGone }
-        let run: [String: Any] = [
-            "run_id": UUID().uuidString.lowercased(),
-            "routine_id": routineID,
-            "bot_id": id(bot),
-            "executed_at": now.timeIntervalSince1970,
-            "result": "accepted",
-        ]
-        schedulerRuns.append(run)
-        var runtime = routineRuntime[routineID.lowercased()] ?? [:]
-        runtime["last_run_id"] = run["run_id"]
-        runtime["last_execution_at"] = now.timeIntervalSince1970
-        runtime["last_result"] = run["result"]
-        if let routine = try store.listRoutines(botID: bot.id).first(where: {
-            $0.definition.id.value.uuidString.caseInsensitiveCompare(routineID) == .orderedSame
-        }) {
-            runtime["next_run_at"] = dateValue(nextRunDate(
-                definition: routine.definition,
-                enabled: routine.activation.isEnabled,
-                after: now
-            ))
-        }
-        routineRuntime[routineID.lowercased()] = runtime
-        attention[id(bot)] = canonicalAttentionItem([
-            "id": UUID().uuidString.lowercased(),
-            "bot_id": id(bot),
-            "conversation_id": selectedConversation[id(bot)] ?? NSNull(),
-            "run_id": run["run_id"] ?? NSNull(),
-            "state": "working",
-            "finished_at": NSNull(),
-            "ownership": "primary",
-            "primary": true,
-            "delegated": false,
-            "title": "Routine: \(routineID)",
-            "detail": "Manual routine run accepted",
-            "source": "routine",
-        ], hostID: string(params, "host_id"))
-        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: run)
+        try store.requestRoutineTestRun(id: routine.definition.id, now: now)
+        let started = startRoutineLocked(routine, scheduledAt: nil, hostID: string(params, "host_id"), now: now)
+        var readback = started.run
+        if let notification = started.notification { readback["notification"] = notification }
+        let failed = started.run["result"] as? String == "failed"
+        return receipt(requestID: requestID, status: failed ? .failed : .completed, botID: id(bot), readback: readback)
     }
 
     private func routineDelete(params: [String: Any], requestID: String) throws -> [String: Any] {
@@ -1685,70 +1885,23 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["deleted": true])
     }
 
+    /// The same pass the in-process timer runs, starting each claimed slot
+    /// in place: `runs` holds what really happened to each one.
     private func schedulerTick(params: [String: Any], now: Date, requestID: String) throws -> [String: Any] {
-        var fired: [[String: Any]] = []
+        var runs: [[String: Any]] = []
         var notifications: [[String: Any]] = []
-        for bot in try store.list() {
-            for routine in try store.listRoutines(botID: bot.id) where routine.activation.isEnabled {
-                let routineKey = routine.definition.id.value.uuidString.lowercased()
-                let persistedDue = routineRuntime[routineKey]?["next_run_at"] as? Double
-                guard let due = persistedDue else {
-                    var runtime = routineRuntime[routineKey] ?? [:]
-                    runtime["next_run_at"] = dateValue(nextRunDate(
-                        definition: routine.definition,
-                        enabled: true,
-                        after: now
-                    ))
-                    routineRuntime[routineKey] = runtime
-                    continue
-                }
-                guard due <= now.timeIntervalSince1970 else { continue }
-                let run: [String: Any] = [
-                    "run_id": UUID().uuidString.lowercased(),
-                    "routine_id": routineKey,
-                    "bot_id": id(bot),
-                    "executed_at": now.timeIntervalSince1970,
-                    "scheduled_at": due,
-                    "automatic": true,
-                    "result": "completed",
-                    "schedule_spec_json": routine.definition.scheduleSpecJSON,
-                ]
-                schedulerRuns.append(run)
-                var runtime = routineRuntime[routineKey] ?? [:]
-                runtime["last_run_id"] = run["run_id"]
-                runtime["last_execution_at"] = now.timeIntervalSince1970
-                runtime["last_result"] = "completed"
-                runtime["next_run_at"] = dateValue(nextRunDate(
-                    definition: routine.definition,
-                    enabled: true,
-                    after: Date(timeIntervalSince1970: due).addingTimeInterval(
-                        ScheduledTaskOccurrenceCalculator.spentOccurrenceAdvance
-                    )
-                ))
-                routineRuntime[routineKey] = runtime
-                let item = canonicalAttentionItem([
-                    "id": UUID().uuidString.lowercased(),
-                    "bot_id": id(bot),
-                    "conversation_id": selectedConversation[id(bot)] ?? NSNull(),
-                    "run_id": run["run_id"] ?? NSNull(),
-                    "state": "finished",
-                    "finished_at": now.timeIntervalSince1970,
-                    "ownership": "primary",
-                    "primary": true,
-                    "delegated": false,
-                    "title": routine.definition.name,
-                    "detail": "Scheduled routine completed",
-                    "source": "routine",
-                ], hostID: string(params, "host_id"))
-                attention[id(bot)] = item
-                if let notification = try persistAttentionNotification(item, now: now) {
-                    notifications.append(notification)
-                }
-                fired.append(run)
-            }
+        for fire in try claimDueRoutinesLocked(now: now).claims {
+            let started = startRoutineLocked(
+                fire.routine,
+                scheduledAt: fire.scheduledAt,
+                hostID: string(params, "host_id"),
+                now: now
+            )
+            runs.append(started.run)
+            if let notification = started.notification { notifications.append(notification) }
         }
         return receipt(requestID: requestID, status: .completed, botID: nil, readback: [
-            "runs": fired,
+            "runs": runs,
             "notifications": notifications,
         ])
     }

@@ -391,7 +391,10 @@ final class BotTypesTests: XCTestCase {
 
     func test_routineCopy_doesNotClaimAppClosedExecution() {
         XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("Test runs are real work"))
-        XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("App-closed schedules stay off"))
+        // The executor runs only while RemoteCode is open; the caption must
+        // say so, matching the Schedule Tasks "While RemoteCode is open".
+        XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("only while RemoteCode is open"))
+        XCTAssertFalse(BotRoutineCopy.testRunHonestyCaption.contains("App-closed"))
     }
 
     func test_permissionAdvertisedOrSupervised_becauseLeftoverFullAccessIsNotLivePower() {

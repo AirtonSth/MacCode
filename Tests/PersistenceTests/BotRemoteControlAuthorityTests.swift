@@ -1833,10 +1833,76 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual((listed["bots"] as? [[String: Any]])?.count, BotRemoteControlAuthority.liveAccountCap)
     }
 
-    /// WHY: iOS active/finished routing and schedule screens must be projections
-    /// of durable host truth. A due routine must fire once, then retain its exact
-    /// execution/result and attention identity after the Mac authority relaunches.
-    func test_dueRoutinePersistsExecutionResultNextRunAndAttentionIdentity() throws {
+    /// A bot with one enabled routine on a daily `base + 60` slot (UTC), the
+    /// autonomy switch on, and a host send that records each routine it
+    /// starts in a new conversation, like the Mac's `enqueueScheduledRoutine`.
+    private func scheduleRoutine(
+        prefix: String,
+        base: Date,
+        enabled: Bool = true
+    ) throws -> (botID: String, routineID: String, sends: () -> [BotRoutine]) {
+        settings.update {
+            $0.botsControlPlaneEnabled = true
+            $0.botsAutonomyEnabled = true
+        }
+        let created = try authority.dispatch(method: "bot.create", params: [
+            "client_request_id": "\(prefix)-bot", "name": prefix,
+        ], now: base)
+        let botID = try XCTUnwrap(created["bot_id"] as? String)
+        var spec = BotScheduleSpec(
+            frequency: .daily,
+            localTime: base.addingTimeInterval(60),
+            timeZoneIdentifier: "UTC"
+        )
+        spec.model = "scheduled-model"
+        let routine = try authority.dispatch(method: "bot.routine.create", params: [
+            "client_request_id": "\(prefix)-routine",
+            "bot_id": botID,
+            "name": "Daily review",
+            "prompt": "Review the open PRs",
+            "schedule_note": spec.displayNote(),
+            "schedule_spec_json": spec.encodedJSON(),
+        ], now: base)
+        let routineID = try XCTUnwrap((routine["readback"] as? [String: Any])?["routine_id"] as? String)
+        _ = try authority.dispatch(method: "bot.routine.enable", params: [
+            "client_request_id": "\(prefix)-enable",
+            "bot_id": botID,
+            "routine_id": routineID,
+            "enabled": enabled,
+        ], now: base)
+        var sends: [BotRoutine] = []
+        let store = self.store!
+        authority.onRoutineSend = { routine in
+            sends.append(routine)
+            let conversation = BotConversation(botID: routine.definition.botID, title: routine.definition.name)
+            try store.upsertConversation(conversation)
+            return [
+                "bot_id": routine.definition.botID.value.uuidString.lowercased(),
+                "conversation_id": conversation.id.value.uuidString.lowercased(),
+                "run_id": "run-\(sends.count)",
+            ]
+        }
+        return (botID, routineID, { sends })
+    }
+
+    private func tick(_ requestID: String, at date: Date, hostID: String? = nil) throws -> [[String: Any]] {
+        var params: [String: Any] = ["client_request_id": requestID]
+        if let hostID { params["host_id"] = hostID }
+        let result = try authority.dispatch(method: "bot.scheduler.tick", params: params, now: date)
+        return ((result["readback"] as? [String: Any])?["runs"] as? [[String: Any]]) ?? []
+    }
+
+    private func routineRow(_ authority: BotRemoteControlAuthority, botID: String) throws -> [String: Any] {
+        let listed = try authority.dispatch(method: "bot.routine.list", params: ["bot_id": botID])
+        return try XCTUnwrap((listed["routines"] as? [[String: Any]])?.first)
+    }
+
+    /// WHY: scheduled tasks never ran. The tick recorded a fake "completed"
+    /// and started nothing. A due slot must start ONE real run (the Instruction
+    /// in a new conversation), report `started` with that run, and keep it, the
+    /// next slot, and the attention identity across a relaunch, so iOS shows
+    /// what really happened.
+    func test_dueRoutineStartsOneRealRunAndPersistsItsResultNextRunAndAttention() throws {
         let base = Date(timeIntervalSince1970: 1_800_000_000)
         let profileID = "ios-schedule-profile"
         let hostID = "host-schedule"
@@ -1845,103 +1911,36 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             hostID: hostID,
             deviceID: "ios-schedule-device"
         )
-        let created = try authority.dispatch(method: "bot.create", params: [
-            "client_request_id": "schedule-bot", "name": "Scheduler",
-        ], now: base)
-        let botID = try XCTUnwrap(created["bot_id"] as? String)
-        let conversation = try authority.dispatch(method: "bot.conversation.create", params: [
-            "client_request_id": "schedule-conversation",
-            "bot_id": botID,
-            "title": "Scheduled work",
-        ], now: base)
-        let conversationID = try XCTUnwrap(
-            (conversation["readback"] as? [String: Any])?["conversation_id"] as? String
-        )
-        var spec = BotScheduleSpec(
-            frequency: .once,
-            scheduledDate: base.addingTimeInterval(60),
-            timeZoneIdentifier: "UTC"
-        )
-        spec.model = "grok-scheduled"
-        let routine = try authority.dispatch(method: "bot.routine.create", params: [
-            "client_request_id": "schedule-create",
-            "bot_id": botID,
-            "name": "Once",
-            "prompt": "Run exactly once",
-            "schedule_note": spec.displayNote(),
-            "schedule_spec_json": spec.encodedJSON(),
-        ], now: base)
-        let routineID = try XCTUnwrap(
-            (routine["readback"] as? [String: Any])?["routine_id"] as? String
-        )
-        let enabled = try authority.dispatch(method: "bot.routine.enable", params: [
-            "client_request_id": "schedule-enable",
-            "bot_id": botID,
-            "routine_id": routineID,
-            "enabled": true,
-        ], now: base)
-        let due = try XCTUnwrap(
-            (enabled["readback"] as? [String: Any])?["next_run_at"] as? Double
-        )
-        XCTAssertEqual(due, base.addingTimeInterval(60).timeIntervalSince1970, accuracy: 1)
+        let fixture = try scheduleRoutine(prefix: "due", base: base)
+        let slot = base.addingTimeInterval(60)
 
-        let early = try authority.dispatch(method: "bot.scheduler.tick", params: [
-            "client_request_id": "schedule-early",
-            "host_id": hostID,
-        ], now: base.addingTimeInterval(30))
-        XCTAssertTrue((((early["readback"] as? [String: Any])?["runs"] as? [[String: Any]]) ?? []).isEmpty,
-                      "scheduler must not fabricate an early execution")
-        XCTAssertTrue((((early["readback"] as? [String: Any])?["notifications"] as? [[String: Any]]) ?? []).isEmpty)
+        XCTAssertTrue(try tick("early", at: base.addingTimeInterval(30), hostID: hostID).isEmpty,
+                      "nothing runs before its slot")
+        XCTAssertTrue(fixture.sends().isEmpty)
         let fired = try authority.dispatch(method: "bot.scheduler.tick", params: [
-            "client_request_id": "schedule-due",
+            "client_request_id": "due-tick",
             "host_id": hostID,
-        ], now: Date(timeIntervalSince1970: due))
+        ], now: slot.addingTimeInterval(5))
         let firedReadback = try XCTUnwrap(fired["readback"] as? [String: Any])
         let run = try XCTUnwrap((firedReadback["runs"] as? [[String: Any]])?.first)
-        let runID = try XCTUnwrap(run["run_id"] as? String)
-        XCTAssertEqual(run["routine_id"] as? String, routineID)
-        XCTAssertEqual(run["result"] as? String, "completed")
-        let actualSpec = try XCTUnwrap((run["schedule_spec_json"] as? String)?.data(using: .utf8))
-        let expectedSpec = try XCTUnwrap(spec.encodedJSON().data(using: .utf8))
-        XCTAssertEqual(
-            try JSONSerialization.jsonObject(with: actualSpec) as? NSDictionary,
-            try JSONSerialization.jsonObject(with: expectedSpec) as? NSDictionary
-        )
-        let notification = try XCTUnwrap(
-            (firedReadback["notifications"] as? [[String: Any]])?.first
-        )
-        let notificationID = try XCTUnwrap(notification["id"] as? String)
-        XCTAssertEqual(notification["profile_id"] as? String, profileID)
-        XCTAssertEqual(notification["host_id"] as? String, hostID)
-        XCTAssertEqual(notification["attention_item_id"] as? String, notificationID)
-        XCTAssertEqual(notification["notification_id"] as? String, notificationID)
-        XCTAssertEqual(notification["bot_id"] as? String, botID)
-        XCTAssertEqual(notification["source"] as? String, "routine")
-        XCTAssertEqual(notification["category"] as? String, "RemoteCodeThreadUpdate")
-        XCTAssertNil(notification["conversation_id"], "P003 must not claim a conversation")
-        let persistedNotification = try XCTUnwrap(
-            NotificationRepository(db: db).list().first { $0.id == notificationID }
-        )
-        XCTAssertEqual(persistedNotification.title, notification["title"] as? String)
-        XCTAssertEqual(persistedNotification.body, notification["body"] as? String)
-        XCTAssertEqual(persistedNotification.category, notification["category"] as? String)
-        let persistedMetadata = try XCTUnwrap(
-            BotAttentionNotificationMetadataStore(db: db).metadata(notificationID: notificationID)
-        )
-        XCTAssertEqual(persistedMetadata.profileID, profileID)
-        XCTAssertEqual(persistedMetadata.hostID, hostID)
-        XCTAssertEqual(persistedMetadata.attentionItemID, notificationID)
-        XCTAssertEqual(persistedMetadata.botID, botID)
-        XCTAssertEqual(persistedMetadata.source, "routine")
+        XCTAssertEqual(fixture.sends().map(\.definition.prompt), ["Review the open PRs"],
+                       "the slot starts one real run with the Instruction")
+        XCTAssertEqual(run["result"] as? String, "started", "never a fabricated completed")
+        XCTAssertEqual(run["run_id"] as? String, "run-1")
+        XCTAssertEqual(run["routine_id"] as? String, fixture.routineID)
+        XCTAssertEqual(run["scheduled_at"] as? Double, slot.timeIntervalSince1970)
+        let conversationID = try XCTUnwrap(run["conversation_id"] as? String)
+        XCTAssertTrue((firedReadback["notifications"] as? [[String: Any]])?.isEmpty ?? false,
+                      "a run that only started has finished nothing yet")
+
         let replay = try authority.dispatch(method: "bot.scheduler.tick", params: [
-            "client_request_id": "schedule-due",
+            "client_request_id": "due-tick",
             "host_id": hostID,
-        ], now: Date(timeIntervalSince1970: due))
-        XCTAssertEqual(
-            (replay["readback"] as? NSDictionary),
-            (fired["readback"] as? NSDictionary)
-        )
-        XCTAssertEqual(try NotificationRepository(db: db).list().filter { $0.id == notificationID }.count, 1)
+        ], now: slot.addingTimeInterval(5))
+        XCTAssertEqual(replay["readback"] as? NSDictionary, fired["readback"] as? NSDictionary)
+        XCTAssertTrue(try tick("same-slot", at: slot.addingTimeInterval(35)).isEmpty,
+                      "a later tick in the same slot must not start it again")
+        XCTAssertEqual(fixture.sends().count, 1)
 
         let relaunched = BotRemoteControlAuthority(
             db: db,
@@ -1949,28 +1948,172 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             settings: settings,
             appSupportDirectory: supportDir
         )
-        let routines = try relaunched.dispatch(method: "bot.routine.list", params: ["bot_id": botID])
-        let persisted = try XCTUnwrap((routines["routines"] as? [[String: Any]])?.first)
-        XCTAssertEqual(persisted["last_run_id"] as? String, runID)
-        XCTAssertEqual(persisted["last_result"] as? String, "completed")
-        XCTAssertTrue(persisted["next_run_at"] is NSNull,
-                      "one-shot schedules must persist that no next run exists")
+        let persisted = try routineRow(relaunched, botID: fixture.botID)
+        XCTAssertEqual(persisted["last_run_id"] as? String, "run-1")
+        XCTAssertEqual(persisted["last_result"] as? String, "started")
+        XCTAssertEqual(persisted["last_conversation_id"] as? String, conversationID)
+        XCTAssertTrue(persisted["last_error"] is NSNull)
+        XCTAssertEqual(persisted["next_run_at"] as? Double, slot.addingTimeInterval(86_400).timeIntervalSince1970,
+                       "the next slot is tomorrow's, not the one just spent")
         let attention = try relaunched.dispatch(method: "bot.attention.list", params: [:])
         let item = try XCTUnwrap((attention["items"] as? [[String: Any]])?.first)
-        XCTAssertNotNil(item["id"] as? String)
-        XCTAssertEqual(item["bot_id"] as? String, botID)
+        XCTAssertEqual(item["bot_id"] as? String, fixture.botID)
         XCTAssertEqual(item["conversation_id"] as? String, conversationID)
-        XCTAssertEqual(item["run_id"] as? String, runID)
-        XCTAssertEqual(item["state"] as? String, "finished")
-        XCTAssertNotNil(item["finished_at"] as? Double)
-        XCTAssertEqual(item["ownership"] as? String, "primary")
-        XCTAssertEqual(item["primary"] as? Bool, true)
-        XCTAssertEqual(item["delegated"] as? Bool, false)
-        XCTAssertNotNil(item["title"] as? String)
-        XCTAssertNotNil(item["detail"] as? String)
+        XCTAssertEqual(item["run_id"] as? String, "run-1")
+        XCTAssertEqual(item["state"] as? String, "working")
         XCTAssertEqual(item["source"] as? String, "routine")
         XCTAssertEqual(item["profile_id"] as? String, profileID)
         XCTAssertEqual(item["host_id"] as? String, hostID)
+    }
+
+    /// WHY: fail loud. A slot whose run could not start must say so on the
+    /// phone (receipt, routine row, notification) and on the Mac (Activity),
+    /// never vanish or look finished.
+    func test_routineThatCannotStartIsRecordedFailedAndSurfaced() throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let profileID = "ios-fail-profile"
+        let hostID = "host-fail"
+        try BotAttentionPushBindingStore(db: db).bind(profileID: profileID, hostID: hostID, deviceID: "ios-fail")
+        let fixture = try scheduleRoutine(prefix: "fail", base: base)
+        authority.onRoutineSend = { _ in
+            throw BotRemoteControlAuthority.Error(code: -32091, message: "Docker desktop is not ready.")
+        }
+        XCTAssertTrue(try tick("fail-seed", at: base).isEmpty)
+
+        let fired = try authority.dispatch(method: "bot.scheduler.tick", params: [
+            "client_request_id": "fail-tick",
+            "host_id": hostID,
+        ], now: base.addingTimeInterval(61))
+        let readback = try XCTUnwrap(fired["readback"] as? [String: Any])
+        let run = try XCTUnwrap((readback["runs"] as? [[String: Any]])?.first)
+        XCTAssertEqual(run["result"] as? String, "failed")
+        XCTAssertEqual(run["error"] as? String, "Docker desktop is not ready.")
+        let notification = try XCTUnwrap((readback["notifications"] as? [[String: Any]])?.first)
+        XCTAssertEqual(notification["profile_id"] as? String, profileID)
+        XCTAssertEqual(notification["host_id"] as? String, hostID)
+        XCTAssertEqual(notification["bot_id"] as? String, fixture.botID)
+        XCTAssertEqual(notification["source"] as? String, "routine")
+        XCTAssertEqual(notification["body"] as? String, "Scheduled task did not start: Docker desktop is not ready.")
+        XCTAssertNotNil(try NotificationRepository(db: db).list().first { $0.id == notification["id"] as? String })
+        let row = try routineRow(authority, botID: fixture.botID)
+        XCTAssertEqual(row["last_result"] as? String, "failed")
+        XCTAssertEqual(row["last_error"] as? String, "Docker desktop is not ready.")
+        let macItem = try XCTUnwrap(try store.listAttention().first)
+        XCTAssertEqual(macItem.kind, .blocked, "the Mac Activity shows it as needing you")
+        XCTAssertEqual(macItem.detail, "Daily review: Docker desktop is not ready.")
+        XCTAssertTrue(try tick("fail-again", at: base.addingTimeInterval(90)).isEmpty,
+                      "a failed slot is spent, not retried every tick")
+    }
+
+    /// WHY: only Active tasks of live bots run, and only while automatic runs
+    /// are on. Pausing, disabling, or deleting must stop the next slot.
+    func test_routineNeverFiresWhenAutonomyIsOffTheTaskIsDisabledOrTheBotIsDeleted() throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let active = try scheduleRoutine(prefix: "active", base: base)
+        let disabled = try scheduleRoutine(prefix: "disabled", base: base, enabled: false)
+        let sends = disabled.sends // the host send both bots share from here on
+        XCTAssertTrue(try tick("seed", at: base).isEmpty)
+
+        settings.update { $0.botsAutonomyEnabled = false }
+        XCTAssertTrue(try tick("paused", at: base.addingTimeInterval(61)).isEmpty)
+        XCTAssertTrue(sends().isEmpty, "Scheduler paused must not run anything")
+
+        settings.update { $0.botsAutonomyEnabled = true }
+        XCTAssertEqual(try tick("resumed", at: base.addingTimeInterval(86_461)).count, 1)
+        XCTAssertEqual(sends().map { $0.definition.botID.value.uuidString.lowercased() }, [active.botID],
+                       "only the Active task runs, and the slot the pause skipped is not caught up")
+
+        _ = try authority.dispatch(method: "bot.delete", params: [
+            "client_request_id": "delete-active", "bot_id": active.botID, "confirm": "delete",
+        ], now: base.addingTimeInterval(86_500))
+        XCTAssertTrue(try tick("deleted", at: base.addingTimeInterval(2 * 86_400 + 61)).isEmpty,
+                      "a deleted bot's task must not run")
+        XCTAssertEqual(sends().count, 1)
+    }
+
+    /// WHY: the copy promises "while RemoteCode is open". Slots that passed
+    /// while the app was closed must not all run at launch; a slot missed by
+    /// less than one tick (the app opened right after it) still runs once.
+    func test_slotMissedWhileClosedIsSkippedAtRelaunch_butOneMissedByLessThanATickRuns() throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let first = try scheduleRoutine(prefix: "closed", base: base)
+        XCTAssertTrue(try tick("closed-seed", at: base).isEmpty)
+
+        // Closed for three days: three slots passed.
+        authority = BotRemoteControlAuthority(db: db, store: store, settings: settings, appSupportDirectory: supportDir)
+        var relaunchSends: [BotRoutine] = []
+        authority.onRoutineSend = { routine in
+            relaunchSends.append(routine)
+            return ["bot_id": first.botID, "conversation_id": UUID().uuidString.lowercased(), "run_id": "late"]
+        }
+        let reopened = base.addingTimeInterval(3 * 86_400 + 600)
+        XCTAssertTrue(try tick("reopen", at: reopened).isEmpty, "no catch-up storm after a relaunch")
+        XCTAssertTrue(relaunchSends.isEmpty)
+        XCTAssertEqual(try routineRow(authority, botID: first.botID)["next_run_at"] as? Double,
+                       base.addingTimeInterval(4 * 86_400 + 60).timeIntervalSince1970)
+
+        // Reopened 10 s after a slot: that slot still runs, once.
+        authority = BotRemoteControlAuthority(db: db, store: store, settings: settings, appSupportDirectory: supportDir)
+        authority.onRoutineSend = { routine in
+            relaunchSends.append(routine)
+            return ["bot_id": first.botID, "conversation_id": UUID().uuidString.lowercased(), "run_id": "just-missed"]
+        }
+        let justAfter = base.addingTimeInterval(4 * 86_400 + 70)
+        XCTAssertEqual(try tick("just-after", at: justAfter).map { $0["run_id"] as? String }, ["just-missed"])
+        XCTAssertTrue(try tick("just-after-again", at: justAfter.addingTimeInterval(30)).isEmpty)
+        XCTAssertEqual(relaunchSends.count, 1)
+    }
+
+    /// WHY: moving a task to another time must stop the old slot and run the
+    /// new one, even though the Mac editor never touches the host runtime.
+    func test_editedScheduleRunsAtItsNewTime_notAtTheOldSlot() throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let fixture = try scheduleRoutine(prefix: "edit", base: base)
+        XCTAssertTrue(try tick("edit-seed", at: base).isEmpty)
+
+        let botID = BotID(try XCTUnwrap(UUID(uuidString: fixture.botID)))
+        var routine = try XCTUnwrap(store.listRoutines(botID: botID).first).definition
+        let moved = BotScheduleSpec(frequency: .daily, localTime: base.addingTimeInterval(120), timeZoneIdentifier: "UTC")
+        routine.scheduleSpecJSON = moved.encodedJSON()
+        routine.scheduleNote = moved.displayNote()
+        routine.updatedAt = base.addingTimeInterval(30)
+        try store.saveRoutine(routine, now: base.addingTimeInterval(30))
+
+        XCTAssertTrue(try tick("old-slot", at: base.addingTimeInterval(61)).isEmpty, "the old time no longer runs")
+        XCTAssertEqual(try tick("new-slot", at: base.addingTimeInterval(121)).count, 1)
+        XCTAssertEqual(fixture.sends().count, 1)
+    }
+
+    /// WHY: iOS Run now answered "accepted" and ran nothing. It must start a
+    /// real run like the Mac's Test run, and fail its receipt when it cannot.
+    func test_routineRunFromThePhoneStartsARealRun_andFailsItsReceiptWhenItCannot() throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let fixture = try scheduleRoutine(prefix: "run-now", base: base, enabled: false)
+        settings.update { $0.botsAutonomyEnabled = false }
+        let ran = try authority.dispatch(method: "bot.routine.run", params: [
+            "client_request_id": "run-now",
+            "bot_id": fixture.botID,
+            "routine_id": fixture.routineID,
+        ], now: base)
+        XCTAssertEqual(ran["status"] as? String, "completed")
+        let readback = try XCTUnwrap(ran["readback"] as? [String: Any])
+        XCTAssertEqual(readback["result"] as? String, "started")
+        XCTAssertEqual(readback["run_id"] as? String, "run-1")
+        XCTAssertEqual(readback["automatic"] as? Bool, false)
+        XCTAssertEqual(fixture.sends().map(\.definition.prompt), ["Review the open PRs"],
+                       "Run now is manual: it runs even with the task off and autonomy paused")
+        XCTAssertNotNil(try store.listRoutines(botID: BotID(XCTUnwrap(UUID(uuidString: fixture.botID))))
+            .first?.activation.lastTestRunRequestedAt, "Run now is stamped like the Mac's Test run")
+
+        authority.onRoutineSend = { _ in throw BotStoreError.invalidRow("Bot runtime is unavailable") }
+        let failed = try authority.dispatch(method: "bot.routine.run", params: [
+            "client_request_id": "run-now-fail",
+            "bot_id": fixture.botID,
+            "routine_id": fixture.routineID,
+        ], now: base)
+        XCTAssertEqual(failed["status"] as? String, "failed")
+        XCTAssertEqual((failed["readback"] as? [String: Any])?["result"] as? String, "failed")
+        XCTAssertEqual(try routineRow(authority, botID: fixture.botID)["last_result"] as? String, "failed")
     }
 
     /// WHY: Notify Off is a delivery preference, not permission to erase Bot

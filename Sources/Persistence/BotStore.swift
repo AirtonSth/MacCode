@@ -1431,6 +1431,30 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    /// Every enabled routine of a bot that is not deleted, in one query: the
+    /// routine scheduler reads this every tick instead of one read per bot.
+    public func listEnabledRoutines() throws -> [BotRoutine] {
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                SELECT d.id, d.bot_id, d.name, d.prompt, d.schedule_note, d.created_at, d.updated_at, d.schedule_spec_json,
+                       a.routine_id, a.bot_id, a.is_enabled, a.last_test_run_requested_at, a.updated_at
+                FROM bot_routine_definitions d
+                JOIN bot_routine_activations a ON a.routine_id = d.id
+                JOIN bots b ON b.id = d.bot_id
+                WHERE a.is_enabled = 1 AND b.deleted_at IS NULL
+                ORDER BY d.updated_at DESC;
+                """)
+            defer { statement.reset() }
+            var result: [BotRoutine] = []
+            while try statement.step() {
+                let definition = try decodeRoutineDefinition(statement)
+                let activation = try decodeActivation(statement, offset: 8)
+                result.append(BotRoutine(definition: definition, activation: activation))
+            }
+            return result
+        }
+    }
+
     public func saveRoutine(_ definition: BotRoutineDefinition, now: Date = Date()) throws {
         try db.transaction {
             guard let bot = try loadBot(id: definition.botID, database: db), bot.deletedAt == nil else {

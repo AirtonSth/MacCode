@@ -2343,8 +2343,9 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         let profileID = UUID().uuidString.lowercased()
         let notification: JSONValue = .object([
             "id": .string(itemID),
-            "title": .string("Scheduled Bot finished"),
-            "body": .string("The result is ready."),
+            // What the host tick really notifies: a slot that did not start.
+            "title": .string("Review Empath"),
+            "body": .string("Scheduled task did not start: Docker desktop is not ready."),
             "category": .string("RemoteCodeThreadUpdate"),
             "profile_id": .string(profileID),
             "host_id": .string(Phase4LiveServer.hostId),
@@ -2383,8 +2384,8 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         XCTAssertEqual(events.map(\.kind), [.botSchedulerUpdated, .notificationCreated])
         let payload = try XCTUnwrap(events.last?.payload.objectValue)
         XCTAssertEqual(payload["id"]?.stringValue, itemID)
-        XCTAssertEqual(payload["title"]?.stringValue, "Scheduled Bot finished")
-        XCTAssertEqual(payload["body"]?.stringValue, "The result is ready.")
+        XCTAssertEqual(payload["title"]?.stringValue, "Review Empath")
+        XCTAssertEqual(payload["body"]?.stringValue, "Scheduled task did not start: Docker desktop is not ready.")
         XCTAssertEqual(payload["category"]?.stringValue, "RemoteCodeThreadUpdate")
         XCTAssertEqual(payload["profile_id"]?.stringValue, profileID)
         XCTAssertEqual(payload["host_id"]?.stringValue, Phase4LiveServer.hostId)

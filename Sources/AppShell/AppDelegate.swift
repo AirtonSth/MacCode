@@ -130,6 +130,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Distributed-notification observer: schedule store commits → rail reload.
     private var scheduledTaskStoreObserver: NSObjectProtocol?
     private var scheduledTaskScheduler: ScheduledTaskScheduler?
+    private var botRoutineScheduler: BotRoutineScheduler?
     private var scheduledTaskTimer: Timer?
     private var scheduledTaskNotificationTokens: [(NotificationCenter, NSObjectProtocol)] = []
     /// Menu items whose keyEquivalent is controlled by keybindings.json.
@@ -579,27 +580,46 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let scheduler = ScheduledTaskScheduler(context: context, router: router)
         scheduledTaskScheduler = scheduler
         router.scheduledTaskScheduler = scheduler
+        // Bot scheduled tasks ride the same timer and observers.
+        let botRoutines = BotRoutineScheduler(
+            authority: { [weak router] in router?.botRoutineAuthority },
+            botsViewModel: { [weak router] in router?.botsViewModel }
+        )
+        botRoutineScheduler = botRoutines
         scheduledTaskTimer?.invalidate()
-        scheduledTaskTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak scheduler] _ in
-            Task { @MainActor in scheduler?.tick() }
+        scheduledTaskTimer = Timer.scheduledTimer(
+            withTimeInterval: BotRemoteControlAuthority.routineTickInterval,
+            repeats: true
+        ) { [weak scheduler, weak botRoutines] _ in
+            Task { @MainActor in
+                scheduler?.tick()
+                botRoutines?.tick()
+            }
         }
         let wakeToken = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,
             queue: .main
-        ) { [weak scheduler] _ in
-            Task { @MainActor in scheduler?.tick() }
+        ) { [weak scheduler, weak botRoutines] _ in
+            Task { @MainActor in
+                scheduler?.tick()
+                botRoutines?.tick()
+            }
         }
         scheduledTaskNotificationTokens.append((NSWorkspace.shared.notificationCenter, wakeToken))
         for name: Notification.Name in [.NSSystemClockDidChange, .NSSystemTimeZoneDidChange] {
-            let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak scheduler] _ in
-                Task { @MainActor in scheduler?.tick() }
+            let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak scheduler, weak botRoutines] _ in
+                Task { @MainActor in
+                    scheduler?.tick()
+                    botRoutines?.tick()
+                }
             }
             scheduledTaskNotificationTokens.append((NotificationCenter.default, token))
         }
         // First tick skips past-due occurrences (app was closed), then claims
         // only work that becomes due while the app stays open.
         scheduler.tick()
+        botRoutines.tick()
     }
 
     private func stopInProcessScheduledTaskScheduler() {
@@ -611,6 +631,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         scheduledTaskNotificationTokens.removeAll()
         router?.scheduledTaskScheduler = nil
         scheduledTaskScheduler = nil
+        botRoutineScheduler = nil
     }
 
     private func reloadAgentSurfacesFromScheduledStoreChange() {

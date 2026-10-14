@@ -255,7 +255,7 @@ public enum BotAttentionItemKind: String, Codable, Sendable, Equatable {
 
 public enum BotRoutineCopy {
     public static let testRunHonestyCaption =
-        "Test runs are real work. App-closed schedules stay off until autonomy is enabled."
+        "Test runs are real work. Active tasks run on schedule only while RemoteCode is open."
 }
 
 /// Desk always launches supervised. Self-config can persist leftover
