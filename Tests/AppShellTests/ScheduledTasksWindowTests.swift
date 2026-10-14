@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import CoreModel
 @testable import AppShell
 @testable import Persistence
@@ -305,6 +306,56 @@ final class ScheduledTasksWindowTests: XCTestCase {
                        "a failed scoped read must not replace the last known task projection")
         XCTAssertNotNil(viewModel.errorMessage,
                         "a failed scoped read must remain visible to the user")
+    }
+
+    @MainActor
+    func test_activeRunPollReloadsHistoryOnlyWhenAnActiveRowChanges_becauseItTicksEverySecondOnMain() async throws {
+        // WHY: the 1 s poll used to reload and republish 200 history rows on
+        // the main thread every tick (~56 ms on a real database) while any
+        // scheduled run was active, re-rendering the window each second.
+        let directory = NSTemporaryDirectory() + "rc-scheduled-poll-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let store = ScheduledTaskStore(db: context.db)
+        let task = ScheduledTask(
+            title: "Poll task", prompt: "Poll prompt", workspaceID: WorkspaceID(),
+            workspacePathSnapshot: "/tmp", runAsUser: NSUserName(), runAsUID: 501,
+            provider: .codex, providerInstanceID: "codex", model: "gpt-5", reasoningEffort: .high,
+            recurrence: .hourly(anchor: Date(timeIntervalSince1970: 0), intervalHours: 1),
+            timeZoneIdentifier: "UTC",
+            createdAt: Date(timeIntervalSince1970: 10), updatedAt: Date(timeIntervalSince1970: 10)
+        )
+        try store.save(task)
+        let claim = try store.claimManual(taskID: task.id, now: Date(timeIntervalSince1970: 30), owner: "poll-test")
+
+        let viewModel = ScheduledTasksViewModel(context: context, router: router, loadImmediately: false)
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.activeRunStatus(for: task.id), .queued)
+        var runPublishes = 0, statusPublishes = 0
+        let runsSink = viewModel.$runs.dropFirst().sink { _ in runPublishes += 1 }
+        let statusSink = viewModel.$activeRunStatuses.dropFirst().sink { _ in statusPublishes += 1 }
+        defer { runsSink.cancel(); statusSink.cancel() }
+
+        viewModel.pollActiveRunsOnce()
+        viewModel.pollActiveRunsOnce()
+        XCTAssertEqual(runPublishes, 0, "an unchanged active run must not reload the history")
+        XCTAssertEqual(statusPublishes, 0, "an unchanged status map must not republish")
+
+        // Thread attached while still running: the row's Open-thread target must appear.
+        try store.markStarted(runID: claim.run.id, threadID: AgentThreadID(), agentRunID: AgentRunID())
+        viewModel.pollActiveRunsOnce()
+        XCTAssertEqual(runPublishes, 1)
+        XCTAssertEqual(viewModel.activeRunStatus(for: task.id), .running)
+        XCTAssertNotNil(viewModel.runs.first { $0.id == claim.run.id }?.threadID)
+
+        try store.finish(runID: claim.run.id, status: .completed, at: Date(timeIntervalSince1970: 60))
+        viewModel.pollActiveRunsOnce()
+        XCTAssertEqual(runPublishes, 2, "finishing must refresh the history exactly once")
+        XCTAssertNil(viewModel.activeRunStatus(for: task.id))
+        XCTAssertEqual(viewModel.runs.first { $0.id == claim.run.id }?.status, .completed)
     }
 
     func test_scopedTaskAndRunRefreshesKeepLatestWinsAndFailureVisible() throws {

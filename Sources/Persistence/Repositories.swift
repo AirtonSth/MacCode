@@ -11,9 +11,71 @@ import CryptoKit
 final class LockedISO8601Formatter: @unchecked Sendable {
     private let lock = NSLock()
     private let formatter: ISO8601DateFormatter
-    init(_ formatter: ISO8601DateFormatter) { self.formatter = formatter }
+    /// Set when the formatter writes one of the canonical shapes
+    /// `parseCanonical` reads: false = `…:ssZ`, true = `…:ss.SSSZ`.
+    private let canonicalFractional: Bool?
+    init(_ formatter: ISO8601DateFormatter) {
+        self.formatter = formatter
+        switch formatter.formatOptions {
+        case [.withInternetDateTime]: canonicalFractional = false
+        case [.withInternetDateTime, .withFractionalSeconds]: canonicalFractional = true
+        default: canonicalFractional = nil
+        }
+    }
     func string(from date: Date) -> String { lock.lock(); defer { lock.unlock() }; return formatter.string(from: date) }
-    func date(from string: String) -> Date? { lock.lock(); defer { lock.unlock() }; return formatter.date(from: string) }
+    func date(from string: String) -> Date? {
+        // PERF: every stored timestamp is read back here; ICU costs tens of
+        // microseconds a parse behind the lock (live sample: the Scheduled
+        // Tasks poll spent ~50 ms a tick in it). The canonical shapes are
+        // parsed directly, bit-identical to the formatter; any other input
+        // still goes to the formatter.
+        if let fractional = canonicalFractional,
+           let date = Self.parseCanonical(string, fractional: fractional) {
+            return date
+        }
+        lock.lock(); defer { lock.unlock() }; return formatter.date(from: string)
+    }
+
+    /// `yyyy-MM-ddTHH:mm:ssZ` (or `…:ss.SSSZ` when `fractional`), UTC, years
+    /// 1900–9999, every field in range; nil for anything else.
+    static func parseCanonical(_ string: String, fractional: Bool) -> Date? {
+        var string = string
+        return string.withUTF8 { bytes -> Date? in
+            guard bytes.count == (fractional ? 24 : 20),
+                  bytes[4] == UInt8(ascii: "-"), bytes[7] == UInt8(ascii: "-"),
+                  bytes[10] == UInt8(ascii: "T"), bytes[13] == UInt8(ascii: ":"),
+                  bytes[16] == UInt8(ascii: ":"), bytes[bytes.count - 1] == UInt8(ascii: "Z") else { return nil }
+            func number(_ start: Int, _ length: Int) -> Int? {
+                var value = 0
+                for index in start..<(start + length) {
+                    let digit = Int(bytes[index]) - 48
+                    guard (0...9).contains(digit) else { return nil }
+                    value = value * 10 + digit
+                }
+                return value
+            }
+            guard let year = number(0, 4), let month = number(5, 2), let day = number(8, 2),
+                  let hour = number(11, 2), let minute = number(14, 2), let second = number(17, 2) else { return nil }
+            var millisecond = 0
+            if fractional {
+                guard bytes[19] == UInt8(ascii: "."), let value = number(20, 3) else { return nil }
+                millisecond = value
+            }
+            guard (1900...9999).contains(year), (1...12).contains(month), hour < 24, minute < 60, second < 60 else { return nil }
+            let isLeap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+            let monthDays = [31, isLeap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+            guard (1...monthDays).contains(day) else { return nil }
+            // Days since 1970-01-01 in the proleptic Gregorian calendar (H. Hinnant's days_from_civil).
+            let shiftedYear = month <= 2 ? year - 1 : year
+            let era = shiftedYear / 400
+            let yearOfEra = shiftedYear - era * 400
+            let dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1
+            let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+            let days = era * 146_097 + dayOfEra - 719_468
+            let milliseconds = Int64(((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + Int64(millisecond)
+            return Date(timeIntervalSince1970: Double(milliseconds) / 1000)
+        }
+    }
 }
 
 let iso = LockedISO8601Formatter(ISO8601DateFormatter())

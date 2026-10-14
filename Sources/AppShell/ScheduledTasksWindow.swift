@@ -121,6 +121,8 @@ public final class ScheduledTasksViewModel: ObservableObject {
     @Published public private(set) var runCounts: [UUID: Int] = [:]
     /// Live run status per task (queued / running). Drives overview + detail badges.
     @Published public private(set) var activeRunStatuses: [UUID: ScheduledTaskRunStatus] = [:]
+    /// The active rows the last poll saw; a change means the history is stale.
+    private var lastActiveRuns: [ScheduledTaskRun] = []
     /// Counts for All / Active / Paused chips (search-scoped, not status-filtered).
     @Published public private(set) var filterCounts: (all: Int, active: Int, paused: Int) = (0, 0, 0)
     @Published public var searchText: String = "" { didSet { reloadTasksOrDefer() } }
@@ -492,7 +494,9 @@ public final class ScheduledTasksViewModel: ObservableObject {
         reloadActiveRunStatuses()
     }
 
-    private func reloadActiveRunStatuses() {
+    /// Returns whether any task's active status changed.
+    @discardableResult
+    private func reloadActiveRunStatuses() -> Bool {
         do {
             let activeRuns = try store.listActiveRuns()
             var next: [UUID: ScheduledTaskRunStatus] = [:]
@@ -505,10 +509,23 @@ public final class ScheduledTasksViewModel: ObservableObject {
             for (taskID, status) in activeRunStatuses where status == .queued && next[taskID] == nil {
                 next[taskID] = .queued
             }
-            activeRunStatuses = next
+            // Publish only real changes: the poll runs every second and each
+            // publish re-renders the whole window.
+            let changed = next != activeRunStatuses || activeRuns != lastActiveRuns
+            lastActiveRuns = activeRuns
+            if next != activeRunStatuses { activeRunStatuses = next }
+            return changed
         } catch {
             errorMessage = String(describing: error)
+            return true
         }
+    }
+
+    /// One tick of the active-run poll. Only active rows change while runs are
+    /// in flight, so the history reloads when one of them does (start, thread
+    /// attached, finish) instead of every tick.
+    func pollActiveRunsOnce() {
+        if reloadActiveRunStatuses() { reloadRuns() }
     }
 
     private func ensureActiveRunPolling() {
@@ -522,8 +539,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard let self, !Task.isCancelled else { return }
-                self.reloadActiveRunStatuses()
-                self.reloadRuns()
+                self.pollActiveRunsOnce()
                 if self.activeRunStatuses.isEmpty {
                     self.activeRunPollTask = nil
                     return
