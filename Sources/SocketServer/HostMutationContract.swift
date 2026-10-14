@@ -493,6 +493,8 @@ public enum HostMutationContract {
         case "host.bot.send": return [.uuid("bot_id"), .string("text", nonempty: true)]
         case "host.bot.thread.create": return [.uuid("bot_id")]
         case "host.bot.skill.create": return [.uuid("bot_id"), .string("skill_id", nonempty: true)]
+        case "host.bot.delegate": return [.string("bot", nonempty: true), .string("text", nonempty: true)]
+        case "host.scheduled_task.run_next": return [.string("workspace", nonempty: true)]
         case "fs.workspace.create_file": return [.uuid("workspace_id"), .string("path")]
         case "fs.workspace.delete": return [.uuid("workspace_id")]
         case "fs.workspace.rename": return [.uuid("workspace_id"), .string("path"), .string("new_name")]

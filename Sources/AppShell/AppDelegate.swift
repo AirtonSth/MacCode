@@ -293,6 +293,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         startInProcessScheduledTaskScheduler()
         installScheduledTaskStoreObserver()
         startPetController()
+        // Titio lives in the Bot roster so paired devices can chat with it too.
+        if let botStore = context?.botStore, let support = context?.appSupportDirectory {
+            _ = try? TitioBot.ensure(store: botStore, appSupportDirectory: support)
+        }
         activityDockBadge.start()
 
         // start unix socket server

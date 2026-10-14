@@ -10590,7 +10590,8 @@ public final class BotsViewModel: ObservableObject {
         markStarted: Bool = true
     ) throws -> (thread: AgentThread, conversation: BotConversation) {
         var routing = routing
-        if BotExecutionDefault.target(for: try currentRevision(for: bot)) == .vm {
+        if BotExecutionDefault.target(for: try currentRevision(for: bot)) == .vm
+            || bot.handle == TitioBot.handle {
             routing.permissionMode = .fullAccess
         }
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
@@ -10756,7 +10757,8 @@ public final class BotsViewModel: ObservableObject {
             return nil
         }
         var routing = routingOverride ?? frozenDeskRouting(for: conversation)
-        if BotExecutionDefault.target(for: revision) == .vm {
+        // Titio acts through host catalog mutations, which require fullAccess.
+        if BotExecutionDefault.target(for: revision) == .vm || bot.handle == TitioBot.handle {
             routing.permissionMode = .fullAccess
         }
         let prepared = try prepareSupervisedRun(

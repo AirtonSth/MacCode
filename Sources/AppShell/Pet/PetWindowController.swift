@@ -287,7 +287,7 @@ private struct PetSpriteView: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Remote Code pet")
+        .accessibilityLabel("Titio")
         .accessibilityValue(model.accessibilityValue)
         .accessibilityHint("Opens Remote Code pet status")
         .accessibilityAddTraits(.isButton)
@@ -325,6 +325,7 @@ private struct PetAttentionPopoverView: View {
     let onOpen: (PetAttentionItem) -> Void
     let onOpenActive: (PetActiveThreadItem) -> Void
     let onOpenApp: () -> Void
+    let onOpenTitio: () -> Void
     let onClose: () -> Void
     let contentWidth: CGFloat
 
@@ -332,7 +333,7 @@ private struct PetAttentionPopoverView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Activity")
+                    Text("Titio")
                         .font(.title2.weight(.semibold))
                     Text(model.accessibilityValue)
                         .font(.subheadline)
@@ -368,9 +369,13 @@ private struct PetAttentionPopoverView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Review work and requests in Activity.")
                     .foregroundStyle(.secondary)
-                Button("Open Activity") { onOpenApp() }
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("pet.openActivity")
+                VStack(alignment: .leading, spacing: 8) {
+                    Button("Chat with Titio") { onOpenTitio() }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("pet.openTitio")
+                    Button("Open Activity") { onOpenApp() }
+                        .accessibilityIdentifier("pet.openActivity")
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(18)
@@ -547,6 +552,7 @@ public final class PetWindowController: NSObject {
     public var onOpenItem: ((PetAttentionItem) -> Void)?
     public var onOpenActiveThread: ((PetActiveThreadItem) -> Void)?
     public var onOpenRemoteCode: (() -> Void)?
+    public var onOpenTitio: (() -> Void)?
     public var onOpenSettings: (() -> Void)?
     public var onHidePet: (() -> Void)?
     public var onToggleAnimations: (() -> Void)?
@@ -712,7 +718,7 @@ public final class PetWindowController: NSObject {
         hosting.identifier = NSUserInterfaceItemIdentifier("pet.window")
         hosting.setAccessibilityElement(true)
         hosting.setAccessibilityRole(.button)
-        hosting.setAccessibilityLabel("Remote Code pet")
+        hosting.setAccessibilityLabel("Titio")
         hosting.setAccessibilityHelp("Open Remote Code pet status")
         hosting.setAccessibilityIdentifier("pet.status")
         hosting.onClick = activate
@@ -775,6 +781,7 @@ public final class PetWindowController: NSObject {
             onOpen: { [weak self] in self?.onOpenItem?($0) },
             onOpenActive: { [weak self] in self?.onOpenActiveThread?($0) },
             onOpenApp: { [weak self] in self?.onOpenRemoteCode?() },
+            onOpenTitio: { [weak self] in self?.onOpenTitio?() },
             onClose: { [weak self] in self?.closePopover() },
             contentWidth: contentWidth
         ))
@@ -1128,6 +1135,7 @@ public final class PetWindowController: NSObject {
 
     private func contextMenu() -> NSMenu {
         let menu = NSMenu(title: "Remote Code Pet")
+        menu.addItem(menuItem("Chat with Titio", #selector(contextOpenTitio)))
         menu.addItem(menuItem("Open Remote Code", #selector(contextOpenRemoteCode)))
         menu.addItem(menuItem("Open ready items", #selector(contextOpenReadyItems)))
         menu.addItem(.separator())
@@ -1156,6 +1164,7 @@ public final class PetWindowController: NSObject {
         return item
     }
 
+    @objc private func contextOpenTitio() { onOpenTitio?() }
     @objc private func contextOpenRemoteCode() { onOpenRemoteCode?() }
     @objc private func contextOpenReadyItems() { openPopover() }
     @objc private func contextToggleAnimations() { onToggleAnimations?() }

@@ -233,6 +233,9 @@ public protocol CommandRouting: AnyObject {
     func openHostBot(botID: BotID) throws -> JSONValue
     func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?, callerThread: AgentThreadID, callerRun: AgentRunID) async throws -> JSONValue
     func createHostBotThread(botID: BotID, title: String) throws -> JSONValue
+    func listHostActivity() async throws -> JSONValue
+    func delegateHostBot(bot: String, text: String, conversationID: BotConversationID?, callerThread: AgentThreadID, callerRun: AgentRunID) async throws -> JSONValue
+    func runNextHostScheduledTask(workspace: String, taskID: UUID?) throws -> JSONValue
     func createHostBotSkill(botID: BotID, skillID: String, body: String?, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
     func viewHostBotSkill(botID: BotID, skillID: String, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
     func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue
@@ -526,6 +529,18 @@ public extension CommandRouting {
 
     func createHostBotThread(botID: BotID, title: String) throws -> JSONValue {
         throw JSONRPCError.notSupported("host Bot thread create")
+    }
+
+    func listHostActivity() async throws -> JSONValue {
+        throw JSONRPCError.notSupported("host activity list")
+    }
+
+    func delegateHostBot(bot: String, text: String, conversationID: BotConversationID?, callerThread: AgentThreadID, callerRun: AgentRunID) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("host Bot delegate")
+    }
+
+    func runNextHostScheduledTask(workspace: String, taskID: UUID?) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host scheduled task run next")
     }
 
     func createHostBotSkill(botID: BotID, skillID: String, body: String?, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue {
@@ -950,6 +965,8 @@ public final class JSONRPCDispatcher {
         "host.bot.send",
         "host.bot.thread.create",
         "host.bot.skill.create",
+        "host.bot.delegate",
+        "host.scheduled_task.run_next",
         "bot.create",
         "bot.discard_new",
         "bot.save",
@@ -3451,6 +3468,39 @@ public final class JSONRPCDispatcher {
                         callerRun: runID
                     )
                 )
+            case "host.activity.list":
+                return .init(id: id, result: try await router.listHostActivity())
+            case "host.bot.delegate":
+                guard let bot = params["bot"]?.stringValue,
+                      let text = params["text"]?.stringValue,
+                      let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                return .init(
+                    id: id,
+                    result: try await router.delegateHostBot(
+                        bot: bot,
+                        text: text,
+                        conversationID: params["conversation_id"]?.stringValue
+                            .flatMap(UUID.init)
+                            .map(BotConversationID.init),
+                        callerThread: threadID,
+                        callerRun: runID
+                    )
+                )
+            case "host.scheduled_task.run_next":
+                guard let workspace = params["workspace"]?.stringValue else {
+                    throw JSONRPCError.invalidParams
+                }
+                let taskID: UUID?
+                if let raw = params["task_id"]?.stringValue {
+                    guard let parsed = UUID(uuidString: raw) else { throw JSONRPCError.invalidParams }
+                    taskID = parsed
+                } else {
+                    taskID = nil
+                }
+                return .init(id: id, result: try router.runNextHostScheduledTask(workspace: workspace, taskID: taskID))
             case "host.bot.thread.create":
                 guard let botID = params["bot_id"]?.stringValue.flatMap(UUID.init).map(BotID.init) else {
                     throw JSONRPCError.invalidParams
