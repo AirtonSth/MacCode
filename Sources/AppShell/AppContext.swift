@@ -1182,45 +1182,51 @@ public final class AppContext {
                 // system or private push banners (parent owns user-facing UX).
                 // The notification is the last effect of this hop; its reads
                 // (including the receipt scan under the process-wide receipt
-                // lock) run off the MainActor.
-                let inputs = await self.runFinishedNotificationInputs(runId: rid, threadId: tid)
-                let chrome = inputs.chrome
-                let notificationSettings = inputs.settings
-                if let content = RemoteCodeNotificationContent.threadOutcome(
-                    threadId: tid.value.uuidString,
-                    runId: rid.value.uuidString,
-                    workspaceId: chrome?.workspaceId?.value.uuidString,
-                    title: chrome?.title,
-                    phase: status,
-                    isNestedWorker: inputs.isNestedWorker,
-                    finalMessageId: inputs.finalMessageId
-                ) {
-                    let isFailureOrInterrupted = status == .failed || status == .interrupted
-                    let isUserStop = status == .cancelled
-                    let allowed = RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
-                        isAction: isFailureOrInterrupted || isUserStop,
+                // lock) run off the MainActor. Runs finishing close together
+                // gather concurrently, but each post waits for the previous
+                // one so banners and grouped outcomes keep callback order.
+                let previousPost = self.runFinishedNotificationPostTail
+                self.runFinishedNotificationPostTail = Task { @MainActor in
+                    let inputs = await self.runFinishedNotificationInputs(runId: rid, threadId: tid)
+                    await previousPost?.value
+                    let chrome = inputs.chrome
+                    let notificationSettings = inputs.settings
+                    if let content = RemoteCodeNotificationContent.threadOutcome(
+                        threadId: tid.value.uuidString,
+                        runId: rid.value.uuidString,
                         workspaceId: chrome?.workspaceId?.value.uuidString,
-                        settings: notificationSettings
-                    )
-                    if allowed {
-                        if isFailureOrInterrupted {
-                            SystemNotifier.shared.post(content, settings: notificationSettings)
-                        } else if !isUserStop {
-                            SystemNotifier.shared.postOutcomeGrouped(
-                                content,
-                                workspaceId: chrome?.workspaceId?.value.uuidString,
-                                settings: notificationSettings,
-                                remoteDelivery: !isSideThread && status == .completed ? { [weak bridge = self.privateNotificationBridge] grouped in
-                                    Task { await bridge?.deliverThreadOutcomeRemote(grouped, phase: .completed) }
-                                } : nil
-                            )
-                        }
-                        if !isSideThread && status != .completed {
-                            Task {
-                                await self.privateNotificationBridge.deliverThreadOutcomeRemote(
+                        title: chrome?.title,
+                        phase: status,
+                        isNestedWorker: inputs.isNestedWorker,
+                        finalMessageId: inputs.finalMessageId
+                    ) {
+                        let isFailureOrInterrupted = status == .failed || status == .interrupted
+                        let isUserStop = status == .cancelled
+                        let allowed = RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+                            isAction: isFailureOrInterrupted || isUserStop,
+                            workspaceId: chrome?.workspaceId?.value.uuidString,
+                            settings: notificationSettings
+                        )
+                        if allowed {
+                            if isFailureOrInterrupted {
+                                SystemNotifier.shared.post(content, settings: notificationSettings)
+                            } else if !isUserStop {
+                                SystemNotifier.shared.postOutcomeGrouped(
                                     content,
-                                    phase: status
+                                    workspaceId: chrome?.workspaceId?.value.uuidString,
+                                    settings: notificationSettings,
+                                    remoteDelivery: !isSideThread && status == .completed ? { [weak bridge = self.privateNotificationBridge] grouped in
+                                        Task { await bridge?.deliverThreadOutcomeRemote(grouped, phase: .completed) }
+                                    } : nil
                                 )
+                            }
+                            if !isSideThread && status != .completed {
+                                Task {
+                                    await self.privateNotificationBridge.deliverThreadOutcomeRemote(
+                                        content,
+                                        phase: status
+                                    )
+                                }
                             }
                         }
                     }
@@ -1670,9 +1676,14 @@ public final class AppContext {
         let finalMessageId: String?
     }
 
+    /// The latest run-finished notification post; the next one waits for it.
+    private var runFinishedNotificationPostTail: Task<Void, Never>?
+
     #if DEBUG
     /// Records which thread the run-finished notification reads ran on.
     let runFinishedNotificationReadProbeForTesting = ActivityReceiptsThreadProbe()
+    /// Runs off-main before a run's notification reads; tests hold one gather.
+    var runFinishedNotificationWillGatherForTesting: (@Sendable (AgentRunID) -> Void)?
     #endif
 
     /// Reads the run-finished notification needs, off the MainActor. The
@@ -1689,9 +1700,11 @@ public final class AppContext {
         let runRepo = runRepo
         #if DEBUG
         let probe = runFinishedNotificationReadProbeForTesting
+        let willGather = runFinishedNotificationWillGatherForTesting
         #endif
         return await Task.detached(priority: .userInitiated) {
             #if DEBUG
+            willGather?(runId)
             probe.recordCurrentThread()
             #endif
             return RunFinishedNotificationInputs(

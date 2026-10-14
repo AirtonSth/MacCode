@@ -343,6 +343,10 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
         defer { vm.dispose() }
         vm.createThread(title: "Live")
         await vm.waitForSelectThreadHydrationForTesting()
+        // The selection refresh persists reconciliation with a dead PID probe;
+        // landing between the two seeds below, it demotes the parent and the
+        // child admission throws. Let it finish before seeding.
+        await vm.awaitSubagentActivityRefreshForTesting()
         let threadID = try XCTUnwrap(vm.selectedThreadId)
         let seedRuntime = AgentOrchestrationRuntime(
             repository: repository,
