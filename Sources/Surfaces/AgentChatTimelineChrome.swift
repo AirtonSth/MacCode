@@ -64,6 +64,9 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
     public let horizontalPadding: CGFloat
     public let verticalPadding: CGFloat
     public let columnGutter: CGFloat
+    /// Host action pinned to the bottom-trailing corner, above the composer
+    /// (Bots Desk new-thread +). Scroll-to-latest stacks above it.
+    private let trailingAccessory: AnyView?
     private let content: (CGFloat) -> Content
     private let followOverlay: (@escaping () -> Void) -> FollowOverlay
 
@@ -82,6 +85,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
         horizontalPadding: CGFloat = 22,
         verticalPadding: CGFloat = 32,
         columnGutter: CGFloat = 44,
+        trailingAccessory: AnyView? = nil,
         @ViewBuilder content: @escaping (CGFloat) -> Content,
         @ViewBuilder followOverlay: @escaping (@escaping () -> Void) -> FollowOverlay
     ) {
@@ -93,6 +97,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
         self.horizontalPadding = horizontalPadding
         self.verticalPadding = verticalPadding
         self.columnGutter = columnGutter
+        self.trailingAccessory = trailingAccessory
         self.content = content
         self.followOverlay = followOverlay
     }
@@ -129,26 +134,31 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
                 // SwiftUI's ScrollEnvironmentStorage while AttributeGraph
                 // still tracks `isScrollViewTransformClippingEnabled`.
                 .overlay(alignment: .bottomTrailing) {
-                    if showScrollDownButton {
-                        Button {
-                            rejoin(proxy)
-                        } label: {
-                            Image(systemName: "arrow.down")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(DS.Palette.onAccent)
-                                .frame(width: 44, height: 44)
-                                .background(DS.Palette.accent)
-                                .clipShape(Circle())
-                                .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
+                    VStack(alignment: .trailing, spacing: DS.Space.sm) {
+                        if showScrollDownButton {
+                            Button {
+                                rejoin(proxy)
+                            } label: {
+                                Image(systemName: "arrow.down")
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundColor(DS.Palette.onAccent)
+                                    .frame(width: 44, height: 44)
+                                    .background(DS.Palette.accent)
+                                    .clipShape(Circle())
+                                    .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Scroll to latest message")
+                            .accessibilityIdentifier(scrollToBottomIdentifier)
+                            .help("Scroll to latest message")
+                            .transition(AgentChatMotion.transition(.fadeAndScale, reduceMotion: reduceMotion))
                         }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Scroll to latest message")
-                        .accessibilityIdentifier(scrollToBottomIdentifier)
-                        .help("Scroll to latest message")
-                        .padding(.trailing, 14)
-                        .padding(.bottom, AgentChatTimelineScrollChrome.scrollDownButtonBottomInset)
-                        .transition(AgentChatMotion.transition(.fadeAndScale, reduceMotion: reduceMotion))
+                        if let trailingAccessory {
+                            trailingAccessory
+                        }
                     }
+                    .padding(.trailing, 14)
+                    .padding(.bottom, AgentChatTimelineScrollChrome.scrollDownButtonBottomInset)
                 }
             }
             .onAppear { rejoin(proxy) }

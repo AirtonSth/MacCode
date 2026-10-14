@@ -8713,11 +8713,32 @@ final class BotsWindowTests: XCTestCase {
         let chatRest = source[chatStart.upperBound...]
         let chatEnd = chatRest.range(of: "\n    private func deskUnlinkedComposer")?.lowerBound ?? chatRest.endIndex
         let chat = String(source[chatStart.lowerBound..<chatEnd])
-        let mount = try XCTUnwrap(chat.range(of: "deskNewThreadFAB"), "the chat column must mount the FAB")
-        let timeline = try XCTUnwrap(chat.range(of: "bots.desk.timeline"))
+        // The owner asked for it blue, bottom-right just above the composer:
+        // the transcript's trailing accessory slot, where scroll-to-latest
+        // stacks on top of it instead of overlapping it.
+        XCTAssertTrue(fab.contains("DS.Palette.accent"), "the FAB is the accent (blue) action")
+        let mount = try XCTUnwrap(
+            chat.range(of: "timelineAccessory: AnyView(deskNewThreadFAB)"),
+            "the linked chat mounts the FAB in the transcript's bottom-trailing slot"
+        )
+        let railBranch = try XCTUnwrap(chat.range(of: "deskThreadRail\n"))
         let inspector = try XCTUnwrap(chat.range(of: "if vm.isDeskSidePaneVisible"))
-        XCTAssertLessThan(timeline.lowerBound, mount.lowerBound, "mounted on the chat column, after the rail branch")
+        XCTAssertLessThan(railBranch.lowerBound, mount.lowerBound, "mounted on the chat column, after the rail branch")
         XCTAssertLessThan(mount.lowerBound, inspector.lowerBound, "not inside the inspector branch")
+        XCTAssertFalse(chat.contains(".overlay(alignment: .trailing) {\n                deskNewThreadFAB"),
+                       "no mid-column float over the transcript")
+
+        let unlinkedStart = try XCTUnwrap(source.range(of: "private func deskUnlinkedComposer"))
+        let unlinkedRest = source[unlinkedStart.upperBound...]
+        let composer = try XCTUnwrap(unlinkedRest.range(of: "AgentChatComposerBar("))
+        XCTAssertTrue(String(unlinkedRest[..<composer.lowerBound]).contains("deskNewThreadFAB"),
+                      "a thread with no run yet keeps the FAB in the same corner, above its composer")
+
+        let chrome = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatTimelineChrome.swift"), encoding: .utf8)
+        let scrollDown = try XCTUnwrap(chrome.range(of: "accessibilityIdentifier(scrollToBottomIdentifier)"))
+        let accessory = try XCTUnwrap(chrome.range(of: "if let trailingAccessory {"))
+        XCTAssertLessThan(scrollDown.lowerBound, accessory.lowerBound,
+                          "scroll-to-latest stacks above the accessory in the same corner")
 
         let rail = try XCTUnwrap(source.range(of: "private var deskThreadRail: some View {"))
         let railRest = source[rail.upperBound...]

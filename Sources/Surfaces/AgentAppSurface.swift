@@ -12823,6 +12823,8 @@ public struct AgentAppView: View {
     private let accountPanel: AnyView?
     @State private var showingAccounts = false
     private let layout: AgentAppViewLayout
+    /// Host action on the transcript's bottom-trailing corner (Bots Desk +).
+    private let timelineAccessory: AnyView?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var announcedUndoToasts: Set<Date> = []
     @State private var renamingThreadId: AgentThreadID?
@@ -12888,10 +12890,16 @@ public struct AgentAppView: View {
         vm.embedding?.sendInterceptor != nil ? .relay : .power
     }
 
-    public init(vm: AgentAppViewModel, accountPanel: AnyView? = nil, layout: AgentAppViewLayout = .standard) {
+    public init(
+        vm: AgentAppViewModel,
+        accountPanel: AnyView? = nil,
+        layout: AgentAppViewLayout = .standard,
+        timelineAccessory: AnyView? = nil
+    ) {
         self.vm = vm
         self.accountPanel = accountPanel
         self.layout = layout
+        self.timelineAccessory = timelineAccessory
     }
 
     static let fullAccessScopeDescription =
@@ -15911,7 +15919,8 @@ public struct AgentAppView: View {
             followToken: workDisclosureLayoutEpoch,
             scrollToBottomIdentifier: "agent.timeline.scrollToBottom",
             accessibilityIdentifier: "agent.timeline",
-            scrollTarget: vm.messageScrollTarget
+            scrollTarget: vm.messageScrollTarget,
+            trailingAccessory: timelineAccessory
         ) { timelineColumnWidth in
                         // AA-25: materialize the merged entries ONCE per body; the
                         // property rebuilt two whole-thread dictionaries each read
