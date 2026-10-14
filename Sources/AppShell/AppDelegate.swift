@@ -414,7 +414,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             }
         }
 
-        runCCRRetention()
+        // PERF (launch): the first pass waits until the window is interactive and
+        // the restore burst has settled, so its scan never competes with hydration.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.launchCCRRetentionDelaySeconds) { [weak self] in
+            self?.runCCRRetention()
+        }
         ccrRetentionTimer = Timer.scheduledTimer(withTimeInterval: 24 * 60 * 60, repeats: true) { [weak self] _ in
             guard let delegate = self else { return }
             Task { @MainActor in
@@ -569,7 +573,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     private func startInProcessScheduledTaskScheduler() {
         // Best-effort: leftover LaunchAgent must not own provider turns anymore.
-        try? ScheduledTaskAgentServiceManager().unregister()
+        // Off main: the SMAppService XPC must not delay the first window, and a
+        // leftover agent that still launches unregisters itself in Main.swift.
+        Task.detached(priority: .utility) { try? ScheduledTaskAgentServiceManager().unregister() }
         let scheduler = ScheduledTaskScheduler(context: context, router: router)
         scheduledTaskScheduler = scheduler
         router.scheduledTaskScheduler = scheduler
@@ -1082,9 +1088,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
+    static let launchCCRRetentionDelaySeconds: TimeInterval = 30
+
     /// Safe storage cleanup off the main thread (plan-final W3).
     /// Uses LocalStorageBudgetManager.cleanupExpired (marker-reachable handles),
-    /// never prune-by-ref_count. Cadence: launch + every 24h via ccrRetentionTimer.
+    /// never prune-by-ref_count. Cadence: 30 s after launch + every 24h via ccrRetentionTimer.
     private func runCCRRetention() {
         guard let ctx = context else { return }
         let db = ctx.db

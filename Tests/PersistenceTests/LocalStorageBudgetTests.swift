@@ -478,6 +478,120 @@ final class LocalStorageBudgetTests: XCTestCase {
                        "cleanup must see a reference committed by a writer that started first")
     }
 
+    /// WHY: the launch/24 h pass builds the manager without an attachment root,
+    /// so the digest + reference-ID regex over every checkpoint, snapshot and
+    /// provider payload (~200 MB on a real database) fed a blob delete that
+    /// returns 0 before reading it. That discarded scan was the 5-7 s launch
+    /// freeze. Without a root (or without an expired blob) it must not run.
+    func test_cleanupWithoutAttachmentRootNeverReadsAttachmentOwnerColumns() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
+        try AgentMessageRepository(db: fixture.db).append(AgentMessage(
+            threadId: fixture.thread.id,
+            role: .assistant,
+            content: "no marker"
+        ))
+        var stepped: [String] = []
+        fixture.db.beforeStatementStepForTesting = { stepped.append($0) }
+
+        _ = try LocalStorageBudgetManager(db: fixture.db).cleanupExpired(
+            now: Date(timeIntervalSince1970: 4_000_000),
+            compact: false
+        )
+        fixture.db.beforeStatementStepForTesting = nil
+
+        let structured = LocalStorageAttachmentReferenceRegistry.structuredColumns.map(\.column)
+        XCTAssertFalse(stepped.contains { sql in structured.contains { sql.contains("SELECT \"\($0)\"") } },
+                       "attachment owner columns feed only blob deletion, which has nothing to delete without a root")
+        XCTAssertFalse(stepped.contains { $0.hasSuffix("IS NOT NULL;") },
+                       "no registry column may be read whole (unfiltered and unbounded) when nothing can be deleted")
+    }
+
+    /// WHY: the reference scan used to run inside BEGIN IMMEDIATE on the single
+    /// connection, so every main-thread read (SettingsRepository.get during
+    /// window hydration) waited for the whole scan. With every expired original
+    /// still referenced, the scan must read in bounded chunks outside the write
+    /// transaction, keep the original, and never rescan under the writer lock.
+    func test_referenceScanReadsInChunksOutsideTheWriteTransaction() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
+        let store = ReversibleContentStore(db: fixture.db)
+        let handle = try store.store("referenced from terminal output", at: Date(timeIntervalSince1970: 1))
+        let terminal = TerminalOutputRepository(db: fixture.db)
+        let rows = LocalStorageBudgetManager.referenceScanChunkRows * 2 + 5
+        for index in 1...rows {
+            let text = index == rows ? "Recover with \(ReversibleContentStore.marker(for: handle))" : "plain output \(index)"
+            try terminal.append(surfaceID: "terminal", workspaceID: nil, chunkIndex: Int64(index), data: Data(text.utf8))
+        }
+        var insideWriteTransaction = false
+        var terminalScanSteps = 0
+        var registryReadsInsideWriteTransaction: [String] = []
+        let markerColumns = LocalStorageRecoveryReferenceRegistry.markerColumns.map(\.column)
+        fixture.db.beforeExecuteForTesting = { sql in
+            if sql.hasPrefix("BEGIN IMMEDIATE") { insideWriteTransaction = true }
+            if sql.hasPrefix("COMMIT") || sql.hasPrefix("ROLLBACK") { insideWriteTransaction = false }
+        }
+        fixture.db.beforeStatementStepForTesting = { sql in
+            if sql.contains("FROM \"terminal_output_chunks\"") { terminalScanSteps += 1 }
+            if insideWriteTransaction, markerColumns.contains(where: { sql.contains("\"\($0)\"") }) {
+                registryReadsInsideWriteTransaction.append(sql)
+            }
+        }
+
+        let manager = LocalStorageBudgetManager(db: fixture.db)
+        // Row-count chunking only: a loaded test host must not end chunks early.
+        manager.referenceScanChunkBudgetNanoseconds = .max
+        let result = try manager.cleanupExpired(now: Date(timeIntervalSince1970: 4_000_000), compact: false)
+        fixture.db.beforeExecuteForTesting = nil
+        fixture.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(result.removedRows[.reversibleContent], 0)
+        XCTAssertEqual(try store.retrieveText(handle), "referenced from terminal output",
+                       "a marker in the last chunk must still protect its original")
+        XCTAssertEqual(registryReadsInsideWriteTransaction, [],
+                       "a fully referenced candidate set must not rescan the registry under the writer lock")
+        // One step per row plus one end-of-chunk step per serialized read: at
+        // least three reads for 2×chunk+5 rows, each releasing the gate.
+        XCTAssertGreaterThanOrEqual(terminalScanSteps - rows, 3,
+                                    "the scan must be split into bounded per-lock chunks")
+        for reference in LocalStorageRecoveryReferenceRegistry.markerColumns
+            + LocalStorageRecoveryReferenceRegistry.directHandleColumns {
+            XCTAssertNoThrow(try fixture.db.prepare("SELECT rowid FROM \"\(reference.table)\" LIMIT 0;"),
+                             "chunked scan pages by rowid; \(reference.table) must keep one")
+        }
+    }
+
+    /// WHY: the chunked scan runs without the writer lock, and several registry
+    /// columns are updated in place (session snapshots, drafts, provider
+    /// runtime). A reference written after the scan saw "unreferenced" must
+    /// still protect the original: deletion is decided only by the re-check
+    /// inside the delete transaction, never by the stale chunked view.
+    func test_referenceWrittenInPlaceAfterChunkedScanStillProtectsOriginal() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
+        let store = ReversibleContentStore(db: fixture.db)
+        let old = Date(timeIntervalSince1970: 1)
+        let lateReferenced = try store.store("referenced after the scan", at: old)
+        let orphan = try store.store("still an orphan", at: old)
+        try fixture.db.execute(
+            "INSERT INTO session_snapshots(version, payload_json, created_at) VALUES(1, '{}', '1970-01-01T00:00:01Z');"
+        )
+        let manager = LocalStorageBudgetManager(db: fixture.db)
+        manager.beforeCleanupWriteTransactionForTesting = {
+            let update = try? fixture.db.prepare("UPDATE session_snapshots SET payload_json = ?;")
+            try? update?.bind(1, "{\"text\":\"\(ReversibleContentStore.marker(for: lateReferenced))\"}")
+            _ = try? update?.step()
+            update?.reset()
+        }
+
+        let result = try manager.cleanupExpired(now: Date(timeIntervalSince1970: 4_000_000), compact: false)
+
+        XCTAssertEqual(result.removedRows[.reversibleContent], 1)
+        XCTAssertEqual(try store.retrieveText(lateReferenced), "referenced after the scan",
+                       "an in-place reference committed before the delete transaction must win")
+        XCTAssertNil(try store.retrieve(orphan), "an original nobody references is still removed")
+    }
+
     func test_attachmentCleanupWaitsForConcurrentDurableOwnerWriter() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(atPath: fixture.directory) }

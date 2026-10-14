@@ -352,6 +352,27 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertTrue(delegate.contains("router.scheduledTaskScheduler = scheduler"))
     }
 
+    /// WHY: `SMAppService.unregister()` is a synchronous XPC to the background
+    /// task service, and the manager is @MainActor, so the launch path paid it
+    /// on main before the first window. It is a best-effort migration whose
+    /// result is discarded (Main.swift already unregisters a leftover agent),
+    /// so it must run from a detached task through the nonisolated entry.
+    func test_launchUnregistersLegacyAgentOffMain_becauseTheXPCMustNotDelayTheFirstWindow() throws {
+        let delegate = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/AppDelegate.swift"),
+            encoding: .utf8
+        )
+        let runtime = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(delegate.contains(
+            "Task.detached(priority: .utility) { try? ScheduledTaskAgentServiceManager().unregister() }"
+        ))
+        XCTAssertTrue(runtime.contains("public nonisolated func unregister() throws {"))
+        XCTAssertTrue(runtime.contains("public nonisolated init() {}"))
+    }
+
     func test_runNowUsesInProcessScheduler_becauseXPCIsRetired() throws {
         let source = try String(
             contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTasksWindow.swift"),

@@ -277,6 +277,13 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
     private let fileManager: FileManager
     private let attachmentRoot: URL?
     var beforeAttachmentCleanupLockForTesting: (() -> Void)?
+    /// Runs after the chunked reference scan, before the delete transaction.
+    var beforeCleanupWriteTransactionForTesting: (() -> Void)?
+    /// Rows per serialized read in the chunked reference scan.
+    static let referenceScanChunkRows = 64
+    /// A chunk also yields the connection gate once this much time has passed,
+    /// so a cold multi-MB checkpoint page-in cannot stretch one lock hold.
+    var referenceScanChunkBudgetNanoseconds: UInt64 = 4_000_000
     // PERF: durableReferencedAttachments allocated JSONDecoder per cleanup/snapshot
     // scan of structured attachment columns (many rows). Shared under a short lock
     // so concurrent budget managers avoid per-scan codec construction.
@@ -352,46 +359,68 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
         return (size(db.path), size(db.path + "-wal"), size(db.path + "-shm"))
     }
 
-    /// Delete expired rows in one transaction, then optionally compact only after
-    /// the cleanup COMMIT. VACUUM failures throw; safety preflight failures return a
+    /// Delete expired rows, then optionally compact only after the cleanup
+    /// COMMIT. VACUUM failures throw; safety preflight failures return a
     /// visible skip reason while preserving the already-safe cleanup result.
+    ///
+    /// PERF: the durable reference scan reads hundreds of MB of text. It runs
+    /// first in short serialized chunks outside any write transaction and only
+    /// narrows which expired originals *may* go; every one that may go is
+    /// re-checked against the full registry inside the delete transaction, so
+    /// a reference written mid-scan (insert or in-place update) still wins.
+    /// Diagnostics rows are found the same way and deleted in short
+    /// transactions that re-check the expiry predicate per row.
     public func cleanupExpired(now: Date = Date(), compact: Bool = true) throws -> LocalStorageCleanupResult {
         let cutoffDate = now.addingTimeInterval(-Double(Self.retentionDays) * 86_400)
         let cutoffText = iso.string(from: cutoffDate)
         let cutoffMs = Int64(cutoffDate.timeIntervalSince1970 * 1_000)
 
-        let removed = try db.performSync { database in
+        // Expired undo pins stop protecting their originals before the scan.
+        try db.performSync { database in
             try database.transaction {
                 try deleteExpiredThreadUndoGCPins(database, expiresAtOrBefore: now)
-                let referencedHandles = try durableReferencedHandles(database)
-                let reversible = try deleteExpiredReversibleContent(
-                    database,
-                    cutoffMs: cutoffMs,
-                    referencedHandles: referencedHandles
-                )
-                let streamEvents = try deleteExpiredTerminalRunRows(
-                    database,
-                    table: "agent_stream_events",
-                    cutoffText: cutoffText
-                )
-                let providerLogs = try deleteExpiredTerminalRunRows(
-                    database,
-                    table: "agent_provider_event_logs",
-                    cutoffText: cutoffText
-                )
-                let attachmentReferences = try durableReferencedAttachments(database)
-                let attachmentBlobs = try deleteExpiredAttachmentBlobs(
-                    cutoffDate: cutoffDate,
-                    references: attachmentReferences
-                )
-                return [
-                    LocalStorageClass.reversibleContent: reversible,
-                    LocalStorageClass.attachmentBlobs: attachmentBlobs,
-                    LocalStorageClass.streamEvents: streamEvents,
-                    LocalStorageClass.providerLogs: providerLogs
-                ]
             }
         }
+        let candidates = try expiredReversibleCandidates(cutoffMs: cutoffMs)
+        let unreferencedCandidates = candidates.isEmpty
+            ? []
+            : candidates.subtracting(try referencedHandlesInChunks(among: candidates))
+        beforeCleanupWriteTransactionForTesting?()
+
+        let reversible = unreferencedCandidates.isEmpty ? 0 : try db.performSync { database in
+            try database.transaction {
+                try deleteExpiredReversibleContent(
+                    database,
+                    cutoffMs: cutoffMs,
+                    referencedHandles: try durableReferencedHandles(database),
+                    eligibleHandles: unreferencedCandidates
+                )
+            }
+        }
+        let streamEvents = try deleteExpiredTerminalRunRows(
+            table: "agent_stream_events",
+            cutoffText: cutoffText
+        )
+        let providerLogs = try deleteExpiredTerminalRunRows(
+            table: "agent_provider_event_logs",
+            cutoffText: cutoffText
+        )
+        // The opaque-column digest scan only feeds blob deletion; skip it when
+        // there is no attachment root or no blob is old enough.
+        let attachmentBlobs = try hasExpiredAttachmentBlob(cutoffDate: cutoffDate) ? try db.performSync { database in
+            try database.transaction {
+                try deleteExpiredAttachmentBlobs(
+                    cutoffDate: cutoffDate,
+                    references: try durableReferencedAttachments(database)
+                )
+            }
+        } : 0
+        let removed = [
+            LocalStorageClass.reversibleContent: reversible,
+            LocalStorageClass.attachmentBlobs: attachmentBlobs,
+            LocalStorageClass.streamEvents: streamEvents,
+            LocalStorageClass.providerLogs: providerLogs
+        ]
 
         var compacted = false
         var skippedReason: LocalStorageCompactionSkippedReason?
@@ -469,16 +498,103 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
         return statement.columnInt64(0)
     }
 
+    private func expiredReversibleCandidates(cutoffMs: Int64) throws -> Set<String> {
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                SELECT handle FROM rc_reversible_content
+                WHERE ref_count <= 0 AND last_access_ms < ?;
+                """)
+            defer { statement.reset() }
+            try statement.bind(1, cutoffMs)
+            var handles = Set<String>()
+            while try statement.step() {
+                if let handle = statement.columnText(0)?.lowercased() { handles.insert(handle) }
+            }
+            return handles
+        }
+    }
+
+    /// Candidates some durable field names, read in chunks of at most
+    /// `referenceScanChunkRows` rows or `referenceScanChunkBudgetNanoseconds`
+    /// per `performSync`, so the connection gate is released between chunks.
+    /// Without a write transaction this view can be stale, so it only decides
+    /// which candidates to *keep*; the rest are re-checked under the writer lock.
+    private func referencedHandlesInChunks(among candidates: Set<String>) throws -> Set<String> {
+        var referenced = Set<String>()
+        for reference in LocalStorageRecoveryReferenceRegistry.markerColumns {
+            let column = quoted(reference.column)
+            // SQLite's instr() skips marker-free rows in C without copying them out.
+            try forEachRowInChunks(
+                table: reference.table,
+                columns: "CASE WHEN instr(\(column), '[[rc:') > 0 THEN \(column) END",
+                filter: "\(column) IS NOT NULL"
+            ) { statement in
+                guard let data = statement.columnBlob(1) else { return }
+                autoreleasepool {
+                    referenced.formUnion(Self.markerHandles(in: data).intersection(candidates))
+                }
+            }
+        }
+        for reference in LocalStorageRecoveryReferenceRegistry.directHandleColumns {
+            let column = quoted(reference.column)
+            try forEachRowInChunks(table: reference.table, columns: column, filter: "\(column) IS NOT NULL") { statement in
+                guard let raw = statement.columnText(1)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                      candidates.contains(raw) else { return }
+                referenced.insert(raw)
+            }
+        }
+        return referenced
+    }
+
+    /// Visits `SELECT rowid, <columns>` for every row of `table` matching
+    /// `filter`, in rowid order. `?1` is the chunk cursor; `bindings` fill
+    /// `?2`, `?3`, ... in `columns`.
+    private func forEachRowInChunks(
+        table: String,
+        columns: String,
+        filter: String,
+        bindings: [String] = [],
+        _ body: (SQLiteStatement) -> Void
+    ) throws {
+        let sql = """
+            SELECT rowid, \(columns) FROM \(quoted(table))
+            WHERE rowid > ?1 AND \(filter)
+            ORDER BY rowid LIMIT \(Self.referenceScanChunkRows);
+            """
+        var afterRowID = Int64.min
+        while true {
+            let lastRowID: Int64? = try db.performSync { database in
+                let statement = try database.prepare(sql)
+                defer { statement.reset() }
+                try statement.bind(1, afterRowID)
+                for (offset, value) in bindings.enumerated() {
+                    try statement.bind(Int32(offset + 2), value)
+                }
+                let start = DispatchTime.now().uptimeNanoseconds
+                var last: Int64?
+                while try statement.step() {
+                    last = statement.columnInt64(0)
+                    body(statement)
+                    if DispatchTime.now().uptimeNanoseconds - start >= referenceScanChunkBudgetNanoseconds { break }
+                }
+                return last
+            }
+            guard let lastRowID else { return }
+            afterRowID = lastRowID
+        }
+    }
+
     private func durableReferencedHandles(_ database: SQLiteDB) throws -> Set<String> {
         var handles = Set<String>()
         for reference in LocalStorageRecoveryReferenceRegistry.markerColumns {
+            // instr() is an exact prefilter: every regex match contains `[[rc:`.
             let statement = try database.prepare(
-                "SELECT \(quoted(reference.column)) FROM \(quoted(reference.table)) WHERE \(quoted(reference.column)) IS NOT NULL;"
+                "SELECT \(quoted(reference.column)) FROM \(quoted(reference.table)) WHERE \(quoted(reference.column)) IS NOT NULL AND instr(\(quoted(reference.column)), '[[rc:') > 0;"
             )
             defer { statement.reset() }
             while try statement.step() {
                 guard let data = statement.columnBlob(0) else { continue }
-                handles.formUnion(Self.markerHandles(in: data))
+                autoreleasepool { handles.formUnion(Self.markerHandles(in: data)) }
             }
         }
         for reference in LocalStorageRecoveryReferenceRegistry.directHandleColumns {
@@ -582,6 +698,17 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
             referenceIDs.insert(String(text[swiftRange]).lowercased())
         }
         return referenceIDs
+    }
+
+    private func hasExpiredAttachmentBlob(cutoffDate: Date) throws -> Bool {
+        guard let attachmentRoot,
+              fileManager.fileExists(atPath: attachmentRoot.path) else { return false }
+        return try AgentAttachmentStorageSynchronization.withLock(root: attachmentRoot) {
+            try attachmentFiles(in: attachmentRoot).contains { url in
+                let values = try url.resourceValues(forKeys: [.contentModificationDateKey])
+                return values.contentModificationDate.map { $0 < cutoffDate } ?? false
+            }
+        }
     }
 
     private func deleteExpiredAttachmentBlobs(
@@ -694,7 +821,8 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
     private func deleteExpiredReversibleContent(
         _ database: SQLiteDB,
         cutoffMs: Int64,
-        referencedHandles: Set<String>
+        referencedHandles: Set<String>,
+        eligibleHandles: Set<String>
     ) throws -> Int {
         let candidates = try database.prepare("""
             SELECT handle FROM rc_reversible_content
@@ -705,6 +833,7 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
         var handlesToDelete: [String] = []
         while try candidates.step() {
             guard let handle = candidates.columnText(0)?.lowercased(),
+                  eligibleHandles.contains(handle),
                   !referencedHandles.contains(handle) else { continue }
             handlesToDelete.append(handle)
         }
@@ -724,39 +853,59 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
         return removed
     }
 
+    /// `created_at` sits after the payload, so testing it pages in every
+    /// overflow chain (~90 MB on a real database). Find expired rows in chunks
+    /// outside any write transaction, then delete them in short transactions
+    /// that re-check the same predicate, so only rows still expired at delete
+    /// time go.
     private func deleteExpiredTerminalRunRows(
-        _ database: SQLiteDB,
         table: String,
         cutoffText: String
     ) throws -> Int {
         let statuses = Self.terminalRunStatusRawValuesSorted
         let placeholders = Self.terminalRunStatusPlaceholders
-        let count = try database.prepare("""
-            SELECT COUNT(*) FROM \(quoted(table)) AS storage_row
-            JOIN agent_runs ON agent_runs.id = storage_row.run_id
-            WHERE storage_row.created_at < ?
-              AND agent_runs.status IN (\(placeholders));
-            """)
-        defer { count.reset() }
-        try count.bind(1, cutoffText)
-        for (offset, status) in statuses.enumerated() {
-            try count.bind(Int32(offset + 2), status)
+        let statusParameters = statuses.indices.map { "?\($0 + 3)" }.joined(separator: ", ")
+        var expired: [Int64] = []
+        try forEachRowInChunks(
+            table: table,
+            columns: "created_at < ?2 AND run_id IN (SELECT id FROM agent_runs WHERE status IN (\(statusParameters)))",
+            filter: "run_id IS NOT NULL",
+            bindings: [cutoffText] + statuses
+        ) { statement in
+            if statement.columnInt64(1) != 0 { expired.append(statement.columnInt64(0)) }
         }
-        let removed = (try count.step()) ? Int(count.columnInt64(0)) : 0
 
-        let delete = try database.prepare("""
-            DELETE FROM \(quoted(table))
-            WHERE created_at < ?
-              AND run_id IN (
-                  SELECT id FROM agent_runs WHERE status IN (\(placeholders))
-              );
-            """)
-        defer { delete.reset() }
-        try delete.bind(1, cutoffText)
-        for (offset, status) in statuses.enumerated() {
-            try delete.bind(Int32(offset + 2), status)
+        var removed = 0
+        var start = expired.startIndex
+        while start < expired.endIndex {
+            let batch = expired[start..<min(start + Self.referenceScanChunkRows, expired.endIndex)]
+            start = batch.endIndex
+            removed += try db.performSync { database in
+                try database.transaction {
+                    let delete = try database.prepare("""
+                        DELETE FROM \(quoted(table))
+                        WHERE rowid = ?
+                          AND created_at < ?
+                          AND run_id IN (
+                              SELECT id FROM agent_runs WHERE status IN (\(placeholders))
+                          );
+                        """)
+                    defer { delete.reset() }
+                    var deleted = 0
+                    for rowID in batch {
+                        delete.reset()
+                        try delete.bind(1, rowID)
+                        try delete.bind(2, cutoffText)
+                        for (offset, status) in statuses.enumerated() {
+                            try delete.bind(Int32(offset + 3), status)
+                        }
+                        _ = try delete.step()
+                        deleted += Int(try scalar(database, "SELECT changes();"))
+                    }
+                    return deleted
+                }
+            }
         }
-        _ = try delete.step()
         return removed
     }
 

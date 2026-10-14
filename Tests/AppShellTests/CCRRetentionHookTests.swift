@@ -95,6 +95,29 @@ final class CCRRetentionHookTests: XCTestCase {
                         "the retained block must still be retrievable after the production hook fires")
     }
 
+    /// WHY: the launch pass used to start on the writer queue right before
+    /// `windowController.show()`, so its reference scan held the single SQLite
+    /// connection while the first window hydrated (5-7 s main-thread freeze in
+    /// every launch hang report). The launch path must only schedule it for
+    /// after the window is interactive; the 24 h timer keeps the cadence.
+    func test_launchDefersFirstRetentionPassUntilAfterTheFirstWindow() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/AppDelegate.swift"),
+            encoding: .utf8
+        )
+        let launch = try XCTUnwrap(source.range(of: "func applicationDidFinishLaunching"))
+        let show = try XCTUnwrap(source.range(of: "windowController.show()", range: launch.upperBound..<source.endIndex))
+        let beforeShow = source[launch.upperBound..<show.lowerBound]
+        XCTAssertTrue(beforeShow.contains(
+            "DispatchQueue.main.asyncAfter(deadline: .now() + Self.launchCCRRetentionDelaySeconds) { [weak self] in\n            self?.runCCRRetention()\n        }"
+        ))
+        XCTAssertEqual(beforeShow.components(separatedBy: "runCCRRetention()").count - 1, 2,
+                       "only the delayed launch pass and the 24 h timer may call it before show()")
+        XCTAssertGreaterThanOrEqual(AppDelegate.launchCCRRetentionDelaySeconds, 10)
+    }
+
     /// WHY: the production hook dispatches to `backgroundWriterQueue` (off main).
     /// If that dispatch were accidentally changed to a synchronous call on the main
     /// actor it would stall the UI during the on-launch prune. This test verifies

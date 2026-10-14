@@ -1054,15 +1054,17 @@ public final class ScheduledTaskAgentXPCListener: NSObject, @preconcurrency NSXP
 public final class ScheduledTaskAgentServiceManager {
     /// Bump when XPC methods change. Clients re-register a mismatched agent.
     public static let protocolVersion = 2
-    public static var serviceBaseName: String { (Bundle.main.bundleIdentifier ?? "io.remotecode.desktop") + ".scheduled-tasks" }
-    public static var plistName: String { serviceBaseName + ".plist" }
+    // nonisolated: the launch path unregisters from a detached task so the
+    // synchronous SMAppService XPC never runs on the main thread.
+    nonisolated public static var serviceBaseName: String { (Bundle.main.bundleIdentifier ?? "io.remotecode.desktop") + ".scheduled-tasks" }
+    nonisolated public static var plistName: String { serviceBaseName + ".plist" }
     public static var machServiceName: String { serviceBaseName }
     public static var serviceVersion: String {
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "development"
         return "\(protocolVersion):\(build)"
     }
 
-    public init() {}
+    public nonisolated init() {}
 
     public var status: SMAppService.Status { SMAppService.agent(plistName: Self.plistName).status }
 
@@ -1082,7 +1084,7 @@ public final class ScheduledTaskAgentServiceManager {
         try service.register()
     }
 
-    public func unregister() throws {
+    public nonisolated func unregister() throws {
         try SMAppService.agent(plistName: Self.plistName).unregister()
     }
 
