@@ -127,6 +127,59 @@ final class LiveDataPerfBenchTests: XCTestCase {
             _ = try store.listActiveRuns()
         }
     }
+
+    func test_bench_scheduledTaskOverviewHistoryRefresh() throws {
+        let store = ScheduledTaskStore(db: try openCopy())
+        // The store work of one Scheduled Tasks reloadRuns() on the overview
+        // (no task selected): history is no longer read there.
+        try bench("scheduled.overviewReloadRuns") {
+            _ = try store.listActiveRuns()
+        }
+    }
+
+    func test_bench_performSyncWithAWarmStatementCache() throws {
+        let db = try openCopy()
+        // A long-lived connection caches every distinct SQL string it ran.
+        for index in 0..<300 {
+            try db.performSync { db in
+                let statement = try db.prepare("SELECT \(index);")
+                _ = try statement.step()
+            }
+        }
+        try bench("sqlite.performSync.x1000.cache300") {
+            for _ in 0..<1000 {
+                try db.performSync { db in
+                    let statement = try db.prepare("SELECT 1;")
+                    _ = try statement.step()
+                }
+            }
+        }
+    }
+
+    func test_bench_botsExactAssistantCheckpointLookup() throws {
+        let db = try openCopy()
+        // The thread with the heaviest checkpoint payload and its latest run.
+        let pick = try db.prepare("""
+            SELECT thread_id, run_id FROM agent_turn_checkpoints
+            WHERE thread_id = (
+                SELECT thread_id FROM agent_turn_checkpoints GROUP BY thread_id
+                ORDER BY SUM(LENGTH(file_snapshots_json) + LENGTH(COALESCE(diff_patch, '')) + LENGTH(file_diffs_json)) DESC
+                LIMIT 1
+            )
+            ORDER BY checkpoint_turn_count DESC LIMIT 1;
+        """)
+        guard try pick.step(),
+              let thread = pick.columnText(0).flatMap(UUID.init(uuidString:)),
+              let run = pick.columnText(1).flatMap(UUID.init(uuidString:)) else {
+            throw XCTSkip("no checkpoints in the copy")
+        }
+        let threadID = AgentThreadID(thread), runID = AgentRunID(run)
+        let repo = AgentTurnCheckpointRepository(db: db)
+        // What exactAssistantMessage reads to find the run's assistant message.
+        try bench("bots.exactAssistantCheckpointLookup") {
+            _ = try repo.latestAssistantMessageReference(threadId: threadID, runId: runID)?.assistantMessageId
+        }
+    }
 }
 
 private final class LockedMax: @unchecked Sendable {

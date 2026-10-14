@@ -2328,8 +2328,10 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     }
 
     private func exactAssistantMessage(threadID: AgentThreadID, runID: AgentRunID) -> AgentMessage? {
-        guard let checkpoint = (try? checkpointRepo.list(threadId: threadID))?
-            .last(where: { $0.runId == runID }),
+        guard let checkpoint = try? checkpointRepo.latestAssistantMessageReference(
+            threadId: threadID,
+            runId: runID
+        ),
               checkpoint.threadId == threadID,
               let messageID = checkpoint.assistantMessageId,
               let message = try? messageRepo.get(id: messageID),
@@ -8720,8 +8722,10 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func exactAssistantMessage(threadID: AgentThreadID, runID: AgentRunID) -> AgentMessage? {
-        guard let checkpoint = (try? context.turnCheckpointRepo.list(threadId: threadID))?
-            .last(where: { $0.runId == runID }),
+        guard let checkpoint = try? context.turnCheckpointRepo.latestAssistantMessageReference(
+            threadId: threadID,
+            runId: runID
+        ),
               checkpoint.threadId == threadID,
               let messageID = checkpoint.assistantMessageId,
               let message = try? context.messageRepo.get(id: messageID),

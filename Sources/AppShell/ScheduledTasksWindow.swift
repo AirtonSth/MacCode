@@ -114,6 +114,9 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
 public final class ScheduledTasksViewModel: ObservableObject {
     @Published public private(set) var tasks: [ScheduledTask] = []
     @Published public private(set) var runs: [ScheduledTaskRun] = []
+    /// The task `runs` belongs to. History is only read for the detail screen,
+    /// so another task's rows are never shown as this task's.
+    @Published public private(set) var runsTaskID: UUID?
     @Published public private(set) var workspaces: [Workspace] = []
     @Published public private(set) var providers: [AgentProviderSnapshot] = []
     @Published public private(set) var providersLoading = false
@@ -121,8 +124,12 @@ public final class ScheduledTasksViewModel: ObservableObject {
     @Published public private(set) var runCounts: [UUID: Int] = [:]
     /// Live run status per task (queued / running). Drives overview + detail badges.
     @Published public private(set) var activeRunStatuses: [UUID: ScheduledTaskRunStatus] = [:]
-    /// The active rows the last poll saw; a change means the history is stale.
+    /// The active rows the last poll saw, without the scheduler's 30 s
+    /// heartbeat; a change means the history is stale.
     private var lastActiveRuns: [ScheduledTaskRun] = []
+    /// Run Now's same-click Queued badges that the store has not confirmed yet.
+    /// Only these survive a reload that finds no active row.
+    private var optimisticQueuedTaskIDs: Set<UUID> = []
     /// Counts for All / Active / Paused chips (search-scoped, not status-filtered).
     @Published public private(set) var filterCounts: (all: Int, active: Int, paused: Int) = (0, 0, 0)
     @Published public var searchText: String = "" { didSet { reloadTasksOrDefer() } }
@@ -156,8 +163,13 @@ public final class ScheduledTasksViewModel: ObservableObject {
     private var runsRefreshGeneration: UInt64 = 0
     private var navigationGeneration: UInt64 = 0
     private var suppressSelectedTaskReload = false
+    /// False while the shell has swapped the Scheduled Tasks host out; the
+    /// active-run poll only runs while it is shown.
+    private var isVisible = true
     private let deferHydration: Bool
     private(set) var fullHydrationCountForTesting = 0
+    private(set) var runHistoryReadCountForTesting = 0
+    var isPollingActiveRunsForTesting: Bool { activeRunPollTask != nil }
 
     public init(context: AppContext, router: AppCommandRouter, loadImmediately: Bool = true) {
         self.context = context
@@ -204,6 +216,17 @@ public final class ScheduledTasksViewModel: ObservableObject {
     private func finishFreshnessTask(ownedBy generation: UInt64) {
         guard freshnessGeneration == generation else { return }
         freshnessTask = nil
+    }
+
+    /// The shell keeps this model cached while another destination is shown.
+    /// Hiding stops the active-run poll; the remount's freshness pass reloads
+    /// once and re-arms the poll if a run is still active.
+    public func setVisible(_ visible: Bool) {
+        guard visible != isVisible else { return }
+        isVisible = visible
+        guard !visible else { return }
+        activeRunPollTask?.cancel()
+        activeRunPollTask = nil
     }
 
     func waitForFreshnessForTesting() async {
@@ -285,6 +308,8 @@ public final class ScheduledTasksViewModel: ObservableObject {
             reloadRuns()
             reloadServiceStatus()
         } catch { errorMessage = String(describing: error) }
+        // Keep badges live for any active run, not only one started here.
+        ensureActiveRunPolling()
         Task { [weak self] in
             guard let self else { return }
             providerLoadCount += 1
@@ -379,10 +404,14 @@ public final class ScheduledTasksViewModel: ObservableObject {
         // Immediate feedback: claim is async, but the card should flip to Queued
         // in the same click.
         activeRunStatuses[task.id] = .queued
+        optimisticQueuedTaskIDs.insert(task.id)
         runCounts[task.id, default: 0] += 1
         ensureActiveRunPolling()
         scheduler.runNow(taskID: task.id) { [weak self] result in
             guard let self else { return }
+            // The claim has either committed its row or failed; from here the
+            // store is the source of truth for this task's badge.
+            self.optimisticQueuedTaskIDs.remove(task.id)
             switch result {
             case .failure(let error):
                 self.activeRunStatuses.removeValue(forKey: task.id)
@@ -488,10 +517,21 @@ public final class ScheduledTasksViewModel: ObservableObject {
     }
 
     private func reloadRuns() {
-        do { runs = try store.listRuns(taskID: selectedTaskID, limit: 200) }
-        catch { errorMessage = String(describing: error) }
+        reloadRunHistory()
         // Keep overview badges in sync when history refreshes (e.g. after Run Now).
         reloadActiveRunStatuses()
+    }
+
+    /// Only the detail screen shows history, so the overview (no selection)
+    /// never decodes up to 200 cross-task rows.
+    private func reloadRunHistory() {
+        guard let selectedTaskID else { return }
+        runHistoryReadCountForTesting += 1
+        do {
+            let next = try store.listRuns(taskID: selectedTaskID, limit: 200)
+            if next != runs { runs = next }
+            if runsTaskID != selectedTaskID { runsTaskID = selectedTaskID }
+        } catch { errorMessage = String(describing: error) }
     }
 
     /// Returns whether any task's active status changed.
@@ -506,13 +546,19 @@ public final class ScheduledTasksViewModel: ObservableObject {
                 next[run.taskID] = run.status
             }
             // Preserve optimistic Queued until the store has the row (or failure clears it).
-            for (taskID, status) in activeRunStatuses where status == .queued && next[taskID] == nil {
+            for taskID in optimisticQueuedTaskIDs where next[taskID] == nil {
                 next[taskID] = .queued
             }
             // Publish only real changes: the poll runs every second and each
-            // publish re-renders the whole window.
-            let changed = next != activeRunStatuses || activeRuns != lastActiveRuns
-            lastActiveRuns = activeRuns
+            // publish re-renders the whole window. The heartbeat is rewritten on
+            // every scheduler tick and shown nowhere, so it is not a change.
+            let observedRuns = activeRuns.map { run -> ScheduledTaskRun in
+                var run = run
+                run.heartbeatAt = nil
+                return run
+            }
+            let changed = next != activeRunStatuses || observedRuns != lastActiveRuns
+            lastActiveRuns = observedRuns
             if next != activeRunStatuses { activeRunStatuses = next }
             return changed
         } catch {
@@ -525,11 +571,11 @@ public final class ScheduledTasksViewModel: ObservableObject {
     /// in flight, so the history reloads when one of them does (start, thread
     /// attached, finish) instead of every tick.
     func pollActiveRunsOnce() {
-        if reloadActiveRunStatuses() { reloadRuns() }
+        if reloadActiveRunStatuses() { reloadRunHistory() }
     }
 
     private func ensureActiveRunPolling() {
-        guard !activeRunStatuses.isEmpty else {
+        guard isVisible, !activeRunStatuses.isEmpty else {
             activeRunPollTask?.cancel()
             activeRunPollTask = nil
             return
@@ -1004,14 +1050,26 @@ public struct ScheduledTasksRootView: View {
             Text("Run History")
                 .font(DS.Font.title3.weight(.semibold))
                 .foregroundColor(DS.Palette.text)
-            if vm.runs.isEmpty {
+            if vm.runsTaskID != task.id {
+                // This task's history is still loading (or failed, which the
+                // alert reports): keep the card's shape, claim nothing.
+                historyHeaderRow
+                    .background(DS.Palette.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                    )
+            } else if vm.runs.isEmpty {
                 Text("No runs yet. Use Run Now or wait for the next scheduled occurrence.")
                     .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .dsPanel(padding: DS.Space.xl)
             } else {
-                VStack(spacing: 0) {
+                // Lazy: up to 200 rows, each formatting dates; only the
+                // visible ones need building.
+                LazyVStack(spacing: 0) {
                     historyHeaderRow
                     Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
                     ForEach(Array(vm.runs.enumerated()), id: \.element.id) { index, run in

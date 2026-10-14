@@ -184,6 +184,46 @@ final class AgentTurnCheckpointRepositoryTests: XCTestCase {
         XCTAssertEqual(result.corruptCount, 0)
     }
 
+    // MARK: - latestAssistantMessageReference
+
+    func testLatestAssistantMessageReference_latestCheckpointOfTheRunWins_withoutReadingBlobs() throws {
+        // WHY: bot hand-off settles only need one run's assistant message id.
+        // They used list(threadId:), which decodes every snapshot and diff of
+        // the thread on the MainActor; the narrow read must give the same answer
+        // (the run's latest checkpoint) without touching those columns.
+        let db = try makeDB()
+        let repo = AgentTurnCheckpointRepository(db: db)
+        let (tid, rid) = try seedThreadAndRun(db: db)
+        let other = AgentRun(threadId: tid, provider: .codex, model: "m", status: .running)
+        try AgentRunRepository(db: db).upsert(other)
+        let big = [AgentTurnCheckpointFileSnapshot(
+            path: "big.bin", kind: "file", contentsBase64: String(repeating: "A", count: 512 * 1024)
+        )]
+        let first = AgentMessageID(), latest = AgentMessageID(), otherReply = AgentMessageID()
+        for (turn, run, message) in [(1, rid, first), (2, rid, latest), (3, other.id, otherReply)] {
+            try repo.upsert(AgentTurnCheckpointSummary(
+                threadId: tid, runId: run, turnId: "turn-\(turn)", checkpointTurnCount: turn,
+                checkpointRef: "ref-\(turn)", status: .ready, files: [], fileSnapshots: big,
+                assistantMessageId: message, completedAt: Date(timeIntervalSince1970: Double(turn))
+            ))
+        }
+        let expected = try repo.list(threadId: tid).last(where: { $0.runId == rid })?.assistantMessageId
+        XCTAssertEqual(expected, latest)
+        var stepped: [String] = []
+        db.beforeStatementStepForTesting = { stepped.append($0) }
+        let fullReadsBefore = repo.fullRowListReadCountForTesting
+
+        let reference = try XCTUnwrap(try repo.latestAssistantMessageReference(threadId: tid, runId: rid))
+
+        XCTAssertEqual(reference.threadId, tid)
+        XCTAssertEqual(reference.assistantMessageId, latest, "same answer as list(threadId:).last(where:)")
+        XCTAssertEqual(repo.fullRowListReadCountForTesting, fullReadsBefore)
+        XCTAssertFalse(stepped.contains { $0.contains("file_snapshots_json") || $0.contains("diff_patch") },
+                       "the lookup must not select blob columns: \(stepped)")
+        XCTAssertNil(try repo.latestAssistantMessageReference(threadId: tid, runId: AgentRunID()),
+                     "a run with no checkpoint has no reply")
+    }
+
     // MARK: - list backward-compat: now returns healthy only, does not throw on corrupt
 
     func testList_allValid_returnsAll() throws {

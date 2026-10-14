@@ -140,10 +140,15 @@ public final class SQLiteDB {
     // from the previous use so there is no stale-binding data corruption.
     //
     // Eviction: statements are finalised (freed) when the connection closes (deinit).
-    // There is no LRU cap because the SQL vocabulary of a single SQLiteDB connection
-    // is bounded by the number of distinct query strings in the Persistence module
-    // (~40-50 distinct strings), so unbounded growth is not a practical risk.
+    // There is no LRU cap: the vocabulary is the module's query strings plus a
+    // few dynamic `IN (?, ...)` widths, so it grows slowly and then stops. Because
+    // it is not small, the end of a `performSync` resets only the statements that
+    // operation handed out (`touchedStatements`), not the whole cache.
     private var stmtCache: [String: OpaquePointer] = [:]
+    private var touchedStatements: Set<OpaquePointer> = []
+#if DEBUG
+    private(set) var cachedStatementResetCountForTesting = 0
+#endif
     var beforeStatementStepForTesting: ((String) -> Void)?
     /// Invoked for every `execute` SQL string (including BEGIN/COMMIT/ROLLBACK).
     /// Tests use this to prove read paths never issue BEGIN IMMEDIATE or DDL.
@@ -269,6 +274,21 @@ public final class SQLiteDB {
         }
     }
 
+    /// Ends the statements one `performSync` handed out. Every other cached
+    /// statement was already reset when its own operation ended.
+    private func resetTouchedStatements() {
+        for statement in touchedStatements {
+            sqlite3_reset(statement)
+            // Bindings are SQLITE_TRANSIENT copies; clear them so large bound
+            // payloads are not kept alive until the SQL runs again.
+            sqlite3_clear_bindings(statement)
+        }
+#if DEBUG
+        cachedStatementResetCountForTesting += touchedStatements.count
+#endif
+        touchedStatements.removeAll(keepingCapacity: true)
+    }
+
     // Returns a cached-and-reset statement, or compiles a fresh one.
     // Caller is responsible for serialisation (either via `performSync` or a
     // single-writer context); see `prepare` for the thread-safety rationale.
@@ -292,10 +312,12 @@ public final class SQLiteDB {
                 // Reset: rewinds the VM + wipes bindings before each reuse.
                 sqlite3_reset(cached)
                 sqlite3_clear_bindings(cached)
+                touchedStatements.insert(cached)
                 return SQLiteStatement(handle: cached, db: self, sql: sql, owned: false)
             }
             let stmt = try compileStatement(sql)
             stmtCache[sql] = stmt
+            touchedStatements.insert(stmt)
             return SQLiteStatement(handle: stmt, db: self, sql: sql, owned: false)
         }
         return SQLiteStatement(handle: try compileStatement(sql), db: self, sql: sql, owned: true)
@@ -442,7 +464,7 @@ public final class SQLiteDB {
                 return try queue.sync {
                     // Early-returned SELECTs must not retain a WAL read snapshot after
                     // the serialized operation ends, including when the block throws.
-                    defer { resetCachedStatements() }
+                    defer { resetTouchedStatements() }
                     return try block(self)
                 }
             }

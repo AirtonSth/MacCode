@@ -334,6 +334,10 @@ final class ScheduledTasksWindowTests: XCTestCase {
         viewModel.scheduleFreshnessPass()
         await viewModel.waitForFreshnessForTesting()
         XCTAssertEqual(viewModel.activeRunStatus(for: task.id), .queued)
+        // History is a detail-screen read; open the task's detail first.
+        viewModel.selectedTaskID = task.id
+        await viewModel.waitForFreshnessForTesting()
+        defer { viewModel.setVisible(false) }
         var runPublishes = 0, statusPublishes = 0
         let runsSink = viewModel.$runs.dropFirst().sink { _ in runPublishes += 1 }
         let statusSink = viewModel.$activeRunStatuses.dropFirst().sink { _ in statusPublishes += 1 }
@@ -356,6 +360,164 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertEqual(runPublishes, 2, "finishing must refresh the history exactly once")
         XCTAssertNil(viewModel.activeRunStatus(for: task.id))
         XCTAssertEqual(viewModel.runs.first { $0.id == claim.run.id }?.status, .completed)
+    }
+
+    @MainActor
+    private func makePollFixture(_ name: String) throws -> (
+        directory: String, context: AppContext, router: AppCommandRouter, store: ScheduledTaskStore, task: ScheduledTask
+    ) {
+        let directory = NSTemporaryDirectory() + "rc-scheduled-\(name)-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let store = ScheduledTaskStore(db: context.db)
+        let task = ScheduledTask(
+            title: "Poll task", prompt: "Poll prompt", workspaceID: WorkspaceID(),
+            workspacePathSnapshot: "/tmp", runAsUser: NSUserName(), runAsUID: 501,
+            provider: .codex, providerInstanceID: "codex", model: "gpt-5", reasoningEffort: .high,
+            recurrence: .hourly(anchor: Date(timeIntervalSince1970: 0), intervalHours: 1),
+            timeZoneIdentifier: "UTC",
+            createdAt: Date(timeIntervalSince1970: 10), updatedAt: Date(timeIntervalSince1970: 10)
+        )
+        try store.save(task)
+        return (directory, context, router, store, task)
+    }
+
+    @MainActor
+    func test_overviewPollNeverReadsHistoryAndHeartbeatsAreNotChanges_becauseOnlyTheDetailShowsHistory() async throws {
+        // WHY: the overview never renders `runs`, yet every active-row change
+        // decoded the 200 newest runs of all tasks on the main thread; and the
+        // scheduler rewrites heartbeat_at every 30 s, which forced that reload
+        // (and a history republish) twice a minute for the whole run.
+        let f = try makePollFixture("overview-poll")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let claim = try f.store.claimManual(taskID: f.task.id, now: Date(timeIntervalSince1970: 30), owner: "poll-test")
+        let viewModel = ScheduledTasksViewModel(context: f.context, router: f.router, loadImmediately: false)
+        defer { viewModel.setVisible(false) }
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertNil(viewModel.selectedTaskID)
+        XCTAssertEqual(viewModel.runHistoryReadCountForTesting, 0, "the overview's freshness pass must not read history")
+
+        try f.store.markStarted(runID: claim.run.id, threadID: AgentThreadID(), agentRunID: AgentRunID())
+        viewModel.pollActiveRunsOnce()
+        XCTAssertEqual(viewModel.activeRunStatus(for: f.task.id), .running, "badges still follow the store")
+        XCTAssertEqual(viewModel.runHistoryReadCountForTesting, 0, "an active-row change on the overview reads no history")
+
+        viewModel.selectedTaskID = f.task.id
+        await viewModel.waitForFreshnessForTesting()
+        let readsOnDetail = viewModel.runHistoryReadCountForTesting
+        XCTAssertEqual(readsOnDetail, 1)
+        var runPublishes = 0
+        let sink = viewModel.$runs.dropFirst().sink { _ in runPublishes += 1 }
+        defer { sink.cancel() }
+        for second in 1...30 {
+            try f.store.heartbeat(runID: claim.run.id, at: Date(timeIntervalSince1970: 100 + Double(second * 30)))
+            viewModel.pollActiveRunsOnce()
+        }
+        XCTAssertEqual(viewModel.runHistoryReadCountForTesting, readsOnDetail, "heartbeat-only polls must not reload history")
+        XCTAssertEqual(runPublishes, 0)
+
+        try f.store.finish(runID: claim.run.id, status: .completed, at: Date(timeIntervalSince1970: 2_000))
+        viewModel.pollActiveRunsOnce()
+        XCTAssertEqual(viewModel.runHistoryReadCountForTesting, readsOnDetail + 1, "finishing refreshes history once")
+        XCTAssertEqual(runPublishes, 1)
+        XCTAssertEqual(viewModel.runs.first { $0.id == claim.run.id }?.status, .completed)
+        XCTAssertNil(viewModel.activeRunStatus(for: f.task.id))
+    }
+
+    @MainActor
+    func test_hiddenHostStopsThePollAndRemountShowsTheStoreTruth_becauseTheModelOutlivesTheScreen() async throws {
+        // WHY: MainWindowController caches this model, so the 1 s main-thread
+        // poll kept running for hours after the user left Scheduled Tasks.
+        // Coming back must show what happened meanwhile, including a run that
+        // was queued in the store and finished while nobody polled.
+        let f = try makePollFixture("hidden-poll")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let claim = try f.store.claimManual(taskID: f.task.id, now: Date(timeIntervalSince1970: 30), owner: "poll-test")
+        let viewModel = ScheduledTasksViewModel(context: f.context, router: f.router, loadImmediately: false)
+        defer { viewModel.setVisible(false) }
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.activeRunStatus(for: f.task.id), .queued)
+        XCTAssertTrue(viewModel.isPollingActiveRunsForTesting, "an active run keeps its badge live while shown")
+
+        viewModel.setVisible(false)
+        XCTAssertFalse(viewModel.isPollingActiveRunsForTesting, "a detached host must not poll")
+        viewModel.scheduleFreshnessPass() // a refresh that lands after leaving must not re-arm it
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertFalse(viewModel.isPollingActiveRunsForTesting)
+
+        try f.store.finish(runID: claim.run.id, status: .failed, errorSummary: "boom", at: Date(timeIntervalSince1970: 40))
+        viewModel.setVisible(true)
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertNil(viewModel.activeRunStatus(for: f.task.id),
+                     "a store-confirmed Queued that finished while hidden must not stick as Queued")
+        XCTAssertFalse(viewModel.isPollingActiveRunsForTesting, "nothing active, nothing to poll")
+
+        _ = try f.store.claimManual(taskID: f.task.id, now: Date(timeIntervalSince1970: 50), owner: "poll-test")
+        viewModel.setVisible(false)
+        viewModel.setVisible(true)
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.activeRunStatus(for: f.task.id), .queued)
+        XCTAssertTrue(viewModel.isPollingActiveRunsForTesting, "remount re-arms the poll after its one reload")
+    }
+
+    @MainActor
+    func test_selectingAnotherTaskNeverPresentsThePreviousTasksHistory_becauseHistoryLoadsAfterTheFirstFrame() async throws {
+        // WHY: selection is acknowledged first and history loads after a
+        // committed frame; until then `runs` still holds the previous task's
+        // rows, so the view must know whose rows they are.
+        let f = try makePollFixture("select-history")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let other = ScheduledTask(
+            title: "Other task", prompt: "Other prompt", workspaceID: f.task.workspaceID,
+            workspacePathSnapshot: "/tmp", runAsUser: NSUserName(), runAsUID: 501,
+            provider: .codex, providerInstanceID: "codex", model: "gpt-5", reasoningEffort: .high,
+            recurrence: .hourly(anchor: Date(timeIntervalSince1970: 0), intervalHours: 1),
+            timeZoneIdentifier: "UTC",
+            createdAt: Date(timeIntervalSince1970: 20), updatedAt: Date(timeIntervalSince1970: 20)
+        )
+        try f.store.save(other)
+        let claim = try f.store.claimManual(taskID: f.task.id, now: Date(timeIntervalSince1970: 30), owner: "select-test")
+        try f.store.finish(runID: claim.run.id, status: .completed, at: Date(timeIntervalSince1970: 40))
+        let viewModel = ScheduledTasksViewModel(context: f.context, router: f.router, loadImmediately: false)
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertNil(viewModel.runsTaskID, "the overview loads no history")
+
+        viewModel.selectedTaskID = f.task.id
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.runsTaskID, f.task.id)
+        XCTAssertEqual(viewModel.runs.map(\.id), [claim.run.id])
+
+        viewModel.selectedTaskID = other.id
+        XCTAssertNotEqual(viewModel.runsTaskID, other.id,
+                          "before the deferred read, the held rows must not be attributed to the new task")
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.runsTaskID, other.id)
+        XCTAssertEqual(viewModel.runs, [])
+    }
+
+    func test_historyListIsLazyAndGatedOnItsTask_becauseEagerRowsFormatEveryDate() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func runHistorySection("))
+        let end = try XCTUnwrap(source.range(of: "private var historyHeaderRow"))
+        let section = String(source[start.lowerBound..<end.lowerBound])
+        // Up to 200 rows, each formatting 2-3 dates: only visible rows may build.
+        XCTAssertTrue(section.contains("LazyVStack(spacing: 0)"))
+        XCTAssertFalse(section.contains("                VStack(spacing: 0) {"))
+        XCTAssertTrue(section.contains("if vm.runsTaskID != task.id"),
+                      "another task's rows must never render under this task's header")
+    }
+
+    func test_mainWindowPausesScheduledTasksWhenItLeaves_becauseTheCachedModelWouldKeepPolling() throws {
+        let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
+        XCTAssertTrue(main.contains("if oldValue == .scheduledTasks, shellContentMode != .scheduledTasks {\n                scheduledTasksViewModel?.setVisible(false)"))
+        XCTAssertTrue(main.contains("vm.setVisible(true)\n        vm.scheduleFreshnessPass()"),
+                      "the remount marks the model visible before its one freshness reload")
     }
 
     func test_scopedTaskAndRunRefreshesKeepLatestWinsAndFailureVisible() throws {

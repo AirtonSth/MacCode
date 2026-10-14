@@ -11015,6 +11015,45 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_peerReplySettleFindsTheReplyWithoutReadingCheckpointBlobs() async throws {
+        // WHY: the settle runs on the MainActor and only needs one run's
+        // assistant message id. Loading every checkpoint of the thread decoded
+        // all of its file snapshots and diffs (tens of MB on a long thread).
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let peerRunner = ControlledBotHandoffRunner(provider: .codex)
+        context.coordinator.replaceProvider(.codex, runner: peerRunner)
+        let vm = BotsViewModel(context: context, router: router)
+        let piper = try vm.create(name: "Piper", title: "Seller", provider: .codex)
+        let quinn = try vm.create(name: "Quinn", title: "CRM Controller", provider: .claude)
+        vm.openDesk(piper)
+        let milestone = try submitPeerHandoffForTesting(
+            context: context,
+            router: router,
+            viewModel: vm,
+            peer: quinn,
+            prompt: "@\(quinn.handle) what is in the inbox?"
+        )
+        let peerStarted = await waitUntil(timeout: 5) { peerRunner.requests.count == 1 }
+        XCTAssertTrue(peerStarted)
+        let blobReadsBefore = context.turnCheckpointRepo.fullRowListReadCountForTesting
+        XCTAssertTrue(peerRunner.finish(
+            runID: try XCTUnwrap(peerRunner.requests.first?.runId),
+            status: .completed,
+            reply: "inbox is clear"
+        ))
+        await milestone.value
+        let completed = await waitUntil(timeout: 8) {
+            vm.peerHandoffSnapshotsForTesting().first {
+                $0.originBotID == piper.id && $0.peerBotID == quinn.id
+            }?.phase == .completed
+        }
+        XCTAssertTrue(completed, "the exact reply must still be found and settle the hand-off")
+        XCTAssertEqual(context.turnCheckpointRepo.fullRowListReadCountForTesting, blobReadsBefore,
+                       "settling must not read checkpoint snapshot/diff columns")
+    }
+
     func test_beginCreateTwiceAllocatesDistinctHandles_becauseNewAgentIsAPlaceholder() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)

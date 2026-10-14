@@ -7446,6 +7446,32 @@ public final class AgentTurnCheckpointRepository {
         return AgentTurnCheckpointRepository.decodableCheckpoints(attempts).healthy
     }
 
+    /// The assistant message the latest checkpoint of `runId` names, with that
+    /// checkpoint's thread. Reads three short columns: callers that only need
+    /// the reply must not decode every snapshot and diff of the thread.
+    /// Same order as `list(threadId:)`, so the latest checkpoint of the run wins.
+    public func latestAssistantMessageReference(
+        threadId: AgentThreadID,
+        runId: AgentRunID
+    ) throws -> (threadId: AgentThreadID, assistantMessageId: AgentMessageID?)? {
+        let st = try db.prepare("""
+            SELECT thread_id, run_id, assistant_message_id
+            FROM agent_turn_checkpoints
+            WHERE thread_id = ?
+            ORDER BY checkpoint_turn_count ASC, completed_at ASC;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        var latest: (threadId: AgentThreadID, assistantMessageId: AgentMessageID?)?
+        while try st.step() {
+            guard UUID(uuidString: st.columnText(1) ?? "") == runId.value else { continue }
+            latest = (
+                threadId: AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? threadId.value),
+                assistantMessageId: st.columnText(2).flatMap(UUID.init(uuidString:)).map(AgentMessageID.init)
+            )
+        }
+        return latest
+    }
+
     /// Same row shape as `decodeCheckpoint(from:fallbackThreadId:)` minus the
     /// three heavy blob columns (snapshots, unified diff, per-file diffs).
     private func decodeCheckpointSummary(from st: SQLiteStatement, fallbackThreadId: AgentThreadID) throws -> AgentTurnCheckpointSummary {

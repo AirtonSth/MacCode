@@ -366,7 +366,15 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         case activeThreads
         case bots
     }
-    private var shellContentMode: ShellContentMode = .workspace
+    private var shellContentMode: ShellContentMode = .workspace {
+        didSet {
+            // The cached Scheduled Tasks model keeps no active-run poll while
+            // another destination is shown; its next mount re-arms it.
+            if oldValue == .scheduledTasks, shellContentMode != .scheduledTasks {
+                scheduledTasksViewModel?.setVisible(false)
+            }
+        }
+    }
     private var scheduledTasksViewModel: ScheduledTasksViewModel?
     private var scheduledTasksHostingView: NSView?
     private var activeThreadsViewModel: ActiveThreadsViewModel?
@@ -1393,6 +1401,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             loadImmediately: false
         )
         scheduledTasksViewModel = vm
+        vm.setVisible(true)
         vm.scheduleFreshnessPass()
         if let existing = scheduledTasksHostingView {
             attachShellHost(existing)
