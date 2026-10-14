@@ -7,7 +7,7 @@ public struct ManualActionSnapshot: Equatable, Sendable {
     public let request: ManualActionRequest
     public let botName: String?
     /// False when the thread runs on the Mac: there is no bot computer to take,
-    /// and the Mac card hides "Assumir controle" too.
+    /// and the Mac card hides "Take control" too.
     public let canTake: Bool
 
     public init(request: ManualActionRequest, botName: String?, canTake: Bool) {

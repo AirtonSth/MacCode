@@ -594,7 +594,7 @@ final class ThreadActorRemoteTests: XCTestCase {
         XCTAssertNil(try f.ctx.threadRepo.guestPlacement(of: f.thread.id)?.guestRuntime)
     }
 
-    /// WHY (iOS parity): the Mac's first bot send and "Rodar esta thread no
+    /// WHY (iOS parity): the Mac's first bot send and "Run this thread on the
     /// Mac" change the actor and target; paired devices must see it without
     /// refetching the list.
     func test_macComposerLockAndMoveToMac_publishTheFullActorFields() async throws {

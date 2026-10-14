@@ -1178,6 +1178,9 @@ public final class AppContext {
                 // message remains stranded with no later lifecycle callback.
                 self.cancelQueueDrainWaiter(threadId: tid)
                 self.ensureQueueDrainWaiterIfNeeded(threadId: tid)
+                // The host stopped a bot that asked the user to step in: the phone already
+                // has "Waiting for you", so the same pause sends no "Thread cancelled".
+                let pausedForUser = status == .cancelled && self.router?.botThreadAwaitsUser(tid) == true
                 // Main agent only: nested/subagent workers must not fire
                 // system or private push banners (parent owns user-facing UX).
                 // The notification is the last effect of this hop; its reads
@@ -1220,7 +1223,7 @@ public final class AppContext {
                                     } : nil
                                 )
                             }
-                            if !isSideThread && status != .completed {
+                            if !isSideThread && status != .completed && !pausedForUser {
                                 Task {
                                     await self.privateNotificationBridge.deliverThreadOutcomeRemote(
                                         content,
@@ -1633,6 +1636,7 @@ public final class AppContext {
 
     func queueDrainAllowsWork(threadId: AgentThreadID) -> Bool {
         !isTerminating && queueDrainSuppressionLeases[threadId]?.isEmpty != false
+            && router?.botThreadAwaitsUser(threadId) != true
     }
 
     private func removeQueueDrainWaiter(threadId: AgentThreadID, token: UUID) {

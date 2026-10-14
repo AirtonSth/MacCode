@@ -7,7 +7,7 @@ import DesignSystemKit
 extension AgentAppViewModel {
     /// Header pill text; a pending manual action overrides the run status.
     public var statusLabel: String {
-        openManualAction == nil ? status.rawValue : "Aguardando você"
+        openManualAction == nil ? status.rawValue : "Waiting for you"
     }
 
     func manualActionStoreDidChange() {
@@ -84,7 +84,7 @@ extension AgentAppViewModel {
         if let botID = botScreenBotID { openBotScreen?(botID) }
     }
 
-    /// Devolver with an open request behaves like Continuar; otherwise it only releases control.
+    /// Handing control back with an open request behaves like "Ready, continue"; otherwise it only releases control.
     public func toggleBotScreenControl() async {
         guard let botID = botScreenBotID else { return }
         if botComputerControl.isControlledByUser(botID) {
@@ -188,7 +188,7 @@ struct AgentManualActionCard: View {
                 Image(systemName: Self.symbol(request.kind))
                     .font(.system(size: 12))
                     .foregroundColor(DS.Palette.warning)
-                Text("\(vm.botNameProvider(request.botID) ?? "Bot") aguarda você")
+                Text("\(vm.botNameProvider(request.botID) ?? "Bot") is waiting for you")
                     .font(DS.Font.caption.weight(.semibold))
                     .foregroundColor(DS.Palette.textSecondary)
                 Spacer(minLength: 0)
@@ -207,26 +207,30 @@ struct AgentManualActionCard: View {
                     .frame(maxHeight: 120)
                     .cornerRadius(6)
             }
-            TextField("Nota para o bot (opcional)", text: $note)
+            TextField("Note for the bot (optional)", text: $note)
                 .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Note for the bot")
                 .accessibilityIdentifier("agent.manualAction.note")
             HStack(spacing: DS.Space.sm) {
                 if !executesOnMac {
-                    Button(request.state == .taken ? "Controle assumido" : "Assumir controle") {
+                    Button(request.state == .taken ? "Control taken" : "Take control") {
                         vm.takeManualControl()
                     }
                     .disabled(request.state == .taken)
+                    .help("Drive the bot's computer yourself; the bot stays paused")
                     .accessibilityIdentifier("agent.manualAction.take")
                 }
-                Button("Pronto, continuar") {
+                Button("Ready, continue") {
                     let text = note
                     note = ""
                     Task { await vm.continueManualAction(note: text) }
                 }
+                .help("Resume the bot with your note")
                 .accessibilityIdentifier("agent.manualAction.continue")
-                Button("Recusar") {
+                Button("Decline") {
                     Task { await vm.declineManualAction() }
                 }
+                .help("Tell the bot to continue without this step, or stop")
                 .accessibilityIdentifier("agent.manualAction.decline")
             }
         }
@@ -237,12 +241,12 @@ struct AgentManualActionCard: View {
 
     private func resolvedRow(_ request: ManualActionRequest) -> some View {
         let minutes = max(0, Int((request.resolvedAt ?? request.createdAt).timeIntervalSince(request.createdAt) / 60))
-        let outcome = request.state == .declined ? "recusado" : "continuado"
+        let outcome = request.state == .declined ? "declined" : "continued"
         return HStack(spacing: DS.Space.sm) {
             Image(systemName: Self.symbol(request.kind))
                 .font(.system(size: 10))
                 .foregroundColor(DS.Palette.textTertiary)
-            Text("Você assumiu por \(minutes) min · \(outcome)")
+            Text("You took over for \(minutes) min · \(outcome)")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
         }

@@ -82,7 +82,7 @@ public struct AgentThreadGuestPlacement: Equatable, Sendable {
         executionTarget == .vm && guestRuntime?.isEmpty == false
     }
 
-    /// A guest thread the user moved to the Mac ("Rodar esta thread no Mac",
+    /// A guest thread the user moved to the Mac ("Run this thread on the Mac",
     /// an approved Mac-execution request) keeps its marker until the provider
     /// accepts a Mac run: each run until then drops the guest session, which
     /// the Mac cannot load, and carries a handoff summary instead. Deferred to

@@ -108,6 +108,8 @@ extension AppCommandRouter {
                 followUp = .sent(try await sendBotThreadFollowUp(thread: thread, text: followUpText))
             } catch {
                 followUp = .failed((error as? LocalizedError)?.errorDescription ?? String(describing: error))
+                // No follow-up turn will drain the queue held while the card was open.
+                ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread)
             }
         }
         let latest = manualActionStore.all(threadID: thread)

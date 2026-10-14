@@ -168,7 +168,7 @@ final class BotComputerControlHostTests: XCTestCase {
         }
         defer { center.removeObserver(token) }
         let result = try service.apply(action(BotComputerCatalog.requestMacExecution, bot: bot, reason: "swift build"))
-        XCTAssertEqual(result["message"] as? String, "Pedido enviado ao usuário; aguarde aprovação. Encerre o turno.")
+        XCTAssertEqual(result["message"] as? String, "Request sent to the user; wait for approval. End your turn.")
         XCTAssertEqual(reasons, ["swift build"])
     }
 

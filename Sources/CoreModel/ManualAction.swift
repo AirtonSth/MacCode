@@ -21,16 +21,16 @@ public enum ManualActionState: String, Codable, Sendable {
 
 public struct ManualActionRequest: Codable, Equatable, Sendable, Identifiable {
     public static let maxReasonLength = 280
-    public static let defaultReason = "O bot pediu que você assuma"
+    public static let defaultReason = "The bot asked you to take over"
 
     /// Tool result for `bot_request_user_action`. The run must end after it.
     public static let pauseReply =
-        "Pausado aguardando o usuário. Encerre o turno agora. Você receberá uma mensagem quando ele terminar."
+        "Paused: waiting for the user. End your turn now. Their answer arrives as a new message."
     /// Returned instead of executing act/exec/browser act while the user controls the computer.
     public static let refusalPhrase =
-        "O usuário assumiu o controle deste computador, então esta chamada NÃO foi executada. Não repita: a tela está mudando. Pause a tarefa, diga que está esperando o usuário devolver o controle e tire um screenshot novo antes da próxima ação."
+        "The user has taken control of this computer, so this call was NOT executed. Do not retry: the screen is changing. Pause the task, say you are waiting for the user to hand control back, and take a fresh screenshot before the next action."
     public static let declineFollowUp =
-        "O usuário recusou a ação manual. Siga sem isso ou pare e explique."
+        "The user declined the manual action. Continue without it, or stop and explain."
 
     public var id: UUID
     public var botID: BotID
@@ -76,8 +76,8 @@ public struct ManualActionRequest: Codable, Equatable, Sendable, Identifiable {
 
     public static func continueFollowUp(kind: ManualActionKind, note: String?) -> String {
         let trimmed = note?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let shown = trimmed.isEmpty ? "nenhuma" : trimmed
-        return "O usuário concluiu a ação manual (\(kind.rawValue)). Nota: \(shown). Tire um screenshot novo antes de agir."
+        let shown = trimmed.isEmpty ? "none" : trimmed
+        return "The user finished the manual action (\(kind.rawValue)). Note: \(shown). Take a fresh screenshot before acting."
     }
 }
 
@@ -208,6 +208,8 @@ public enum BotHostNotificationKey {
     public static let jpeg = "jpeg"
     public static let reason = "reason"
     public static let kind = "kind"
+    /// true when the request's thread was guessed (no caller thread), so the host must not stop its run.
+    public static let threadIsFallback = "threadIsFallback"
 }
 
 public enum ManualActionHost {
@@ -220,6 +222,7 @@ public enum ManualActionHost {
         kind: ManualActionKind,
         reason: String,
         screenshotPNG: Data?,
+        threadIsFallback: Bool = false,
         center: NotificationCenter = .default
     ) -> UUID {
         let candidate = ManualActionRequest(botID: botID, threadID: threadID, kind: kind, reason: reason)
@@ -227,6 +230,7 @@ public enum ManualActionHost {
         if id == candidate.id {
             var userInfo: [String: Any] = [BotHostNotificationKey.request: candidate]
             if let screenshotPNG { userInfo[BotHostNotificationKey.screenshotPNG] = screenshotPNG }
+            if threadIsFallback { userInfo[BotHostNotificationKey.threadIsFallback] = true }
             center.post(name: .botManualActionRequested, object: nil, userInfo: userInfo)
         }
         return id

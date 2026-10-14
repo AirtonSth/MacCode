@@ -695,7 +695,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let center = NotificationCenter.default
         botHostObservers.append(center.addObserver(forName: .botManualActionRequested, object: nil, queue: nil) { [weak self] note in
             guard let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest else { return }
-            Task { @MainActor [weak self] in self?.handleManualActionRequested(request) }
+            let threadIsFallback = note.userInfo?[BotHostNotificationKey.threadIsFallback] as? Bool ?? false
+            Task { @MainActor [weak self] in
+                self?.handleManualActionRequested(request, stopsRun: !threadIsFallback)
+            }
         })
         // Synchronous on the poster's thread: an agent.manual_action.resolve call posts on the
         // main actor, so its event is published inside the call and lands in the receipt.
@@ -703,9 +706,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let request = note.userInfo?[BotHostNotificationKey.request] as? ManualActionRequest,
                   let threadID = request.threadID else { return }
             if Thread.isMainThread {
-                MainActor.assumeIsolated { self?.publishManualActionUpdated(thread: threadID, requestID: request.id) }
+                MainActor.assumeIsolated { self?.manualActionStateChanged(request, thread: threadID) }
             } else {
-                Task { @MainActor [weak self] in self?.publishManualActionUpdated(thread: threadID, requestID: request.id) }
+                Task { @MainActor [weak self] in self?.manualActionStateChanged(request, thread: threadID) }
             }
         })
         // Hops even on the main thread: `bot.guest.control` changes control under the
@@ -739,7 +742,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         })
     }
 
-    private func handleManualActionRequested(_ request: ManualActionRequest) {
+    /// `stopsRun` is false when the thread was guessed rather than named by the caller:
+    /// stopping a guess could halt another of the bot's threads while the requester runs on.
+    private func handleManualActionRequested(_ request: ManualActionRequest, stopsRun: Bool) {
         guard let threadID = request.threadID else { return }
         // A late main-actor hop must not overwrite or re-announce a request the user already
         // resolved. A Mac card that saved it first (its observer can run before this hop)
@@ -754,13 +759,34 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         publishManualActionUpdated(thread: threadID, requestID: request.id)
         guard let ctx = context else { return }
         // The pausing turn may already have ended; a fresh run id still passes the nested-worker check.
-        let runID = (try? ctx.runRepo.latestActive(for: threadID))?.id ?? AgentRunID()
+        let activeRun = try? ctx.runRepo.latestActive(for: threadID)
         ctx.postAgentUserActionPushIfNeeded(
             threadId: threadID,
-            runId: runID,
+            runId: activeRun?.id ?? AgentRunID(),
             requestId: request.id.uuidString,
-            actionTitle: "Aguardando você"
+            actionTitle: "Waiting for you"
         )
+        // The tool only asks the model to end its turn; the host enforces the pause so the bot
+        // stops acting on the shared computer. The user's answer sends the one follow-up turn,
+        // and the queue drain holds while the card is open (`botThreadAwaitsUser`).
+        if stopsRun, activeRun != nil {
+            ctx.coordinator.stopRun(threadId: threadID)
+        }
+    }
+
+    private func manualActionStateChanged(_ request: ManualActionRequest, thread: AgentThreadID) {
+        publishManualActionUpdated(thread: thread, requestID: request.id)
+        // Continue and Decline send a follow-up whose finish drains the held queue, so the bot
+        // hears the answer first. A request closed with no answer re-arms the drain here.
+        if request.state == .expired {
+            context?.ensureQueueDrainWaiterIfNeeded(threadId: thread)
+        }
+    }
+
+    /// A bot paused for the user (an open handoff card or a pending "run on the Mac?" request):
+    /// its queued messages must not start a turn before the bot hears the answer.
+    func botThreadAwaitsUser(_ thread: AgentThreadID) -> Bool {
+        pendingMacExecution[thread] != nil || manualActionStore.open(threadID: thread) != nil
     }
 
     private func handleBotScreenshotPosted(threadID: AgentThreadID, jpeg: Data, reason: String) {
@@ -3259,7 +3285,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             BotVMRunRegistry.shared.tryBegin(botID: botID, entry: entry)
         }
         viewModel.botReleaseVM = { [weak self] runID in self?.releaseBotVMRun(runID) }
-        // iOS parity: the composer's bot lock and "Rodar esta thread no Mac"
+        // iOS parity: the composer's bot lock and "Run this thread on the Mac"
         // reach paired devices from the Desk too, as from Agent App tabs.
         viewModel.onThreadConfigPersisted = { [weak self] thread in
             self?.publishAgentThreadUpdated(thread)
@@ -8881,16 +8907,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let appSupport = ctx.appSupportDirectory
         if action.kind == BotBrowserCatalog.stateKind, action.action == BotBrowserCatalog.waitLoginAction {
             let openedURL = (try? BotBrowserStore(appSupportDirectory: appSupport).loadTarget(botID: botID))?.url ?? ""
+            let callerThread = action.threadID.flatMap { UUID(uuidString: $0) }.map { AgentThreadID($0) }
             ManualActionHost.request(
                 control: botComputerControl,
                 botID: botID,
-                threadID: action.threadID.flatMap { UUID(uuidString: $0) }.map { AgentThreadID($0) }
+                threadID: callerThread
                     ?? botActiveThreadResolverForTesting?(botID)
                     ?? ((try? ctx.botStore.listConversations(botID: botID)) ?? []).lazy
                         .compactMap(\.linkedAgentThreadID).first,
                 kind: .login,
                 reason: BotBrowserLoginWait.userPrompt(url: openedURL),
-                screenshotPNG: nil
+                screenshotPNG: nil,
+                threadIsFallback: callerThread == nil
             )
         }
         if action.kind == BotBrowserCatalog.open {

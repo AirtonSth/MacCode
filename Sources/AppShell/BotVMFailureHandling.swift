@@ -19,8 +19,8 @@ struct BotVMBusyError: LocalizedError, CustomStringConvertible {
 }
 
 extension AppCommandRouter {
-    static let macExecutionApprovedFollowUp = "Execução no Mac aprovada pelo usuário. Continue."
-    static let macExecutionDeclinedFollowUp = "O usuário recusou a execução no Mac. Continue na VM ou pare e explique."
+    static let macExecutionApprovedFollowUp = "The user approved running on the Mac. Continue."
+    static let macExecutionDeclinedFollowUp = "The user declined running on the Mac. Continue in the VM, or stop and explain."
 
     /// Every Agent App view model that can show a bot thread: the Agent App
     /// tabs and the embedded Bots Desk.
@@ -118,6 +118,11 @@ extension AppCommandRouter {
 
     func handleMacExecutionRequested(threadID: AgentThreadID, reason: String) {
         pendingMacExecution[threadID] = reason
+        // Same host-enforced pause as the handoff card: the reply only asks the model to end
+        // its turn. The answer's follow-up resumes the bot; the queue holds until then.
+        if let ctx = context, (try? ctx.runRepo.latestActive(for: threadID)) != nil {
+            ctx.coordinator.stopRun(threadId: threadID)
+        }
         for viewModel in botThreadViewModels {
             viewModel.pendingMacExecutionByThread[threadID] = reason
         }
@@ -153,7 +158,7 @@ extension AppCommandRouter {
             for viewModel in botThreadViewModels {
                 viewModel.pendingMacExecutionByThread[thread] = reason
                 if viewModel.selectedThreadId == thread {
-                    viewModel.statusMessage = "Não foi possível salvar a resposta: \(error.localizedDescription)"
+                    viewModel.statusMessage = "Could not save the answer: \(error.localizedDescription)"
                 }
             }
             throw MacExecutionStoreError(underlying: error)
@@ -179,6 +184,8 @@ extension AppCommandRouter {
             ))
         } catch {
             followUp = .failed((error as? LocalizedError)?.errorDescription ?? String(describing: error))
+            // No follow-up turn will drain the queue held while the request was pending.
+            context?.ensureQueueDrainWaiterIfNeeded(threadId: thread)
         }
         let latest = ((try? context?.threadRepo.get(id: thread)) ?? nil) ?? stored
         return MacExecutionResolveOutcome(thread: latest, approved: approve, followUp: followUp)
@@ -189,7 +196,7 @@ extension AppCommandRouter {
     /// its agent runs in the guest user's home, and BotHome is never a mountable workspace.
     /// A bot already running elsewhere keeps its container: the send queues instead of remounting.
     func botVMPreflight(_ botID: BotID, workspace: String?) async -> String? {
-        guard let ctx = context else { return "Contexto indisponível." }
+        guard let ctx = context else { return "RemoteCode is not ready." }
         let docker = botVMDocker
         let service = botVMService(appSupport: ctx.appSupportDirectory)
         let registered = Set(ctx.state.workspaces.values.map(\.cwd))
@@ -251,7 +258,7 @@ extension AppCommandRouter {
 
     /// nil on success; otherwise the user-facing failure.
     func provisionBotVM(_ botID: BotID) async -> String? {
-        guard let appSupport = context?.appSupportDirectory else { return "Contexto indisponível." }
+        guard let appSupport = context?.appSupportDirectory else { return "RemoteCode is not ready." }
         let service = botVMService(appSupport: appSupport)
         let docker = botVMDocker
         let prefetch = guestDistillPrefetch()

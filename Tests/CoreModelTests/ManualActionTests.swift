@@ -8,7 +8,7 @@ final class ManualActionTests: XCTestCase {
         // WHY: the reason is shown verbatim on the card; it must be bounded and never empty.
         XCTAssertEqual(ManualActionRequest.normalizedReason("  entre na conta \n"), "entre na conta")
         XCTAssertEqual(ManualActionRequest.normalizedReason(String(repeating: "a", count: 500)).count, 280)
-        XCTAssertEqual(ManualActionRequest.normalizedReason("   \n"), "O bot pediu que você assuma")
+        XCTAssertEqual(ManualActionRequest.normalizedReason("   \n"), "The bot asked you to take over")
     }
 
     func test_twoFactorRawValueAndCodableRoundTrip() throws {
@@ -72,24 +72,24 @@ final class ManualActionTests: XCTestCase {
 
     func test_followUpTextsAreExact() {
         XCTAssertEqual(
-            ManualActionRequest.continueFollowUp(kind: .twoFactor, note: " feito "),
-            "O usuário concluiu a ação manual (2fa). Nota: feito. Tire um screenshot novo antes de agir."
+            ManualActionRequest.continueFollowUp(kind: .twoFactor, note: " done "),
+            "The user finished the manual action (2fa). Note: done. Take a fresh screenshot before acting."
         )
         XCTAssertEqual(
             ManualActionRequest.continueFollowUp(kind: .login, note: nil),
-            "O usuário concluiu a ação manual (login). Nota: nenhuma. Tire um screenshot novo antes de agir."
+            "The user finished the manual action (login). Note: none. Take a fresh screenshot before acting."
         )
         XCTAssertEqual(
             ManualActionRequest.declineFollowUp,
-            "O usuário recusou a ação manual. Siga sem isso ou pare e explique."
+            "The user declined the manual action. Continue without it, or stop and explain."
         )
         XCTAssertEqual(
             ManualActionRequest.pauseReply,
-            "Pausado aguardando o usuário. Encerre o turno agora. Você receberá uma mensagem quando ele terminar."
+            "Paused: waiting for the user. End your turn now. Their answer arrives as a new message."
         )
         XCTAssertEqual(
             ManualActionRequest.refusalPhrase,
-            "O usuário assumiu o controle deste computador, então esta chamada NÃO foi executada. Não repita: a tela está mudando. Pause a tarefa, diga que está esperando o usuário devolver o controle e tire um screenshot novo antes da próxima ação."
+            "The user has taken control of this computer, so this call was NOT executed. Do not retry: the screen is changing. Pause the task, say you are waiting for the user to hand control back, and take a fresh screenshot before the next action."
         )
     }
 

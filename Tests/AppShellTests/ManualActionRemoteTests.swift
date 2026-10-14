@@ -563,7 +563,7 @@ final class ManualActionRemoteTests: XCTestCase {
     // MARK: - Snapshot, not found and bot delete (review P2)
 
     /// WHY: after missed events the iPhone rebuilds from sync.snapshot; without
-    /// the key it lost "Aguardando você" until it happened to re-list.
+    /// the key it lost "Waiting for you" until it happened to re-list.
     func test_syncSnapshotThreadRowsCarryPendingManualAction() async throws {
         let f = try makeFixture()
         func snapshotPending() async throws -> JSONValue? {

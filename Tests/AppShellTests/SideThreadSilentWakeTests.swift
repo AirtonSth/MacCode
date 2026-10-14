@@ -67,6 +67,32 @@ final class SideThreadSilentWakeTests: XCTestCase {
         XCTAssertEqual(banners.first?.data["threadId"], main.id.value.uuidString)
     }
 
+    func testABotPausedForTheUserSendsThePhoneNoThreadCancelledAlert() async throws {
+        // WHY: when a bot asks the user to step in, the host stops its run so it stops acting.
+        // The phone already got "Waiting for you"; a "Thread cancelled" alert for the same
+        // pause reads as a failure. A real Stop with no open request still sends it.
+        let api = SilentWakeRecordingAPI()
+        let ctx = try makeContext(api: api)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        try pairPhone(with: ctx, api: api, liveActivityActive: false)
+        let (main, _) = try makeMainAndSideThread(in: ctx)
+        let pausedRun = try makeFinishedRun(of: main, in: ctx)
+        let request = ManualActionRequest(botID: BotID(), threadID: main.id, kind: .login, reason: "Sign in")
+        try router.manualActionStore.upsert(request)
+
+        ctx.coordinator.onRunFinished?(main.id, pausedRun.id, .cancelled)
+        let cancelledAlert = { api.requests.contains { !$0.silent && $0.title == "Thread cancelled" } }
+        await wait(seconds: 10, until: cancelledAlert)
+        XCTAssertFalse(cancelledAlert(), "the handoff pause is not a cancelled thread")
+
+        try router.manualActionStore.resolve(id: request.id, state: .declined)
+        let stoppedRun = try makeFinishedRun(of: main, in: ctx)
+        ctx.coordinator.onRunFinished?(main.id, stoppedRun.id, .cancelled)
+        await wait(seconds: 30, until: cancelledAlert)
+        XCTAssertTrue(cancelledAlert(), "a Stop with no open request still tells the phone")
+    }
+
     func testSideChatFinishEventQueuesNoWakeAndTheNextRealFinishDoes() async throws {
         // WHY: every finished run is published as `agent.run.completed`, and the
         // wake coordinator turns that kind into a progress wake without knowing

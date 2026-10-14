@@ -6411,7 +6411,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if selectedThreadId == id { selectedRunActor = actor }
     }
 
-    /// "Iniciar VM": provisions through the host, then clears the banner.
+    /// "Start VM": provisions through the host, then clears the banner.
     public func startUnavailableBotVM() {
         guard let botID = vmUnavailableBotID, let provision = botVMProvision else { return }
         Task {
@@ -6424,7 +6424,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// "Rodar esta thread no Mac": explicit user choice, locks the thread to the Mac target.
+    /// "Run this thread on the Mac": explicit user choice, locks the thread to the Mac target.
     public func runSelectedThreadOnMac() {
         guard let botID = vmUnavailableBotID, let tid = selectedThreadId,
               let thread = threads.first(where: { $0.id == tid }) else { return }

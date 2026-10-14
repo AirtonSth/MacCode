@@ -386,7 +386,7 @@ final class BotDeskGuestThreadTests: XCTestCase {
         XCTAssertEqual(f.vm.deskRuntimeLabel, inVM, "the guest thread reads its stored placement")
         let agent = try XCTUnwrap(f.vm.deskAgentVM)
 
-        // "Rodar esta thread no Mac" / an approved Mac execution request.
+        // "Run this thread on the Mac" / an approved Mac execution request.
         XCTAssertTrue(try f.ctx.threadRepo.setActor(
             id: thread.id, actor: thread.actor, lockedAt: thread.actorLockedAt, executionTarget: .mac
         ))

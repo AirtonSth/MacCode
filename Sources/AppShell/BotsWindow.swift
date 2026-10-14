@@ -10161,7 +10161,7 @@ public final class BotsViewModel: ObservableObject {
         // Desk threads locked to the bot's VM get the same gate, queue and
         // D11 banner as Agent App tabs. A workspace-less desk thread's gate
         // asks Docker and never provisions inline (the send fails fast with
-        // the banner); "Iniciar VM" starts the desktop through the desk's own
+        // the banner); "Start VM" starts the desktop through the desk's own
         // launch, so the desktop pane and the send admission see that VM.
         router.configureBotVMHooks(on: vm)
         vm.botVMPreflight = { [weak self, weak router] botID, workspace in
@@ -10225,7 +10225,7 @@ public final class BotsViewModel: ObservableObject {
         return "Linux desktop is starting. Try again when it is ready."
     }
 
-    /// "Iniciar VM": nil once the bot's Linux desktop is up, starting it
+    /// "Start VM": nil once the bot's Linux desktop is up, starting it
     /// through the desk's own launch (a real provision, never the cached
     /// flag, like the Agent App tabs' `provisionBotVM`); otherwise the
     /// user-facing failure.

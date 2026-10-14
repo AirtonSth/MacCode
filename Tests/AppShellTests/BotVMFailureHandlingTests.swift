@@ -133,7 +133,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertNil(f.router.pendingMacExecution[f.thread.id])
         let sent = await waitUntil { f.runner.requests.count == 1 }
         XCTAssertTrue(sent)
-        XCTAssertEqual(f.runner.requests.first?.userMessageContent, "Execução no Mac aprovada pelo usuário. Continue.")
+        XCTAssertEqual(f.runner.requests.first?.userMessageContent, "The user approved running on the Mac. Continue.")
     }
 
     func test_declineMacExecutionKeepsVMAndSendsDeclineFollowUp() async throws {
@@ -146,7 +146,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertTrue(sent)
         XCTAssertEqual(
             f.runner.requests.first?.userMessageContent,
-            "O usuário recusou a execução no Mac. Continue na VM ou pare e explique."
+            "The user declined running on the Mac. Continue in the VM, or stop and explain."
         )
         XCTAssertEqual(
             f.runner.requests.first?.prompt.contains(BotStandingInstructions.vmThreadRules), true,
@@ -274,7 +274,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
     }
 
     func test_runOnMacFromTheVMBannerHandsAGuestThreadOffOnItsNextSend() async throws {
-        // WHY (D11 + M10): "Rodar esta thread no Mac" is the only way a guest
+        // WHY (D11 + M10): "Run this thread on the Mac" is the only way a guest
         // thread reaches the Mac; its next send must start a Mac session from the
         // transcript, not try to load the guest session.
         let f = try makeFixture()

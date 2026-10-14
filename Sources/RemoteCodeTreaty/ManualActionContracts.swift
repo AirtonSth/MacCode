@@ -3,7 +3,7 @@ import Foundation
 // Manual actions (host capability `agent.manual_actions_v1`). A bot that
 // needs the user (login, captcha, 2FA, payment, confirm) pauses its run and
 // opens a request on its thread; the Mac shows a card and the iPhone gets an
-// "Aguardando você" push.
+// "Waiting for you" push.
 //
 // - Reads: `agent.manual_action.list` (batchable, read scope); an unknown
 //   `thread_id` is -32060 `not_found`. Every agent thread payload

@@ -726,7 +726,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         }
     }
 
-    public static let macExecutionReply = "Pedido enviado ao usuário; aguarde aprovação. Encerre o turno."
+    public static let macExecutionReply = "Request sent to the user; wait for approval. End your turn."
 
     private static func boundedBase64(_ png: Data) throws -> String {
         let base64 = png.base64EncodedString()
