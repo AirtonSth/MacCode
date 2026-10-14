@@ -36,6 +36,19 @@ public enum LayoutError: Error, Equatable {
     case invalidLayout
 }
 
+/// Readable text for alerts that show `error.localizedDescription`; without it
+/// the user sees "CoreModel.LayoutError error 0".
+extension LayoutError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .workspaceNotFound: return "Its workspace is closed or no longer exists."
+        case .paneNotFound: return "That pane is no longer open."
+        case .surfaceNotFound: return "That tab is no longer open."
+        case .invalidLayout: return "The layout could not be updated."
+        }
+    }
+}
+
 public struct LayoutState: Codable, Sendable, Equatable {
     public var windows: [AppWindow]
     public var focusedWindowID: WindowID

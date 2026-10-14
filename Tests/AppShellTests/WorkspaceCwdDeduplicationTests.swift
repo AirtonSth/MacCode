@@ -148,7 +148,7 @@ final class WorkspaceCwdDeduplicationIntegrationTests: XCTestCase {
         XCTAssertEqual(messages.first, "Could not add \(stale.lastPathComponent)")
         XCTAssertEqual(details.first,
             "That folder no longer exists. It may have been moved, renamed or deleted.",
-            "WHY: LayoutError has no LocalizedError conformance, so the raw localizedDescription would only name the enum case")
+            "WHY: LayoutError's generic text says a workspace is closed; on this path the folder itself is gone, so the reason must name the folder")
     }
 
     // Unrelated failures must keep their own message, not claim the folder vanished.

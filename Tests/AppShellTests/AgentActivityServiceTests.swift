@@ -270,6 +270,27 @@ final class AgentActivityServiceTests: XCTestCase {
         XCTAssertNil(item.conversationID)
     }
 
+    func test_botLinkedRunCarriesBotAndConversationSoActivityOpensTheDesk() throws {
+        // WHY: a bot Desk thread has no workspace. Without its bot on the row, Activity sent it
+        // to openAgentThread, which can only throw ("CoreModel.LayoutError error 0").
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let bot = try context.botStore.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let conversation = BotConversation(botID: bot.id, title: "oi", linkedAgentThreadID: thread.id)
+        try context.botStore.upsertConversation(conversation)
+        let run = try makeRun(context, thread: thread, status: .completed, at: 100)
+        let unlinked = try makeRun(context, thread: try makeThread(context), status: .completed, at: 200)
+
+        let items = try decodePage(service(context).list([:])).items
+        let item = try XCTUnwrap(items.first { $0.id == "run:\(run.id.description)" })
+        XCTAssertEqual(item.botID, bot.id.value)
+        XCTAssertEqual(item.conversationID, conversation.id.value)
+        XCTAssertEqual(item.threadID, thread.id.value, "the row still names its thread for the embedded transcript")
+        let plain = try XCTUnwrap(items.first { $0.id == "run:\(unlinked.id.description)" })
+        XCTAssertNil(plain.botID, "a thread no bot owns must keep the workspace route")
+        XCTAssertNil(plain.conversationID)
+    }
+
     func test_unknownNotificationRemainsVisibleWithSafeCanonicalTitle() throws {
         let context = try makeContext()
         try NotificationRepository(db: context.db).insert(AppNotification(id: "thread-update", title: "private title", body: "private body", category: "RemoteCodeThreadUpdate"))

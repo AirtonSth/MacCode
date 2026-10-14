@@ -533,6 +533,14 @@ struct ClaudeProviderRuntimePresentation: Equatable {
     }
 }
 
+/// Result of `AppCommandRouter.agentThreadOpenDestination(_:)`.
+public enum AgentThreadOpenDestination: Equatable, Sendable {
+    case workspace(WorkspaceID)
+    case bot(BotID, BotConversationID)
+    /// No open workspace and no owning bot conversation: `openAgentThread` would throw.
+    case unavailable
+}
+
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
@@ -2977,6 +2985,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     /// In-process schedule owner (main app). Run Now / ticks call this instead of XPC.
     public weak var scheduledTaskScheduler: ScheduledTaskScheduler?
+
+    /// Where `openAgentThread` could land, checked before a caller leaves its own screen.
+    /// Same workspace check as its guard; a thread with no open workspace that a bot
+    /// conversation owns belongs in that bot's Desk instead.
+    public func agentThreadOpenDestination(_ threadID: AgentThreadID) throws -> AgentThreadOpenDestination {
+        guard let ctx = context else { return .unavailable }
+        if let workspaceID = try ctx.threadRepo.workspaceId(of: threadID),
+           ctx.state.workspaces[workspaceID] != nil {
+            return .workspace(workspaceID)
+        }
+        if let conversation = try ctx.botStore.conversationLinked(to: threadID) {
+            return .bot(conversation.botID, conversation.id)
+        }
+        return .unavailable
+    }
 
     /// Open one exact agent thread in a concrete Agent App surface.
     ///
@@ -9250,6 +9273,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     var activityWorkspaceOptions: [(id: String, name: String)] {
         context?.state.workspaces.values.map { ($0.id.value.uuidString, $0.name) } ?? []
+    }
+
+    /// In-memory, so Activity rows can ask on every render; `openAgentThread` checks the same.
+    func activityWorkspaceIsOpen(_ id: String) -> Bool {
+        guard let uuid = UUID(uuidString: id) else { return false }
+        return context?.state.workspaces[WorkspaceID(uuid)] != nil
     }
 
     public func activityList(params: [String: JSONValue]) throws -> JSONValue {

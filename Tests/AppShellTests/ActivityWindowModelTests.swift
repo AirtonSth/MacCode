@@ -107,10 +107,78 @@ final class ActivityWindowModelTests: XCTestCase {
             setViewed: { _ in missingMutations += 1; return self.updated([]) }, acknowledge: { _ in .object([:]) }
         ), defaults: missingDefaults)
         missing.refreshAfterFrame()
-        await waitUntil("missing target error") { missing.error != nil && !missing.loading }
+        await waitUntil("missing restored target dropped") { missing.selectedID == nil && !missing.loading }
         XCTAssertNil(missing.detail)
-        XCTAssertEqual(missing.selectedID, "run:missing")
+        XCTAssertNil(missing.error, "a restored selection is convenience state, not a target the user asked for")
+        XCTAssertNil(missingDefaults.string(forKey: "activity.selection"))
         XCTAssertEqual(missingMutations, 0, "missing target must never mark another result seen")
+    }
+
+    func testRestoredSelectionThatLeftRunningIsDroppedSilentlyAndNeverReRaisedOnLiveRefresh() async {
+        // WHY: the saved selection is usually a run clicked last session that has since finished.
+        // Treating it as a requested target showed "Update failed: Requested activity result was
+        // not found." over an unrelated Running row, and re-raised it on every agent.run.* refresh.
+        let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
+        defaults.set("running", forKey: "activity.tab")
+        defaults.set("run:finished-earlier", forKey: "activity.selection")
+        defaults.set("run:finished-earlier", forKey: "activity.scroll")
+        var listCalls = 0
+        var mutations = 0
+        let model = ActivityViewModel(service: ActivityClient(
+            list: { params in
+                listCalls += 1
+                return params["cursor"] == nil
+                    ? self.page([self.item("run:oi", state: "running")], cursor: "more")
+                    : self.page([self.item("run:other", state: "running")])
+            },
+            setViewed: { _ in mutations += 1; return self.updated([]) }, acknowledge: { _ in .object([:]) }
+        ), defaults: defaults)
+
+        model.refreshAfterFrame()
+        await waitUntil("first refresh") { listCalls >= 1 && !model.loading }
+        XCTAssertNil(model.error)
+        XCTAssertNil(model.selectedID)
+        XCTAssertNil(model.detail)
+        XCTAssertNil(defaults.string(forKey: "activity.selection"), "the dropped selection must not come back next launch")
+        XCTAssertEqual(model.page.items.first?.id, "run:oi", "the running bot row is still shown")
+        XCTAssertEqual(mutations, 0)
+        let callsAfterFirst = listCalls
+
+        for refresh in 1...2 {
+            model.refreshAfterFrame()
+            await waitUntil("live refresh \(refresh)") { listCalls == callsAfterFirst + refresh && !model.loading }
+            XCTAssertNil(model.error, "an invalidation refresh must not raise a missing-target error")
+        }
+        XCTAssertEqual(listCalls, callsAfterFirst + 2, "a dropped target must not be paged for again")
+    }
+
+    func testExplicitRouteMissIsReportedOnceAndStaysDismissedAcrossLiveRefreshes() async {
+        // WHY: a notification that names a row the host no longer lists must say so, once.
+        // Left armed, every agent.run.* refresh paged for it again and re-raised the banner,
+        // so Dismiss and Retry could never make it go away.
+        let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
+        var listCalls = 0
+        let model = ActivityViewModel(service: ActivityClient(
+            list: { params in
+                listCalls += 1
+                return params["cursor"] == nil ? self.page([self.item("other")], cursor: "more") : self.page([])
+            },
+            setViewed: { _ in self.updated([]) }, acknowledge: { _ in .object([:]) }
+        ), defaults: defaults)
+        model.applyRoute(intent: NotificationRouteIntent(threadId: nil, workspaceId: nil, opensActivity: true, activityItemId: "run:gone"))
+        await waitUntil("routed miss") { model.error != nil && !model.loading }
+        XCTAssertEqual(model.error, "Requested activity result was not found.")
+        let callsAfterMiss = listCalls
+
+        model.refreshAfterFrame()
+        await waitUntil("invalidation refresh") { listCalls == callsAfterMiss + 1 && !model.loading }
+        XCTAssertEqual(model.error, "Requested activity result was not found.",
+                       "an invalidation 100 ms later must not wipe the honest error before it can be read")
+        model.dismissError()
+        model.refreshAfterFrame()
+        await waitUntil("refresh after dismiss") { listCalls == callsAfterMiss + 2 && !model.loading }
+        XCTAssertNil(model.error, "a dismissed miss must not come back")
+        XCTAssertEqual(listCalls, callsAfterMiss + 2, "the missed target is searched for once, not on every refresh")
     }
 
     func testAcknowledgedNeedsYouSelectionDisappearingOnRefreshDoesNotReportMissingExternalTarget() async {

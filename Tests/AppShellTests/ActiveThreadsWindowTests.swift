@@ -118,6 +118,65 @@ final class ActiveThreadsWindowTests: XCTestCase {
                         "a failed finished-run repository read must remain visible")
     }
 
+    @MainActor
+    func test_threadOpenDestinationIsKnownBeforeLeavingActivity() throws {
+        // WHY: openAgentThread can only open a thread whose workspace is in the live layout.
+        // Activity, Schedule Tasks and notification rows also list bot Desk threads (no
+        // workspace) and threads of closed workspaces; callers must learn that before they
+        // leave their screen, so a bot thread goes to its Desk and a dead one fails in place.
+        let directory = NSTemporaryDirectory() + "rc-active-destination-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "Open", cwd: NSTemporaryDirectory())
+
+        let open = AgentThread(workspaceId: workspace.id, title: "open", provider: .codex, model: "m")
+        let closed = AgentThread(workspaceId: WorkspaceID(), title: "closed", provider: .codex, model: "m")
+        let orphan = AgentThread(workspaceId: nil, title: "orphan", provider: .codex, model: "m")
+        let botThread = AgentThread(workspaceId: nil, title: "oi", provider: .claude, model: "m")
+        for thread in [open, closed, orphan, botThread] { try context.threadRepo.upsert(thread) }
+        let bot = try context.botStore.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let conversation = BotConversation(botID: bot.id, title: "oi", linkedAgentThreadID: botThread.id)
+        try context.botStore.upsertConversation(conversation)
+
+        XCTAssertEqual(try router.agentThreadOpenDestination(open.id), .workspace(workspace.id))
+        XCTAssertEqual(try router.agentThreadOpenDestination(botThread.id), .bot(bot.id, conversation.id))
+        XCTAssertEqual(try router.agentThreadOpenDestination(closed.id), .unavailable)
+        XCTAssertEqual(try router.agentThreadOpenDestination(orphan.id), .unavailable)
+    }
+
+    @MainActor
+    func test_openActivity_unreachableThread_failsInPlaceWithReadableErrorAndReplacesStaleAlert() throws {
+        // WHY: the open used to leave Activity first and fail a frame later on a hidden view,
+        // as "CoreModel.LayoutError error 0". That alert then popped up on the next Activity
+        // visit over an unrelated row (the /goal row in the report).
+        let directory = NSTemporaryDirectory() + "rc-active-unreachable-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let closed = AgentThread(workspaceId: WorkspaceID(), title: "closed", provider: .codex, model: "m")
+        try context.threadRepo.upsert(closed)
+        let viewModel = ActiveThreadsViewModel(context: context, router: router, loadImmediately: false)
+        viewModel.errorMessage = "Could not open thread: an older failure"
+
+        viewModel.openActivity(ActivityWireItem(
+            id: "run:x", kind: "agent", run_id: nil, request_id: nil, notification_id: nil,
+            workspace_id: closed.workspaceId?.value.uuidString, thread_id: closed.id.value.uuidString, surface_id: nil,
+            state: "completed", title: "closed", workspace_name: nil, provider: nil, summary: nil,
+            occurred_at: "2026-10-14T12:00:00Z", started_at: nil, finished_at: nil, viewed_at: nil,
+            attention_acknowledged_at: nil, needs_action: false, blocking: false,
+            final_message_id: nil, checkpoint_id: nil, changed_files: [], error: nil
+        ))
+
+        // Same turn, no yield: the failure belongs to the click, not to a deferred task.
+        let message = try XCTUnwrap(viewModel.errorMessage)
+        XCTAssertEqual(message, "Could not open thread: Its workspace is closed or no longer exists.")
+        XCTAssertFalse(message.contains("LayoutError"))
+        XCTAssertFalse(message.contains("older failure"))
+    }
+
     func test_appContextPublishesSidebarRefreshOnActiveCountChange_becauseBadgeMustStayLive() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/AppContext.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("lastPublishedActiveThreadCount"),

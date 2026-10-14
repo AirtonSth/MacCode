@@ -5,6 +5,10 @@ import Persistence
 
 struct ActivityOriginSnapshot: Sendable {
     let labelsByRunID: [String: String]
+    /// Lowercased thread id → the bot conversation that owns it, so a bot thread's rows open
+    /// its Desk instead of a workspace it never had. Group-member conversations are not
+    /// listed here; the router's destination check finds them by thread at open time.
+    let botLinksByThreadID: [String: (botID: UUID, conversationID: UUID)]
     let botRequests: [AgentActivityItem]
     let scheduledOccurrences: [AgentActivityItem]
 }
@@ -40,6 +44,11 @@ enum ActivityOriginProjection {
             guard let threadID = conversation.linkedAgentThreadID,
                   threadByID[threadID.value.uuidString.lowercased()] != nil else { return nil }
             return (threadID.value.uuidString.lowercased(), "Bot conversation: \(conversation.title)")
+        }, uniquingKeysWith: { first, _ in first })
+        let botLinks = Dictionary(conversations.compactMap { conversation -> (String, (botID: UUID, conversationID: UUID))? in
+            guard let threadID = conversation.linkedAgentThreadID?.value.uuidString.lowercased(),
+                  threadByID[threadID] != nil else { return nil }
+            return (threadID, (conversation.botID.value, conversation.id.value))
         }, uniquingKeysWith: { first, _ in first })
         let runThreads = try db.performSync { database -> [(String, String)] in
             let statement = try database.prepare("SELECT id, thread_id FROM agent_runs;")
@@ -131,7 +140,7 @@ enum ActivityOriginProjection {
             }
             return items
         }
-        return ActivityOriginSnapshot(labelsByRunID: labels, botRequests: requests, scheduledOccurrences: scheduledOccurrences)
+        return ActivityOriginSnapshot(labelsByRunID: labels, botLinksByThreadID: botLinks, botRequests: requests, scheduledOccurrences: scheduledOccurrences)
     }
 
     // Shared and style-first: every scheduled occurrence parses three timestamps on each

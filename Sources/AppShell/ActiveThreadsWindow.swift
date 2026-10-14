@@ -353,6 +353,8 @@ public final class ActiveThreadsViewModel: ObservableObject {
     }
 
     func openActivity(_ item: ActivityWireItem) {
+        // A new open owns the alert; an older failure must not outlive it.
+        errorMessage = nil
         if let notificationID = item.notification_id, item.bot_id == nil {
             do {
                 guard let notification = try NotificationRepository(db: context.db).get(id: notificationID),
@@ -367,11 +369,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
             return
         }
         if let botID = item.bot_id.flatMap(UUID.init(uuidString:)) {
-            do {
-                guard try router.openBotsDesk(botID: BotID(botID), conversationID: item.conversation_id.flatMap(UUID.init(uuidString:)).map(BotConversationID.init)) else {
-                    throw LayoutError.surfaceNotFound
-                }
-            } catch { errorMessage = "Could not open bot: \(error.localizedDescription)" }
+            openBot(BotID(botID), conversationID: item.conversation_id.flatMap(UUID.init(uuidString:)).map(BotConversationID.init))
             return
         }
         if let threadID = item.thread_id.flatMap(UUID.init(uuidString:)) {
@@ -401,8 +399,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
                     errorMessage = "Could not open activity settings destination."
                     return
                 }
-            case .botsDesk(let botID):
-                guard try router.openBotsDesk(botID: botID) else { throw LayoutError.surfaceNotFound }
+            case .botsDesk(let botID): openBot(botID, conversationID: nil)
             }
         } catch { errorMessage = "Could not open activity destination: \(error.localizedDescription)" }
     }
@@ -414,12 +411,43 @@ public final class ActiveThreadsViewModel: ObservableObject {
         return nil
     }
 
+    /// `openBotsDesk` has already left Activity when it fails.
+    private func openBot(_ botID: BotID, conversationID: BotConversationID?) {
+        do {
+            guard try router.openBotsDesk(botID: botID, conversationID: conversationID) else {
+                throw LayoutError.surfaceNotFound
+            }
+        } catch { reportAfterLeaving("Could not open bot: \(error.localizedDescription)") }
+    }
+
+    /// A failure found after Activity was replaced would wait on this hidden model and
+    /// pop up on a later visit, over whatever row is selected then. Show it now, in
+    /// Activity, where the user asked for the open.
+    private func reportAfterLeaving(_ message: String) {
+        router.windowController?.presentActiveThreadsInMainContent()
+        errorMessage = message
+    }
+
     private func openThread(_ threadID: AgentThreadID, workspaceID: WorkspaceID?, finalMessageID: AgentMessageID? = nil, checkpoint: (Int, AgentRunID, String?)? = nil) {
+        // Resolve the destination while Activity is still on screen: a bot thread opens
+        // its Desk, and a thread with no open workspace fails here, on the clicked row.
+        let destination: AgentThreadOpenDestination
+        do { destination = try router.agentThreadOpenDestination(threadID) }
+        catch { errorMessage = "Could not open thread: \(error.localizedDescription)"; return }
+        switch destination {
+        case .workspace: break
+        case .bot(let botID, let conversationID):
+            openBot(botID, conversationID: conversationID)
+            return
+        case .unavailable:
+            errorMessage = "Could not open thread: \(LayoutError.workspaceNotFound.localizedDescription)"
+            return
+        }
         // Leave the shell destination first so the workspace cache can paint.
         router.windowController?.presentWorkspaceContent()
         guard deferHydration || finalMessageID != nil || checkpoint != nil else {
             do { _ = try router.openAgentThread(thread: threadID, markRead: false) }
-            catch { errorMessage = "Could not open thread: \(error.localizedDescription)" }
+            catch { reportAfterLeaving("Could not open thread: \(error.localizedDescription)") }
             return
         }
         navigationTask?.cancel()
@@ -451,7 +479,7 @@ public final class ActiveThreadsViewModel: ObservableObject {
             } catch {
                 guard !(error is CancellationError), self.navigationGeneration == generation else { return }
                 if let revealError = error as? AgentAppSurfaceMessageRevealError, case .selectionChanged = revealError { return }
-                self.errorMessage = "Could not open thread: \(error.localizedDescription)"
+                self.reportAfterLeaving("Could not open thread: \(error.localizedDescription)")
             }
         }
     }

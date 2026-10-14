@@ -889,6 +889,14 @@ public final class ScheduledTaskScheduler {
         }
     }
 
+    /// The Activity row a failure notification opens. Activity lists an occurrence that
+    /// started an agent run only as that run, so routing to the occurrence id would always
+    /// miss and report "Requested activity result was not found."
+    nonisolated static func failureActivityItemID(for run: ScheduledTaskRun) -> String {
+        if let agentRunID = run.agentRunID { return "run:\(agentRunID.description)" }
+        return "scheduled-occurrence:\(run.id.uuidString.lowercased())"
+    }
+
     nonisolated private func notifyFailure(for run: ScheduledTaskRun) {
         let task = try? store.get(id: run.taskID)
         let settings = SettingsStore(db: context.db).load()
@@ -903,7 +911,7 @@ public final class ScheduledTaskScheduler {
             body: "A scheduled task failed.",
             categoryIdentifier: "",
             threadIdentifier: "",
-            userInfo: ["activityItemId": "scheduled-occurrence:\(run.id.uuidString.lowercased())", "workspaceId": task?.workspaceID.value.uuidString ?? "", "outcome": "failed"],
+            userInfo: ["activityItemId": Self.failureActivityItemID(for: run), "workspaceId": task?.workspaceID.value.uuidString ?? "", "outcome": "failed"],
             soundEnabled: settings.notificationSoundEnabled
         )
         SystemNotifier.shared.post(content, settings: settings)

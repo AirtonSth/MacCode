@@ -828,10 +828,9 @@ public final class SidebarViewModel: ObservableObject {
 
     /// User-facing reason a folder could not be added.
     ///
-    /// `LayoutError` has no `LocalizedError` conformance, so using
-    /// `error.localizedDescription` directly would surface only
-    /// "The operation couldn't be completed. (CoreModel.LayoutError error 0.)"
-    /// for the one failure this path actually hits.
+    /// `LayoutError.workspaceNotFound` describes itself generically ("Its
+    /// workspace is closed or no longer exists."); on this path it means the
+    /// picked folder is gone, so it gets a folder-specific reason.
     nonisolated public static func addWorkspaceFailureDetail(for error: Error) -> String {
         if let layoutError = error as? LayoutError, layoutError == .workspaceNotFound {
             return "That folder no longer exists. It may have been moved, renamed or deleted."

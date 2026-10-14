@@ -213,6 +213,9 @@ final class ActivityViewModel: ObservableObject {
     private var eventSubscription: UUID?
     private var refreshInvalidationPending = false
     private var requestedTargetID: String?
+    /// Only a notification route names its target explicitly. A selection restored from
+    /// defaults is local convenience: when its row has moved section it is dropped quietly.
+    private var requestedTargetIsExplicit = false
 
     init(router: AppCommandRouter, defaults: UserDefaults = .standard) {
         service = ActivityClient(router: router)
@@ -343,6 +346,7 @@ final class ActivityViewModel: ObservableObject {
         selectedID = nil
         scrollID = nil
         requestedTargetID = intent.activityItemId
+        requestedTargetIsExplicit = intent.activityItemId != nil
         if let itemID = intent.activityItemId {
             selectedID = itemID
             scrollID = itemID
@@ -398,7 +402,19 @@ final class ActivityViewModel: ObservableObject {
                         }
                     }
                     guard !Task.isCancelled, self.generation == request else { return }
-                    if self.detail == nil { self.error = "Requested activity result was not found."; self.errorIsFromRefresh = true }
+                    if self.detail == nil {
+                        if self.requestedTargetIsExplicit {
+                            // Stays until dismissed: the next invalidation refresh must not wipe it.
+                            self.error = "Requested activity result was not found."
+                            self.errorIsFromRefresh = false
+                        } else {
+                            self.selectedID = nil
+                            self.scrollID = nil
+                        }
+                    }
+                    // Search once. A target left armed was paged for and reported again on every refresh.
+                    self.requestedTargetID = nil
+                    self.requestedTargetIsExplicit = false
                 } else if let selectedID = self.selectedID, self.detail == nil {
                     self.selectedID = nil
                     self.scrollID = nil
@@ -778,6 +794,8 @@ struct ActivityRootView: View {
     let openEvidence: (ActivityWireItem, String?) -> Void
     private let makeConversation: (ActivityWireItem) -> AgentAppViewModel?
     private let workspaceOptions: () -> [(id: String, name: String)]
+    /// Whether a workspace is still open in this Mac's layout; a thread outside one has nowhere to open.
+    private let isWorkspaceOpen: (String) -> Bool
     let route: NotificationRouteIntent?
     let consumeRoute: () -> Void
 
@@ -792,10 +810,11 @@ struct ActivityRootView: View {
         self.route = route
         self.consumeRoute = consumeRoute
         workspaceOptions = { router.activityWorkspaceOptions }
+        isWorkspaceOpen = { [weak router] id in router?.activityWorkspaceIsOpen(id) ?? false }
     }
 
     /// Renders a prepared model without a router: offscreen layout proofs and worst-case data.
-    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }, makeConversation: @escaping (ActivityWireItem) -> AgentAppViewModel? = { _ in nil }) {
+    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }, isWorkspaceOpen: @escaping (String) -> Bool = { _ in true }, makeConversation: @escaping (ActivityWireItem) -> AgentAppViewModel? = { _ in nil }) {
         _model = StateObject(wrappedValue: model)
         openThread = { _ in }
         openEvidence = { _, _ in }
@@ -803,6 +822,7 @@ struct ActivityRootView: View {
         route = nil
         consumeRoute = {}
         self.workspaceOptions = workspaceOptions
+        self.isWorkspaceOpen = isWorkspaceOpen
     }
 
     var body: some View {
@@ -1174,6 +1194,10 @@ struct ActivityRootView: View {
                         .keyboardShortcut("u", modifiers: [.command, .shift])
                 }
             }
+            if item.thread_id != nil, !canOpen(item) {
+                Text("This conversation can't be opened: its workspace is closed or no longer exists.")
+                    .font(DS.Font.bodyDense).foregroundColor(DS.Palette.textSecondary)
+            }
             if item.state == "waiting_approval" || item.state == "waiting_answer", conversation?.threadID != item.thread_id {
                 Text("Open the conversation to respond. It leaves Needs you once answered.")
                     .font(DS.Font.bodyDense).foregroundColor(DS.Palette.textSecondary)
@@ -1206,7 +1230,9 @@ struct ActivityRootView: View {
     }
 
     private func canOpen(_ item: ActivityWireItem) -> Bool {
-        item.thread_id != nil || item.bot_id != nil || item.surface_id != nil || item.notification_id != nil
+        if item.bot_id != nil || item.surface_id != nil || item.notification_id != nil { return true }
+        // A thread no bot owns opens only into its workspace, which must still be open here.
+        return item.thread_id != nil && item.workspace_id.map(isWorkspaceOpen) == true
     }
 
     private func canViewChanges(_ item: ActivityWireItem) -> Bool {

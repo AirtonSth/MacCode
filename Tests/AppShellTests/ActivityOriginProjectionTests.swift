@@ -40,6 +40,27 @@ final class ActivityOriginProjectionTests: XCTestCase {
         XCTAssertEqual(page.items.filter { $0.runID == fixture.runID }.count, 1)
     }
 
+    func testLinkedOccurrenceFailureNotificationOpensTheListedRunRow() throws {
+        // WHY: the failure notification routes Activity to one exact row. Activity lists an
+        // occurrence that started an agent run only as `run:<id>`, so naming the occurrence
+        // always missed and showed "Requested activity result was not found." for a row
+        // that was right there.
+        let fixture = try makeScheduled(status: "failed", linked: true)
+        let run = ScheduledTaskRun(
+            id: try XCTUnwrap(UUID(uuidString: fixture.occurrenceID)), taskID: UUID(), occurrenceKey: fixture.occurrenceID,
+            trigger: .scheduled, scheduledAt: Date(), status: .failed, agentRunID: AgentRunID(fixture.runID)
+        )
+        let routed = ScheduledTaskScheduler.failureActivityItemID(for: run)
+        let data = try JSONEncoder().encode(try ActivityService(context: fixture.context).list(["section": .string("finished")]))
+        let finished = try AgentActivityPage.makeJSONDecoder().decode(AgentActivityPage.self, from: data)
+        XCTAssertTrue(finished.items.contains { $0.id == routed }, "\(routed) must be a row the routed Finished tab lists")
+
+        let unlinked = ScheduledTaskRun(taskID: UUID(), occurrenceKey: "k", trigger: .scheduled, scheduledAt: Date(), status: .failed)
+        XCTAssertEqual(ScheduledTaskScheduler.failureActivityItemID(for: unlinked),
+                       "scheduled-occurrence:\(unlinked.id.uuidString.lowercased())",
+                       "an occurrence that never started a run is listed under its own id")
+    }
+
     private struct ScheduledFixture {
         let context: AppContext
         let service: ActivityService

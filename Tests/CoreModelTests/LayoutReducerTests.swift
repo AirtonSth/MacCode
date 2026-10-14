@@ -225,4 +225,17 @@ final class LayoutReducerTests: XCTestCase {
                        "[A,B,C,D] drag A before C must produce [B,A,C,D]  -  " +
                        "the insertion line is at the top of C so A must land immediately before C, not after it")
     }
+
+    func test_layoutErrorLocalizedDescription_isReadable_notTheBridgedEnumCode() {
+        // WHY: Activity and other alerts show `error.localizedDescription`. Bridged as a
+        // plain Error, workspaceNotFound read "CoreModel.LayoutError error 0", which tells
+        // the user nothing about why their conversation did not open.
+        for error in [LayoutError.workspaceNotFound, .paneNotFound, .surfaceNotFound, .invalidLayout] {
+            let text = error.localizedDescription
+            XCTAssertFalse(text.contains("LayoutError"), text)
+            XCTAssertFalse(text.contains("error 0"), text)
+        }
+        XCTAssertEqual(LayoutError.workspaceNotFound.localizedDescription,
+                       "Its workspace is closed or no longer exists.")
+    }
 }

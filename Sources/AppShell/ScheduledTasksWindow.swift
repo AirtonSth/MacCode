@@ -445,6 +445,26 @@ public final class ScheduledTasksViewModel: ObservableObject {
 
     public func openThread(_ run: ScheduledTaskRun) {
         guard let threadID = run.threadID else { return }
+        // Resolve the destination while Schedule Tasks is still on screen: a bot run's
+        // thread has no workspace and opens in its bot's Desk; a thread with neither
+        // fails here instead of in a hidden view after leaving.
+        do {
+            switch try router.agentThreadOpenDestination(threadID) {
+            case .workspace: break
+            case .bot(let botID, let conversationID):
+                guard try router.openBotsDesk(botID: botID, conversationID: conversationID) else {
+                    throw LayoutError.surfaceNotFound
+                }
+                return
+            case .unavailable:
+                throw LayoutError.workspaceNotFound
+            }
+        } catch {
+            // openBotsDesk may have left already; show the failure where it was asked for.
+            router.windowController?.presentScheduledTasksInMainContent()
+            errorMessage = "Could not open agent task: \(error.localizedDescription)"
+            return
+        }
         guard !deferHydration else {
             router.windowController?.presentWorkspaceContent()
             navigationTask?.cancel()
@@ -457,12 +477,18 @@ public final class ScheduledTasksViewModel: ObservableObject {
                 guard !Task.isCancelled,
                       self.navigationGeneration == generation else { return }
                 do { _ = try self.router.openAgentThread(thread: threadID, markRead: true) }
-                catch { self.errorMessage = String(describing: error) }
+                catch {
+                    self.router.windowController?.presentScheduledTasksInMainContent()
+                    self.errorMessage = "Could not open agent task: \(error.localizedDescription)"
+                }
             }
             return
         }
         do { _ = try router.openAgentThread(thread: threadID, markRead: true) }
-        catch { errorMessage = String(describing: error) }
+        catch {
+            router.windowController?.presentScheduledTasksInMainContent()
+            errorMessage = "Could not open agent task: \(error.localizedDescription)"
+        }
     }
 
     private func finishNavigationTask(ownedBy generation: UInt64) {

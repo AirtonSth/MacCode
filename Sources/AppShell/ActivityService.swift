@@ -120,6 +120,7 @@ final class ActivityService: @unchecked Sendable {
             let needsAction = state == .needsYou || ((state == .failed || state == .interrupted) && result?.attentionAcknowledgedAt == nil)
             let checkpoint = checkpointByRun[row.runID.description]
             let workspaceName = thread.workspaceId.flatMap { workspaceNames[$0] }
+            let botLink = origins.botLinksByThreadID[thread.id.value.uuidString.lowercased()]
             return AgentActivityItem(
                 id: "run:\(row.runID.description)", kind: .agent, runID: row.runID.value,
                 workspaceID: thread.workspaceId?.value, threadID: thread.id.value, state: state,
@@ -129,6 +130,7 @@ final class ActivityService: @unchecked Sendable {
                 viewedAt: result?.viewedAt, attentionAcknowledgedAt: result?.attentionAcknowledgedAt,
                 needsAction: needsAction, blocking: blockedRunIDs.contains(row.runID), finalMessageID: result?.finalMessageId?.value,
                 checkpointTurnCount: checkpoint?.turnCount, changedFiles: checkpoint?.files ?? [], error: row.error,
+                botID: botLink?.botID, conversationID: botLink?.conversationID,
                 originLabel: origins.labelsByRunID[row.runID.description]
             )
         }
@@ -139,6 +141,7 @@ final class ActivityService: @unchecked Sendable {
             let state: AgentActivityState
             if callback.state == .stale || activeRun == nil { state = .expired }
             else { state = callback.kind == .approval ? .waitingApproval : .waitingAnswer }
+            let botLink = origins.botLinksByThreadID[thread.id.value.uuidString.lowercased()]
             let requestID = activeRun.map { "request:\($0.description):\(callback.requestId)" }
                 ?? "request:\(callback.threadId.description):\(callback.requestId)"
             items.append(AgentActivityItem(
@@ -147,7 +150,8 @@ final class ActivityService: @unchecked Sendable {
                 title: callback.kind == .approval ? "Approval needed" : "Information needed",
                 workspaceName: thread.workspaceId.flatMap { workspaceNames[$0] },
                 provider: thread.provider.rawValue, occurredAt: callback.createdAt,
-                needsAction: true, blocking: activeRun != nil
+                needsAction: true, blocking: activeRun != nil,
+                botID: botLink?.botID, conversationID: botLink?.conversationID
             ))
         }
 
