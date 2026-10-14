@@ -5,9 +5,36 @@
 #include <util.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
+#include <libproc.h>
 
 pid_t rc2_forkpty(int *amaster) {
     return forkpty(amaster, NULL, NULL, NULL);
+}
+
+// Runs in the forked child before exec: syscalls only, no allocation.
+// Closes just the descriptors that are open (a sweep to a raised
+// RLIMIT_NOFILE would be ~1M close calls and delay exec); falls back to the
+// sweep when the list does not fit or cannot be read.
+static void rc2_close_inherited_fds(void) {
+    struct proc_fdinfo fds[1024];
+    int bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fds, (int)sizeof(fds));
+    if (bytes > 0 && bytes < (int)sizeof(fds)) {
+        int count = bytes / (int)PROC_PIDLISTFD_SIZE;
+        for (int i = 0; i < count; i++) {
+            if (fds[i].proc_fd > STDERR_FILENO) {
+                (void)close(fds[i].proc_fd);
+            }
+        }
+        return;
+    }
+    int max_fd = getdtablesize();
+    if (max_fd < 0 || max_fd > 65536) {
+        max_fd = 65536;
+    }
+    for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) {
+        (void)close(fd);
+    }
 }
 
 static pid_t rc2_spawnpty_exec_impl(
@@ -62,6 +89,12 @@ static pid_t rc2_spawnpty_exec_impl(
     if (suspend_before_exec && kill(getpid(), SIGSTOP) != 0) {
         _exit(127);
     }
+
+    // forkpty already put the slave on 0-2. Close every other inherited app
+    // descriptor: Foundation Pipe() fds are not close-on-exec, so a shell
+    // spawned while a git probe ran kept its write ends and the app's reader
+    // never saw EOF; shells also kept app logs.
+    rc2_close_inherited_fds();
 
     if (chdir(cwd) != 0) {
         _exit(127);

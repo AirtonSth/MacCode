@@ -75,23 +75,6 @@ struct PipeAccumulator: Sendable {
 }
 
 public enum ProviderCLIProbe {
-    private final class PipeDrainControl: @unchecked Sendable {
-        private let lock = NSLock()
-        private var deadline: Date?
-
-        func finishRoot() {
-            lock.lock()
-            deadline = Date().addingTimeInterval(BoundedPipeDrain.defaultTimeout)
-            lock.unlock()
-        }
-
-        var shouldStop: Bool {
-            lock.lock()
-            defer { lock.unlock() }
-            return deadline.map { Date() >= $0 } ?? false
-        }
-    }
-
     public struct AuthStatus: Equatable, Sendable {
         public let authenticated: Bool?
         public let accountLabel: String?

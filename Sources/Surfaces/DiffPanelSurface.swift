@@ -363,6 +363,7 @@ public final class DiffPanelViewModel: ObservableObject {
     public var gitOutcomeHandler: ((String, Bool) -> Void)?
     /// FSEvents stream token for cwd watch; nil until `startFSWatcher()` is called.
     private var fsStream: FSEventStreamRef?
+    var isWatchingFileSystem: Bool { fsStream != nil }
     /// Wall-clock time of the last auto-refresh triggered by FSEvents.
     private var lastFSRefresh: Date = .distantPast
 
@@ -954,6 +955,8 @@ public final class DiffPanelViewModel: ObservableObject {
                 guard let info else { return }
                 let vm = Unmanaged<DiffPanelViewModel>.fromOpaque(info).takeUnretainedValue()
                 DispatchQueue.main.async {
+                    // A callback already queued when the panel was hidden.
+                    guard vm.fsStream != nil else { return }
                     let elapsed = Date().timeIntervalSince(vm.lastFSRefresh)
                     guard DiffPanelViewModel.shouldRefresh(elapsed: elapsed) else { return }
                     vm.lastFSRefresh = Date()
@@ -2222,6 +2225,10 @@ public final class DiffPanelSurface: NSObject, Surface {
     /// Called by the shell when the panel becomes visible so stale state is
     /// never the first thing the user sees after switching tabs or windows.
     public func didBecomeVisible() { viewModel.didBecomeVisible() }
+    /// A hidden panel stops its recursive workspace watcher, which re-ran
+    /// `git summary` (5 spawns) up to every 2 s while agents edited or built.
+    /// `didBecomeVisible` refreshes once and restarts it.
+    public func didBecomeHidden() { viewModel.stopFSWatcher() }
     public func sendText(_ text: String) {}
     public func readText() -> String { viewModel.rawDiff }
     public func snapshot() -> [String: String] { ["selected": viewModel.selectedPath ?? ""] }

@@ -1130,15 +1130,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func loadGitBranch() {
         guard embedding == nil else { return }
-        let cwd = self.cwd
-        DispatchQueue.global().async { [weak self] in
-            let b = GitDiff.branches(in: cwd).current
-            let s = GitDiff.summary(in: cwd)
-            DispatchQueue.main.async {
-                self?.gitBranch = b
-                self?.gitSummary = s.isGitRepo ? s : nil
-            }
+        AgentGitHeaderLoader.shared.load(cwd: cwd, owner: self) { [weak self] header in
+            guard let self, !self.isDisposed else { return }
+            self.gitBranch = header.branch
+            self.gitSummary = header.summary.isGitRepo ? header.summary : nil
         }
+    }
+
+    /// `summary` already reads the branch. `GitDiff.branches` repeated isGit
+    /// and rev-parse and listed every local ref only for `.current`; this keeps
+    /// its detached-HEAD rule ("HEAD" means no branch). 5 git spawns, not 8.
+    nonisolated static func loadGitHeader(cwd: String) -> (branch: String?, summary: GitSummary) {
+        let summary = GitDiff.summary(in: cwd)
+        return (summary.branch == "HEAD" ? nil : summary.branch, summary)
     }
 
     // PERF-MAC_AGENT-008: per-finish git refresh shelled out a subprocess every

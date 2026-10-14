@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public enum GitFileStatus: String, Codable, Sendable, Equatable {
     case added, modified, deleted, renamed, copied, untracked, unknown
@@ -1033,7 +1034,7 @@ public enum GitDiff {
     static let stderrCaptureMaxBytes = 1 * 1024 * 1024
     static let truncationNotice = "\n[RemoteCode] git output truncated; showing the captured prefix.\n"
 
-    private struct ProcessResult {
+    struct ProcessResult {
         let exit: Int32
         let stdout: String
         let stderr: String
@@ -1063,8 +1064,30 @@ public enum GitDiff {
         var truncated = false
     }
 
+    /// Set by the timeout work item, read after the process has exited.
+    private final class TimeoutFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set() { lock.lock(); value = true; lock.unlock() }
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+    }
+
     private static func run(_ args: [String], cwd: String) -> ProcessResult {
-        runCommand(["git"] + args, cwd: cwd, environment: nil)
+        runCommand(["git"] + args, cwd: cwd, environment: nil, timeout: timeout(forGitArguments: args))
+    }
+
+    /// Read-only probes the UI waits on (branch chip, summary, diff, history)
+    /// are killed if still running after this long. Commands that change the
+    /// repo or reach the network (commit hooks, push, fetch, pull, checkout)
+    /// have no deadline: cutting them off could leave work half done.
+    static let readOnlyCommandTimeout: TimeInterval = 60
+    private static let readOnlySubcommands: Set<String> = [
+        "rev-parse", "diff", "ls-files", "for-each-ref", "log", "show", "symbolic-ref",
+    ]
+
+    static func timeout(forGitArguments args: [String]) -> TimeInterval? {
+        guard let subcommand = args.first, readOnlySubcommands.contains(subcommand) else { return nil }
+        return readOnlyCommandTimeout
     }
 
     /// Decode a prefix-capped capture without turning a mid-character cut
@@ -1084,11 +1107,40 @@ public enum GitDiff {
     /// Prefix-retain at most `maxBytes` while draining the fd to EOF so a
     /// verbose child cannot fill the pipe or pin multi-MiB Data in-process.
     static func readCapped(_ handle: FileHandle, maxBytes: Int) -> (data: Data, truncated: Bool) {
+        readCapped(handle, maxBytes: maxBytes, control: nil)
+    }
+
+    /// Same drain, but also stops once `control` reports that the root process
+    /// exited and its short grace passed. EOF needs every copy of the write end
+    /// closed, so a descendant that kept it would otherwise pin this thread
+    /// forever after git itself exited. Leaves the handle open.
+    static func readCapped(
+        _ handle: FileHandle,
+        maxBytes: Int,
+        control: PipeDrainControl?
+    ) -> (data: Data, truncated: Bool) {
         var acc = PipeAccumulator(maxBytes: maxBytes, retention: .prefix)
+        let fd = handle.fileDescriptor
+        let flags = fcntl(fd, F_GETFL)
+        guard flags != -1, fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1 else {
+            return (acc.data, acc.truncated)
+        }
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
-            let chunk = handle.readData(ofLength: 64 * 1024)
-            if chunk.isEmpty { break }
-            acc.append(chunk)
+            if control?.shouldStop == true { break }
+            let count = Darwin.read(fd, &buffer, buffer.count)
+            if count > 0 {
+                acc.append(Data(buffer.prefix(count)))
+                continue
+            }
+            if count == 0 { break }
+            if errno == EINTR { continue }
+            guard errno == EAGAIN || errno == EWOULDBLOCK else { break }
+            // Data and EOF wake poll at once; the timeout only bounds how long
+            // a stop request waits.
+            var pollDescriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            if Darwin.poll(&pollDescriptor, 1, 100) < 0, errno != EINTR { break }
+            if pollDescriptor.revents & Int16(POLLNVAL) != 0 { break }
         }
         return (acc.data, acc.truncated)
     }
@@ -1098,7 +1150,12 @@ public enum GitDiff {
         return r.stdout + truncationNotice
     }
 
-    private static func runCommand(_ args: [String], cwd: String, environment: [String: String]?) -> ProcessResult {
+    static func runCommand(
+        _ args: [String],
+        cwd: String,
+        environment: [String: String]?,
+        timeout: TimeInterval? = nil
+    ) -> ProcessResult {
         let started = Date()
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -1110,10 +1167,27 @@ public enum GitDiff {
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
+        let drainControl = PipeDrainControl()
+        p.terminationHandler = { _ in drainControl.finishRoot() }
         do { try p.run() } catch {
             let r = ProcessResult(exit: -1, stdout: "", stderr: String(describing: error))
             logCommand(args, result: r, elapsed: Date().timeIntervalSince(started))
             return r
+        }
+        // Drop the parent's write ends so EOF depends only on the child tree.
+        try? out.fileHandleForWriting.close()
+        try? err.fileHandleForWriting.close()
+        let timedOut = TimeoutFlag()
+        let timeoutWork = timeout.map { seconds -> DispatchWorkItem in
+            // Weak: a cancelled item stays queued until its deadline and must
+            // not keep the Process and its pipe fds alive that long.
+            let work = DispatchWorkItem { [weak p] in
+                guard let p, p.isRunning else { return }
+                timedOut.set()
+                ProcessTerminator.terminateTreeImmediately(p)
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + seconds, execute: work)
+            return work
         }
         // PERF-008: drain stderr on a background thread while reading stdout
         // on the current one, so a child writing more than a pipe buffer
@@ -1122,22 +1196,29 @@ public enum GitDiff {
         // is the classic Process deadlock. A reference box carries the
         // background result back without mutating a captured `var`.
         // Capture is prefix-capped (PipeAccumulator) so checkpoint enrich
-        // cannot pin an unbounded patch; both fds still drain to EOF.
+        // cannot pin an unbounded patch; both fds drain to EOF, or until a
+        // short grace after git exits if a descendant still holds them.
         let errBox = DataBox()
         let errReader = err.fileHandleForReading
         let q = DispatchQueue(label: "git.pipe.drain")
         q.async {
-            let capped = readCapped(errReader, maxBytes: stderrCaptureMaxBytes)
+            let capped = readCapped(errReader, maxBytes: stderrCaptureMaxBytes, control: drainControl)
             errBox.data = capped.data
             errBox.truncated = capped.truncated
         }
-        let outCapped = readCapped(out.fileHandleForReading, maxBytes: stdoutCaptureMaxBytes)
+        let outCapped = readCapped(out.fileHandleForReading, maxBytes: stdoutCaptureMaxBytes, control: drainControl)
         q.sync {}   // barrier: ensure stderr drain finished before reading box.
         p.waitUntilExit()
+        timeoutWork?.cancel()
+        var stderr = decodeCapturedUTF8(errBox.data)
+        if timedOut.isSet, let timeout {
+            if !stderr.isEmpty, !stderr.hasSuffix("\n") { stderr += "\n" }
+            stderr += "\(args.first ?? "command") timed out after \(Int(timeout))s and was stopped."
+        }
         let r = ProcessResult(
-            exit: p.terminationStatus,
+            exit: timedOut.isSet ? -1 : p.terminationStatus,
             stdout: decodeCapturedUTF8(outCapped.data),
-            stderr: decodeCapturedUTF8(errBox.data),
+            stderr: stderr,
             stdoutTruncated: outCapped.truncated,
             stderrTruncated: errBox.truncated
         )

@@ -75,3 +75,23 @@ enum BoundedPipeDrain {
         }
     }
 }
+
+/// Tells a pipe drain when to give up waiting for EOF: once the root process
+/// has exited, drain only for `BoundedPipeDrain.defaultTimeout` more, so a
+/// descendant that kept the write end cannot pin the reading thread.
+final class PipeDrainControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private var deadline: Date?
+
+    func finishRoot() {
+        lock.lock()
+        deadline = Date().addingTimeInterval(BoundedPipeDrain.defaultTimeout)
+        lock.unlock()
+    }
+
+    var shouldStop: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return deadline.map { Date() >= $0 } ?? false
+    }
+}
