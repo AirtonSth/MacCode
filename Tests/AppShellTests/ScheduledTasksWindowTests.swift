@@ -520,6 +520,62 @@ final class ScheduledTasksWindowTests: XCTestCase {
                       "the remount marks the model visible before its one freshness reload")
     }
 
+    @MainActor
+    func test_backToOverviewClearsTheSelectionSoPollAndRemountReadNoHistory_becauseTheOverviewNeverShowsIt() async throws {
+        // WHY: Back only switched the screen, so after any detail visit the
+        // overview kept a selection and every active-row change and remount
+        // freshness pass still decoded up to 200 history rows nobody sees.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func detailHeader("))
+        let end = try XCTUnwrap(source.range(of: ".accessibilityIdentifier(\"scheduledTasks.back\")"))
+        XCTAssertTrue(String(source[start.lowerBound..<end.lowerBound]).contains("vm.selectedTaskID = nil\n                screen = .overview"),
+                      "Back must drop the selection, not only the screen")
+
+        let f = try makePollFixture("back-poll")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let claim = try f.store.claimManual(taskID: f.task.id, now: Date(timeIntervalSince1970: 30), owner: "poll-test")
+        let viewModel = ScheduledTasksViewModel(context: f.context, router: f.router, loadImmediately: false)
+        defer { viewModel.setVisible(false) }
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        viewModel.selectedTaskID = f.task.id
+        await viewModel.waitForFreshnessForTesting()
+        let readsOnDetail = viewModel.runHistoryReadCountForTesting
+        XCTAssertEqual(readsOnDetail, 1)
+
+        viewModel.selectedTaskID = nil // what Back does
+        await viewModel.waitForFreshnessForTesting()
+        try f.store.markStarted(runID: claim.run.id, threadID: AgentThreadID(), agentRunID: AgentRunID())
+        viewModel.pollActiveRunsOnce()
+        XCTAssertEqual(viewModel.activeRunStatus(for: f.task.id), .running, "overview badges still follow the store")
+        viewModel.setVisible(false)
+        viewModel.setVisible(true)
+        viewModel.scheduleFreshnessPass()
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.runHistoryReadCountForTesting, readsOnDetail,
+                       "after Back, neither the poll nor a remount may read history")
+
+        viewModel.selectedTaskID = f.task.id
+        await viewModel.waitForFreshnessForTesting()
+        XCTAssertEqual(viewModel.runHistoryReadCountForTesting, readsOnDetail + 1, "reopening the detail reads it once")
+        XCTAssertEqual(viewModel.runsTaskID, f.task.id)
+        XCTAssertEqual(viewModel.runs.first { $0.id == claim.run.id }?.status, .running)
+    }
+
+    func test_runningRowDurationRunsOnItsOwnClock_becauseHeartbeatPollsNoLongerRepublishHistory() throws {
+        // WHY: a running row's elapsed time is computed at render time. Since
+        // heartbeat-only polls stopped republishing `runs`, nothing re-rendered
+        // the detail during a run, so Duration froze at "0s" while looking live.
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func historyRowPrimaryContent("))
+        let end = try XCTUnwrap(source.range(of: "private func agentTaskTitle("))
+        let row = String(source[start.lowerBound..<end.lowerBound])
+        XCTAssertTrue(row.contains("if run.status == .running {\n                    TimelineView(.periodic(from: .now, by: 1)) { timeline in\n                        Text(durationLabel(run, now: timeline.date))"))
+        XCTAssertTrue(source.contains("private func durationLabel(_ run: ScheduledTaskRun, now: Date) -> String {"))
+        XCTAssertTrue(source.contains("let s = Int(now.timeIntervalSince(started))"),
+                      "the running label must use the timeline's date, not a fresh Date() frozen at the last render")
+    }
+
     func test_scopedTaskAndRunRefreshesKeepLatestWinsAndFailureVisible() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
         for marker in [

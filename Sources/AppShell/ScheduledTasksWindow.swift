@@ -915,6 +915,9 @@ public struct ScheduledTasksRootView: View {
     private func detailHeader(_ task: ScheduledTask) -> some View {
         HStack(alignment: .center, spacing: DS.Space.lg) {
             Button {
+                // The overview shows no history; a kept selection would make
+                // its poll and remount reloads still read this task's rows.
+                vm.selectedTaskID = nil
                 screen = .overview
             } label: {
                 Image(systemName: "chevron.left")
@@ -1203,10 +1206,20 @@ public struct ScheduledTasksRootView: View {
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.text)
                 .frame(width: 140, alignment: .leading)
-            Text(durationLabel(run))
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-                .frame(width: 80, alignment: .leading)
+            Group {
+                // Heartbeats no longer republish `runs`, so a running row
+                // needs its own clock or its elapsed time freezes.
+                if run.status == .running {
+                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                        Text(durationLabel(run, now: timeline.date))
+                    }
+                } else {
+                    Text(durationLabel(run, now: Date()))
+                }
+            }
+            .font(DS.Font.caption)
+            .foregroundColor(DS.Palette.textSecondary)
+            .frame(width: 80, alignment: .leading)
             runStatusPill(run.status)
                 .frame(width: 110, alignment: .leading)
             VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -1233,10 +1246,10 @@ public struct ScheduledTasksRootView: View {
         return "\(task.title) · \(day)"
     }
 
-    private func durationLabel(_ run: ScheduledTaskRun) -> String {
+    private func durationLabel(_ run: ScheduledTaskRun, now: Date) -> String {
         guard let started = run.startedAt, let finished = run.finishedAt else {
             if run.status == .running, let started = run.startedAt {
-                let s = Int(Date().timeIntervalSince(started))
+                let s = Int(now.timeIntervalSince(started))
                 return s < 60 ? "\(s)s" : "\(s / 60)m"
             }
             return "—"
