@@ -114,6 +114,45 @@ final class PetActivityCountsTests: XCTestCase {
         XCTAssertEqual(calls.count, settled + 1, "a changed count publishes exactly once")
     }
 
+    func testFailedRefreshAfterRouterChangeStillShowsUnavailable() async throws {
+        // WHY: a router change drops the previous router's counts. If the new router's first
+        // refresh fails, the sidebar and the Pet must show "unavailable", not keep presenting
+        // the old router's numbers as fresh because the unchanged-count guard saw nothing new.
+        let directory = (NSTemporaryDirectory() as NSString).appendingPathComponent("PetActivityCounts-\(UUID().uuidString)")
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let routerA = AppCommandRouter(context: context)
+        context.router = routerA
+        let workspace = try routerA.createWorkspace(name: "Pet", cwd: NSTemporaryDirectory())
+        _ = try routerA.notificationCreate(
+            workspaceId: workspace.id,
+            title: "Agent input requested",
+            body: "Review the active Agent thread",
+            category: PetNotificationCategory.agentAttention.rawValue
+        )
+        let projection = PetActivityCountsProjection.shared
+        var observed = PetActivityCounts.zero
+        var observedWorkspace: PetActivityCounts?
+        let token = projection.observe { counts, workspaces in
+            observed = counts
+            observedWorkspace = workspaces[workspace.id.value.uuidString]
+        }
+        defer { projection.removeObserver(token) }
+
+        projection.refresh(router: routerA, workspaceIDs: [workspace.id])
+        await waitForCount(1, observed: { observed.needsYou })
+        XCTAssertTrue(observed.isAvailable)
+
+        // No context: activityCountsOffMain throws.
+        let routerB = AppCommandRouter(context: context)
+        routerB.context = nil
+        let completed = projection.completedRefreshCountForTests
+        projection.refresh(router: routerB, workspaceIDs: [workspace.id])
+        await waitForCount(completed + 1, observed: { projection.completedRefreshCountForTests })
+        XCTAssertFalse(observed.isAvailable, "a failed refresh must surface as unavailable")
+        XCTAssertEqual(observed.needsYou, 0, "the previous router's counts must not stay on screen")
+        XCTAssertNotEqual(observedWorkspace?.isAvailable, true, "workspace rows must not keep the old counts as fresh")
+    }
+
     func testCountsOnlyPathMatchesTheActivityPage() throws {
         // WHY: the Pet and sidebar read counts through a path that skips checkpoints, sorting
         // and JSON. Their numbers must stay the ones the Activity window shows, for every

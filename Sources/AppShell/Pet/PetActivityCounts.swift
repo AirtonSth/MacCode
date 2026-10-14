@@ -58,8 +58,9 @@ final class PetActivityCountsProjection {
             generation &+= 1
             refreshPending = false
             refreshDirty = false
-            global = .zero
-            byWorkspace = [:]
+            // Observers must see the reset too, or `publish` would compare later results
+            // against counts they no longer show and drop a real change.
+            notifyIfChanged(global: .zero, byWorkspace: [:])
         }
         latestRouter = router
         latestWorkspaceIDs = Set(workspaceIDs)
@@ -121,6 +122,10 @@ final class PetActivityCountsProjection {
     /// lands on the counts they already show must not reach them.
     private func publish(global: PetActivityCounts, byWorkspace: [String: PetActivityCounts]) {
         completedRefreshCountForTests &+= 1
+        notifyIfChanged(global: global, byWorkspace: byWorkspace)
+    }
+
+    private func notifyIfChanged(global: PetActivityCounts, byWorkspace: [String: PetActivityCounts]) {
         guard global != self.global || byWorkspace != self.byWorkspace else { return }
         self.global = global
         self.byWorkspace = byWorkspace
