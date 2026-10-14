@@ -102,6 +102,7 @@ final class ActivityService: @unchecked Sendable {
         }
         let resultByRun = Dictionary(uniqueKeysWithValues: resultRows.map { ($0.runId.description, $0) })
         let checkpointByRun = includeDisplayDetail ? try checkpointEvidence(runIDs: runs.map(\.runID)) : [:]
+        let notificationStates = try loadNotificationStates(db: readDB)
 
         var items = runs.compactMap { row -> AgentActivityItem? in
             guard let thread = threadByID[row.threadID.description] else { return nil }
@@ -117,7 +118,10 @@ final class ActivityService: @unchecked Sendable {
             default: return nil
             }
             let terminal = Self.isTerminal(state)
-            let needsAction = state == .needsYou || ((state == .failed || state == .interrupted) && result?.attentionAcknowledgedAt == nil)
+            // Clear all reaches a run left "running" with no live process too.
+            let orphanAcknowledgedAt = state == .needsYou ? notificationStates[Self.orphanRunLedgerKey(row.runID)]?.acknowledgedAt : nil
+            let needsAction = (state == .needsYou && orphanAcknowledgedAt == nil)
+                || ((state == .failed || state == .interrupted) && result?.attentionAcknowledgedAt == nil)
             let checkpoint = checkpointByRun[row.runID.description]
             let workspaceName = thread.workspaceId.flatMap { workspaceNames[$0] }
             let botLink = origins.botLinksByThreadID[thread.id.value.uuidString.lowercased()]
@@ -127,7 +131,7 @@ final class ActivityService: @unchecked Sendable {
                 title: thread.title, workspaceName: workspaceName, provider: thread.provider.rawValue,
                 summary: result?.summary ?? (terminal ? "No summary available for this run" : nil),
                 occurredAt: row.finishedAt ?? row.startedAt, startedAt: row.startedAt, finishedAt: row.finishedAt,
-                viewedAt: result?.viewedAt, attentionAcknowledgedAt: result?.attentionAcknowledgedAt,
+                viewedAt: result?.viewedAt, attentionAcknowledgedAt: result?.attentionAcknowledgedAt ?? orphanAcknowledgedAt,
                 needsAction: needsAction, blocking: blockedRunIDs.contains(row.runID), finalMessageID: result?.finalMessageId?.value,
                 checkpointTurnCount: checkpoint?.turnCount, changedFiles: checkpoint?.files ?? [], error: row.error,
                 botID: botLink?.botID, conversationID: botLink?.conversationID,
@@ -142,15 +146,18 @@ final class ActivityService: @unchecked Sendable {
             if callback.state == .stale || activeRun == nil { state = .expired }
             else { state = callback.kind == .approval ? .waitingApproval : .waitingAnswer }
             let botLink = origins.botLinksByThreadID[thread.id.value.uuidString.lowercased()]
-            let requestID = activeRun.map { "request:\($0.description):\(callback.requestId)" }
-                ?? "request:\(callback.threadId.description):\(callback.requestId)"
+            let requestID = Self.requestItemID(callback, activeRun: activeRun)
+            // Keyed by thread + request, so a cleared approval stays cleared when its
+            // run ends and the item id switches to the expired form.
+            let acknowledgedAt = notificationStates[Self.requestLedgerKey(callback)]?.acknowledgedAt
             items.append(AgentActivityItem(
                 id: requestID, kind: .request, runID: activeRun?.value, requestID: callback.requestId,
                 workspaceID: thread.workspaceId?.value, threadID: thread.id.value, state: state,
                 title: callback.kind == .approval ? "Approval needed" : "Information needed",
                 workspaceName: thread.workspaceId.flatMap { workspaceNames[$0] },
                 provider: thread.provider.rawValue, occurredAt: callback.createdAt,
-                needsAction: true, blocking: activeRun != nil,
+                attentionAcknowledgedAt: acknowledgedAt,
+                needsAction: acknowledgedAt == nil, blocking: activeRun != nil,
                 botID: botLink?.botID, conversationID: botLink?.conversationID
             ))
         }
@@ -160,7 +167,6 @@ final class ActivityService: @unchecked Sendable {
         )
         let knownRunIDs = Set(runs.map { $0.runID.description })
         let knownRequestIDs = Set(callbacks.map { "\($0.threadId.description):\($0.requestId)" })
-        let notificationStates = try loadNotificationStates(db: readDB)
         let botNotificationMetadata = BotAttentionNotificationMetadataStore(db: readDB).all()
         let canonicalBotAttentionIDs = Set(origins.botRequests.map(\.id))
         for note in notifications {
@@ -175,7 +181,9 @@ final class ActivityService: @unchecked Sendable {
             let botMetadata = botNotificationMetadata[note.id].flatMap { $0.notificationID == note.id ? $0 : nil }
             let canonicalRequestID = botMetadata.map { "bot-attention:\($0.attentionItemID.lowercased())" }
             if let canonicalRequestID, canonicalBotAttentionIDs.contains(canonicalRequestID) { continue }
+            // A cleared needs-you notice (file conflict) leaves Needs you and lands in Finished.
             let isResolutionRequired = category?.classification == .needsYou && !isFailure && note.readAt == nil
+                && state?.acknowledgedAt == nil
             items.append(AgentActivityItem(
                 id: "notification:\(note.id)", kind: .notification, notificationID: note.id, workspaceID: note.workspaceId?.value,
                 surfaceID: note.surfaceId?.value, state: isFailure ? .failed : (isResolutionRequired ? .needsYou : .completed), title: title,
@@ -183,7 +191,7 @@ final class ActivityService: @unchecked Sendable {
                 summary: category == nil || !includeDisplayDetail ? nil : (Self.notificationSummary(payload.activitySummary) ?? category?.presentation.detail),
                 occurredAt: note.createdAt, finishedAt: isResolutionRequired ? nil : note.createdAt,
                 viewedAt: state?.viewedAt,
-                attentionAcknowledgedAt: isFailure ? state?.acknowledgedAt : nil,
+                attentionAcknowledgedAt: state?.acknowledgedAt,
                 needsAction: isResolutionRequired || (isFailure && state?.acknowledgedAt == nil), blocking: false,
                 botID: (botMetadata?.botID).flatMap(UUID.init(uuidString:))
             ))
@@ -305,11 +313,14 @@ final class ActivityService: @unchecked Sendable {
 
     /// Returns the ids whose acknowledgment changed, in request order. Items that are no
     /// longer eligible are skipped; ids of a kind that cannot be acknowledged throw.
+    /// Every Needs you kind can be cleared (owner, 2026-10-14: Clear all leaves nothing):
+    /// a request only leaves the inbox, its thread still holds the live card.
     private func setAcknowledged(_ ids: [String], acknowledged: Bool) throws -> [String] {
         var runIDs = [AgentRunID: String]()
         var botAttentionIDs = [BotAttentionItemID: String]()
         var scheduledIDs = [String]()
         var notificationIDs = [String]()
+        var requestIDs = [String]()
         for id in ids {
             if id.hasPrefix("run:"), let uuid = UUID(uuidString: String(id.dropFirst(4))) {
                 runIDs[AgentRunID(uuid)] = id
@@ -319,6 +330,8 @@ final class ActivityService: @unchecked Sendable {
                 scheduledIDs.append(String(id.dropFirst("scheduled-occurrence:".count)))
             } else if id.hasPrefix("notification:") {
                 notificationIDs.append(String(id.dropFirst("notification:".count)))
+            } else if id.hasPrefix("request:") {
+                requestIDs.append(id)
             } else {
                 throw JSONRPCError.invalidParams
             }
@@ -327,6 +340,39 @@ final class ActivityService: @unchecked Sendable {
         var updated = Set<String>()
         for runID in try AgentRunResultRepository(db: db).setFailureAcknowledged(runIds: Array(runIDs.keys), at: stamp) {
             if let id = runIDs[runID] { updated.insert(id) }
+        }
+        // Runs still marked running with no live process (Needs you), and requests, keep
+        // their cleared mark in the activity ledger under a key that outlives the item id.
+        var ledgerKeys = [(itemID: String, key: String)]()
+        for (runID, id) in runIDs where !updated.contains(id) {
+            if try isOrphanedRunningRun(runID) { ledgerKeys.append((id, Self.orphanRunLedgerKey(runID))) }
+        }
+        if !requestIDs.isEmpty {
+            var keyByItemID = [String: String]()
+            for callback in try ProviderPendingCallbackRepository(db: db).list(states: [.pending, .stale]) {
+                let activeRun = callback.state == .pending ? activeRunIDProvider(callback.threadId) : nil
+                keyByItemID[Self.requestItemID(callback, activeRun: activeRun)] = Self.requestLedgerKey(callback)
+            }
+            for id in requestIDs {
+                if let key = keyByItemID[id] { ledgerKeys.append((id, key)) }
+            }
+        }
+        if !ledgerKeys.isEmpty {
+            let timestamp = stamp.map(Self.isoFractionalString)
+            try db.performSync { database in
+                try database.transaction {
+                    let statement = try database.prepare(timestamp == nil
+                        ? "UPDATE activity_notification_state SET acknowledged_at = NULL WHERE item_id = ?;"
+                        : "INSERT INTO activity_notification_state(item_id, acknowledged_at) VALUES (?, ?) ON CONFLICT(item_id) DO UPDATE SET acknowledged_at = excluded.acknowledged_at;")
+                    for entry in ledgerKeys {
+                        try statement.bind(1, entry.key)
+                        if let timestamp { try statement.bind(2, timestamp) }
+                        _ = try statement.step()
+                        statement.reset()
+                    }
+                }
+            }
+            updated.formUnion(ledgerKeys.map(\.itemID))
         }
         for itemID in try BotStore(db: db).setAttentionAcknowledged(ids: Array(botAttentionIDs.keys), at: stamp) {
             if let id = botAttentionIDs[itemID] { updated.insert(id) }
@@ -355,10 +401,14 @@ final class ActivityService: @unchecked Sendable {
                     let acknowledgeNote = try database.prepare("INSERT INTO activity_notification_state(item_id, viewed_at, acknowledged_at) VALUES (?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET acknowledged_at = excluded.acknowledged_at;")
                     for notificationID in notificationIDs {
                         try note.bind(1, notificationID)
-                        let isFailure = try note.step() && note.columnText(0).flatMap(PetNotificationCategory.init(rawValue:)).map(Self.notificationFailureCategories.contains) == true
+                        let found = try note.step()
+                        let category = found ? note.columnText(0).flatMap(PetNotificationCategory.init(rawValue:)) : nil
+                        let isFailure = category.map(Self.notificationFailureCategories.contains) == true
+                        // An unread needs-you notice (file conflict) is in Needs you too.
+                        let isOpenNeedsYou = !isFailure && category?.classification == .needsYou && note.columnText(1) == nil
                         let priorViewed = isFailure ? note.columnText(1) : nil
                         note.reset()
-                        guard isFailure else { continue }
+                        guard isFailure || isOpenNeedsYou else { continue }
                         if let timestamp {
                             try acknowledgeNote.bind(1, notificationID)
                             try acknowledgeNote.bind(2, priorViewed)
@@ -444,6 +494,32 @@ final class ActivityService: @unchecked Sendable {
             }
             return states
         }
+    }
+
+    private func isOrphanedRunningRun(_ runID: AgentRunID) throws -> Bool {
+        let row = try db.performSync { database -> (thread: String, status: String)? in
+            let statement = try database.prepare("SELECT thread_id, status FROM agent_runs WHERE id = ?;")
+            defer { statement.reset() }
+            try statement.bind(1, runID.description)
+            guard try statement.step(), let thread = statement.columnText(0), let status = statement.columnText(1) else { return nil }
+            return (thread, status)
+        }
+        guard let row, row.status == "running",
+              let threadUUID = UUID(uuidString: row.thread) else { return false }
+        return activeRunIDProvider(AgentThreadID(threadUUID)) != runID
+    }
+
+    private static func requestItemID(_ callback: ProviderPendingCallback, activeRun: AgentRunID?) -> String {
+        activeRun.map { "request:\($0.description):\(callback.requestId)" }
+            ?? "request:\(callback.threadId.description):\(callback.requestId)"
+    }
+
+    private static func requestLedgerKey(_ callback: ProviderPendingCallback) -> String {
+        "activity:request:\(callback.threadId.description):\(callback.requestId)"
+    }
+
+    private static func orphanRunLedgerKey(_ runID: AgentRunID) -> String {
+        "activity:orphan-run:\(runID.description)"
     }
 
     private static let notificationFailureCategories: Set<PetNotificationCategory> = [

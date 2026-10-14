@@ -23,7 +23,7 @@ final class AgentActivityServiceTests: XCTestCase {
         XCTAssertEqual(page.items.first?.state, .failed)
     }
 
-    func test_batchAcknowledgeClearsFailuresAndBotRequestsSkipsWhatCannotBeClearedAndReopenRestoresNeedsYou() throws {
+    func test_batchAcknowledgeClearsFailuresBotRequestsAndConflictsSkipsCompletedAndReopenRestoresNeedsYou() throws {
         let context = try makeContext()
         let thread = try makeThread(context)
         let failed = try makeRun(context, thread: thread, status: .failed, at: 100)
@@ -45,24 +45,29 @@ final class AgentActivityServiceTests: XCTestCase {
         let failedID = "run:\(failed.id.description)"
         let ids = [failedID, botItem.id, "run:\(completed.id.description)", "notification:conflict"]
         let response = try activity.acknowledge(["item_ids": .array(ids.map(JSONValue.string))])
-        XCTAssertEqual(response.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue), [failedID, botItem.id],
-                       "a completed run and an unresolved conflict have nothing to acknowledge")
+        XCTAssertEqual(response.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue), [failedID, botItem.id, "notification:conflict"],
+                       "a completed run has nothing to acknowledge")
         let cleared = try decodePage(activity.list([:]))
-        XCTAssertEqual(cleared.counts.needsYou, 1, "the conflict still needs its canonical resolution")
-        XCTAssertEqual(cleared.counts.finished, 2, "clearing must never remove a result from history")
+        XCTAssertEqual(cleared.counts.needsYou, 0, "Clear all leaves nothing in Needs you (owner, 2026-10-14)")
+        XCTAssertEqual(cleared.counts.finished, 3, "clearing must never remove a result from history; the conflict lands in Finished")
         XCTAssertEqual(cleared.items.first { $0.runID == failed.id.value }?.state, .failed)
         XCTAssertNotNil(try context.botStore.listAttention(includeAcknowledged: true).first { $0.id == attention.id }?.acknowledgedAt)
+        XCTAssertNil(try NotificationRepository(db: context.db).list(workspaceId: nil, limit: 10).first { $0.id == "conflict" }?.readAt,
+                     "clearing the inbox row must not mark the conflict itself resolved")
 
-        let reopened = try activity.acknowledge(["item_ids": .array([.string(failedID), .string(botItem.id)]), "acknowledged": .bool(false)])
+        let reopened = try activity.acknowledge(["item_ids": .array([.string(failedID), .string(botItem.id), .string("notification:conflict")]), "acknowledged": .bool(false)])
         XCTAssertEqual(reopened.objectValue?["acknowledged"]?.boolValue, false)
         XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 3, "Undo must put every cleared item back in Needs you")
     }
 
-    func test_batchAcknowledgeRejectsKindsThatMustBeAnsweredAndMalformedBatches() throws {
+    func test_batchAcknowledgeRejectsUnknownKindsAndMalformedBatches() throws {
         let context = try makeContext()
         let activity = service(context)
-        XCTAssertThrowsError(try activity.acknowledge(["item_ids": .array([.string("request:thread:approval")])]),
-                             "a provider approval is answered in its conversation, never acknowledged in bulk")
+        XCTAssertThrowsError(try activity.acknowledge(["item_ids": .array([.string("project-script:surface:1")])]),
+                             "a live script is not a Needs you item")
+        XCTAssertEqual(try activity.acknowledge(["item_ids": .array([.string("request:thread:gone")])])
+                        .objectValue?["updated_ids"]?.arrayValue?.count, 0,
+                       "a request another client already resolved is skipped, not an error")
         XCTAssertThrowsError(try activity.acknowledge(["item_ids": .array([.string("notification:a"), .string("notification:a")])]))
         XCTAssertThrowsError(try activity.acknowledge(["item_ids": .array((0...200).map { .string("notification:\($0)") })]))
         XCTAssertThrowsError(try activity.acknowledge([:]))
@@ -333,7 +338,7 @@ final class AgentActivityServiceTests: XCTestCase {
         XCTAssertNil(try decodePage(activity.list([:])).items.first { $0.id == "notification:resurface" }?.viewedAt)
     }
 
-    func test_fileConflictSurvivesReadAndCannotBeAcknowledgedAsAnOutcome() throws {
+    func test_fileConflictSurvivesReadButClearingLeavesNeedsYou() throws {
         let context = try makeContext()
         let repository = NotificationRepository(db: context.db)
         try repository.insert(AppNotification(id: "conflict", title: "private file", category: PetNotificationCategory.fileConflict.rawValue))
@@ -341,9 +346,51 @@ final class AgentActivityServiceTests: XCTestCase {
         XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 1)
         _ = try activity.setViewed(["item_ids": .array([.string("notification:conflict")]), "viewed": .bool(true)])
         XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 1, "Viewing conflict must not resolve canonical conflict state.")
-        XCTAssertThrowsError(try activity.acknowledge(["item_id": .string("notification:conflict")]))
+        _ = try activity.acknowledge(["item_id": .string("notification:conflict")])
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 0, "an explicit clear empties Needs you")
         try repository.dismiss(id: "conflict")
         XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 0)
+    }
+
+    func test_clearingRequestsAndOrphanedRunsEmptiesNeedsYouSurvivesRunEndAndUndoRestores() throws {
+        // WHY: the owner (2026-10-14) saw an expired "Approval needed" survive Clear all.
+        // Every Needs you kind must clear, and a cleared live approval must not come
+        // back when its run ends and the item id switches to the expired form.
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let running = try makeRun(context, thread: thread, status: .running, at: 100)
+        let orphanThread = try makeThread(context)
+        let orphan = try makeRun(context, thread: orphanThread, status: .running, at: 50)
+        try context.providerPendingCallbackRepo.record(threadId: thread.id, request: pendingRequest("approval"))
+        try context.providerPendingCallbackRepo.record(threadId: thread.id, request: pendingRequest("stale"))
+        try context.providerPendingCallbackRepo.markStale(threadId: thread.id, requestId: "stale", kind: .approval, reason: "run ended")
+        let live = ActivityService(context: context, activeRunIDProvider: { $0 == thread.id ? running.id : nil })
+
+        let before = try decodePage(live.list(["section": .string("needs_you")]))
+        let ids = before.items.map(\.id)
+        XCTAssertEqual(Set(ids), [
+            "request:\(running.id.description):approval", "request:\(thread.id.description):stale", "run:\(orphan.id.description)"
+        ])
+        let response = try live.acknowledge(["item_ids": .array(ids.map(JSONValue.string))])
+        XCTAssertEqual(response.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue), ids)
+        XCTAssertEqual(try decodePage(live.list([:])).counts.needsYou, 0, "Clear all leaves nothing behind")
+        XCTAssertEqual(try context.providerPendingCallbackRepo.list(states: [.pending]).map(\.requestId), ["approval"],
+                       "clearing the inbox never answers the approval; its thread still holds it")
+
+        let end = try context.db.prepare("UPDATE agent_runs SET status = 'completed' WHERE id = ?;")
+        try end.bind(1, running.id.description)
+        _ = try end.step()
+        end.reset()
+        let ended = try decodePage(service(context).list([:]))
+        XCTAssertEqual(ended.items.first { $0.requestID == "approval" }?.state, .expired, "its run ended, so it reads as expired")
+        XCTAssertEqual(ended.counts.needsYou, 0,
+                       "the cleared approval stays cleared once its run ends and its item id changes")
+
+        _ = try service(context).acknowledge(["item_ids": .array([
+            .string("request:\(thread.id.description):approval"), .string("request:\(thread.id.description):stale"),
+            .string("run:\(orphan.id.description)")
+        ]), "acknowledged": .bool(false)])
+        XCTAssertEqual(try decodePage(service(context).list([:])).counts.needsYou, 3, "Undo puts every cleared item back")
     }
 
     private func makeContext() throws -> AppContext {

@@ -511,15 +511,20 @@ final class ActivityWindowModelTests: XCTestCase {
         updated(params["item_ids"]?.arrayValue?.compactMap(\.stringValue) ?? [])
     }
 
-    func testOnlyFailuresAndBotRequestsCanBeClearedSoAnswersAndConflictsStayOpen() {
+    func testEveryNeedsYouItemCanBeClearedSoClearAllLeavesNothingBehind() {
+        // WHY: the owner (2026-10-14) wants Clear all to empty Needs you. An expired
+        // approval that could not be cleared stayed there forever.
         XCTAssertTrue(item("run:failed", state: "failed", needsAction: true).isClearable)
         XCTAssertTrue(item("run:interrupted", state: "interrupted", needsAction: true).isClearable)
         XCTAssertTrue(item("bot-attention:one", kind: "request", state: "waiting_answer").isClearable,
                       "a bot request stays in its conversation, so leaving Needs you loses nothing")
-        XCTAssertFalse(item("request:thread:approval", kind: "request", state: "waiting_approval").isClearable,
-                       "a live provider approval must be answered, never cleared")
-        XCTAssertFalse(item("notification:conflict", kind: "notification", state: "needs_you", needsAction: true).isClearable,
-                       "a file conflict is resolved canonically, not from Activity")
+        XCTAssertTrue(item("request:thread:approval", kind: "request", state: "waiting_approval").isClearable,
+                      "a provider approval leaves the inbox; its card still waits in the thread")
+        XCTAssertTrue(item("request:thread:expired", kind: "request", state: "expired").isClearable,
+                      "an expired request has nothing left to answer")
+        XCTAssertTrue(item("notification:conflict", kind: "notification", state: "needs_you", needsAction: true).isClearable,
+                      "a file conflict leaves the inbox; the conflict itself is untouched")
+        XCTAssertTrue(item("run:orphan", state: "needs_you", needsAction: true).isClearable)
         XCTAssertFalse(item("run:acknowledged", state: "failed", needsAction: false).isClearable,
                        "an already cleared failure has nothing left to clear")
         XCTAssertFalse(item("bot-attention:one", kind: "request", state: "waiting_answer").isUnread,
@@ -576,7 +581,7 @@ final class ActivityWindowModelTests: XCTestCase {
         XCTAssertNil(model.error)
     }
 
-    func testClearAllCoversEveryPageOfTheFilterButNeverAnswersRequestsOrTouchesLaterArrivals() async {
+    func testClearAllCoversEveryPageAndEveryKindOfTheFilterButNeverTouchesLaterArrivals() async {
         let defaults = UserDefaults(suiteName: "activity-test-\(UUID())")!
         defaults.set("needsYou", forKey: "activity.tab")
         defaults.set("workspace", forKey: "activity.workspace")
@@ -617,17 +622,17 @@ final class ActivityWindowModelTests: XCTestCase {
         XCTAssertTrue(model.batchRunning, "the click must be acknowledged before any host work")
         await waitUntil("clear all completion") { !model.batchRunning }
 
-        XCTAssertEqual(acknowledged.count, 53)
+        XCTAssertEqual(acknowledged.count, 55)
         XCTAssertTrue(acknowledged.contains("bot-attention:question"))
-        XCTAssertFalse(acknowledged.contains("request:thread:approval"), "clearing must never stand in for answering an approval")
-        XCTAssertFalse(acknowledged.contains("notification:conflict"), "a conflict keeps its canonical resolution")
+        XCTAssertTrue(acknowledged.contains("request:thread:approval"), "Clear all leaves nothing in Needs you")
+        XCTAssertTrue(acknowledged.contains("notification:conflict"), "Clear all leaves nothing in Needs you")
         XCTAssertFalse(acknowledged.contains("run:late"), "arrivals after the click stay in Needs you")
         XCTAssertFalse(viewed.contains("run:50"), "an already read result needs no read mutation")
         XCTAssertFalse(viewed.contains("bot-attention:question"), "a request has no read state")
         XCTAssertFalse(viewed.contains("run:raced"), "an item the host did not clear must keep its unread state")
         XCTAssertEqual(viewed.count, 50)
-        XCTAssertEqual(model.undoCount, 52, "Undo covers exactly what the host confirmed")
-        XCTAssertEqual(model.batchStatus, "Cleared 52 from Needs you.")
+        XCTAssertEqual(model.undoCount, 54, "Undo covers exactly what the host confirmed")
+        XCTAssertEqual(model.batchStatus, "Cleared 54 from Needs you.")
         XCTAssertNil(model.error, "an item another client already resolved is not a failure")
     }
 

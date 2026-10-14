@@ -46,13 +46,10 @@ struct ActivityWireItem: Codable, Identifiable, Equatable, Sendable {
     var isMarkable: Bool { kind != "request" && ["completed", "failed", "interrupted", "stopped"].contains(state) }
     /// Requests have no read state, so only markable results can be unread.
     var isUnread: Bool { isMarkable && isNew }
-    /// Clearing removes the item from Needs you only: a failure stays in Finished and a
-    /// bot request stays in its conversation. Approvals, questions and conflicts are
-    /// resolved where they live, never cleared here.
-    var isClearable: Bool {
-        guard needs_action else { return false }
-        return id.hasPrefix("bot-attention:") || (kind != "request" && (state == "failed" || state == "interrupted"))
-    }
+    /// Clearing removes the item from Needs you only: a failure stays in Finished, and a
+    /// request or conflict stays where it lives (its thread, bot conversation or file).
+    /// Every Needs you item can be cleared, so Clear all leaves nothing behind.
+    var isClearable: Bool { needs_action }
     var occurredDate: Date? { ActivityViewModel.parseDate(occurred_at) }
     var displayTitle: String {
         let collapsed = title.split(whereSeparator: \.isWhitespace).joined(separator: " ")
@@ -951,7 +948,7 @@ struct ActivityRootView: View {
         if model.tab == .needsYou {
             Button("Clear all") { model.clearCurrentNeedsYou() }
                 .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning || model.page.counts.needs_you == 0).fixedSize()
-                .help("Clears failures and bot requests in this filter from Needs you and marks them read. Results stay in Finished; approvals and questions stay until answered.")
+                .help("Clears every item in this filter from Needs you and marks results read. Results stay in Finished; a cleared approval or question still waits in its thread.")
                 .accessibilityIdentifier("activity.clearAll")
         }
     }
