@@ -92,8 +92,8 @@ public enum AccountUsageDisplay {
     }
 }
 
-/// Sidebar footer control for provider account usage: compact concentric rings
-/// left of the Insomnia toggle. Signed out, it opens the account window; signed
+/// Sidebar header control for provider account usage: compact concentric rings
+/// left of the account avatar. Signed out, it opens the account window; signed
 /// in, it shows the cached figures at once and asks the host to refresh them
 /// while the details popover is open.
 struct AccountUsageSidebarControl: View {
@@ -127,13 +127,13 @@ struct AccountUsageSidebarControl: View {
                 })
             }
             .frame(width: 20, height: 20)
-            .frame(width: 24, height: 36)
+            .frame(width: 28, height: 32)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(AccountUsageDisplay.ringsHelp(signedIn: signedIn, snapshot: snapshot))
-        // .top opens over the sidebar list, not over the Insomnia toggle beside the rings.
-        .popover(isPresented: $showsDetails, arrowEdge: .top) {
+        // .bottom opens down over the sidebar list; the header sits at the window top.
+        .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
             details
         }
         .accessibilityLabel("Account usage")

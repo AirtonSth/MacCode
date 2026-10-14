@@ -1697,6 +1697,9 @@ public struct SidebarRootView: View {
                 .help("Settings")
                 .accessibilityLabel("Settings")
 
+                // Account usage sits left of the avatar it describes.
+                AccountUsageSidebarControl(vm: vm, onOpenAccount: onOpenAccount)
+
                 if vm.privateAccountUser != nil {
                     Button(action: onOpenAccount) {
                         headerAccountAvatar
@@ -2128,16 +2131,12 @@ public struct SidebarRootView: View {
         "Insomnia keeps this Mac awake while the toggle is on. Settings can allow display sleep, closed-display sleep, or the screen saver without ending the session."
     }
 
-    /// Account-usage rings sit left of the Insomnia toggle in one row. At the
-    /// 180pt minimum sidebar width the row fits only because the rings' and
-    /// toggle's hit areas carry their own inner margin (no extra row padding,
-    /// no gap between them) and the summary line yields its width first.
+    /// At the 180pt minimum sidebar width the row fits only because the
+    /// toggle's hit area carries its own inner margin (no extra row padding)
+    /// and the summary line yields its width first.
     private var insomniaControl: some View {
         HStack(alignment: .center, spacing: DS.Space.sm) {
-            HStack(spacing: 0) {
-                AccountUsageSidebarControl(vm: vm, onOpenAccount: onOpenAccount)
-                insomniaToggle
-            }
+            insomniaToggle
             VStack(alignment: .leading, spacing: 1) {
                 Text("Insomnia")
                     .font(DS.Font.body)

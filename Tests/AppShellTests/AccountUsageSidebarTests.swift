@@ -139,9 +139,10 @@ final class AccountUsageSidebarTests: XCTestCase {
         )
     }
 
-    func test_footer_mountsRingsLeftOfInsomniaToggleInsteadOfAFullWidthRow() throws {
-        // WHY: the owner asked for subtle rings beside Insomnia, not a second
-        // full-width "Account usage" row; both Workspaces and Bots share this footer.
+    func test_header_mountsRingsLeftOfTheAccountAvatarAndNotInTheFooter() throws {
+        // WHY: the owner moved the rings next to the account they measure:
+        // left of the header avatar, not in the Insomnia footer row. Both
+        // Workspaces and Bots share this header.
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let sidebar = try String(contentsOf: root.appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
@@ -150,9 +151,15 @@ final class AccountUsageSidebarTests: XCTestCase {
         XCTAssertFalse(footer.contains("AccountUsageSidebarControl"), "no standalone account-usage row")
         let rowStart = try XCTUnwrap(sidebar.range(of: "private var insomniaControl: some View {"))
         let row = String(sidebar[rowStart.upperBound...].prefix(600))
-        let rings = try XCTUnwrap(row.range(of: "AccountUsageSidebarControl(vm: vm, onOpenAccount: onOpenAccount)"))
-        let toggle = try XCTUnwrap(row.range(of: "insomniaToggle"))
-        XCTAssertLessThan(rings.lowerBound, toggle.lowerBound, "rings sit to the left of the toggle")
+        XCTAssertFalse(row.contains("AccountUsageSidebarControl"), "the rings left the Insomnia row")
+        let settings = try XCTUnwrap(sidebar.range(of: "Button(action: onOpenSettings) {"))
+        let header = sidebar[settings.upperBound...]
+        let rings = try XCTUnwrap(header.range(of: "AccountUsageSidebarControl(vm: vm, onOpenAccount: onOpenAccount)"))
+        let avatar = try XCTUnwrap(header.range(of: "headerAccountAvatar"))
+        let accountSlot = try XCTUnwrap(header.range(of: "if vm.privateAccountUser != nil {"))
+        XCTAssertLessThan(rings.lowerBound, avatar.lowerBound, "rings sit to the left of the avatar")
+        XCTAssertFalse(String(header[rings.upperBound..<accountSlot.lowerBound]).contains("Button"),
+                       "nothing sits between the rings and the avatar")
         let control = try String(
             contentsOf: root.appendingPathComponent("Sources/AppShell/AccountUsageSidebarControl.swift"),
             encoding: .utf8
