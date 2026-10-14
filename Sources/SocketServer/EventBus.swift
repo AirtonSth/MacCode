@@ -223,7 +223,7 @@ public final class EventBus: @unchecked Sendable {
     /// Cached flat array rebuilt only when subscribers are added or removed.
     /// publish() reads this instead of copying subscribers.values every call.
     private var subscribersSnapshot: [Subscriber] = []
-    private var recent: [Event] = []
+    private var recent = EventReplayRing<Event>()
     private var recentBytes: Int = 0
     private let recentLimit: Int
     private let recentByteLimit: Int
@@ -607,7 +607,7 @@ public final class EventBus: @unchecked Sendable {
             self.recent.append(ev)
             self.recentBytes += bytes
         }
-        self.recent.sort { $0.seq < $1.seq }
+        self.recent = EventReplayRing(self.recent.sorted { $0.seq < $1.seq })
         for event in self.recent {
             domainRevisions = Self.revisions(after: event, current: domainRevisions)
         }
@@ -751,7 +751,7 @@ public final class EventBus: @unchecked Sendable {
 
     public func snapshot() -> (lastSeq: Int64, recent: [Event]) {
         lock.lock(); defer { lock.unlock() }
-        return (lastSeq, recent)
+        return (lastSeq, Array(recent))
     }
 
     /// Cheap counters for `/v1/health` and readiness probes.
@@ -1426,7 +1426,7 @@ public final class EventBus: @unchecked Sendable {
         // older and still admit the newest event so replay keeps progressing.
         if bytes > recentByteLimit {
             raiseRingCoverageFloorLocked(to: ev.seq - 1)
-            recent.removeAll(keepingCapacity: true)
+            recent.removeAll()
             recentBytes = 0
             encodedCache.removeAll(keepingCapacity: true)
             encodedSizeCache.removeAll(keepingCapacity: true)

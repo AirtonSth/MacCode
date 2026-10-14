@@ -174,6 +174,28 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
                        "emit during synthesis must not re-enter fire / double-terminate")
     }
 
+    /// WHY: field 2026-10-14 — every streamed event scheduled a fresh 900 s
+    /// `asyncAfter` work item; cancelled ones stay queued in libdispatch until
+    /// their deadline, so one long run held ~12k live timers (~7 MB) for 15
+    /// minutes. A burst of events must move one deadline, not queue a timer each.
+    func test_turnWatchdogKeepsOneTimerPerTurnAcrossAStreamBurst() async throws {
+        let peer = try FakeGrokACPPeer(mode: .burstThenHang)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.05)
+        defer { adapter.stopAll() }
+        let box = GrokACPEventBox()
+        _ = try await adapter.startSession(makeRequest()) { box.append($0) }
+
+        let deadline = Date().addingTimeInterval(10)
+        while box.assistantText.count < FakeGrokACPPeer.burstChunkCount, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(box.assistantText.count, FakeGrokACPPeer.burstChunkCount, "every burst chunk must stream")
+        XCTAssertEqual(box.finishedCount, 0, "the 900 s inactivity bound must not fire mid-burst")
+        XCTAssertLessThanOrEqual(adapter.turnWatchdogTimersScheduledForTesting, 1,
+                                 "\(FakeGrokACPPeer.burstChunkCount) events must reuse one inactivity timer")
+    }
+
     func test_cancelUsesACPNotificationAndReturnsProviderIdentity() async throws {
         let peer = try FakeGrokACPPeer(mode: .cancel)
         defer { peer.remove() }
@@ -1326,7 +1348,11 @@ private final class FakeGrokACPPeer {
         case hangAfterOpenTool
         /// Completes session/prompt with stopReason max_tokens (completed-class).
         case maxTokens
+        /// Streams `burstChunkCount` one-character chunks, then never resolves
+        /// session/prompt — a long stream under the default inactivity bound.
+        case burstThenHang
     }
+    static let burstChunkCount = 2_000
     let root: URL
     let path: String
     let launchCountPath: String
@@ -1465,6 +1491,15 @@ private final class FakeGrokACPPeer {
                 prompt_id="$id"
                 continue
               fi
+              if [ "$mode" = burstThenHang ]; then
+                i=0
+                while [ "$i" -lt BURST_COUNT ]; do
+                  printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}}\n'
+                  i=$((i + 1))
+                done
+                prompt_id="$id"
+                continue
+              fi
               if [ "$mode" = hangAfterOpenTool ]; then
                 printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"starting long CI"}}}}\n'
                 printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-fixed","update":{"sessionUpdate":"tool_call","toolCallId":"tool-open","title":"run_terminal_command","rawInput":{"command":"sleep 999"}}}}\n'
@@ -1495,6 +1530,7 @@ private final class FakeGrokACPPeer {
         done
         """#
             .replacingOccurrences(of: "MODE", with: mode.rawValue)
+            .replacingOccurrences(of: "BURST_COUNT", with: String(Self.burstChunkCount))
             .replacingOccurrences(of: "PROMPT_COUNT_PATH", with: promptCountPath)
             .replacingOccurrences(of: "COUNT_PATH", with: launchCountPath)
             .replacingOccurrences(of: "SESSION_ID_PATH", with: sessionIdPath)

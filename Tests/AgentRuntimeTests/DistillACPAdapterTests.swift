@@ -950,6 +950,10 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                     send({"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"some-other-session","promptId":"p0","stopReason":"error","agentResult":"stale failure from another session"}})
                     send({"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":session,"promptId":"p1","stopReason":"error","agentResult":"API error (status 404 Not Found): Provider returned error"}})
                     fail(message["id"], None)
+                elif "BURST_HANG" in text:
+                    # A long stream whose session/prompt never returns.
+                    for _ in range(2000):
+                        send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}})
                 else:
                     send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply from " + session}}}})
                     send({"jsonrpc":"2.0","id":message["id"],"result":{"stopReason":"end_turn"}})
@@ -1402,6 +1406,52 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertFalse(requests.contains { $0["method"] as? String == "session/load" },
                        "Retry must reuse the live process, not reload the session in a new one")
         XCTAssertEqual(requests.filter { $0["method"] as? String == "session/prompt" }.count, 2)
+    }
+
+    func test_turnWatchdogKeepsOneTimerPerTurnAcrossAStreamBurst() async throws {
+        // WHY: field 2026-10-14 — every streamed event scheduled a fresh 900 s
+        // `asyncAfter` work item; cancelled ones stay queued in libdispatch until
+        // their deadline, so one long distill run held ~12k live timers (~7 MB)
+        // for 15 minutes. A burst must move one deadline, not queue a timer each.
+        let root = try makeTempRoot("distill-acp-watchdog-burst")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            distillRequest(thread: AgentThreadID(), model: "claude/claude-opus-5-5", prompt: "BURST_HANG", root: root)
+        ) { events.append($0) }
+        let deadline = Date().addingTimeInterval(10)
+        while events.assistantText.count < 2_000, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(events.assistantText.count, 2_000, "every burst chunk must stream")
+        XCTAssertLessThanOrEqual(adapter.turnWatchdogTimersScheduledForTesting, 1,
+                                 "2,000 events must reuse one inactivity timer")
+    }
+
+    func test_historyRetentionGrowsWithItsEventsInsteadOfPreallocatingTheWindow() {
+        // WHY: every resident session reserved the whole 5,121-slot window up
+        // front (~750 KB of AssistantEvent storage) even for a one-message
+        // thread. Small sessions must stay small; a full window must not grow
+        // past the old reservation (the plain doubling would reach 8,192 slots).
+        var history = DistillACPHistoryRetention()
+        let window = AgentRunCoordinator.hotReplayEventCount + DistillACPHistoryRetention.eventPruneSlack + 1
+        for index in 0..<10 {
+            history.append(.itemDelta(itemId: "a", bodyAppend: "\(index)", outputAppend: nil, summary: nil))
+        }
+        XCTAssertLessThanOrEqual(history.storageCapacityForTesting, 64, "ten events must not pin the whole window")
+        var reserved: [AssistantEvent] = []
+        reserved.reserveCapacity(window)
+        var peakCapacity = 0
+        for index in 10..<(window * 3) {
+            history.append(.itemDelta(itemId: "a", bodyAppend: "\(index)", outputAppend: nil, summary: nil))
+            peakCapacity = max(peakCapacity, history.storageCapacityForTesting)
+        }
+        XCTAssertLessThanOrEqual(peakCapacity, reserved.capacity, "a full window must not outgrow the old reservation")
+        XCTAssertEqual(history.retainedEventCount, AgentRunCoordinator.hotReplayEventCount)
     }
 
     func test_modelFamilyIsDerivedFromDistillClaudePrefix() {

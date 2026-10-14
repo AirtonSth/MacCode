@@ -28,6 +28,30 @@ final class GrokACPRetentionTests: XCTestCase {
                        "the public history must stay exact and FIFO ordered")
     }
 
+    /// WHY: every resident session reserved the whole 5,121-slot window up
+    /// front (~750 KB of AssistantEvent storage) even for a one-message thread.
+    /// Small sessions must stay small; a full window must not grow past the old
+    /// reservation (plain doubling would reach 8,192 slots).
+    func test_historyRetentionGrowsWithItsEventsInsteadOfPreallocatingTheWindow() {
+        var history = GrokACPHistoryRetention()
+        let window = AgentRunCoordinator.hotReplayEventCount + GrokACPHistoryRetention.eventPruneSlack + 1
+        for index in 0..<10 {
+            history.append(.turnStarted(turnId: "turn-\(index)"))
+        }
+        XCTAssertLessThanOrEqual(history.storageCapacityForTesting, 64, "ten events must not pin the whole window")
+        var reserved: [AssistantEvent] = []
+        reserved.reserveCapacity(window)
+        var peakCapacity = 0
+        for index in 10..<(window * 3) {
+            history.append(.turnStarted(turnId: "turn-\(index)"))
+            peakCapacity = max(peakCapacity, history.storageCapacityForTesting)
+        }
+        XCTAssertLessThanOrEqual(peakCapacity, reserved.capacity, "a full window must not outgrow the old reservation")
+        XCTAssertEqual(history.readableEvents.count, AgentRunCoordinator.hotReplayEventCount)
+        XCTAssertEqual(history.readableEvents.last.flatMap(Self.turnStartedID), "turn-\(window * 3 - 1)",
+                       "growth must keep the newest event last")
+    }
+
     func test_historyByteLimitKeepsRecentPartialDiagnosticAndTerminal() {
         var history = GrokACPHistoryRetention(
             eventLimit: 100,

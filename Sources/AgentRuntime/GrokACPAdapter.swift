@@ -55,8 +55,6 @@ struct GrokACPHistoryRetention: Sendable {
         self.byteLimit = max(1, byteLimit)
         self.eventSlack = max(0, eventSlack)
         self.byteSlack = max(0, byteSlack)
-        storage.reserveCapacity(self.eventLimit + self.eventSlack + 1)
-        storageBytes.reserveCapacity(self.eventLimit + self.eventSlack + 1)
     }
 
     var readableEvents: [AssistantEvent] {
@@ -65,6 +63,7 @@ struct GrokACPHistoryRetention: Sendable {
 
     var retainedEventCount: Int { storage.count - startIndex }
     var bufferedEventCount: Int { storage.count }
+    var storageCapacityForTesting: Int { storage.capacity }
     var bufferedEstimatedBytes: Int64 { estimatedBytes + discardedBytes }
 
     mutating func append(_ event: AssistantEvent) {
@@ -72,6 +71,16 @@ struct GrokACPHistoryRetention: Sendable {
         // Match boundedHotReplay: a frame larger than the whole window cannot
         // fit alone and must not evict a valid recent tail.
         guard eventBytes <= byteLimit else { return }
+        // Grow with the session instead of reserving the whole window up front
+        // (~750 KB per idle session); cap the last step at the window so a busy
+        // session never doubles past it.
+        let window = eventLimit + eventSlack + 1
+        if storage.count == storage.capacity, storage.capacity * 2 > window {
+            storage.reserveCapacity(window)
+        }
+        if storageBytes.count == storageBytes.capacity, storageBytes.capacity * 2 > window {
+            storageBytes.reserveCapacity(window)
+        }
         storage.append(event)
         storageBytes.append(eventBytes)
         estimatedBytes += eventBytes
@@ -158,7 +167,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         /// finish a newer turn after the inactivity watchdog already closed the
         /// previous one (or the user started a follow-up).
         var promptGeneration: UInt64 = 0
-        var turnWatchdog: DispatchWorkItem?
+        /// One per prompt generation: sendTurn cancels it under `lock` before
+        /// bumping `promptGeneration`, so a live one always matches the turn.
+        var turnWatchdog: ACPTurnInactivityDeadline?
         /// Force-kill armed for a specific `promptGeneration`. Cancelled when a
         /// newer generation starts so N's timer cannot kill N+1.
         var forceKillWorkItem: DispatchWorkItem?
@@ -258,6 +269,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     }
     var promptWriteAcceptanceCountForTesting: Int {
         synchronized { promptWriteAcceptanceCountForTestingStorage }
+    }
+    private var turnWatchdogTimersScheduledForTestingStorage = 0
+    /// Inactivity timers the turn watchdog has created (one per prompt turn).
+    var turnWatchdogTimersScheduledForTesting: Int {
+        synchronized { turnWatchdogTimersScheduledForTestingStorage }
     }
 
     public init(
@@ -1330,15 +1346,15 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             lock.unlock()
             return
         }
-        session.turnWatchdog?.cancel()
-        let delay = turnInactivityTimeout
-        let item = DispatchWorkItem { [weak self, weak session] in
-            guard let self, let session else { return }
-            self.fireTurnInactivityWatchdog(session: session, generation: generation)
+        if session.turnWatchdog == nil {
+            session.turnWatchdog = ACPTurnInactivityDeadline(timeout: turnInactivityTimeout) { [weak self, weak session] in
+                guard let self, let session else { return }
+                self.fireTurnInactivityWatchdog(session: session, generation: generation)
+            }
+            turnWatchdogTimersScheduledForTestingStorage += 1
         }
-        session.turnWatchdog = item
+        session.turnWatchdog?.refresh()
         lock.unlock()
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     private func cancelTurnWatchdogLocked(session: Session) {

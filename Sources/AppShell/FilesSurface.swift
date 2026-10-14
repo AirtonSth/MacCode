@@ -1105,7 +1105,7 @@ final class FilesViewModel: ObservableObject {
         // Drop every other kind on the delivery thread (same as PaneTabsView /
         // Agent App `.agentThreadAndQueue`) so token-rate stream events do not
         // hop each open Files tab to main just to hit `receive` default.
-        let head = EventBus.shared.snapshot().lastSeq
+        let head = EventBus.shared.currentSeq
         eventToken = EventBus.shared.subscribe(
             since: head,
             filter: .filesSurface
