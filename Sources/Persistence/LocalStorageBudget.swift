@@ -277,8 +277,11 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
     private let fileManager: FileManager
     private let attachmentRoot: URL?
     var beforeAttachmentCleanupLockForTesting: (() -> Void)?
-    /// Runs after the chunked reference scan, before the delete transaction.
+    /// Runs after each chunked reference scan, before its delete transaction.
     var beforeCleanupWriteTransactionForTesting: (() -> Void)?
+    /// Chunked reference scans tried while other writes keep landing, before
+    /// the delete transaction re-reads the whole registry under the writer lock.
+    static let referenceScanAttempts = 3
     /// Rows per serialized read in the chunked reference scan.
     static let referenceScanChunkRows = 64
     /// A chunk also yields the connection gate once this much time has passed,
@@ -364,10 +367,12 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
     /// visible skip reason while preserving the already-safe cleanup result.
     ///
     /// PERF: the durable reference scan reads hundreds of MB of text. It runs
-    /// first in short serialized chunks outside any write transaction and only
-    /// narrows which expired originals *may* go; every one that may go is
-    /// re-checked against the full registry inside the delete transaction, so
-    /// a reference written mid-scan (insert or in-place update) still wins.
+    /// in short serialized chunks outside any write transaction. The delete
+    /// transaction trusts that view only when no commit landed since the scan
+    /// began (`total_changes()` and `PRAGMA data_version` unchanged); otherwise
+    /// it rescans in chunks, and only after `referenceScanAttempts` re-checks
+    /// the full registry under the writer lock, so a reference written mid-scan
+    /// (insert or in-place update) still wins.
     /// Diagnostics rows are found the same way and deleted in short
     /// transactions that re-check the expiry predicate per row.
     public func cleanupExpired(now: Date = Date(), compact: Bool = true) throws -> LocalStorageCleanupResult {
@@ -381,20 +386,29 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
                 try deleteExpiredThreadUndoGCPins(database, expiresAtOrBefore: now)
             }
         }
-        let candidates = try expiredReversibleCandidates(cutoffMs: cutoffMs)
-        let unreferencedCandidates = candidates.isEmpty
-            ? []
-            : candidates.subtracting(try referencedHandlesInChunks(among: candidates))
-        beforeCleanupWriteTransactionForTesting?()
-
-        let reversible = unreferencedCandidates.isEmpty ? 0 : try db.performSync { database in
-            try database.transaction {
-                try deleteExpiredReversibleContent(
-                    database,
-                    cutoffMs: cutoffMs,
-                    referencedHandles: try durableReferencedHandles(database),
-                    eligibleHandles: unreferencedCandidates
-                )
+        var eligible = try expiredReversibleCandidates(cutoffMs: cutoffMs)
+        var reversible = 0
+        for attempt in 1...Self.referenceScanAttempts where !eligible.isEmpty {
+            let scanVersion = try db.performSync { try writeVersion($0) }
+            eligible.subtract(try referencedHandlesInChunks(among: eligible))
+            beforeCleanupWriteTransactionForTesting?()
+            guard !eligible.isEmpty else { break }
+            let exactRescan = attempt == Self.referenceScanAttempts
+            let deleted: Int? = try db.performSync { database in
+                try database.transaction {
+                    let unchanged = try writeVersion(database) == scanVersion
+                    guard unchanged || exactRescan else { return nil }
+                    return try deleteExpiredReversibleContent(
+                        database,
+                        cutoffMs: cutoffMs,
+                        referencedHandles: unchanged ? [] : try durableReferencedHandles(database),
+                        eligibleHandles: eligible
+                    )
+                }
+            }
+            if let deleted {
+                reversible = deleted
+                break
             }
         }
         let streamEvents = try deleteExpiredTerminalRunRows(
@@ -498,6 +512,12 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
         return statement.columnInt64(0)
     }
 
+    /// Moves on every commit: this connection's own (`total_changes()`) and any
+    /// other connection's (`PRAGMA data_version`).
+    private func writeVersion(_ database: SQLiteDB) throws -> [Int64] {
+        [try scalar(database, "SELECT total_changes();"), try scalar(database, "PRAGMA data_version;")]
+    }
+
     private func expiredReversibleCandidates(cutoffMs: Int64) throws -> Set<String> {
         try db.performSync { database in
             let statement = try database.prepare("""
@@ -517,8 +537,8 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
     /// Candidates some durable field names, read in chunks of at most
     /// `referenceScanChunkRows` rows or `referenceScanChunkBudgetNanoseconds`
     /// per `performSync`, so the connection gate is released between chunks.
-    /// Without a write transaction this view can be stale, so it only decides
-    /// which candidates to *keep*; the rest are re-checked under the writer lock.
+    /// Without a write transaction this view is exact only if no commit landed
+    /// meanwhile; `cleanupExpired` checks that under the writer lock.
     private func referencedHandlesInChunks(among candidates: Set<String>) throws -> Set<String> {
         var referenced = Set<String>()
         for reference in LocalStorageRecoveryReferenceRegistry.markerColumns {

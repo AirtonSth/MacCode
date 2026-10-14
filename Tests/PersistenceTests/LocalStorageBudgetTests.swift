@@ -564,8 +564,8 @@ final class LocalStorageBudgetTests: XCTestCase {
     /// WHY: the chunked scan runs without the writer lock, and several registry
     /// columns are updated in place (session snapshots, drafts, provider
     /// runtime). A reference written after the scan saw "unreferenced" must
-    /// still protect the original: deletion is decided only by the re-check
-    /// inside the delete transaction, never by the stale chunked view.
+    /// still protect the original: a chunked view a commit has since made
+    /// stale never decides a delete.
     func test_referenceWrittenInPlaceAfterChunkedScanStillProtectsOriginal() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
@@ -590,6 +590,223 @@ final class LocalStorageBudgetTests: XCTestCase {
         XCTAssertEqual(try store.retrieveText(lateReferenced), "referenced after the scan",
                        "an in-place reference committed before the delete transaction must win")
         XCTAssertNil(try store.retrieve(orphan), "an original nobody references is still removed")
+    }
+
+    /// Records registry marker-column reads that run inside BEGIN IMMEDIATE.
+    private final class WriterLockRegistryReads { var sql: [String] = [] }
+
+    private func trackRegistryReadsUnderWriterLock(_ db: SQLiteDB) -> WriterLockRegistryReads {
+        let reads = WriterLockRegistryReads()
+        var insideWriteTransaction = false
+        let markerColumns = LocalStorageRecoveryReferenceRegistry.markerColumns.map(\.column)
+        db.beforeExecuteForTesting = { sql in
+            if sql.hasPrefix("BEGIN IMMEDIATE") { insideWriteTransaction = true }
+            if sql.hasPrefix("COMMIT") || sql.hasPrefix("ROLLBACK") { insideWriteTransaction = false }
+        }
+        db.beforeStatementStepForTesting = { sql in
+            if insideWriteTransaction, markerColumns.contains(where: { sql.contains("\"\($0)\"") }) {
+                reads.sql.append(sql)
+            }
+        }
+        return reads
+    }
+
+    private func rowCount(_ db: SQLiteDB, _ table: String) throws -> Int64 {
+        let statement = try db.prepare("SELECT COUNT(*) FROM \(table);")
+        defer { statement.reset() }
+        _ = try statement.step()
+        return statement.columnInt64(0)
+    }
+
+    /// WHY: when the pass actually deletes an original, re-reading the whole
+    /// registry (~300 MB of marker text on a real database) inside BEGIN
+    /// IMMEDIATE held the single connection gate for 0.4-6 s and froze
+    /// main-thread reads. With no commit since the chunked scan began, that
+    /// scan is exact, so the delete transaction must not read the registry.
+    func test_orphanDeleteTrustsChunkedScanWhenNothingWasWritten() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
+        let store = ReversibleContentStore(db: fixture.db)
+        let old = Date(timeIntervalSince1970: 1)
+        let referenced = try store.store("referenced from terminal output", at: old)
+        let orphan = try store.store("nobody references this", at: old)
+        try TerminalOutputRepository(db: fixture.db).append(
+            surfaceID: "terminal", workspaceID: nil, chunkIndex: 1,
+            data: Data("Recover with \(ReversibleContentStore.marker(for: referenced))".utf8)
+        )
+        let reads = trackRegistryReadsUnderWriterLock(fixture.db)
+
+        let result = try LocalStorageBudgetManager(db: fixture.db).cleanupExpired(
+            now: Date(timeIntervalSince1970: 4_000_000),
+            compact: false
+        )
+        fixture.db.beforeExecuteForTesting = nil
+        fixture.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(result.removedRows[.reversibleContent], 1)
+        XCTAssertNil(try store.retrieve(orphan), "the unreferenced original is deleted")
+        XCTAssertEqual(try store.retrieveText(referenced), "referenced from terminal output")
+        XCTAssertEqual(reads.sql, [],
+                       "an unchanged database must not be rescanned under the writer lock to delete one orphan")
+    }
+
+    /// WHY: trusting the chunked scan is safe only if every commit since it
+    /// began is noticed, including one from another connection on the same
+    /// file, which this connection's `total_changes()` cannot see. That commit
+    /// must send the pass back to a chunked rescan (gate released between
+    /// chunks), never to a delete decided by the stale view.
+    func test_referenceCommittedByAnotherConnectionMidScanTriggersChunkedRescan() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
+        let store = ReversibleContentStore(db: fixture.db)
+        let old = Date(timeIntervalSince1970: 1)
+        let lateReferenced = try store.store("referenced by another connection", at: old)
+        let orphan = try store.store("still an orphan", at: old)
+        let other = try SQLiteDB(path: fixture.db.path)
+        let manager = LocalStorageBudgetManager(db: fixture.db)
+        var scans = 0
+        manager.beforeCleanupWriteTransactionForTesting = {
+            scans += 1
+            guard scans == 1 else { return }
+            try? other.execute("""
+                INSERT INTO session_snapshots(version, payload_json, created_at)
+                VALUES(1, '{"text":"\(ReversibleContentStore.marker(for: lateReferenced))"}', '1970-01-01T00:00:01Z');
+                """)
+        }
+        let reads = trackRegistryReadsUnderWriterLock(fixture.db)
+
+        let result = try manager.cleanupExpired(now: Date(timeIntervalSince1970: 4_000_000), compact: false)
+        fixture.db.beforeExecuteForTesting = nil
+        fixture.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(scans, 2, "a foreign commit must cost one more chunked scan")
+        XCTAssertEqual(reads.sql, [], "the rescan runs in chunks, not under the writer lock")
+        XCTAssertEqual(result.removedRows[.reversibleContent], 1)
+        XCTAssertEqual(try store.retrieveText(lateReferenced), "referenced by another connection",
+                       "a reference another connection committed after the first scan must win")
+        XCTAssertNil(try store.retrieve(orphan))
+    }
+
+    /// WHY: chunked rescans must be bounded. While commits keep landing (an
+    /// agent run streaming), the pass stops after `referenceScanAttempts`
+    /// scans and decides with the exact registry under the writer lock, so a
+    /// reference written right before that last transaction still wins.
+    func test_commitsDuringEveryScanFallBackToExactRescanAfterBoundedAttempts() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
+        let store = ReversibleContentStore(db: fixture.db)
+        let old = Date(timeIntervalSince1970: 1)
+        let lateReferenced = try store.store("referenced before the last transaction", at: old)
+        let orphan = try store.store("still an orphan", at: old)
+        let manager = LocalStorageBudgetManager(db: fixture.db)
+        var scans = 0
+        manager.beforeCleanupWriteTransactionForTesting = {
+            scans += 1
+            let payload = scans == LocalStorageBudgetManager.referenceScanAttempts
+                ? "{\"text\":\"\(ReversibleContentStore.marker(for: lateReferenced))\"}"
+                : "{}"
+            try? fixture.db.execute(
+                "INSERT INTO session_snapshots(version, payload_json, created_at) VALUES(1, '\(payload)', '1970-01-01T00:00:01Z');"
+            )
+        }
+        let reads = trackRegistryReadsUnderWriterLock(fixture.db)
+
+        let result = try manager.cleanupExpired(now: Date(timeIntervalSince1970: 4_000_000), compact: false)
+        fixture.db.beforeExecuteForTesting = nil
+        fixture.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(scans, LocalStorageBudgetManager.referenceScanAttempts,
+                       "constant commits must not loop the chunked scan forever")
+        XCTAssertFalse(reads.sql.isEmpty, "the last attempt re-checks the full registry under the writer lock")
+        XCTAssertEqual(result.removedRows[.reversibleContent], 1)
+        XCTAssertEqual(try store.retrieveText(lateReferenced), "referenced before the last transaction")
+        XCTAssertNil(try store.retrieve(orphan))
+    }
+
+    /// WHY: the pass used to be one atomic transaction; it is now several
+    /// commits. A read error in the chunked reference scan must reach the
+    /// caller (runCCRRetention logs it) and delete nothing, because no original
+    /// may go on an incomplete view of its references.
+    func test_referenceScanFailureThrowsAndDeletesNothing() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
+        let store = ReversibleContentStore(db: fixture.db)
+        let old = Date(timeIntervalSince1970: 1)
+        _ = try store.store("orphan that must survive a failed scan", at: old)
+        let referenced = try store.store("referenced", at: old)
+        let terminal = TerminalOutputRepository(db: fixture.db)
+        for index in 1...(LocalStorageBudgetManager.referenceScanChunkRows + 5) {
+            try terminal.append(surfaceID: "terminal", workspaceID: nil, chunkIndex: Int64(index),
+                                data: Data("Recover with \(ReversibleContentStore.marker(for: referenced))".utf8))
+        }
+        try AgentRunRepository(db: fixture.db).appendStreamEvent(
+            runId: fixture.run.id, seq: 1, kind: "old", payloadJSON: "{}"
+        )
+        try fixture.db.execute("UPDATE agent_stream_events SET created_at = '1970-01-01T00:00:01Z';")
+        var terminalScanSteps = 0
+        fixture.db.beforeStatementStepForTesting = { sql in
+            guard sql.contains("FROM \"terminal_output_chunks\"") else { return }
+            terminalScanSteps += 1
+            // Second chunk: the first one already released the gate.
+            if terminalScanSteps == LocalStorageBudgetManager.referenceScanChunkRows + 2 {
+                fixture.db.injectedResultCodesForTesting = [10] // SQLITE_IOERR
+            }
+        }
+        let manager = LocalStorageBudgetManager(db: fixture.db)
+        manager.referenceScanChunkBudgetNanoseconds = .max
+
+        XCTAssertThrowsError(try manager.cleanupExpired(now: Date(timeIntervalSince1970: 4_000_000), compact: false))
+        fixture.db.beforeStatementStepForTesting = nil
+
+        XCTAssertGreaterThan(terminalScanSteps, LocalStorageBudgetManager.referenceScanChunkRows,
+                             "the failure must hit mid-scan, after a chunk was read")
+        XCTAssertEqual(try rowCount(fixture.db, "rc_reversible_content"), 2, "no original is deleted after a failed scan")
+        XCTAssertEqual(try rowCount(fixture.db, "agent_stream_events"), 1,
+                       "the pass stops at the failure; later stages do not run")
+    }
+
+    /// WHY: diagnostics rows are deleted in short per-batch transactions. A
+    /// failure in a later batch must reach the caller, roll back only that
+    /// batch, and leave earlier committed work (the orphan delete, the first
+    /// batch) in place, never touching a referenced original.
+    func test_streamDeleteBatchFailureThrowsAndKeepsOnlyCommittedBatches() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
+        let store = ReversibleContentStore(db: fixture.db)
+        let old = Date(timeIntervalSince1970: 1)
+        let orphan = try store.store("orphan", at: old)
+        let referenced = try store.store("referenced", at: old)
+        try TerminalOutputRepository(db: fixture.db).append(
+            surfaceID: "terminal", workspaceID: nil, chunkIndex: 1,
+            data: Data("Recover with \(ReversibleContentStore.marker(for: referenced))".utf8)
+        )
+        let chunk = LocalStorageBudgetManager.referenceScanChunkRows
+        let expiredRows = chunk + 10
+        let runs = AgentRunRepository(db: fixture.db)
+        for seq in 1...expiredRows {
+            try runs.appendStreamEvent(runId: fixture.run.id, seq: seq, kind: "old", payloadJSON: "{}")
+        }
+        try fixture.db.execute("UPDATE agent_stream_events SET created_at = '1970-01-01T00:00:01Z';")
+        var streamDeleteSteps = 0
+        fixture.db.beforeStatementStepForTesting = { sql in
+            guard sql.contains("DELETE FROM \"agent_stream_events\"") else { return }
+            streamDeleteSteps += 1
+            // First row of the second batch.
+            if streamDeleteSteps == chunk + 1 {
+                fixture.db.injectedResultCodesForTesting = [10] // SQLITE_IOERR
+            }
+        }
+
+        XCTAssertThrowsError(try LocalStorageBudgetManager(db: fixture.db).cleanupExpired(
+            now: Date(timeIntervalSince1970: 4_000_000),
+            compact: false
+        ))
+        fixture.db.beforeStatementStepForTesting = nil
+
+        XCTAssertEqual(try rowCount(fixture.db, "agent_stream_events"), Int64(expiredRows - chunk),
+                       "only the committed first batch is gone; the failed batch rolled back")
+        XCTAssertEqual(try store.retrieveText(referenced), "referenced")
+        XCTAssertNil(try store.retrieve(orphan), "the orphan delete committed before the failure stays done")
     }
 
     func test_attachmentCleanupWaitsForConcurrentDurableOwnerWriter() throws {
