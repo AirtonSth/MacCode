@@ -69,7 +69,7 @@ public final class AgentWorkspaceRailReloadCoordinator {
     #if DEBUG
     init(
         subagentPollNanoseconds: UInt64,
-        hasMembers: @escaping () -> Bool,
+        hasMembers: (() -> Bool)?,
         sleep: @escaping (UInt64) async throws -> Void,
         pollRound: @escaping () async -> Void,
         railSnapshotLoad: ((AgentAppViewModel) async -> RailSnapshot)? = nil,
@@ -105,6 +105,15 @@ public final class AgentWorkspaceRailReloadCoordinator {
         var bucket = members[viewModel.workspaceID] ?? [:]
         bucket[key] = WeakBox(viewModel: viewModel)
         members[viewModel.workspaceID] = bucket
+        viewModel.subagentPollCoordinator = self
+        ensureSubagentPoll()
+    }
+
+    /// Re-arms the shared badge poll. The loop exits once no selected thread is
+    /// running or showing live subagents, so every path that can make one live
+    /// (run status, selection, rail reload, a live snapshot) calls this.
+    /// Idempotent: a running loop is kept, never cancelled or duplicated.
+    public func subagentPollTargetMayBeLive() {
         ensureSubagentPoll()
     }
 
@@ -113,6 +122,9 @@ public final class AgentWorkspaceRailReloadCoordinator {
         let workspaceID = viewModel.workspaceID
         guard var bucket = members[workspaceID] else { return }
         bucket.removeValue(forKey: key)
+        if viewModel.subagentPollCoordinator === self {
+            viewModel.subagentPollCoordinator = nil
+        }
         if bucket.isEmpty {
             members.removeValue(forKey: workspaceID)
             railDebounceTasks[workspaceID]?.cancel()
@@ -122,13 +134,15 @@ public final class AgentWorkspaceRailReloadCoordinator {
         } else {
             members[workspaceID] = bucket
         }
-        // The shared loop observes empty membership before its next round and
+        // The shared loop observes no live target before its next round and
         // exits itself. Do not cancel here: a detached receipt read cannot be
         // cancelled safely, and a replacement loop could overlap it.
     }
 
     /// EventBus / external path: coalesce N surface notifications into one rail load.
     public func requestCoalescedReload(workspaceID: WorkspaceID) {
+        // Lifecycle events (including LaunchAgent-owned runs) arrive here.
+        ensureSubagentPoll()
         railDebounceTasks[workspaceID]?.cancel()
         railDebounceTasks[workspaceID] = Task { @MainActor [weak self] in
             let delay = self?.debounceNanoseconds ?? 50_000_000
@@ -155,6 +169,8 @@ public final class AgentWorkspaceRailReloadCoordinator {
     public func requestCoalescedSubagentActivityRefresh(
         workspaceID: WorkspaceID
     ) {
+        // Every run status event (including `.running`) arrives here.
+        ensureSubagentPoll()
         let generation = (subagentActivityRefreshGenerations[workspaceID] ?? 0) &+ 1
         subagentActivityRefreshGenerations[workspaceID] = generation
         subagentActivityRefreshTasks[workspaceID]?.cancel()
@@ -205,13 +221,31 @@ public final class AgentWorkspaceRailReloadCoordinator {
         }
     }
 
+    /// True only while a round would do work: some surface's selected thread
+    /// is starting/running or shows live subagents. Idle or hidden Agent tabs
+    /// used to keep this 2s MainActor wake alive for the app's lifetime.
     private var hasSubagentPollMembers: Bool {
         #if DEBUG
         if let hasMembers = subagentPollHasMembersForTesting {
             return hasMembers()
         }
         #endif
-        return !members.isEmpty
+        for bucket in members.values {
+            for box in bucket.values {
+                if let viewModel = box.viewModel,
+                   !viewModel.isDisposedForReloadCoordination,
+                   Self.isSubagentPollTarget(viewModel) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Completed idle threads are refreshed by lifecycle events instead.
+    private static func isSubagentPollTarget(_ viewModel: AgentAppViewModel) -> Bool {
+        guard viewModel.selectedThreadId != nil else { return false }
+        return viewModel.selectedThreadRunIsStartingOrRunning || viewModel.subagentActivity.isLive
     }
 
     private func runSubagentPollRound() async {
@@ -254,10 +288,8 @@ public final class AgentWorkspaceRailReloadCoordinator {
         // selected thread stay empty without adding work.
         let targets: [(viewModel: AgentAppViewModel, threadId: AgentThreadID)] = workspaceIDs.flatMap { workspaceID in
             liveViewModels(for: workspaceID).compactMap { viewModel in
-                guard let threadId = viewModel.selectedThreadId else { return nil }
-                guard viewModel.selectedThreadRunIsStartingOrRunning || viewModel.subagentActivity.isLive else {
-                    return nil
-                }
+                guard let threadId = viewModel.selectedThreadId,
+                      Self.isSubagentPollTarget(viewModel) else { return nil }
                 return (viewModel, threadId)
             }
         }

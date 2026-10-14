@@ -1180,16 +1180,20 @@ public final class AppContext {
                 self.ensureQueueDrainWaiterIfNeeded(threadId: tid)
                 // Main agent only: nested/subagent workers must not fire
                 // system or private push banners (parent owns user-facing UX).
-                let chrome = (try? self.threadRepo.listChrome(ids: [tid]))?[tid]
-                let notificationSettings = SettingsStore(db: self.db).load()
+                // The notification is the last effect of this hop; its reads
+                // (including the receipt scan under the process-wide receipt
+                // lock) run off the MainActor.
+                let inputs = await self.runFinishedNotificationInputs(runId: rid, threadId: tid)
+                let chrome = inputs.chrome
+                let notificationSettings = inputs.settings
                 if let content = RemoteCodeNotificationContent.threadOutcome(
                     threadId: tid.value.uuidString,
                     runId: rid.value.uuidString,
                     workspaceId: chrome?.workspaceId?.value.uuidString,
                     title: chrome?.title,
                     phase: status,
-                    isNestedWorker: self.isNestedAgentWorker(runId: rid, threadId: tid),
-                    finalMessageId: ((try? AgentRunResultRepository(db: self.db).get(runId: rid)) ?? nil)?.finalMessageId?.description
+                    isNestedWorker: inputs.isNestedWorker,
+                    finalMessageId: inputs.finalMessageId
                 ) {
                     let isFailureOrInterrupted = status == .failed || status == .interrupted
                     let isUserStop = status == .cancelled
@@ -1659,9 +1663,68 @@ public final class AppContext {
             NSClassFromString("XCTestCase") != nil
     }
 
+    struct RunFinishedNotificationInputs: @unchecked Sendable {
+        let chrome: AgentThreadRepository.ListChrome?
+        let settings: AppSettings
+        let isNestedWorker: Bool
+        let finalMessageId: String?
+    }
+
+    #if DEBUG
+    /// Records which thread the run-finished notification reads ran on.
+    let runFinishedNotificationReadProbeForTesting = ActivityReceiptsThreadProbe()
+    #endif
+
+    /// Reads the run-finished notification needs, off the MainActor. The
+    /// nested-worker check scans orchestration receipts (`detail LIKE`, ~15 ms
+    /// on an 8.9k-row log) under the process-wide receipt and file locks; on
+    /// the MainActor that stalled every run completion.
+    func runFinishedNotificationInputs(
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) async -> RunFinishedNotificationInputs {
+        let threadRepo = threadRepo
+        let db = db
+        let orchestrationRuntime = orchestrationRuntime
+        let runRepo = runRepo
+        #if DEBUG
+        let probe = runFinishedNotificationReadProbeForTesting
+        #endif
+        return await Task.detached(priority: .userInitiated) {
+            #if DEBUG
+            probe.recordCurrentThread()
+            #endif
+            return RunFinishedNotificationInputs(
+                chrome: (try? threadRepo.listChrome(ids: [threadId]))?[threadId],
+                settings: SettingsStore(db: db).load(),
+                isNestedWorker: Self.isNestedAgentWorker(
+                    runId: runId,
+                    threadId: threadId,
+                    orchestrationRuntime: orchestrationRuntime,
+                    runRepo: runRepo
+                ),
+                finalMessageId: ((try? AgentRunResultRepository(db: db).get(runId: runId)) ?? nil)?.finalMessageId?.description
+            )
+        }.value
+    }
+
     /// Nested orchestration workers (subagents) carry a parent receipt. Main
     /// agent root runs have `parentReceiptId == nil` and `nodeId == "root"`.
     func isNestedAgentWorker(runId: AgentRunID, threadId: AgentThreadID) -> Bool {
+        Self.isNestedAgentWorker(
+            runId: runId,
+            threadId: threadId,
+            orchestrationRuntime: orchestrationRuntime,
+            runRepo: runRepo
+        )
+    }
+
+    nonisolated static func isNestedAgentWorker(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        orchestrationRuntime: AgentOrchestrationRuntime,
+        runRepo: AgentRunRepository
+    ) -> Bool {
         if let receipt = try? orchestrationRuntime.admissionReceipt(for: runId),
            RemoteCodeNotificationContent.AgentAppPushPolicy.isNestedWorker(
             parentReceiptId: receipt.parentReceiptId,

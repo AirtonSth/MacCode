@@ -192,6 +192,116 @@ final class AgentWorkspaceRailReloadCoordinatorTests: XCTestCase {
         }
     }
 
+    func test_subagentPollStopsForIdleSurfacesAndRearmsWhenATargetGoesLive() async throws {
+        // WHY: the shared badge poll used to exit only when no Agent surface
+        // existed, so one idle or hidden tab woke the MainActor every 2s for the
+        // app's lifetime while every round found nothing to read. The loop must
+        // stop once no selected thread is running or showing live subagents,
+        // and each transition that makes one live (a tracked run, selecting a
+        // running thread, a live snapshot) must re-arm it or badges freeze.
+        let root = NSTemporaryDirectory() + "rc-poll-gate-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runCoordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [:]
+        )
+        let workspaceID = WorkspaceID()
+        let idleThread = AgentThread(workspaceId: workspaceID, title: "Idle", provider: .codex, model: "gpt-5")
+        let busyThread = AgentThread(workspaceId: workspaceID, title: "Busy", provider: .codex, model: "gpt-5")
+        try threadRepo.upsert(idleThread)
+        try threadRepo.upsert(busyThread)
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: root,
+            coordinator: runCoordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        vm.selectThread(idleThread.id, markRead: false)
+        await vm.waitForSelectThreadHydrationForTesting()
+        await vm.awaitSubagentActivityRefreshForTesting()
+
+        let fixture = PollFixture()
+        let coordinator = AgentWorkspaceRailReloadCoordinator(
+            subagentPollNanoseconds: 2_000_000_000,
+            hasMembers: nil,
+            sleep: { _ in await fixture.clock.sleep() },
+            pollRound: { fixture.roundCount += 1 }
+        )
+        coordinator.register(vm)
+        defer {
+            coordinator.unregister(vm)
+            vm.dispose()
+        }
+        func tick() async {
+            await waitUntil { fixture.clock.waiterCount == 1 }
+            fixture.clock.advanceOne()
+        }
+
+        // Idle tab: one wake, no round, then the loop is gone.
+        await tick()
+        await waitUntil { !coordinator.subagentPollIsRunningForTesting }
+        XCTAssertEqual(fixture.roundCount, 0, "an idle surface must not run poll rounds")
+
+        // A run on a thread this tab is not showing re-arms, finds no target, stops.
+        vm.seedRunThreadProjectionForTesting(runId: AgentRunID(), threadId: busyThread.id)
+        XCTAssertTrue(coordinator.subagentPollIsRunningForTesting, "a newly tracked run must re-arm the poll")
+        await tick()
+        await waitUntil { !coordinator.subagentPollIsRunningForTesting }
+        XCTAssertEqual(fixture.roundCount, 0, "a run on an unselected thread is not a badge target")
+
+        // Selecting the running thread re-arms and polls every tick.
+        vm.selectThread(busyThread.id, markRead: false)
+        XCTAssertTrue(coordinator.subagentPollIsRunningForTesting, "selecting a running thread must re-arm the poll")
+        for expected in 1...3 {
+            await tick()
+            await waitUntil { fixture.roundCount == expected }
+        }
+
+        // The run ends: the next wake stops the loop.
+        vm.clearRunThreadProjectionsForTesting()
+        await tick()
+        await waitUntil { !coordinator.subagentPollIsRunningForTesting }
+        XCTAssertEqual(fixture.roundCount, 3)
+
+        // Live subagents on the selected thread re-arm the badge poll.
+        await vm.waitForSelectThreadHydrationForTesting()
+        await vm.awaitSubagentActivityRefreshForTesting()
+        let now = Date()
+        let live = SubagentActivitySnapshot(
+            active: [SubagentActivityItem(
+                id: UUID(),
+                runId: AgentRunID(),
+                threadId: busyThread.id,
+                nodeId: "nested.codex.1",
+                displayName: "Worker",
+                provider: .codex,
+                model: "gpt-5",
+                phase: .working,
+                lifecycleStatus: .accepted,
+                finalRunStatus: nil,
+                admittedAt: now,
+                finalizedAt: nil,
+                lifecycleUpdatedAt: now,
+                isActive: true
+            )],
+            done: []
+        )
+        vm.applySubagentActivity(live, loadedFor: busyThread.id)
+        XCTAssertTrue(coordinator.subagentPollIsRunningForTesting, "a live subagent snapshot must re-arm the poll")
+        await tick()
+        await waitUntil { fixture.roundCount == 4 }
+        vm.applySubagentActivity(.empty, loadedFor: busyThread.id)
+        await tick()
+        await waitUntil { !coordinator.subagentPollIsRunningForTesting }
+        XCTAssertEqual(fixture.roundCount, 4)
+    }
+
     func test_applyRailSnapshot_doesNotDecodeReceiptsOnMainActor() async throws {
         // WHY: the freeze-class CPU diag was applyRailSnapshot →
         // refreshSubagentActivity → JSONDecoder of admission receipts on

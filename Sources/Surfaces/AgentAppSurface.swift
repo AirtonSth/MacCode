@@ -1168,7 +1168,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// Maps an in-flight run back to its thread so a completion can mark
     /// the right thread unread even after the user navigated away (B6).
-    private var runThreads: [AgentRunID: AgentThreadID] = [:]
+    private var runThreads: [AgentRunID: AgentThreadID] = [:] {
+        didSet {
+            // A newly tracked run can make the selected thread a badge-poll target.
+            if runThreads.count > oldValue.count {
+                subagentPollCoordinator?.subagentPollTargetMayBeLive()
+            }
+        }
+    }
+
+    /// Set by `AgentWorkspaceRailReloadCoordinator.register`; the shared badge
+    /// poll stops while no surface is live and is re-armed through this.
+    weak var subagentPollCoordinator: AgentWorkspaceRailReloadCoordinator?
 
     /// Cross-thread mirror of `selectedThreadId` so nonisolated stream delivery
     /// can drop events for other surfaces without a MainActor hop. Updated on
@@ -1786,6 +1797,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             applySubagentActivity(.empty)
             return
         }
+        // Selection or rail reload may land on a running thread.
+        subagentPollCoordinator?.subagentPollTargetMayBeLive()
         // Switching threads must drop the previous thread's badge immediately.
         // The receipt load stays off-main (freeze-class hang_breach).
         if publishedSubagentActivityThreadId != threadId {
@@ -1853,6 +1866,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard Self.shouldPublishSubagentActivity(current: subagentActivity, next: next) else { return }
         subagentActivity = next
         publishedSubagentActivityThreadId = selectedThreadId
+        if next.isLive {
+            subagentPollCoordinator?.subagentPollTargetMayBeLive()
+        }
     }
 
     /// Apply a poll result only while the thread that produced it is still selected.
@@ -2396,6 +2412,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         dropColdTimelineArchive()
         selectedThreadId = id
+        subagentPollCoordinator?.subagentPollTargetMayBeLive()
         refreshManualAction()
         transcriptState.selectedThreadIdForPeerFlag = id
         transcriptState.waitingBotPeerActivity = AgentTranscriptState.hasWaitingBotPeerActivity(

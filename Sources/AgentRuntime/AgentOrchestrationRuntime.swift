@@ -646,6 +646,11 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
     private var cachedRunReceipts:
         [AgentRunID: (signature: ReceiptSetSignature, receipt: AgentOrchestrationAdmissionReceipt?)] = [:]
     private static let runReceiptMemoCap = 256
+    private var cachedReceiptsByIDs: (
+        signature: ReceiptSetSignature,
+        results: [Set<UUID>: [UUID: AgentOrchestrationAdmissionReceipt]]
+    )?
+    private static let receiptsByIDsMemoCap = 16
 #if DEBUG
     public private(set) var receiptDetailDecodeCountForTesting = 0
 #endif
@@ -972,12 +977,26 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
             .map { $0 }
     }
 
+    /// Parent-chain lookup for activity reads. The badge poll's child window is
+    /// global, so its parents usually live on other threads and miss the
+    /// primary fetch on every tick. This used to scan, sort (temp-file spill)
+    /// and decode every receipt row per tick while holding the writer
+    /// connection. Now SQL returns only the requested ids, in the same
+    /// `ORDER BY id` order so the first-wins tie-break is unchanged, and an
+    /// unchanged receipt set is served from the signature memo.
     fileprivate func receiptsUnlocked(
         ids: Set<UUID>
     ) throws -> [UUID: AgentOrchestrationAdmissionReceipt] {
         guard !ids.isEmpty else { return [:] }
+        let signature = receiptSetSignatureUnlocked()
+        if let signature,
+           let cached = activityCacheLock.withLock({ cachedReceiptsByIDs }),
+           cached.signature == signature,
+           let receipts = cached.results[ids] {
+            return receipts
+        }
         var latestByID: [UUID: AgentOrchestrationAdmissionReceipt] = [:]
-        try forEachReceiptRecordUnlocked(containing: nil) { receipt in
+        try forEachReceiptRecordUnlocked(withIDs: ids) { receipt in
             guard ids.contains(receipt.id) else { return }
             if let current = latestByID[receipt.id],
                current.lifecycleUpdatedAt >= receipt.lifecycleUpdatedAt {
@@ -985,7 +1004,53 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
             }
             latestByID[receipt.id] = receipt
         }
+        if let signature {
+            activityCacheLock.withLock {
+                var results = cachedReceiptsByIDs?.signature == signature
+                    ? cachedReceiptsByIDs?.results ?? [:]
+                    : [:]
+                if results.count >= Self.receiptsByIDsMemoCap {
+                    results.removeAll(keepingCapacity: true)
+                }
+                results[ids] = latestByID
+                cachedReceiptsByIDs = (signature, results)
+            }
+        }
         return latestByID
+    }
+
+    private func forEachReceiptRecordUnlocked(
+        withIDs ids: Set<UUID>,
+        _ body: (AgentOrchestrationAdmissionReceipt) -> Void
+    ) throws {
+        switch storage {
+        case .database(let db, _):
+            // JSONEncoder writes UUIDs uppercase; `upper` also matches a
+            // lowercase writer, which JSONDecoder accepts. The CASE keeps one
+            // malformed row from failing the whole read (decode skips it).
+            let statement = try db.prepare("""
+                SELECT detail FROM audit_log
+                WHERE action IN (?, ?)
+                  AND upper(CASE WHEN json_valid(detail) THEN json_extract(detail, '$.id') END)
+                      IN (SELECT value FROM json_each(?))
+                ORDER BY id ASC;
+            """)
+            try statement.bind(1, Self.admissionAction)
+            try statement.bind(2, Self.lifecycleAction)
+            try statement.bind(3, "[" + ids.map { "\"\($0.uuidString)\"" }.joined(separator: ",") + "]")
+            while try statement.step() {
+                guard let detail = statement.columnText(0),
+                      let receipt = try? decoder.decode(
+                        AgentOrchestrationAdmissionReceipt.self,
+                        from: Data(detail.utf8)
+                      ) else {
+                    continue
+                }
+                body(receipt)
+            }
+        case .file:
+            try forEachReceiptRecordUnlocked(containing: nil, body)
+        }
     }
 
     public func receipt(runId: AgentRunID) throws -> AgentOrchestrationAdmissionReceipt? {

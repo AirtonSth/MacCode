@@ -1249,6 +1249,117 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )
     }
 
+    func testBadgePollResolvesOutOfWindowParentsByID_becauseAFullReceiptScanPerTickSpilledToDisk() throws {
+        // WHY: the badge poll's child window is global, so its parents usually
+        // sit outside the primary fetch. Resolving them used to step every
+        // receipt row (`... WHERE action IN (?, ?) ORDER BY id ASC`), sort it
+        // in a temp file and decode it on every 2s tick while holding the
+        // writer connection (~240 GB of temp writes in two days on a real
+        // 8.9k-row log). The parents must come from an id-filtered read, an
+        // unchanged receipt set must not re-read them, and the result (scope
+        // closure + dead-ancestor demotion) must stay exact.
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let now = Date(timeIntervalSince1970: 80_000)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            killSwitch: { false },
+            now: { now },
+            processIsAlive: { _ in true }
+        )
+        func receipt(
+            id: UUID = UUID(),
+            parent: UUID? = nil,
+            thread: AgentThreadID,
+            at offset: TimeInterval,
+            updatedAt updatedOffset: TimeInterval? = nil,
+            status: AgentOrchestrationReceiptLifecycleStatus = .accepted
+        ) -> AgentOrchestrationAdmissionReceipt {
+            AgentOrchestrationAdmissionReceipt(
+                id: id,
+                parentReceiptId: parent,
+                runId: AgentRunID(),
+                threadId: thread,
+                nodeId: parent == nil ? "root" : "nested.codex.1",
+                routingRevision: 0,
+                policyDigest: "external",
+                packageRevision: "external",
+                provider: .codex,
+                providerInstanceId: "codex-cli",
+                model: "gpt",
+                capabilitySnapshotId: "external",
+                decisionReason: parent == nil ? "manual-agent-app-controller" : "external-controlled-child",
+                admittedAt: now.addingTimeInterval(offset),
+                lifecycleStatus: status,
+                lifecycleUpdatedAt: updatedOffset.map { now.addingTimeInterval($0) },
+                deadlineAt: now.addingTimeInterval(600),
+                permissionMode: .supervised,
+                ownerProcessID: 111
+            )
+        }
+        let selected = AgentThreadID()
+        let otherThread = AgentThreadID()
+        // The selected thread's older root falls out of a 1-row thread window
+        // once a newer root lands; its child lives on another thread.
+        let oldRoot = receipt(thread: selected, at: -50)
+        let decoyRoot = receipt(thread: otherThread, at: -40)
+        try repository.save(oldRoot)
+        try repository.save(decoyRoot)
+        let child = receipt(parent: oldRoot.id, thread: AgentThreadID(), at: -30)
+        let decoyChild = receipt(parent: decoyRoot.id, thread: AgentThreadID(), at: -20)
+        try repository.save(child)
+        try repository.save(decoyChild)
+        let newRoot = receipt(thread: selected, at: -10)
+        try repository.save(newRoot)
+
+        var stepped: [String] = []
+        db.beforeStatementStepForTesting = { stepped.append($0) }
+        defer { db.beforeStatementStepForTesting = nil }
+        func poll() throws -> [AgentOrchestrationAdmissionReceipt] {
+            try runtime.activityReceipts(
+                threadIds: [selected],
+                limit: 1,
+                childRecordLimit: 16,
+                persistLifecycleReconciliation: false
+            )
+        }
+        func normalized(_ sql: String) -> String {
+            sql.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        let fullScan = "SELECT detail FROM audit_log WHERE action IN (?, ?) ORDER BY id ASC;"
+
+        let first = try poll()
+        XCTAssertEqual(
+            Set(first.map(\.id)), [newRoot.id, oldRoot.id, child.id],
+            "the out-of-window parent must still pull its cross-thread child into scope; the decoy chain stays out"
+        )
+        XCTAssertEqual(first.first(where: { $0.id == child.id })?.lifecycleStatus, .accepted,
+                       "a child whose resolved parent is live stays active")
+        XCTAssertFalse(stepped.contains { normalized($0) == fullScan },
+                       "missing parents must be resolved by id, not by stepping every receipt row")
+        let idLookups = stepped.filter { $0.contains("json_each") }.count
+        XCTAssertGreaterThan(idLookups, 0, "sanity: the missing parents came from the id-filtered read")
+
+        let second = try poll()
+        XCTAssertEqual(second, first, "an unchanged receipt set must return the identical result")
+        XCTAssertEqual(stepped.filter { $0.contains("json_each") }.count, idLookups,
+                       "an unchanged receipt set must not re-read the same parents")
+
+        // The parent finalizes (still older than the 1-row thread window): the
+        // signature changes, the parent is re-read by id and the still-accepted
+        // child is projected as unknown (inactive ancestor).
+        try repository.update(receipt(id: oldRoot.id, thread: selected, at: -50, updatedAt: -15, status: .finalized))
+        let third = try poll()
+        XCTAssertGreaterThan(stepped.filter { $0.contains("json_each") }.count, idLookups,
+                             "a receipt write must invalidate the parent memo")
+        XCTAssertEqual(third.first(where: { $0.id == oldRoot.id })?.lifecycleStatus, .finalized)
+        XCTAssertEqual(third.first(where: { $0.id == child.id })?.lifecycleStatus, .unknown,
+                       "a child of a finalized parent must not keep reading as active")
+        XCTAssertFalse(stepped.contains { normalized($0) == fullScan })
+    }
+
     func testManualControllerRootLinksActualCrossProviderChildRun() throws {
         // WHY: explicit `remote-code agent-app` delegation must not invent a
         // second synthetic run id. The parent and child receipts need the real
