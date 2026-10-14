@@ -47,10 +47,8 @@ final class PetSpriteHostingView<Content: View>: NSHostingView<Content> {
     var onDragStateChanged: ((Bool) -> Void)?
     var onDragEnded: ((CGRect) -> Void)?
     var imageProvider: (() -> CGImage?)?
-    /// Right-side red attention badge hit region.
+    /// Top-right red attention dot hit region.
     var attentionBadgeVisibleProvider: (() -> Bool)?
-    /// Left-side blue active-thread badge hit region.
-    var activeBadgeVisibleProvider: (() -> Bool)?
     /// Back-compat alias used by older call sites/tests.
     var badgeVisibleProvider: (() -> Bool)? {
         get { attentionBadgeVisibleProvider }
@@ -154,10 +152,6 @@ final class PetSpriteHostingView<Content: View>: NSHostingView<Content> {
         guard bounds.contains(point) else { return false }
         if attentionBadgeVisibleProvider?() == true {
             let badgeRect = CGRect(x: bounds.maxX - 34, y: bounds.maxY - 34, width: 34, height: 34)
-            if badgeRect.contains(point) { return true }
-        }
-        if activeBadgeVisibleProvider?() == true {
-            let badgeRect = CGRect(x: bounds.minX, y: bounds.maxY - 34, width: 34, height: 34)
             if badgeRect.contains(point) { return true }
         }
         guard let image = imageProvider?() else { return true }

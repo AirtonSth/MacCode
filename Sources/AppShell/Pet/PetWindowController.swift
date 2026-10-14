@@ -270,27 +270,17 @@ private struct PetSpriteView: View {
 
             VStack {
                 HStack(alignment: .top) {
-                    // Blue says work is running right now; the red capsule says what waits on you.
-                    if let badge = model.activeBadgeText {
-                        Text(badge)
-                            .font(.system(size: 12, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, badge == "99+" ? 6 : 7)
-                            .frame(minWidth: 24, minHeight: 24)
-                            .background(Circle().fill(Color.blue))
-                            .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 1.5))
-                            .shadow(color: .black.opacity(0.35), radius: 2, y: 1)
-                            .accessibilityIdentifier("pet.activeBadge")
-                    }
                     Spacer(minLength: 0)
+                    // The pet's only indicator: a small red dot while something needs
+                    // you. The count lives in the tooltip and the accessibility value.
                     if let badge = model.badgeText {
-                        Text("\(badge) need you")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Capsule().fill(Color.red))
-                            .accessibilityIdentifier("pet.needsYouBadge")
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 11, height: 11)
+                            .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 1.5))
+                            .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
+                            .padding(4)
+                            .help("\(badge) need you")
                     }
                 }
                 Spacer(minLength: 0)
@@ -718,7 +708,6 @@ public final class PetWindowController: NSObject {
         }
         hosting.imageProvider = { [weak self] in self?.model.currentFrame?.displayImage }
         hosting.attentionBadgeVisibleProvider = { [weak self] in self?.model.badgeText != nil }
-        hosting.activeBadgeVisibleProvider = { [weak self] in self?.model.activeBadgeText != nil }
         hosting.accessibilityValueProvider = { [weak self] in
             self?.model.accessibilityValue ?? "Pet status unavailable"
         }

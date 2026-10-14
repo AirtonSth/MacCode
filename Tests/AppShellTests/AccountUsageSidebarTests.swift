@@ -52,39 +52,113 @@ final class AccountUsageSidebarTests: XCTestCase {
         XCTAssertEqual(SidebarRootView.lastUpdatedLabel(now.addingTimeInterval(60), now: now), "Updated just now")
     }
 
-    // MARK: - Card subtitle
+    // MARK: - Footer rings
 
-    func test_subtitle_signedOut_asksToSignInEvenWithLocalUsage() {
-        // WHY: account usage is refreshed only for a signed-in account, so the
-        // signed-out card must say why it shows no account figures.
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    func test_ringProgress_prefersLiveSessionOverWeekly_likeTheIOSRings() {
+        // WHY: the paired iPhone rings read session ?? weekly (digest "today").
+        // A different rule here would show two numbers for one account.
+        let usage = ProviderTokenUsage(
+            provider: .claude,
+            currentSessionUsedPercent: 12,
+            currentSessionResetsAt: now.addingTimeInterval(3_600),
+            weeklyUsedPercent: 90,
+            weeklyResetsAt: now.addingTimeInterval(86_400)
+        )
+        XCTAssertEqual(try XCTUnwrap(AccountUsageDisplay.ringProgress(usage, now: now)), 0.12, accuracy: 0.0001)
+    }
+
+    func test_ringProgress_expiredSessionFallsBackToWeekly() {
+        let usage = ProviderTokenUsage(
+            provider: .codex,
+            currentSessionUsedPercent: 70,
+            currentSessionResetsAt: now.addingTimeInterval(-60),
+            weeklyUsedPercent: 42,
+            weeklyResetsAt: now.addingTimeInterval(86_400)
+        )
+        XCTAssertEqual(try XCTUnwrap(AccountUsageDisplay.ringProgress(usage, now: now)), 0.42, accuracy: 0.0001)
+    }
+
+    func test_ringProgress_nothingLoaded_isNilNotZero() {
+        // WHY: an unloaded provider must draw a faint "no data" ring, never a
+        // ring that reads as 0% used.
+        XCTAssertNil(AccountUsageDisplay.ringProgress(ProviderTokenUsage(provider: .grok), now: now))
+    }
+
+    func test_ringProgress_expiredWeekReadsZero_andOverLimitClampsToFull() {
+        let expired = ProviderTokenUsage(provider: .grok, weeklyUsedPercent: 56, weeklyResetsAt: now.addingTimeInterval(-1))
+        XCTAssertEqual(AccountUsageDisplay.ringProgress(expired, now: now), 0)
+        let over = ProviderTokenUsage(provider: .grok, weeklyUsedPercent: 130, weeklyResetsAt: now.addingTimeInterval(60))
+        XCTAssertEqual(AccountUsageDisplay.ringProgress(over, now: now), 1)
+    }
+
+    private func mixedSnapshot() -> ProviderUsageSnapshot {
+        ProviderUsageSnapshot(period: .sevenDays, providers: [
+            ProviderTokenUsage(provider: .claude, actualProviderTokens: 27_605_158_124),
+            ProviderTokenUsage(provider: .codex, weeklyUsedPercent: 42, weeklyResetsAt: now.addingTimeInterval(86_400)),
+            ProviderTokenUsage(
+                provider: .grok,
+                currentSessionUsedPercent: 12,
+                currentSessionResetsAt: now.addingTimeInterval(600),
+                weeklyUsedPercent: 56,
+                weeklyResetsAt: now.addingTimeInterval(86_400)
+            ),
+            ProviderTokenUsage(provider: .distill, actualProviderTokens: 3_852_818_295, weeklyUsedPercent: 99)
+        ])
+    }
+
+    func test_ringsAccessibilityValue_readsEveryProviderAndSkipsDistill() {
+        // WHY: the rings are the only always-visible usage signal, so VoiceOver
+        // must hear each real percentage and which window it is from; a missing
+        // probe says "not loaded" and Distill never joins Claude/Codex/Grok
+        // (the old footer summed it into a lifetime "40361M").
         XCTAssertEqual(
-            AccountUsageDisplay.subtitle(signedIn: false, usedTokens: 5_000),
-            "Sign in to track Claude + Codex + Grok usage"
+            AccountUsageDisplay.ringsAccessibilityValue(signedIn: true, snapshot: mixedSnapshot(), now: now),
+            "Claude not loaded, Codex week 42%, Grok session 12%"
         )
     }
 
-    func test_subtitle_signedIn_reportsUsedTokensAcrossProviders() {
+    func test_ringsHelp_listsRingsOuterToInnerAndOffersDetails() {
         XCTAssertEqual(
-            AccountUsageDisplay.subtitle(signedIn: true, usedTokens: 1_355_000),
-            "Used 1.4M in Claude + Codex + Grok"
+            AccountUsageDisplay.ringsHelp(signedIn: true, snapshot: mixedSnapshot(), now: now),
+            "Account usage\nClaude not loaded\nCodex week 42%\nGrok session 12%\nClick for details"
         )
     }
 
-    func test_subtitle_signedInWithoutUsage_doesNotInventAFigure() {
+    func test_rings_signedOut_askToSignInInsteadOfShowingFigures() {
+        // WHY: account usage refreshes only for a signed-in account, so the
+        // signed-out rings must say why they show nothing.
         XCTAssertEqual(
-            AccountUsageDisplay.subtitle(signedIn: true, usedTokens: 0),
-            "No provider usage recorded yet"
+            AccountUsageDisplay.ringsAccessibilityValue(signedIn: false, snapshot: mixedSnapshot(), now: now),
+            "Sign in to track Claude, Codex and Grok usage"
+        )
+        XCTAssertEqual(
+            AccountUsageDisplay.ringsHelp(signedIn: false, snapshot: mixedSnapshot(), now: now),
+            "Sign in to track Claude, Codex and Grok usage"
         )
     }
 
-    func test_formatTokenCount_switchesToMillionsAtOneMillion() {
-        // WHY: million-scale totals must read as "M", not as four-digit "K"
-        // (e.g. 1909K). The threshold is exactly 1M.
-        XCTAssertEqual(AccountUsageDisplay.formatTokenCount(99_000), "99K")
-        XCTAssertEqual(AccountUsageDisplay.formatTokenCount(480_000), "480K")
-        XCTAssertEqual(AccountUsageDisplay.formatTokenCount(1_000_000), "1.0M")
-        XCTAssertEqual(AccountUsageDisplay.formatTokenCount(999_999), "1000K")
-        XCTAssertEqual(AccountUsageDisplay.formatTokenCount(950), "950")
+    func test_footer_mountsRingsLeftOfInsomniaToggleInsteadOfAFullWidthRow() throws {
+        // WHY: the owner asked for subtle rings beside Insomnia, not a second
+        // full-width "Account usage" row; both Workspaces and Bots share this footer.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let sidebar = try String(contentsOf: root.appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        let footerStart = try XCTUnwrap(sidebar.range(of: "private var footerUtilityControls: some View {"))
+        let footer = String(sidebar[footerStart.upperBound...].prefix(400))
+        XCTAssertFalse(footer.contains("AccountUsageSidebarControl"), "no standalone account-usage row")
+        let rowStart = try XCTUnwrap(sidebar.range(of: "private var insomniaControl: some View {"))
+        let row = String(sidebar[rowStart.upperBound...].prefix(600))
+        let rings = try XCTUnwrap(row.range(of: "AccountUsageSidebarControl(vm: vm, onOpenAccount: onOpenAccount)"))
+        let toggle = try XCTUnwrap(row.range(of: "insomniaToggle"))
+        XCTAssertLessThan(rings.lowerBound, toggle.lowerBound, "rings sit to the left of the toggle")
+        let control = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/AccountUsageSidebarControl.swift"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(control.contains("chart.bar.xaxis"))
+        XCTAssertFalse(control.contains("in Claude + Codex + Grok"), "the lifetime token sum is gone from the footer")
     }
 
     // MARK: - Provider captions

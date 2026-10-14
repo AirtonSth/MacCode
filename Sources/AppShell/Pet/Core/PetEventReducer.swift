@@ -230,7 +230,7 @@ public struct PetEventReducer: Sendable {
         )
     }
 
-    /// Agent work poses that must not stick when host Active (blue badge) is zero.
+    /// Agent work poses that must not stick when the host Active list is empty.
     ///
     /// Includes coding/plan-thinking and decorative laptop/hard-hat variants.
     /// Excludes short surface flashes (files editing, browser search) which are

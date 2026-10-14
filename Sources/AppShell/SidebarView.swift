@@ -2022,10 +2022,6 @@ public struct SidebarRootView: View {
 
     private var footerUtilityControls: some View {
         VStack(alignment: .leading, spacing: 0) {
-            AccountUsageSidebarControl(vm: vm, onOpenAccount: onOpenAccount)
-                .padding(.horizontal, DS.Space.md)
-                .padding(.top, vm.privateAccountUser == nil ? 0 : DS.Space.md)
-
             insomniaControl
                 .padding(.horizontal, DS.Space.md)
                 .padding(.top, DS.Space.sm)
@@ -2132,9 +2128,16 @@ public struct SidebarRootView: View {
         "Insomnia keeps this Mac awake while the toggle is on. Settings can allow display sleep, closed-display sleep, or the screen saver without ending the session."
     }
 
+    /// Account-usage rings sit left of the Insomnia toggle in one row. At the
+    /// 180pt minimum sidebar width the row fits only because the rings' and
+    /// toggle's hit areas carry their own inner margin (no extra row padding,
+    /// no gap between them) and the summary line yields its width first.
     private var insomniaControl: some View {
         HStack(alignment: .center, spacing: DS.Space.sm) {
-            insomniaToggle
+            HStack(spacing: 0) {
+                AccountUsageSidebarControl(vm: vm, onOpenAccount: onOpenAccount)
+                insomniaToggle
+            }
             VStack(alignment: .leading, spacing: 1) {
                 Text("Insomnia")
                     .font(DS.Font.body)
@@ -2145,13 +2148,11 @@ public struct SidebarRootView: View {
                     .foregroundColor(DS.Palette.textTertiary)
                     .lineLimit(1)
             }
-            .frame(height: 32, alignment: .center)
-            Spacer(minLength: 0)
+            .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32, alignment: .leading)
+            .help(insomniaHelpText)
             insomniaOptionsMenu
         }
-        .padding(.horizontal, DS.Space.sm)
         .frame(height: 40)
-        .help(insomniaHelpText)
     }
 
     private var insomniaStateSummary: String {

@@ -392,7 +392,9 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertNil(model.badgeText)
     }
 
-    func test_viewModelFormatsBlueActiveBadgeAndKeepsItIndependentOfReadyCounterSetting() {
+    func test_viewModelCountsActiveThreadsWithoutLightingTheAttentionDot() {
+        // WHY: the pet shows one indicator, a red dot for what needs you. Running
+        // work alone stays in the Active list and accessibility value, never the dot.
         let model = PetViewModel(settings: AppSettings(petEnabled: true))
         let threadA = AgentThreadID(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!)
         let threadB = AgentThreadID(UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")!)
@@ -429,8 +431,8 @@ final class PetWindowAndLifecycleTests: XCTestCase {
 
         model.apply(activeThreads: projected)
         model.apply(activityCounts: PetActivityCounts(running: 2, needsYou: 0, newResults: 0))
-        XCTAssertEqual(model.activeBadgeText, "2")
         XCTAssertEqual(model.activeThreadCount, 2)
+        XCTAssertNil(model.badgeText, "Running work alone must not light the red attention dot.")
         XCTAssertEqual(
             model.accessibilityValue,
             "Activity: 2 running, No items need attention"
@@ -439,9 +441,9 @@ final class PetWindowAndLifecycleTests: XCTestCase {
 
         model.apply(settings: AppSettings(petEnabled: true, petReadyCounterEnabled: false))
         XCTAssertEqual(
-            model.activeBadgeText,
-            "2",
-            "The running badge is independent of the ready-counter preference."
+            model.activeThreadCount,
+            2,
+            "The Active list is independent of the ready-counter preference."
         )
         XCTAssertNil(model.badgeText)
 
@@ -461,7 +463,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         )
 
         model.apply(activeThreads: [])
-        XCTAssertNil(model.activeBadgeText)
+        XCTAssertEqual(model.activeThreadCount, 0)
         XCTAssertEqual(model.accessibilityValue, "Activity: 2 running, No items need attention")
         XCTAssertFalse(model.isPopoverEmpty)
 
@@ -574,7 +576,6 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         defer { controller.stop() }
 
         XCTAssertEqual(controller.modelForTests.activeThreadCount, 0)
-        XCTAssertNil(controller.modelForTests.activeBadgeText)
 
         let runID = AgentRunID()
         let projection = ActiveRunProjection(runs: [
@@ -594,10 +595,9 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             1,
             "Multiple run IDs for one thread still count as one active thread."
         )
-        XCTAssertEqual(controller.modelForTests.activeBadgeText, "1")
         XCTAssertNil(
             controller.modelForTests.badgeText,
-            "Red ready badge remains gated by petReadyCounterEnabled and independent of active runs."
+            "Red attention dot remains gated by petReadyCounterEnabled and independent of active runs."
         )
         let row = try XCTUnwrap(controller.modelForTests.activeThreads.first)
         XCTAssertEqual(row.title, "Agent run in progress")
@@ -616,7 +616,6 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         )
         try await Task.sleep(nanoseconds: 30_000_000)
         XCTAssertEqual(controller.modelForTests.activeThreadCount, 0)
-        XCTAssertNil(controller.modelForTests.activeBadgeText)
     }
 
     func test_itemStartedProgressRepublishKeepsElapsedAndUpdatesLastUpdatePreview() async throws {

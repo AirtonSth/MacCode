@@ -214,6 +214,30 @@ final class PetWindowAccessibilityTests: XCTestCase {
         XCTAssertNotEqual(identifier, PetAccessibilityIdentifier.row(raw + "-other"))
     }
 
+    func test_petShowsOnlyARedAttentionDotDrivenByNeedsYou() throws {
+        // WHY: the owner wants one quiet indicator on the pet — a red dot while
+        // something needs them — not a blue running count plus an "N need you" pill.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let window = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/Pet/PetWindowController.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(window.range(of: "private struct PetSpriteView: View {"))
+        let sprite = String(window[start.upperBound...].prefix(1_800))
+        XCTAssertFalse(sprite.contains("Circle().fill(Color.blue)"), "no blue running-count badge")
+        XCTAssertFalse(sprite.contains("Capsule().fill(Color.red)"), "no red pill")
+        XCTAssertFalse(sprite.contains("Text(\"\\(badge) need you\")"), "no visible \"need you\" text")
+        XCTAssertFalse(window.contains("activeBadgeVisibleProvider"), "the old blue badge corner must not catch clicks")
+        let dot = try XCTUnwrap(sprite.range(of: "if let badge = model.badgeText {"))
+        XCTAssertTrue(
+            sprite[dot.upperBound...].hasPrefix("\n                        Circle()\n                            .fill(Color.red)"),
+            "the dot is a red circle gated on the needs-you count (badgeText)"
+        )
+        XCTAssertTrue(sprite.contains(".help(\"\\(badge) need you\")"), "the count stays readable on hover")
+        XCTAssertTrue(sprite.contains(".accessibilityValue(model.accessibilityValue)"))
+    }
+
     func test_spriteExposesButtonRoleAndDefaultPressAction() throws {
         let controller = try controller()
         defer { controller.stop() }

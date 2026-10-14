@@ -3,7 +3,7 @@ import Persistence
 import SwiftUI
 
 /// The sprite frame lives apart from PetViewModel so a 2-7 fps animation tick redraws
-/// only the image, not the badges, accessibility value or popover that observe the model.
+/// only the image, not the attention dot, accessibility value or popover that observe the model.
 @MainActor
 final class PetFrameModel: ObservableObject {
     @Published fileprivate(set) var image: NSImage?
@@ -35,11 +35,6 @@ public final class PetViewModel: ObservableObject {
             count: activityCounts.needsYou,
             isEnabled: settings.petReadyCounterEnabled
         )
-    }
-
-    /// Blue badge: unique active agent threads. Not gated by the ready-counter setting.
-    public var activeBadgeText: String? {
-        PetActiveThreadCountFormatter.badgeText(count: activeThreadCount)
     }
 
     public var accessibilityValue: String {

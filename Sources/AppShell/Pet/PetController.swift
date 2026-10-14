@@ -574,7 +574,7 @@ public final class PetController {
         }
         apply(reduction)
         // Invariant: work/plan (laptop, hard-hat, thinking, coding…) only while the
-        // blue Active badge is non-zero. EventBus can insert ghost run ids when
+        // Active list (model.activeThreads) is non-empty. EventBus can insert ghost run ids when
         // finish is missed; host coordinator Active is the sole authority.
         if Self.shouldResyncActiveRuns(after: domainEvent) {
             // A lifecycle event can arrive before the coordinator publishes its
@@ -833,7 +833,7 @@ public final class PetController {
     private func apply(_ reduction: PetEventReduction) {
         applyTransientTimerDirective(reduction.transientTimerDirective)
         var nextState = reduction.state
-        // Hard rule: no work/plan pose without a blue Active badge. Projection
+        // Hard rule: no work/plan pose without an Active list row. Projection
         // and EventBus can diverge; the visible Active list is authoritative.
         if model.activeThreads.isEmpty,
            reducer.activeRunCount > 0 || PetEventReducer.isWorkPose(nextState) {
@@ -1456,7 +1456,7 @@ public final class PetController {
         // the work-base set — using reducer.state cancelled the next work countdown
         // and re-froze the laptop pose for a full 35–55s after every variant.
         //
-        // activeRunCount = blue Active badge (model.activeThreads), not EventBus
+        // activeRunCount = Active list (model.activeThreads), not EventBus
         // ghost run ids. Work variants (laptop/hard-hat) must not play with zero
         // Active rows — that was the "working with no badge" stick.
         return PetCompanionEligibility(
