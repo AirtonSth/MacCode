@@ -18,7 +18,7 @@ final class BotVMExecutionTests: XCTestCase {
         // WHY: one VM runs one thread at a time; only a different thread must be queued.
         let registry = BotVMRunRegistry()
         registry.begin(botID: botID, entry: entry())
-        XCTAssertEqual(registry.busyMessage(botID: botID, threadID: threadB), "bot ocupado em Tarefa A")
+        XCTAssertEqual(registry.busyMessage(botID: botID, threadID: threadB), "The bot is busy in Tarefa A")
         XCTAssertNil(registry.busyMessage(botID: botID, threadID: threadA))
     }
 

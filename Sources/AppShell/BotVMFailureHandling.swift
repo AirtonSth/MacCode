@@ -87,7 +87,7 @@ extension AppCommandRouter {
     }
 
     nonisolated static func botVMBusyNotice(holderTitle: String) -> String {
-        "bot ocupado em \(holderTitle)"
+        "The bot is busy in \(holderTitle)"
     }
 
     /// Queues `thread` behind the run holding the bot's VM and shows the

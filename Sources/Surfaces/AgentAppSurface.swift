@@ -9352,7 +9352,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     workspace: actorThread?.worktreePath ?? embedding?.executionCwd ?? cwd
                 )
                 if let holder = claimVM(botID, entry) {
-                    let notice = "bot ocupado em \(holder.title)"
+                    let notice = "The bot is busy in \(holder.title)"
                     botVMClaimRefusal = (botID, notice, tid)
                     if selectedThreadId == tid { statusMessage = notice }
                     return nil

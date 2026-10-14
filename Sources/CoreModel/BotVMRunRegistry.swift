@@ -119,6 +119,6 @@ public final class BotVMRunRegistry: @unchecked Sendable {
 
     public func busyMessage(botID: BotID, threadID: AgentThreadID) -> String? {
         guard let entry = active(botID: botID), entry.threadID != threadID else { return nil }
-        return "bot ocupado em \(entry.title)"
+        return "The bot is busy in \(entry.title)"
     }
 }

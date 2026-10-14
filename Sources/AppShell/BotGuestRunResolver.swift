@@ -38,7 +38,7 @@ protocol BotGuestVMPreparing: Sendable {
 ///
 /// One guest run per bot: the registry claim (`tryBegin`) is taken here, at
 /// the spawn point every send path goes through, and refuses another
-/// conversation's run ("bot ocupado"); the coordinator's run-finished callback
+/// conversation's run ("The bot is busy"); the coordinator's run-finished callback
 /// frees it. The per-bot lease then makes the run wait until the previous
 /// run's guest process is dead and its sign-in copies are gone.
 ///
@@ -158,7 +158,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             threadID: request.threadId, runID: request.runId, title: thread.title, workspace: request.cwd
         )
         if let holder = deps.registry.tryBegin(botID: botID, entry: claim) {
-            throw DistillGuestLaunchError.busy("bot ocupado em \(holder.title)")
+            throw DistillGuestLaunchError.busy("The bot is busy in \(holder.title)")
         }
         // From here the claim is the coordinator's to free (run finished,
         // which also fires for a failed start): freeing it here would skip

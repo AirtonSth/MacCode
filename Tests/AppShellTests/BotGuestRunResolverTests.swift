@@ -684,7 +684,7 @@ final class BotGuestRunResolverTests: XCTestCase {
             _ = try await f.resolver.prepare(request(second)) { _ in }
             XCTFail("the second conversation must not get the bot")
         } catch {
-            XCTAssertEqual(error as? DistillGuestLaunchError, .busy("bot ocupado em First chat"))
+            XCTAssertEqual(error as? DistillGuestLaunchError, .busy("The bot is busy in First chat"))
         }
         gate.signal()
         let plan = try unwrapPlan(try await firstRun.value)
