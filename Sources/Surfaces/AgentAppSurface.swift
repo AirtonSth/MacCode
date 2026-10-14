@@ -1132,8 +1132,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard embedding == nil else { return }
         AgentGitHeaderLoader.shared.load(cwd: cwd, owner: self) { [weak self] header in
             guard let self, !self.isDisposed else { return }
-            self.gitBranch = header.branch
-            self.gitSummary = header.summary.isGitRepo ? header.summary : nil
+            let summary = header.summary.isGitRepo ? header.summary : nil
+            // Unchanged values still fire objectWillChange and rebuild the view.
+            if self.gitBranch != header.branch { self.gitBranch = header.branch }
+            if self.gitSummary != summary { self.gitSummary = summary }
         }
     }
 
@@ -6561,6 +6563,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if trackedRunId(for: threadId) != nil { return true }
         // LaunchAgent-owned scheduled runs have no local coordinator session.
         return isScheduledThreadRunning?(threadId) == true
+    }
+
+    /// `isThreadStartingOrRunning` for a whole rail pass: one coordinator lock
+    /// instead of one per thread on every AgentAppView body (perf).
+    public func startingOrRunningThreadIds(among threads: [AgentThread]) -> Set<AgentThreadID> {
+        var ids = Set(runThreads.values).union(coordinator.activeThreadIdsSnapshot())
+        if let isScheduledThreadRunning {
+            for thread in threads where !ids.contains(thread.id) && isScheduledThreadRunning(thread.id) {
+                ids.insert(thread.id)
+            }
+        }
+        return ids
     }
 
     /// S5: Stop/Escape/Send concurrency — includes pre-run preparation.
@@ -15316,9 +15330,7 @@ public struct AgentAppView: View {
         ) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
-                    let runningThreadIds = Set(vm.filteredThreads.compactMap { thread in
-                        vm.isThreadStartingOrRunning(thread.id) ? thread.id : nil
-                    })
+                    let runningThreadIds = vm.startingOrRunningThreadIds(among: vm.filteredThreads)
                     let now = vm.currentTime()
                     ForEach(vm.filteredThreads, id: \.id) { t in
                         threadRow(t, running: runningThreadIds.contains(t.id), now: now)

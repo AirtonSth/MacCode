@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import AppShell
 
 /// Contract for the "Connect from anywhere" default and the sidebar header
@@ -109,6 +110,45 @@ final class TailcatConnectionStatusTests: XCTestCase {
             .off,
             "notifications without a parseable rawStatus must not change the badge state"
         )
+    }
+
+    // MARK: - Settings status re-posts
+
+    /// WHY: the Tailcat poll re-posts `.active` every 15 s with no change.
+    /// Each @Published assignment re-evaluates the whole Settings form, so an
+    /// unchanged status must not republish, while a real change still lands.
+    /// The supervisor keeps re-posting on purpose: it corrects statuses the
+    /// Settings VM set locally, so the dedupe belongs in the consumer.
+    func test_repeatedRuntimeStatusDoesNotRepublishSettings_butChangesStillLand() async throws {
+        let (controller, _) = try makeSettingsController()
+        defer { close(controller) }
+        let vm = controller.viewModel
+        await drainUntil(false, timeout: 0.2)
+
+        func post(_ status: TailcatRuntimeStatus) {
+            NotificationCenter.default.post(
+                name: .rc2TailcatRuntimeStatusChanged,
+                object: nil,
+                userInfo: ["status": status.displayText, "rawStatus": status.rawValue]
+            )
+        }
+        post(.active)
+        let landed = await drainUntil(vm.tailcatAccessStatus == TailcatRuntimeStatus.active.displayText)
+        XCTAssertTrue(landed, "a real status change must reach Settings")
+
+        var publishes = 0
+        let subscription = vm.objectWillChange.sink { publishes += 1 }
+        defer { subscription.cancel() }
+        post(.active)
+        post(.active)
+        await drainUntil(false, timeout: 0.2)
+        print("PERF_COUNT name=settings.tailcatRepeatedActive.publishes value=\(publishes)")
+        XCTAssertEqual(publishes, 0, "two unchanged .active re-posts must not re-render Settings")
+
+        post(.unavailable)
+        let changed = await drainUntil(vm.tailcatAccessStatus == TailcatRuntimeStatus.unavailable.displayText)
+        XCTAssertTrue(changed, "a later different status must still land after the dedupe")
+        XCTAssertEqual(publishes, 1)
     }
 
     // MARK: - Helpers

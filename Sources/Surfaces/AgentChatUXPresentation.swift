@@ -606,6 +606,12 @@ public enum AgentUltracodeBorderPresentation {
     public static func isAnimated(reduceMotion: Bool) -> Bool {
         !reduceMotion
     }
+
+    /// The rotation only advances where someone can see it: a key window with the
+    /// composer on screen. Otherwise it holds its angle instead of ticking at 30 Hz.
+    public static func isTicking(reduceMotion: Bool, windowIsKey: Bool, onScreen: Bool) -> Bool {
+        isAnimated(reduceMotion: reduceMotion) && windowIsKey && onScreen
+    }
 }
 
 // MARK: - Completed work density (perf)

@@ -115,16 +115,53 @@ public enum BotsChrome {
 
     /// Painted avatar ink. Blobatar uses the figure head; leftover SF chips
     /// keep the handle swatch so roster highlight matches the glyph.
+    /// The roster calls this per visible row on every BotsViewModel publish
+    /// (30 Hz while a desk streams); the ink is a pure function of its inputs,
+    /// so a full figure is built once per (name, handle, symbol).
     public static func identityHex(name: String, handle: String, symbol: String) -> UInt32 {
+        let key = IdentityKey(name: name, handle: handle, symbol: symbol)
+        if let cached = identityHexCache.value(for: key) { return cached }
+        identityHexComputeCountForTesting += 1
+        let hex: UInt32
         if let spec = BotBlobatarSpec.parse(symbol) {
-            return BotBlobatar.figure(
+            hex = BotBlobatar.figure(
                 name: name.isEmpty ? handle : name,
                 spec: spec,
                 handle: handle
             ).palette.head
+        } else {
+            hex = avatarHex(for: handle)
         }
-        return avatarHex(for: handle)
+        identityHexCache.store(hex, for: key)
+        return hex
     }
+
+    nonisolated(unsafe) static var identityHexComputeCountForTesting = 0
+
+    private struct IdentityKey: Hashable {
+        let name: String
+        let handle: String
+        let symbol: String
+    }
+
+    private final class IdentityHexCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [IdentityKey: UInt32] = [:]
+
+        func value(for key: IdentityKey) -> UInt32? {
+            lock.lock(); defer { lock.unlock() }
+            return values[key]
+        }
+
+        func store(_ value: UInt32, for key: IdentityKey) {
+            lock.lock(); defer { lock.unlock() }
+            // Renames/re-skins add keys; a small roster never reaches this.
+            if values.count >= 512 { values.removeAll(keepingCapacity: true) }
+            values[key] = value
+        }
+    }
+
+    private static let identityHexCache = IdentityHexCache()
 
     public static func identityColor(name: String, handle: String, symbol: String) -> Color {
         Color(hex: identityHex(name: name, handle: handle, symbol: symbol))

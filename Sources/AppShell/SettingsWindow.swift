@@ -487,7 +487,12 @@ public final class SettingsViewModel: ObservableObject {
             forName: .rc2TailcatRuntimeStatusChanged, object: nil, queue: .main
         ) { [weak self] notification in
             guard let status = notification.userInfo?["status"] as? String else { return }
-            Task { @MainActor [weak self] in self?.tailcatAccessStatus = status }
+            // The Tailcat poll re-posts an unchanged .active every 15 s; an equal
+            // @Published write would still re-render the whole Settings form.
+            Task { @MainActor [weak self] in
+                guard let self, self.tailcatAccessStatus != status else { return }
+                self.tailcatAccessStatus = status
+            }
         })
         changeObservers.append(NotificationCenter.default.addObserver(
             forName: .petSettingsDidChange, object: nil, queue: .main

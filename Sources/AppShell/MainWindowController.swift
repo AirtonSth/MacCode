@@ -1408,6 +1408,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             return
         }
         let host = NSHostingView(rootView: ScheduledTasksRootView(vm: vm))
+        // Pinned to all edges: only the root's 980x680 minimum matters (its ideal
+        // size equals it), so skip the intrinsic/max passes on every publish.
+        host.sizingOptions = [.minSize]
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
         host.layer?.backgroundColor = DS.NS.bg.cgColor
