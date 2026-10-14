@@ -1156,7 +1156,7 @@ struct ActivityRootView: View {
                 if !item.changed_files.isEmpty {
                     detailSection("Changes") {
                         ForEach(item.changed_files, id: \.self) { path in
-                            if canViewChanges(item) {
+                            if canOpen(item), canViewChanges(item) {
                                 Button { openEvidence(item, path) } label: {
                                     Text(path).font(DS.Font.monoSmall).lineLimit(1).truncationMode(.middle)
                                 }.buttonStyle(.link).help(path).accessibilityLabel("View \(path)")
