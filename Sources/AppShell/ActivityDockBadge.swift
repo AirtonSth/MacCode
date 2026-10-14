@@ -1,4 +1,5 @@
 import AppKit
+import os
 
 /// Red Dock-icon badge carrying the global needs-you count: the same number
 /// and "99+" cap as the pet's dot. Fed by the shared activity projection the
@@ -9,6 +10,7 @@ final class ActivityDockBadge {
     private let apply: (String?) -> Void
     private var observer: UUID?
     private var appliedLabel: String??
+    private static let log = Logger(subsystem: "io.remotecode.app", category: "dock")
 
     init(
         projection: PetActivityCountsProjection = .shared,
@@ -43,5 +45,6 @@ final class ActivityDockBadge {
         guard appliedLabel != .some(label) else { return }
         appliedLabel = .some(label)
         apply(label)
+        Self.log.info("dock.badge label=\(label ?? "none", privacy: .public)")
     }
 }

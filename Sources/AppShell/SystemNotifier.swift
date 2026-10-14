@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import UserNotifications
+import os
 import Persistence
 
 // MARK: - NotificationCenterClient DI seam (QA :96)
@@ -119,6 +120,11 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         super.init()
     }
 
+    /// `.badge` is what lets the Dock icon show the needs-you count: without
+    /// it macOS keeps "Badge application icon" off and hides the badge.
+    static let authorizationOptions: UNAuthorizationOptions = [.alert, .sound, .badge]
+    private static let log = Logger(subsystem: "io.remotecode.app", category: "notifications")
+
     private static var canUseNotificationCenter: Bool {
         Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
     }
@@ -150,8 +156,13 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
                 options: []
             )
         ])
-        notificationCenterClient.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+        notificationCenterClient.requestAuthorization(options: Self.authorizationOptions) { [notificationCenterClient] granted, _ in
             self.authorized = granted
+            // The Dock badge only shows while macOS allows badges for the app.
+            Task {
+                let badge = await notificationCenterClient.notificationSettings().badgeSetting
+                Self.log.info("notifications.authorized granted=\(granted, privacy: .public) badge=\(badge.rawValue, privacy: .public)")
+            }
         }
     }
 
@@ -261,7 +272,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         if authorized {
             deliver()
         } else {
-            notificationCenterClient.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            notificationCenterClient.requestAuthorization(options: Self.authorizationOptions) { granted, _ in
                 self.authorized = granted
                 if granted { deliver() }
             }

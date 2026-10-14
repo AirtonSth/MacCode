@@ -270,23 +270,16 @@ private struct PetSpriteView: View {
 
             VStack {
                 HStack(alignment: .top) {
+                    // Blue (left): agent threads running now. Red (right): what
+                    // needs you. Both carry their count, capped at "99+".
+                    if let active = model.activeBadgeText {
+                        PetCountDot(text: active, color: .blue)
+                            .help("\(active) running")
+                            .accessibilityIdentifier("pet.activeBadge")
+                    }
                     Spacer(minLength: 0)
-                    // The pet's only indicator: a red dot carrying the needs-you
-                    // count (capped at "99+"). One digit stays a circle; more
-                    // digits stretch it, so the dot never clips its number.
                     if let badge = model.badgeText {
-                        Text(badge)
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                            .fixedSize()
-                            .padding(.horizontal, 3.5)
-                            .frame(minWidth: 16, minHeight: 16)
-                            .background(Capsule().fill(Color.red))
-                            .overlay(Capsule().stroke(Color.white.opacity(0.9), lineWidth: 1.5))
-                            .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
-                            .padding(4)
+                        PetCountDot(text: badge, color: .red)
                             .help("\(badge) need you")
                     }
                 }
@@ -303,6 +296,28 @@ private struct PetSpriteView: View {
     }
 
 
+}
+
+/// A count on a colored dot. One digit stays a circle; more digits stretch it,
+/// so the dot never clips its number.
+private struct PetCountDot: View {
+    let text: String
+    let color: Color
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .monospacedDigit()
+            .foregroundColor(.white)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 3.5)
+            .frame(minWidth: 16, minHeight: 16)
+            .background(Capsule().fill(color))
+            .overlay(Capsule().stroke(Color.white.opacity(0.9), lineWidth: 1.5))
+            .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
+            .padding(4)
+    }
 }
 
 private struct PetAttentionPopoverView: View {
@@ -715,6 +730,7 @@ public final class PetWindowController: NSObject {
         }
         hosting.imageProvider = { [weak self] in self?.model.currentFrame?.displayImage }
         hosting.attentionBadgeVisibleProvider = { [weak self] in self?.model.badgeText != nil }
+        hosting.activeBadgeVisibleProvider = { [weak self] in self?.model.activeBadgeText != nil }
         hosting.accessibilityValueProvider = { [weak self] in
             self?.model.accessibilityValue ?? "Pet status unavailable"
         }

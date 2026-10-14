@@ -214,10 +214,11 @@ final class PetWindowAccessibilityTests: XCTestCase {
         XCTAssertNotEqual(identifier, PetAccessibilityIdentifier.row(raw + "-other"))
     }
 
-    func test_petShowsOnlyARedAttentionDotCarryingTheNeedsYouCount() throws {
-        // WHY: the owner wants one indicator on the pet — no blue running count,
-        // no "N need you" pill — and (2026-10-14) the red dot itself must show
-        // how many items need them, capped at 99+ so it stays a small dot.
+    func test_petShowsABlueRunningDotLeftAndARedNeedsYouDotRight() throws {
+        // WHY: the owner wants two counts on the pet (2026-10-14): a blue dot on
+        // the left with the agent threads running now, and the red dot on the
+        // right with what needs them. Both capped at 99+, one shared look, and
+        // both corners clickable. No "N need you" pill.
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let window = try String(
@@ -226,20 +227,49 @@ final class PetWindowAccessibilityTests: XCTestCase {
         )
         let start = try XCTUnwrap(window.range(of: "private struct PetSpriteView: View {"))
         let sprite = String(window[start.upperBound...].prefix(2_200))
-        XCTAssertFalse(sprite.contains("Circle().fill(Color.blue)"), "no blue running-count badge")
         XCTAssertFalse(sprite.contains("Text(\"\\(badge) need you\")"), "no visible \"need you\" text")
-        XCTAssertFalse(window.contains("activeBadgeVisibleProvider"), "the old blue badge corner must not catch clicks")
-        let dot = try XCTUnwrap(sprite.range(of: "if let badge = model.badgeText {"))
-        let body = String(sprite[dot.upperBound...].prefix(700))
-        XCTAssertTrue(body.hasPrefix("\n                        Text(badge)"), "the dot prints the count")
-        XCTAssertTrue(body.contains(".background(Capsule().fill(Color.red))"), "on a red dot")
-        XCTAssertTrue(body.contains(".frame(minWidth: 16, minHeight: 16)"), "one digit stays a round dot")
+        let blue = try XCTUnwrap(sprite.range(of: "PetCountDot(text: active, color: .blue)"))
+        let spacer = try XCTUnwrap(sprite.range(of: "Spacer(minLength: 0)"))
+        let red = try XCTUnwrap(sprite.range(of: "PetCountDot(text: badge, color: .red)"))
+        XCTAssertLessThan(blue.lowerBound, spacer.lowerBound, "blue sits on the left")
+        XCTAssertLessThan(spacer.lowerBound, red.lowerBound, "red sits on the right")
+        XCTAssertTrue(sprite.contains("if let active = model.activeBadgeText {"), "blue counts active threads")
+        XCTAssertTrue(sprite.contains("if let badge = model.badgeText {"), "red counts needs-you items")
         XCTAssertTrue(sprite.contains(".help(\"\\(badge) need you\")"), "the count stays readable on hover")
         XCTAssertTrue(sprite.contains(".accessibilityValue(model.accessibilityValue)"))
+        let dotStart = try XCTUnwrap(window.range(of: "private struct PetCountDot: View {"))
+        let dot = String(window[dotStart.upperBound...].prefix(700))
+        XCTAssertTrue(dot.contains("Text(text)"), "the dot prints the count")
+        XCTAssertTrue(dot.contains(".frame(minWidth: 16, minHeight: 16)"), "one digit stays a round dot")
+        XCTAssertTrue(window.contains("hosting.activeBadgeVisibleProvider = { [weak self] in self?.model.activeBadgeText != nil }"),
+                      "the blue corner catches clicks like the red one")
+
+        let model = PetViewModel(settings: AppSettings(petEnabled: true))
+        XCTAssertNil(model.activeBadgeText, "no blue dot while nothing runs")
+        XCTAssertEqual(PetActiveThreadCountFormatter.badgeText(count: 3), "3")
+        XCTAssertEqual(PetActiveThreadCountFormatter.badgeText(count: 250), "99+")
         XCTAssertEqual(PetAttentionCountFormatter.badgeText(count: 7), "7")
-        XCTAssertEqual(PetAttentionCountFormatter.badgeText(count: 99), "99")
         XCTAssertEqual(PetAttentionCountFormatter.badgeText(count: 100), "99+", "capped so the dot stays small")
         XCTAssertNil(PetAttentionCountFormatter.badgeText(count: 0), "no dot when nothing needs you")
+    }
+
+    func test_activeDotCornerIsOpaqueOnlyWhileTheBlueDotShows() throws {
+        // WHY: a transparent pixel passes the click to the desktop. The blue
+        // dot's corner must catch it while the dot shows, and only then.
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: 120, height: 120, bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let transparent = try XCTUnwrap(context.makeImage())
+        let hosting = PetSpriteHostingView(rootView: Color.clear)
+        hosting.frame = CGRect(x: 0, y: 0, width: 120, height: 120)
+        hosting.imageProvider = { transparent }
+        var visible = false
+        hosting.activeBadgeVisibleProvider = { visible }
+        let corner = CGPoint(x: 10, y: 110)
+        XCTAssertFalse(hosting.isOpaque(at: corner), "no dot: the transparent corner clicks through")
+        visible = true
+        XCTAssertTrue(hosting.isOpaque(at: corner), "the top-left blue dot catches the click")
     }
 
     func test_spriteExposesButtonRoleAndDefaultPressAction() throws {

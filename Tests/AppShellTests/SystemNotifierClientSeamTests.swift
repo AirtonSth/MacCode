@@ -266,4 +266,10 @@ final class SystemNotifierClientSeamTests: XCTestCase {
             "SystemNotifier.shared must use LiveNotificationCenterClient so production " +
             "notification posting is unaffected when no client is injected")
     }
+
+    func test_authorizationAsksForBadges_becauseTheDockCountNeedsThem() {
+        // WHY: the owner saw no Dock badge. macOS hides an app's Dock badge
+        // unless the app asked for `.badge` ("Badge application icon").
+        XCTAssertEqual(SystemNotifier.authorizationOptions, [.alert, .sound, .badge])
+    }
 }

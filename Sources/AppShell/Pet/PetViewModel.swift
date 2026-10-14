@@ -37,6 +37,12 @@ public final class PetViewModel: ObservableObject {
         )
     }
 
+    /// Blue dot: agent threads running now (the popover's active list). Not
+    /// gated by the ready-counter setting.
+    public var activeBadgeText: String? {
+        PetActiveThreadCountFormatter.badgeText(count: activeThreadCount)
+    }
+
     public var accessibilityValue: String {
         guard activityCounts.isAvailable else { return "Activity status unavailable" }
         let running = activityCounts.running == 1 ? "1 running" : "\(activityCounts.running) running"
