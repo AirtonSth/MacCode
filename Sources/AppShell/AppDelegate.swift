@@ -110,6 +110,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
     public private(set) var petController: PetController?
+    private let activityDockBadge = ActivityDockBadge()
     public var updater: AppUpdateChecking?
     var keyWindowProviderForTests: (() -> NSWindow?)?
     public let channel: ReleaseChannel
@@ -292,6 +293,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         startInProcessScheduledTaskScheduler()
         installScheduledTaskStoreObserver()
         startPetController()
+        activityDockBadge.start()
 
         // start unix socket server
         let socketPath = AppPaths.socketPath(for: channel)

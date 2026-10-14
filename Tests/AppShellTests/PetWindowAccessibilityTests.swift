@@ -214,9 +214,10 @@ final class PetWindowAccessibilityTests: XCTestCase {
         XCTAssertNotEqual(identifier, PetAccessibilityIdentifier.row(raw + "-other"))
     }
 
-    func test_petShowsOnlyARedAttentionDotDrivenByNeedsYou() throws {
-        // WHY: the owner wants one quiet indicator on the pet — a red dot while
-        // something needs them — not a blue running count plus an "N need you" pill.
+    func test_petShowsOnlyARedAttentionDotCarryingTheNeedsYouCount() throws {
+        // WHY: the owner wants one indicator on the pet — no blue running count,
+        // no "N need you" pill — and (2026-10-14) the red dot itself must show
+        // how many items need them, capped at 99+ so it stays a small dot.
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let window = try String(
@@ -224,18 +225,21 @@ final class PetWindowAccessibilityTests: XCTestCase {
             encoding: .utf8
         )
         let start = try XCTUnwrap(window.range(of: "private struct PetSpriteView: View {"))
-        let sprite = String(window[start.upperBound...].prefix(1_800))
+        let sprite = String(window[start.upperBound...].prefix(2_200))
         XCTAssertFalse(sprite.contains("Circle().fill(Color.blue)"), "no blue running-count badge")
-        XCTAssertFalse(sprite.contains("Capsule().fill(Color.red)"), "no red pill")
         XCTAssertFalse(sprite.contains("Text(\"\\(badge) need you\")"), "no visible \"need you\" text")
         XCTAssertFalse(window.contains("activeBadgeVisibleProvider"), "the old blue badge corner must not catch clicks")
         let dot = try XCTUnwrap(sprite.range(of: "if let badge = model.badgeText {"))
-        XCTAssertTrue(
-            sprite[dot.upperBound...].hasPrefix("\n                        Circle()\n                            .fill(Color.red)"),
-            "the dot is a red circle gated on the needs-you count (badgeText)"
-        )
+        let body = String(sprite[dot.upperBound...].prefix(700))
+        XCTAssertTrue(body.hasPrefix("\n                        Text(badge)"), "the dot prints the count")
+        XCTAssertTrue(body.contains(".background(Capsule().fill(Color.red))"), "on a red dot")
+        XCTAssertTrue(body.contains(".frame(minWidth: 16, minHeight: 16)"), "one digit stays a round dot")
         XCTAssertTrue(sprite.contains(".help(\"\\(badge) need you\")"), "the count stays readable on hover")
         XCTAssertTrue(sprite.contains(".accessibilityValue(model.accessibilityValue)"))
+        XCTAssertEqual(PetAttentionCountFormatter.badgeText(count: 7), "7")
+        XCTAssertEqual(PetAttentionCountFormatter.badgeText(count: 99), "99")
+        XCTAssertEqual(PetAttentionCountFormatter.badgeText(count: 100), "99+", "capped so the dot stays small")
+        XCTAssertNil(PetAttentionCountFormatter.badgeText(count: 0), "no dot when nothing needs you")
     }
 
     func test_spriteExposesButtonRoleAndDefaultPressAction() throws {

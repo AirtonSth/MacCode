@@ -271,13 +271,20 @@ private struct PetSpriteView: View {
             VStack {
                 HStack(alignment: .top) {
                     Spacer(minLength: 0)
-                    // The pet's only indicator: a small red dot while something needs
-                    // you. The count lives in the tooltip and the accessibility value.
+                    // The pet's only indicator: a red dot carrying the needs-you
+                    // count (capped at "99+"). One digit stays a circle; more
+                    // digits stretch it, so the dot never clips its number.
                     if let badge = model.badgeText {
-                        Circle()
-                            .fill(Color.red)
-                            .frame(width: 11, height: 11)
-                            .overlay(Circle().stroke(Color.white.opacity(0.9), lineWidth: 1.5))
+                        Text(badge)
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .padding(.horizontal, 3.5)
+                            .frame(minWidth: 16, minHeight: 16)
+                            .background(Capsule().fill(Color.red))
+                            .overlay(Capsule().stroke(Color.white.opacity(0.9), lineWidth: 1.5))
                             .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
                             .padding(4)
                             .help("\(badge) need you")
