@@ -179,10 +179,18 @@ public enum BotBrainCompiler {
     /// Studio already says Test run. Compile listed Active routines only,
     /// so first-chat "test this routine" invented a hop or a schedule fire.
     /// Hermes test runs are live work, not a fake cron. Compile that so
-    /// the model does the Instruction now and does not set Active. Dest
-    /// Source title stays Routine. Schema does not grow a test tool.
+    /// the model does the Instruction when asked and does not set Active.
+    /// It rides on every turn, so it must stay conditional: an unconditional
+    /// "do the Instruction now" turned a bare "oi" into the routine's PR
+    /// merges. Dest Source title stays Routine. Schema does not grow a test tool.
     public static let testRunHonesty =
-        "Test run: do the Instruction now. Does not set Active. \(BotRoutineCopy.testRunHonestyCaption)"
+        "Test run: only when the User request below explicitly asks to test or run a routine, or the turn is a scheduled fire, do that routine's Instruction. A greeting or an unrelated request never starts a routine. Does not set Active. \(BotRoutineCopy.testRunHonestyCaption)"
+
+    /// Follows the routine list. The list is a summary so the bot knows its
+    /// routines without carrying (and obeying) every multi-KB Instruction on
+    /// every turn; the full text stays one bot_get_settings call away.
+    public static let routinesReferenceOnly =
+        "Routines above are reference only, each with the first line of its Instruction; \(BotStandingInstructions.getSettingsTool) returns the full text. Do not act on them in this turn unless one fires on schedule or the User request below asks for it."
 
     /// Memory lives in Files. A leftover Memory / fact write on
     /// set_settings used to return an empty success, so first-chat
@@ -381,6 +389,9 @@ public enum BotBrainCompiler {
         if let description = descriptionLine(revision.description) {
             lines.append(description)
         }
+        // Before Instructions, so a custom soul that asks for another
+        // style still has the last word.
+        lines.append(BotStandingInstructions.replyStyleLine)
         let soul = BotStandingInstructions.resolved(
             name: bot.name,
             title: revision.title,
@@ -419,11 +430,13 @@ public enum BotBrainCompiler {
             // "which are Active?" cannot invent a hop. Off stays out.
             lines.append("Routines (not while the app is closed):")
             lines.append(contentsOf: liveRoutines.map(Self.routineLine))
+            lines.append(routinesReferenceOnly)
         }
         // Studio already says Test run. Compile that name so first-chat
         // "test this routine" cannot invent a hop or a schedule fire.
-        // Do the Instruction now. Does not set Active. Dest Source title
-        // stays Routine. Schema does not grow a test tool.
+        // Only an explicit ask or a scheduled fire runs the Instruction;
+        // stays even with no routines. Does not set Active. Dest Source
+        // title stays Routine. Schema does not grow a test tool.
         lines.append(testRunHonesty)
         if let directive = turnDirective?.trimmingCharacters(in: .whitespacesAndNewlines),
            !directive.isEmpty {
@@ -607,10 +620,12 @@ public enum BotBrainCompiler {
     /// first-chat "what's the Instruction?" cannot invent a hop. Empty
     /// When stays omitted. Studio already says Active. Live lines keep
     /// that name so first-chat "which are Active?" cannot invent a hop.
-    /// Off dest rows omit Active.
+    /// Off dest rows omit Active. Instruction is its first line, capped:
+    /// Studio Test run sends the full body as the User request, and
+    /// bot_get_settings returns it.
     static func routineLine(_ routine: BotRoutine) -> String {
         let name = routine.definition.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prompt = routine.definition.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = routineInstructionSummary(routine.definition.prompt)
         let note = routine.definition.scheduleNote.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = mutateKey(routine.definition.id.value)
         let active = routine.activation.isEnabled ? " Active." : ""
@@ -618,6 +633,19 @@ public enum BotBrainCompiler {
             return "- \(name): Instruction: \(prompt).\(active) [\(key)]"
         }
         return "- \(name): Instruction: \(prompt). When: \(note).\(active) [\(key)]"
+    }
+
+    static let routineInstructionSummaryLimit = 160
+
+    /// First non-empty line of a routine Instruction, cut to
+    /// `routineInstructionSummaryLimit` characters with "…" when longer.
+    static func routineInstructionSummary(_ prompt: String) -> String {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let firstLine = trimmed.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        let line = firstLine.trimmingCharacters(in: .whitespaces)
+        let isCut = line.count > routineInstructionSummaryLimit || line.count < trimmed.count
+        guard isCut else { return line }
+        return String(line.prefix(routineInstructionSummaryLimit)).trimmingCharacters(in: .whitespaces) + "…"
     }
 
     static func sourceLayers(

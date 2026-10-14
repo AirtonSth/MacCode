@@ -286,4 +286,36 @@ final class DistillACPClientSessionParamsTests: XCTestCase {
         let userChoice = DistillACPClient.launchEnvironment(["GROK_CURSOR_MCPS_ENABLED": "1"])
         XCTAssertEqual(userChoice["GROK_CURSOR_MCPS_ENABLED"], "1")
     }
+
+    /// WHY: Distill's default caveman level `full` drops articles, so bots
+    /// answered "Fala tarefa.". `lite` keeps full sentences; a host
+    /// GROK_CAVEMAN must not override it for bots, while a non-bot Agent App
+    /// thread keeps the user's own choice.
+    func test_botLaunchesPinLiteCaveman_nonBotLaunchesKeepTheUsersLevel() {
+        let bot = DistillACPClient.launchEnvironment([
+            BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof",
+            "GROK_CAVEMAN": "ultra",
+        ])
+        XCTAssertEqual(bot["GROK_CAVEMAN"], "lite")
+        XCTAssertNil(DistillACPClient.launchEnvironment(["PATH": "/usr/bin"])["GROK_CAVEMAN"])
+        XCTAssertEqual(DistillACPClient.launchEnvironment(["GROK_CAVEMAN": "full"])["GROK_CAVEMAN"], "full")
+    }
+
+    /// WHY: the bot persona arrives as a user turn, below Distill's
+    /// system-level `<output_style>` ("takes precedence over other tone").
+    /// Only `_meta.rules` (appended to the system prompt) can override it,
+    /// and only bot sessions may get it.
+    func test_sessionNewCarriesHumanReplyRulesOnlyForBotRuns() throws {
+        let rules = try XCTUnwrap(BotRunMCPAdmission.distillSessionRules(
+            environment: [BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof"]
+        ))
+        XCTAssertEqual(rules, BotRunMCPAdmission.distillBotReplyRules)
+        XCTAssertTrue(rules.contains("ignore the <output_style> section"))
+        XCTAssertTrue(rules.contains(BotStandingInstructions.replyStyleLine))
+        XCTAssertNil(BotRunMCPAdmission.distillSessionRules(environment: ["PATH": "/usr/bin"]))
+
+        let params = DistillACPClient.sessionOpenParams(cwd: "/tmp", mcpServers: [], rules: rules)
+        XCTAssertEqual((params["_meta"] as? [String: Any])?["rules"] as? String, rules)
+        XCTAssertNil(DistillACPClient.sessionOpenParams(cwd: "/tmp", mcpServers: [], rules: nil)["_meta"])
+    }
 }

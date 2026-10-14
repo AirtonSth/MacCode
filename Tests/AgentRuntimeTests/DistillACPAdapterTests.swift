@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 import CoreModel
+import Persistence
 @testable import AgentRuntime
 
 final class DistillACPAdapterTests: ProviderProcessTestCase {
@@ -433,6 +434,40 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual((params["_meta"] as? [String: Any])?["reasoningEffort"] as? String, "medium")
         let methods = try recordedRequests(requestsURL).compactMap { $0["method"] as? String }
         XCTAssertTrue(methods.contains("session/prompt"), "the prompt must be sent once the catalog effort is bound")
+    }
+
+    /// WHY: Distill's system-level caveman `<output_style>` outranks the bot
+    /// persona sent as the user turn, so bots answered in fragments. The run
+    /// path must put the human reply rules on a bot's session/new, and never
+    /// on a normal Agent App thread's.
+    func test_botRunSessionNewCarriesHumanReplyRules_nonBotRunDoesNot() async throws {
+        for isBot in [true, false] {
+            let root = try makeTempRoot("distill-acp-reply-rules")
+            defer { try? FileManager.default.removeItem(at: root) }
+            let (harness, requestsURL) = try writeWorkerHarness(root: root, initializeCapabilities: "{}", workerResult: "{}")
+            let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+            defer { adapter.stopAll() }
+            let events = DistillACPAdapterEventBox()
+            _ = try await adapter.startSession(
+                AgentRunRequest(
+                    threadId: AgentThreadID(),
+                    provider: .distill,
+                    model: "main",
+                    cwd: root.path,
+                    prompt: "bom dia",
+                    environment: isBot ? [BotSelfConfigCatalog.callerEnvironmentKey: "bot-proof"] : [:]
+                )
+            ) { events.append($0) }
+            _ = try await events.waitForFinish()
+            let opens = try recordedRequests(requestsURL).filter { $0["method"] as? String == "session/new" }
+            XCTAssertEqual(opens.count, 1)
+            let rules = ((opens.first?["params"] as? [String: Any])?["_meta"] as? [String: Any])?["rules"] as? String
+            if isBot {
+                XCTAssertEqual(rules, BotRunMCPAdmission.distillBotReplyRules)
+            } else {
+                XCTAssertNil(rules, "a non-bot Agent App thread keeps Distill's own style")
+            }
+        }
     }
 
     /// `chatgpt/gpt-6-luna` as the live Mac distill 2.0.33 session/new advertises it (captured 2026-10-07).

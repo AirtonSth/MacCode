@@ -5484,7 +5484,8 @@ final class BotsWindowTests: XCTestCase {
         vm.setRoutineEnabled(id: id, enabled: true)
         vm.composerText = "Test this routine"
         let preview = try XCTUnwrap(vm.previewBrain())
-        XCTAssertTrue(preview.compiledPayload.contains("Test run: do the Instruction now. Does not set Active."))
+        XCTAssertTrue(preview.compiledPayload.contains(BotBrainCompiler.testRunHonesty))
+        XCTAssertTrue(preview.compiledPayload.contains("Test run: only when the User request below explicitly asks to test or run a routine"))
         XCTAssertTrue(preview.compiledPayload.contains(BotRoutineCopy.testRunHonestyCaption))
         XCTAssertTrue(preview.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(preview.compiledPayload.contains("bot_test_routine"))

@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import Persistence
 
 public enum DistillGuestEnvironmentError: LocalizedError, Equatable {
     case invalidName(String)
@@ -83,6 +84,9 @@ public enum DistillGuestEnvironment {
         // Cursor configs it finds; the guest's set is exactly its config.toml.
         env["GROK_CLAUDE_MCPS_ENABLED"] = "0"
         env["GROK_CURSOR_MCPS_ENABLED"] = "0"
+        // Every guest run is a bot run: same reply style as a Mac bot launch,
+        // set after the secrets so none of them can make the bot terse.
+        env.merge(BotRunMCPAdmission.distillBotReplyStyleEnvironment) { _, forced in forced }
         // After the secrets, like every guest value: no model key or bot
         // secret of the same name can set the version the guest asks as.
         env[DistillCodexClientVersion.environmentKey] = codexClientVersion

@@ -348,6 +348,15 @@ public enum BotStandingInstructions {
     Ação manual: Peça ação manual com bot_request_user_action só para login, captcha, 2FA, pagamento ou confirmação humana. Nunca peça senha, código ou dados de cartão no chat. Depois de retomar, sempre tire screenshot antes de agir.
     """
 
+    /// How a bot talks to the user, on every provider. Distill bots also get
+    /// it at system level (`BotRunMCPAdmission.distillBotReplyRules`); this
+    /// per-turn copy also reaches resumed sessions and Claude/Codex bots.
+    public static let replyStyleLine =
+        "Reply style: write to the user like a real person, in the user's language: natural, warm, complete sentences with articles and connecting words. No telegraphic fragments, shorthand or robotic status lines, and no AI filler. Stay concise: a greeting gets a short, friendly greeting back. Keep code, commands, paths and names exact."
+
+    /// Must stay identical to `BotSelfConfigCatalog.getSettings`.
+    public static let getSettingsTool = "bot_get_settings"
+
     /// Unique last line so Studio can refresh the starter without overwriting a custom soul.
     public static let generatedSignature =
         "Do not invent tools, files, accounts, or access you do not have."

@@ -1008,7 +1008,8 @@ public struct BotSelfConfigService: Sendable {
             throw BotSelfConfigError.invalid(BotPermission.honestyLabel)
         }
         // Studio Routines already says Test run. Compile already labels
-        // do the Instruction now. A leftover Test run / test_run write
+        // it: the Instruction runs only when the user asks or the routine
+        // fires on schedule. A leftover Test run / test_run write
         // used to return an empty success, so first-chat invented a
         // persist. Schema does not grow a test_run key. Dest title stays
         // Routine. The owner Test run button stays.

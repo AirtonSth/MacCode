@@ -762,9 +762,14 @@ public final class DistillACPClient: @unchecked Sendable {
     /// or GROK_CONFIG overlay disables them. They go away with the guest-only
     /// DISTILL_HOME planned for in-VM execution, not a per-bot home here
     /// (that would copy the user's provider credentials).
+    ///
+    /// Bot runs also pin Distill's reply style to `lite`, over any host value,
+    /// so bots keep articles and full sentences.
     static func launchEnvironment(_ environment: [String: String]) -> [String: String] {
         guard BotRunMCPAdmission.isBotRun(environment: environment) else { return environment }
-        return environment.merging(BotRunMCPAdmission.distillUserMCPImportOffEnvironment) { _, off in off }
+        return environment
+            .merging(BotRunMCPAdmission.distillUserMCPImportOffEnvironment) { _, off in off }
+            .merging(BotRunMCPAdmission.distillBotReplyStyleEnvironment) { _, forced in forced }
     }
 
     public static func initializeParams(clientVersion: String) -> JSONObject {
@@ -926,6 +931,7 @@ public final class DistillACPClient: @unchecked Sendable {
     /// `autoMode` is intentionally omitted: RemoteCode autoAcceptEdits maps to
     /// `set_mode acceptEdits`, not harness auto. Distill selects the session
     /// model and reasoning effort through the harness `_meta.modelId` / `_meta.reasoningEffort` contract.
+    /// `rules` is the harness `_meta.rules` system-prompt append (session/new only).
     static func sessionOpenParams(
         cwd: String,
         mcpServers: [Any],
@@ -933,7 +939,8 @@ public final class DistillACPClient: @unchecked Sendable {
         yoloMode: Bool = false,
         noReplay: Bool = false,
         modelId: String? = nil,
-        reasoningEffort: AgentReasoningEffort? = nil
+        reasoningEffort: AgentReasoningEffort? = nil,
+        rules: String? = nil
     ) -> JSONObject {
         var params: JSONObject = [
             "cwd": cwd,
@@ -957,6 +964,9 @@ public final class DistillACPClient: @unchecked Sendable {
            let wire = trimmedModel == "auto" ? reasoningEffort.rawValue : wireReasoningEffort(reasoningEffort, modelId: trimmedModel) {
             meta["reasoningEffort"] = wire
         }
+        if let rules, !rules.isEmpty {
+            meta["rules"] = rules
+        }
         if !meta.isEmpty {
             params["_meta"] = meta
         }
@@ -971,7 +981,8 @@ public final class DistillACPClient: @unchecked Sendable {
         mainEffortSelection: AgentEffortSelection? = nil,
         reasoningModel: String? = nil,
         reasoningModelEffortSelection: AgentEffortSelection? = nil,
-        reasoningModelSelectionSupported: Bool = true
+        reasoningModelSelectionSupported: Bool = true,
+        rules: String? = nil
     ) async throws -> DistillACPSessionOpenResult {
         let requestedMain = modelId?.trimmingCharacters(in: .whitespacesAndNewlines)
         let requestedWorker = reasoningModel?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -986,7 +997,8 @@ public final class DistillACPClient: @unchecked Sendable {
                 mcpServers: sessionMCPServers(),
                 yoloMode: yoloMode,
                 modelId: modelId,
-                reasoningEffort: reasoningEffort
+                reasoningEffort: reasoningEffort,
+                rules: rules
             ),
             timeout: 20
         )

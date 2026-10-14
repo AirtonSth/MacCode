@@ -113,6 +113,14 @@ final class DistillGuestEnvironmentTests: XCTestCase {
         XCTAssertEqual(env["GROK_CURSOR_MCPS_ENABLED"], "0")
     }
 
+    /// Every guest run is a bot run: Distill's default caveman level `full`
+    /// drops articles ("Fala tarefa."), so the guest pins `lite`, and a model
+    /// secret of the same name cannot set it back.
+    func test_guestBotRunsUseLiteCaveman() {
+        XCTAssertEqual(build()["GROK_CAVEMAN"], "lite")
+        XCTAssertEqual(build(modelSecrets: ["GROK_CAVEMAN": "full"])["GROK_CAVEMAN"], "lite")
+    }
+
     /// The guest has no `codex` to read a version from, so without the Mac's
     /// it asks ChatGPT for models as Distill's default and misses the newest
     /// ones the Mac lists (and the model picker offers).

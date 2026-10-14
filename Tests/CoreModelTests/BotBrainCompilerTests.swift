@@ -1298,7 +1298,7 @@ final class BotBrainCompilerTests: XCTestCase {
             "Off. Not injected."
         )
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.testRunHonesty))
-        XCTAssertTrue(receipt.compiledPayload.contains("Test run: do the Instruction now"))
+        XCTAssertTrue(receipt.compiledPayload.contains("Test run: only when the User request below explicitly asks"))
         XCTAssertTrue(receipt.compiledPayload.contains("Does not set Active"))
         XCTAssertEqual(receipt.layers.first(where: { $0.text.contains("Morning scan") })?.title, "Routine")
     }
@@ -1342,7 +1342,7 @@ final class BotBrainCompilerTests: XCTestCase {
             ]
         )
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.testRunHonesty))
-        XCTAssertTrue(receipt.compiledPayload.contains("Test run: do the Instruction now. Does not set Active."))
+        XCTAssertTrue(receipt.compiledPayload.contains("Test run: only when the User request below explicitly asks to test or run a routine"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotRoutineCopy.testRunHonestyCaption))
         XCTAssertTrue(receipt.compiledPayload.contains("Own the inbox."))
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
@@ -1774,5 +1774,94 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.viewSkillTool))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.webSearchTool))
         XCTAssertTrue(receipt.compiledPayload.contains(BotStandingInstructions.askUserTool))
+    }
+
+    private func greetingFixture() -> (BotDefinition, BotRevision) {
+        let bot = BotDefinition(handle: "elephant", name: "Elephant", title: "Developer", description: "")
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: "Elephant",
+            title: "Developer",
+            description: "",
+            soul: "Own the repo.",
+            provider: .distill,
+            providerInstanceID: "distill",
+            model: "chatgpt/gpt-6.1-sol",
+            reasoningEffort: .medium,
+            compatibleRouteSet: ["default"],
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x"
+        )
+        return (bot, revision)
+    }
+
+    func test_greetingTurnWithActiveRoutine_carriesNoRunOrderNorTheRoutineBody() throws {
+        // WHY: a bot answered "oi" by launching its PR-merging routine. Every
+        // turn carried the routine's whole autonomous Instruction plus an
+        // unconditional "Test run: do the Instruction now" right before the
+        // user text. A greeting must only see that the routine exists.
+        let (bot, revision) = greetingFixture()
+        let review = BotRoutineDefinition(
+            botID: bot.id,
+            name: "Review Empath",
+            prompt: "Maintain every open PR.\nDo not ask me anything. Do NOT stop early.\nMerge each PR, then post to Slack.",
+            scheduleNote: "Daily 19:00"
+        )
+        let routine = BotRoutine(
+            definition: review,
+            activation: BotRoutineActivation(routineID: review.id, botID: bot.id, isEnabled: true)
+        )
+        let payload = BotBrainCompiler.assemble(bot: bot, revision: revision, userText: "oi", routines: [routine])
+            .compiledPayload
+
+        XCTAssertFalse(payload.contains("do the Instruction now"), "no unconditional run order on a greeting")
+        XCTAssertFalse(payload.contains("Do NOT stop early"), "the routine body must not ride on every turn")
+        XCTAssertFalse(payload.contains("post to Slack"))
+        XCTAssertTrue(payload.contains("- Review Empath: Instruction: Maintain every open PR.…. When: Daily 19:00. Active."),
+                      "the bot still knows its routine by name, first line and schedule")
+        XCTAssertTrue(payload.contains(BotStandingInstructions.getSettingsTool), "full Instruction stays one call away")
+        let userRequest = try XCTUnwrap(payload.range(of: "User request:"))
+        let reference = try XCTUnwrap(payload.range(of: BotBrainCompiler.routinesReferenceOnly))
+        let testRun = try XCTUnwrap(payload.range(of: BotBrainCompiler.testRunHonesty))
+        XCTAssertLessThan(reference.lowerBound, userRequest.lowerBound)
+        XCTAssertLessThan(testRun.lowerBound, userRequest.lowerBound)
+        XCTAssertTrue(BotBrainCompiler.testRunHonesty.contains("only when the User request below explicitly asks"))
+        XCTAssertTrue(BotBrainCompiler.testRunHonesty.contains("A greeting or an unrelated request never starts a routine"))
+    }
+
+    func test_longSingleLineRoutineInstructionIsCapped_becauseOneLineCanStillBeAWholeRunbook() {
+        let (bot, revision) = greetingFixture()
+        let runbook = "You are an autonomous GitHub PR maintenance agent " + String(repeating: "and you merge everything ", count: 40)
+        let definition = BotRoutineDefinition(botID: bot.id, name: "Runbook", prompt: runbook)
+        let routine = BotRoutine(
+            definition: definition,
+            activation: BotRoutineActivation(routineID: definition.id, botID: bot.id, isEnabled: true)
+        )
+        let payload = BotBrainCompiler.composeRunPrompt(bot: bot, revision: revision, userText: "oi", routines: [routine])
+
+        XCTAssertFalse(payload.contains(runbook.trimmingCharacters(in: .whitespaces)))
+        let summary = BotBrainCompiler.routineInstructionSummary(runbook)
+        XCTAssertTrue(summary.hasPrefix("You are an autonomous GitHub PR maintenance agent"))
+        XCTAssertTrue(summary.hasSuffix("…"))
+        XCTAssertLessThanOrEqual(summary.count, BotBrainCompiler.routineInstructionSummaryLimit + 1)
+        XCTAssertEqual(BotBrainCompiler.routineInstructionSummary("  Scan overnight failures \n"), "Scan overnight failures",
+                       "a short one-line Instruction is shown whole, with no cut marker")
+    }
+
+    func test_runPromptAsksForNaturalHumanRepliesBeforeInstructions() throws {
+        // WHY: Distill bots answered "Bom dia. Página Ratel aberta no Chrome.
+        // Fala tarefa." The turn payload carried no reply style at all; it now
+        // asks for natural, complete sentences in the user's language on every
+        // provider, ahead of Instructions so a custom soul still has the last word.
+        let (bot, revision) = greetingFixture()
+        let payload = BotBrainCompiler.composeRunPrompt(bot: bot, revision: revision, userText: "bom dia")
+        let style = try XCTUnwrap(payload.range(of: BotStandingInstructions.replyStyleLine))
+        let instructions = try XCTUnwrap(payload.range(of: "Instructions:"))
+        XCTAssertLessThan(style.lowerBound, instructions.lowerBound)
+        XCTAssertTrue(BotStandingInstructions.replyStyleLine.contains("in the user's language"))
+        XCTAssertTrue(BotStandingInstructions.replyStyleLine.contains("complete sentences with articles"))
+        XCTAssertTrue(BotStandingInstructions.replyStyleLine.contains("No telegraphic fragments"))
     }
 }

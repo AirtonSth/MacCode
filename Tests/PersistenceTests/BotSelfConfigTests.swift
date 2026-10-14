@@ -32,6 +32,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(BotStandingInstructions.listSecretsTool, BotSelfConfigCatalog.listSecrets)
         XCTAssertEqual(BotStandingInstructions.saveSecretTool, BotSelfConfigCatalog.saveSecret)
         XCTAssertEqual(BotStandingInstructions.deleteSecretTool, BotSelfConfigCatalog.deleteSecret)
+        XCTAssertEqual(BotStandingInstructions.getSettingsTool, BotSelfConfigCatalog.getSettings)
         let tools = BotStandingInstructions.admittedToolsText
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.writeHomeFile))
         XCTAssertTrue(tools.contains(BotSelfConfigCatalog.setSettings))
@@ -730,7 +731,7 @@ final class BotSelfConfigTests: XCTestCase {
 
     func test_setSettingsRejectsAdvertisedTestRun_becauseStudioSaysDoTheInstructionNow() throws {
         // WHY: Studio Routines already says Test run. Compile already
-        // labels do the Instruction now. set_settings still accepted
+        // labels when the Instruction runs. set_settings still accepted
         // Test run / test_run as an empty success, so first-chat
         // invented a persist. Reject the advertised name. Name still
         // persists. Leftover permission_mode now rejects. Schema

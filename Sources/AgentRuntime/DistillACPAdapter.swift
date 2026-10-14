@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import Persistence
 import CryptoKit
 import os
 
@@ -1238,7 +1239,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     mainEffortSelection: request.distillMainEffortSelection,
                     reasoningModel: request.reasoningModel,
                     reasoningModelEffortSelection: request.distillReasoningEffortSelection,
-                    reasoningModelSelectionSupported: capabilities.sessionWorkerModel
+                    reasoningModelSelectionSupported: capabilities.sessionWorkerModel,
+                    rules: BotRunMCPAdmission.distillSessionRules(environment: request.environment)
                 )
             }
             // The guest agent is up with its MCP servers: the strip goes back to the turn's own status.
