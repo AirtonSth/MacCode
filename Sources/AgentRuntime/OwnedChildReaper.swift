@@ -62,6 +62,44 @@ public enum OwnedChildReaper {
         return .timedOutStillRunning
     }
 
+    /// Reaps `pid` when it exits, without blocking the caller. For a child that
+    /// `terminateAndReap(waitForZombie: false)` already sent SIGKILL and that
+    /// nothing else waits on (a forkpty child, not a Foundation `Process`):
+    /// otherwise a child slower than the kill grace stays `<defunct>` forever.
+    public static func reapWhenExited(pid: pid_t) {
+        guard pid > 0 else { return }
+        let source = DispatchSource.makeProcessSource(
+            identifier: pid,
+            eventMask: .exit,
+            queue: .global(qos: .utility)
+        )
+        pendingReapLock.withLock { pendingReaps[pid] = source }
+        source.setEventHandler {
+            // Only the side that takes the entry waits, so the pid is waited once.
+            guard let taken = takePendingReap(pid) else { return }
+            taken.cancel()
+            var status: Int32 = 0
+            _ = waitpid(pid, &status, 0)
+        }
+        source.resume()
+        // An exit before the source armed raises no event.
+        if poll(pid: pid) != nil {
+            takePendingReap(pid)?.cancel()
+        }
+    }
+
+    /// Sources stay retained here until their child is reaped.
+    private static let pendingReapLock = NSLock()
+    private static var pendingReaps: [pid_t: DispatchSourceProcess] = [:]
+
+    private static func takePendingReap(_ pid: pid_t) -> DispatchSourceProcess? {
+        pendingReapLock.withLock { pendingReaps.removeValue(forKey: pid) }
+    }
+
+    static var pendingReapCountForTesting: Int {
+        pendingReapLock.withLock { pendingReaps.count }
+    }
+
     private static func waitUntil(pid: pid_t, deadline: Date) -> Int32? {
         while Date() < deadline {
             if let status = poll(pid: pid) {

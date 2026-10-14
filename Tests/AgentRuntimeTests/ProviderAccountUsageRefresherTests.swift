@@ -755,6 +755,158 @@ final class ProviderAccountUsageRefresherTests: XCTestCase {
                        "the fallback child must be reaped rather than left as a zombie")
     }
 
+    /// A fake `claude` that records each launch's arguments and prints the
+    /// headless `/usage` line, or fails the headless probe when `failHeadless`.
+    private func makeCountingClaude(in dir: URL, failHeadless: Bool = false) throws -> (script: URL, launches: URL) {
+        let launches = dir.appendingPathComponent("launches")
+        let script = dir.appendingPathComponent("fake-claude")
+        try """
+        #!/bin/sh
+        echo "$*" >> '\(launches.path)'
+        if [ "$1" = "-p" ] && [ "\(failHeadless)" = "false" ]; then
+          printf 'Current week (all models): 12%% used\\n'
+          exit 0
+        fi
+        exit 1
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return (script, launches)
+    }
+
+    private func launchLines(_ url: URL) -> [String] {
+        ((try? String(contentsOf: url, encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+    }
+
+    private func writeClaudeConfig(
+        to url: URL,
+        fetchedAt: Date,
+        cacheAccount: String = "acct-1",
+        currentAccount: String = "acct-1",
+        weekly: Int = 15
+    ) throws {
+        try JSONSerialization.data(withJSONObject: [
+            "oauthAccount": ["accountUuid": currentAccount],
+            "cachedUsageUtilization": [
+                "fetchedAtMs": Int(fetchedAt.timeIntervalSince1970 * 1000),
+                "accountUuid": cacheAccount,
+                "utilization": [
+                    "five_hour": ["utilization": 4, "resets_at": "2099-08-21T22:00:00Z"],
+                    "seven_day": ["utilization": weekly, "resets_at": "2099-08-26T11:00:00Z"]
+                ]
+            ]
+        ]).write(to: url)
+    }
+
+    /// WHY: a periodic tick that may not launch the Claude CLI must not launch
+    /// it, nor the interactive PTY: each launch is ~10 CPU-s and ~600 MB.
+    func test_claudeCLIProbeDisallowed_launchesNothing() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-no-cli-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let claude = try makeCountingClaude(in: dir)
+
+        let usages = await ProviderAccountUsageRefresher(timeoutSeconds: 3)
+            .refreshAccountUsage(ProviderAccountUsageRefreshRequest(
+                codexBinary: dir.appendingPathComponent("missing-codex").path,
+                claudeBinary: claude.script.path,
+                allowClaudeCLIProbe: false,
+                cwd: dir.path
+            ))
+        XCTAssertNil(usages.first { $0.provider == .claude })
+        XCTAssertEqual(launchLines(claude.launches), [], "a skipped probe must not launch claude")
+    }
+
+    /// WHY: the PTY fallback is the expensive, zombie-prone path. Periodic
+    /// refreshes forbid it even when they may run the headless probe.
+    func test_claudeUsageScreenDisallowed_skipsThePTYAfterAFailedHeadlessProbe() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-no-pty-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let claude = try makeCountingClaude(in: dir, failHeadless: true)
+
+        let usages = await ProviderAccountUsageRefresher(timeoutSeconds: 3)
+            .refreshAccountUsage(ProviderAccountUsageRefreshRequest(
+                codexBinary: dir.appendingPathComponent("missing-codex").path,
+                claudeBinary: claude.script.path,
+                allowClaudeUsageScreen: false,
+                cwd: dir.path
+            ))
+        XCTAssertNil(usages.first { $0.provider == .claude })
+        let launches = launchLines(claude.launches)
+        XCTAssertEqual(launches.count, 1, "only the headless probe may run")
+        XCTAssertTrue(launches.first?.hasPrefix("-p ") == true)
+    }
+
+    /// WHY: every probe used to boot the user's MCP servers and plugin hooks
+    /// (a dozen processes, an npm registry call) just to print usage.
+    func test_claudeHeadlessProbeSkipsMCPServersAndHooks() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-argv-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let claude = try makeCountingClaude(in: dir)
+
+        let usages = await ProviderAccountUsageRefresher(timeoutSeconds: 3)
+            .refreshAccountUsage(ProviderAccountUsageRefreshRequest(
+                codexBinary: dir.appendingPathComponent("missing-codex").path,
+                claudeBinary: claude.script.path,
+                cwd: dir.path
+            ))
+        XCTAssertEqual(usages.first { $0.provider == .claude }?.weeklyUsedPercent, 12)
+        XCTAssertEqual(launchLines(claude.launches), [
+            #"-p --output-format text --no-session-persistence --max-budget-usd 0.01 --strict-mcp-config --settings {"disableAllHooks":true} /usage"#
+        ])
+    }
+
+    /// WHY: Claude Code answers `/usage` from its own cache in `~/.claude.json`
+    /// while it is under 60 s old. Reading that cache gives the same answer as
+    /// launching the CLI, without launching it.
+    func test_freshClaudeCodeUsageCacheAnswersWithoutLaunchingTheCLI() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-cache-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let claude = try makeCountingClaude(in: dir)
+        let config = dir.appendingPathComponent(".claude.json")
+        try writeClaudeConfig(to: config, fetchedAt: Date().addingTimeInterval(-5))
+
+        let usages = await ProviderAccountUsageRefresher(timeoutSeconds: 3)
+            .refreshAccountUsage(ProviderAccountUsageRefreshRequest(
+                codexBinary: dir.appendingPathComponent("missing-codex").path,
+                claudeBinary: claude.script.path,
+                claudeUsageCacheURL: config,
+                cwd: dir.path
+            ))
+        let usage = try XCTUnwrap(usages.first { $0.provider == .claude })
+        XCTAssertEqual(usage.weeklyUsedPercent, 15)
+        XCTAssertEqual(usage.currentSessionUsedPercent, 4)
+        XCTAssertNotNil(usage.weeklyResetsAtMs)
+        XCTAssertEqual(launchLines(claude.launches), [], "a fresh cache must not launch claude")
+    }
+
+    /// WHY: a cache older than Claude Code's own 60 s window, or stamped for
+    /// another signed-in account, is not what `/usage` would print now.
+    func test_staleOrForeignClaudeCodeUsageCacheIsIgnored() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-claude-cache-stale-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let config = dir.appendingPathComponent(".claude.json")
+
+        try writeClaudeConfig(to: config, fetchedAt: Date().addingTimeInterval(-61))
+        XCTAssertNil(AssistantAccountUsageParser.claudeCachedUsage(fromConfigFile: config))
+
+        try writeClaudeConfig(to: config, fetchedAt: Date(), cacheAccount: "acct-old")
+        XCTAssertNil(AssistantAccountUsageParser.claudeCachedUsage(fromConfigFile: config),
+                     "another account's usage must never paint this account's ring")
+
+        try writeClaudeConfig(to: config, fetchedAt: Date())
+        XCTAssertEqual(AssistantAccountUsageParser.claudeCachedUsage(fromConfigFile: config)?.weeklyUsedPercent, 15)
+    }
+
     func test_liveAccountUsageRefresh_whenExplicitlyEnabled() async throws {
         guard ProcessInfo.processInfo.environment["REMOTE_CODE_LIVE_USAGE_TEST"] == "1" else {
             throw XCTSkip("Set REMOTE_CODE_LIVE_USAGE_TEST=1 to call local provider usage commands.")

@@ -53,6 +53,47 @@ final class OwnedChildReaperTests: XCTestCase {
         XCTAssertEqual(OwnedChildReaper.poll(pid: -1), 0)
     }
 
+    private func spawn(_ script: String) throws -> pid_t {
+        var pid: pid_t = 0
+        let argv: [UnsafeMutablePointer<CChar>?] = [strdup("/bin/sh"), strdup("-c"), strdup(script), nil]
+        defer { argv.forEach { free($0) } }
+        let rc = posix_spawn(&pid, "/bin/sh", nil, nil, argv, nil)
+        XCTAssertEqual(rc, 0)
+        return pid
+    }
+
+    private func isReaped(_ pid: pid_t, within timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            // WNOWAIT looks without reaping, so only the reaper under test reaps.
+            var info = siginfo_t()
+            if waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == -1, errno == ECHILD {
+                return true
+            }
+            usleep(20_000)
+        } while Date() < deadline
+        return false
+    }
+
+    /// WHY: the Claude `/usage` PTY child is killed with `waitForZombie: false`
+    /// so a stuck child cannot pin a refresh. One still exiting when the kill
+    /// grace ended was never waited for: 9 `<defunct>` claude children piled
+    /// up on the running app. It must be reaped once it exits.
+    func test_reapWhenExited_reapsAChildThatExitsLater() throws {
+        let pid = try spawn("sleep 0.3")
+        OwnedChildReaper.reapWhenExited(pid: pid)
+        XCTAssertTrue(isReaped(pid, within: 3), "the child must not stay <defunct>")
+        XCTAssertEqual(OwnedChildReaper.pendingReapCountForTesting, 0)
+    }
+
+    func test_reapWhenExited_reapsAChildThatAlreadyExited() throws {
+        let pid = try spawn("exit 0")
+        usleep(200_000)
+        OwnedChildReaper.reapWhenExited(pid: pid)
+        XCTAssertTrue(isReaped(pid, within: 1))
+        XCTAssertEqual(OwnedChildReaper.pendingReapCountForTesting, 0)
+    }
+
     func test_waitForZombieFalse_returnsWithoutBlockingWaitpid() throws {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/sh")

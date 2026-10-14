@@ -278,6 +278,13 @@ public final class AppContext {
     }
     private var periodicAccountUsageCycleID: UInt64 = 0
     private var periodicAccountUsageCycle: PeriodicAccountUsageCycle?
+    /// When a refresh was last allowed to launch `claude -p /usage`, and how
+    /// many allowed refreshes in a row got no Claude answer.
+    private var lastClaudeUsageCLIProbeAt: Date?
+    private var claudeUsageCLIProbeMisses = 0
+    /// Injectable so tests can step through the Claude CLI interval.
+    var accountUsageNow: () -> Date = Date.init
+    private let accountUsagePublishes = AccountUsagePublishLedger()
     private var usageNotificationTask: Task<Void, Never>?
     private var lastUsageNotificationAt: Date = .distantPast
     /// Per-run usage state. Claude can emit independent per-request charges
@@ -1066,8 +1073,7 @@ public final class AppContext {
                 EventBus.shared.publish(kind: .agentThreadTokenUsage, payload: .object(p))
             case .accountUsage(let usage):
                 self.recordAccountUsage(usage)
-                EventBus.shared.publish(kind: .agentAccountUsage,
-                    payload: .object(Self.accountUsagePayload(threadId: t, usage: usage)))
+                self.publishAccountUsage(threadId: t, usage: usage)
             case .contextCompaction(let summary):
                 EventBus.shared.publish(kind: .agentContextCompaction, payload: .object([
                     "thread_id": .string(t),
@@ -2046,6 +2052,22 @@ public final class AppContext {
             }
         }
         let periodicCycleID = includeGrok ? nil : periodicAccountUsageCycle?.id
+        // WHY: on macOS the Claude OAuth token is in the Keychain (not read), so
+        // unless Claude Code's own usage cache is fresh, Claude usage means
+        // launching `claude -p /usage`: ~10 CPU-s and ~600 MB each time. A timer
+        // tick launches it at most once per interval (longer after misses) and
+        // never falls back to the interactive PTY; launch and an opened usage
+        // panel still probe right away.
+        let isPeriodic = reason == "periodic"
+        let now = accountUsageNow()
+        let claudeCLIProbeDue = !isPeriodic || lastClaudeUsageCLIProbeAt.map {
+            let elapsed = now.timeIntervalSince($0)
+            let backoff = Double(1 << min(claudeUsageCLIProbeMisses, 2))
+            return elapsed < 0 || elapsed >= Self.claudeUsageCLIProbeInterval * backoff
+        } ?? true
+        if claudeCLIProbeDue {
+            lastClaudeUsageCLIProbeAt = now
+        }
         accountUsageRefreshCount += 1
         publishAccountUsageRefresh(state: "started", reason: reason, detail: nil)
 
@@ -2058,6 +2080,9 @@ public final class AppContext {
             grokBinary: grokBinary?.isEmpty == false ? grokBinary! : "grok",
             grokAuthFileURL: Self.defaultGrokAuthFileURL,
             claudeAuthFileURL: Self.defaultClaudeAuthFileURL,
+            claudeUsageCacheURL: Self.defaultClaudeUsageCacheURL,
+            allowClaudeCLIProbe: claudeCLIProbeDue,
+            allowClaudeUsageScreen: !isPeriodic,
             codexAuthFileURL: Self.defaultCodexAuthFileURL,
             includeGrok: includeGrok,
             cwd: state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
@@ -2074,8 +2099,12 @@ public final class AppContext {
                 let acceptedUsages = usages.filter { $0.provider != .grok || acceptsGrok }
                 for usage in acceptedUsages {
                     self.recordAccountUsage(usage)
-                    EventBus.shared.publish(kind: .agentAccountUsage,
-                        payload: .object(Self.accountUsagePayload(reason: reason, usage: usage)))
+                    self.publishAccountUsage(reason: reason, usage: usage)
+                }
+                if acceptedUsages.contains(where: { $0.provider == .claude }) {
+                    self.claudeUsageCLIProbeMisses = 0
+                } else if claudeCLIProbeDue {
+                    self.claudeUsageCLIProbeMisses += 1
                 }
                 // Partial success: providers that did not answer *and* have no
                 // unexpired weekly window are inactive / signed-out / unreachable.
@@ -2092,6 +2121,9 @@ public final class AppContext {
                         returned: acceptedUsages.map(\.provider),
                         existing: existing
                     ).filter { acceptsGrok || $0 != .grok }
+                        // Claude was not asked when its CLI was skipped: no
+                        // answer is not proof the account went inactive.
+                        .filter { claudeCLIProbeDue || $0 != .claude }
                     for provider in toClear {
                         self.clearAccountUsagePercentages(provider, reason: reason)
                     }
@@ -2170,8 +2202,7 @@ public final class AppContext {
             // `agent.account.usage.get`; without this event the iPhone kept the
             // pre-clear percent while the Mac sidebar showed 0%.
             if let row = snapshot.providers.first(where: { $0.provider == provider }) {
-                EventBus.shared.publish(kind: .agentAccountUsage,
-                    payload: .object(Self.accountUsagePayload(reason: reason, usage: Self.clearedAccountUsage(row))))
+                publishAccountUsage(reason: reason, usage: Self.clearedAccountUsage(row))
             }
         } catch {
             NSLog("RemoteCode account usage clear failed (\(provider.rawValue)): \(error)")
@@ -2241,10 +2272,7 @@ public final class AppContext {
                 if let usage {
                     self.recordAccountUsage(usage)
                     shouldPublishWidgetDigest = true
-                    EventBus.shared.publish(
-                        kind: .agentAccountUsage,
-                        payload: .object(Self.accountUsagePayload(reason: reason, usage: usage))
-                    )
+                    self.publishAccountUsage(reason: reason, usage: usage)
                     self.publishAccountUsageRefresh(
                         state: "finished",
                         reason: reason,
@@ -2288,6 +2316,16 @@ public final class AppContext {
             .appendingPathComponent(".claude/.credentials.json")
     }
 
+    /// Claude Code's config, which caches its last `/api/oauth/usage` answer.
+    static var defaultClaudeUsageCacheURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude.json")
+    }
+
+    /// Shortest gap between Claude usage CLI launches from the periodic timer;
+    /// doubles after each launch that got no answer, up to 4×.
+    static let claudeUsageCLIProbeInterval: TimeInterval = 15 * 60
+
     static var defaultCodexAuthFileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/auth.json")
@@ -2321,6 +2359,21 @@ public final class AppContext {
                 resume([])
             }
         }
+    }
+
+    /// Publishes `agent.account.usage`. A periodic tick skips a value paired
+    /// devices already have: unchanged usage used to add two rows a minute to
+    /// the durable 5,000-row event log (PL-05). Every other path, and any value
+    /// that differs from the last one published (a clear included), publishes.
+    nonisolated private func publishAccountUsage(
+        threadId: String? = nil,
+        reason: String? = nil,
+        usage: AssistantAccountUsage
+    ) {
+        let changed = accountUsagePublishes.record(usage.provider, Self.accountUsagePayload(usage: usage))
+        guard changed || reason != "periodic" else { return }
+        EventBus.shared.publish(kind: .agentAccountUsage,
+            payload: .object(Self.accountUsagePayload(threadId: threadId, reason: reason, usage: usage)))
     }
 
     private func publishAccountUsageRefresh(
@@ -3092,5 +3145,17 @@ public final class AppContext {
         candidates
             .filter { !$0.isActive && $0.lastActivityAt < idleCutoff }
             .map(\.threadId)
+    }
+}
+
+/// Last `agent.account.usage` value published per provider. Locked: the live
+/// `.accountUsage` path publishes from the provider parse queue.
+private final class AccountUsagePublishLedger: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: [AgentProvider: [String: JSONValue]] = [:]
+
+    /// Records `payload` and reports whether it differs from the previous one.
+    func record(_ provider: AgentProvider, _ payload: [String: JSONValue]) -> Bool {
+        lock.withLock { last.updateValue(payload, forKey: provider) != payload }
     }
 }

@@ -160,12 +160,16 @@ public final class EventBus: @unchecked Sendable {
     /// layout or settings mutation. The `sync.snapshot` fence ignores them so
     /// a streaming agent or printing terminal cannot starve baseline reads.
     /// `bot.run.stream` is liveness evidence of a Bot run and carries no state.
+    /// `agent.account.usage.refresh` is refresh progress (four per 60 s tick)
+    /// that no client projects; persisting it filled about a third of the
+    /// 5,000-row event log (PL-05). The usage values ride `agent.account.usage`.
     public static let liveOnlyStreamEventKinds: Set<String> = [
         "surface.output",
         "agent.item.delta",
         "agent.item.progress",
         "agent.provider_runtime.event",
         "bot.run.stream",
+        "agent.account.usage.refresh",
     ]
 
     /// `agent.*` kinds that never change an `agentThreads` snapshot row

@@ -306,6 +306,43 @@ public enum AssistantAccountUsageParser {
         )
     }
 
+    /// How long Claude Code itself answers `/usage` from `cachedUsageUtilization`
+    /// before fetching again (60 s in Claude Code 2.1.x).
+    public static let claudeUsageCacheMaxAge: TimeInterval = 60
+
+    /// Claude Code's own cache of `GET /api/oauth/usage`, kept in `~/.claude.json`
+    /// as `cachedUsageUtilization` (`fetchedAtMs`, `accountUuid`, `utilization`).
+    ///
+    /// WHY: on macOS the OAuth token lives in the Keychain, which RemoteCode must
+    /// not read, so the usage API is unreachable and the only other source was
+    /// launching `claude -p /usage`. Claude Code answers that command from this
+    /// cache while it is younger than `maxAge`, so inside that window this is the
+    /// value the launch would print. A cache stamped for another account is
+    /// ignored, as Claude Code ignores it. Reads no credentials.
+    public static func claudeCachedUsage(
+        fromConfigFile url: URL,
+        maxAge: TimeInterval = claudeUsageCacheMaxAge,
+        now: Date = Date()
+    ) -> AssistantAccountUsage? {
+        // The cache is written with the file, so an older file cannot hold a
+        // fresh cache: skip parsing it.
+        guard let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate,
+              now.timeIntervalSince(modified) < maxAge,
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cache = obj["cachedUsageUtilization"] as? [String: Any],
+              let fetchedAtMs = double(cache["fetchedAtMs"]),
+              let utilization = cache["utilization"] as? [String: Any] else {
+            return nil
+        }
+        let account = (obj["oauthAccount"] as? [String: Any])?["accountUuid"] as? String
+        guard cache["accountUuid"] as? String == account else { return nil }
+        let age = now.timeIntervalSince1970 - fetchedAtMs / 1000
+        guard age >= 0, age < maxAge else { return nil }
+        return claudeOAuthUsage(from: utilization)
+    }
+
     public static func claudeAccessToken(fromAuthFile url: URL) -> String? {
         guard let data = try? Data(contentsOf: url, options: .mappedIfSafe),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -379,38 +416,172 @@ public enum AssistantAccountUsageParser {
     /// more than 512 KiB of non-billing traffic between credit snapshots (observed
     /// gaps > 800 KiB). A too-small window returns nil, the partial account-usage
     /// refresh treats Grok as missing, and the rings falsely paint Grok at 0%.
+    ///
+    /// WHY the scan is remembered: the 60 s account-usage tick lands here every
+    /// time the credits API misses, and re-reading and JSON-parsing a 3.4 MB log
+    /// that had not changed cost ~70-120 ms of CPU and ~10 MB of churn a minute.
+    /// An unchanged log (same file, size and mtime) returns the last answer
+    /// without reading; a log that only grew is read from where the last scan
+    /// stopped. Either way the answer equals a full scan of the window.
     public static func grokFromBillingLogFile(
         at url: URL,
         maxBytes: Int = 4 * 1024 * 1024
     ) -> AssistantAccountUsage? {
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
-        let size: UInt64
-        do {
-            size = try handle.seekToEnd()
-        } catch {
-            return nil
+        var info = stat()
+        guard fstat(handle.fileDescriptor, &info) == 0 else { return nil }
+        let key = "\(maxBytes):\(url.path)"
+        let previous = grokBillingLogScanLock.withLock { grokBillingLogScans[key] }
+            .flatMap { $0.device == info.st_dev && $0.inode == info.st_ino ? $0 : nil }
+        if let previous, previous.size == info.st_size,
+           previous.modified.tv_sec == info.st_mtimespec.tv_sec,
+           previous.modified.tv_nsec == info.st_mtimespec.tv_nsec {
+            return previous.usage
         }
-        let start = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
-        do {
-            try handle.seek(toOffset: start)
-        } catch {
-            return nil
-        }
-        guard let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
-        // Drop partial first line when we mid-started the file.
-        var text = String(data: data, encoding: .utf8) ?? ""
-        if start > 0, let nl = text.firstIndex(of: "\n") {
-            text = String(text[text.index(after: nl)...])
-        }
-        // Newest last in the log — walk reverse.
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
-            if let usage = grokBillingLogLine(String(line)) {
-                return usage
+        let size = UInt64(max(0, info.st_size))
+        let windowStart = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+
+        var scan: GrokBillingLogScan?
+        if let previous, info.st_size > previous.size,
+           windowStart == 0 || previous.scannedThrough > windowStart,
+           readGrokBillingLog(handle, at: previous.scannedThrough - UInt64(previous.anchor.count),
+                              upTo: previous.anchor.count) == previous.anchor,
+           let appended = readGrokBillingLog(handle, at: previous.scannedThrough) {
+            // Only appended: lines from `scannedThrough` on are new or were
+            // incomplete last time, and every older line is unchanged.
+            let newest = newestGrokBillingLine(in: appended, firstLine: 0)
+            let keepPrevious = previous.usage != nil
+                && (windowStart == 0 || previous.usageLineStart > windowStart)
+            if newest != nil || previous.usage == nil || keepPrevious {
+                scan = GrokBillingLogScan(
+                    info: info,
+                    end: previous.scannedThrough + UInt64(appended.count),
+                    base: previous.scannedThrough,
+                    data: appended,
+                    hit: newest,
+                    resumed: previous
+                )
             }
         }
-        return nil
+        if scan == nil {
+            guard let data = readGrokBillingLog(handle, at: windowStart) else { return nil }
+            // Drop partial first line when we mid-started the file.
+            var firstLine = 0
+            if windowStart > 0, let newline = data.firstIndex(of: UInt8(ascii: "\n")) {
+                firstLine = newline - data.startIndex + 1
+            }
+            scan = GrokBillingLogScan(
+                info: info,
+                end: windowStart + UInt64(data.count),
+                base: windowStart,
+                data: data,
+                hit: newestGrokBillingLine(in: data, firstLine: firstLine),
+                resumed: nil
+            )
+        }
+        guard let scan else { return nil }
+        grokBillingLogScanLock.withLock { grokBillingLogScans[key] = scan }
+        return scan.usage
+    }
+
+    /// What the last scan of one billing log saw.
+    private struct GrokBillingLogScan {
+        let device: dev_t
+        let inode: ino_t
+        let size: off_t
+        let modified: timespec
+        /// Offset just past the last newline read: an appended log resumes here.
+        let scannedThrough: UInt64
+        /// Bytes right before `scannedThrough`, compared on resume so a log that
+        /// was truncated and regrew is read from scratch.
+        let anchor: Data
+        let usage: AssistantAccountUsage?
+        /// Offset of the line `usage` came from.
+        let usageLineStart: UInt64
+
+        init(
+            info: stat,
+            end: UInt64,
+            base: UInt64,
+            data: Data,
+            hit: (usage: AssistantAccountUsage, lineStart: Int)?,
+            resumed: GrokBillingLogScan?
+        ) {
+            device = info.st_dev
+            inode = info.st_ino
+            // The bytes actually read: a write after `fstat` is picked up next tick.
+            size = off_t(end)
+            modified = info.st_mtimespec
+            let lastNewline = data.lastIndex(of: UInt8(ascii: "\n")).map { $0 - data.startIndex + 1 }
+            scannedThrough = base + UInt64(lastNewline ?? 0)
+            let anchorStart = max(0, (lastNewline ?? 0) - 32)
+            anchor = lastNewline.map { Data(data[(data.startIndex + anchorStart)..<(data.startIndex + $0)]) }
+                ?? resumed?.anchor ?? Data()
+            if let hit {
+                usage = hit.usage
+                usageLineStart = base + UInt64(hit.lineStart)
+            } else {
+                // No new match: the previous answer stands (the caller checked
+                // it is still inside the window).
+                usage = resumed?.usage
+                usageLineStart = resumed?.usageLineStart ?? 0
+            }
+        }
+    }
+
+    private static let grokBillingLogScanLock = NSLock()
+    private static var grokBillingLogScans: [String: GrokBillingLogScan] = [:]
+    /// Bytes read from billing logs; lets tests prove an unchanged log is not read.
+    static var grokBillingLogBytesReadForTesting: Int {
+        grokBillingLogScanLock.withLock { grokBillingLogBytesRead }
+    }
+    private static var grokBillingLogBytesRead = 0
+    private static let grokConfigKey = Array(#""config""#.utf8)
+
+    private static func readGrokBillingLog(_ handle: FileHandle, at offset: UInt64, upTo count: Int? = nil) -> Data? {
+        do {
+            try handle.seek(toOffset: offset)
+            let data = try count.map { try handle.read(upToCount: $0) ?? Data() } ?? handle.readToEnd() ?? Data()
+            grokBillingLogScanLock.withLock { grokBillingLogBytesRead += data.count }
+            return data
+        } catch {
+            return nil
+        }
+    }
+
+    /// Newest line of `data` (from byte `firstLine`) that `grokBillingLogLine`
+    /// accepts, with its start. Only lines holding the `"config"` key are parsed:
+    /// `grokBillingJSON` returns nil without a `config` object, so no other line
+    /// can match, and the live log has none.
+    private static func newestGrokBillingLine(
+        in data: Data,
+        firstLine: Int
+    ) -> (usage: AssistantAccountUsage, lineStart: Int)? {
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> (usage: AssistantAccountUsage, lineStart: Int)? in
+            guard let base = raw.baseAddress, raw.count > firstLine else { return nil }
+            var candidates: [Range<Int>] = []
+            var searchFrom = firstLine
+            while searchFrom < raw.count,
+                  let found = memmem(base + searchFrom, raw.count - searchFrom,
+                                     grokConfigKey, grokConfigKey.count) {
+                let hit = base.distance(to: UnsafeRawPointer(found))
+                var start = hit
+                while start > firstLine, raw[start - 1] != UInt8(ascii: "\n") { start -= 1 }
+                var end = hit
+                while end < raw.count, raw[end] != UInt8(ascii: "\n") { end += 1 }
+                candidates.append(start..<end)
+                searchFrom = end + 1
+            }
+            // Newest last in the log — walk reverse.
+            for line in candidates.reversed() {
+                let text = String(decoding: UnsafeRawBufferPointer(rebasing: raw[line]), as: UTF8.self)
+                if let usage = grokBillingLogLine(text) {
+                    return (usage, line.lowerBound)
+                }
+            }
+            return nil
+        }
     }
 
     private static func grokWeeklyUsedPercent(from config: [String: Any]) -> Double? {

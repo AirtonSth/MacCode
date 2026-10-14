@@ -27,6 +27,15 @@ public struct ProviderAccountUsageRefreshRequest: Sendable, Equatable {
     /// When set, Claude prefers `GET /api/oauth/usage`. Tests leave it nil.
     public let claudeAuthFileURL: URL?
     public let claudeUsageAPIURL: URL?
+    /// When set, Claude next tries Claude Code's own usage cache
+    /// (`~/.claude.json`) before launching the CLI. Tests leave it nil.
+    public let claudeUsageCacheURL: URL?
+    /// When false, Claude stops after the OAuth API and the cache: no
+    /// `claude -p /usage` launch (~10 CPU-s, ~600 MB per run) this time.
+    public let allowClaudeCLIProbe: Bool
+    /// When false, a failed `claude -p /usage` does not fall back to the
+    /// interactive PTY screen.
+    public let allowClaudeUsageScreen: Bool
     /// When set, Codex prefers `GET …/wham/usage`. Tests leave it nil.
     public let codexAuthFileURL: URL?
     public let codexUsageAPIURL: URL?
@@ -46,6 +55,9 @@ public struct ProviderAccountUsageRefreshRequest: Sendable, Equatable {
         grokCreditsAPIURL: URL? = nil,
         claudeAuthFileURL: URL? = nil,
         claudeUsageAPIURL: URL? = nil,
+        claudeUsageCacheURL: URL? = nil,
+        allowClaudeCLIProbe: Bool = true,
+        allowClaudeUsageScreen: Bool = true,
         codexAuthFileURL: URL? = nil,
         codexUsageAPIURL: URL? = nil,
         includeGrok: Bool = true,
@@ -60,6 +72,9 @@ public struct ProviderAccountUsageRefreshRequest: Sendable, Equatable {
         self.grokCreditsAPIURL = grokCreditsAPIURL
         self.claudeAuthFileURL = claudeAuthFileURL
         self.claudeUsageAPIURL = claudeUsageAPIURL
+        self.claudeUsageCacheURL = claudeUsageCacheURL
+        self.allowClaudeCLIProbe = allowClaudeCLIProbe
+        self.allowClaudeUsageScreen = allowClaudeUsageScreen
         self.codexAuthFileURL = codexAuthFileURL
         self.codexUsageAPIURL = codexUsageAPIURL
         self.includeGrok = includeGrok
@@ -213,11 +228,18 @@ public final class ProviderAccountUsageRefresher: ProviderAccountUsageRefreshing
         if let live = await fetchClaudeOAuthUsage(request) {
             return live
         }
+        if let cacheURL = request.claudeUsageCacheURL,
+           let cached = AssistantAccountUsageParser.claudeCachedUsage(fromConfigFile: cacheURL) {
+            return cached
+        }
+        guard request.allowClaudeCLIProbe else { return nil }
         // Prefer the Process path (waitUntilExit) first — it never leaves PTY zombies.
         // Screen-capture PTY is fallback only when text /usage fails (plan-final W1).
         // Parse with claudeUsageText (which prefers claudeUsageScreen patterns) so
         // modern "Current week (all models): N% used" headless output is accepted
-        // without spawning an interactive PTY.
+        // without spawning an interactive PTY. The probe only reads usage: it
+        // skips the user's MCP servers and hooks, which otherwise start a dozen
+        // processes (npm, MCP servers, plugin hooks) on every launch.
         let binary = request.claudeBinary
         let cwd = request.cwd
         let environment = request.environment
@@ -226,6 +248,8 @@ public final class ProviderAccountUsageRefresher: ProviderAccountUsageRefreshing
             "--output-format", "text",
             "--no-session-persistence",
             "--max-budget-usd", "0.01",
+            "--strict-mcp-config",
+            "--settings", #"{"disableAllHooks":true}"#,
             "/usage"
         ]
         let timeoutSeconds = self.timeoutSeconds
@@ -236,6 +260,7 @@ public final class ProviderAccountUsageRefresher: ProviderAccountUsageRefreshing
            let usage = AssistantAccountUsageParser.claudeUsageText(result.stdout) {
             return usage
         }
+        guard request.allowClaudeUsageScreen else { return nil }
         if let usage = await runClaudeUsageScreen(request) {
             return usage
         }
@@ -460,7 +485,12 @@ public final class ProviderAccountUsageRefresher: ProviderAccountUsageRefreshing
     private func terminatePTYChild(_ pid: Int32) {
         // Bounded wait only. A stuck `/usage` child must not pin overlapping
         // refreshes on blocking waitpid (freeze-class sample: two wait4).
-        _ = OwnedChildReaper.terminateAndReap(pid: pid, waitForZombie: false)
+        // A child still exiting after SIGKILL is reaped when it exits; nothing
+        // else waits on a forkpty child, so it would stay `<defunct>` for the
+        // app's lifetime.
+        if OwnedChildReaper.terminateAndReap(pid: pid, waitForZombie: false) == .timedOutStillRunning {
+            OwnedChildReaper.reapWhenExited(pid: pid)
+        }
     }
 
     private func terminateScriptProcess(_ proc: Process) {
