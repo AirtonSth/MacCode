@@ -2114,6 +2114,34 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(failed["status"] as? String, "failed")
         XCTAssertEqual((failed["readback"] as? [String: Any])?["result"] as? String, "failed")
         XCTAssertEqual(try routineRow(authority, botID: fixture.botID)["last_result"] as? String, "failed")
+        // A manual run that failed is not a missed schedule: say which it was.
+        XCTAssertEqual(try store.listAttention().first?.title, "Task run did not start")
+        let item = try XCTUnwrap(
+            (try authority.dispatch(method: "bot.attention.list", params: [:])["items"] as? [[String: Any]])?.first
+        )
+        XCTAssertEqual(item["detail"] as? String, "Task run did not start: Invalid bot row: Bot runtime is unavailable")
+    }
+
+    /// WHY: every sidecar write re-encodes the scheduler history. Once tasks
+    /// really run (hourly, for months), an unbounded history would make every
+    /// bot.* mutation slower and the settings row grow without end.
+    func test_schedulerRunHistoryKeepsOnlyRecentRuns() throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let fixture = try scheduleRoutine(prefix: "history", base: base)
+        let limit = BotRemoteControlAuthority.schedulerRunHistoryLimit
+        for index in 0..<(limit + 10) {
+            _ = try authority.dispatch(method: "bot.routine.run", params: [
+                "client_request_id": "history-\(index)",
+                "bot_id": fixture.botID,
+                "routine_id": fixture.routineID,
+            ], now: base.addingTimeInterval(Double(index)))
+        }
+        let stored = try XCTUnwrap(SettingsRepository(db: db).get("bot.remote.scheduler_runs"))
+        let runs = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(stored.utf8)) as? [[String: Any]]
+        )
+        XCTAssertEqual(runs.count, limit)
+        XCTAssertEqual(runs.last?["run_id"] as? String, "run-\(limit + 10)", "the newest run is kept")
     }
 
     /// WHY: Notify Off is a delivery preference, not permission to erase Bot

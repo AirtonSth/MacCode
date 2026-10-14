@@ -346,6 +346,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// The in-process timer's period. A slot missed by less than one tick
     /// still fires after a relaunch, a pause, or an edit.
     public static let routineTickInterval: TimeInterval = 30
+    static let schedulerRunHistoryLimit = 50
 
     /// Claims every due routine slot with one store read, off the main thread.
     /// The claim writes `last_slot_at` and the next `next_run_at` before any
@@ -504,7 +505,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let routineKey = definition.id.value.uuidString.lowercased()
         let botID = definition.botID.value.uuidString.lowercased()
         let error = run["error"] as? String
+        // Recent history only: every sidecar write re-encodes it, and each
+        // routine row already carries its own last result.
         schedulerRuns.append(run)
+        if schedulerRuns.count > Self.schedulerRunHistoryLimit {
+            schedulerRuns.removeFirst(schedulerRuns.count - Self.schedulerRunHistoryLimit)
+        }
         var runtime = routineRuntime[routineKey] ?? [:]
         runtime["last_run_id"] = run["run_id"] ?? NSNull()
         runtime["last_execution_at"] = now.timeIntervalSince1970
@@ -513,6 +519,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         runtime["last_conversation_id"] = run["conversation_id"] ?? NSNull()
         routineRuntime[routineKey] = runtime
         let automatic = run["automatic"] as? Bool == true
+        let notStarted = automatic ? "Scheduled task did not start" : "Task run did not start"
         let item = canonicalAttentionItem([
             "id": UUID().uuidString.lowercased(),
             "bot_id": botID,
@@ -524,7 +531,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "primary": true,
             "delegated": false,
             "title": definition.name,
-            "detail": error.map { "Scheduled task did not start: \($0)" }
+            "detail": error.map { "\(notStarted): \($0)" }
                 ?? (automatic ? "Scheduled task started" : "Task run started"),
             "source": "routine",
         ], hostID: hostID)
@@ -543,7 +550,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             try store.upsertAttention(BotAttentionItem(
                 botID: definition.botID,
                 kind: .blocked,
-                title: "Scheduled task did not start",
+                title: notStarted,
                 detail: "\(definition.name): \(error)",
                 createdAt: now
             ))
