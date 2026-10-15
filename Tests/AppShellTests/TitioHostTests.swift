@@ -1,4 +1,6 @@
 import XCTest
+import Carbon.HIToolbox
+import Surfaces
 @testable import AgentRuntime
 import CoreModel
 import SocketServer
@@ -249,5 +251,51 @@ final class TitioHostTests: XCTestCase {
         XCTAssertFalse(allowed.contains { $0.hasPrefix("--disallowedTools") || $0 == "--tools" })
         XCTAssertTrue(TitioBot.soul.contains(RemoteCodeHostCatalog.activityList))
         XCTAssertTrue(TitioBot.soul.contains("normal tools"))
+    }
+
+    func test_titioIsPinnedAndAlwaysFirstInTheRosterWithThePetAvatar() throws {
+        // WHY: Titio holds the top roster slot like the CEO, with the pet's face.
+        let f = try makeFixture()
+        let ceo = try f.vm.create(name: "Ceo", title: "Chief of all bots")
+        f.vm.setPinned(id: ceo.id, pinned: true)
+        _ = try f.vm.create(name: "Developer", title: "Builds things")
+        let titio = try TitioBot.ensure(store: f.context.botStore, appSupportDirectory: f.context.appSupportDirectory)
+        try f.context.botStore.setPinned(id: titio.id, pinned: false)
+        try f.context.botStore.setHidden(id: titio.id, hidden: true)
+
+        let again = try TitioBot.ensure(store: f.context.botStore, appSupportDirectory: f.context.appSupportDirectory)
+        XCTAssertTrue(again.pinned, "ensure re-pins Titio")
+        XCTAssertFalse(again.hidden, "ensure un-hides Titio")
+        f.vm.reload()
+        XCTAssertEqual(f.vm.fleet.first?.handle, TitioBot.handle)
+
+        XCTAssertNotNil(TitioBot.avatarImage, "pet avatar ships in the AppShell bundle")
+        TitioBot.installAvatar()
+        XCTAssertNotNil(BotsAvatarView.imageOverride(TitioBot.handle))
+        XCTAssertNil(BotsAvatarView.imageOverride("ceo"))
+    }
+
+    func test_quickChatSendsToANewTitioConversation() async throws {
+        let f = try makeFixture()
+        let conversation = try XCTUnwrap(f.router.sendTitioQuickMessage("Titio, quais tarefas estão sendo feitas?"))
+        let titio = try XCTUnwrap(try f.context.botStore.list().first { $0.handle == TitioBot.handle })
+        XCTAssertEqual(try f.context.botStore.conversation(id: conversation)?.botID, titio.id)
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertTrue(request.prompt.contains("quais tarefas"))
+        f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
+    func test_quickChatRegistersOptionSpaceAndSubmitsTrimmedText() {
+        let controller = TitioQuickChatController()
+        var sent: [String] = []
+        controller.install { sent.append($0) }
+        XCTAssertEqual(TitioQuickChatController.keyCode, UInt32(kVK_Space))
+        XCTAssertEqual(TitioQuickChatController.modifiers, UInt32(optionKey))
+        XCTAssertEqual(controller.registrationStatus, noErr)
+        controller.submit("   ")
+        controller.submit("  oi titio ")
+        XCTAssertEqual(sent, ["oi titio"])
     }
 }

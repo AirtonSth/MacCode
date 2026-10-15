@@ -1,9 +1,13 @@
+import AppKit
 import SwiftUI
 import CoreModel
 import DesignSystemKit
 
 /// Shared teammate avatar. Desk roster and both composers mount this view.
 public struct BotsAvatarView: View {
+    /// Image that replaces the generated avatar for a handle (Titio uses the pet).
+    @MainActor public static var imageOverride: (String) -> NSImage? = { _ in nil }
+
     public let name: String
     public let handle: String
     public var symbol: String?
@@ -26,7 +30,18 @@ public struct BotsAvatarView: View {
 
     public var body: some View {
         Group {
-            if let symbol, let spec = BotBlobatarSpec.parse(symbol) {
+            if let image = Self.imageOverride(handle) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.none)
+                    .scaledToFit()
+                    .padding(size * 0.06)
+                    .frame(width: size, height: size)
+                    .background(
+                        RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+                            .fill(Color(white: 0.92))
+                    )
+            } else if let symbol, let spec = BotBlobatarSpec.parse(symbol) {
                 BotBlobatarView(
                     name: name.isEmpty ? handle : name,
                     spec: spec.liveFaced(attention: attention),

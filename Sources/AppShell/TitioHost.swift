@@ -1,7 +1,9 @@
+import AppKit
 import CoreModel
 import Foundation
 import Persistence
 import SocketServer
+import Surfaces
 
 /// Titio: the pet as a chat Bot. It is an ordinary host Bot (handle `titio`)
 /// so its desk, persistence, provider tools and iOS mirroring are the Bot
@@ -17,7 +19,10 @@ public enum TitioBot {
     @discardableResult
     public static func ensure(store: BotStore, appSupportDirectory: URL) throws -> BotDefinition {
         if let existing = try store.list(includeHidden: true).first(where: { $0.handle == handle && $0.deletedAt == nil }) {
-            return existing
+            // Titio stays pinned and visible, like the CEO slot.
+            if !existing.pinned { try store.setPinned(id: existing.id, pinned: true) }
+            if existing.hidden { try store.setHidden(id: existing.id, hidden: false) }
+            return try store.get(id: existing.id) ?? existing
         }
         let bot = try store.create(
             name: name,
@@ -26,10 +31,23 @@ public enum TitioBot {
             handle: handle,
             soul: soul
         )
+        try store.setPinned(id: bot.id, pinned: true)
         try? BotHome(appSupportDirectory: appSupportDirectory, bot: bot).ensure(
             name: bot.name, handle: bot.handle, title: bot.title, description: bot.description, soul: soul
         )
-        return bot
+        return try store.get(id: bot.id) ?? bot
+    }
+
+    /// The pet's idle frame, used as Titio's avatar everywhere a Bot avatar shows.
+    @MainActor public static let avatarImage: NSImage? = {
+        guard let bundle = try? AppShellResourceBundle.bundle(),
+              let url = bundle.url(forResource: "titio-avatar", withExtension: "png", subdirectory: "Pet")
+                ?? bundle.url(forResource: "titio-avatar", withExtension: "png") else { return nil }
+        return NSImage(contentsOf: url)
+    }()
+
+    @MainActor public static func installAvatar() {
+        BotsAvatarView.imageOverride = { $0 == handle ? avatarImage : nil }
     }
 }
 
@@ -42,6 +60,24 @@ extension AppCommandRouter {
         botsViewModel?.reload()
         _ = try openBotsDesk(botID: bot.id)
         return bot.id
+    }
+
+    /// Option+Space quick chat: starts a new Titio conversation with `text`
+    /// and opens it, like starting a chat from the pet.
+    @discardableResult
+    public func sendTitioQuickMessage(_ text: String) -> BotConversationID? {
+        guard let ctx = context, let botsViewModel else { return nil }
+        do {
+            let bot = try TitioBot.ensure(store: ctx.botStore, appSupportDirectory: ctx.appSupportDirectory)
+            let sent = try botsViewModel.enqueueHostMessage(botID: bot.id, text: text, conversationID: nil)
+            let conversation = sent.objectValue?["conversation_id"]?.stringValue
+                .flatMap(UUID.init).map(BotConversationID.init)
+            _ = try? openBotsDesk(botID: bot.id, conversationID: conversation)
+            return conversation
+        } catch {
+            NSSound.beep()
+            return nil
+        }
     }
 
     public func listHostActivity() async throws -> JSONValue {

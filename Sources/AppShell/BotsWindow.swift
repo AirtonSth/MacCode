@@ -3875,6 +3875,9 @@ public final class BotsViewModel: ObservableObject {
             }
         }
         var result = filtered.sorted { lhs, rhs in
+            // Titio is the pet: always the first Bot.
+            let lhsTitio = lhs.handle == TitioBot.handle, rhsTitio = rhs.handle == TitioBot.handle
+            if lhsTitio != rhsTitio { return lhsTitio }
             if lhs.pinned != rhs.pinned { return lhs.pinned && !rhs.pinned }
             return lhs.updatedAt > rhs.updatedAt
         }
