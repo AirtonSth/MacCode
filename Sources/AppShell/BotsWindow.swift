@@ -4331,7 +4331,7 @@ public final class BotsViewModel: ObservableObject {
     public func rosterPreview(for bot: BotDefinition) -> String {
         // One plain line: a subtitle never shows raw `**`, links or fences.
         if let preview = lastPreviewByBot[bot.id], !preview.isEmpty {
-            let plain = MarkdownPlainText.firstLine(BotsDeskFollowThrough.displayUserText(from: preview))
+            let plain = MarkdownPlainText.firstLine(AgentReplyQuote.strippingQuote(BotsDeskFollowThrough.displayUserText(from: preview)))
             if !plain.isEmpty { return plain }
         }
         if !bot.title.isEmpty { return bot.title }
@@ -4356,11 +4356,11 @@ public final class BotsViewModel: ObservableObject {
         let cached = messagesByBot[bot.id] ?? []
         let source = cached.isEmpty && selectedBotID == bot.id ? deskMessages : cached
         let rows = source.suffix(4).map { message in
-            BotActivityRow(id: message.id, text: MarkdownPlainText.firstLine(message.text), createdAt: message.createdAt)
+            BotActivityRow(id: message.id, text: MarkdownPlainText.firstLine(AgentReplyQuote.strippingQuote(message.text)), createdAt: message.createdAt)
         }
         if !rows.isEmpty { return Array(rows) }
         if let preview = lastPreviewByBot[bot.id], let stamp = lastUpdatedByBot[bot.id] {
-            return [BotActivityRow(text: MarkdownPlainText.firstLine(preview), createdAt: stamp)]
+            return [BotActivityRow(text: MarkdownPlainText.firstLine(AgentReplyQuote.strippingQuote(preview)), createdAt: stamp)]
         }
         return []
     }
@@ -10442,6 +10442,8 @@ public final class BotsViewModel: ObservableObject {
         // Fork from any message (like the Agent App): a new conversation of
         // the same Bot on a forked copy of this thread. Not in Titio's inbox.
         if !isTitioInbox {
+            // Reply to a message: quote it above the composer ("Reply…").
+            vm.supportsReplies = true
             vm.onForkInNewChat = { [weak self, weak vm] messageID in
                 guard let self else { return }
                 Task { @MainActor in
