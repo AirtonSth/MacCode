@@ -759,24 +759,36 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func handleBotScreenshotPosted(threadID: AgentThreadID, jpeg: Data, reason: String) {
-        guard let ctx = context else { return }
         do {
-            let attachment = try agentAttachmentStore().stage(
-                data: jpeg, displayName: "screenshot.jpg", kind: .image, mimeType: "image/jpeg"
+            _ = try publishAssistantImage(
+                threadID: threadID, data: jpeg, displayName: "screenshot.jpg",
+                mimeType: "image/jpeg", content: "📷 \(reason)"
             )
-            let message = AgentMessage(
-                threadId: threadID, role: .assistant, content: "📷 \(reason)", attachments: [attachment]
-            )
-            try ctx.messageRepo.append(message)
-            // Paired devices see the screenshot row now, not on their next reload.
-            EventBus.shared.publish(
-                kind: .agentMessageAppended,
-                payload: AgentMessageTransport.appendedEventPayload(from: message)
-            )
-            refreshAgentSurfaces(thread: threadID, reloadTranscriptIfSelected: true)
         } catch {
             NSLog("RemoteCode: bot screenshot could not be saved: \(error)")
         }
+    }
+
+    func publishAssistantImage(
+        threadID: AgentThreadID, data: Data, displayName: String, mimeType: String, content: String
+    ) throws -> (message: AgentMessage, attachmentID: String) {
+        guard let ctx = context else { throw LayoutError.invalidLayout }
+        let attachment = try agentAttachmentStore().stage(
+            data: data, displayName: displayName, kind: .image, mimeType: mimeType
+        )
+        guard let attachmentID = attachment.id else {
+            throw JSONRPCError(code: -32044, message: "Image could not be stored.")
+        }
+        let message = AgentMessage(
+            threadId: threadID, role: .assistant, content: content, attachments: [attachment]
+        )
+        try ctx.messageRepo.append(message)
+        EventBus.shared.publish(
+            kind: .agentMessageAppended,
+            payload: AgentMessageTransport.appendedEventPayload(from: message)
+        )
+        refreshAgentSurfaces(thread: threadID, reloadTranscriptIfSelected: true)
+        return (message, attachmentID)
     }
 
     func publishAgentThreadUpdated(_ thread: AgentThread) {
@@ -9245,6 +9257,78 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
             }
         }
+    }
+
+    static func hostBrowserScreenshotSurface(
+        in surfaces: [SurfaceDescriptor], requested: SurfaceID?
+    ) throws -> SurfaceID {
+        let browsers = surfaces.filter { $0.type == .browser }
+        if let requested {
+            guard browsers.contains(where: { $0.id == requested }) else {
+                throw JSONRPCError(code: -32047, message: "Browser surface does not belong to this conversation's workspace.")
+            }
+            return requested
+        }
+        guard browsers.count == 1, let browser = browsers.first else {
+            throw JSONRPCError(
+                code: -32044,
+                message: browsers.isEmpty
+                    ? "No browser is open in this conversation's workspace."
+                    : "Choose a browser surface_id before capturing: " + browsers.map { "\($0.title) (\($0.id.value.uuidString))" }.joined(separator: ", ")
+            )
+        }
+        return browser.id
+    }
+
+    public func captureHostBrowserToChat(
+        callerThread: AgentThreadID, surface: SurfaceID?, reason: String
+    ) throws -> JSONValue {
+        guard let ctx = context else {
+            throw DefiniteMutationRejection(JSONRPCError(code: -32044, message: "RemoteCode is unavailable."))
+        }
+        let selected: SurfaceID
+        do {
+            guard let thread = try ctx.threadRepo.get(id: callerThread),
+                  let workspaceID = thread.workspaceId,
+                  let workspace = ctx.state.workspaces[workspaceID] else {
+                throw JSONRPCError(code: -32044, message: "This conversation has no Mac browser workspace.")
+            }
+            guard try ctx.threadRepo.guestPlacement(of: callerThread)?.runsInGuest != true else {
+                throw JSONRPCError(code: -32052, message: "Capturing the Mac browser requires running this conversation on the Mac.")
+            }
+            guard !reason.isEmpty, reason.count <= 500 else { throw JSONRPCError.invalidParams }
+            var surfaces: [SurfaceDescriptor] = []
+            forEachSurface(in: workspace.layout) { surfaces.append($0) }
+            selected = try Self.hostBrowserScreenshotSurface(in: surfaces, requested: surface)
+        } catch {
+            throw DefiniteMutationRejection(error)
+        }
+        let data: Data
+        do {
+            let path = try browserScreenshot(surface: selected, savePath: nil)
+            let url = URL(fileURLWithPath: path)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let resource = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard resource.isRegularFile == true,
+                  let size = resource.fileSize, size > 0,
+                  size <= AgentAttachmentStore.maximumSizeBytes else {
+                throw JSONRPCError(code: -32044, message: "Browser screenshot exceeds the image attachment limit.")
+            }
+            data = try Data(contentsOf: url)
+        } catch {
+            throw DefiniteMutationRejection(error)
+        }
+        let published = try publishAssistantImage(
+            threadID: callerThread, data: data, displayName: "mac-browser-screenshot.png",
+            mimeType: "image/png", content: "Mac browser: \(reason)"
+        )
+        return .object([
+            "thread_id": .string(callerThread.value.uuidString),
+            "message_id": .string(published.message.id.value.uuidString),
+            "attachment_id": .string(published.attachmentID),
+            "surface_id": .string(selected.value.uuidString),
+            "origin": .string("mac_browser")
+        ])
     }
 
     public func browserScreenshot(surface: SurfaceID, savePath: String?) throws -> String {

@@ -68,7 +68,7 @@ public struct AgentChatChoicesCard: View {
             }
         }
         .padding(DS.Space.xl)
-        .frame(maxWidth: 560, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(DS.Palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.modal, style: .continuous))
         .accessibilityElement(children: .contain)

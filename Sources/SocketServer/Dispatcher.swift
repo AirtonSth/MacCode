@@ -236,6 +236,7 @@ public protocol CommandRouting: AnyObject {
     func listHostActivity() async throws -> JSONValue
     func delegateHostBot(bot: String, text: String, conversationID: BotConversationID?, callerThread: AgentThreadID, callerRun: AgentRunID) async throws -> JSONValue
     func runNextHostScheduledTask(workspace: String, taskID: UUID?) throws -> JSONValue
+    func captureHostBrowserToChat(callerThread: AgentThreadID, surface: SurfaceID?, reason: String) throws -> JSONValue
     func createHostBotSkill(botID: BotID, skillID: String, body: String?, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
     func viewHostBotSkill(botID: BotID, skillID: String, callerRun: AgentRunID, callerThread: AgentThreadID) throws -> JSONValue
     func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue
@@ -407,6 +408,7 @@ public protocol CommandRouting: AnyObject {
 
 public extension CommandRouting {
     func activityList(params: [String: JSONValue]) throws -> JSONValue { throw JSONRPCError.notSupported("agent.activity.list") }
+    func captureHostBrowserToChat(callerThread: AgentThreadID, surface: SurfaceID?, reason: String) throws -> JSONValue { throw JSONRPCError.notSupported("host.browser.screenshot") }
     func activityListOffMain(params: [String: JSONValue]) async throws -> JSONValue { try activityList(params: params) }
     func activitySetViewed(params: [String: JSONValue]) throws -> JSONValue { throw JSONRPCError.notSupported("agent.activity.viewed.set") }
     func activityAcknowledge(params: [String: JSONValue]) throws -> JSONValue { throw JSONRPCError.notSupported("agent.activity.acknowledge") }
@@ -973,6 +975,7 @@ public final class JSONRPCDispatcher {
         "host.bot.skill.create",
         "host.bot.delegate",
         "host.scheduled_task.run_next",
+        "host.browser.screenshot",
         "bot.create",
         "bot.discard_new",
         "bot.save",
@@ -3504,6 +3507,22 @@ public final class JSONRPCDispatcher {
                         callerRun: runID
                     )
                 )
+            case "host.browser.screenshot":
+                guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else {
+                    throw DefiniteMutationRejection(JSONRPCError.invalidParams)
+                }
+                let surface: SurfaceID?
+                if let raw = params["surface_id"]?.stringValue {
+                    guard let uuid = UUID(uuidString: raw) else { throw DefiniteMutationRejection(JSONRPCError.invalidParams) }
+                    surface = SurfaceID(uuid)
+                } else if params["surface_id"] != nil {
+                    throw DefiniteMutationRejection(JSONRPCError.invalidParams)
+                } else {
+                    surface = nil
+                }
+                let reason = params["reason"]?.stringValue ?? "Screenshot of Mac browser"
+                guard !reason.isEmpty, reason.count <= 500 else { throw DefiniteMutationRejection(JSONRPCError.invalidParams) }
+                return .init(id: id, result: try router.captureHostBrowserToChat(callerThread: threadID, surface: surface, reason: reason))
             case "host.scheduled_task.run_next":
                 guard let workspace = params["workspace"]?.stringValue else {
                     throw JSONRPCError.invalidParams

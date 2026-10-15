@@ -3248,6 +3248,7 @@ public final class BotsViewModel: ObservableObject {
     /// `liveWorkingBots()` SQLite reads (perf BT-01). Refreshed only where the
     /// inputs change — see `refreshActiveBotCount()`.
     @Published public private(set) var activeBotCount: Int = 0
+    @Published private var liveRosterBotIDs: Set<BotID> = []
     /// Stored roster snapshot so ForEach does not re-filter/sort `fleet` on
     /// unrelated @Published writes (desk timeline, inspector).
     @Published public private(set) var publishedRoster: [BotDefinition] = []
@@ -3947,7 +3948,12 @@ public final class BotsViewModel: ObservableObject {
     /// `liveWorkingBots()` costs two SQLite queries plus a coordinator lock
     /// (perf BT-01).
     public func refreshActiveBotCount() {
-        let next = liveWorkingBots().count
+        let liveBots = liveWorkingBots()
+        let nextIDs = Set(liveBots.map(\.id))
+        if nextIDs != liveRosterBotIDs {
+            liveRosterBotIDs = nextIDs
+        }
+        let next = liveBots.count
         if next != activeBotCount {
             activeBotCount = next
         }
@@ -4303,6 +4309,10 @@ public final class BotsViewModel: ObservableObject {
             return .none
         }
         return state
+    }
+
+    public func activityState(for bot: BotDefinition) -> BotAttentionState {
+        liveRosterBotIDs.contains(bot.id) ? .working : attentionState(for: bot)
     }
 
     /// A leftover failed/interrupted run on another thread is not a live ask.
@@ -10439,11 +10449,11 @@ public final class BotsViewModel: ObservableObject {
                 }
             }
         }
-        // Fork from any message (like the Agent App): a new conversation of
-        // the same Bot on a forked copy of this thread. Not in Titio's inbox.
+        // Reply quotes work in every Desk thread, including Titio's inbox.
+        vm.supportsReplies = true
+        // Fork from any message: a new conversation of the same Bot on a
+        // forked copy of this thread. Not in Titio's inbox.
         if !isTitioInbox {
-            // Reply to a message: quote it above the composer ("Reply…").
-            vm.supportsReplies = true
             vm.onForkInNewChat = { [weak self, weak vm] messageID in
                 guard let self else { return }
                 Task { @MainActor in
@@ -12618,7 +12628,7 @@ public struct BotsRosterList: View {
                         handle: bot.handle,
                         symbol: bot.avatarSymbol,
                         size: BotsChrome.rosterAvatarSize,
-                        attention: state
+                        attention: vm.activityState(for: bot)
                     )
                     Circle()
                         .fill(rosterStatusColor(state))
@@ -12639,7 +12649,7 @@ public struct BotsRosterList: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
-                if BotsChrome.rosterShowsBusySpinner(for: state) {
+                if BotsChrome.rosterShowsBusySpinner(for: vm.activityState(for: bot)) {
                     DSBusySpinner(
                         label: BotsChrome.statusTitle(for: .working),
                         identifier: "bots.roster.busy.\(bot.handle)"
@@ -13053,7 +13063,7 @@ public struct BotsRootView: View {
                 handle: vm.studioDraft.handle,
                 symbol: vm.studioDraft.avatarSymbol,
                 size: 40,
-                attention: studioAvatarAttention
+                attention: vm.selectedBot.map { vm.activityState(for: $0) } ?? studioAvatarAttention
             )
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: DS.Space.sm) {
@@ -13696,7 +13706,7 @@ public struct BotsRootView: View {
                         handle: bot.handle,
                         symbol: bot.avatarSymbol,
                         size: 22,
-                        attention: vm.attentionState(for: bot)
+                        attention: vm.activityState(for: bot)
                     )
                     VStack(alignment: .leading, spacing: 1) {
                         HStack(spacing: DS.Space.sm) {

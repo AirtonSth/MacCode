@@ -99,17 +99,29 @@ final class AgentChatChoicesNoticeTests: XCTestCase {
                       "the newest-reply card is gated on Bot threads")
     }
 
+    func test_choicesViewportStaysBoundedInShortAndTallWindows() {
+        // WHY: several unresolved notices must scroll without pushing the composer
+        // below a short window; tall windows still cap the card area.
+        XCTAssertEqual(AgentAppView.choicesViewportHeight(availableHeight: 300), 96)
+        XCTAssertEqual(AgentAppView.choicesViewportHeight(availableHeight: 1_000), 240)
+        XCTAssertEqual(AgentAppView.choicesViewportHeight(availableHeight: 0), 0)
+        XCTAssertFalse(AgentAppView.hasVisibleChoicesCards(ordinaryPending: false, openNoticeCount: 0))
+        XCTAssertTrue(AgentAppView.hasVisibleChoicesCards(ordinaryPending: true, openNoticeCount: 0))
+        XCTAssertTrue(AgentAppView.hasVisibleChoicesCards(ordinaryPending: false, openNoticeCount: 1))
+    }
+
     func test_theChoicesCardObservesTheComposerDraftAndTheTranscript() throws {
         // WHY: the card lived in the view body that observes only the view
         // model; the draft and messages publish on their own objects, so
         // typing never disabled the card and a tap overwrote the draft.
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let surface = try String(contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"))
-        XCTAssertTrue(surface.contains("""
-            ComposerReactiveScope(composerState: vm.composerState) {
-                            TranscriptReactiveScope(transcriptState: vm.transcriptState) {
-                                choicesCardRow
-            """), "the card row is rendered inside both observing scopes")
+        XCTAssertTrue(surface.contains("ComposerReactiveScope(composerState: vm.composerState) {\n                TranscriptReactiveScope(transcriptState: vm.transcriptState) {\n                    if hasVisibleChoicesCards {\n                        ScrollView(.vertical) {\n                            choicesCardRow"),
+                      "scrolling card row is conditional and nested inside both publisher scopes")
+        XCTAssertTrue(surface.contains("private var hasVisibleChoicesCards: Bool {\n        let ordinaryPending = vm.showsBotChoices"),
+                      "no scroll view exists when neither card source has pending content")
+        XCTAssertTrue(surface.contains(".frame(height: Self.choicesViewportHeight(availableHeight: availableHeight))"),
+                      "the card viewport is bounded by conversation height")
         let card = try XCTUnwrap(surface.range(of: "private var choicesCardRow: some View {"))
         let body = String(surface[card.upperBound...].prefix(2_000))
         XCTAssertTrue(body.contains("guard vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty"),

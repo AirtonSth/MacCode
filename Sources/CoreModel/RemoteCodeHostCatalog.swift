@@ -22,6 +22,7 @@ public enum RemoteCodeHostCatalog: Sendable {
     public static let activityList = "rc_activity_list"
     public static let botDelegate = "rc_bot_delegate"
     public static let scheduledTaskRunNext = "rc_scheduled_task_run_next"
+    public static let browserScreenshot = "rc_browser_screenshot"
 
     // Keep managed-provider calls on a private namespace. The owner-only socket
     // is also used by RC2CLI, whose legacy workspace/thread methods intentionally
@@ -40,6 +41,7 @@ public enum RemoteCodeHostCatalog: Sendable {
     public static let activityListRPC = "host.activity.list"
     public static let botDelegateRPC = "host.bot.delegate"
     public static let scheduledTaskRunNextRPC = "host.scheduled_task.run_next"
+    public static let browserScreenshotRPC = "host.browser.screenshot"
 
     public static let operationIDKey = "operation_id"
     public static let genericHostCallTool = "rc_host_call"
@@ -60,7 +62,7 @@ public enum RemoteCodeHostCatalog: Sendable {
     }
 
     public static let providerDirective = """
-    Built-in RemoteCode intents (create or list workspaces, Agent App threads, Bots, Bot desk threads, and owned Bot skills) must call the named tools \(workspaceCreate), \(workspaceList), \(threadCreate), \(threadList), \(botCreate), \(botList), \(botOpen), \(botSend), \(botThreadCreate), \(botSkillCreate), and \(botSkillView). To answer what is happening in RemoteCode (running or idle threads, Bots, scheduled tasks, items that need the user) call \(activityList). To ask another Bot by name to do something call \(botDelegate). To fire a workspace's next scheduled task now call \(scheduledTaskRunNext). For a consulted Bot's skill files, use \(botSkillCreate) and \(botSkillView); `bot_write_home_file` is only for the calling Bot's own home. Never invent a generic host-call tool. Do not use Computer Use, macos-harness, Accessibility (AX), or clicking the RemoteCode UI as a fallback for these intents. Every mutation must supply a unique `operation_id`. If a mutation reply is lost, read back with the matching list/view tool instead of retrying with a new id.
+    Built-in RemoteCode intents (create or list workspaces, Agent App threads, Bots, Bot desk threads, and owned Bot skills) must call the named tools \(workspaceCreate), \(workspaceList), \(threadCreate), \(threadList), \(botCreate), \(botList), \(botOpen), \(botSend), \(botThreadCreate), \(botSkillCreate), and \(botSkillView). To answer what is happening in RemoteCode (running or idle threads, Bots, scheduled tasks, items that need the user) call \(activityList). To ask another Bot by name to do something call \(botDelegate). To fire a workspace's next scheduled task now call \(scheduledTaskRunNext). To capture the Mac browser into the calling Agent thread, call \(browserScreenshot); it accepts optional surface_id and reason, and requires operation_id. For a consulted Bot's skill files, use \(botSkillCreate) and \(botSkillView); `bot_write_home_file` is only for the calling Bot's own home. Never invent a generic host-call tool. Do not use Computer Use, macos-harness, Accessibility (AX), or clicking the RemoteCode UI as a fallback for these intents. Every mutation must supply a unique `operation_id`. If a mutation reply is lost, read back with the matching list/view tool instead of retrying with a new id.
     """
 
     public static var toolNames: [String] {
@@ -69,13 +71,13 @@ public enum RemoteCodeHostCatalog: Sendable {
             threadCreate, threadList,
             botCreate, botList, botOpen, botSend, botThreadCreate,
             botSkillCreate, botSkillView,
-            activityList, botDelegate, scheduledTaskRunNext,
+            activityList, botDelegate, scheduledTaskRunNext, browserScreenshot,
         ]
     }
 
     public static let mutationToolNames: Set<String> = [
         workspaceCreate, threadCreate, botCreate, botOpen, botSend, botThreadCreate, botSkillCreate,
-        botDelegate, scheduledTaskRunNext,
+        botDelegate, scheduledTaskRunNext, browserScreenshot,
     ]
 
     public static let rpcMethods: Set<String> = [
@@ -83,13 +85,13 @@ public enum RemoteCodeHostCatalog: Sendable {
         threadCreateRPC, threadListRPC,
         botCreateRPC, botListRPC, botOpenRPC, botSendRPC, botThreadCreateRPC,
         botSkillCreateRPC, botSkillViewRPC,
-        activityListRPC, botDelegateRPC, scheduledTaskRunNextRPC,
+        activityListRPC, botDelegateRPC, scheduledTaskRunNextRPC, browserScreenshotRPC,
     ]
 
     public static let rpcMutationMethods: Set<String> = [
         workspaceCreateRPC, threadCreateRPC,
         botCreateRPC, botOpenRPC, botSendRPC, botThreadCreateRPC, botSkillCreateRPC,
-        botDelegateRPC, scheduledTaskRunNextRPC,
+        botDelegateRPC, scheduledTaskRunNextRPC, browserScreenshotRPC,
     ]
 
     public static func rpcMethod(for tool: String) -> String? {
@@ -108,6 +110,7 @@ public enum RemoteCodeHostCatalog: Sendable {
         case activityList: return activityListRPC
         case botDelegate: return botDelegateRPC
         case scheduledTaskRunNext: return scheduledTaskRunNextRPC
+        case browserScreenshot: return browserScreenshotRPC
         default: return nil
         }
     }
@@ -156,6 +159,8 @@ public enum RemoteCodeHostCatalog: Sendable {
             return "Ask another RemoteCode Bot, by name or handle, to do something. Sends the text to that Bot's conversation and returns after persist and enqueue. Requires operation_id."
         case scheduledTaskRunNext:
             return "Run a workspace's next scheduled task now through the in-app scheduler. The workspace is a name or id; task_id optionally picks a specific task in it. Requires operation_id."
+        case browserScreenshot:
+            return "Capture the Mac browser and add its screenshot to the authenticated calling Agent thread. Optional surface_id selects the browser surface; reason is a short explanation. Requires operation_id."
         default:
             return name
         }
@@ -267,6 +272,14 @@ public enum RemoteCodeHostCatalog: Sendable {
                     "task_id": ["type": "string"],
                 ]) { _, new in new },
                 required: ["workspace", operationIDKey]
+            )
+        case browserScreenshot:
+            return objectSchema(
+                properties: operationID.merging([
+                    "surface_id": ["type": "string", "format": "uuid"],
+                    "reason": ["type": "string", "maxLength": 500],
+                ]) { _, new in new },
+                required: [operationIDKey]
             )
         default:
             return objectSchema(properties: [:], required: [])

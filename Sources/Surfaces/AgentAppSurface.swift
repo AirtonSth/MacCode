@@ -12910,6 +12910,22 @@ public enum AgentUndoToastPlacement {
 }
 
 public struct AgentAppView: View {
+    static func choicesViewportHeight(availableHeight: CGFloat) -> CGFloat {
+        min(240, max(0, availableHeight * 0.32))
+    }
+
+    static func hasVisibleChoicesCards(ordinaryPending: Bool, openNoticeCount: Int) -> Bool {
+        ordinaryPending || openNoticeCount > 0
+    }
+
+    private var hasVisibleChoicesCards: Bool {
+        let ordinaryPending = vm.showsBotChoices
+            && AgentChatChoicesCard.Pending.latest(in: vm.messages, isRunning: vm.hasRunningWorkForChrome)
+                .map { !dismissedChoices.contains($0.messageID) } == true
+        let openNoticeCount = vm.embedding?.noticeChoiceHandler == nil ? 0
+            : AgentChatChoicesCard.Pending.openNotices(in: vm.messages, dismissed: dismissedChoices).count
+        return Self.hasVisibleChoicesCards(ordinaryPending: ordinaryPending, openNoticeCount: openNoticeCount)
+    }
     struct QueueStatusBannerPresentation: Equatable {
         let message: String
         let offersCopy: Bool
@@ -15342,7 +15358,7 @@ public struct AgentAppView: View {
                             maxWidth: Self.threadRailWidthRange.upperBound
                         )
                 }
-                conversationColumn
+                conversationColumn(availableHeight: proxy.size.height)
                     .frame(minWidth: 0, maxWidth: .infinity)
                 if vm.showPlanSidebar && layout.showsPlanSidebar {
                     planSidebar.frame(minWidth: 240, idealWidth: Self.planSidebarIdealWidth, maxWidth: 420)
@@ -15593,7 +15609,7 @@ public struct AgentAppView: View {
 
     // MARK: Conversation column
 
-    private var conversationColumn: some View {
+    private func conversationColumn(availableHeight: CGFloat) -> some View {
         VStack(spacing: 0) {
             if layout.showsHeader {
                 header
@@ -15637,7 +15653,16 @@ public struct AgentAppView: View {
             // typing a draft disables the card and new replies refresh it.
             ComposerReactiveScope(composerState: vm.composerState) {
                 TranscriptReactiveScope(transcriptState: vm.transcriptState) {
-                    choicesCardRow
+                    if hasVisibleChoicesCards {
+                        ScrollView(.vertical) {
+                            choicesCardRow
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: Self.choicesViewportHeight(availableHeight: availableHeight))
+                        .clipped()
+                        .accessibilityIdentifier("agent.choices.scroll")
+                    }
                 }
             }
             // A failed page read stays on screen with Retry; the transcript

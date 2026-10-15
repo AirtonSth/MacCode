@@ -57,6 +57,66 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
         XCTAssertEqual(router.createCount, 2, "unknown outcomes must not be blindly retried as a new create")
     }
 
+    func test_hostBrowserScreenshotRequiresAuthenticatedActiveRun() async {
+        let router = HostCatalogReceiptRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let response = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "host.browser.screenshot",
+            params: ["thread_id": .string(UUID().uuidString)]
+        ))
+        XCTAssertEqual(response.error?.code, -32047)
+        XCTAssertEqual(router.screenshotCount, 0)
+    }
+
+    func test_hostBrowserScreenshotRoutesCallerAndReplaysReceipt() async throws {
+        let router = HostCatalogReceiptRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let threadID = UUID().uuidString.lowercased()
+        let surfaceID = UUID().uuidString.lowercased()
+        let params: [String: JSONValue] = [
+            "thread_id": .string(threadID),
+            "run_id": .string(UUID().uuidString.lowercased()),
+            BotPeerDelegation.capabilityRPCParameterKey: .string(router.activeCapability),
+            "surface_id": .string(surfaceID),
+            "reason": .string("Inspect browser"),
+            "client_request_id": .string("screenshot-once"),
+        ]
+        func request() -> JSONRPCRequest {
+            JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "host.browser.screenshot", params: params)
+        }
+        let first = await dispatcher.dispatchUnixSocket(request())
+        XCTAssertNil(first.error)
+        XCTAssertEqual(first.result?.objectValue?["captured"]?.boolValue, true)
+        XCTAssertEqual(router.screenshotThread?.value.uuidString.lowercased(), threadID)
+        XCTAssertEqual(router.screenshotSurface?.value.uuidString.lowercased(), surfaceID)
+        XCTAssertEqual(router.screenshotReason, "Inspect browser")
+        XCTAssertEqual(router.screenshotCount, 1)
+        let replay = await dispatcher.dispatchUnixSocket(request())
+        XCTAssertNil(replay.error)
+        XCTAssertEqual(replay.result, first.result)
+        XCTAssertEqual(router.screenshotCount, 1)
+    }
+
+    func test_hostBrowserScreenshotPreservesDefiniteMutationRejection() async {
+        let router = HostCatalogReceiptRouter()
+        router.screenshotError = DefiniteMutationRejection(JSONRPCError(code: -32047, message: "Preflight rejected"))
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let response = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
+            jsonrpc: "2.0", id: .number(1), method: "host.browser.screenshot",
+            params: [
+                "thread_id": .string(UUID().uuidString),
+                "run_id": .string(UUID().uuidString),
+                BotPeerDelegation.capabilityRPCParameterKey: .string(router.activeCapability),
+                "client_request_id": .string("screenshot-rejected"),
+            ]
+        ))
+        XCTAssertEqual(response.error?.code, -32047)
+        XCTAssertNotEqual(response.error?.code, -32095)
+        XCTAssertEqual(router.screenshotCount, 1)
+    }
+
     func test_unixHostCallsRejectMissingCapability() async throws {
         let dispatcher = JSONRPCDispatcher(router: HostCatalogReceiptRouter())
         let response = await dispatcher.dispatchUnixSocket(JSONRPCRequest(
@@ -507,6 +567,20 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
     let activeHostID = "host-peer-receipt-test"
     var peerAskCount = 0
     var peerSelfConfigCount = 0
+    var screenshotCount = 0
+    var screenshotThread: AgentThreadID?
+    var screenshotSurface: SurfaceID?
+    var screenshotReason: String?
+    var screenshotError: Error?
+
+    override func captureHostBrowserToChat(callerThread: AgentThreadID, surface: SurfaceID?, reason: String) throws -> JSONValue {
+        screenshotCount += 1
+        screenshotThread = callerThread
+        screenshotSurface = surface
+        screenshotReason = reason
+        if let screenshotError { throw screenshotError }
+        return .object(["captured": .bool(true)])
+    }
     private var receipts: [String: Receipt] = [:]
     private var bots: [String: String] = [:]
     private var skills: [String: String] = [:]
