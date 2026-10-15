@@ -712,12 +712,15 @@ public final class PetWindowController: NSObject {
     public var onInteraction: (() -> Void)?
     public var onCareAction: ((PetCareAction) -> Void)?
     public var onDragStateChanged: ((Bool) -> Void)?
+    /// The popover is about to open; the speech bubble yields to it.
+    var onPopoverWillOpen: (() -> Void)?
 
     private let model: PetViewModel
     private let placementStore: PetPlacementStore
     private var petPanel: NSPanel?
     private var spriteView: PetSpriteHostingView<PetSpriteView>?
     private var popoverPanel: PetPopoverPanel?
+    private var speechPanel: PetSpeechPanel?
     private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
     private var popoverLocalMonitor: Any?
@@ -747,6 +750,9 @@ public final class PetWindowController: NSObject {
     public var isPopoverVisible: Bool { popoverPanel?.isVisible == true }
     var petPanelForTests: NSPanel? { petPanel }
     var popoverPanelForTests: NSPanel? { popoverPanel }
+    var speechPanelForTests: NSPanel? { speechPanel?.windowForTests }
+    var speechHostingForTests: PetSpeechHostingView? { speechPanel?.hostingForTests }
+    public var isSpeechVisible: Bool { speechPanel?.isVisible == true }
     var spriteAccessibilityViewForTests: NSView? { spriteView }
     var dragLifecycleForTests: (active: Bool, monitoring: Bool, cursorPushed: Bool)? {
         spriteView?.dragLifecycleForTests
@@ -769,6 +775,7 @@ public final class PetWindowController: NSObject {
 
     public func hide() {
         closePopover()
+        hideSpeech(animated: false)
         cancelActiveDrag()
         petPanel?.orderOut(nil)
         removeMouseMonitors()
@@ -783,8 +790,10 @@ public final class PetWindowController: NSObject {
         uninstallDockPlacementCacheObservers()
         petPanel?.close()
         popoverPanel?.close()
+        speechPanel?.close()
         petPanel = nil
         popoverPanel = nil
+        speechPanel = nil
         spriteView = nil
     }
 
@@ -807,6 +816,7 @@ public final class PetWindowController: NSObject {
             installMouseMonitors()
         }
         if isPopoverVisible { positionPopover() }
+        if isSpeechVisible { positionSpeech() }
     }
 
     public func resetPosition() {
@@ -899,6 +909,8 @@ public final class PetWindowController: NSObject {
 
     private func openPopover() {
         ensurePetPanel()
+        onPopoverWillOpen?()
+        hideSpeech(animated: false)
         let panel: PetPopoverPanel
         if let existing = popoverPanel {
             panel = existing
@@ -983,6 +995,34 @@ public final class PetWindowController: NSObject {
         panel.setFrame(placement.frame, display: true)
     }
 
+    /// Shows Titio's speech bubble next to the pet, in its own window. False
+    /// when the pet is not on screen to speak from.
+    @discardableResult
+    func showSpeech(_ speech: PetSpeech, reduceMotion: Bool, onClick: @escaping () -> Void) -> Bool {
+        guard isVisible, !isPopoverVisible,
+              let anchor = petPanel?.frame,
+              let screen = popoverTargetScreen() else { return false }
+        let panel = speechPanel ?? PetSpeechPanel()
+        speechPanel = panel
+        panel.show(
+            speech,
+            anchorFrame: anchor,
+            visibleFrame: screen.visibleFrame,
+            reduceMotion: reduceMotion,
+            onClick: onClick
+        )
+        return true
+    }
+
+    func hideSpeech(animated: Bool) {
+        speechPanel?.hide(animated: animated)
+    }
+
+    private func positionSpeech() {
+        guard let anchor = petPanel?.frame, let screen = popoverTargetScreen() else { return }
+        speechPanel?.reposition(anchorFrame: anchor, visibleFrame: screen.visibleFrame)
+    }
+
     private func finishDrag(frame: CGRect) {
         guard let panel = petPanel,
               let screen = screen(containing: frame) ?? fallbackScreen() else { return }
@@ -1000,6 +1040,7 @@ public final class PetWindowController: NSObject {
         ))
         onAdoptFreePosition?()
         if isPopoverVisible { positionPopover() }
+        if isSpeechVisible { positionSpeech() }
     }
 
     private func resolvePetFrame(size: CGSize, settings: AppSettings) -> CGRect? {
@@ -1061,6 +1102,7 @@ public final class PetWindowController: NSObject {
             return
         }
         if isPopoverVisible { positionPopover() }
+        if isSpeechVisible { positionSpeech() }
     }
 
     private func petSize(scale: Double) -> CGSize {

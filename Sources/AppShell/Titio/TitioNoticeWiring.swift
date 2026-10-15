@@ -473,7 +473,11 @@ extension AppCommandRouter {
                 language: language
             )
             let linked = try vm.ensureTitioInboxThread(bot: bot, conversation: ensured.conversation)
-            vm.onTitioInboxSelected = { [weak ctx] _ in ctx?.titioNoticeCenter.markInboxRead() }
+            vm.onTitioInboxSelected = { [weak ctx] _ in
+                ctx?.titioNoticeCenter.markInboxRead()
+                // The user is now reading the inbox: the pet stops talking over it.
+                (NSApp?.delegate as? AppDelegate)?.petController?.reevaluateSpeech()
+            }
             if ensured.created {
                 EventBus.shared.publish(kind: .botConversationUpdated, payload: .object([
                     "method": .string("bot.conversation.create"),

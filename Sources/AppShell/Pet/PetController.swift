@@ -15,6 +15,7 @@ public final class PetController {
     private let attentionStore: PetAttentionStore
     private let notificationRecorder: PetTerminalNotificationRecorder
     private let model: PetViewModel
+    private let speechController: PetSpeechController
     private var animationController: PetAnimationController?
     private var windowController: PetWindowController?
     private let systemMonitor = PetSystemActivityMonitor()
@@ -81,6 +82,9 @@ public final class PetController {
     private(set) var lastScheduledTransientMillisecondsForTests: Int64?
 
     var modelForTests: PetViewModel { model }
+    var speechControllerForTests: PetSpeechController { speechController }
+    /// Test seam for the speech bubble's click route.
+    var openSpeechRouteForTests: (([String: String]) -> Void)?
     var windowControllerForTests: PetWindowController { windowController! }
     var animationTimerIsRunningForTests: Bool { animationController?.timerIsRunning == true }
     /// Test seam: inject host ActiveRunProjection the same path production uses
@@ -130,6 +134,7 @@ public final class PetController {
         self.settingsStore = SettingsStore(db: context.db)
         let settings = settingsStore.load()
         self.model = PetViewModel(settings: settings)
+        self.speechController = PetSpeechController(model: model)
         self.attentionStore = PetAttentionStore(
             threadRepository: context.threadRepo,
             callbackRepository: context.providerPendingCallbackRepo,
@@ -173,6 +178,61 @@ public final class PetController {
         self.notificationRecorder = PetTerminalNotificationRecorder(
             repository: NotificationRepository(db: context.db)
         )
+        configureSpeech()
+    }
+
+    /// Titio's notice hub speaks through here (`TitioNoticeCenter.setOnSpeech`).
+    func speak(_ notice: TitioNoticeSpeech) {
+        speechController.speak(PetSpeech(notice))
+    }
+
+    /// The desk or popover changed: hide the bubble if a rule now says so.
+    func reevaluateSpeech() {
+        speechController.reevaluate()
+    }
+
+    private func configureSpeech() {
+        speechController.inputs = { [weak self] conversationID in
+            guard let self else {
+                return PetSpeechSuppression.Inputs(
+                    speechEnabled: false, petEnabled: false, petVisible: false,
+                    popoverOpen: false, inboxIsKeyDesk: false
+                )
+            }
+            return PetSpeechSuppression.Inputs(
+                speechEnabled: self.model.settings.petSpeechEnabled,
+                petEnabled: self.model.settings.petEnabled,
+                petVisible: self.windowController?.isVisible == true,
+                popoverOpen: self.windowController?.isPopoverVisible == true,
+                inboxIsKeyDesk: self.router.isTitioInboxViewed(conversationID)
+            )
+        }
+        speechController.present = { [weak self] speech, onClick in
+            guard let self, let windowController = self.windowController else { return false }
+            return windowController.showSpeech(
+                speech,
+                reduceMotion: self.model.settings.petReduceMotion
+                    || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+                onClick: onClick
+            )
+        }
+        speechController.dismiss = { [weak self] animated in
+            self?.windowController?.hideSpeech(animated: animated)
+        }
+        speechController.openRoute = { [weak self] route in
+            if let openRoute = self?.openSpeechRouteForTests {
+                openRoute(route)
+            } else {
+                (NSApp?.delegate as? AppDelegate)?.openNotificationUserInfo(route)
+            }
+        }
+        speechController.onSpoke = { [weak self] _ in
+            guard let self,
+                  let cue = PetCompanionDirector.speechCue(baseState: self.reducer.companionBaseState) else { return }
+            // playCompanionCue skips the pounce under reduced motion or paused
+            // animations; the bubble then only fades in.
+            self.playCompanionCue(cue)
+        }
     }
 
     public func start() {
@@ -210,6 +270,7 @@ public final class PetController {
     }
 
     public func stop() {
+        speechController.clear(animated: false)
         activitySurfaceGeneration &+= 1
         activitySurfaceTask?.cancel()
         activitySurfaceTask = nil
@@ -428,6 +489,9 @@ public final class PetController {
         windowController.onInteraction = { [weak self] in self?.handleInteraction() }
         windowController.onDragStateChanged = { [weak self] isDragging in
             self?.handlePetDragStateChanged(isDragging)
+        }
+        windowController.onPopoverWillOpen = { [weak self] in
+            self?.speechController.clear(animated: false)
         }
         windowController.onCareAction = { [weak self] action in
             guard let self else { return }
@@ -1465,6 +1529,7 @@ public final class PetController {
             companionTask = nil
             pendingCompanionCue = nil
         }
+        speechController.reevaluate()
     }
 
     private func handleInteraction() {
@@ -1473,6 +1538,8 @@ public final class PetController {
     }
 
     private func handlePetDragStateChanged(_ isDragging: Bool) {
+        // The bubble would be left behind mid-air; it is in the inbox anyway.
+        if isDragging { speechController.clear(animated: false) }
         apply(reducer.reduce(
             isDragging ? .petDragBegan : .petDragEnded,
             atMilliseconds: monotonicMilliseconds()

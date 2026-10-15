@@ -558,12 +558,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             )
             petController = controller
             controller.start()
+            // Titio speaks new notices from the pet (hub spec §9).
+            context.titioNoticeCenter.setOnSpeech { [weak controller] speech in
+                Task { @MainActor in controller?.speak(speech) }
+            }
         } catch {
             appLifecycleLog.error("pet.start_failed error=\(error.localizedDescription, privacy: .public)")
         }
     }
 
     func stopPetController() {
+        context?.titioNoticeCenter.setOnSpeech(nil)
         petController?.stop()
         petController = nil
     }

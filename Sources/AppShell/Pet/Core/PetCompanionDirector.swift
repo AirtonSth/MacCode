@@ -165,9 +165,14 @@ public struct PetCompanionDirector: Sendable {
         newCount: Int,
         baseState: PetAnimationState
     ) -> PetCompanionCue? {
-        guard previousCount == 0,
-              newCount > 0,
-              ![.approval, .question, .sleeping, .failed, .interrupted].contains(baseState) else {
+        guard previousCount == 0, newCount > 0 else { return nil }
+        return Self.speechCue(baseState: baseState)
+    }
+
+    /// Titio speaks from the pet (hub spec §9): the pounce pairs with the
+    /// bubble, except over a pose that already asks for the user or sleeps.
+    public static func speechCue(baseState: PetAnimationState) -> PetCompanionCue? {
+        guard ![.approval, .question, .sleeping, .failed, .interrupted].contains(baseState) else {
             return nil
         }
         return PetCompanionCue(state: .notificationPounce, returnState: baseState)
