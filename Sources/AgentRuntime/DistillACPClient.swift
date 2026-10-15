@@ -1185,11 +1185,13 @@ public final class DistillACPClient: @unchecked Sendable {
     }
 
     /// Distill extension that forks a saved session into a new session id.
-    static let sessionForkMethod = "x.ai/session/fork"
+    /// ACP extension methods travel with a leading `_` (the agent strips it
+    /// before dispatch); without it Distill answers "Method not found".
+    static let sessionForkMethod = "_x.ai/session/fork"
     /// Distill extension that deletes a session (used to compensate a fork).
-    static let sessionDeleteMethod = "x.ai/session/delete"
+    static let sessionDeleteMethod = "_x.ai/session/delete"
     /// Distill extension that answers a side question without interrupting the turn.
-    static let btwMethod = "x.ai/btw"
+    static let btwMethod = "_x.ai/btw"
 
     /// Forks `sourceSessionId` into `newSessionId`. `kind` is `"fork"` or `"side"`.
     /// Passing an existing `newSessionId` is what makes a retried fork converge.
@@ -1239,7 +1241,9 @@ public final class DistillACPClient: @unchecked Sendable {
             params: ["sessionId": sessionId, "question": question],
             timeout: 180
         )
-        guard let answer = response["answer"] as? String else {
+        // Distill wraps the answer: `{"result": {"answer": "…"}}`.
+        let nested = response["result"] as? JSONObject
+        guard let answer = (response["answer"] as? String) ?? (nested?["answer"] as? String) else {
             throw DistillACPError.responseTypeMismatch(Self.btwMethod)
         }
         return answer
