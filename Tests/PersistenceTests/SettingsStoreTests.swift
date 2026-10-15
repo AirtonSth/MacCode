@@ -58,6 +58,8 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(d.petSize, 1.5, "the pet must start at the existing 150% size")
         XCTAssertEqual(d.petAttentionFilter, "all")
         XCTAssertFalse(d.petReduceMotion)
+        XCTAssertTrue(d.titioNotificationsEnabled, "Titio delivers notifications by default (hub spec §11)")
+        XCTAssertTrue(d.petSpeechEnabled, "the pet speaks by default (hub spec §11)")
         XCTAssertTrue(d.botsControlPlaneEnabled, "P1a ships the Bot control plane on")
         XCTAssertTrue(d.botsMemoryEnabled, "P1a includes memory CRUD")
         XCTAssertFalse(d.botsEffectsEnabled)
@@ -201,5 +203,19 @@ final class SettingsStoreTests: XCTestCase {
         let r = s.load()
         XCTAssertFalse(r.petEnabled, "a user who disables the pet must keep that choice")
         XCTAssertEqual(r.petSize, 1, "a user-selected 100% size must survive relaunch")
+    }
+
+    func test_titioSettingsDefaultOnForOldBlobsAndRoundTripOff() throws {
+        // WHY: an install upgraded from a build without these keys must get the
+        // hub on, and turning the kill switch off must survive a restart.
+        let old = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"petEnabled":true}"#.utf8))
+        XCTAssertTrue(old.titioNotificationsEnabled)
+        XCTAssertTrue(old.petSpeechEnabled)
+        var off = AppSettings()
+        off.titioNotificationsEnabled = false
+        off.petSpeechEnabled = false
+        let decoded = try JSONDecoder().decode(AppSettings.self, from: JSONEncoder().encode(off))
+        XCTAssertFalse(decoded.titioNotificationsEnabled)
+        XCTAssertFalse(decoded.petSpeechEnabled)
     }
 }

@@ -14,6 +14,72 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
 
     public static let threadUpdateCategoryIdentifier = "RemoteCodeThreadUpdate"
     public static let openActionIdentifier = "thread.open"
+    /// Titio notices (hub spec §8, §9): Open action only.
+    public static let titioNoticeCategoryIdentifier = "RemoteCodeTitioNotice"
+    /// Groups every Titio banner in Notification Center.
+    public static let titioThreadIdentifier = "bot.titio"
+
+    /// A Titio notice banner: title "Titio", body = the message's first line
+    /// (markdown stripped), userInfo = the §8 push data map. `identifier` is
+    /// the notice key (or `titio.digest.<messageId>`), so the relay and
+    /// `SystemNotifier.postedIdentifiers` deduplicate a re-post.
+    public static func titioNotice(
+        identifier: String,
+        body: String,
+        userInfo: [String: String],
+        soundEnabled: Bool = true
+    ) -> RemoteCodeNotificationContent {
+        RemoteCodeNotificationContent(
+            identifier: identifier,
+            title: TitioNoticeCopy.bannerTitle,
+            body: TitioNoticeCopy.preview(body),
+            categoryIdentifier: titioNoticeCategoryIdentifier,
+            threadIdentifier: titioThreadIdentifier,
+            userInfo: userInfo,
+            soundEnabled: soundEnabled
+        )
+    }
+
+    /// The §8 push `data` / banner userInfo map for a Titio message.
+    ///
+    /// - `botId` is set only when `profileId` is known: an iOS bot route needs
+    ///   `profileId` + `hostId`, and without them it would resolve to nil, so
+    ///   iOS falls back to the legacy thread / Activity keys instead. The Mac
+    ///   banner passes `includeBotIdWithoutProfile` so its own click still
+    ///   opens the inbox.
+    /// - The legacy keys (`threadId`, `workspaceId`, `runId`, `finalMessageId`,
+    ///   `activityItemId`, `outcome`) keep old clients routing as today.
+    public static func titioNoticeUserInfo(
+        botID: String,
+        conversationID: String,
+        messageID: String,
+        noticeKey: String?,
+        identifier: String,
+        profileID: String?,
+        hostID: String?,
+        legacy: [String: String] = [:],
+        includeBotIdWithoutProfile: Bool = false
+    ) -> [String: String] {
+        var info: [String: String] = [:]
+        for key in ["threadId", "workspaceId", "runId", "finalMessageId", "activityItemId", "outcome"] {
+            if let value = legacy[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                info[key] = value
+            }
+        }
+        info["category"] = titioNoticeCategoryIdentifier
+        let profile = profileID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let host = hostID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !profile.isEmpty { info["profileId"] = profile }
+        if !host.isEmpty { info["hostId"] = host }
+        if !profile.isEmpty || includeBotIdWithoutProfile { info["botId"] = botID }
+        info["attentionItemId"] = "titio.inbox.\(conversationID)"
+        info["acknowledgeBotOnOpen"] = "false"
+        info["conversationId"] = conversationID
+        info["messageId"] = messageID
+        if let noticeKey, !noticeKey.isEmpty { info["noticeKey"] = noticeKey }
+        info["idempotencyKey"] = identifier
+        return info
+    }
 
     /// Agent App visible push policy (main agent only).
     ///

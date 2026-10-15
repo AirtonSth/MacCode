@@ -3512,8 +3512,16 @@ public final class BotsViewModel: ObservableObject {
             }
             publishInterestedDeskThreadID()
             syncDeskAgentVM()
+            if let inbox = titioInboxConversationID,
+               selectedConversation?.id == inbox, oldValue?.id != inbox {
+                onTitioInboxSelected?(inbox)
+            }
         }
     }
+    /// Titio's Notifications conversation, once the notice hub resolved it.
+    var titioInboxConversationID: BotConversationID?
+    /// Selecting the inbox on the Mac marks it read (hub spec §8 "Read state").
+    var onTitioInboxSelected: ((BotConversationID) -> Void)?
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
     /// Agent App VM pinned to the selected conversation's linked thread.
     @Published public private(set) var deskAgentVM: AgentAppViewModel?
@@ -10070,7 +10078,9 @@ public final class BotsViewModel: ObservableObject {
         return working
     }
 
-    private func frozenDeskRouting(for conversation: BotConversation) -> BotDeskRouting {
+    /// Internal so the Titio notice hub creates the inbox thread with the same
+    /// route a desk send would freeze (hub spec §8).
+    func frozenDeskRouting(for conversation: BotConversation) -> BotDeskRouting {
         if selectedConversation?.id == conversation.id {
             return deskRouting
         }
@@ -10647,6 +10657,82 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskLiveTurn(botID: botID)
     }
 
+    /// The Titio inbox thread: the conversation's linked thread, created with
+    /// the route a desk send would freeze and reused by the next send, never
+    /// replaced while the route stays the same (hub spec §8).
+    func ensureTitioInboxThread(bot: BotDefinition, conversation: BotConversation) throws -> (thread: AgentThread, conversation: BotConversation) {
+        guard let router else { throw JSONRPCError.internalError }
+        let linked = try ensureLinkedThread(
+            bot: bot,
+            conversation: conversation,
+            routing: frozenDeskRouting(for: conversation),
+            router: router,
+            markStarted: false
+        )
+        titioInboxConversationID = linked.conversation.id
+        if linked.conversation != conversation {
+            adoptFollowThroughConversation(linked.conversation)
+        }
+        return linked
+    }
+
+    /// True while the Mac desk shows `conversationID` (the caller also checks
+    /// that the Bots window is key).
+    func isDeskShowing(conversationID: BotConversationID) -> Bool {
+        screen == .desk && selectedConversation?.id == conversationID
+    }
+
+    /// A host-written Titio message (hub spec §3 step 4, §8). The notice hub
+    /// already persisted `message` and the conversation's unread/attention
+    /// state off the MainActor; this repaints the desk cache, roster preview
+    /// and attention without another SQLite write. A rewrite (same message id,
+    /// new body) replaces the cached bubble instead of appending one.
+    func appendHostAssistantMessage(
+        botID: BotID,
+        conversationID: BotConversationID,
+        message: AgentMessage,
+        conversation: BotConversation?
+    ) {
+        let desk = BotDeskMessage(
+            role: .assistant,
+            text: message.content,
+            createdAt: message.createdAt,
+            agentMessageID: message.id
+        )
+        // Upsert by message id in the caches that already hold this
+        // conversation only: Titio's bot-level cache may show another of its
+        // conversations, which a notice must not replace. An uncached
+        // conversation reads the row from SQLite when it opens.
+        func upsert(_ messages: inout [BotDeskMessage]) {
+            if let index = messages.firstIndex(where: { $0.agentMessageID == message.id }) {
+                messages[index] = desk
+            } else {
+                messages.append(desk)
+            }
+        }
+        if var cached = messagesByConversation[conversationID] {
+            upsert(&cached)
+            messagesByConversation[conversationID] = cached
+        }
+        if messagesConversationIDByBot[botID] == conversationID, var cached = messagesByBot[botID] {
+            upsert(&cached)
+            messagesByBot[botID] = cached
+        }
+        if selectedBotID == botID, selectedConversation?.id == conversationID {
+            upsert(&deskMessages)
+        }
+        lastPreviewByBot[botID] = message.content
+        lastUpdatedByBot[botID] = message.createdAt
+        if let conversation {
+            adoptFollowThroughConversation(conversation)
+            applyAttentionState(
+                for: botID,
+                conversations: destConversations(botID: botID, patched: conversation)
+            )
+        }
+        Self.publishDestAttentionChanged()
+    }
+
     /// Peer rows persisted for the linked thread repaint in the embedded desk.
     func applyDeskPeerMessage(
         messageID: AgentMessageID,
@@ -10662,8 +10748,9 @@ public final class BotsViewModel: ObservableObject {
     }
 
     /// Reuses the conversation's linked thread (drifting model/effort/permission
-    /// in place) or creates it. Shared by the send path and the embedded desk.
-    private func ensureLinkedThread(
+    /// in place) or creates it. Shared by the send path, the embedded desk and
+    /// the Titio notice inbox (internal for the latter, hub spec §8).
+    func ensureLinkedThread(
         bot: BotDefinition,
         conversation: BotConversation,
         routing: BotDeskRouting,

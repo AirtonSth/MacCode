@@ -48,6 +48,10 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var notificationCompletionAlertsEnabled: Bool
     public var notificationSoundEnabled: Bool
     public var notificationMutedWorkspaceIDs: [String]
+    /// Titio delivers notifications as messages in its Notifications
+    /// conversation (hub spec §11). Off restores today's banners, identifiers
+    /// and userInfo byte for byte (the kill switch). Default true.
+    public var titioNotificationsEnabled: Bool
     /// Base terminal font size in points. 0 means use Ghostty's configured default.
     public var terminalFontSize: Double
 
@@ -63,6 +67,8 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var petAttentionFilter: String
     /// App override may only reduce motion beyond the system preference.
     public var petReduceMotion: Bool
+    /// Titio's speech bubble above the pet for new notices. Default true.
+    public var petSpeechEnabled: Bool
 
     /// P1a Bot control plane. Default on so a user can create and message a Bot.
     public var botsControlPlaneEnabled: Bool
@@ -111,6 +117,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 notificationCompletionAlertsEnabled: Bool = true,
                 notificationSoundEnabled: Bool = false,
                 notificationMutedWorkspaceIDs: [String] = [],
+                titioNotificationsEnabled: Bool = true,
                 terminalFontSize: Double = 0,
                 petEnabled: Bool = true,
                 petAnimationsEnabled: Bool = true,
@@ -119,6 +126,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 petSize: Double = 1.5,
                 petAttentionFilter: String = "all",
                 petReduceMotion: Bool = false,
+                petSpeechEnabled: Bool = true,
                 botsControlPlaneEnabled: Bool = true,
                 botsMemoryEnabled: Bool = true,
                 botsEffectsEnabled: Bool = false,
@@ -138,6 +146,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.notificationCompletionAlertsEnabled = notificationCompletionAlertsEnabled
         self.notificationSoundEnabled = notificationSoundEnabled
         self.notificationMutedWorkspaceIDs = notificationMutedWorkspaceIDs
+        self.titioNotificationsEnabled = titioNotificationsEnabled
         self.terminalFontSize = terminalFontSize
         self.petEnabled = petEnabled
         self.petAnimationsEnabled = petAnimationsEnabled
@@ -146,6 +155,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.petSize = petSize
         self.petAttentionFilter = petAttentionFilter
         self.petReduceMotion = petReduceMotion
+        self.petSpeechEnabled = petSpeechEnabled
         self.botsControlPlaneEnabled = botsControlPlaneEnabled
         self.botsMemoryEnabled = botsMemoryEnabled
         self.botsEffectsEnabled = botsEffectsEnabled
@@ -168,6 +178,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case notificationCompletionAlertsEnabled
         case notificationSoundEnabled
         case notificationMutedWorkspaceIDs
+        case titioNotificationsEnabled
         case terminalFontSize
         case petEnabled
         case petAnimationsEnabled
@@ -176,6 +187,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case petSize
         case petAttentionFilter
         case petReduceMotion
+        case petSpeechEnabled
         case botsControlPlaneEnabled
         case botsMemoryEnabled
         case botsEffectsEnabled
@@ -199,6 +211,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         notificationCompletionAlertsEnabled = try c.decodeIfPresent(Bool.self, forKey: .notificationCompletionAlertsEnabled) ?? true
         notificationSoundEnabled = try c.decodeIfPresent(Bool.self, forKey: .notificationSoundEnabled) ?? false
         notificationMutedWorkspaceIDs = try c.decodeIfPresent([String].self, forKey: .notificationMutedWorkspaceIDs) ?? []
+        titioNotificationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .titioNotificationsEnabled) ?? true
         terminalFontSize = try c.decodeIfPresent(Double.self, forKey: .terminalFontSize) ?? 0
         petEnabled = try c.decodeIfPresent(Bool.self, forKey: .petEnabled) ?? true
         petAnimationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .petAnimationsEnabled) ?? true
@@ -207,6 +220,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         petSize = try c.decodeIfPresent(Double.self, forKey: .petSize) ?? 1.5
         petAttentionFilter = try c.decodeIfPresent(String.self, forKey: .petAttentionFilter) ?? "all"
         petReduceMotion = try c.decodeIfPresent(Bool.self, forKey: .petReduceMotion) ?? false
+        petSpeechEnabled = try c.decodeIfPresent(Bool.self, forKey: .petSpeechEnabled) ?? true
         botsControlPlaneEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsControlPlaneEnabled) ?? true
         botsMemoryEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsMemoryEnabled) ?? true
         botsEffectsEnabled = try c.decodeIfPresent(Bool.self, forKey: .botsEffectsEnabled) ?? false

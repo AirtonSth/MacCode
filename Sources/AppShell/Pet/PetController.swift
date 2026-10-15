@@ -140,16 +140,19 @@ public final class PetController {
                 context?.state.workspaces[workspaceID]?.name
             },
             destLookup: { [weak context] in
-                guard let store = context?.botStore else {
+                guard let store = context?.botStore, let db = context?.db else {
                     return PetDestAttentionSnapshot(bots: [], conversations: [], attention: [])
                 }
+                let inboxID = (try? TitioNoticeRepository(db: db).inboxState())?.conversationID
+                    .flatMap(UUID.init(uuidString:)).map(BotConversationID.init)
                 return PetDestAttentionSnapshot(
                     bots: try store.list(),
                     conversations: try store.listConversations(
                         attentionStates: [.unreadActivity, .needsAttention]
                     ),
                     attention: try store.listAttention(),
-                    linkedThreadIDs: try store.listLinkedAgentThreadIDs()
+                    linkedThreadIDs: try store.listLinkedAgentThreadIDs(),
+                    excludedConversationIDs: inboxID.map { [$0] } ?? []
                 )
             },
             markBotConversationViewed: { [weak context] conversationID in
@@ -315,7 +318,8 @@ public final class PetController {
     // PERF: event-log recovery and live EventBus handling classify every
     // published kind. Array literals reallocated membership tables per event;
     // share process-wide Sets (membership contract unchanged).
-    private static let potentialProjectionKinds: Set<String> = [
+    /// Internal: the Titio notice hub subscribes to the same kinds.
+    static let potentialProjectionKinds: Set<String> = [
         "git.push", "git.deliver", "project.script.finished",
         "ssh.transfer.completed", "ssh.transfer.failed", "ssh.session.updated",
         "agent.provider.updated", "files.edit.conflict", "files.edit.saved",

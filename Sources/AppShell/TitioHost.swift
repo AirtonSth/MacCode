@@ -39,6 +39,45 @@ public enum TitioBot {
         return try store.get(id: bot.id) ?? bot
     }
 
+    /// Finds or creates Titio's Notifications conversation (hub spec §8). Its
+    /// id lives in `titio_inbox_state`; a deleted (or foreign) row is
+    /// recreated with the title for `language` and the inbox counters reset.
+    /// Store-only, so it runs off the MainActor. `created` is true when a new
+    /// row was written (the caller publishes `bot.conversation.updated`).
+    public static func ensureInboxConversation(
+        store: BotStore,
+        notices: TitioNoticeRepository,
+        bot: BotDefinition,
+        language: TitioNoticeLanguage,
+        now: Date = Date()
+    ) throws -> (conversation: BotConversation, created: Bool) {
+        let state = try notices.inboxState()
+        if let raw = state.conversationID,
+           let uuid = UUID(uuidString: raw),
+           let existing = try store.conversation(id: BotConversationID(uuid)),
+           existing.botID == bot.id, existing.groupID == nil {
+            guard existing.hidden else { return (existing, false) }
+            var visible = existing
+            visible.hidden = false
+            try store.upsertConversation(visible)
+            return (visible, false)
+        }
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: TitioNoticeCopy.inboxTitle(language: language),
+            createdAt: now,
+            updatedAt: now
+        )
+        try store.upsertConversation(conversation)
+        try notices.updateInboxState {
+            $0.conversationID = conversation.id.value.uuidString.lowercased()
+            $0.unreadCount = 0
+            $0.armedReplyKey = nil
+            $0.armedAt = nil
+        }
+        return (conversation, true)
+    }
+
     /// The pet's idle frame: the still fallback for Titio's animated avatar.
     @MainActor public static let avatarImage: NSImage? = {
         guard let bundle = try? AppShellResourceBundle.bundle(),

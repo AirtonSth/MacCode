@@ -55,6 +55,7 @@ public struct AppSettingsKeys {
         "notificationCompletionAlertsEnabled",
         "notificationSoundEnabled",
         "notificationMutedWorkspaceIDs",
+        "titioNotificationsEnabled",
         "insomniaAllowDisplaySleep",
         "insomniaAllowSystemSleepWhenDisplayClosed",
         "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
@@ -66,6 +67,7 @@ public struct AppSettingsKeys {
         "petSize",
         "petAttentionFilter",
         "petReduceMotion",
+        "petSpeechEnabled",
         "botsControlPlaneEnabled",
         "botsMemoryEnabled",
         "botsEffectsEnabled",
@@ -765,6 +767,11 @@ public final class SettingsViewModel: ObservableObject {
         settingsStore.update { $0.notificationSoundEnabled = on }
     }
 
+    public func setTitioNotificationsEnabled(_ on: Bool) {
+        appSettings.titioNotificationsEnabled = on
+        settingsStore.update { $0.titioNotificationsEnabled = on }
+    }
+
     public func setNotificationWorkspaceMuted(_ workspaceID: String, muted: Bool) {
         var ids = Set(appSettings.notificationMutedWorkspaceIDs)
         if muted { ids.insert(workspaceID) } else { ids.remove(workspaceID) }
@@ -821,6 +828,12 @@ public final class SettingsViewModel: ObservableObject {
     public func setPetReduceMotion(_ on: Bool) {
         appSettings.petReduceMotion = on
         settingsStore.update { $0.petReduceMotion = on }
+        postPetSettingsDidChange()
+    }
+
+    public func setPetSpeechEnabled(_ on: Bool) {
+        appSettings.petSpeechEnabled = on
+        settingsStore.update { $0.petSpeechEnabled = on }
         postPetSettingsDidChange()
     }
 
@@ -1712,6 +1725,15 @@ public struct SettingsView: View {
                     .accessibilityIdentifier("settings.pet.counter.toggle")
                 }
 
+                settingRow("Titio speaks from the pet") {
+                    Toggle("", isOn: Binding(
+                        get: { vm.appSettings.petSpeechEnabled },
+                        set: { vm.setPetSpeechEnabled($0) }
+                    ))
+                    .labelsHidden()
+                    .accessibilityIdentifier("settings.pet.speech.toggle")
+                }
+
                 settingRow("Reduce motion") {
                     Toggle("", isOn: Binding(
                         get: { vm.appSettings.petReduceMotion },
@@ -2392,6 +2414,16 @@ extension SettingsView {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.danger)
                     .accessibilityIdentifier("settings.notifications.deniedNote")
+            }
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                Toggle("Titio delivers notifications", isOn: Binding(
+                    get: { vm.appSettings.titioNotificationsEnabled },
+                    set: { vm.setTitioNotificationsEnabled($0) }
+                )).accessibilityIdentifier("settings.notifications.titio")
+                Text("Off restores the standard alerts.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .accessibilityIdentifier("settings.notifications.titio.subtitle")
             }
             Toggle("Action and failure alerts", isOn: Binding(
                 get: { vm.appSettings.notificationActionAlertsEnabled },

@@ -760,11 +760,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context else { return }
         // The pausing turn may already have ended; a fresh run id still passes the nested-worker check.
         let activeRun = try? ctx.runRepo.latestActive(for: threadID)
+        let reason = request.reason.trimmingCharacters(in: .whitespacesAndNewlines)
         ctx.postAgentUserActionPushIfNeeded(
             threadId: threadID,
             runId: activeRun?.id ?? AgentRunID(),
             requestId: request.id.uuidString,
-            actionTitle: "Waiting for you"
+            facts: TitioRequestFacts(
+                kind: .manualAction,
+                legacyActionTitle: "Waiting for you",
+                detail: reason.isEmpty ? nil : reason,
+                botName: ((try? ctx.botStore.get(id: request.botID)) ?? nil)?.name
+            )
         )
         // The tool only asks the model to end its turn; the host enforces the pause so the bot
         // stops acting on the shared computer. The user's answer sends the one follow-up turn,
@@ -776,6 +782,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func manualActionStateChanged(_ request: ManualActionRequest, thread: AgentThreadID) {
         publishManualActionUpdated(thread: thread, requestID: request.id)
+        if !request.state.isOpen {
+            context?.titioNoticeCenter.sourceResolved(
+                key: TitioNoticeIDs.threadAttention(threadId: thread.value.uuidString, requestId: request.id.uuidString)
+            )
+        }
         // Continue and Decline send a follow-up whose finish drains the held queue, so the bot
         // hears the answer first. A request closed with no answer re-arms the drain here.
         if request.state == .expired {
@@ -9392,8 +9403,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ctx.state.workspaces[wid] = ws
             windowController?.refreshFromState()
         }
-        // Mirror into macOS notification center.
-        SystemNotifier.shared.post(title: title, body: body, category: category)
+        // Mirror into macOS notification center, or as a Titio notice (§5 "External").
+        if ctx.titioNoticeCenter.isEnabled(SettingsStore(db: ctx.db).load()) {
+            ctx.titioNoticeCenter.ingest(TitioNoticeFact(
+                key: TitioNoticeIDs.externalNotification(id: n.id),
+                kind: .external,
+                source: TitioNoticeSource(workspaceId: workspaceId?.value.uuidString, notificationId: n.id),
+                facts: TitioNoticeFacts(title: title, body: body)
+            ))
+        } else {
+            SystemNotifier.shared.post(title: title, body: body, category: category)
+        }
         var eventPayload: [String: JSONValue] = ["id": .string(n.id)]
         if let workspaceId { eventPayload["workspace_id"] = .string(workspaceId.value.uuidString) }
         if let surfaceId { eventPayload["surface_id"] = .string(surfaceId.value.uuidString) }

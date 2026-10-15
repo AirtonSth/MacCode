@@ -330,6 +330,28 @@ final class TitioNoticeRepositoryTests: XCTestCase {
         try Schema.migrate(db)
         XCTAssertEqual(try repo.get(key: "run.A.completed")?.state, .posted, "re-migrate keeps ledger rows")
     }
+
+    // MARK: Open-notice reads (stage 2)
+
+    func test_openDecisionCountAndOpenKeysFollowTheRowState() throws {
+        // WHY: the inbox stays "needs you" exactly while a decision card is
+        // open, and the bot-attention projector resolves only open notices.
+        let (_, repo) = try make()
+        try repo.ingest(fact("thread.T.attention.Q1", .approval, actions: [.approve, .decline]))
+        try repo.ingest(fact("bot.attention.A1", .botBlocked))
+        try repo.ingest(fact("bot.attention.A2", .botBlocked))
+        XCTAssertEqual(try repo.openDecisionCount(), 0, "a pending decision is not on screen yet")
+        try post(repo, ["thread.T.attention.Q1"])
+        XCTAssertEqual(try repo.openDecisionCount(), 1)
+        XCTAssertTrue(try repo.claim(key: "thread.T.attention.Q1"))
+        XCTAssertEqual(try repo.openDecisionCount(), 1, "acting is still open until the host result")
+        _ = try repo.resolve(key: "thread.T.attention.Q1", resolution: .approved, at: t0)
+        XCTAssertEqual(try repo.openDecisionCount(), 0)
+
+        _ = try repo.drop(key: "bot.attention.A2", resolution: .elsewhere, at: t0)
+        XCTAssertEqual(try repo.openKeys(prefix: "bot.attention."), ["bot.attention.A1"])
+        XCTAssertEqual(try repo.openKeys(prefix: "thread."), [], "resolved rows are not open")
+    }
 }
 
 private final class ManagedAtomicCounter: @unchecked Sendable {

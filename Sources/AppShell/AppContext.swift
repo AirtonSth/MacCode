@@ -144,6 +144,10 @@ public final class AppContext {
     public let orchestrationRuntime: AgentOrchestrationRuntime
     public let privateNotificationBridge: PrivateNotificationBridge
     public let liveActivityHostIdentity: LiveActivityHostIdentity
+    /// Titio's notice hub (hub spec §3). Inert until `start()` (app launch):
+    /// before that, and with the kill switch off, every hook keeps today's code.
+    public nonisolated let titioNoticeCenter: TitioNoticeCenter
+    private nonisolated let titioNoticeBox = TitioNoticeContextBox()
     public let liveActivityAcceptanceOutbox: LiveActivityAcceptanceOutbox
     public let liveActivitySyncCoordinator: LiveActivitySyncCoordinator
     public lazy var distillAccountsController: DistillAccountsController = {
@@ -226,6 +230,7 @@ public final class AppContext {
     let hostsBotGroupConversations: Bool
     public var router: AppCommandRouter! {
         didSet {
+            titioNoticeBox.context = self
             botPeerHandoffAuthority.router = router
             if hostsBotGroupConversations {
                 botGroupOrchestrator.router = router
@@ -622,6 +627,19 @@ public final class AppContext {
         self.privateNotificationBridge = privateNotificationBridge
         let liveActivityIdentity = try LiveActivityIdentityStore.beginBoot(settings: self.settingsRepo)
         self.liveActivityHostIdentity = liveActivityIdentity
+        self.titioNoticeCenter = TitioNoticeCenter(
+            db: db,
+            botStore: self.botStore,
+            hooks: Self.makeTitioNoticeHooks(
+                box: titioNoticeBox,
+                db: db,
+                botStore: self.botStore,
+                messageRepo: self.messageRepo,
+                runRepo: self.runRepo,
+                bridge: privateNotificationBridge,
+                hostID: liveActivityIdentity.serverId
+            )
+        )
         privateNotificationBridge.setConnectionHintSources(
             watermark: { String(EventBus.shared.currentSeq) },
             bootEpoch: { String(liveActivityIdentity.bootEpoch) }
@@ -982,7 +1000,13 @@ public final class AppContext {
                     threadId: tid,
                     runId: runId,
                     requestId: request.id,
-                    actionTitle: "Approve: \(PetApprovalActionLabel.label(for: request.kind))"
+                    facts: TitioRequestFacts(
+                        kind: .approval,
+                        legacyActionTitle: "Approve: \(PetApprovalActionLabel.label(for: request.kind))",
+                        requestTitle: request.title,
+                        detail: request.detail,
+                        allowsSessionApproval: request.allowsSessionApproval
+                    )
                 )
             case .requestResolved(let requestId, let state):
                 do {
@@ -999,6 +1023,10 @@ public final class AppContext {
                     "request_id": .string(requestId),
                     "state": .string(state.rawValue)
                 ]))
+                // A Titio card for this request is now stale (§5 "Request resolutions").
+                self.titioNoticeCenter.sourceResolved(
+                    key: TitioNoticeIDs.threadAttention(threadId: tid.value.uuidString, requestId: requestId)
+                )
             case .userInputRequested(let request):
                 do {
                     try self.providerPendingCallbackRepo.record(threadId: tid, userInput: request)
@@ -1033,11 +1061,24 @@ public final class AppContext {
                 ]
                 if let turnId = request.turnId { userInputPayload["turn_id"] = .string(turnId) }
                 EventBus.shared.publish(kind: .agentUserInputRequested, payload: .object(userInputPayload))
+                let singleQuestion = request.questions.count == 1 ? request.questions.first : nil
+                let prompt = request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? singleQuestion?.prompt : request.prompt
+                let options = request.options.isEmpty ? singleQuestion?.options.map(\.label) ?? [] : request.options
+                let multiple = request.allowsMultipleSelection || singleQuestion?.allowsMultipleSelection == true
                 self.postAgentUserActionPushIfNeeded(
                     threadId: tid,
                     runId: runId,
                     requestId: request.id,
-                    actionTitle: request.isSecret ? "Secret input requested" : "Input requested"
+                    facts: TitioRequestFacts(
+                        kind: .userInput,
+                        legacyActionTitle: request.isSecret ? "Secret input requested" : "Input requested",
+                        prompt: prompt,
+                        // A one-tap card cannot pick several options: multi-select answers as text.
+                        options: multiple ? nil : options,
+                        isSecret: request.isSecret,
+                        questionCount: request.questions.count
+                    )
                 )
             case .userInputResolved(let requestId, let answer):
                 do {
@@ -1052,6 +1093,9 @@ public final class AppContext {
                     "request_id": .string(requestId),
                     "answer": answer.map(JSONValue.string) ?? .null
                 ]))
+                self.titioNoticeCenter.sourceResolved(
+                    key: TitioNoticeIDs.threadAttention(threadId: tid.value.uuidString, requestId: requestId)
+                )
             case .tokenUsage(let usage):
                 self.recordProviderTokenUsage(usage, runId: runId)
                 var p: [String: JSONValue] = [
@@ -1210,6 +1254,22 @@ public final class AppContext {
                             workspaceId: chrome?.workspaceId?.value.uuidString,
                             settings: notificationSettings
                         )
+                        // Titio hub branch (§5): the policy checks above stay
+                        // first; a user stop and pausedForUser never notify.
+                        if allowed, !isUserStop, !pausedForUser, !isSideThread,
+                           self.titioNoticeCenter.isEnabled(notificationSettings),
+                           self.ingestTitioRunOutcome(
+                               threadId: tid,
+                               runId: rid,
+                               status: status,
+                               workspaceId: chrome?.workspaceId,
+                               threadTitle: chrome?.title,
+                               finalMessageId: inputs.finalMessageId,
+                               facts: inputs.titio,
+                               legacy: content
+                           ) {
+                            return
+                        }
                         if allowed {
                             if isFailureOrInterrupted {
                                 SystemNotifier.shared.post(content, settings: notificationSettings)
@@ -1678,6 +1738,8 @@ public final class AppContext {
         let settings: AppSettings
         let isNestedWorker: Bool
         let finalMessageId: String?
+        /// Bot link, summary and duration for the Titio notice (hub spec §5).
+        let titio: TitioRunFacts
     }
 
     /// The latest run-finished notification post; the next one waits for it.
@@ -1702,6 +1764,7 @@ public final class AppContext {
         let db = db
         let orchestrationRuntime = orchestrationRuntime
         let runRepo = runRepo
+        let botStore = botStore
         #if DEBUG
         let probe = runFinishedNotificationReadProbeForTesting
         let willGather = runFinishedNotificationWillGatherForTesting
@@ -1711,6 +1774,7 @@ public final class AppContext {
             willGather?(runId)
             probe.recordCurrentThread()
             #endif
+            let finalMessageId = ((try? AgentRunResultRepository(db: db).get(runId: runId)) ?? nil)?.finalMessageId?.description
             return RunFinishedNotificationInputs(
                 chrome: (try? threadRepo.listChrome(ids: [threadId]))?[threadId],
                 settings: SettingsStore(db: db).load(),
@@ -1720,7 +1784,15 @@ public final class AppContext {
                     orchestrationRuntime: orchestrationRuntime,
                     runRepo: runRepo
                 ),
-                finalMessageId: ((try? AgentRunResultRepository(db: db).get(runId: runId)) ?? nil)?.finalMessageId?.description
+                finalMessageId: finalMessageId,
+                titio: Self.titioRunFacts(
+                    runId: runId,
+                    threadId: threadId,
+                    finalMessageId: finalMessageId,
+                    db: db,
+                    botStore: botStore,
+                    runRepo: runRepo
+                )
             )
         }.value
     }
@@ -1767,7 +1839,7 @@ public final class AppContext {
         threadId: AgentThreadID,
         runId: AgentRunID,
         requestId: String,
-        actionTitle: String
+        facts: TitioRequestFacts
     ) {
         let nested = isNestedAgentWorker(runId: runId, threadId: threadId)
         let chrome = (try? threadRepo.listChrome(ids: [threadId]))?[threadId]
@@ -1776,7 +1848,7 @@ public final class AppContext {
             threadId: threadId.value.uuidString,
             workspaceId: chrome?.workspaceId?.value.uuidString,
             threadTitle: chrome?.title,
-            actionTitle: actionTitle,
+            actionTitle: facts.legacyActionTitle,
             requestId: requestId,
             isNestedWorker: nested
         ) else { return }
@@ -1785,6 +1857,10 @@ public final class AppContext {
             workspaceId: chrome?.workspaceId?.value.uuidString,
             settings: notificationSettings
         ) else { return }
+        if titioNoticeCenter.isEnabled(notificationSettings),
+           ingestTitioRequest(threadId: threadId, runId: runId, requestId: requestId, facts: facts, chrome: chrome, legacy: content) {
+            return
+        }
         SystemNotifier.shared.post(content, settings: notificationSettings)
         Task {
             await privateNotificationBridge.deliver(content)

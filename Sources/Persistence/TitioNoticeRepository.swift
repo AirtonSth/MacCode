@@ -147,6 +147,42 @@ public final class TitioNoticeRepository: @unchecked Sendable {
             """) { try $0.bind(1, now.addingTimeInterval(-window).timeIntervalSince1970) }
     }
 
+    /// Open decisions: posted rows the user still has to decide on (state
+    /// `posted`, `acting` or `awaiting_reply`, urgency `decision`). Drives the
+    /// inbox conversation's `needsAttention` state and `titio_inbox.open_decisions`.
+    public func openDecisionCount() throws -> Int {
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                SELECT COUNT(*) FROM titio_notices
+                WHERE urgency = 'decision' AND state IN ('posted', 'acting', 'awaiting_reply');
+                """)
+            defer { statement.reset() }
+            guard try statement.step() else { return 0 }
+            return Int(statement.columnInt64(0))
+        }
+    }
+
+    /// Keys starting with `prefix` whose notice is still open (`pending`,
+    /// `posted`, `acting`, `awaiting_reply`). The bot-attention projector uses
+    /// it to resolve items acknowledged elsewhere and to skip Bot items that a
+    /// thread request notice already covers.
+    public func openKeys(prefix: String) throws -> Set<String> {
+        try db.performSync { database in
+            let statement = try database.prepare("""
+                SELECT key FROM titio_notices
+                WHERE substr(key, 1, ?) = ? AND state IN ('pending', 'posted', 'acting', 'awaiting_reply');
+                """)
+            defer { statement.reset() }
+            try statement.bind(1, prefix.count)
+            try statement.bind(2, prefix)
+            var keys = Set<String>()
+            while try statement.step() {
+                if let key = statement.columnText(0) { keys.insert(key) }
+            }
+            return keys
+        }
+    }
+
     // MARK: Flush
 
     /// One transaction: re-reads which of `keys` are still `pending` (resolved or

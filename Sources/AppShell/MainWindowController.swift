@@ -375,6 +375,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             }
         }
     }
+    /// The main content shows the Bots destination (Titio inbox "viewing", hub spec §8).
+    var isShowingBotsContent: Bool { shellContentMode == .bots }
+    /// The main content shows the workspace layout (focused-success suppression, §2).
+    var isShowingWorkspaceContent: Bool { shellContentMode == .workspace }
     private var scheduledTasksViewModel: ScheduledTasksViewModel?
     private var scheduledTasksHostingView: NSView?
     private var activeThreadsViewModel: ActiveThreadsViewModel?
