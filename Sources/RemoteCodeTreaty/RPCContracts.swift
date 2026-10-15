@@ -60,6 +60,8 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case attachmentTooLarge
         /// `agent.attachment.get`: stored bytes gone or changed, or a thumbnail of a non-image.
         case attachmentUnavailable
+        /// `agent.message.image.get`: the message, the ref in it, or the file it names is missing.
+        case messageImageNotFound
         case unknown(Int)
     }
 
@@ -107,6 +109,10 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
             default: break
             }
         }
+        if case .object(let data)? = data, data["domain"] == .string("message_image"),
+           data["kind"] == .string("not_found") {
+            return .messageImageNotFound
+        }
         if case .object(let data)? = data, data["domain"] == .string("manual_action") {
             switch data["kind"] {
             case .string("not_found"): return .manualActionNotFound
@@ -145,6 +151,7 @@ public struct RemoteCodeError: Codable, Equatable, Sendable, Error {
         case -32066: return .attachmentNotFound
         case -32067: return .attachmentTooLarge
         case -32068: return .attachmentUnavailable
+        case -32069: return .messageImageNotFound
         default: return .unknown(code)
         }
     }

@@ -23,7 +23,7 @@ final class AgentMessageMarkdownTableBlockquoteTests: XCTestCase {
 
         XCTAssertEqual(blocks.count, 1, "a standalone GFM table must parse into exactly one block")
 
-        guard case .table(let headers, let rows) = blocks[0].kind else {
+        guard case .table(let headers, let rows, _) = blocks[0].kind else {
             XCTFail("expected .table block, got \(blocks[0].kind)")
             return
         }
@@ -48,7 +48,7 @@ final class AgentMessageMarkdownTableBlockquoteTests: XCTestCase {
         let blocks = AgentMessageMarkdown.blocks(from: md)
 
         XCTAssertEqual(blocks.count, 1)
-        guard case .table(let headers, let rows) = blocks[0].kind else {
+        guard case .table(let headers, let rows, _) = blocks[0].kind else {
             XCTFail("expected .table block")
             return
         }
@@ -71,7 +71,7 @@ final class AgentMessageMarkdownTableBlockquoteTests: XCTestCase {
         XCTAssertEqual(blocks.count, 2,
                        "paragraph + table must each produce their own block")
         XCTAssertEqual(blocks[0].kind, .paragraph)
-        guard case .table(let headers, let rows) = blocks[1].kind else {
+        guard case .table(let headers, let rows, _) = blocks[1].kind else {
             XCTFail("second block must be .table")
             return
         }

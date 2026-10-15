@@ -397,6 +397,9 @@ public protocol CommandRouting: AnyObject {
     /// `agent.attachment.get`: one message attachment's bytes (or a JPEG
     /// thumbnail), read off the main actor with `AgentAttachmentGetWire.load`.
     func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue
+    /// `agent.message.image.get`: a downsampled Mac-local image referenced by
+    /// an assistant message, read off the main actor with `AgentMessageImageGetWire.load`.
+    func getAgentMessageImage(_ request: AgentMessageImageGetWire.Request) async throws -> JSONValue
     /// `agent.account.usage.get`: stored provider account usage
     /// (`AgentAccountUsageWire.load`), read off the main actor, no provider probe.
     func getAgentAccountUsage() async throws -> JSONValue
@@ -424,6 +427,9 @@ public extension CommandRouting {
     func replayedRunErrorFields(message: String, recoverable: Bool) -> [String: JSONValue] { [:] }
     func getAgentAttachment(_ request: AgentAttachmentGetWire.Request) async throws -> JSONValue {
         throw JSONRPCError.notSupported("agent.attachment.get")
+    }
+    func getAgentMessageImage(_ request: AgentMessageImageGetWire.Request) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("agent.message.image.get")
     }
     func getAgentAccountUsage() async throws -> JSONValue {
         throw JSONRPCError.notSupported("agent.account.usage.get")
@@ -2656,6 +2662,8 @@ public final class JSONRPCDispatcher {
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
                     "attachment_get_v1": .bool(true),
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "message_image_get_v1": .bool(true),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
                     "account_usage_get_v1": .bool(true),
                     "agent_activity": .object(["protocol_version": .number(1)])
                 ]
@@ -4132,6 +4140,9 @@ public final class JSONRPCDispatcher {
             case "agent.attachment.get":
                 let request = try AgentAttachmentGetWire.request(from: params)
                 return .init(id: id, result: try await router.getAgentAttachment(request))
+            case "agent.message.image.get":
+                let request = try AgentMessageImageGetWire.request(from: params)
+                return .init(id: id, result: try await router.getAgentMessageImage(request))
             case "agent.account.usage.get":
                 return .init(id: id, result: try await router.getAgentAccountUsage())
             case "agent.activity.list":
@@ -5214,7 +5225,7 @@ public final class JSONRPCDispatcher {
         "surface.health", "surface.read_text", "surface.read_history",
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
         "agent.message.list", "agent.message.get", "agent.pending_callbacks.list", "agent.manual_action.list",
-        "agent.attachment.get", "agent.account.usage.get",
+        "agent.attachment.get", "agent.message.image.get", "agent.account.usage.get",
         // Legacy agent.checkpoint.list remains batch-admitted. Explicit
         // response_version 1 is rejected by preflightTransport before execution.
         "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
@@ -5267,6 +5278,8 @@ public final class JSONRPCDispatcher {
     ///     `agent.attachment.get` is deliberately `read`: a read device can
     ///     download the bytes of attachments on threads it can read (including
     ///     imported workspace files), but no other host file.
+    ///     `agent.message.image.get` is `read` on the same terms: only image
+    ///     files an assistant message on a readable thread names literally.
     ///   - "write": every other known (mutating) method.
     ///   - "device-admin": HTTP device list/revoke only; not an RPC method
     ///     grant. `write`/`file`/`read` must not inherit it.

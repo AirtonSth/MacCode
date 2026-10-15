@@ -1057,7 +1057,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
                     if let renderFinal {
                         renderFinal(final)
                     } else {
-                        AgentChatAssistantReply(text: final)
+                        AgentChatAssistantReply(text: final, showsImages: turn.finished)
                     }
                 }
             }
