@@ -109,6 +109,44 @@ final class TitioNoticeRemoteControlTests: XCTestCase {
         XCTAssertEqual(readback["conversation_id"] as? String, conversation.uuidString.lowercased())
     }
 
+    func test_noticeClearReadsBackTheClearedMessageAndReplaysItsReceipt() throws {
+        // WHY (voice contract §3): the phone's clear button needs a receipt
+        // `{cleared, message_id, thread_id, route}`, a retry must not clear
+        // twice, and only Titio's inbox messages may be cleared.
+        let messageID = UUID().uuidString.lowercased()
+        let thread = UUID().uuidString.lowercased()
+        var calls: [String] = []
+        authority.onNoticeClear = { botID, message in
+            XCTAssertEqual(botID, self.titio.id)
+            calls.append(message)
+            return ["thread_id": thread]
+        }
+        let params: [String: Any] = ["client_request_id": "clear-1", "bot_id": titioID, "message_id": messageID]
+        let first = try authority.dispatch(method: "bot.notice.clear", params: params)
+        let replay = try authority.dispatch(method: "bot.notice.clear", params: params)
+        XCTAssertEqual(calls, [messageID], "a replayed request answers from its receipt")
+        XCTAssertEqual(first["status"] as? String, "completed")
+        let readback = try XCTUnwrap(first["readback"] as? [String: Any])
+        XCTAssertEqual(readback["cleared"] as? Bool, true)
+        XCTAssertEqual(readback["message_id"] as? String, messageID)
+        XCTAssertEqual(readback["thread_id"] as? String, thread)
+        XCTAssertEqual(readback["route"] as? String, "bot")
+        XCTAssertEqual(replay["receipt_id"] as? String, first["receipt_id"] as? String)
+
+        let other = try store.create(name: "Dev", title: "", description: "")
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.notice.clear", params: [
+            "client_request_id": "clear-other", "bot_id": other.id.value.uuidString.lowercased(), "message_id": messageID,
+        ]))
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.notice.clear", params: [
+            "client_request_id": "clear-bad", "bot_id": titioID, "message_id": "nope",
+        ]))
+        authority.onNoticeClear = { _, _ in throw BotRemoteControlAuthority.Error.invalidParams }
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.notice.clear", params: [
+            "client_request_id": "clear-user-row", "bot_id": titioID, "message_id": UUID().uuidString,
+        ]), "the hub rejects anything that is not an inbox assistant message")
+        XCTAssertEqual(calls.count, 1)
+    }
+
     func test_botListCarriesTitioInboxAndTheConversationListMarksTheInbox() throws {
         // WHY: the iOS roster shows Titio's preview, time and unread badge from
         // `titio_inbox` and pins the inbox first by `kind`; other Bots and

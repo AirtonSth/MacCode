@@ -107,6 +107,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onNoticeAct: ((BotID, String, Int) throws -> [String: Any])?
     /// `bot.notice.read`: the inbox unread count goes to 0.
     public var onNoticeRead: ((BotID, BotConversationID) throws -> [String: Any])?
+    /// `bot.notice.clear` (contract §3): removes an assistant message from
+    /// Titio's inbox and answers `{"thread_id"}`; throws `invalidParams` for
+    /// any other message. Runs off the MainActor under the authority lock.
+    public var onNoticeClear: ((BotID, String) throws -> [String: Any])?
     /// The `titio_inbox` object for Titio's `bot.list` row and the inbox's
     /// `bot.conversation.list` kind (in-memory, no SQLite). Nil: no inbox yet.
     public var onTitioInbox: (() -> [String: Any]?)?
@@ -1137,6 +1141,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try noticeAct(params: params, requestID: requestID)
         case "notice.read":
             return try noticeRead(params: params, requestID: requestID)
+        case "notice.clear":
+            return try noticeClear(params: params, requestID: requestID)
         case "desktop.set":
             return try desktopSet(params: params, requestID: requestID)
         case "avatar.set":
@@ -3184,6 +3190,25 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         readback["conversation_id"] = raw.lowercased()
         readback["route"] = "bot"
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: readback)
+    }
+
+    /// A trailing clear on a Titio inbox message (contract §3). The receipt
+    /// reads back `{cleared, message_id, thread_id, route}`.
+    private func noticeClear(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard bot.handle.lowercased() == TitioIdentity.handle,
+              let messageID = string(params, "message_id")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              UUID(uuidString: messageID) != nil else {
+            throw Error.invalidParams
+        }
+        guard let onNoticeClear else { throw Error(code: -32091, message: "Bot runtime is unavailable.") }
+        let answer = try onNoticeClear(bot.id, messageID)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "cleared": true,
+            "message_id": messageID.lowercased(),
+            "thread_id": answer["thread_id"] ?? NSNull(),
+            "route": "bot",
+        ])
     }
 
     private func desktopSet(params: [String: Any], requestID: String) throws -> [String: Any] {

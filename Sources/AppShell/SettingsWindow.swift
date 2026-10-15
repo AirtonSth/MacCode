@@ -56,6 +56,7 @@ public struct AppSettingsKeys {
         "notificationSoundEnabled",
         "notificationMutedWorkspaceIDs",
         "titioNotificationsEnabled",
+        "titioLanguage",
         "insomniaAllowDisplaySleep",
         "insomniaAllowSystemSleepWhenDisplayClosed",
         "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
@@ -770,6 +771,13 @@ public final class SettingsViewModel: ObservableObject {
     public func setTitioNotificationsEnabled(_ on: Bool) {
         appSettings.titioNotificationsEnabled = on
         settingsStore.update { $0.titioNotificationsEnabled = on }
+    }
+
+    /// `auto` or a BCP-47 tag; anything else is ignored (never stored).
+    public func setTitioLanguage(_ tag: String) {
+        guard let value = TitioLanguageSetting.normalized(tag) else { return }
+        appSettings.titioLanguage = value
+        settingsStore.update { $0.titioLanguage = value }
     }
 
     public func setNotificationWorkspaceMuted(_ workspaceID: String, muted: Bool) {
@@ -2425,6 +2433,15 @@ extension SettingsView {
                     .foregroundColor(DS.Palette.textSecondary)
                     .accessibilityIdentifier("settings.notifications.titio.subtitle")
             }
+            Picker("Titio's language", selection: Binding(
+                get: { vm.appSettings.titioLanguage },
+                set: { vm.setTitioLanguage($0) }
+            )) {
+                ForEach(TitioLanguageSetting.choices(including: vm.appSettings.titioLanguage)) { choice in
+                    Text(choice.label).tag(choice.tag)
+                }
+            }
+            .accessibilityIdentifier("settings.notifications.titioLanguage")
             Toggle("Action and failure alerts", isOn: Binding(
                 get: { vm.appSettings.notificationActionAlertsEnabled },
                 set: { vm.setNotificationActionAlertsEnabled($0) }

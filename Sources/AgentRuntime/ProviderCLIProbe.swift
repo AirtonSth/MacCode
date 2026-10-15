@@ -314,13 +314,14 @@ public enum ProviderCLIProbe {
         runAsUser: AgentRunAsUser?,
         timeoutSeconds: TimeInterval,
         retention: PipeAccumulator.Retention = .prefix,
-        currentDirectory: String? = nil
+        currentDirectory: String? = nil,
+        environmentPurpose: CodexRunner.EnvironmentPurpose = .supportProcess
     ) -> CommandResult? {
         let trimmed = binaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         guard FileManager.default.isExecutableFile(atPath: trimmed) else { return nil }
 
-        let baseEnv = CodexRunner.processEnvironment(overrides: environment, purpose: .supportProcess)
+        let baseEnv = CodexRunner.processEnvironment(overrides: environment, purpose: environmentPurpose)
         let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
         do {
             // Probes stay non-interactive: the installed helper must already

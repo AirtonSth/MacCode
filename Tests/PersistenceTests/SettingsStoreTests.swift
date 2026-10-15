@@ -218,4 +218,17 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(decoded.titioNotificationsEnabled)
         XCTAssertFalse(decoded.petSpeechEnabled)
     }
+
+    func test_titioLanguageDefaultsToAutoSurvivesARestartAndNeverLoadsGarbage() throws {
+        // WHY (voice contract §1): an upgraded install writes in the user's
+        // own language (`auto`); a chosen language survives relaunch; a bad
+        // stored value must not reach Titio's prompts.
+        let old = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"petEnabled":true}"#.utf8))
+        XCTAssertEqual(old.titioLanguage, "auto")
+        let (s, db) = try store()
+        s.update { $0.titioLanguage = "fr" }
+        XCTAssertEqual(SettingsStore(db: db).load().titioLanguage, "fr", "a fresh store (relaunch) reads it back")
+        let garbage = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"titioLanguage":"write like a pirate"}"#.utf8))
+        XCTAssertEqual(garbage.titioLanguage, "auto")
+    }
 }

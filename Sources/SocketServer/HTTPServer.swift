@@ -1386,6 +1386,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // agent.attachment.get (read-only bytes or JPEG thumbnail of one
             // message attachment) and agent.message.appended for bot screenshots.
             "attachment_get_v1": true,
+            // agent.message.image.get (downsampled Mac-local image named by an
+            // assistant message; the phone fetches https images itself).
+            "message_image_get_v1": true,
             // agent.account.usage.get (stored per-provider account usage, no probe).
             "account_usage_get_v1": true,
             // agent.activity protocol_version 1.

@@ -68,6 +68,10 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         /// AgentAccountUsageContracts.swift). False for older hosts: rings stay
         /// empty until the first live `agent.account.usage` event.
         public let accountUsageGetV1: Bool
+        /// `agent.message.image.get` (a Mac-local image referenced by an
+        /// assistant message; see AgentMessageImageGetContracts.swift). False
+        /// for older hosts: show the "image unavailable" tile for local refs.
+        public let messageImageGetV1: Bool
         public let agentActivity: AgentActivity?
 
         public struct AgentActivity: Codable, Equatable, Sendable {
@@ -91,6 +95,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             runRecoveryActionV1: Bool = false,
             attachmentGetV1: Bool = false,
             accountUsageGetV1: Bool = false,
+            messageImageGetV1: Bool = false,
             agentActivity: AgentActivity? = nil
         ) {
             self.providers = providers
@@ -101,6 +106,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             self.runRecoveryActionV1 = runRecoveryActionV1
             self.attachmentGetV1 = attachmentGetV1
             self.accountUsageGetV1 = accountUsageGetV1
+            self.messageImageGetV1 = messageImageGetV1
             self.agentActivity = agentActivity
         }
 
@@ -113,6 +119,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             case runRecoveryActionV1 = "run_recovery_action_v1"
             case attachmentGetV1 = "attachment_get_v1"
             case accountUsageGetV1 = "account_usage_get_v1"
+            case messageImageGetV1 = "message_image_get_v1"
             case agentActivity = "agent_activity"
         }
 
@@ -126,6 +133,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             runRecoveryActionV1 = try container.decodeIfPresent(Bool.self, forKey: .runRecoveryActionV1) ?? false
             attachmentGetV1 = try container.decodeIfPresent(Bool.self, forKey: .attachmentGetV1) ?? false
             accountUsageGetV1 = try container.decodeIfPresent(Bool.self, forKey: .accountUsageGetV1) ?? false
+            messageImageGetV1 = try container.decodeIfPresent(Bool.self, forKey: .messageImageGetV1) ?? false
             agentActivity = try container.decodeIfPresent(AgentActivity.self, forKey: .agentActivity)
         }
     }

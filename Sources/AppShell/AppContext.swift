@@ -638,7 +638,9 @@ public final class AppContext {
                 runRepo: self.runRepo,
                 bridge: privateNotificationBridge,
                 hostID: liveActivityIdentity.serverId
-            )
+            ),
+            // Unit tests never spawn a real provider CLI: the factual fallback posts.
+            voice: AppContext.isRunningUnitTests ? nil : Self.makeTitioVoiceWriter(box: titioNoticeBox, db: db)
         )
         titioNoticeCenter.installActions(Self.makeTitioNoticeActionHooks(
             box: titioNoticeBox,

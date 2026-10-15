@@ -43,6 +43,13 @@ public struct TitioNoticeComposed: Equatable, Sendable {
     public var cardOptions: [TitioNoticeCardOption]?
     /// The ledger key whose `actions_json` holds the card (the block's `notice`).
     public var cardOwnerKey: String?
+
+    public init(text: String, preview: String, cardOptions: [TitioNoticeCardOption]?, cardOwnerKey: String?) {
+        self.text = text
+        self.preview = preview
+        self.cardOptions = cardOptions
+        self.cardOwnerKey = cardOwnerKey
+    }
 }
 
 /// Where a forwarded answer went (result lines).
@@ -77,7 +84,7 @@ public enum TitioNoticeStatus: Equatable, Sendable {
     /// The host action threw (not in the spec table; see `statusLine`).
     case failed
 
-    /// Nil for `flap`: a flapping notice was never posted, so there is nothing to rewrite.
+    /// Nil for `flap` (never posted) and `cleared` (the message is gone): nothing to rewrite.
     public init?(resolution: TitioNoticeResolution) {
         switch resolution {
         case .approved, .approvedSession: self = .approved
@@ -88,13 +95,15 @@ public enum TitioNoticeStatus: Equatable, Sendable {
         case .elsewhere: self = .elsewhere
         case .expired: self = .expired
         case .failed: self = .failed
-        case .flap: return nil
+        case .flap, .cleared: return nil
         }
     }
 }
 
-/// Deterministic pt-BR / en copy for Titio notices (spec §6, §16). Pure: no
-/// clock, locale or database reads; every input is a parameter.
+/// The factual pt-BR / en fallback for Titio notices, plus the card labels,
+/// ids, previews and formatting the voice path shares. Titio's own words come
+/// from `TitioVoicePrompt` + the writer; this copy is only what posts when no
+/// LLM could run. Pure: no clock, locale or database reads.
 public enum TitioNoticeCopy {
     public static let bannerTitle = "Titio"
     public static let summaryMaxCharacters = 140
@@ -158,10 +167,8 @@ public enum TitioNoticeCopy {
             return TitioNoticeComposed(text: body, preview: itemPreview, cardOptions: nil, cardOwnerKey: nil)
         }
         let question = cardQuestion(for: item, language: language)
-        // The card asks; the body above it does not repeat the question.
-        let lead = droppingTrailingQuestion(body, language: language)
         let block = choicesBlock(question: question, options: options.compactMap(\.label), notice: item.key)
-        return TitioNoticeComposed(text: lead + "\n\n" + block, preview: singlePreview(item, body: lead),
+        return TitioNoticeComposed(text: body + "\n\n" + block, preview: itemPreview,
                                    cardOptions: options, cardOwnerKey: item.key)
     }
 
@@ -184,16 +191,6 @@ public enum TitioNoticeCopy {
         }
     }
 
-    /// Trailing generic questions the card itself asks.
-    private static let cardRepeatedQuestions = [" O que deseja fazer?", " What should I do?", " Qual opção?", " Which option?"]
-
-    static func droppingTrailingQuestion(_ body: String, language: TitioNoticeLanguage) -> String {
-        for question in cardRepeatedQuestions where body.hasSuffix(question) {
-            return String(body.dropLast(question.count))
-        }
-        return body
-    }
-
     /// The banner and push body (§8/§9) for a flushed message. It goes to the
     /// relay, APNs and the lock screen, so it never carries the request
     /// detail (a command or tool input can hold a secret), the run summary
@@ -213,22 +210,16 @@ public enum TitioNoticeCopy {
         return preview(body(for: redacted, language: language, timeZone: timeZone))
     }
 
-    /// A flushed batch: one item uses its single template; two or more become a
-    /// digest (failures first, then by time; at most `digestMaxBullets` bullets).
-    /// `catchUp` picks the startup opener. Nil for an empty batch.
+    /// The fallback for a flushed batch: one item uses its single sentence; two
+    /// or more become a plain digest (failures first, then by time; at most
+    /// `digestMaxBullets` bullets), with no opener. `catchUp` only matters to
+    /// the voice prompt. Nil for an empty batch.
     public static func composeBatch(_ items: [TitioNoticeRenderItem], language: TitioNoticeLanguage, catchUp: Bool = false, timeZone: TimeZone = .current) -> TitioNoticeComposed? {
         guard let first = items.first else { return nil }
         if items.count == 1 { return compose(first, language: language, timeZone: timeZone) }
         let pt = language == .ptBR
         let ordered = digestOrder(items)
         var lines: [String] = []
-        if catchUp {
-            lines.append(pt ? "Enquanto o app estava fechado, ficou isso pendente:" : "While the app was closed, this was pending:")
-        } else {
-            // Digests are count-based, not idle-based: they fire while the
-            // user sits at the Mac, so the opener never claims they were away.
-            lines.append(pt ? "Algumas novidades:" : "A few updates:")
-        }
         let maxBullets = TitioNoticeTiming.digestMaxBullets
         lines += ordered.prefix(maxBullets).map { "• " + digestLine($0, language: language) }
         if ordered.count > maxBullets {
@@ -239,7 +230,6 @@ public enum TitioNoticeCopy {
         var cardOptions: [TitioNoticeCardOption]?
         if let firstFailure {
             let name = digestTitle(firstFailure, language: language)
-            lines.append(pt ? "Se quiser, abro a **\(name)**." : "Want me to open **\(name)**?")
             let open: TitioNoticeAction
             switch firstFailure.kind {
             case .runFailed, .runInterrupted: open = .openThread
@@ -256,14 +246,12 @@ public enum TitioNoticeCopy {
         guard let cardOptions, let owner = firstFailure else {
             return TitioNoticeComposed(text: body, preview: headline, cardOptions: nil, cardOwnerKey: nil)
         }
-        let block = choicesBlock(question: pt ? "O que deseja fazer?" : "What should I do?",
-                                 options: cardOptions.compactMap(\.label), notice: owner.key)
+        let block = choicesBlock(question: nil, options: cardOptions.compactMap(\.label), notice: owner.key)
         return TitioNoticeComposed(text: body + "\n\n" + block, preview: headline, cardOptions: cardOptions, cardOwnerKey: owner.key)
     }
 
     /// One line that says what a digest holds (banner, push, pet, roster):
-    /// "3 novidades — Fix login: falhou · Deploy: concluída +1". The opener
-    /// alone ("A few updates:") would tell the user nothing.
+    /// "3 novidades — Fix login: falhou · Deploy: concluída +1".
     static func digestHeadline(_ ordered: [TitioNoticeRenderItem], language: TitioNoticeLanguage) -> String {
         let pt = language == .ptBR
         let shown = ordered.prefix(2).map { "\(digestTitle($0, language: language)): \(digestState($0.kind, language: language))" }
@@ -272,121 +260,96 @@ public enum TitioNoticeCopy {
         return clip(head + shown.joined(separator: " · ") + (extra > 0 ? " +\(extra)" : ""), max: previewMaxCharacters)
     }
 
-    /// The message text for one notice, without any choices block.
+    /// The fallback text for one notice, without any choices block: one
+    /// minimal factual sentence from the facts (no opener, no interjection,
+    /// no clipped summary). Titio's real words come from the voice writer;
+    /// this is only posted when no LLM could run (`titio.voice.fallback`).
     public static func body(for item: TitioNoticeRenderItem, language: TitioNoticeLanguage, timeZone: TimeZone = .current) -> String {
         let pt = language == .ptBR
         let f = item.facts
         let title = clean(f.title, max: 120)
         let ws = clean(f.workspaceName, max: 80)
         let bot = clean(f.botName, max: 80)
-        let summary = summaryLine(f.summary)
         let detail = clean(f.detail, max: 200)
         let duration = f.durationMs.map { self.duration(ms: $0, language: language) }
         let wsPt = ws.map { " do **\($0)**" } ?? ""
         let wsNoPt = ws.map { " no **\($0)**" } ?? ""
         let wsEn = ws.map { " in **\($0)**" } ?? ""
-        func opener(_ category: OpenerCategory) -> String { self.opener(category, key: item.key, language: language) }
 
         switch item.kind {
         case .runCompleted:
             if pt {
-                let subject = title.map { "a tarefa **\($0)**" } ?? "uma tarefa"
-                return "\(opener(.info)) \(subject)\(wsPt) foi concluída\(duration.map { " em \($0)" } ?? "")."
-                    + (summary.map { "\nResumo: “\($0)”" } ?? "")
+                let subject = title.map { "A tarefa **\($0)**" } ?? "Uma tarefa"
+                return "\(subject)\(wsPt) foi concluída\(duration.map { " em \($0)" } ?? "")."
             }
-            let subject = title.map { "**\($0)**" } ?? "a task"
-            return "\(opener(.info)) \(subject)\(wsEn) is done\(duration.map { " in \($0)" } ?? "")."
-                + (summary.map { "\nSummary: “\($0)”" } ?? "")
+            let subject = title.map { "**\($0)**" } ?? "A task"
+            return "\(subject)\(wsEn) is done\(duration.map { " in \($0)" } ?? "")."
 
         case .runFailed:
-            if pt {
-                let subject = title.map { "a tarefa **\($0)**" } ?? "uma tarefa"
-                return "\(opener(.failure)) \(subject)\(wsPt) falhou.\(summary.map { " Última mensagem: “\($0)”" } ?? "") O que deseja fazer?"
-            }
-            let subject = title.map { "**\($0)**" } ?? "a task"
-            return "\(opener(.failure)) \(subject)\(wsEn) failed.\(summary.map { " Last message: “\($0)”" } ?? "") What should I do?"
+            if pt { return "\(title.map { "A tarefa **\($0)**" } ?? "Uma tarefa")\(wsPt) falhou." }
+            return "\(title.map { "**\($0)**" } ?? "A task")\(wsEn) failed."
 
         case .runInterrupted:
-            if pt {
-                let subject = title.map { "a tarefa **\($0)**" } ?? "uma tarefa"
-                return "\(opener(.failure)) \(subject)\(wsPt) foi interrompida. Quer que eu continue de onde parou?"
-            }
-            let subject = title.map { "**\($0)**" } ?? "a task"
-            return "\(opener(.failure)) \(subject)\(wsEn) was interrupted. Want me to pick it up where it stopped?"
+            if pt { return "\(title.map { "A tarefa **\($0)**" } ?? "Uma tarefa")\(wsPt) foi interrompida." }
+            return "\(title.map { "**\($0)**" } ?? "A task")\(wsEn) was interrupted."
 
         case .botReply:
-            if pt {
-                return "O \(bot.map { "**\($0)**" } ?? "Bot") respondeu\(wsNoPt)" + (summary.map { ": “\($0)”" } ?? ".")
-            }
-            return "\(bot.map { "**\($0)**" } ?? "A Bot") replied\(wsEn)" + (summary.map { ": “\($0)”" } ?? ".")
+            if pt { return "\(bot.map { "O **\($0)**" } ?? "Um Bot") respondeu\(wsNoPt)." }
+            return "\(bot.map { "**\($0)**" } ?? "A Bot") replied\(wsEn)."
 
         case .approval:
             let verb = approvalVerb(kind: f.requestKind, requestTitle: f.requestTitle, language: language)
             let code = approvalSnippet(f.detail).map { $0.replacingOccurrences(of: "`", with: "'") }
             let codePart = code.map { " (`\($0)`)" } ?? ""
             if pt {
-                return "Preciso que você decida uma coisa\(wsNoPt): o agente\(title.map { " de **\($0)**" } ?? "") quer \(verb)\(codePart). O que deseja fazer?"
+                return "O agente\(title.map { " de **\($0)**" } ?? "")\(wsNoPt) quer \(verb)\(codePart)."
             }
-            return "I need you to decide something\(wsEn): the agent\(title.map { " on **\($0)**" } ?? "") wants to \(verb)\(codePart). What should I do?"
+            return "The agent\(title.map { " on **\($0)**" } ?? "")\(wsEn) wants to \(verb)\(codePart)."
 
         case .userInput:
             let prompt = clean(f.prompt, max: 200)
             let subject = pt
                 ? "O agente\(title.map { " de **\($0)**" } ?? "")\(wsNoPt)"
                 : "The agent\(title.map { " on **\($0)**" } ?? "")\(wsEn)"
-            let asked = pt
-                ? (prompt.map { " perguntou: *\($0)*" } ?? " fez uma pergunta.")
-                : (prompt.map { " asks: *\($0)*" } ?? " has a question.")
             switch f.userInputShape {
-            case .options:
-                return subject + asked + (pt ? " Qual opção?" : " Which option?")
-            case .freeText:
-                return subject + asked + (pt
-                    ? " Toque em Responder aqui que eu repasso sua próxima mensagem."
-                    : " Tap Reply here and I'll pass on your next message.")
+            case .options, .freeText:
+                if pt { return subject + (prompt.map { " perguntou: *\($0)*" } ?? " fez uma pergunta.") }
+                return subject + (prompt.map { " asks: *\($0)*" } ?? " has a question.")
             case .secret, .multiQuestion:
                 let secret = f.userInputShape == .secret
                 if pt {
-                    return "\(subject) precisa de \(secret ? "um segredo" : "algumas respostas"). Por segurança, responda direto na conversa."
+                    return "\(subject) precisa de \(secret ? "um segredo" : "algumas respostas"), que só dá para responder na conversa."
                 }
-                return "\(subject) needs \(secret ? "a secret" : "a few answers"). For safety, answer in the thread itself."
+                return "\(subject) needs \(secret ? "a secret" : "a few answers"), which can only be answered in the thread."
             }
 
         case .manualAction:
             let who = bot ?? title
             if pt {
-                return "\(who.map { "O **\($0)**" } ?? "O agente") está esperando você fazer algo no Mac\(detail.map { ": \($0)" } ?? ""). Abra a conversa quando puder."
+                return "\(who.map { "O **\($0)**" } ?? "O agente") está esperando você fazer algo no Mac\(detail.map { ": \($0)" } ?? "")."
             }
-            return "\(who.map { "**\($0)**" } ?? "The agent") is waiting for you to do something on the Mac\(detail.map { ": \($0)" } ?? ""). Open the thread when you can."
+            return "\(who.map { "**\($0)**" } ?? "The agent") is waiting for you to do something on the Mac\(detail.map { ": \($0)" } ?? "")."
 
         case .botQuestion:
-            if pt {
-                return "O \(bot.map { "**\($0)**" } ?? "Bot") precisa de você" + (detail.map { ": *\($0)*" } ?? ".")
-            }
+            if pt { return "\(bot.map { "O **\($0)**" } ?? "Um Bot") precisa de você" + (detail.map { ": *\($0)*" } ?? ".") }
             return "\(bot.map { "**\($0)**" } ?? "A Bot") needs you" + (detail.map { ": *\($0)*" } ?? ".")
 
         case .botBlocked:
-            if pt {
-                return "\(opener(.failure)) o \(bot.map { "**\($0)**" } ?? "Bot") travou\(detail.map { ": \($0)" } ?? "")."
-            }
-            return "\(opener(.failure)) \(bot.map { "**\($0)**" } ?? "a Bot") got stuck\(detail.map { ": \($0)" } ?? "")."
+            if pt { return "\(bot.map { "O **\($0)**" } ?? "Um Bot") travou\(detail.map { ": \($0)" } ?? "")." }
+            return "\(bot.map { "**\($0)**" } ?? "A Bot") got stuck\(detail.map { ": \($0)" } ?? "")."
 
         case .scheduledFailed:
             let time = clock(item.occurredAt, language: language, timeZone: timeZone)
-            if pt {
-                return "\(opener(.failure)) a rotina\(title.map { " **\($0)**" } ?? "")\(wsPt) falhou às \(time)."
-            }
-            return "\(opener(.failure)) scheduled task\(title.map { " **\($0)**" } ?? "")\(wsEn) failed at \(time)."
+            if pt { return "A rotina\(title.map { " **\($0)**" } ?? "")\(wsPt) falhou às \(time)." }
+            return "Scheduled task\(title.map { " **\($0)**" } ?? "")\(wsEn) failed at \(time)."
 
         case .gitFailed:
-            if pt {
-                return "\(opener(.failure)) o `git push`\(wsPt) falhou\(f.exitCode.map { " (código \($0))" } ?? "")."
-            }
-            return "\(opener(.failure)) `git push`\(wsEn) failed\(f.exitCode.map { " (exit \($0))" } ?? "")."
+            if pt { return "O `git push`\(wsPt) falhou\(f.exitCode.map { " (código \($0))" } ?? "")." }
+            return "`git push`\(wsEn) failed\(f.exitCode.map { " (exit \($0))" } ?? "")."
 
         case .gitCompleted:
-            if pt { return "\(opener(.info)) o push\(wsPt) foi feito." }
-            return "\(opener(.info)) the push\(wsEn) went through."
+            if pt { return "O push\(wsPt) foi feito." }
+            return "The push\(wsEn) went through."
 
         case .scriptFailed:
             if pt {
@@ -404,22 +367,22 @@ public enum TitioNoticeCopy {
             return "\(title.map { "SSH transfer **\($0)**" } ?? "An SSH transfer") \(failed ? "failed" : "finished")."
 
         case .sshDisconnected:
-            if pt { return "\(opener(.failure)) a sessão SSH\(title.map { " **\($0)**" } ?? "") caiu sem você pedir." }
-            return "\(opener(.failure)) \(title.map { "SSH session **\($0)**" } ?? "an SSH session") dropped unexpectedly."
+            if pt { return "A sessão SSH\(title.map { " **\($0)**" } ?? "") caiu sem você pedir." }
+            return "\(title.map { "SSH session **\($0)**" } ?? "An SSH session") dropped unexpectedly."
 
         case .fileConflict:
-            if pt { return "Preciso de você: \(title.map { "**\($0)**" } ?? "um arquivo") foi alterado fora do editor enquanto você editava." }
-            return "I need you: \(title.map { "**\($0)**" } ?? "a file") changed outside the editor while you were editing."
+            if pt { return "\(title.map { "**\($0)**" } ?? "Um arquivo") foi alterado fora do editor enquanto você editava." }
+            return "\(title.map { "**\($0)**" } ?? "A file") changed outside the editor while you were editing."
 
         case .serverListenerFailed:
             if pt {
-                return "\(opener(.failure)) o servidor do RemoteCode não conseguiu abrir a porta\(f.port.map { " \($0)" } ?? ""). O iPhone pode não conectar."
+                return "O servidor do RemoteCode não conseguiu abrir a porta\(f.port.map { " \($0)" } ?? ""), então o iPhone pode não conectar."
             }
-            return "\(opener(.failure)) RemoteCode's server could not open \(f.port.map { "port \($0)" } ?? "its port"). Your iPhone may not connect."
+            return "RemoteCode's server could not open \(f.port.map { "port \($0)" } ?? "its port"), so your iPhone may not connect."
 
         case .providerUpdateFailed:
-            if pt { return "\(opener(.failure)) a atualização\(title.map { " do **\($0)**" } ?? "") falhou." }
-            return "\(opener(.failure)) the \(title.map { "**\($0)** " } ?? "")update failed."
+            if pt { return "A atualização\(title.map { " do **\($0)**" } ?? "") falhou." }
+            return "The \(title.map { "**\($0)** " } ?? "")update failed."
 
         case .notificationsDenied:
             return pt
@@ -428,40 +391,13 @@ public enum TitioNoticeCopy {
 
         case .external:
             let body = clean(f.body, max: 300)
-            if pt { return (title.map { "Chegou um aviso: **\($0)**" } ?? "Chegou um aviso.") + (body.map { "\n“\($0)”" } ?? "") }
-            return (title.map { "New notice: **\($0)**" } ?? "New notice.") + (body.map { "\n“\($0)”" } ?? "")
+            switch (title, body) {
+            case let (title?, body?): return "**\(title)**\n\(body)"
+            case let (title?, nil): return "**\(title)**"
+            case let (nil, body?): return body
+            case (nil, nil): return pt ? "Chegou um aviso." : "A notice arrived."
+            }
         }
-    }
-
-    // MARK: Openers
-
-    public enum OpenerCategory: Sendable { case info, failure, decision }
-
-    public static func openers(_ category: OpenerCategory, language: TitioNoticeLanguage) -> [String] {
-        switch (category, language) {
-        case (.info, .ptBR): return ["Hmm… vi aqui que", "Ó,", "Opa,"]
-        case (.info, .en): return ["Hmm, looks like", "Heads up:", "FYI,"]
-        case (.failure, .ptBR): return ["Ih,", "Opa,"]
-        case (.failure, .en): return ["Uh-oh,", "Heads up:"]
-        case (.decision, .ptBR): return ["Preciso que você decida uma coisa"]
-        case (.decision, .en): return ["I need you to decide something"]
-        }
-    }
-
-    /// Rotates by `fnv1a(key) % n`, so a notice reads the same after a restart.
-    public static func opener(_ category: OpenerCategory, key: String, language: TitioNoticeLanguage) -> String {
-        let options = openers(category, language: language)
-        return options[Int(fnv1a(key) % UInt64(options.count))]
-    }
-
-    /// 64-bit FNV-1a over the UTF-8 bytes. Stable across runs (unlike `Hasher`).
-    public static func fnv1a(_ text: String) -> UInt64 {
-        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-        for byte in text.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* 0x0000_0100_0000_01b3
-        }
-        return hash
     }
 
     // MARK: Card
@@ -663,16 +599,16 @@ public enum TitioNoticeCopy {
         }
         switch result {
         case let .approved(workspace):
-            return pt ? "Feito, aprovei\(ws(workspace, "no"))." : "Done, approved\(ws(workspace, "no"))."
+            return pt ? "Aprovei\(ws(workspace, "no"))." : "Approved\(ws(workspace, "no"))."
         case let .approvedSession(workspace):
-            return pt ? "Feito, aprovei para esta sessão\(ws(workspace, "no"))." : "Done, approved for this session\(ws(workspace, "no"))."
+            return pt ? "Aprovei para esta sessão\(ws(workspace, "no"))." : "Approved for this session\(ws(workspace, "no"))."
         case let .declined(workspace):
-            return pt ? "Ok, recusei. O agente\(ws(workspace, "do")) foi avisado." : "OK, declined. The agent\(ws(workspace, "do")) was told."
+            return pt ? "Recusei e o agente\(ws(workspace, "do")) foi avisado." : "Declined, and the agent\(ws(workspace, "do")) was told."
         case let .answered(answer, to):
             let quoted = clean(answer, max: summaryMaxCharacters) ?? ""
             return pt ? "Repassei “\(quoted)” para \(target(to))." : "Passed “\(quoted)” to \(target(to))."
         case let .armed(to):
-            return pt ? "Pode mandar. Eu repasso sua próxima mensagem para \(target(to))." : "Go ahead. I'll pass your next message to \(target(to))."
+            return pt ? "Eu repasso sua próxima mensagem para \(target(to))." : "I'll pass your next message to \(target(to))."
         case let .continued(title):
             let name = clean(title, max: 120).map { "**\($0)**" }
             return pt ? "Pedi para continuar \(name ?? "a tarefa")." : "Asked \(name ?? "the task") to continue."
@@ -705,10 +641,12 @@ public enum TitioNoticeCopy {
         }
     }
 
-    /// The original message with its ```choices block removed and the status line appended.
-    public static func resolvedText(original: String, statusLine: String) -> String {
+    /// The original message with its ```choices block removed and the status
+    /// line appended (nil: the card is only removed; the voice adds the line).
+    public static func resolvedText(original: String, statusLine: String?) -> String {
         let parsed = BotChoicesBlock.parse(original)
         let base = trimmedTrailing(parsed.choices != nil ? parsed.text : original)
+        guard let statusLine, !statusLine.isEmpty else { return base }
         if base.hasSuffix(statusLine) { return base }
         return base + "\n\n" + statusLine
     }
@@ -730,16 +668,9 @@ public enum TitioNoticeCopy {
         (bannerTitle, preview(replyText))
     }
 
-    /// First non-empty line, markdown emphasis/code marks stripped, max 178 chars.
+    /// The first visible line as plain text (`MarkdownPlainText`), max 178 chars.
     public static func preview(_ text: String) -> String {
-        let line = text.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .first { !$0.isEmpty } ?? ""
-        let stripped = line
-            .replacingOccurrences(of: "**", with: "")
-            .replacingOccurrences(of: "*", with: "")
-            .replacingOccurrences(of: "`", with: "")
-        return clip(stripped, max: previewMaxCharacters)
+        MarkdownPlainText.firstLine(text, maxCharacters: previewMaxCharacters)
     }
 
     // MARK: Formatting
@@ -773,12 +704,6 @@ public enum TitioNoticeCopy {
         guard let value else { return nil }
         let flat = value.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
         return flat.isEmpty ? nil : clip(flat, max: max)
-    }
-
-    /// The summary's first non-empty line, max 140 chars.
-    static func summaryLine(_ value: String?) -> String? {
-        let first = value?.components(separatedBy: .newlines).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        return clean(first, max: summaryMaxCharacters)
     }
 
     static func clip(_ text: String, max: Int) -> String {

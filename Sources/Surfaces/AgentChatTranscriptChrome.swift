@@ -376,6 +376,13 @@ public struct AgentChatAssistantReply: View, Equatable {
     public var branchIdentifier: String? = nil
     public var onBranch: (() -> Void)? = nil
     public var content: AnyView? = nil
+    /// Message attachments; image ones (bot screenshots) join the gallery.
+    public var attachments: [AgentAttachment] = []
+    /// False while the reply is still streaming, so partial paths/URLs never
+    /// start image loads.
+    public var showsImages: Bool = true
+    /// Titio's inbox: a trailing "Clear notification" button.
+    public var onClear: (() -> Void)? = nil
 
     public init(
         text: String,
@@ -384,7 +391,10 @@ public struct AgentChatAssistantReply: View, Equatable {
         branchIdentifier: String? = nil,
         onBranch: (() -> Void)? = nil,
         stripsChoices: Bool = true,
-        content: AnyView? = nil
+        attachments: [AgentAttachment] = [],
+        showsImages: Bool = true,
+        content: AnyView? = nil,
+        onClear: (() -> Void)? = nil
     ) {
         // A ready-made answers block is shown (and answered) as the choices
         // card, in Bot threads only (`stripsChoices`).
@@ -393,7 +403,10 @@ public struct AgentChatAssistantReply: View, Equatable {
         self.copyIdentifier = copyIdentifier
         self.branchIdentifier = branchIdentifier
         self.onBranch = onBranch
+        self.attachments = attachments
+        self.showsImages = showsImages
         self.content = content
+        self.onClear = onClear
     }
 
     public var body: some View {
@@ -406,6 +419,12 @@ public struct AgentChatAssistantReply: View, Equatable {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .accessibilityIdentifier(roleIdentifier)
                     .accessibilityLabel(text)
+            }
+            if showsImages {
+                let images = AgentChatImageGallery.refs(text: text, attachments: attachments)
+                if !images.isEmpty {
+                    AgentChatImageGallery(refs: images)
+                }
             }
             HStack(spacing: DS.Space.xs) {
                 AgentChatCopyButton(text: text) { copied in
@@ -431,6 +450,20 @@ public struct AgentChatAssistantReply: View, Equatable {
                     .accessibilityIdentifier(branchIdentifier ?? "agent.assistantMessage.branch")
                     .help("Branch in new chat")
                 }
+                if let onClear {
+                    Spacer(minLength: DS.Space.xs)
+                    Button(action: onClear) {
+                        Image(systemName: "xmark.circle")
+                            .font(.system(size: 12, weight: .regular))
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityLabel("Clear notification")
+                    .accessibilityIdentifier("agent.assistantMessage.clear")
+                    .help("Clear notification")
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -444,6 +477,9 @@ public struct AgentChatAssistantReply: View, Equatable {
             && lhs.branchIdentifier == rhs.branchIdentifier
             && (lhs.onBranch != nil) == (rhs.onBranch != nil)
             && (lhs.content != nil) == (rhs.content != nil)
+            && lhs.attachments == rhs.attachments
+            && lhs.showsImages == rhs.showsImages
+            && (lhs.onClear != nil) == (rhs.onClear != nil)
     }
 }
 

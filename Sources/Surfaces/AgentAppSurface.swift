@@ -430,6 +430,10 @@ public struct AgentAppEmbedding {
     /// True means the host took the text (an armed "Reply here"): the prompt
     /// clears and no run starts.
     public let hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) -> Bool)?
+    /// Titio's inbox only: the trailing clear button on an assistant message.
+    /// The host removes it (`bot.notice.clear` semantics); false means it did
+    /// not, and the row comes back.
+    public let noticeClearHandler: (@MainActor (_ messageID: AgentMessageID) async -> Bool)?
 
     public init(
         pinnedThreadId: AgentThreadID,
@@ -444,9 +448,11 @@ public struct AgentAppEmbedding {
         pinnedThread: AgentThread? = nil,
         ownsComposerDraft: Bool = true,
         noticeChoiceHandler: (@MainActor (_ messageID: String, _ optionIndex: Int) -> Void)? = nil,
-        hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) -> Bool)? = nil
+        hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) -> Bool)? = nil,
+        noticeClearHandler: (@MainActor (_ messageID: AgentMessageID) async -> Bool)? = nil
     ) {
         self.ownsComposerDraft = ownsComposerDraft
+        self.noticeClearHandler = noticeClearHandler
         self.noticeChoiceHandler = noticeChoiceHandler
         self.hostReplyHandler = hostReplyHandler
         self.pinnedThreadId = pinnedThreadId
@@ -8911,6 +8917,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// the user rows and result lines of a card act, and resolution
     /// rewrites): upserted by id from the row itself, any role, with no
     /// SQLite read on the MainActor.
+    /// Messages the host removed from the thread (a cleared Titio notice).
+    public func applyHostRemovedMessages(_ ids: [AgentMessageID], threadId: AgentThreadID) {
+        guard selectedThreadId == threadId else { return }
+        let removed = Set(ids)
+        guard messages.contains(where: { removed.contains($0.id) }) else { return }
+        messages.removeAll { removed.contains($0.id) }
+    }
+
+    /// The clear button: the row leaves at once; if the host could not
+    /// remove it, it comes back where it was and the reason is shown.
+    public func clearHostMessage(_ id: AgentMessageID) {
+        guard let handler = embedding?.noticeClearHandler,
+              let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        let removed = messages.remove(at: index)
+        Task { @MainActor [weak self] in
+            guard await handler(id) == false, let self else { return }
+            statusMessage = "Could not clear the notification."
+            guard selectedThreadId == removed.threadId, !messages.contains(where: { $0.id == id }) else { return }
+            let position = messages.firstIndex { $0.createdAt > removed.createdAt } ?? messages.endIndex
+            messages.insert(removed, at: position)
+        }
+    }
+
     public func applyHostWrittenMessage(_ message: AgentMessage) {
         guard selectedThreadId == message.threadId else { return }
         if let index = messages.firstIndex(where: { $0.id == message.id }) {
@@ -17330,6 +17359,7 @@ public struct AgentAppView: View {
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
                         onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
                         stripsChoices: vm.showsBotChoices,
+                        attachments: msg.attachments,
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
                                 AgentChatPeerIdentityHeader(
@@ -17355,7 +17385,9 @@ public struct AgentAppView: View {
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
                         onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
-                        stripsChoices: vm.showsBotChoices
+                        stripsChoices: vm.showsBotChoices,
+                        attachments: msg.attachments,
+                        onClear: vm.embedding?.noticeClearHandler == nil ? nil : { vm.clearHostMessage(msg.id) }
                     )
                 }
             }
@@ -17540,6 +17572,7 @@ public struct AgentAppView: View {
             branchIdentifier: "agent.assistantMessage.branch.\(turn.turnId)",
             onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(turn.turnId) } : nil,
             stripsChoices: vm.showsBotChoices,
+            showsImages: turn.finished,
             content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
         )
     }

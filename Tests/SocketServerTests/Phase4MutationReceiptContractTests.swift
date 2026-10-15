@@ -1233,8 +1233,9 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        // 175 + bot.notice.act and bot.notice.read (Titio notice cards, hub spec §7).
-        XCTAssertEqual(canonical.count, 177)
+        // 175 + bot.notice.act and bot.notice.read (Titio notice cards, hub spec §7)
+        // + bot.notice.clear (clear a Titio notification, voice contract §3).
+        XCTAssertEqual(canonical.count, 178)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -2381,6 +2382,49 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         XCTAssertEqual(event.kind, .botUpdated)
         XCTAssertEqual(event.payload.objectValue?["method"]?.stringValue, "bot.notice.act")
         XCTAssertEqual(event.payload.objectValue?["bot_id"]?.stringValue, botID)
+    }
+
+    /// WHY: clearing a Titio notification (`bot.notice.clear`, voice
+    /// contract §3) is a host mutation: it passes the Phase 4 gate with its
+    /// syntax checked, replays from its receipt, and tells other devices
+    /// through `bot.updated` (the hub also publishes `agent.messages.removed`).
+    func test_titioNoticeClearIsGatedAndPublishesBotUpdated() async throws {
+        XCTAssertTrue(JSONRPCDispatcher.hostMutationMethods.contains("bot.notice.clear"))
+        XCTAssertThrowsError(try HostMutationContract.preflight(method: "bot.notice.clear", params: [
+            "bot_id": .string(UUID().uuidString), "message_id": .string("forged"),
+        ]), "a message id that is not a UUID never reaches the host")
+
+        let botID = UUID().uuidString.lowercased()
+        let messageID = UUID().uuidString.lowercased()
+        let router = Phase4ReceiptFakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("notice-clear"),
+            "receipt_id": .string("notice-clear-receipt"),
+            "bot_id": .string(botID),
+            "readback": .object([
+                "cleared": .bool(true),
+                "message_id": .string(messageID),
+                "thread_id": .string(UUID().uuidString.lowercased()),
+                "route": .string("bot"),
+            ]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_737)
+        defer { live.stop() }
+        var params = live.mutationParams(requestId: "notice-clear", threadId: AgentThreadID(), text: "unused")
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["bot_id"] = botID
+        params["message_id"] = messageID
+        let first = try await live.rpc(method: "bot.notice.clear", params: params)
+        let retry = try await live.rpc(method: "bot.notice.clear", params: params)
+        XCTAssertNil(first["error"])
+        XCTAssertNil(retry["error"])
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1, "a retried clear is answered from its receipt")
+        let event = try XCTUnwrap(router.finalizedEvents["bot.notice.clear:notice-clear"]?.first)
+        XCTAssertEqual(event.kind, .botUpdated)
+        XCTAssertEqual(event.payload.objectValue?["method"]?.stringValue, "bot.notice.clear")
+        XCTAssertEqual(event.payload.objectValue?["cleared"]?.boolValue, true)
     }
 
     /// WHY: iOS schedules Bot OS notifications only from notification.created.
@@ -3692,7 +3736,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         let manifestKinds = Set(mutations.flatMap { $0["eventKinds"] as? [String] ?? [] })
         let treatyKinds = Set(RemoteCodeEventKind.allCases.map(\.rawValue))
 
-        XCTAssertEqual(treatyKinds.count, 150)
+        XCTAssertEqual(treatyKinds.count, 151)
         XCTAssertTrue(
             manifestKinds.isSubset(of: treatyKinds),
             "Treaty is missing manifest kinds: \(manifestKinds.subtracting(treatyKinds).sorted())"

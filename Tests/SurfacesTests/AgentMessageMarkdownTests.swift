@@ -44,9 +44,12 @@ final class AgentMessageMarkdownTests: XCTestCase {
         XCTAssertEqual(blocks[1].text, "clone the repo")
     }
 
+    /// WHY: nesting is relative to the parent item's text column, not a fixed
+    /// "2 spaces per level". A 4-space nested item is ONE level deeper; the old
+    /// spaces/2 rule rendered it two levels deep, detached from its parent.
     func test_nestedBulletKeepsIndent() {
         let blocks = AgentMessageMarkdown.blocks(from: "- top\n    - nested")
-        XCTAssertEqual(blocks.map(\.kind), [.bullet(indent: 0), .bullet(indent: 2)])
+        XCTAssertEqual(blocks.map(\.kind), [.bullet(indent: 0), .bullet(indent: 1)])
     }
 
     func test_blocksLeavePlainChatTextAsOneParagraph() {
