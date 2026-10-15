@@ -111,6 +111,98 @@ final class TitioInboxThreadTests: XCTestCase {
         vm.selectDeskThread(target.conversationID)
     }
 
+    func test_openChatFromThePetLandsOnAMountedTitioConversation() throws {
+        // WHY: the pet's "Open Chat" (router.openTitio) must show a usable
+        // Titio chat. With only the Notifications inbox, the desk stayed on
+        // "Loading…" because no Agent App view model was mounted.
+        let (_, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        vm.reload()
+        _ = try router.openTitio()
+        XCTAssertEqual(vm.selectedBotID, target.botID)
+        let conversation = try XCTUnwrap(vm.selectedConversation, "a Titio conversation is selected")
+        if conversation.linkedAgentThreadID != nil {
+            XCTAssertNotNil(vm.deskAgentVM, "a linked conversation mounts its chat")
+        }
+    }
+
+    func test_openChatFromThePetMountsTheChatWithCacheFirstNavigation() async throws {
+        // WHY: the shell enables cache-first navigation; the pet's "Open Chat"
+        // must still end on a mounted Titio chat after the freshness pass,
+        // never on a "Loading…" strip.
+        let (_, router, vm) = try makeFixture()
+        vm.enableNavigationFirstFrameDeferral()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        _ = try router.openTitio()
+        await vm.waitForNavigationFreshnessForTesting()
+        XCTAssertEqual(vm.selectedBotID, target.botID)
+        let conversation = try XCTUnwrap(vm.selectedConversation, "a Titio conversation is selected")
+        if conversation.linkedAgentThreadID != nil {
+            XCTAssertNotNil(vm.deskAgentVM, "a linked conversation mounts its chat")
+        }
+    }
+
+    func test_openChatAfterTheHubPostedMountsTheInboxChat() async throws {
+        // WHY: in the running app the hub is started and has posted into the
+        // inbox before the user taps "Open Chat"; the desk must mount the chat.
+        let (context, router, vm) = try makeFixture()
+        vm.enableNavigationFirstFrameDeferral()
+        vm.reload()
+        _ = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        context.titioNoticeCenter.start(subscribeToEvents: true)
+        context.titioNoticeCenter.ingest(TitioNoticeFact(
+            key: "notification.e2e-1", kind: .external, source: TitioNoticeSource(),
+            facts: TitioNoticeFacts(title: "Deploy do elephant", body: "terminou")
+        ))
+        await context.titioNoticeCenter.idle()
+        for _ in 0..<20 { await Task.yield() }
+        _ = try router.openTitio()
+        await vm.waitForNavigationFreshnessForTesting()
+        await context.titioNoticeCenter.idle()
+        for _ in 0..<20 { await Task.yield() }
+        await vm.waitForNavigationFreshnessForTesting()
+        let conversation = try XCTUnwrap(vm.selectedConversation, "a Titio conversation is selected")
+        XCTAssertNotNil(conversation.linkedAgentThreadID)
+        XCTAssertNotNil(vm.deskAgentVM, "the inbox chat is mounted, not a Loading strip")
+    }
+
+    func test_aBotWithNoConversationOffersTheComposerInsteadOfLoadingForever() async throws {
+        // WHY: Titio (and any new Bot) starts with no conversation. The desk
+        // used to sit on "Loading…" forever; it must offer the composer,
+        // whose first send creates the conversation.
+        let (_, router, vm) = try makeFixture()
+        vm.enableNavigationFirstFrameDeferral()
+        let titio = try TitioBot.ensure(store: try XCTUnwrap(router.context).botStore,
+                                        appSupportDirectory: try XCTUnwrap(router.context).appSupportDirectory)
+        vm.reload()
+        _ = try router.openBotsDesk(botID: titio.id)
+        await vm.waitForNavigationFreshnessForTesting()
+        XCTAssertNil(vm.selectedConversation)
+        XCTAssertTrue(vm.deskShowsNewConversationComposer)
+    }
+
+    func test_anInboxCreatedWhileTitiosEmptyDeskIsOpenBecomesTheOpenChat() async throws {
+        // WHY: the user opened Titio before any notice; the first notice
+        // creates the inbox and the open desk must show it, not stay empty.
+        let (_, router, vm) = try makeFixture()
+        vm.enableNavigationFirstFrameDeferral()
+        let titio = try TitioBot.ensure(store: try XCTUnwrap(router.context).botStore,
+                                        appSupportDirectory: try XCTUnwrap(router.context).appSupportDirectory)
+        vm.reload()
+        _ = try router.openBotsDesk(botID: titio.id)
+        await vm.waitForNavigationFreshnessForTesting()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let conversation = try XCTUnwrap(try router.context?.botStore.conversation(id: target.conversationID))
+        vm.appendHostAssistantMessage(
+            botID: target.botID, conversationID: target.conversationID,
+            message: AgentMessage(threadId: target.threadID, role: .assistant, content: "Heads up: deploy done."),
+            conversation: conversation
+        )
+        XCTAssertEqual(vm.selectedConversation?.id, target.conversationID)
+        XCTAssertNotNil(vm.deskAgentVM, "the inbox chat mounts")
+        XCTAssertFalse(vm.deskShowsNewConversationComposer)
+    }
+
     func test_selectingTheInboxMarksItRead() throws {
         // WHY: opening the inbox on the Mac clears its unread count (§8 "Read state").
         let (_, router, vm) = try makeFixture()

@@ -9982,6 +9982,13 @@ public final class BotsViewModel: ObservableObject {
         if selectedBotID == conversation.botID {
             conversations.removeAll { $0.id == conversation.id }
             conversations.insert(conversation, at: 0)
+            // A desk open on this Bot with nothing selected (it had no
+            // conversation yet, e.g. Titio before its first notice) shows the
+            // conversation that just appeared instead of waiting forever.
+            if selectedConversation == nil, screen == .desk {
+                selectedConversation = conversation
+                selectedConversationByBot[conversation.botID] = conversation.id
+            }
             rememberStudioSupport(for: conversation.botID)
         } else {
             patchStudioSupportConversation(conversation, botID: conversation.botID)
@@ -10236,6 +10243,15 @@ public final class BotsViewModel: ObservableObject {
     /// Keeps at most one pinned Agent App VM on the selected conversation's
     /// linked thread. An unlinked conversation gets no VM: its thread is created
     /// lazily by the first send (`ensureLinkedThread`).
+    /// The selected Bot has no conversation at all and nothing is still
+    /// loading: the desk offers the new-conversation composer (the first send
+    /// creates the conversation) instead of a "Loading…" strip that never ends.
+    public var deskShowsNewConversationComposer: Bool {
+        guard selectedConversation == nil, navigationFreshnessTask == nil,
+              let botID = selectedBotID else { return false }
+        return !conversations.contains { $0.botID == botID }
+    }
+
     /// Verbosity Human: the desk shows only the Bot's messages.
     static func deskHidesToolActivity(_ bot: BotDefinition) -> Bool {
         bot.verbosity == .human
@@ -13685,6 +13701,8 @@ public struct BotsRootView: View {
                 } else if let conversation = vm.selectedConversation,
                           conversation.botID == bot.id,
                           conversation.linkedAgentThreadID == nil {
+                    deskUnlinkedComposer(bot)
+                } else if vm.deskShowsNewConversationComposer {
                     deskUnlinkedComposer(bot)
                 } else {
                     AgentChatLoadingStatusStrip()
