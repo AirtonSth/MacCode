@@ -6,6 +6,10 @@ import AgentRuntime
 
 @MainActor
 class FakeRouter: CommandRouting, TerminalCommandRouting {
+    func captureHostBrowserToChat(callerThread: AgentThreadID, surface: SurfaceID?, reason: String) throws -> JSONValue {
+        throw JSONRPCError.notSupported("host.browser.screenshot")
+    }
+
     var workspaces: [Workspace] = []
     var window = AppWindow()
     var distillAccountID: String?

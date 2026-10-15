@@ -2867,7 +2867,8 @@ final class BotsWindowTests: XCTestCase {
         let end = rest.range(of: "\n    private func ")?.lowerBound ?? rest.endIndex
         let row = String(source[start.lowerBound..<end])
         XCTAssertTrue(row.contains("DSBusySpinner("), "dest dest roster must reuse the workspace busy spinner")
-        XCTAssertTrue(row.contains("BotsChrome.rosterShowsBusySpinner"))
+        XCTAssertTrue(row.contains("BotsChrome.rosterShowsBusySpinner(for: vm.activityState(for: bot))"),
+                      "a live run must keep its spinner even while a separate attention item stays open")
         XCTAssertTrue(row.contains("bots.roster.busy"))
 
         let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
@@ -3332,6 +3333,65 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(vm.fleet.first).pinned)
     }
 
+    func test_renderedRosterSpinnerTracksActivityWhileApprovalMarkerRemains() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "SpinnerFixtureUnique", title: "Scout")
+        let thread = AgentThread(title: "Run", provider: .codex, model: "test")
+        try context.threadRepo.upsert(thread)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: bot.id, title: "Run chat", linkedAgentThreadID: thread.id)
+        )
+        try context.botStore.upsertAttention(
+            BotAttentionItem(botID: bot.id, kind: .approval, title: "Need you")
+        )
+        vm.reload()
+        vm.searchText = "SpinnerFixtureUnique"
+        vm.activeThreadIDsOverrideForTesting = [thread.id]
+        XCTAssertEqual(vm.activityState(for: bot), .working)
+        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention)
+
+        func capture() throws -> NSBitmapImageRep {
+            let size = NSSize(width: 280, height: 600)
+            let hosting = NSHostingView(rootView: BotsRosterList(vm: vm).frame(width: size.width, height: size.height))
+            hosting.frame = NSRect(origin: .zero, size: size)
+            hosting.wantsLayer = true
+            let window = NSWindow(contentRect: hosting.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.contentView = hosting
+            window.layoutIfNeeded()
+            hosting.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+            hosting.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+            window.contentView = nil
+            return bitmap
+        }
+
+        let active = try capture()
+        try XCTUnwrap(active.representation(using: .png, properties: [:])).write(to: URL(fileURLWithPath: "/tmp/rc-bot-spinner-active.png"))
+        vm.activeThreadIDsOverrideForTesting = []
+        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention)
+        let idle = try capture()
+        try XCTUnwrap(idle.representation(using: .png, properties: [:])).write(to: URL(fileURLWithPath: "/tmp/rc-bot-spinner-idle.png"))
+        var trailingDifferences = 0
+        // This fixture's only roster row is below the search field; exclude the Active Bots badge.
+        let rowTop = Int(Double(active.pixelsHigh) * 0.33)
+        let rowBottom = Int(Double(active.pixelsHigh) * 0.42)
+        for y in rowTop..<rowBottom {
+            for x in Int(Double(active.pixelsWide) * 0.85)..<active.pixelsWide {
+                guard let a = active.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
+                      let b = idle.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                if abs(a.redComponent - b.redComponent) + abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent) > 0.12 {
+                    trailingDifferences += 1
+                }
+            }
+        }
+        XCTAssertGreaterThan(trailingDifferences, 20, "actual trailing spinner pixels must change while approval marker remains")
+        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention)
+    }
+
     func test_activeBotCountSurvivesPublishesWithoutRosterQueries_andTracksRunTransitions() throws {
         // WHY (perf BT-01): the roster body read `activeBotCount` up to 8× and
         // every read ran `liveWorkingBots()` — two SQLite queries plus a
@@ -3342,14 +3402,26 @@ final class BotsWindowTests: XCTestCase {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout")
+        let otherBot = try vm.create(name: "Quinn", title: "Reviewer")
         let thread = AgentThread(title: "Run", provider: .codex, model: "test")
         try context.threadRepo.upsert(thread)
         try context.botStore.upsertConversation(
             BotConversation(botID: bot.id, title: "Run chat", linkedAgentThreadID: thread.id)
         )
+        let otherThread = AgentThread(title: "Other run", provider: .claude, model: "test")
+        try context.threadRepo.upsert(otherThread)
+        try context.botStore.upsertConversation(
+            BotConversation(botID: otherBot.id, title: "Other chat", linkedAgentThreadID: otherThread.id)
+        )
+        try context.botStore.upsertAttention(
+            BotAttentionItem(botID: bot.id, kind: .approval, title: "Need you")
+        )
 
         vm.activeThreadIDsOverrideForTesting = []
+        vm.reload()
         XCTAssertEqual(vm.activeBotCount, 0)
+        XCTAssertNotEqual(vm.activityState(for: bot), .working)
+        XCTAssertEqual(vm.attentionState(for: otherBot), .none)
         let baseline = vm.liveWorkingBotsCountForTesting
 
         // 50 unrelated publishes (per-token desk timeline writes are the worst
@@ -3366,18 +3438,30 @@ final class BotsWindowTests: XCTestCase {
         )
 
         // Run start: the linked thread joins the active set -> count 0 -> 1.
-        vm.activeThreadIDsOverrideForTesting = [thread.id]
+        vm.activeThreadIDsOverrideForTesting = [thread.id, otherThread.id]
         XCTAssertEqual(
-            vm.activeBotCount, 1,
-            "a bot whose linked thread starts running must count as active"
+            vm.activeBotCount, 2,
+            "each bot whose linked thread starts running must count as active"
         )
+        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention,
+                       "a live run must preserve its pending approval marker")
+        XCTAssertEqual(vm.activityState(for: bot), .working,
+                       "a live run must paint the avatar spinner over pending attention")
+        XCTAssertEqual(vm.activityState(for: otherBot), .working,
+                       "a nonselected bot's live run must update its avatar projection")
 
-        // Run end: the thread leaves the active set -> count back to 0.
+        // Run end: both threads leave the active set -> count back to 0.
         vm.activeThreadIDsOverrideForTesting = []
         XCTAssertEqual(
             vm.activeBotCount, 0,
-            "a bot whose linked run finished must leave the active count"
+            "bots whose linked runs finished must leave the active count"
         )
+        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention,
+                       "completed run must retain pending approval state")
+        XCTAssertNotEqual(vm.activityState(for: bot), .working,
+                          "a completed run must stop painting the avatar as working")
+        XCTAssertNotEqual(vm.activityState(for: otherBot), .working,
+                          "a nonselected bot's completed run must stop its avatar spinner")
     }
 
     func test_reloadDoesNotRestoreTheSameDeskTwice_becauseRemountsRepeatTheReads() throws {

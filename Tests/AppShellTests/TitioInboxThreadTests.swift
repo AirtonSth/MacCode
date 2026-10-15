@@ -226,17 +226,20 @@ final class TitioInboxThreadTests: XCTestCase {
         XCTAssertEqual(BotsViewModel.forkTitle("  "), "Fork")
     }
 
-    func test_botChatsOfferReplyWithAQuotedComposerButTitiosInboxDoesNot() throws {
-        // WHY: the owner asked (2026-10-15) to reply to a Bot message: the
-        // composer shows the quote and "Reply…". Titio's inbox answers notices
-        // through its own reply arm, which a quote line would break.
+    func test_botChatsAndTitiosInboxOfferReplyWithAQuotedComposer() throws {
+        // WHY: notification messages need the same quoted reply affordance as
+        // regular Bot messages without changing Titio's armed-reply send path.
         let (_, router, vm) = try makeFixture()
         let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
         try openInbox(vm, router: router, target: target)
         let inboxDesk = try XCTUnwrap(vm.deskAgentVM)
-        XCTAssertFalse(inboxDesk.supportsReplies, "no reply in the inbox")
+        XCTAssertTrue(inboxDesk.supportsReplies, "notification messages offer Reply")
         inboxDesk.beginReply(to: "Heads up: deploy done.")
+        XCTAssertEqual(inboxDesk.activeReplyTarget?.excerpt, "Heads up: deploy done.")
+        XCTAssertEqual(inboxDesk.composerPlaceholder, "Reply…")
+        inboxDesk.cancelReply()
         XCTAssertNil(inboxDesk.activeReplyTarget)
+        XCTAssertNil(inboxDesk.onForkInNewChat, "the inbox still cannot fork")
 
         let context = try XCTUnwrap(router.context)
         let bot = try XCTUnwrap(try context.botStore.get(id: target.botID))

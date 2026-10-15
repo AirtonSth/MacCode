@@ -111,6 +111,7 @@ public enum HostMutationContract {
     browser.eval
     browser.mirror_url.get
     browser.screenshot
+    host.browser.screenshot
     ssh.connect
     ssh.disconnect
     ssh.host.upsert
@@ -508,6 +509,7 @@ public enum HostMutationContract {
         case "host.bot.skill.create": return [.uuid("bot_id"), .string("skill_id", nonempty: true)]
         case "host.bot.delegate": return [.string("bot", nonempty: true), .string("text", nonempty: true)]
         case "host.scheduled_task.run_next": return [.string("workspace", nonempty: true)]
+        case "host.browser.screenshot": return [.uuid("thread_id"), .optionalUUID("surface_id"), .optionalString("reason")]
         case "fs.workspace.create_file": return [.uuid("workspace_id"), .string("path")]
         case "fs.workspace.delete": return [.uuid("workspace_id")]
         case "fs.workspace.rename": return [.uuid("workspace_id"), .string("path"), .string("new_name")]
