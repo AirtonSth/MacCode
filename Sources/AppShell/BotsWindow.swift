@@ -6296,8 +6296,15 @@ public final class BotsViewModel: ObservableObject {
     /// (`rc_bot_send` / `rc_bot_delegate`), routines and acts never can.
     enum HostSendOrigin: Equatable {
         case host
-        case pairedClient
+        /// `tapsNoticeCards`: the client acts on Titio cards through
+        /// `bot.notice.act`, so its plain text is never taken as a card option
+        /// (an option word typed in a sentence must stay chat). Older clients
+        /// send the option text, so they keep the exact-text fallback.
+        case pairedClient(tapsNoticeCards: Bool)
     }
+
+    /// `bot.send` capability of clients that tap Titio cards through `bot.notice.act`.
+    static let noticeActClientCapability = "titio_notice_act_v1"
 
     /// Host-catalog Bot sends use the same persisted user line, compiled Bot
     /// brain, routing, provider start, and follow-through as a Desk send. They
@@ -6330,11 +6337,16 @@ public final class BotsViewModel: ObservableObject {
                 // An LLM must never approve or answer for the user (§0.2):
                 // only the paired user's own text may reach the intercept,
                 // and nothing else may write into the inbox as the user.
-                guard origin == .pairedClient else {
+                guard case .pairedClient(let tapsNoticeCards) = origin else {
                     throw BotStoreError.invalidRow("Titio's Notifications inbox only takes messages from you.")
                 }
                 if attachments.isEmpty,
-                   let consumed = interceptTitioInboxSend(bot: bot, conversation: existing, text: message) {
+                   let consumed = interceptTitioInboxSend(
+                    bot: bot,
+                    conversation: existing,
+                    text: message,
+                    acceptsOptionText: !tapsNoticeCards
+                   ) {
                     return consumed
                 }
             }
@@ -10796,13 +10808,14 @@ public final class BotsViewModel: ObservableObject {
     private func interceptTitioInboxSend(
         bot: BotDefinition,
         conversation: BotConversation,
-        text: String
+        text: String,
+        acceptsOptionText: Bool
     ) -> JSONValue? {
         let center = context.titioNoticeCenter
         let consumed: String
         if center.takeArmedReply(text: text) {
             consumed = "reply"
-        } else if center.takeOptionText(text) {
+        } else if acceptsOptionText, center.takeOptionText(text) {
             consumed = "option"
         } else {
             return nil

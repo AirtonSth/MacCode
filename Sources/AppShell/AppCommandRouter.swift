@@ -4084,7 +4084,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             try service.removeGuestRuntime(botID: id)
         }
-        created.onSend = { [weak self] id, text, conversationID, attachmentReferences, routingValues in
+        created.onSend = { [weak self] id, text, conversationID, attachmentReferences, routingValues, clientCapabilities in
             guard let self, let vm = self.botsViewModel else {
                 throw BotRemoteControlAuthority.Error(
                     code: -32091,
@@ -4104,7 +4104,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 attachments: attachments,
                 routing: routing,
                 adoptAsDeskRoute: routingValues.map(Self.pairedRouteKeepsItsProvider) ?? false,
-                origin: .pairedClient
+                origin: .pairedClient(
+                    tapsNoticeCards: clientCapabilities.contains(BotsViewModel.noticeActClientCapability)
+                )
             )
             return Self.foundationObject(result.objectValue ?? [:])
         }

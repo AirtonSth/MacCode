@@ -194,13 +194,39 @@ final class TitioInboxThreadTests: XCTestCase {
         let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
         let key = try await armReplyHere(context, target: target)
         let receipt = try vm.enqueueHostMessage(botID: target.botID, text: "use staging", conversationID: target.conversationID,
-                                                origin: .pairedClient)
+                                                origin: .pairedClient(tapsNoticeCards: false))
         XCTAssertEqual(receipt.objectValue?["host_consumed"]?.boolValue, true)
         XCTAssertNil(receipt.objectValue?["run_id"], "no run id: nothing was started")
         await context.titioNoticeCenter.settleActs()
         await context.titioNoticeCenter.idle()
         XCTAssertNil(try context.runRepo.latestActive(for: target.threadID))
         XCTAssertEqual(try TitioNoticeRepository(db: context.db).get(key: key)?.state, .resolved)
+    }
+
+    func test_aClientThatTapsCardsNeverHasItsTextTakenAsAnOption() async throws {
+        // WHY: current iOS taps cards through bot.notice.act. If its plain text
+        // were still matched against option labels, the user typing a word
+        // that equals a label (or an LLM's plain list echoed back) would act on
+        // a notice. Only builds without the capability keep that fallback.
+        let (context, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let thread = AgentThreadID()
+        let facts = TitioNoticeFacts(title: "Deploy", workspaceName: "api", prompt: "Which environment?",
+                                     options: ["staging", "production"])
+        let key = TitioNoticeIDs.threadAttention(threadId: thread.value.uuidString, requestId: "Q2")
+        context.titioNoticeCenter.ingest(TitioNoticeFact(
+            key: key, kind: .userInput,
+            source: TitioNoticeSource(threadId: thread.value.uuidString, requestId: "Q2"),
+            facts: facts, actions: TitioNoticeAction.defaultActions(kind: .userInput, facts: facts)
+        ))
+        await context.titioNoticeCenter.idle()
+        XCTAssertEqual(try TitioNoticeRepository(db: context.db).get(key: key)?.state, .posted)
+
+        let receipt = try vm.enqueueHostMessage(botID: target.botID, text: "staging", conversationID: target.conversationID,
+                                                origin: .pairedClient(tapsNoticeCards: true))
+        XCTAssertNil(receipt.objectValue?["host_consumed"], "a card-tapping client's text is ordinary chat")
+        await context.titioNoticeCenter.settleActs()
+        XCTAssertEqual(try TitioNoticeRepository(db: context.db).get(key: key)?.state, .posted, "the notice stays open")
     }
 
     func test_agentHostToolsCannotAnswerANoticeOrWriteIntoTheInbox() async throws {

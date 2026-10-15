@@ -160,6 +160,11 @@ public enum AgentChatLiveTurnChrome {
         return (split.activity, outside)
     }
 
+    /// The work items a Verbosity Human turn still paints: its errors.
+    public static func visibleErrors(in activity: [AssistantItem]) -> [AssistantItem] {
+        activity.filter { $0.type == .error }
+    }
+
     /// Claude often emits a streaming assistantMessage and then a snapshot
     /// item with the same body in one turn. Paint that answer once.
     static func deduplicatedAssistantItems(_ items: [AssistantItem]) -> [AssistantItem] {
@@ -987,6 +992,16 @@ public struct AgentChatLiveTurnView: View, Equatable {
             if hidesWork {
                 if live && showsWorkHeader {
                     AgentChatHiddenWorkStatus(turn: turn)
+                }
+                // Hidden work still owns up to its failures (iOS parity): an
+                // error the user cannot see would read as silent success.
+                ForEach(AgentChatLiveTurnChrome.visibleErrors(in: composition.activity)) { item in
+                    AgentChatLiveItemRow(
+                        item: item,
+                        expandedReasoning: $expandedReasoning,
+                        expandedTools: $expandedTools
+                    )
+                    .equatable()
                 }
             } else if !composition.activity.isEmpty {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {

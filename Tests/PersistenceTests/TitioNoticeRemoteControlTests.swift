@@ -151,7 +151,7 @@ final class TitioNoticeRemoteControlTests: XCTestCase {
         let inbox = BotConversation(botID: titio.id, title: "Notifications")
         try store.upsertConversation(inbox)
         let conversationID = inbox.id.value.uuidString.lowercased()
-        authority.onSend = { [titioID] _, _, _, _, _ in
+        authority.onSend = { [titioID] _, _, _, _, _, _ in
             [
                 "bot_id": titioID,
                 "conversation_id": conversationID,

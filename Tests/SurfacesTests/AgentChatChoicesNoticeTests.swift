@@ -116,3 +116,16 @@ final class AgentChatChoicesNoticeTests: XCTestCase {
                       "a tap re-checks the draft before replacing the prompt")
     }
 }
+
+/// Verbosity Human hides a turn's work but not its failures (iOS parity).
+final class AgentChatHiddenWorkErrorTests: XCTestCase {
+    func test_humanVerbosityStillShowsErrorsButNoToolRows() {
+        // WHY: with tool rows hidden, an error the user cannot see reads as a
+        // silent success; iOS keeps error items visible in the same mode.
+        let activity = [
+            AssistantItem(id: "tool-1", turnId: "t1", type: .tool, body: "pwd", startedAtMs: 1),
+            AssistantItem(id: "err-1", turnId: "t1", type: .error, body: "Provider crashed", startedAtMs: 2),
+        ]
+        XCTAssertEqual(AgentChatLiveTurnChrome.visibleErrors(in: activity).map(\.id), ["err-1"])
+    }
+}

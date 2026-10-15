@@ -595,7 +595,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let runID = UUID().uuidString.lowercased()
         let threadID = UUID().uuidString.lowercased()
         var sendCalls = 0
-        authority.onSend = { callbackBotID, _, callbackConversationID, _, _ in
+        authority.onSend = { callbackBotID, _, callbackConversationID, _, _, _ in
             sendCalls += 1
             XCTAssertEqual(callbackBotID.value.uuidString.lowercased(), botID)
             XCTAssertEqual(callbackConversationID?.value.uuidString.lowercased(), conversationID)
@@ -726,7 +726,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         )
         let threadID = UUID()
         let runID = UUID()
-        authority.onSend = { callbackBotID, _, callbackConversationID, _, _ in
+        authority.onSend = { callbackBotID, _, callbackConversationID, _, _, _ in
             XCTAssertEqual(callbackBotID, bot)
             XCTAssertEqual(callbackConversationID?.value.uuidString.lowercased(), conversationID)
             return [
@@ -859,7 +859,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let conversation = BotConversationID(try XCTUnwrap(UUID(uuidString: conversationID)))
         let threadID = UUID()
         let runID = UUID()
-        authority.onSend = { _, _, _, _, _ in
+        authority.onSend = { _, _, _, _, _, _ in
             [
                 "bot_id": botID,
                 "conversation_id": conversationID,
@@ -1262,7 +1262,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let expectedRunID = UUID().uuidString.lowercased()
         let expectedThreadID = UUID().uuidString.lowercased()
         authority.onHasLiveRun = { _ in true }
-        authority.onSend = { callbackBotID, callbackText, callbackConversationID, _, callbackRouting in
+        authority.onSend = { callbackBotID, callbackText, callbackConversationID, _, callbackRouting, _ in
             XCTAssertEqual(callbackBotID.value.uuidString.lowercased(), botID)
             XCTAssertEqual(callbackText, "Use this exact route")
             XCTAssertNil(callbackConversationID,
@@ -1377,7 +1377,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(rows.map { $0["id"] as? String }, [grantID])
         XCTAssertEqual(rows.first?["filename"] as? String, "attachment-restore.txt")
 
-        relaunched.onSend = { botID, _, conversationID, _, _ in
+        relaunched.onSend = { botID, _, conversationID, _, _, _ in
             [
                 "bot_id": botID.value.uuidString.lowercased(),
                 "conversation_id": conversationID?.value.uuidString.lowercased() as Any,
@@ -1452,7 +1452,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             conversationID: target.conversationID
         )
         var sendCalls = 0
-        authority.onSend = { _, _, _, attachments, _ in
+        authority.onSend = { _, _, _, attachments, _, _ in
             sendCalls += 1
             XCTAssertEqual(attachments.map(\.id), ["rcatt1_\(String(repeating: "a", count: 32))"])
             return [
@@ -1505,7 +1505,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             botID: target.botID,
             conversationID: target.conversationID
         )
-        authority.onSend = { _, _, _, _, _ in throw BotRemoteControlAuthority.Error.invalidParams }
+        authority.onSend = { _, _, _, _, _, _ in throw BotRemoteControlAuthority.Error.invalidParams }
         XCTAssertThrowsError(try authority.dispatch(method: "bot.send", params: [
             "client_request_id": "admission-fails",
             "bot_id": target.botID,
@@ -1513,7 +1513,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "text": "first",
             "attachment_ids": [grantID],
         ]))
-        authority.onSend = { _, _, _, _, _ in [
+        authority.onSend = { _, _, _, _, _, _ in [
             "bot_id": target.botID,
             "conversation_id": target.conversationID,
             "thread_id": UUID().uuidString.lowercased(),
@@ -4178,7 +4178,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         )
         let runID = UUID().uuidString.lowercased()
         let threadID = UUID().uuidString.lowercased()
-        authority.onSend = { _, _, _, _, _ in
+        authority.onSend = { _, _, _, _, _, _ in
             [
                 "bot_id": botID,
                 "conversation_id": conversationID,

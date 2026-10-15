@@ -68,7 +68,7 @@ final class BotSendRoutingParityTests: XCTestCase {
         let botID = try makeBot("Piper")
         let conversationID = try makeConversation(botID: botID, "Plan")
         var receivedRouting: [String: Any]?? = .none
-        authority.onSend = { _, _, _, _, routing in
+        authority.onSend = { _, _, _, _, routing, _ in
             receivedRouting = .some(routing)
             return self.admittedSend(botID: botID, conversationID: conversationID)
         }
@@ -154,7 +154,7 @@ final class BotSendRoutingParityTests: XCTestCase {
         }
 
         var sentRouting: [String: Any]?
-        authority.onSend = { _, _, _, _, routing in
+        authority.onSend = { _, _, _, _, routing, _ in
             sentRouting = routing
             return self.admittedSend(botID: botID, conversationID: planID)
         }

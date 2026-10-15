@@ -84,7 +84,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// Routing is nil when the send carries no routing receipt: the host then
     /// runs the conversation's own desk route (or the resolved Distill default)
     /// and reports it back as `effective_routing`.
-    public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]?) throws -> [String: Any])?
+    /// The last argument is the client's `client_capabilities` from `bot.send`
+    /// (e.g. `titio_notice_act_v1`: the client taps Titio cards through
+    /// `bot.notice.act`, so its text is never read as a card answer).
+    public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]?, Set<String>) throws -> [String: Any])?
     /// A routine execution (scheduled slot or `bot.routine.run`): the same
     /// host send as `bot.send`, in a new conversation on the routine's own
     /// route. Returns the send's `bot_id`, `conversation_id` and `run_id`.
@@ -1531,7 +1534,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         let authoritativeSend: [String: Any]
         if let onSend {
-            authoritativeSend = try onSend(bot.id, text, conversation, boundAttachments, routing)
+            let clientCapabilities = Set((params["client_capabilities"] as? [Any] ?? []).compactMap { $0 as? String })
+            authoritativeSend = try onSend(bot.id, text, conversation, boundAttachments, routing, clientCapabilities)
             // Titio's inbox took the text for a notice (an armed "Reply here"
             // or an old build's option text, hub spec §7): no run starts, so
             // no live run or working attention is registered.

@@ -50,7 +50,7 @@ final class TitioNoticeWireContractTests: XCTestCase {
         let inbox = BotConversation(botID: titio.id, title: "Notifications")
         try store.upsertConversation(inbox)
         let conversationID = inbox.id.value.uuidString.lowercased()
-        authority.onSend = { [titioID] _, _, _, _, _ in
+        authority.onSend = { [titioID] _, _, _, _, _, _ in
             // The exact object BotsViewModel.interceptTitioInboxSend returns.
             [
                 "bot_id": titioID,
