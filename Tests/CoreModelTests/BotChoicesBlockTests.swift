@@ -58,3 +58,34 @@ extension BotChoicesBlockTests {
         XCTAssertEqual(parsed.choices?.options, ["x", "y"])
     }
 }
+
+/// Titio notice cards carry an optional `notice` key (hub spec §7). Clients use
+/// it to route a tap to the host ledger instead of sending the option text, so
+/// it must parse, and blocks without it must behave exactly as before.
+extension BotChoicesBlockTests {
+    func test_noticeKeyParsesOnHostWrittenCards() {
+        let parsed = BotChoicesBlock.parse("Decide\n\n```choices\n{\"notice\":\"thread.T.attention.R\",\"options\":[\"Aprovar\",\"Recusar\"],\"question\":\"O que deseja fazer?\"}\n```")
+        XCTAssertEqual(parsed.text, "Decide")
+        XCTAssertEqual(parsed.choices?.notice, "thread.T.attention.R")
+        XCTAssertEqual(parsed.choices?.options, ["Aprovar", "Recusar"])
+    }
+
+    func test_blocksWithoutNoticeStayOrdinaryCards() {
+        // WHY: every Bot card written before this change has no key; it must keep
+        // sending the option text as a normal message.
+        let parsed = BotChoicesBlock.parse("Hi\n```choices\n{\"options\":[\"x\",\"y\"]}\n```")
+        XCTAssertNil(parsed.choices?.notice)
+        XCTAssertEqual(parsed.choices, BotChoicesBlock(question: nil, hint: nil, multiple: false, options: ["x", "y"]))
+    }
+
+    func test_blankOrNonStringNoticeIsIgnored() {
+        // WHY: only a real key may route to the ledger; junk must not make a card "special".
+        XCTAssertNil(BotChoicesBlock.parse("```choices\n{\"notice\":\"  \",\"options\":[\"x\",\"y\"]}\n```").choices?.notice)
+        XCTAssertNil(BotChoicesBlock.parse("```choices\n{\"notice\":7,\"options\":[\"x\",\"y\"]}\n```").choices?.notice)
+        XCTAssertNotEqual(
+            BotChoicesBlock(question: nil, hint: nil, multiple: false, options: ["x", "y"], notice: "k"),
+            BotChoicesBlock(question: nil, hint: nil, multiple: false, options: ["x", "y"]),
+            "a notice card is a different card"
+        )
+    }
+}

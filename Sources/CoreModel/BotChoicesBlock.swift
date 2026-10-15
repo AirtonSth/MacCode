@@ -16,12 +16,17 @@ public struct BotChoicesBlock: Equatable, Sendable {
     public let hint: String?
     public let multiple: Bool
     public let options: [String]
+    /// Titio notice key (`"notice"` in the block). Set only on cards the host
+    /// writes for a ledger notice: a tap then acts through the host ledger
+    /// instead of sending the option text. Blocks without it parse as before.
+    public let notice: String?
 
-    public init(question: String?, hint: String?, multiple: Bool, options: [String]) {
+    public init(question: String?, hint: String?, multiple: Bool, options: [String], notice: String? = nil) {
         self.question = question
         self.hint = hint
         self.multiple = multiple
         self.options = options
+        self.notice = notice
     }
 
     public struct Parsed: Equatable, Sendable {
@@ -89,7 +94,8 @@ public struct BotChoicesBlock: Equatable, Sendable {
             question: nonEmpty(object["question"]),
             hint: nonEmpty(object["hint"]),
             multiple: object["multiple"] as? Bool ?? false,
-            options: options
+            options: options,
+            notice: nonEmpty(object["notice"])
         )
     }
 
