@@ -23,7 +23,7 @@ variables:
   before_script:
     - export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
     - command -v git-lfs >/dev/null || brew install git-lfs
-    - git lfs install
+    - git lfs install --local --force
     - git lfs pull
 
 .macos_large:
