@@ -255,6 +255,8 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> IntrinsicHeightTextView {
         let tv = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        // Rounded inline-code pills (see AgentMarkdownLayoutManager).
+        tv.textContainer?.replaceLayoutManager(AgentMarkdownLayoutManager())
         tv.delegate = context.coordinator
         context.coordinator.textView = tv
         tv.drawsBackground = false
@@ -370,8 +372,10 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
                 lineSpacing: lineSpacing
             )
             Self.applyTextStorage(ns, to: tv)
-            tv.font = font
-            tv.textColor = textColor
+            // Typing attributes only: the `font` / `textColor` setters restyle
+            // the WHOLE storage and erased heading sizes, bold, italic, code
+            // fonts and quote colours that `makeNSAttributedString` resolved.
+            tv.typingAttributes = [.font: font, .foregroundColor: textColor]
         }
         if plan.heightDirty {
             // Drop the fitted-size cache so the next sizeThatFits remeasures.
@@ -398,20 +402,42 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
         textView.setSelectedRange(NSRange(location: location, length: length))
     }
 
+    /// Marks inline-code runs so `AgentMarkdownLayoutManager` draws their
+    /// background as a rounded pill; the value is the pill colour.
+    static let inlineCodePillKey = NSAttributedString.Key("RCInlineCodePill")
+    static let inlineCodeBackground = DS.NS.line.withAlphaComponent(0.85)
+
+    /// The NSAttributedString actually handed to the NSTextView.
+    ///
+    /// AppKit only reads AppKit keys: a SwiftUI `.font` / `.foregroundColor`
+    /// set on the AttributedString is stored under "SwiftUI.*" and ignored,
+    /// and Foundation's markdown only records bold / italic / code /
+    /// strikethrough as `inlinePresentationIntent`. Resolve both here, against
+    /// each run's own font (body, heading or table cell), so the text view
+    /// really draws them.
     static func makeNSAttributedString(
         attributed: AttributedString,
         font: NSFont,
         textColor: NSColor,
         lineSpacing: CGFloat
     ) -> NSAttributedString {
-        let base = NSMutableAttributedString(attributedString: NSAttributedString(attributed))
+        let converted = (try? NSAttributedString(attributed, including: \.agentMarkdown)) ?? NSAttributedString(attributed)
+        let base = NSMutableAttributedString(attributedString: converted)
         let full = NSRange(location: 0, length: base.length)
         if full.length > 0 {
             // Apply base typography without clobbering existing link attributes.
             base.enumerateAttributes(in: full, options: []) { attrs, range, _ in
                 var next = attrs
-                if next[.font] == nil {
-                    next[.font] = font
+                let intent = (next[.inlinePresentationIntent] as? NSNumber)
+                    .map { InlinePresentationIntent(rawValue: $0.uintValue) } ?? []
+                let runFont = (next[.font] as? NSFont) ?? font
+                next[.font] = intent.isEmpty ? runFont : Self.styledFont(runFont, intent: intent)
+                if intent.contains(.code) {
+                    next[.backgroundColor] = inlineCodeBackground
+                    next[inlineCodePillKey] = inlineCodeBackground
+                }
+                if intent.contains(.strikethrough) {
+                    next[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
                 }
                 if next[.foregroundColor] == nil, next[.link] == nil {
                     next[.foregroundColor] = textColor
@@ -433,6 +459,24 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
             }
         }
         return base
+    }
+
+    /// Bold / italic as font traits of `font`; code switches to the monospaced
+    /// system font a step smaller so it sits on the same x-height.
+    static func styledFont(_ font: NSFont, intent: InlinePresentationIntent) -> NSFont {
+        var result = font
+        if intent.contains(.code) {
+            let bold = font.fontDescriptor.symbolicTraits.contains(.bold)
+            result = NSFont.monospacedSystemFont(ofSize: max(9, (font.pointSize * 0.9).rounded()), weight: bold ? .semibold : .regular)
+        }
+        var traits: NSFontDescriptor.SymbolicTraits = []
+        if intent.contains(.stronglyEmphasized) { traits.insert(.bold) }
+        if intent.contains(.emphasized) { traits.insert(.italic) }
+        if !traits.isEmpty {
+            let descriptor = result.fontDescriptor.withSymbolicTraits(result.fontDescriptor.symbolicTraits.union(traits))
+            result = NSFont(descriptor: descriptor, size: result.pointSize) ?? result
+        }
+        return result
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -665,5 +709,93 @@ final class IntrinsicHeightTextView: NSTextView {
                 lastFittedSize = .zero
             }
         }
+    }
+}
+
+/// TextKit 1 layout manager that paints inline-code backgrounds as rounded
+/// pills sized to the code font (not the whole line fragment, which also
+/// covers the paragraph's line spacing).
+final class AgentMarkdownLayoutManager: NSLayoutManager {
+    static let quoteDepthKey = NSAttributedString.Key(AgentMarkdownQuoteDepthAttribute.name)
+    static let quoteBarWidth: CGFloat = 3
+
+    override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
+        super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
+        drawQuoteBars(forGlyphRange: glyphsToShow, at: origin)
+    }
+
+    /// One continuous bar per quote level over each run of quoted lines.
+    private func drawQuoteBars(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
+        guard let storage = textStorage, storage.length > 0 else { return }
+        var lines: [(depth: Int, used: NSRect)] = []
+        var maxDepth = 0
+        enumerateLineFragments(forGlyphRange: glyphsToShow) { _, used, _, glyphRange, _ in
+            let character = self.characterIndexForGlyph(at: glyphRange.location)
+            let depth = character < storage.length
+                ? (storage.attribute(Self.quoteDepthKey, at: character, effectiveRange: nil) as? NSNumber)?.intValue ?? 0
+                : 0
+            maxDepth = max(maxDepth, depth)
+            lines.append((depth, used))
+        }
+        guard maxDepth > 0 else { return }
+        DS.NS.accent.withAlphaComponent(0.45).setFill()
+        for level in 1...maxDepth {
+            var start: NSRect?
+            var end: NSRect = .zero
+            func flush() {
+                guard let top = start else { return }
+                let x = origin.x + CGFloat(level - 1) * AgentMessageMarkdown.quoteIndentStep
+                let bar = NSRect(x: x, y: origin.y + top.minY, width: Self.quoteBarWidth, height: end.maxY - top.minY)
+                NSBezierPath(roundedRect: bar, xRadius: 1.5, yRadius: 1.5).fill()
+                start = nil
+            }
+            for line in lines {
+                if line.depth >= level {
+                    if start == nil { start = line.used }
+                    end = line.used
+                } else {
+                    flush()
+                }
+            }
+            flush()
+        }
+    }
+
+    override func fillBackgroundRectArray(
+        _ rectArray: UnsafePointer<NSRect>,
+        count rectCount: Int,
+        forCharacterRange charRange: NSRange,
+        color: NSColor
+    ) {
+        guard let storage = textStorage, charRange.location < storage.length,
+              let pill = storage.attribute(
+                AgentLinkedInlineTextRepresentable.inlineCodePillKey,
+                at: charRange.location,
+                effectiveRange: nil
+              ) as? NSColor,
+              pill.isEqual(color),
+              let container = textContainers.first else {
+            super.fillBackgroundRectArray(rectArray, count: rectCount, forCharacterRange: charRange, color: color)
+            return
+        }
+        let font = storage.attribute(.font, at: charRange.location, effectiveRange: nil) as? NSFont
+            ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let path = NSBezierPath()
+        for index in 0..<rectCount {
+            let rect = rectArray[index]
+            var pillRect = rect.insetBy(dx: -2, dy: 0)
+            let glyph = glyphIndex(for: NSPoint(x: rect.midX, y: rect.midY), in: container)
+            if glyph < numberOfGlyphs {
+                let line = lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+                let baseline = line.minY + location(forGlyphAt: glyph).y
+                let top = baseline - font.ascender - 1.5
+                let bottom = baseline - font.descender + 1.5
+                pillRect.origin.y = top
+                pillRect.size.height = bottom - top
+            }
+            path.append(NSBezierPath(roundedRect: pillRect, xRadius: 4, yRadius: 4))
+        }
+        color.setFill()
+        path.fill()
     }
 }

@@ -8443,6 +8443,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }.value
     }
 
+    /// Message lookup on the read gateway; file checks, decode and encode off
+    /// the main actor.
+    public func getAgentMessageImage(_ request: AgentMessageImageGetWire.Request) async throws -> JSONValue {
+        let message = try await agentAppReadGateway.message(id: request.messageID)
+        return try await Task.detached(priority: .userInitiated) {
+            try AgentMessageImageGetWire.load(request, message: message)
+        }.value
+    }
+
     /// Reads the stored usage file off the main actor; never probes a provider.
     public func getAgentAccountUsage() async throws -> JSONValue {
         guard let directory = context?.appSupportDirectory else {

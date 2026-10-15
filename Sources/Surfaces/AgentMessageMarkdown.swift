@@ -3,19 +3,51 @@ import SwiftUI
 import AppKit
 import DesignSystemKit
 
-struct AgentMessageMarkdownBlock: Equatable {
-    enum Kind: Equatable {
+struct AgentMessageMarkdownBlock: Hashable {
+    enum TableAlignment: Hashable { case none, left, center, right }
+
+    enum Kind: Hashable {
         case paragraph
         case heading(Int)
         case bullet(indent: Int)
         case numbered(number: Int, indent: Int)
+        /// GFM task item `- [ ]` / `- [x]`.
+        case task(checked: Bool, indent: Int)
+        /// A later paragraph of the list item at `indent` (after a blank line).
+        case listContinuation(indent: Int)
+        /// `language` is "" when the fence has no info string (or for indented code).
         case code(language: String)
-        case table(headers: [String], rows: [[String]])
+        case table(headers: [String], rows: [[String]], alignments: [TableAlignment])
+        /// Paragraph text inside a block quote (`quoteDepth` ≥ 1).
         case blockquote
+        /// Thematic break (`---`, `***`, `___`, `* * *`).
+        case rule
     }
 
     let kind: Kind
     let text: String
+    /// Number of enclosing `>` quotes (0 outside quotes). Lists, headings and
+    /// code inside a quote keep their own kind and carry the depth here.
+    var quoteDepth: Int = 0
+}
+
+/// Quote nesting of a prose paragraph, read by `AgentMarkdownLayoutManager`
+/// to draw the quote bars. (TextKit 1 NSTextBlock quotes lose their layout
+/// as soon as the paragraph has line spacing, so bars are drawn by hand.)
+enum AgentMarkdownQuoteDepthAttribute: AttributedStringKey {
+    typealias Value = Int
+    static let name = "RCQuoteDepth"
+}
+
+extension AttributeScopes {
+    /// AppKit attributes plus the transcript's own keys, used when the prose
+    /// AttributedString is handed to the NSTextView.
+    struct AgentMarkdownAttributes: AttributeScope {
+        let quoteDepth: AgentMarkdownQuoteDepthAttribute
+        let appKit: AttributeScopes.AppKitAttributes
+    }
+
+    var agentMarkdown: AgentMarkdownAttributes.Type { AgentMarkdownAttributes.self }
 }
 
 enum AgentMessageMarkdown {
@@ -109,8 +141,8 @@ enum AgentMessageMarkdown {
         #endif
         // Live streaming rows grow every paint tick. Re-tokenizing the whole
         // body each tick made a long reply O(n²); the prefix before the last
-        // blank line outside a code fence is final, so parse (and cache) it
-        // once and re-parse only the growing tail.
+        // block-level reset point is final, so parse (and cache) it once and
+        // re-parse only the growing tail.
         if !cache {
             let chunks = stableLiveChunks(text)
             if chunks.count > 1 {
@@ -139,33 +171,48 @@ enum AgentMessageMarkdown {
         return result
     }
 
-    /// Splits at every blank line outside a ``` fence that follows visible
-    /// content. `computeBlocks` flushes every block at such a line, so the
-    /// concatenated per-chunk parses equal the full parse. All chunks but the
-    /// last are final and cache; only the growing last chunk re-parses.
+    /// Splits where the block parser fully resets: one or more blank lines
+    /// (outside a ``` / ~~~ fence) followed by a line that starts at column 0.
+    /// An indented line after a blank can still continue a list item or an
+    /// indented code block, so it never starts a chunk. The concatenated
+    /// per-chunk parses therefore equal the full parse; all chunks but the
+    /// last are final and cache, and only the growing last chunk re-parses.
     static func stableLiveChunks(_ text: String) -> [Substring] {
         let utf8 = text.utf8
-        var fenceOpen = false
+        let newline = UInt8(ascii: "\n")
+        let space = UInt8(ascii: " ")
+        let tab = UInt8(ascii: "\t")
+        var fence: (char: UInt8, length: Int)?
         var lineStart = utf8.startIndex
         var chunkStart = utf8.startIndex
+        var blankRunStart: String.Index?
         var sawContent = false
         var chunks: [Substring] = []
         var index = utf8.startIndex
         while index < utf8.endIndex {
-            if utf8[index] == UInt8(ascii: "\n") {
-                let trimmed = text[lineStart..<index].drop(while: { $0 == " " || $0 == "\t" })
+            if utf8[index] == newline {
+                var cursor = lineStart
+                while cursor < index, utf8[cursor] == space || utf8[cursor] == tab { cursor = utf8.index(after: cursor) }
+                let indented = cursor != lineStart
+                let blank = cursor == index || text[cursor..<index].allSatisfy(\.isWhitespace)
                 let next = utf8.index(after: index)
-                if trimmed.hasPrefix("```") {
-                    fenceOpen.toggle()
-                    sawContent = true
-                } else if trimmed.allSatisfy(\.isWhitespace) {
-                    if !fenceOpen, sawContent {
-                        chunks.append(text[chunkStart..<lineStart])
-                        chunkStart = next
-                        sawContent = false
-                    }
+                if let open = fence {
+                    var run = 0
+                    var probe = cursor
+                    while probe < index, utf8[probe] == open.char { run += 1; probe = utf8.index(after: probe) }
+                    if run >= open.length, text[probe..<index].allSatisfy(\.isWhitespace) { fence = nil }
+                } else if blank {
+                    if sawContent, blankRunStart == nil { blankRunStart = lineStart }
                 } else {
+                    if let blankStart = blankRunStart, !indented {
+                        chunks.append(text[chunkStart..<blankStart])
+                        chunkStart = lineStart
+                    }
+                    blankRunStart = nil
                     sawContent = true
+                    if let opener = fenceOpener(text[cursor..<index]) {
+                        fence = (opener.char == "`" ? UInt8(ascii: "`") : UInt8(ascii: "~"), opener.length)
+                    }
                 }
                 lineStart = next
             }
@@ -187,7 +234,7 @@ enum AgentMessageMarkdown {
 
         for block in blocks {
             switch block.kind {
-            case .code, .table:
+            case .code, .table, .rule:
                 flushProse()
                 groups.append([block])
             default:
@@ -205,12 +252,44 @@ enum AgentMessageMarkdown {
         return cache
     }()
 
+    // MARK: Prose typography (AppKit attributes)
+    //
+    // The prose group is drawn by an NSTextView (`AgentLinkedAttributedText`),
+    // which only understands AppKit attribute keys. SwiftUI `.font` /
+    // `.foregroundColor` runs are stored under "SwiftUI.*" keys that AppKit
+    // ignores, so every typographic decision here is an NSFont / NSColor /
+    // NSParagraphStyle. Inline intents (bold, italic, code, strikethrough) are
+    // resolved against each run's font in `makeNSAttributedString`.
+
+    static let bodyFontSize: CGFloat = 13
+    static let listIndentStep: CGFloat = 18
+    static let listMarkerWidth: CGFloat = 18
+    /// Indent per quote level; the bar sits in the first 3 pt of it.
+    static let quoteIndentStep: CGFloat = 14
+
+    static func headingFontSize(_ level: Int, compact: Bool) -> CGFloat {
+        if compact { return level <= 2 ? 15 : 13 }
+        switch level {
+        case 1: return 20
+        case 2: return 17
+        case 3: return 15
+        case 6: return 12
+        default: return 13
+        }
+    }
+
+    static func headingFont(_ level: Int, compact: Bool) -> NSFont {
+        NSFont.systemFont(ofSize: headingFontSize(level, compact: compact), weight: level <= 2 ? .bold : .semibold)
+    }
+
     static func selectableProse(from blocks: [AgentMessageMarkdownBlock], compact: Bool, cache: Bool = true) -> AttributedString {
         let proseKey: NSString = {
             var hasher = Hasher()
             hasher.combine(compact)
             hasher.combine(blocks.count)
             for block in blocks {
+                hasher.combine(block.kind)
+                hasher.combine(block.quoteDepth)
                 hasher.combine(block.text.utf8.count)
                 hasher.combine(block.text)
             }
@@ -220,50 +299,92 @@ enum AgentMessageMarkdown {
             return cached.value
         }
         var result = AttributedString()
+        var previous: AgentMessageMarkdownBlock?
+        var previousParagraph = AttributeContainer()
+        var appended = 0
         for (index, block) in blocks.enumerated() {
-            if index > 0 { result.append(AttributedString("\n")) }
-
-            let source: String
-            let size: CGFloat
-            let weight: Font.Weight
-            let color: Color
-            switch block.kind {
-            case .paragraph:
-                source = block.text
-                size = 13
-                weight = .regular
-                color = DS.Palette.text
-            case .heading(let level):
-                source = block.text
-                size = compact ? 13 : (level == 1 ? 18 : level == 2 ? 15 : 13)
-                weight = .semibold
-                color = DS.Palette.text
-            case .bullet(let indent):
-                source = String(repeating: "  ", count: indent) + "• " + block.text
-                size = 13
-                weight = .regular
-                color = DS.Palette.text
-            case .numbered(let number, let indent):
-                source = String(repeating: "  ", count: indent) + "\(number). " + block.text
-                size = 13
-                weight = .regular
-                color = DS.Palette.text
-            case .blockquote:
-                source = "▌ " + block.text
-                size = 13
-                weight = .regular
-                color = DS.Palette.textSecondary
-            case .code, .table:
-                continue
-            }
-
             // Perf CH-04: in a live streaming group only the LAST block can
             // still grow; stable earlier blocks are cached and read like
             // finished content so a token does not re-parse them.
-            var line = attributedInline(source, cache: cache || index < blocks.count - 1)
-            line.font = .system(size: size, weight: weight)
-            line.foregroundColor = color
+            var line = attributedInline(block.text, cache: cache || index < blocks.count - 1)
+            // An image-only paragraph renders in the gallery, not as an empty line.
+            if case .paragraph = block.kind, !line.characters.contains(where: { !$0.isWhitespace }) { continue }
+            if case .blockquote = block.kind, !line.characters.contains(where: { !$0.isWhitespace }) { continue }
+
+            let style = NSMutableParagraphStyle()
+            style.paragraphSpacingBefore = appended == 0 ? 0 : spacingBefore(block, previous: previous, compact: compact)
+
+            var font = NSFont.systemFont(ofSize: bodyFontSize)
+            var color = DS.NS.text
+            var marker: AttributedString?
+            switch block.kind {
+            case .paragraph, .code, .table, .rule:
+                break
+            case .heading(let level):
+                font = headingFont(level, compact: compact)
+                if level == 6 { color = DS.NS.textSecondary }
+                style.paragraphSpacing = compact ? 0 : 2
+            case .blockquote:
+                color = DS.NS.textSecondary
+            case .bullet(let indent):
+                marker = listMarker(["•", "◦", "▪"][indent % 3], color: DS.NS.textTertiary, font: NSFont.systemFont(ofSize: bodyFontSize, weight: .bold))
+                applyListIndent(style, indent: indent, markerWidth: listMarkerWidth)
+            case .numbered(let number, let indent):
+                let label = "\(number)."
+                let markerFont = NSFont.monospacedDigitSystemFont(ofSize: bodyFontSize, weight: .regular)
+                let width = max(listMarkerWidth, ceil((label as NSString).size(withAttributes: [.font: markerFont]).width) + 6)
+                marker = listMarker(label, color: DS.NS.textSecondary, font: markerFont)
+                applyListIndent(style, indent: indent, markerWidth: width)
+            case .task(let checked, let indent):
+                marker = listMarker(
+                    checked ? "☑" : "☐",
+                    color: checked ? DS.NS.accent : DS.NS.textTertiary,
+                    font: NSFont.systemFont(ofSize: bodyFontSize + 1)
+                )
+                applyListIndent(style, indent: indent, markerWidth: listMarkerWidth + 2)
+                if checked { color = DS.NS.textSecondary }
+            case .listContinuation(let indent):
+                let head = CGFloat(indent) * listIndentStep + listMarkerWidth
+                style.firstLineHeadIndent = head
+                style.headIndent = head
+            }
+
+            // Quotes: indent past the bars `AgentMarkdownLayoutManager` draws.
+            if block.quoteDepth > 0 {
+                let offset = CGFloat(block.quoteDepth) * quoteIndentStep
+                style.firstLineHeadIndent += offset
+                style.headIndent += offset
+                style.tabStops = style.tabStops.map { NSTextTab(textAlignment: $0.alignment, location: $0.location + offset) }
+            }
+
+            var base = AttributeContainer()
+            base[AttributeScopes.AppKitAttributes.FontAttribute.self] = font
+            base[AttributeScopes.AppKitAttributes.ForegroundColorAttribute.self] = color
+            line.mergeAttributes(base, mergePolicy: .keepNew)
+            if let marker {
+                var full = marker
+                full.append(line)
+                line = full
+            }
+            var paragraph = AttributeContainer()
+            paragraph[AttributeScopes.AppKitAttributes.ParagraphStyleAttribute.self] = style
+            if block.quoteDepth > 0 {
+                paragraph[AgentMarkdownQuoteDepthAttribute.self] = block.quoteDepth
+            }
+            if appended > 0 {
+                // The newline ends the PREVIOUS paragraph and must carry its
+                // style: TextKit lays text blocks (quote bars) out per whole
+                // paragraph, and a terminator with another paragraph's blocks
+                // drops the bar.
+                var separator = AttributedString("\n")
+                separator.mergeAttributes(previousParagraph)
+                result.append(separator)
+            }
+            line.mergeAttributes(paragraph, mergePolicy: .keepNew)
             result.append(line)
+            previousParagraph = paragraph
+            previous = block
+            appended += 1
         }
         if cache {
             let cost = blocks.reduce(0) { $0 + $1.text.utf8.count }
@@ -272,171 +393,491 @@ enum AgentMessageMarkdown {
         return result
     }
 
+    private static func listMarker(_ glyph: String, color: NSColor, font: NSFont) -> AttributedString {
+        var marker = AttributedString(glyph + "\t")
+        var container = AttributeContainer()
+        container[AttributeScopes.AppKitAttributes.FontAttribute.self] = font
+        container[AttributeScopes.AppKitAttributes.ForegroundColorAttribute.self] = color
+        marker.mergeAttributes(container)
+        return marker
+    }
+
+    /// Hanging indent: the marker sits at the item's indent, wrapped lines
+    /// align with the text after it (not with the marker).
+    private static func applyListIndent(_ style: NSMutableParagraphStyle, indent: Int, markerWidth: CGFloat) {
+        let start = CGFloat(indent) * listIndentStep
+        style.firstLineHeadIndent = start
+        style.headIndent = start + markerWidth
+        style.tabStops = [NSTextTab(textAlignment: .left, location: start + markerWidth)]
+        style.defaultTabInterval = listIndentStep
+    }
+
+    private static func isListItem(_ kind: AgentMessageMarkdownBlock.Kind) -> Bool {
+        switch kind {
+        case .bullet, .numbered, .task, .listContinuation: return true
+        default: return false
+        }
+    }
+
+    private static func spacingBefore(
+        _ block: AgentMessageMarkdownBlock,
+        previous: AgentMessageMarkdownBlock?,
+        compact: Bool
+    ) -> CGFloat {
+        let gap: CGFloat = compact ? 6 : 10
+        if case .heading = block.kind { return compact ? 8 : 14 }
+        if let previous, isListItem(block.kind), isListItem(previous.kind) { return 4 }
+        if let previous, block.quoteDepth > 0, previous.quoteDepth > 0 { return 6 }
+        if let previous, case .heading = previous.kind { return compact ? 4 : 6 }
+        return gap
+    }
+
+    // MARK: Block parser
+
     private static func computeBlocks(from text: String) -> [AgentMessageMarkdownBlock] {
         #if DEBUG
         blocksComputeCountForTesting &+= 1
         blocksParsedUTF8BytesForTesting &+= text.utf8.count
         #endif
+        let blocks = parseBlocks(text.components(separatedBy: "\n"))
+        return blocks.isEmpty ? [AgentMessageMarkdownBlock(kind: .paragraph, text: text)] : blocks
+    }
+
+    /// Columns of leading whitespace (a tab advances to the next multiple of
+    /// 4) and the remaining content.
+    static func measure(_ line: String) -> (indent: Int, content: Substring) {
+        var columns = 0
+        var index = line.startIndex
+        while index < line.endIndex {
+            let character = line[index]
+            if character == " " {
+                columns += 1
+            } else if character == "\t" {
+                columns += 4 - columns % 4
+            } else {
+                break
+            }
+            index = line.index(after: index)
+        }
+        return (columns, line[index...])
+    }
+
+    /// Removes up to `count` columns of leading whitespace.
+    static func dropColumns(_ line: String, _ count: Int) -> String {
+        var columns = 0
+        var index = line.startIndex
+        while index < line.endIndex, columns < count {
+            let character = line[index]
+            if character == " " {
+                columns += 1
+            } else if character == "\t" {
+                let next = columns + 4 - columns % 4
+                if next > count {
+                    // A tab straddling the cut keeps its overshoot as spaces.
+                    return String(repeating: " ", count: next - count) + line[line.index(after: index)...]
+                }
+                columns = next
+            } else {
+                break
+            }
+            index = line.index(after: index)
+        }
+        return String(line[index...])
+    }
+
+    /// ``` or ~~~ (3+); a backtick fence's info string may not contain a backtick.
+    static func fenceOpener<S: StringProtocol>(_ content: S) -> (char: Character, length: Int, info: String)? {
+        guard let first = content.first, first == "`" || first == "~" else { return nil }
+        let run = content.prefix(while: { $0 == first }).count
+        guard run >= 3 else { return nil }
+        let info = content.dropFirst(run)
+        if first == "`", info.contains("`") { return nil }
+        let language = info.trimmingCharacters(in: .whitespaces).split(separator: " ").first.map(String.init) ?? ""
+        return (first, run, language)
+    }
+
+    private static func isFenceClose<S: StringProtocol>(_ content: S, char: Character, length: Int) -> Bool {
+        let run = content.prefix(while: { $0 == char }).count
+        return run >= length && content.dropFirst(run).allSatisfy(\.isWhitespace)
+    }
+
+    static func isThematicBreak<S: StringProtocol>(_ content: S) -> Bool {
+        guard let first = content.first, first == "-" || first == "*" || first == "_" else { return false }
+        var count = 0
+        for character in content {
+            if character == first {
+                count += 1
+            } else if character != " " && character != "\t" {
+                return false
+            }
+        }
+        return count >= 3
+    }
+
+    private static func setextLevel<S: StringProtocol>(_ content: S) -> Int? {
+        let trimmed = content.trimmingCharacters(in: .whitespaces)
+        guard trimmed.count >= 2 else { return nil }
+        if trimmed.allSatisfy({ $0 == "=" }) { return 1 }
+        if trimmed.allSatisfy({ $0 == "-" }) { return 2 }
+        return nil
+    }
+
+    private static func heading<S: StringProtocol>(from content: S) -> (level: Int, text: String)? {
+        let level = content.prefix(while: { $0 == "#" }).count
+        guard (1...6).contains(level) else { return nil }
+        let rest = content.dropFirst(level)
+        guard rest.isEmpty || rest.first == " " || rest.first == "\t" else { return nil }
+        var text = rest.trimmingCharacters(in: .whitespaces)
+        // Optional closing sequence: "## Title ##".
+        if let hashes = text.lastIndex(where: { $0 != "#" }), hashes < text.index(before: text.endIndex),
+           text[hashes] == " " || text[hashes] == "\t" {
+            text = String(text[...hashes]).trimmingCharacters(in: .whitespaces)
+        } else if text.allSatisfy({ $0 == "#" }) {
+            text = ""
+        }
+        return text.isEmpty ? nil : (level, text)
+    }
+
+    enum ListMarker: Equatable { case bullet, numbered(Int) }
+
+    /// Detect bullet (`- ` / `* ` / `+ `) or ordered (`1. ` / `1) `) list items.
+    /// `indent` is the marker column, `content` the column where item text starts.
+    static func listItem(from rawLine: String) -> (indent: Int, content: Int, marker: ListMarker, text: String)? {
+        let (indent, line) = measure(rawLine)
+        guard let first = line.first else { return nil }
+        let marker: ListMarker
+        let markerLength: Int
+        if first == "-" || first == "*" || first == "+" {
+            marker = .bullet
+            markerLength = 1
+        } else {
+            let digits = line.prefix { $0.isASCII && $0.isNumber }
+            guard !digits.isEmpty, digits.count <= 9, let number = Int(digits) else { return nil }
+            let separator = line.dropFirst(digits.count).first
+            guard separator == "." || separator == ")" else { return nil }
+            marker = .numbered(number)
+            markerLength = digits.count + 1
+        }
+        let afterMarker = line.dropFirst(markerLength)
+        guard let gap = afterMarker.first, gap == " " || gap == "\t" else { return nil }
+        let spaces = afterMarker.prefix { $0 == " " || $0 == "\t" }.count
+        let text = afterMarker.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return nil }
+        let content = indent + markerLength + (spaces > 4 ? 1 : spaces)
+        return (indent, content, marker, text)
+    }
+
+    /// Splits a GFM table row into cells: outer pipes are optional, `\|` is a
+    /// literal pipe, and a pipe inside an inline code span does not split.
+    static func tableCells(from line: String) -> [String] {
+        var content = Substring(line.trimmingCharacters(in: .whitespaces))
+        if content.hasPrefix("|") { content = content.dropFirst() }
+        var cells: [String] = []
+        var current = ""
+        var codeRun = 0
+        var index = content.startIndex
+        while index < content.endIndex {
+            let character = content[index]
+            if character == "\\", content.index(after: index) < content.endIndex,
+               content[content.index(after: index)] == "|" {
+                current.append("|")
+                index = content.index(index, offsetBy: 2)
+                continue
+            }
+            if character == "`" {
+                let run = content[index...].prefix { $0 == "`" }.count
+                if codeRun == 0 {
+                    // Open only when a closing run of the same length follows.
+                    let rest = content[content.index(index, offsetBy: run)...]
+                    if hasBacktickRun(rest, length: run) { codeRun = run }
+                } else if run == codeRun {
+                    codeRun = 0
+                }
+                current += String(repeating: "`", count: run)
+                index = content.index(index, offsetBy: run)
+                continue
+            }
+            if character == "|", codeRun == 0 {
+                cells.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+            } else {
+                current.append(character)
+            }
+            index = content.index(after: index)
+        }
+        let last = current.trimmingCharacters(in: .whitespaces)
+        if !last.isEmpty || cells.isEmpty { cells.append(last) }
+        return cells
+    }
+
+    private static func hasBacktickRun(_ text: Substring, length: Int) -> Bool {
+        var index = text.startIndex
+        while index < text.endIndex {
+            guard text[index] == "`" else { index = text.index(after: index); continue }
+            let run = text[index...].prefix { $0 == "`" }.count
+            if run == length { return true }
+            index = text.index(index, offsetBy: run)
+        }
+        return false
+    }
+
+    /// A GFM delimiter row: every cell is `:?-+:?`.
+    static func tableAlignments(fromSeparator line: String) -> [AgentMessageMarkdownBlock.TableAlignment]? {
+        guard line.contains("-") else { return nil }
+        let cells = tableCells(from: line)
+        var alignments: [AgentMessageMarkdownBlock.TableAlignment] = []
+        for cell in cells {
+            let left = cell.hasPrefix(":")
+            let right = cell.hasSuffix(":") && cell.count > 1
+            let dashes = cell.dropFirst(left ? 1 : 0).dropLast(right ? 1 : 0)
+            guard !dashes.isEmpty, dashes.allSatisfy({ $0 == "-" }) else { return nil }
+            alignments.append(left && right ? .center : right ? .right : left ? .left : .none)
+        }
+        return alignments.isEmpty ? nil : alignments
+    }
+
+    /// Header row + delimiter row with the same column count.
+    private static func tableStart(_ lines: [String], at index: Int) -> (headers: [String], alignments: [AgentMessageMarkdownBlock.TableAlignment])? {
+        guard index + 1 < lines.count else { return nil }
+        let (indent, content) = measure(lines[index])
+        guard indent < 4, content.contains("|"), !content.hasPrefix(">") else { return nil }
+        guard let alignments = tableAlignments(fromSeparator: lines[index + 1]),
+              lines[index + 1].contains("|") || alignments.count == 1 else { return nil }
+        let headers = tableCells(from: lines[index])
+        guard headers.count == alignments.count else { return nil }
+        return (headers, alignments)
+    }
+
+    /// Whether `lines[index]` opens a block that interrupts a paragraph or a
+    /// lazily continued list item / quote.
+    private static func startsBlock(_ lines: [String], at index: Int, paragraphOpen: Bool) -> Bool {
+        let (indent, content) = measure(lines[index])
+        if fenceOpener(content) != nil { return true }
+        guard indent < 4 else { return false }
+        if content.hasPrefix(">") || isThematicBreak(content) || heading(from: content) != nil { return true }
+        if let item = listItem(from: lines[index]) {
+            if paragraphOpen, case .numbered(let number) = item.marker, number != 1 { return false }
+            return true
+        }
+        return tableStart(lines, at: index) != nil
+    }
+
+    /// Line-oriented CommonMark/GFM block parser tuned for chat replies.
+    /// Quotes recurse on their de-quoted lines, so lists, code and nested
+    /// quotes inside a quote parse like top-level content.
+    static func parseBlocks(_ lines: [String]) -> [AgentMessageMarkdownBlock] {
         var blocks: [AgentMessageMarkdownBlock] = []
         var paragraph: [String] = []
-        var inFence = false
-        var fenceLanguage = ""
-        var fenceLines: [String] = []
-
-        // Table accumulation: pending header cells + confirmed rows
-        var tableHeaders: [String] = []
-        var tableRows: [[String]] = []
-        var inTable = false
+        // Open list items: marker column and content column.
+        var listStack: [(marker: Int, content: Int)] = []
+        // Block whose text takes lazy continuation lines (a list item).
+        var openItemIndex: Int?
+        var previousBlank = false
+        var i = 0
 
         func flushParagraph() {
             guard !paragraph.isEmpty else { return }
             blocks.append(AgentMessageMarkdownBlock(kind: .paragraph, text: paragraph.joined(separator: "\n")))
             paragraph.removeAll()
         }
-
-        func flushTable() {
-            guard inTable, !tableHeaders.isEmpty else { return }
-            blocks.append(AgentMessageMarkdownBlock(
-                kind: .table(headers: tableHeaders, rows: tableRows),
-                text: ""
-            ))
-            tableHeaders.removeAll()
-            tableRows.removeAll()
-            inTable = false
+        func closeLists() {
+            listStack.removeAll()
+            openItemIndex = nil
         }
 
-        // Parse a pipe-delimited row into trimmed cells (strips outer pipes).
-        func tableCells(from line: String) -> [String] {
-            var s = line.trimmingCharacters(in: .whitespaces)
-            if s.hasPrefix("|") { s = String(s.dropFirst()) }
-            if s.hasSuffix("|") { s = String(s.dropLast()) }
-            return s.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
-        }
-
-        // A GFM separator row contains only pipes, dashes, colons, and spaces.
-        func isSeparatorRow(_ line: String) -> Bool {
-            let s = line.trimmingCharacters(in: .whitespaces)
-            guard s.hasPrefix("|") || s.contains("|") else { return false }
-            let stripped = s.replacingOccurrences(of: "|", with: "")
-                            .replacingOccurrences(of: "-", with: "")
-                            .replacingOccurrences(of: ":", with: "")
-                            .replacingOccurrences(of: " ", with: "")
-            return stripped.isEmpty && s.contains("-")
-        }
-
-        // A pipe row: trimmed starts or ends with "|", or contains "|".
-        func isPipeRow(_ line: String) -> Bool {
-            let s = line.trimmingCharacters(in: .whitespaces)
-            return s.hasPrefix("|") || (s.contains("|") && !s.hasPrefix(">"))
-        }
-
-        let rawLines = text.components(separatedBy: "\n")
-        var i = rawLines.startIndex
-
-        while i < rawLines.endIndex {
-            let rawLine = rawLines[i]
-            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
-            i = rawLines.index(after: i)
-
-            if inFence {
-                if trimmed.hasPrefix("```") {
-                    flushTable()
-                    blocks.append(AgentMessageMarkdownBlock(
-                        kind: .code(language: fenceLanguage),
-                        text: fenceLines.joined(separator: "\n")
-                    ))
-                    inFence = false
-                    fenceLanguage = ""
-                    fenceLines.removeAll()
-                } else {
-                    fenceLines.append(rawLine)
-                }
-                continue
-            }
-
-            if trimmed.hasPrefix("```") {
-                flushTable()
+        while i < lines.count {
+            let line = lines[i]
+            let (indent, content) = measure(line)
+            if content.allSatisfy(\.isWhitespace) {
                 flushParagraph()
-                inFence = true
-                fenceLanguage = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                openItemIndex = nil
+                previousBlank = true
+                i += 1
                 continue
             }
+            let afterBlank = previousBlank
+            previousBlank = false
 
-            if trimmed.isEmpty {
-                flushTable()
+            // Fenced code (any indentation; content loses the fence's indent).
+            if let opener = fenceOpener(content) {
                 flushParagraph()
+                openItemIndex = nil
+                if listStack.first.map({ indent < $0.content }) ?? false { listStack.removeAll() }
+                var body: [String] = []
+                i += 1
+                while i < lines.count {
+                    let (_, closing) = measure(lines[i])
+                    if isFenceClose(closing, char: opener.char, length: opener.length) { i += 1; break }
+                    body.append(dropColumns(lines[i], indent))
+                    i += 1
+                }
+                blocks.append(AgentMessageMarkdownBlock(kind: .code(language: opener.info), text: body.joined(separator: "\n")))
                 continue
             }
 
-            // GFM table detection: pipe row followed by separator on next line.
-            if !inTable && isPipeRow(trimmed) {
-                let nextIndex = i  // i already advanced
-                if nextIndex < rawLines.endIndex {
-                    let nextTrimmed = rawLines[nextIndex].trimmingCharacters(in: .whitespaces)
-                    if isSeparatorRow(nextTrimmed) {
-                        // Confirmed table start -- flush any pending paragraph.
-                        flushParagraph()
-                        tableHeaders = tableCells(from: trimmed)
-                        tableRows.removeAll()
-                        inTable = true
-                        // Consume separator line.
-                        i = rawLines.index(after: i)
-                        continue
-                    }
-                }
-            }
-
-            // If inside table, consume data rows.
-            if inTable {
-                if isPipeRow(trimmed) {
-                    tableRows.append(tableCells(from: trimmed))
+            if indent < 4 || !listStack.isEmpty {
+                // Setext heading underline (only under a plain paragraph).
+                if !paragraph.isEmpty, indent < 4, let level = setextLevel(content) {
+                    blocks.append(AgentMessageMarkdownBlock(kind: .heading(level), text: paragraph.joined(separator: "\n")))
+                    paragraph.removeAll()
+                    i += 1
                     continue
-                } else {
-                    // Non-pipe line ends the table.
-                    flushTable()
-                    // Fall through to re-process this line as normal.
+                }
+                if isThematicBreak(content), indent < 4 {
+                    flushParagraph()
+                    closeLists()
+                    blocks.append(AgentMessageMarkdownBlock(kind: .rule, text: ""))
+                    i += 1
+                    continue
+                }
+                if indent < 4, let heading = heading(from: content) {
+                    flushParagraph()
+                    closeLists()
+                    blocks.append(AgentMessageMarkdownBlock(kind: .heading(heading.level), text: heading.text))
+                    i += 1
+                    continue
+                }
+                if indent < 4, content.hasPrefix(">") {
+                    flushParagraph()
+                    closeLists()
+                    var inner: [String] = []
+                    var lastInnerBlank = false
+                    while i < lines.count {
+                        let (quoteIndent, quoteContent) = measure(lines[i])
+                        if quoteIndent < 4, quoteContent.hasPrefix(">") {
+                            var stripped = quoteContent.dropFirst()
+                            if stripped.first == " " { stripped = stripped.dropFirst() }
+                            inner.append(String(stripped))
+                            lastInnerBlank = stripped.allSatisfy(\.isWhitespace)
+                        } else if !quoteContent.allSatisfy(\.isWhitespace), !lastInnerBlank,
+                                  !startsBlock(lines, at: i, paragraphOpen: true) {
+                            inner.append(String(quoteContent))  // lazy continuation
+                        } else {
+                            break
+                        }
+                        i += 1
+                    }
+                    for var block in parseBlocks(inner) {
+                        block.quoteDepth += 1
+                        if case .paragraph = block.kind {
+                            block = AgentMessageMarkdownBlock(kind: .blockquote, text: block.text, quoteDepth: block.quoteDepth)
+                        }
+                        blocks.append(block)
+                    }
+                    continue
+                }
+                if let table = tableStart(lines, at: i) {
+                    flushParagraph()
+                    closeLists()
+                    var rows: [[String]] = []
+                    i += 2
+                    while i < lines.count {
+                        let (rowIndent, rowContent) = measure(lines[i])
+                        guard rowIndent < 4, rowContent.contains("|"), !rowContent.allSatisfy(\.isWhitespace) else { break }
+                        var cells = tableCells(from: lines[i])
+                        if cells.count < table.headers.count {
+                            cells += Array(repeating: "", count: table.headers.count - cells.count)
+                        } else if cells.count > table.headers.count {
+                            cells = Array(cells.prefix(table.headers.count))
+                        }
+                        rows.append(cells)
+                        i += 1
+                    }
+                    blocks.append(AgentMessageMarkdownBlock(
+                        kind: .table(headers: table.headers, rows: rows, alignments: table.alignments),
+                        text: ""
+                    ))
+                    continue
+                }
+                if let item = listItem(from: line),
+                   indent < 4 || !listStack.isEmpty,
+                   !(paragraph.isEmpty == false && { if case .numbered(let n) = item.marker { return n != 1 }; return false }()) {
+                    flushParagraph()
+                    while let last = listStack.last, item.indent < last.content { listStack.removeLast() }
+                    let depth = listStack.count
+                    listStack.append((item.indent, item.content))
+                    let kind: AgentMessageMarkdownBlock.Kind
+                    var text = item.text
+                    switch item.marker {
+                    case .numbered(let number):
+                        kind = .numbered(number: number, indent: depth)
+                    case .bullet:
+                        if let checked = taskState(text) {
+                            kind = .task(checked: checked, indent: depth)
+                            text = String(text.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                        } else {
+                            kind = .bullet(indent: depth)
+                        }
+                    }
+                    blocks.append(AgentMessageMarkdownBlock(kind: kind, text: text))
+                    openItemIndex = blocks.count - 1
+                    i += 1
+                    continue
                 }
             }
 
-            // Blockquote: lines starting with "> ".
-            if trimmed.hasPrefix("> ") || trimmed == ">" {
-                flushParagraph()
-                let content = trimmed.hasPrefix("> ") ? String(trimmed.dropFirst(2)) : ""
-                blocks.append(AgentMessageMarkdownBlock(kind: .blockquote, text: content))
+            // Continuation of the open list item (indented or lazy).
+            if let open = openItemIndex, !afterBlank, !startsBlock(lines, at: i, paragraphOpen: true) {
+                let item = blocks[open]
+                blocks[open] = AgentMessageMarkdownBlock(
+                    kind: item.kind,
+                    text: item.text + "\n" + content,
+                    quoteDepth: item.quoteDepth
+                )
+                i += 1
                 continue
             }
 
-            if let heading = heading(from: trimmed) {
-                flushParagraph()
-                blocks.append(AgentMessageMarkdownBlock(kind: .heading(heading.level), text: heading.text))
-                continue
-            }
-
-            if let list = listItem(from: rawLine) {
-                flushParagraph()
-                switch list.marker {
-                case .bullet:
-                    blocks.append(AgentMessageMarkdownBlock(kind: .bullet(indent: list.indent), text: list.text))
-                case .numbered(let number):
-                    blocks.append(AgentMessageMarkdownBlock(kind: .numbered(number: number, indent: list.indent), text: list.text))
+            // A later paragraph of a list item: indented to an open item's content.
+            if paragraph.isEmpty, let outer = listStack.first {
+                if indent >= outer.content {
+                    while let last = listStack.last, indent < last.content { listStack.removeLast() }
+                    blocks.append(AgentMessageMarkdownBlock(
+                        kind: .listContinuation(indent: max(0, listStack.count - 1)),
+                        text: String(content)
+                    ))
+                    openItemIndex = blocks.count - 1
+                    i += 1
+                    continue
                 }
+                listStack.removeAll()
+            }
+
+            // Indented code: 4+ columns where a new block may start.
+            if indent >= 4, paragraph.isEmpty {
+                var body: [String] = []
+                while i < lines.count {
+                    let (codeIndent, codeContent) = measure(lines[i])
+                    let blank = codeContent.allSatisfy(\.isWhitespace)
+                    guard blank || codeIndent >= 4 else { break }
+                    body.append(blank ? "" : dropColumns(lines[i], 4))
+                    i += 1
+                }
+                while body.last?.isEmpty == true { body.removeLast() }
+                previousBlank = true
+                blocks.append(AgentMessageMarkdownBlock(kind: .code(language: ""), text: body.joined(separator: "\n")))
                 continue
             }
 
-            paragraph.append(rawLine)
+            paragraph.append(String(content))
+            i += 1
         }
-
-        if inFence {
-            blocks.append(AgentMessageMarkdownBlock(
-                kind: .code(language: fenceLanguage),
-                text: fenceLines.joined(separator: "\n")
-            ))
-        }
-        flushTable()
         flushParagraph()
-
-        return blocks.isEmpty ? [AgentMessageMarkdownBlock(kind: .paragraph, text: text)] : blocks
+        return blocks
     }
+
+    /// `[ ] ` / `[x] ` / `[X] ` at the start of a bullet's text.
+    private static func taskState(_ text: String) -> Bool? {
+        guard text.count >= 4 else { return nil }
+        let prefix = text.prefix(4)
+        switch prefix {
+        case "[ ] ": return false
+        case "[x] ", "[X] ": return true
+        default: return nil
+        }
+    }
+
+    // MARK: Inline
 
     static func attributedInline(_ text: String, cache: Bool = true, fingerprint: Int? = nil) -> AttributedString {
         let key = fingerprint.map { cacheKey(for: text, fingerprint: $0) } ?? cacheKey(for: text)
@@ -453,6 +894,13 @@ enum AgentMessageMarkdown {
         return result
     }
 
+    private static let lineBreakTag = try! NSRegularExpression(pattern: #"^<br\s*/?>$"#, options: [.caseInsensitive])
+
+    /// Foundation's inline parser (GFM emphasis, strikethrough, code, links,
+    /// autolinks) plus chat fixes: images leave the prose (they render in the
+    /// gallery), `<br>` is a line break, other raw HTML stays literal text.
+    /// Fonts for bold/italic/code are resolved later from the run intents, so
+    /// headings, table cells and body text each get the right family and size.
     private static func computeAttributedInline(_ text: String) -> AttributedString {
         #if DEBUG
         inlineComputeCountForTesting &+= 1
@@ -461,15 +909,49 @@ enum AgentMessageMarkdown {
         guard var attributed = try? AttributedString(markdown: text, options: options) else {
             return AttributedString(text)
         }
-        let codeRanges = attributed.runs
-            .filter { $0.inlinePresentationIntent?.contains(.code) == true }
-            .map(\.range)
-        for range in codeRanges {
-            attributed[range].font = DS.Font.monoSmall
-            attributed[range].backgroundColor = DS.Palette.surfaceOverlay
-            attributed[range].foregroundColor = DS.Palette.accent
+        var removals: [Range<AttributedString.Index>] = []
+        var breaks: [Range<AttributedString.Index>] = []
+        for run in attributed.runs {
+            if run.imageURL != nil {
+                removals.append(run.range)
+            } else if run.inlinePresentationIntent?.contains(.inlineHTML) == true {
+                let tag = String(attributed.characters[run.range])
+                let ns = tag as NSString
+                if lineBreakTag.firstMatch(in: tag, range: NSRange(location: 0, length: ns.length)) != nil {
+                    breaks.append(run.range)
+                }
+            }
         }
-        return applyingDetectedLinks(to: attributed)
+        for range in (removals + breaks).sorted(by: { $0.lowerBound > $1.lowerBound }) {
+            if breaks.contains(range) {
+                // U+2028: a line break that stays inside the paragraph (and
+                // inside a table cell, where "\n" would end the cell).
+                attributed.replaceSubrange(range, with: AttributedString("\u{2028}"))
+            } else {
+                attributed.removeSubrange(range)
+            }
+        }
+        return keepingLineBreaksInParagraph(applyingDetectedLinks(to: attributed))
+    }
+
+    /// Soft and hard line breaks become U+2028 so they stay inside one
+    /// paragraph: wrapped and continued lines keep a list item's hanging
+    /// indent, block spacing applies once per block, and a `<br>` in a table
+    /// cell does not end the cell.
+    static func keepingLineBreaksInParagraph(_ source: AttributedString) -> AttributedString {
+        guard source.characters.contains("\n") else { return source }
+        // One pass over the runs (index arithmetic per break would be O(n·k)).
+        var result = AttributedString()
+        for run in source.runs {
+            let slice = source[run.range]
+            let text = String(slice.characters)
+            if text.contains("\n") {
+                result.append(AttributedString(text.replacingOccurrences(of: "\n", with: "\u{2028}"), attributes: run.attributes))
+            } else {
+                result.append(slice)
+            }
+        }
+        return result
     }
 
     // MARK: Clickable mentions (UX-MAC_AGENT-OPEN-SPLIT)
@@ -497,10 +979,11 @@ enum AgentMessageMarkdown {
 
     // Explicit-scheme / www. / localhost URLs only — no bare-domain detection, so
     // file names like "Reducer.swift" or "config.dev" never false-positive as web links.
+    // Parentheses are allowed inside the URL (`wiki/Foo_(bar)`); an unbalanced
+    // closing one is trimmed afterwards by `trimmingTrailingPunctuation`.
     private static let urlRegex = try! NSRegularExpression(
-        pattern: #"(?i)\b(?:https?://|file:///|www\.)[^\s<>"'\)\]\}]+|(?<![\w.])localhost:\d+[^\s<>"'\)\]\}]*"#
+        pattern: #"(?i)\b(?:https?://|file:///|www\.)[^\s<>"'\]\}]+|(?<![\w.])localhost:\d+[^\s<>"'\]\}]*"#
     )
-
     // Two shapes: rooted paths (`/abs`, `~/x`, `./x`, `../x`) and relative paths that
     // contain a slash AND end in a file extension (so "and/or" or "I/O" never match).
     // Both accept a trailing `:line(:col)` suffix.
@@ -556,10 +1039,16 @@ enum AgentMessageMarkdown {
             return trimmed.length > 0 ? trimmed : nil
         }
 
-        var claimed: [NSRange] = []
+        // Raw HTML stays literal text: `</span>` is not a file path.
+        var claimed: [NSRange] = source.runs.compactMap { run in
+            guard run.inlinePresentationIntent?.contains(.inlineHTML) == true else { return nil }
+            return NSRange(run.range, in: source)
+        }
 
         for match in urlRegex.matches(in: ns.string, range: fullRange) {
-            guard let range = mappedTrimmed(match.range), !hasExistingLink(range) else { continue }
+            guard let range = mappedTrimmed(match.range),
+                  !claimed.contains(where: { rangesOverlap($0, range) }),
+                  !hasExistingLink(range) else { continue }
             let token = nsText.substring(with: range)
             guard let url = normalizedWebURL(token) else { continue }
             if url.isFileURL {
@@ -631,14 +1120,19 @@ enum AgentMessageMarkdown {
     }
 
     /// Sentence punctuation glued to a match ("see /a/b.swift.") is not part of the
-    /// token. A trailing ")" is kept only when the token contains its "(".
+    /// token. A trailing ")" is kept only while the token's parentheses balance
+    /// (`wiki/Foo_(bar)` keeps it, `(see https://x/y)` drops it).
     private static func trimmingTrailingPunctuation(_ text: NSString, _ range: NSRange) -> NSRange {
         var length = range.length
         while length > 0 {
             let last = text.substring(with: NSRange(location: range.location + length - 1, length: 1))
             if ".,;:!?\"'".contains(last) {
                 length -= 1
-            } else if last == ")", !(text.substring(with: NSRange(location: range.location, length: length)).contains("(")) {
+            } else if last == ")" {
+                let token = text.substring(with: NSRange(location: range.location, length: length))
+                let opens = token.reduce(0) { $0 + ($1 == "(" ? 1 : 0) }
+                let closes = token.reduce(0) { $0 + ($1 == ")" ? 1 : 0) }
+                guard closes > opens else { break }
                 length -= 1
             } else {
                 break
@@ -655,52 +1149,6 @@ enum AgentMessageMarkdown {
         pb.clearContents()
         pb.setString(text, forType: .string)
     }
-
-    private static func heading(from line: String) -> (level: Int, text: String)? {
-        var level = 0
-        for character in line {
-            if character == "#" {
-                level += 1
-            } else {
-                break
-            }
-        }
-        guard (1...6).contains(level),
-              line.dropFirst(level).first == " " else { return nil }
-        let text = line.dropFirst(level).trimmingCharacters(in: .whitespaces)
-        return text.isEmpty ? nil : (level, text)
-    }
-
-    enum ListMarker: Equatable { case bullet, numbered(Int) }
-
-    /// Detect bullet (`- ` / `* ` / `+ `) or ordered (`1. ` / `1) `) list items, capturing
-    /// the indentation level so nested lists render with hanging indent. Ordered lists were
-    /// previously rendered as run-on paragraphs ("malformatted") — this fixes that.
-    static func listItem(from rawLine: String) -> (indent: Int, marker: ListMarker, text: String)? {
-        let leadingSpaces = rawLine.prefix { $0 == " " }.count
-        let indent = min(leadingSpaces / 2, 4)
-        let line = rawLine.trimmingCharacters(in: .whitespaces)
-        // Bullet
-        if line.hasPrefix("- ") || line.hasPrefix("* ") || line.hasPrefix("+ ") {
-            let text = line.dropFirst(2).trimmingCharacters(in: .whitespaces)
-            return text.isEmpty ? nil : (indent, .bullet, String(text))
-        }
-        // Ordered: digits then '.' or ')' then a space.
-        let digits = line.prefix { $0.isNumber }
-        if !digits.isEmpty, digits.count <= 3 {
-            let afterDigits = line.dropFirst(digits.count)
-            if let sep = afterDigits.first, sep == "." || sep == ")" {
-                let rest = afterDigits.dropFirst()
-                if rest.first == " " {
-                    let text = rest.trimmingCharacters(in: .whitespaces)
-                    if !text.isEmpty, let number = Int(digits) {
-                        return (indent, .numbered(number), String(text))
-                    }
-                }
-            }
-        }
-        return nil
-    }
 }
 
 /// Copy-button chrome for a fenced code block. Hover/copied @State is local so
@@ -708,6 +1156,8 @@ enum AgentMessageMarkdown {
 /// `blocks(from:)` when the pointer enters or leaves Copy.
 struct CodeBlockCopyChrome: View {
     let text: String
+    /// Fence info string ("swift"); empty hides the label.
+    var language: String = ""
     @State private var hovered = false
     @State private var copied = false
     @FocusState private var copyFocused: Bool
@@ -720,12 +1170,21 @@ struct CodeBlockCopyChrome: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            AgentSelectablePlainText(
-                text: text.isEmpty ? " " : text,
-                fontSize: 11,
-                monospaced: true,
-                textColor: DS.NS.text
-            )
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                if !language.isEmpty {
+                    Text(language.lowercased())
+                        .font(DS.Font.caption2.monospaced())
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                        .accessibilityLabel("\(language) code")
+                }
+                AgentSelectablePlainText(
+                    text: text.isEmpty ? " " : text,
+                    fontSize: 11,
+                    monospaced: true,
+                    textColor: DS.NS.text
+                )
+            }
             .padding(DS.Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(DS.Palette.surface)
@@ -803,17 +1262,22 @@ public struct AgentMessageMarkdownView: View, Equatable {
                         // Perf CH-04: only the last group of a live row can still
                         // grow; earlier groups parse (and cache) like finished
                         // content so tokens do not re-parse stable paragraphs.
-                        AgentLinkedAttributedText(
-                            attributed: AgentMessageMarkdown.selectableProse(
-                                from: group,
-                                compact: compact,
-                                cache: cacheResults || index < groups.count - 1
-                            ),
-                            font: .systemFont(ofSize: 13),
-                            textColor: DS.NS.text,
-                            lineFragmentPadding: 0,
-                            lineSpacing: compact ? 3 : 5
+                        let prose = AgentMessageMarkdown.selectableProse(
+                            from: group,
+                            compact: compact,
+                            cache: cacheResults || index < groups.count - 1
                         )
+                        // An image-only paragraph shows in the gallery; an
+                        // empty text view would still reserve a blank line.
+                        if !prose.characters.isEmpty {
+                            AgentLinkedAttributedText(
+                                attributed: prose,
+                                font: .systemFont(ofSize: AgentMessageMarkdown.bodyFontSize),
+                                textColor: DS.NS.text,
+                                lineFragmentPadding: 0,
+                                lineSpacing: compact ? 3 : 5
+                            )
+                        }
                     }
                 }
             }
@@ -825,119 +1289,259 @@ public struct AgentMessageMarkdownView: View, Equatable {
 
     private func isIsolatedBlock(_ block: AgentMessageMarkdownBlock) -> Bool {
         switch block.kind {
-        case .code, .table: return true
+        case .code, .table, .rule: return true
         default: return false
         }
     }
 
-    /// Inline markdown that opens Files/Browser splits on link click and shows
-    /// the pointing-hand cursor over those links (AppKit NSTextView).
-    @ViewBuilder
-    private func linkedInline(
-        _ source: String,
-        size: CGFloat = 13,
-        weight: NSFont.Weight = .regular,
-        color: NSColor = DS.NS.text,
-        lineSpacing: CGFloat = 5
-    ) -> some View {
-        AgentLinkedInlineText(
-            text: source,
-            fontSize: size,
-            fontWeight: weight,
-            textColor: color,
-            lineSpacing: compact ? min(lineSpacing, 3) : lineSpacing,
-            cacheResults: cacheResults
-        )
-    }
-
+    /// Blocks that are not prose: everything else shares one NSTextView per
+    /// group (`selectableProse`).
     @ViewBuilder
     private func blockView(_ block: AgentMessageMarkdownBlock) -> some View {
         switch block.kind {
-        case .paragraph:
-            linkedInline(block.text, lineSpacing: compact ? 3 : 5)
-        case .heading(let level):
-            linkedInline(block.text, size: headingSize(level), weight: .semibold, lineSpacing: 2)
-                .padding(.top, compact ? 0 : DS.Space.xs)
-        case .bullet(let indent):
-            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 4, weight: .semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .padding(.top, 6)
-                linkedInline(block.text, lineSpacing: compact ? 3 : 5)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(.leading, CGFloat(indent) * 16)
-        case .numbered(let number, let indent):
-            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-                Text("\(number).")
-                    .font(DS.Font.monoSmall)
-                    .foregroundColor(DS.Palette.textSecondary)
-                linkedInline(block.text, lineSpacing: compact ? 3 : 5)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(.leading, CGFloat(indent) * 16)
-        case .table(let headers, let rows):
-            VStack(alignment: .leading, spacing: 0) {
-                // Header row
-                HStack(spacing: 0) {
-                    ForEach(headers.indices, id: \.self) { headerIndex in
-                        let header = headers[headerIndex]
-                        linkedInline(header, weight: .semibold, lineSpacing: 2)
-                            .padding(.horizontal, DS.Space.sm)
-                            .padding(.vertical, DS.Space.xs)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .background(DS.Palette.surface)
-                Divider()
-                // Data rows
-                ForEach(rows.indices, id: \.self) { rowIndex in
-                    let row = rows[rowIndex]
-                    HStack(spacing: 0) {
-                        ForEach(row.indices, id: \.self) { colIndex in
-                            let cell = row[colIndex]
-                            linkedInline(cell, lineSpacing: 2)
-                                .padding(.horizontal, DS.Space.sm)
-                                .padding(.vertical, DS.Space.xs)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            if colIndex < row.count - 1 {
-                                Divider()
-                            }
-                        }
-                    }
-                    .background(rowIndex % 2 == 0 ? Color.clear : DS.Palette.surface.opacity(0.5))
-                    if rowIndex < rows.count - 1 {
-                        Divider()
-                    }
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+        case .code(let language):
+            CodeBlockCopyChrome(text: block.text, language: language)
+        case .table(let headers, let rows, let alignments):
+            AgentMarkdownTableView(headers: headers, rows: rows, alignments: alignments)
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .rule:
+            Rectangle()
+                .fill(DS.Palette.line)
+                .frame(height: DS.Border.hairline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, compact ? DS.Space.xxs : DS.Space.xs)
+                .accessibilityHidden(true)
+        default:
+            EmptyView()
+        }
+    }
+}
 
-        case .blockquote:
-            HStack(alignment: .top, spacing: DS.Space.sm) {
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(DS.Palette.accent.opacity(0.5))
-                    .frame(width: 3)
-                linkedInline(block.text, color: DS.NS.textSecondary, lineSpacing: compact ? 3 : 5)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(.leading, DS.Space.xs)
+// MARK: - Tables
 
-        case .code:
-            CodeBlockCopyChrome(text: block.text)
+/// Builds the attributed text of a GFM table: one NSTextTable whose cells are
+/// sized to their content (capped) so the table can be wider than the column
+/// and scroll horizontally instead of crushing its columns.
+enum AgentMarkdownTableLayout {
+    static let maxColumnWidth: CGFloat = 320
+    static let minColumnWidth: CGFloat = 28
+    static let cellPaddingX: CGFloat = 10
+    static let cellPaddingY: CGFloat = 5
+    static let fontSize: CGFloat = 12.5
+
+    final class Built {
+        let text: NSAttributedString
+        let width: CGFloat
+        init(text: NSAttributedString, width: CGFloat) {
+            self.text = text
+            self.width = width
         }
     }
 
-    private func headingSize(_ level: Int) -> CGFloat {
-        if compact { return 13 }
-        switch level {
-        case 1: return 18
-        case 2: return 15
-        default: return 13
+    private static let cache: NSCache<NSString, Built> = {
+        let cache = NSCache<NSString, Built>()
+        cache.countLimit = 64
+        return cache
+    }()
+
+    static func build(
+        headers: [String],
+        rows: [[String]],
+        alignments: [AgentMessageMarkdownBlock.TableAlignment]
+    ) -> Built {
+        var hasher = Hasher()
+        hasher.combine(headers)
+        hasher.combine(rows)
+        hasher.combine(alignments)
+        let key = "table:\(hasher.finalize())" as NSString
+        if let cached = cache.object(forKey: key) { return cached }
+
+        let columns = max(1, headers.count)
+        let headerFont = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+        let bodyFont = NSFont.systemFont(ofSize: fontSize)
+        let grid: [[NSAttributedString]] = ([headers] + rows).enumerated().map { rowIndex, row in
+            (0..<columns).map { column in
+                let source = column < row.count ? row[column] : ""
+                return AgentLinkedInlineTextRepresentable.makeNSAttributedString(
+                    attributed: AgentMessageMarkdown.attributedInline(source),
+                    font: rowIndex == 0 ? headerFont : bodyFont,
+                    textColor: DS.NS.text,
+                    lineSpacing: 2
+                )
+            }
         }
+        var widths = [CGFloat](repeating: minColumnWidth, count: columns)
+        for row in grid {
+            for (column, cell) in row.enumerated() {
+                let natural = ceil(cell.boundingRect(
+                    with: NSSize(width: 10_000, height: 10_000),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading]
+                ).width) + 1
+                widths[column] = min(maxColumnWidth, max(widths[column], natural))
+            }
+        }
+
+        let table = NSTextTable()
+        table.numberOfColumns = columns
+        table.layoutAlgorithm = .fixedLayoutAlgorithm
+        table.collapsesBorders = true
+        table.hidesEmptyCells = false
+        let output = NSMutableAttributedString()
+        for (rowIndex, row) in grid.enumerated() {
+            for (column, cell) in row.enumerated() {
+                let block = NSTextTableBlock(table: table, startingRow: rowIndex, rowSpan: 1, startingColumn: column, columnSpan: 1)
+                block.setValue(widths[column], type: .absoluteValueType, for: .width)
+                block.setWidth(cellPaddingX, type: .absoluteValueType, for: .padding, edge: .minX)
+                block.setWidth(cellPaddingX, type: .absoluteValueType, for: .padding, edge: .maxX)
+                block.setWidth(cellPaddingY, type: .absoluteValueType, for: .padding, edge: .minY)
+                block.setWidth(cellPaddingY, type: .absoluteValueType, for: .padding, edge: .maxY)
+                block.setWidth(DS.Border.hairline, type: .absoluteValueType, for: .border)
+                block.setBorderColor(DS.NS.line)
+                if rowIndex == 0 {
+                    block.backgroundColor = DS.NS.surface
+                } else if rowIndex % 2 == 0 {
+                    block.backgroundColor = DS.NS.surface.withAlphaComponent(0.45)
+                }
+                let style = NSMutableParagraphStyle()
+                style.textBlocks = [block]
+                style.lineSpacing = 2
+                switch column < alignments.count ? alignments[column] : .none {
+                case .center: style.alignment = .center
+                case .right: style.alignment = .right
+                case .left, .none: style.alignment = .left
+                }
+                let paragraph = NSMutableAttributedString(attributedString: cell)
+                paragraph.append(NSAttributedString(string: "\n", attributes: [.font: rowIndex == 0 ? headerFont : bodyFont]))
+                paragraph.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: paragraph.length))
+                output.append(paragraph)
+            }
+        }
+        let width = widths.reduce(0) { $0 + $1 + cellPaddingX * 2 } + CGFloat(columns + 1) * DS.Border.hairline
+        let built = Built(text: output, width: ceil(width))
+        cache.setObject(built, forKey: key)
+        return built
+    }
+}
+
+/// Horizontal-only scroll view that hands vertical wheel gestures to the
+/// transcript, so a wide table never traps the page scroll.
+final class AgentHorizontalScrollView: NSScrollView {
+    private var gestureIsHorizontal = false
+
+    override func scrollWheel(with event: NSEvent) {
+        if event.phase == .began || (event.phase.isEmpty && event.momentumPhase.isEmpty) {
+            gestureIsHorizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
+        }
+        let fits = (documentView?.frame.width ?? 0) <= contentView.bounds.width + 0.5
+        if gestureIsHorizontal, !fits {
+            super.scrollWheel(with: event)
+        } else {
+            nextResponder?.scrollWheel(with: event)
+        }
+    }
+}
+
+/// GFM table: one selectable TextKit 1 NSTextView (NSTextTable) inside an
+/// AppKit horizontal scroller. AppKit on purpose: a SwiftUI ScrollView nested
+/// in the transcript ScrollView reads the parent's scroll environment and
+/// crashes on macOS 26 (see `AgentTranscriptImageThumbStrip`).
+struct AgentMarkdownTableView: NSViewRepresentable {
+    let headers: [String]
+    let rows: [[String]]
+    let alignments: [AgentMessageMarkdownBlock.TableAlignment]
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var openURL: OpenURLAction?
+        weak var textView: NSTextView?
+        var built: AgentMarkdownTableLayout.Built?
+        var textHeight: CGFloat = 0
+
+        func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+            let url = (link as? URL) ?? (link as? String).flatMap(URL.init(string:))
+            guard let url, let openURL else { return false }
+            openURL(url)
+            return true
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> AgentHorizontalScrollView {
+        let scroll = AgentHorizontalScrollView()
+        scroll.drawsBackground = false
+        scroll.hasHorizontalScroller = true
+        scroll.hasVerticalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.verticalScrollElasticity = .none
+        scroll.horizontalScrollElasticity = .automatic
+        scroll.borderType = .noBorder
+
+        let textView = NSTextView(usingTextLayoutManager: false)
+        textView.textContainer?.replaceLayoutManager(AgentMarkdownLayoutManager())
+        textView.delegate = context.coordinator
+        textView.drawsBackground = false
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = true
+        textView.allowsUndo = false
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = false
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.heightTracksTextView = false
+        textView.linkTextAttributes = [
+            .foregroundColor: DS.NS.accent,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .cursor: NSCursor.pointingHand,
+        ]
+        scroll.documentView = textView
+        context.coordinator.textView = textView
+        context.coordinator.openURL = context.environment.openURL
+        apply(context: context)
+        return scroll
+    }
+
+    func updateNSView(_ scroll: AgentHorizontalScrollView, context: Context) {
+        context.coordinator.openURL = context.environment.openURL
+        apply(context: context)
+    }
+
+    /// `CGSize?` on purpose: a non-optional return does not witness the
+    /// protocol requirement, and SwiftUI would size the scroll view to zero.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: AgentHorizontalScrollView, context: Context) -> CGSize? {
+        apply(context: context)
+        let tableWidth = context.coordinator.built?.width ?? 0
+        var available = tableWidth
+        if let width = proposal.width, width.isFinite, width > 0 { available = width }
+        var height = context.coordinator.textHeight
+        if tableWidth > available + 0.5, nsView.scrollerStyle == .legacy {
+            height += NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        }
+        return CGSize(width: min(available, tableWidth), height: height)
+    }
+
+    private func apply(context: Context) {
+        let built = AgentMarkdownTableLayout.build(headers: headers, rows: rows, alignments: alignments)
+        let coordinator = context.coordinator
+        guard coordinator.built !== built, let textView = coordinator.textView,
+              let layoutManager = textView.layoutManager, let container = textView.textContainer else { return }
+        coordinator.built = built
+        container.containerSize = NSSize(width: built.width + 2, height: CGFloat.greatestFiniteMagnitude)
+        textView.textStorage?.setAttributedString(built.text)
+        layoutManager.ensureLayout(for: container)
+        // The last cell's terminator leaves an empty extra line fragment
+        // under the table; it is not part of the table.
+        var used = layoutManager.usedRect(for: container).height
+        if layoutManager.extraLineFragmentTextContainer != nil {
+            used -= layoutManager.extraLineFragmentUsedRect.height
+        }
+        let height = ceil(max(0, used))
+        coordinator.textHeight = height
+        textView.frame = NSRect(x: 0, y: 0, width: built.width + 2, height: height)
     }
 }
 

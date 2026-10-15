@@ -17359,6 +17359,7 @@ public struct AgentAppView: View {
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
                         onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
                         stripsChoices: vm.showsBotChoices,
+                        attachments: msg.attachments,
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
                                 AgentChatPeerIdentityHeader(
@@ -17385,6 +17386,7 @@ public struct AgentAppView: View {
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
                         onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
                         stripsChoices: vm.showsBotChoices,
+                        attachments: msg.attachments,
                         onClear: vm.embedding?.noticeClearHandler == nil ? nil : { vm.clearHostMessage(msg.id) }
                     )
                 }
@@ -17570,6 +17572,7 @@ public struct AgentAppView: View {
             branchIdentifier: "agent.assistantMessage.branch.\(turn.turnId)",
             onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(turn.turnId) } : nil,
             stripsChoices: vm.showsBotChoices,
+            showsImages: turn.finished,
             content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
         )
     }

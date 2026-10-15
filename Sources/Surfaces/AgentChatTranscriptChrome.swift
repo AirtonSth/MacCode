@@ -376,6 +376,11 @@ public struct AgentChatAssistantReply: View, Equatable {
     public var branchIdentifier: String? = nil
     public var onBranch: (() -> Void)? = nil
     public var content: AnyView? = nil
+    /// Message attachments; image ones (bot screenshots) join the gallery.
+    public var attachments: [AgentAttachment] = []
+    /// False while the reply is still streaming, so partial paths/URLs never
+    /// start image loads.
+    public var showsImages: Bool = true
     /// Titio's inbox: a trailing "Clear notification" button.
     public var onClear: (() -> Void)? = nil
 
@@ -386,6 +391,8 @@ public struct AgentChatAssistantReply: View, Equatable {
         branchIdentifier: String? = nil,
         onBranch: (() -> Void)? = nil,
         stripsChoices: Bool = true,
+        attachments: [AgentAttachment] = [],
+        showsImages: Bool = true,
         content: AnyView? = nil,
         onClear: (() -> Void)? = nil
     ) {
@@ -396,6 +403,8 @@ public struct AgentChatAssistantReply: View, Equatable {
         self.copyIdentifier = copyIdentifier
         self.branchIdentifier = branchIdentifier
         self.onBranch = onBranch
+        self.attachments = attachments
+        self.showsImages = showsImages
         self.content = content
         self.onClear = onClear
     }
@@ -410,6 +419,12 @@ public struct AgentChatAssistantReply: View, Equatable {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .accessibilityIdentifier(roleIdentifier)
                     .accessibilityLabel(text)
+            }
+            if showsImages {
+                let images = AgentChatImageGallery.refs(text: text, attachments: attachments)
+                if !images.isEmpty {
+                    AgentChatImageGallery(refs: images)
+                }
             }
             HStack(spacing: DS.Space.xs) {
                 AgentChatCopyButton(text: text) { copied in
@@ -462,6 +477,8 @@ public struct AgentChatAssistantReply: View, Equatable {
             && lhs.branchIdentifier == rhs.branchIdentifier
             && (lhs.onBranch != nil) == (rhs.onBranch != nil)
             && (lhs.content != nil) == (rhs.content != nil)
+            && lhs.attachments == rhs.attachments
+            && lhs.showsImages == rhs.showsImages
             && (lhs.onClear != nil) == (rhs.onClear != nil)
     }
 }
