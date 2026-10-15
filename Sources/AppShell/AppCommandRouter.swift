@@ -7632,6 +7632,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let agent = surface as? AgentAppSurface else { continue }
             await agent.viewModel.loadProviderSnapshots(forceCatalogRefresh: true)
         }
+        // The open Bot desk lists the same Distill models: Auto appears there
+        // as soon as the profile is saved, not after the next desk rebuild.
+        await botsViewModel?.deskAgentVM?.loadProviderSnapshots(forceCatalogRefresh: true)
         if let controller = context?.distillAccountsController {
             _ = await controller.discoverModels {
                 await self.listAgentModels(provider: .distill, runAsUser: nil, forceCatalogRefresh: true)

@@ -226,6 +226,38 @@ final class TitioInboxThreadTests: XCTestCase {
         XCTAssertEqual(BotsViewModel.forkTitle("  "), "Fork")
     }
 
+    func test_botChatsOfferReplyWithAQuotedComposerButTitiosInboxDoesNot() throws {
+        // WHY: the owner asked (2026-10-15) to reply to a Bot message: the
+        // composer shows the quote and "Reply…". Titio's inbox answers notices
+        // through its own reply arm, which a quote line would break.
+        let (_, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        try openInbox(vm, router: router, target: target)
+        let inboxDesk = try XCTUnwrap(vm.deskAgentVM)
+        XCTAssertFalse(inboxDesk.supportsReplies, "no reply in the inbox")
+        inboxDesk.beginReply(to: "Heads up: deploy done.")
+        XCTAssertNil(inboxDesk.activeReplyTarget)
+
+        let context = try XCTUnwrap(router.context)
+        let bot = try XCTUnwrap(try context.botStore.get(id: target.botID))
+        var chat = BotConversation(botID: bot.id, title: "Chat")
+        try context.botStore.upsertConversation(chat)
+        chat = try vm.ensureLinkedThread(
+            bot: bot, conversation: chat, routing: vm.frozenDeskRouting(for: chat), router: router, markStarted: false
+        ).conversation
+        vm.reload()
+        vm.openDesk(bot)
+        vm.selectDeskThread(chat.id)
+        let desk = try XCTUnwrap(vm.deskAgentVM)
+        XCTAssertTrue(desk.supportsReplies)
+        desk.beginReply(to: "**Abri 2 tarefas** novas de consultas lentas")
+        XCTAssertEqual(desk.activeReplyTarget?.excerpt, "Abri 2 tarefas novas de consultas lentas")
+        XCTAssertEqual(desk.composerPlaceholder, "Reply…")
+        desk.cancelReply()
+        XCTAssertNil(desk.activeReplyTarget)
+        XCTAssertNotEqual(desk.composerPlaceholder, "Reply…", "cancel restores the Bot's placeholder")
+    }
+
     func test_pairedForkRejectsAConversationOfAnotherBot() async throws {
         // WHY: bot.conversation.fork must never fork a conversation the
         // request's Bot does not own.
