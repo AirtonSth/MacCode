@@ -352,6 +352,26 @@ final class TitioNoticeRepositoryTests: XCTestCase {
         XCTAssertEqual(try repo.openKeys(prefix: "bot.attention."), ["bot.attention.A1"])
         XCTAssertEqual(try repo.openKeys(prefix: "thread."), [], "resolved rows are not open")
     }
+
+    func test_openCardsListOnlyTappableCardsInPostOrder() throws {
+        // WHY: the old-iOS text intercept may only match a card the user can
+        // still tap; a claimed, resolved or card-less row must never match.
+        let (_, repo) = try make()
+        let card = [TitioNoticeCardOption(label: "Approve", action: .approve)]
+        try repo.ingest(fact("thread.T.attention.Q1", .approval, actions: [.approve]))
+        try repo.ingest(fact("thread.T.attention.Q2", .approval, actions: [.approve]))
+        try repo.ingest(fact("thread.T.attention.Q3", .approval, actions: [.approve]))
+        try repo.ingest(fact("run.R.completed"))
+        try post(repo, ["thread.T.attention.Q1"], at: 1, card: card)
+        try post(repo, ["thread.T.attention.Q2"], at: 2, card: card)
+        try post(repo, ["thread.T.attention.Q3"], at: 3, card: card)
+        try post(repo, ["run.R.completed"], at: 4)
+        XCTAssertTrue(try repo.claim(key: "thread.T.attention.Q2"))
+        XCTAssertTrue(try repo.claim(key: "thread.T.attention.Q3"))
+        XCTAssertTrue(try repo.setAwaitingReply(key: "thread.T.attention.Q3", at: t0))
+        XCTAssertEqual(try repo.openCards().map(\.key), ["thread.T.attention.Q1", "thread.T.attention.Q3"],
+                       "acting rows and rows without a card are excluded; an armed card stays tappable")
+    }
 }
 
 private final class ManagedAtomicCounter: @unchecked Sendable {

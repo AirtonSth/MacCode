@@ -2168,6 +2168,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             guard let ks = k as? String, let vs = v as? String else { return nil }
             return (ks, vs)
         }, uniquingKeysWith: { a, _ in a })
+        openNotificationUserInfo(stringInfo)
+    }
+
+    /// Opens a notification-shaped route: a banner click, or a Titio notice
+    /// card's navigation option (the same `[String: String]` map, hub spec §7).
+    func openNotificationUserInfo(_ stringInfo: [String: String]) {
         notificationRouteGeneration = UUID()
         let generation = notificationRouteGeneration
         guard let intent = Self.routeFromNotification(userInfo: stringInfo) else { return }

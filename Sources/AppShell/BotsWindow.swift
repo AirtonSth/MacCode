@@ -6297,6 +6297,10 @@ public final class BotsViewModel: ObservableObject {
                   existing.botID == bot.id, existing.groupID == nil else {
                 throw BotStoreError.notFound
             }
+            if existing.id == titioInboxConversationID, attachments.isEmpty,
+               let consumed = interceptTitioInboxSend(bot: bot, conversation: existing, text: message) {
+                return consumed
+            }
             if let threadID = existing.linkedAgentThreadID,
                let activeRunID = context.coordinator.activeRunId(threadId: threadID) {
                 let routing = hostSendRouting(explicitRouting, adopt: adoptAsDeskRoute, conversation: existing)
@@ -6365,7 +6369,11 @@ public final class BotsViewModel: ObservableObject {
         adopt: Bool,
         conversation: BotConversation
     ) -> BotDeskRouting {
-        guard let explicitRouting else { return frozenDeskRouting(for: conversation) }
+        // Titio's inbox route is locked (hub spec §16): another provider
+        // would replace the thread that holds every notice.
+        guard let explicitRouting, conversation.id != titioInboxConversationID else {
+            return frozenDeskRouting(for: conversation)
+        }
         guard adopt else { return explicitRouting }
         return adoptHostSendRouting(explicitRouting, conversation: conversation)
     }
@@ -10131,6 +10139,8 @@ public final class BotsViewModel: ObservableObject {
               conversation.botID == botID, conversation.groupID == nil else {
             throw BotStoreError.notFound
         }
+        // The inbox route is locked (hub spec §16): answer the route it keeps.
+        guard conversation.id != titioInboxConversationID else { return frozenDeskRouting(for: conversation) }
         return adoptHostSendRouting(routing, conversation: conversation)
     }
 
@@ -10155,6 +10165,9 @@ public final class BotsViewModel: ObservableObject {
         let threadID: AgentThreadID
         /// The embedding captures the name for its composer and empty copy.
         let botName: String
+        /// Titio's inbox gets the notice hooks; a VM built before the hub
+        /// resolved the inbox is rebuilt once it is known.
+        var isTitioInbox = false
     }
 
     private var deskAgentKey: DeskAgentKey?
@@ -10208,7 +10221,10 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         let live = conversation
-        let key = DeskAgentKey(botID: bot.id, conversationID: live.id, threadID: threadID, botName: bot.name)
+        let isTitioInbox = live.id == titioInboxConversationID
+        let key = DeskAgentKey(
+            botID: bot.id, conversationID: live.id, threadID: threadID, botName: bot.name, isTitioInbox: isTitioInbox
+        )
         if deskAgentKey == key, deskAgentVM != nil {
             applyDeskReplyStyle()
             return
@@ -10249,7 +10265,9 @@ public final class BotsViewModel: ObservableObject {
             composerPlaceholder: Self.deskComposerPlaceholder(botName: bot.name),
             emptyConversationTitle: "Message \(Self.displayName(bot.name))",
             emptyConversationSubtitle: "This thread has no messages yet.",
-            pinnedThread: thread
+            pinnedThread: thread,
+            noticeChoiceHandler: isTitioInbox ? titioNoticeChoiceHandler() : nil,
+            hostReplyHandler: isTitioInbox ? titioHostReplyHandler() : nil
         )
         let vm = AgentAppViewModel(
             workspaceID: Self.botDeskWorkspaceID,
@@ -10580,12 +10598,15 @@ public final class BotsViewModel: ObservableObject {
             liveRunMode: routing.permissionMode,
             runProvider: routing.provider,
             runModel: model,
-            turnDirective: BotPeerDelegation.turnDirective(
-                mentionedBots: BotMentionParser.mentionedBots(
-                    in: text,
-                    bots: bots,
-                    excluding: bot.id
-                )
+            turnDirective: Self.combinedTurnDirective(
+                BotPeerDelegation.turnDirective(
+                    mentionedBots: BotMentionParser.mentionedBots(
+                        in: text,
+                        bots: bots,
+                        excluding: bot.id
+                    )
+                ),
+                titioNoticeTurnDirective(conversationID: conversationID, threadID: threadID, userText: text)
             ),
             runsInGuest: inGuest
         )
@@ -10606,6 +10627,29 @@ public final class BotsViewModel: ObservableObject {
             executionTarget: thread?.executionTarget,
             runsInGuest: inGuest
         )
+    }
+
+    /// Titio's inbox only (hub spec §7): the notices the host posted since the
+    /// user's last message, which the provider session never saw, plus the
+    /// rule that Titio cannot approve or answer them itself. Nil elsewhere.
+    func titioNoticeTurnDirective(conversationID: BotConversationID, threadID: AgentThreadID, userText: String) -> String? {
+        guard conversationID == titioInboxConversationID else { return nil }
+        let request = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var users = ((try? context.messageRepo.listRecent(threadId: threadID, limit: 60)) ?? []).filter { $0.role == .user }
+        // The desk may already have stored this turn's own line.
+        if users.last?.content.trimmingCharacters(in: .whitespacesAndNewlines) == request { users.removeLast() }
+        let since = users.last?.createdAt ?? .distantPast
+        let rows = (try? TitioNoticeRepository(db: context.db).recentPosted(since: since)) ?? []
+        return TitioNoticeDirective.text(
+            rows: rows,
+            language: TitioNoticeCopy.language(lastUserText: request, preferredLanguages: Locale.preferredLanguages)
+        )
+    }
+
+    /// The peer directive and the inbox directive, in that order.
+    nonisolated static func combinedTurnDirective(_ parts: String?...) -> String? {
+        let kept = parts.compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        return kept.isEmpty ? nil : kept.joined(separator: "\n\n")
     }
 
     /// The run's agent runs inside the bot's Linux guest: the thread is on the
@@ -10676,6 +10720,70 @@ public final class BotsViewModel: ObservableObject {
         return linked
     }
 
+    /// A Mac tap on an inbox notice card (hub spec §7): the hub claims and
+    /// runs it off the MainActor; a navigation option opens its route here
+    /// with the same mapper a banner click uses.
+    func actOnTitioNotice(messageID: String, optionIndex: Int) {
+        let center = context.titioNoticeCenter
+        Task { @MainActor [weak self] in
+            let outcome = await center.act(messageID: messageID, optionIndex: optionIndex)
+            guard case .navigate(let route) = outcome else { return }
+            if let openRoute = self?.openTitioNoticeRoute {
+                openRoute(route)
+            } else {
+                (NSApp?.delegate as? AppDelegate)?.openNotificationUserInfo(route)
+            }
+        }
+    }
+
+    /// The inbox desk's card hook (hub spec §7 "Mac hooks").
+    private func titioNoticeChoiceHandler() -> @MainActor (String, Int) -> Void {
+        { [weak self] messageID, optionIndex in
+            self?.actOnTitioNotice(messageID: messageID, optionIndex: optionIndex)
+        }
+    }
+
+    /// The inbox desk's send hook: an armed "Reply here" takes the text.
+    private func titioHostReplyHandler() -> @MainActor (String, AgentThreadID) -> Bool {
+        { [weak self] text, _ in
+            self?.context.titioNoticeCenter.takeArmedReply(text: text) ?? false
+        }
+    }
+
+    /// Test seam for the navigation route of a notice card.
+    var openTitioNoticeRoute: (([String: String]) -> Void)?
+
+    /// iOS `bot.send` into Titio's inbox (hub spec §7): an armed "Reply here"
+    /// takes the text, else an old build's exact option text acts on its one
+    /// open notice. Nil means the text is a normal Titio message.
+    private func interceptTitioInboxSend(
+        bot: BotDefinition,
+        conversation: BotConversation,
+        text: String
+    ) -> JSONValue? {
+        let center = context.titioNoticeCenter
+        let consumed: String
+        if center.takeArmedReply(text: text) {
+            consumed = "reply"
+        } else if center.takeOptionText(text) {
+            consumed = "option"
+        } else {
+            return nil
+        }
+        var receipt: [String: JSONValue] = [
+            "bot_id": .string(bot.id.value.uuidString.lowercased()),
+            "conversation_id": .string(conversation.id.value.uuidString.lowercased()),
+            "enqueued": .bool(false),
+            "queued_follow_up": .bool(false),
+            "host_consumed": .bool(true),
+            "titio_notice": .string(consumed),
+        ]
+        if let thread = conversation.linkedAgentThreadID {
+            receipt["thread_id"] = .string(thread.value.uuidString.lowercased())
+        }
+        return .object(receipt)
+    }
+
     /// True while the Mac desk shows `conversationID` (the caller also checks
     /// that the Bots window is key).
     func isDeskShowing(conversationID: BotConversationID) -> Bool {
@@ -10693,8 +10801,10 @@ public final class BotsViewModel: ObservableObject {
         message: AgentMessage,
         conversation: BotConversation?
     ) {
+        // The act's user rows (an option label, an armed reply) paint as the
+        // user's; every other host row is Titio's.
         let desk = BotDeskMessage(
-            role: .assistant,
+            role: message.role == .user ? .user : .assistant,
             text: message.content,
             createdAt: message.createdAt,
             agentMessageID: message.id
@@ -10721,8 +10831,10 @@ public final class BotsViewModel: ObservableObject {
         if selectedBotID == botID, selectedConversation?.id == conversationID {
             upsert(&deskMessages)
         }
-        lastPreviewByBot[botID] = message.content
-        lastUpdatedByBot[botID] = message.createdAt
+        if message.role != .user {
+            lastPreviewByBot[botID] = message.content
+            lastUpdatedByBot[botID] = message.createdAt
+        }
         if let conversation {
             adoptFollowThroughConversation(conversation)
             applyAttentionState(
@@ -10731,6 +10843,12 @@ public final class BotsViewModel: ObservableObject {
             )
         }
         Self.publishDestAttentionChanged()
+    }
+
+    /// A Titio card act acknowledged this Bot attention item off the
+    /// MainActor; drop it locally (the caller publishes the change).
+    func noteAttentionAcknowledged(_ id: BotAttentionItemID) {
+        dropAcknowledgedAttention(id)
     }
 
     /// Peer rows persisted for the linked thread repaint in the embedded desk.
@@ -11079,11 +11197,18 @@ public final class BotsViewModel: ObservableObject {
                 liveRunMode: routing.permissionMode,
                 runProvider: routing.provider,
                 runModel: model,
-                turnDirective: BotPeerDelegation.turnDirective(
-                    mentionedBots: BotMentionParser.mentionedBots(
-                        in: userText,
-                        bots: bots,
-                        excluding: bot.id
+                turnDirective: Self.combinedTurnDirective(
+                    BotPeerDelegation.turnDirective(
+                        mentionedBots: BotMentionParser.mentionedBots(
+                            in: userText,
+                            bots: bots,
+                            excluding: bot.id
+                        )
+                    ),
+                    titioNoticeTurnDirective(
+                        conversationID: prepared.conversation.id,
+                        threadID: prepared.thread.id,
+                        userText: userText
                     )
                 ),
                 runsInGuest: inGuest

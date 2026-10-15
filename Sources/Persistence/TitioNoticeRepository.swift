@@ -183,6 +183,17 @@ public final class TitioNoticeRepository: @unchecked Sendable {
         }
     }
 
+    /// Posted rows whose card the user can still tap (`posted` or
+    /// `awaiting_reply` with `actions_json`), oldest first. The hub mirrors
+    /// them in memory for the old-iOS exact-option-text intercept (§7).
+    public func openCards(limit: Int = 200) throws -> [TitioNoticeRecord] {
+        try query("""
+            SELECT \(Self.columns) FROM titio_notices
+            WHERE state IN ('posted', 'awaiting_reply') AND actions_json IS NOT NULL AND message_id IS NOT NULL
+            ORDER BY posted_at, key LIMIT ?;
+            """) { try $0.bind(1, limit) }
+    }
+
     // MARK: Flush
 
     /// One transaction: re-reads which of `keys` are still `pending` (resolved or
@@ -265,6 +276,24 @@ public final class TitioNoticeRepository: @unchecked Sendable {
         try db.performSync { database in
             try database.transaction {
                 guard try Self.transitionLocked(database, key: key, from: [.acting, .awaitingReply], to: .posted) else { return false }
+                var inbox = try Self.fetchInbox(database)
+                if inbox.armedReplyKey == key {
+                    inbox.armedReplyKey = nil
+                    inbox.armedAt = nil
+                    try Self.storeInbox(database, inbox)
+                }
+                return true
+            }
+        }
+    }
+
+    /// `awaiting_reply → posted` only: an arm that expired or was replaced by
+    /// another tap gives the card back. Never touches a row an act claimed.
+    @discardableResult
+    public func disarm(key: String) throws -> Bool {
+        try db.performSync { database in
+            try database.transaction {
+                guard try Self.transitionLocked(database, key: key, from: [.awaitingReply], to: .posted) else { return false }
                 var inbox = try Self.fetchInbox(database)
                 if inbox.armedReplyKey == key {
                     inbox.armedReplyKey = nil

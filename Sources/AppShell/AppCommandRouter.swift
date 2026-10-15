@@ -3787,6 +3787,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         "bot.guest.state",
         "bot.receipt.status",
     ]
+    /// Titio notice writes: the hub claims in SQLite on the caller's thread,
+    /// so they run like the off-main reads, never on the MainActor.
+    nonisolated static let pairedBotOffMainMutationMethods: Set<String> = [
+        "bot.notice.act",
+        "bot.notice.read",
+    ]
     nonisolated static let pairedBotMainActorReadMethods: Set<String> = [
         "bot.attention.list",
         "bot.conversation.list",
@@ -3832,7 +3838,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // An observing `bot.guest.state` goes through the observe coordinator,
         // never the plain off-main read.
         let observesGuest = method == "bot.guest.state" && foundation["observe"] as? Bool == true
-        if !observesGuest, Self.pairedBotOffMainReadMethods.contains(method) {
+        if !observesGuest,
+           Self.pairedBotOffMainReadMethods.contains(method) || Self.pairedBotOffMainMutationMethods.contains(method) {
             return try await dispatchPairedBotRead(authority: authority, method: method, params: foundation)
         }
         do {
@@ -4099,6 +4106,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 adoptAsDeskRoute: routingValues.map(Self.pairedRouteKeepsItsProvider) ?? false
             )
             return Self.foundationObject(result.objectValue ?? [:])
+        }
+        // Titio notice cards (hub spec §7, §8). `bot.notice.*` dispatch off the
+        // MainActor (see `pairedBotOffMainMutationMethods`), so these only
+        // touch the hub's thread-safe ledger and in-memory mirrors.
+        let noticeCenter = ctx.titioNoticeCenter
+        created.onNoticeAct = { _, messageID, optionIndex in
+            let outcome = noticeCenter.actNow(messageID: messageID, optionIndex: optionIndex)
+            var answer: [String: Any] = ["outcome": outcome.wireName]
+            if let route = outcome.route { answer["route"] = route }
+            return answer
+        }
+        created.onNoticeRead = { _, conversationID in
+            if let inbox = noticeCenter.inboxSnapshot, inbox.conversationID != conversationID {
+                throw BotRemoteControlAuthority.Error.invalidParams
+            }
+            noticeCenter.markInboxRead()
+            return ["unread_count": 0]
+        }
+        created.onTitioInbox = {
+            noticeCenter.inboxSnapshot?.foundationObject
         }
         created.onRoutineSend = { [weak self] routine in
             guard let vm = self?.botsViewModel else {

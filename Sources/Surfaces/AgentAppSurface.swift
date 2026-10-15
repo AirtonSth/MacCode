@@ -422,6 +422,14 @@ public struct AgentAppEmbedding {
     /// False for a host that mounts the conversation without a composer: it must never
     /// write the thread's draft, or closing it would replace what the real chat holds.
     public let ownsComposerDraft: Bool
+    /// Titio's inbox only: a tap on a card whose choices carry a `notice` key
+    /// goes to the host's notice ledger by (message id, option index) instead
+    /// of being sent as text (hub spec §7). Nil: every card sends its text.
+    public let noticeChoiceHandler: (@MainActor (_ messageID: String, _ optionIndex: Int) -> Void)?
+    /// Titio's inbox only: checked in `send()` right after `sendInterceptor`.
+    /// True means the host took the text (an armed "Reply here"): the prompt
+    /// clears and no run starts.
+    public let hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) -> Bool)?
 
     public init(
         pinnedThreadId: AgentThreadID,
@@ -434,9 +442,13 @@ public struct AgentAppEmbedding {
         emptyConversationTitle: String? = nil,
         emptyConversationSubtitle: String? = nil,
         pinnedThread: AgentThread? = nil,
-        ownsComposerDraft: Bool = true
+        ownsComposerDraft: Bool = true,
+        noticeChoiceHandler: (@MainActor (_ messageID: String, _ optionIndex: Int) -> Void)? = nil,
+        hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) -> Bool)? = nil
     ) {
         self.ownsComposerDraft = ownsComposerDraft
+        self.noticeChoiceHandler = noticeChoiceHandler
+        self.hostReplyHandler = hostReplyHandler
         self.pinnedThreadId = pinnedThreadId
         self.executionCwd = executionCwd
         self.promptTransform = promptTransform
@@ -8607,6 +8619,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             sendThroughInterceptor(interceptor, text: trimmed)
             return
         }
+        if let hostReply = embedding?.hostReplyHandler,
+           attachments.isEmpty, !trimmed.isEmpty,
+           let sendThreadId,
+           hostReply(trimmed, sendThreadId) {
+            prompt = ""
+            return
+        }
         if refuseLegacyProviderThreadRun() { return }
         if refuseUnavailableBotThreadRun() { return }
         if let message = selectedDistillEffortValidationMessage {
@@ -8877,6 +8896,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 status = terminalStatus
             }
             ensureBotPeerReconciliation()
+        }
+        scheduleReloadThreads(delayMilliseconds: 0)
+    }
+
+    /// A row the host already persisted in `threadId` (Titio's inbox notices,
+    /// the user rows and result lines of a card act, and resolution
+    /// rewrites): upserted by id from the row itself, any role, with no
+    /// SQLite read on the MainActor.
+    public func applyHostWrittenMessage(_ message: AgentMessage) {
+        guard selectedThreadId == message.threadId else { return }
+        if let index = messages.firstIndex(where: { $0.id == message.id }) {
+            messages[index] = message
+        } else {
+            messages.append(message)
         }
         scheduleReloadThreads(delayMilliseconds: 0)
     }
@@ -16264,12 +16297,15 @@ public struct AgentAppView: View {
     }
 
     /// Ready-made answers from the newest reply, while the user still has to
-    /// answer it. Picking sends the answer like the composer would.
+    /// answer it. Picking sends the answer like the composer would. In
+    /// Titio's inbox every open notice card stacks here too (hub spec §7).
     @ViewBuilder
     private var choicesCardRow: some View {
+        noticeCardStack
         if let pending = AgentChatChoicesCard.Pending.latest(
             in: vm.messages,
-            isRunning: vm.hasRunningWorkForChrome
+            isRunning: vm.hasRunningWorkForChrome,
+            excludingNotices: vm.embedding?.noticeChoiceHandler != nil
         ), !dismissedChoices.contains(pending.messageID) {
             AgentChatChoicesCard(
                 choices: pending.choices,
@@ -16290,6 +16326,54 @@ public struct AgentAppView: View {
             .padding(.horizontal, 22)
             .padding(.vertical, DS.Space.md)
             .id(pending.messageID)
+        }
+    }
+
+    /// Every assistant message whose choices carry a `notice` key, newest
+    /// `TitioNoticeTiming.openNoticeCardsMax` shown oldest first, with
+    /// "+N open decisions" above them. They ignore `isRunning` (a Titio run
+    /// never hides a decision) and send (message id, option index) to the host,
+    /// never text, so they have no free-text field and no draft gate.
+    @ViewBuilder
+    private var noticeCardStack: some View {
+        if let handler = vm.embedding?.noticeChoiceHandler {
+            let stack = AgentChatChoicesCard.Pending.noticeStack(
+                AgentChatChoicesCard.Pending.openNotices(
+                    in: vm.messages,
+                    dismissed: dismissedChoices
+                )
+            )
+            if !stack.visible.isEmpty {
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    if stack.hiddenCount > 0 {
+                        Text(TitioNoticeCopy.openDecisionsLabel(extra: stack.hiddenCount, language: stack.language))
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .accessibilityIdentifier("agent.choices.notices.more")
+                    }
+                    ForEach(stack.visible, id: \.messageID) { pending in
+                        AgentChatChoicesCard(
+                            choices: pending.choices,
+                            identifier: "agent.choices.\(pending.messageID)",
+                            allowsOwnAnswer: false,
+                            onAnswer: { answer in
+                                // The ledger claims atomically; a repeated tap
+                                // while the first runs is answered silently.
+                                guard let index = pending.choices.options.firstIndex(of: answer) else { return }
+                                handler(pending.messageID, index)
+                            },
+                            onDismiss: {
+                                dismissedChoices.insert(pending.messageID)
+                                AgentChatChoicesCard.DismissedStore.insert(pending.messageID)
+                            }
+                        )
+                        .id(pending.messageID)
+                    }
+                }
+                .padding(.horizontal, 22)
+                .padding(.vertical, DS.Space.md)
+                .accessibilityIdentifier("agent.choices.notices")
+            }
         }
     }
 

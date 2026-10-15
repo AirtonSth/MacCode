@@ -11,6 +11,9 @@ public struct AgentChatChoicesCard: View {
     /// The composer holds a draft or attachments: answering here would
     /// replace them, so the card waits.
     public let isBlockedByDraft: Bool
+    /// False for a Titio notice card: only the options the host stored can be
+    /// acted on, so there is no "Type your own answer" field.
+    public let allowsOwnAnswer: Bool
     public let onAnswer: (String) -> Void
     public let onDismiss: () -> Void
 
@@ -24,12 +27,14 @@ public struct AgentChatChoicesCard: View {
         choices: BotChoicesBlock,
         identifier: String,
         isBlockedByDraft: Bool = false,
+        allowsOwnAnswer: Bool = true,
         onAnswer: @escaping (String) -> Void,
         onDismiss: @escaping () -> Void
     ) {
         self.choices = choices
         self.identifier = identifier
         self.isBlockedByDraft = isBlockedByDraft
+        self.allowsOwnAnswer = allowsOwnAnswer
         self.onAnswer = onAnswer
         self.onDismiss = onDismiss
     }
@@ -58,7 +63,7 @@ public struct AgentChatChoicesCard: View {
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
                     .accessibilityIdentifier("\(identifier).blocked")
-            } else {
+            } else if allowsOwnAnswer {
                 ownAnswerField
             }
         }
@@ -189,12 +194,55 @@ extension AgentChatChoicesCard {
         public let messageID: String
         public let choices: BotChoicesBlock
 
-        public static func latest(in messages: [AgentMessage], isRunning: Bool) -> Pending? {
+        /// `excludingNotices`: a host that acts on notice cards (Titio's
+        /// inbox) shows them in the notice stack instead, so the newest
+        /// message's card is not drawn twice. Every other card is unchanged.
+        public static func latest(in messages: [AgentMessage], isRunning: Bool, excludingNotices: Bool = false) -> Pending? {
             guard !isRunning,
                   let last = messages.last(where: { $0.role != .system }),
                   last.role == .assistant,
-                  let choices = BotChoicesBlock.parse(last.content).choices else { return nil }
+                  let choices = BotChoicesBlock.parse(last.content).choices,
+                  !(excludingNotices && choices.notice != nil) else { return nil }
             return Pending(messageID: last.id.value.uuidString.lowercased(), choices: choices)
+        }
+
+        /// Every assistant message whose choices carry a `notice` key, in
+        /// chronological order, minus the dismissed ones (hub spec §7). A
+        /// message keeps its card until the host resolves the notice and
+        /// rewrites it without the block, so clients keep no decision state.
+        public static func openNotices(in messages: [AgentMessage], dismissed: Set<String>) -> [Pending] {
+            messages.compactMap { message in
+                guard message.role == .assistant,
+                      let choices = BotChoicesBlock.parse(message.content).choices,
+                      choices.notice != nil else { return nil }
+                let id = message.id.value.uuidString.lowercased()
+                return dismissed.contains(id) ? nil : Pending(messageID: id, choices: choices)
+            }
+        }
+
+        /// What the notice stack draws.
+        public struct NoticeStack: Equatable {
+            /// The newest open notices, oldest first.
+            public let visible: [Pending]
+            /// Older open notices behind the "+N open decisions" label.
+            public let hiddenCount: Int
+            /// The label's language: the notices' own (pt-BR or en).
+            public let language: TitioNoticeLanguage
+        }
+
+        public static func noticeStack(
+            _ notices: [Pending],
+            limit: Int = TitioNoticeTiming.openNoticeCardsMax,
+            preferredLanguages: [String] = Locale.preferredLanguages
+        ) -> NoticeStack {
+            let visible = Array(notices.suffix(max(0, limit)))
+            let hidden = notices.count - visible.count
+            // Only the label needs a language, so detection runs only then.
+            let language: TitioNoticeLanguage = hidden > 0
+                ? (TitioNoticeCopy.detectedLanguage(visible.compactMap(\.choices.question).joined(separator: " "))
+                    ?? TitioNoticeCopy.language(lastUserText: nil, preferredLanguages: preferredLanguages))
+                : .en
+            return NoticeStack(visible: visible, hiddenCount: hidden, language: language)
         }
     }
 

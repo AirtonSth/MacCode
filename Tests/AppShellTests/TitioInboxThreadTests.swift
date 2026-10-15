@@ -121,6 +121,125 @@ final class TitioInboxThreadTests: XCTestCase {
         XCTAssertEqual(selected, [target.conversationID], "once per selection, not per repaint")
     }
 
+    /// Posts a free-text question notice into the real inbox and taps
+    /// "Reply here", so the hub holds a live arm.
+    private func armReplyHere(_ context: AppContext, target: TitioInboxTarget) async throws -> String {
+        let thread = AgentThreadID()
+        let facts = TitioNoticeFacts(title: "Deploy", workspaceName: "api", prompt: "Which environment?")
+        let key = TitioNoticeIDs.threadAttention(threadId: thread.value.uuidString, requestId: "Q1")
+        context.titioNoticeCenter.ingest(TitioNoticeFact(
+            key: key, kind: .userInput,
+            source: TitioNoticeSource(threadId: thread.value.uuidString, requestId: "Q1"),
+            facts: facts, actions: TitioNoticeAction.defaultActions(kind: .userInput, facts: facts)
+        ))
+        await context.titioNoticeCenter.idle()
+        let messageID = TitioNoticeIDs.messageID(forKey: key).uuidString
+        let outcome = await context.titioNoticeCenter.act(messageID: messageID, optionIndex: 0)
+        XCTAssertEqual(outcome, .accepted)
+        await context.titioNoticeCenter.settleActs()
+        await context.titioNoticeCenter.idle()
+        XCTAssertEqual(try TitioNoticeRepository(db: context.db).get(key: key)?.state, .awaitingReply)
+        return key
+    }
+
+    func test_inboxDeskHooksTakeTheArmedReplyAndCardTapsWithoutStartingARun() async throws {
+        // WHY: on the Mac the desk composer and the card bypass
+        // enqueueHostMessage; without these hooks an armed answer or a card tap
+        // would start a Titio LLM run instead of reaching the request.
+        let (context, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let key = try await armReplyHere(context, target: target)
+        try openInbox(vm, router: router, target: target)
+        let desk = try XCTUnwrap(vm.deskAgentVM)
+        XCTAssertNotNil(desk.embedding?.noticeChoiceHandler, "only the inbox desk acts on notice cards")
+        XCTAssertNotNil(desk.embedding?.hostReplyHandler)
+
+        desk.prompt = "use staging"
+        await desk.send()
+        XCTAssertEqual(desk.prompt, "", "the host took the text: the composer clears")
+        await context.titioNoticeCenter.settleActs()
+        await context.titioNoticeCenter.idle()
+        XCTAssertNil(try context.runRepo.latestActive(for: target.threadID), "no Titio run started")
+        let row = try XCTUnwrap(TitioNoticeRepository(db: context.db).get(key: key))
+        XCTAssertEqual(row.state, .resolved, "the armed notice was answered (or honestly failed), never left armed")
+        let texts = try context.messageRepo.list(threadId: target.threadID).map(\.content)
+        XCTAssertTrue(texts.contains("use staging"), "the user's words stay in the inbox transcript")
+    }
+
+    func test_otherConversationsGetNoNoticeHooks() throws {
+        // WHY: only the host's own inbox may route taps to the ledger; any
+        // other Titio chat keeps today's text cards and composer.
+        let (context, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let bot = try XCTUnwrap(context.botStore.get(id: target.botID))
+        var chat = BotConversation(botID: bot.id, title: "Chat")
+        try context.botStore.upsertConversation(chat)
+        chat = try vm.ensureLinkedThread(
+            bot: bot, conversation: chat, routing: vm.frozenDeskRouting(for: chat), router: router, markStarted: false
+        ).conversation
+        vm.reload()
+        vm.openDesk(bot)
+        vm.selectDeskThread(chat.id)
+        let desk = try XCTUnwrap(vm.deskAgentVM)
+        XCTAssertNil(desk.embedding?.noticeChoiceHandler)
+        XCTAssertNil(desk.embedding?.hostReplyHandler)
+        XCTAssertNil(vm.titioNoticeTurnDirective(conversationID: chat.id, threadID: target.threadID, userText: "oi"),
+                     "the notice directive is for the inbox only")
+    }
+
+    func test_pairedSendIntoTheInboxIsTakenByAnArmAndStartsNoRun() async throws {
+        // WHY: iOS `bot.send` goes through enqueueHostMessage; an armed reply
+        // must answer the request there too instead of running Titio.
+        let (context, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let key = try await armReplyHere(context, target: target)
+        let receipt = try vm.enqueueHostMessage(botID: target.botID, text: "use staging", conversationID: target.conversationID)
+        XCTAssertEqual(receipt.objectValue?["host_consumed"]?.boolValue, true)
+        XCTAssertNil(receipt.objectValue?["run_id"], "no run id: nothing was started")
+        await context.titioNoticeCenter.settleActs()
+        await context.titioNoticeCenter.idle()
+        XCTAssertNil(try context.runRepo.latestActive(for: target.threadID))
+        XCTAssertEqual(try TitioNoticeRepository(db: context.db).get(key: key)?.state, .resolved)
+    }
+
+    func test_theInboxRouteIsLockedAgainstAPairedProviderChange() throws {
+        // WHY: a new provider would replace the inbox thread that holds every
+        // notice (§16); the host answers the route it keeps.
+        let (context, router, vm) = try makeFixture()
+        defer { withExtendedLifetime(vm) {} }
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let conversation = try XCTUnwrap(context.botStore.conversation(id: target.conversationID))
+        let frozen = vm.frozenDeskRouting(for: conversation)
+        var other = frozen
+        other.provider = .claude
+        other.providerInstanceID = "claude"
+        let adopted = try vm.adoptRemoteDeskRouting(other, botID: target.botID, conversationID: target.conversationID)
+        XCTAssertEqual(adopted.provider, frozen.provider)
+        XCTAssertEqual(try router.resolveTitioInbox(language: .en)?.threadID, target.threadID, "same thread afterwards")
+    }
+
+    func test_freeTextInTheInboxCarriesTheNoticeDirective() async throws {
+        // WHY: the provider session never saw the rows the host wrote; the
+        // directive lists them and forbids Titio from approving on its own.
+        let (context, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        context.titioNoticeCenter.ingest(TitioNoticeFact(
+            key: "run.R1.failed", kind: .runFailed,
+            facts: TitioNoticeFacts(title: "Build", workspaceName: "api"), actions: [.openThread, .ack]
+        ))
+        await context.titioNoticeCenter.idle()
+        let directive = try XCTUnwrap(vm.titioNoticeTurnDirective(
+            conversationID: target.conversationID, threadID: target.threadID, userText: "what failed?"
+        ))
+        XCTAssertTrue(directive.contains("run.R1.failed"))
+        XCTAssertTrue(directive.hasSuffix(TitioNoticeDirective.closingRule))
+        XCTAssertEqual(
+            BotsViewModel.combinedTurnDirective("peer", nil, " ", directive),
+            "peer\n\n" + directive,
+            "the peer directive keeps its place before the inbox directive"
+        )
+    }
+
     func test_petCountsSkipTheInboxConversation() {
         // WHY: no BotAttentionItem is created for notices and the pet must not
         // count the inbox's unread state on top of its own speech bubble.

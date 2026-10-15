@@ -1010,6 +1010,8 @@ public final class JSONRPCDispatcher {
         "bot.verbosity.set",
         "bot.caveman.set",
         "bot.factory_reset",
+        "bot.notice.act",
+        "bot.notice.read",
         "bot.desktop.set",
         "bot.avatar.set",
         "bot.handle.set",

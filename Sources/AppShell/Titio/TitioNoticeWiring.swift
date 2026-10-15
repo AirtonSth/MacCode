@@ -1,3 +1,4 @@
+import AgentRuntime
 import AppKit
 import CoreModel
 import Foundation
@@ -103,7 +104,7 @@ extension AppContext {
                         message: posted.message,
                         conversation: posted.conversation
                     )
-                    router.projectAgentAppPeerMessage(threadID: posted.message.threadId, messageID: posted.message.id)
+                    router.projectTitioInboxMessage(posted.message)
                 }
             },
             inboxChanged: { snapshot in
@@ -128,6 +129,79 @@ extension AppContext {
             },
             isFocusedSuccess: { event in
                 await MainActor.run { box.context?.router?.isFocusedPetSuccess(event) ?? false }
+            }
+        )
+    }
+
+    /// Production host side effects of card actions (§7 step 4). The pending
+    /// request check reads SQLite on the hub's actor; router and Bots calls
+    /// hop to the MainActor where those APIs live.
+    nonisolated static func makeTitioNoticeActionHooks(
+        box: TitioNoticeContextBox,
+        db: SQLiteDB,
+        botStore: BotStore
+    ) -> TitioNoticeActionHooks {
+        let pending = ProviderPendingCallbackRepository(db: db)
+        @Sendable func router() async throws -> AppCommandRouter {
+            guard let router = await MainActor.run(body: { box.context?.router }) else {
+                throw TitioNoticeActionError(reason: "RemoteCode is not ready")
+            }
+            return router
+        }
+        return TitioNoticeActionHooks(
+            isRequestOpen: { thread, request, kind in
+                // No recorded callback (its write failed): let the provider decide.
+                guard let row = (try? pending.get(
+                    threadId: thread, requestId: request, kind: kind == .approval ? .approval : .userInput
+                )) ?? nil else { return true }
+                return row.state == .pending
+            },
+            respondRequest: { thread, request, decision in
+                let response: AgentProviderRequestResponse
+                switch decision {
+                case .approve: response = .approve
+                case .approveForSession: response = .approveForSession
+                case .decline: response = .decline(nil)
+                }
+                try await router().respondAgentRequest(thread: thread, requestId: request, response: response)
+            },
+            respondUserInput: { thread, request, text in
+                try await router().respondAgentUserInput(thread: thread, requestId: request, text: text)
+            },
+            sendBotMessage: { bot, conversation, text in
+                let router = try await router()
+                try await MainActor.run {
+                    guard let vm = router.botsViewModel else {
+                        throw TitioNoticeActionError(reason: "the Bot runtime is unavailable")
+                    }
+                    _ = try vm.enqueueHostMessage(botID: bot, text: text, conversationID: conversation)
+                }
+            },
+            acknowledgeBotAttention: { item in
+                try botStore.acknowledgeAttention(id: item)
+                await MainActor.run {
+                    box.context?.router?.botsViewModel?.noteAttentionAcknowledged(item)
+                    BotsViewModel.publishDestAttentionChanged()
+                }
+            },
+            continueRun: { thread in
+                _ = try await router().continueAgentRun(thread: thread)
+            },
+            rerunScheduledTask: { task in
+                let router = try await router()
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    Task { @MainActor in
+                        guard let scheduler = router.scheduledTaskScheduler else {
+                            continuation.resume(throwing: TitioNoticeActionError(reason: "scheduled tasks are not running"))
+                            return
+                        }
+                        scheduler.runNow(taskID: task) { continuation.resume(with: $0) }
+                    }
+                }
+            },
+            acknowledgeActivity: { item in
+                let router = try await router()
+                _ = try await MainActor.run { try router.activityAcknowledge(params: ["item_id": .string(item)]) }
             }
         )
     }
@@ -412,6 +486,17 @@ extension AppCommandRouter {
         } catch {
             NSLog("RemoteCode: Titio inbox unavailable: \(error)")
             return nil
+        }
+    }
+
+    /// A host-written inbox row (notice, act user row, result line, rewrite)
+    /// repaints every open Agent App on that thread from the row itself,
+    /// without reading SQLite on the MainActor.
+    func projectTitioInboxMessage(_ message: AgentMessage) {
+        botsViewModel?.deskAgentVM?.applyHostWrittenMessage(message)
+        for surface in SurfaceRegistry.shared.all() {
+            guard let agent = surface as? AgentAppSurface else { continue }
+            agent.viewModel.applyHostWrittenMessage(message)
         }
     }
 

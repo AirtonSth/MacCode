@@ -640,6 +640,11 @@ public final class AppContext {
                 hostID: liveActivityIdentity.serverId
             )
         )
+        titioNoticeCenter.installActions(Self.makeTitioNoticeActionHooks(
+            box: titioNoticeBox,
+            db: db,
+            botStore: self.botStore
+        ))
         privateNotificationBridge.setConnectionHintSources(
             watermark: { String(EventBus.shared.currentSeq) },
             bootEpoch: { String(liveActivityIdentity.bootEpoch) }
