@@ -13120,21 +13120,9 @@ public struct BotsRootView: View {
     /// Accent, bottom-trailing above the composer; scroll-to-latest stacks on
     /// top of it, so the two never overlap.
     private var deskNewThreadFAB: some View {
-        Button {
+        AgentChatNewThreadFAB(identifier: "bots.desk.thread.new.fab") {
             vm.createDeskThread()
-        } label: {
-            Image(systemName: "plus")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(DS.Palette.onAccent)
-                .frame(width: DSIconButton.hitTargetSize, height: DSIconButton.hitTargetSize)
-                .background(DS.Palette.accent)
-                .clipShape(Circle())
-                .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
         }
-        .buttonStyle(.plain)
-        .help(AgentChatThreadRailCopy.newHelp)
-        .accessibilityLabel(AgentChatThreadRailCopy.newHelp)
-        .accessibilityIdentifier("bots.desk.thread.new.fab")
     }
 
     /// Visual gap between Desk header glyphs. DSIconButton lays out at

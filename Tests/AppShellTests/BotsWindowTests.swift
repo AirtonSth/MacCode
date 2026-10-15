@@ -8705,8 +8705,7 @@ final class BotsWindowTests: XCTestCase {
         let fab = String(source[fabStart.lowerBound..<fabEnd])
         XCTAssertTrue(fab.contains("vm.createDeskThread()"), "one action for every +")
         XCTAssertTrue(fab.contains("bots.desk.thread.new.fab"))
-        XCTAssertTrue(fab.contains(".help(AgentChatThreadRailCopy.newHelp)"))
-        XCTAssertTrue(fab.contains(".accessibilityLabel(AgentChatThreadRailCopy.newHelp)"))
+        XCTAssertTrue(fab.contains("AgentChatNewThreadFAB("), "the Agent App and the desk share one FAB")
         XCTAssertFalse(fab.contains("isDeskThreadRailVisible"), "the FAB must not touch panel visibility")
 
         let chatStart = try XCTUnwrap(source.range(of: "private func deskChat"))
@@ -8716,7 +8715,8 @@ final class BotsWindowTests: XCTestCase {
         // The owner asked for it blue, bottom-right just above the composer:
         // the transcript's trailing accessory slot, where scroll-to-latest
         // stacks on top of it instead of overlapping it.
-        XCTAssertTrue(fab.contains("DS.Palette.accent"), "the FAB is the accent (blue) action")
+        let shared = try String(contentsOf: sourceURL("Sources/Surfaces/AgentChatNewThreadFAB.swift"), encoding: .utf8)
+        XCTAssertTrue(shared.contains("DS.Palette.accent"), "the FAB is the accent (blue) action")
         let mount = try XCTUnwrap(
             chat.range(of: "timelineAccessory: AnyView(deskNewThreadFAB)"),
             "the linked chat mounts the FAB in the transcript's bottom-trailing slot"

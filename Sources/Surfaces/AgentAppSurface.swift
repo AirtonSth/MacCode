@@ -15908,6 +15908,19 @@ public struct AgentAppView: View {
         }
     }
 
+    /// Same floating + the Bot desk shows. Only the standalone Agent App gets
+    /// it; embedders (Bot desk, groups, Activity) pass their own or none.
+    private var standaloneNewThreadFAB: AnyView? {
+        Self.newThreadFAB(layout: layout, vm: vm).map { AnyView($0) }
+    }
+
+    static func newThreadFAB(layout: AgentAppViewLayout, vm: AgentAppViewModel) -> AgentChatNewThreadFAB? {
+        guard layout == .standard else { return nil }
+        return AgentChatNewThreadFAB(help: "New thread (⌘N)", identifier: "agent.thread.new.fab") {
+            vm.createThread(title: "New thread")
+        }
+    }
+
     // MARK: Timeline
 
     // Flat, Codex-style transcript: a centered reading column, user
@@ -15920,7 +15933,7 @@ public struct AgentAppView: View {
             scrollToBottomIdentifier: "agent.timeline.scrollToBottom",
             accessibilityIdentifier: "agent.timeline",
             scrollTarget: vm.messageScrollTarget,
-            trailingAccessory: timelineAccessory
+            trailingAccessory: timelineAccessory ?? standaloneNewThreadFAB
         ) { timelineColumnWidth in
                         // AA-25: materialize the merged entries ONCE per body; the
                         // property rebuilt two whole-thread dictionaries each read
