@@ -285,10 +285,12 @@ extension AppContext {
         let conversation = (try? botStore.conversationLinked(to: threadId)) ?? nil
         let bot = conversation.flatMap { (try? botStore.get(id: $0.botID)) ?? nil }
         let result = (try? AgentRunResultRepository(db: db).get(runId: runId)) ?? nil
-        let run = (try? runRepo.get(id: runId)) ?? nil
-        let durationMs = run.flatMap { run -> Int? in
-            guard let finished = run.finishedAt else { return nil }
-            return max(0, Int(finished.timeIntervalSince(run.startedAt) * 1_000))
+        // Timing probe, not a full row get: run finish stays off the
+        // durable 10-column read (RunFinishProviderProbeTests).
+        let timing = (try? runRepo.timing(of: runId)) ?? nil
+        let durationMs = timing.flatMap { timing -> Int? in
+            guard let finished = timing.finishedAt else { return nil }
+            return max(0, Int(finished.timeIntervalSince(timing.startedAt) * 1_000))
         }
         let scheduledStore = ScheduledTaskStore(db: db)
         let scheduled = ((try? scheduledStore.activeRun(forThreadID: threadId)) ?? nil)

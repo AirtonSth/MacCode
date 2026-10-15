@@ -9450,7 +9450,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var eventPayload: [String: JSONValue] = ["id": .string(n.id)]
         // Titio's push already alerts the phone for this one: a paired client
         // that sees the key must not schedule its own local notification too.
-        if let titioNoticeKey { eventPayload["titio_notice_key"] = .string(titioNoticeKey) }
+        // Only when a push can really go out; otherwise the phone's local
+        // notification stays its only alert.
+        if let titioNoticeKey, ctx.privateNotificationBridge.hasAlertPushTarget {
+            eventPayload["titio_notice_key"] = .string(titioNoticeKey)
+        }
         if let workspaceId { eventPayload["workspace_id"] = .string(workspaceId.value.uuidString) }
         if let surfaceId { eventPayload["surface_id"] = .string(surfaceId.value.uuidString) }
         if let category { eventPayload["category"] = .string(category) }

@@ -240,3 +240,32 @@ final class NotificationPetProjectionEventTests: XCTestCase {
         ).readAt)
     }
 }
+
+/// Titio hub + paired phone alerts: the phone skips its own local
+/// notification only for notices that Titio's push really delivers.
+@MainActor
+final class TitioNoticeKeyEventTests: XCTestCase {
+    func test_withoutAPushTargetTheEventCarriesNoTitioKeySoThePhoneStillAlerts() throws {
+        // WHY: iOS drops its local notification when notification.created has
+        // titio_notice_key. Without a signed-in, subscribed account and a
+        // registered push target no Titio push goes out, so the key would
+        // leave that phone with no alert at all.
+        let directory = NSTemporaryDirectory() + "RC2TitioKey-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        context.titioNoticeCenter.start(subscribeToEvents: false)
+        XCTAssertTrue(context.titioNoticeCenter.isEnabled(SettingsStore(db: context.db).load()))
+        XCTAssertFalse(context.privateNotificationBridge.hasAlertPushTarget)
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "notification.created" { events.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        _ = try router.notificationCreate(workspaceId: nil, title: "Deploy", body: "done", category: nil)
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertNil(events.first?.payload.objectValue?["titio_notice_key"])
+    }
+}

@@ -990,19 +990,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
         let slice = AgentChatLiveTurnChrome.visibleWorkBlocks(blocks, revealCount: earlierWorkReveal)
         VStack(alignment: .leading, spacing: DS.Space.xl) {
             if hidesWork {
-                if live && showsWorkHeader {
-                    AgentChatHiddenWorkStatus(turn: turn)
-                }
-                // Hidden work still owns up to its failures (iOS parity): an
-                // error the user cannot see would read as silent success.
-                ForEach(AgentChatLiveTurnChrome.visibleErrors(in: composition.activity)) { item in
-                    AgentChatLiveItemRow(
-                        item: item,
-                        expandedReasoning: $expandedReasoning,
-                        expandedTools: $expandedTools
-                    )
-                    .equatable()
-                }
+                hiddenWorkSection(activity: composition.activity)
             } else if !composition.activity.isEmpty {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     if showsWorkHeader {
@@ -1076,6 +1064,24 @@ public struct AgentChatLiveTurnView: View, Equatable {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("bots.desk.liveTurn.\(turn.turnId)")
+    }
+
+    /// Verbosity Human: a "Working" line while live, and the turn's errors.
+    /// Hidden work still owns up to its failures (iOS parity): an error the
+    /// user cannot see would read as a silent success.
+    @ViewBuilder
+    private func hiddenWorkSection(activity: [AssistantItem]) -> some View {
+        if live && showsWorkHeader {
+            AgentChatHiddenWorkStatus(turn: turn)
+        }
+        ForEach(AgentChatLiveTurnChrome.visibleErrors(in: activity)) { item in
+            AgentChatLiveItemRow(
+                item: item,
+                expandedReasoning: $expandedReasoning,
+                expandedTools: $expandedTools
+            )
+            .equatable()
+        }
     }
 }
 

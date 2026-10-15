@@ -9982,13 +9982,6 @@ public final class BotsViewModel: ObservableObject {
         if selectedBotID == conversation.botID {
             conversations.removeAll { $0.id == conversation.id }
             conversations.insert(conversation, at: 0)
-            // A desk open on this Bot with nothing selected (it had no
-            // conversation yet, e.g. Titio before its first notice) shows the
-            // conversation that just appeared instead of waiting forever.
-            if selectedConversation == nil, screen == .desk {
-                selectedConversation = conversation
-                selectedConversationByBot[conversation.botID] = conversation.id
-            }
             rememberStudioSupport(for: conversation.botID)
         } else {
             patchStudioSupportConversation(conversation, botID: conversation.botID)
@@ -10903,6 +10896,12 @@ public final class BotsViewModel: ObservableObject {
         }
         if let conversation {
             adoptFollowThroughConversation(conversation)
+            // Titio's empty desk (opened before its first notice) shows the
+            // inbox that just appeared instead of the new-conversation composer.
+            if selectedBotID == botID, selectedConversation == nil, screen == .desk {
+                selectedConversation = conversation
+                selectedConversationByBot[botID] = conversation.id
+            }
             applyAttentionState(
                 for: botID,
                 conversations: destConversations(botID: botID, patched: conversation)
