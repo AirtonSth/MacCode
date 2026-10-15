@@ -12892,8 +12892,8 @@ public struct AgentAppView: View {
         return QueueStatusBannerPresentation(message: message, offersCopy: true, offersRetry: true)
     }
     @ObservedObject var vm: AgentAppViewModel
-    private let accountPanel: AnyView?
-    @State private var showingAccounts = false
+    /// Opens Settings at Accounts & Auto (nil when no Distill accounts host).
+    private let openAccountsSettings: (() -> Void)?
     private let layout: AgentAppViewLayout
     /// Host action on the transcript's bottom-trailing corner (Bots Desk +).
     private let timelineAccessory: AnyView?
@@ -12965,12 +12965,12 @@ public struct AgentAppView: View {
 
     public init(
         vm: AgentAppViewModel,
-        accountPanel: AnyView? = nil,
+        openAccountsSettings: (() -> Void)? = nil,
         layout: AgentAppViewLayout = .standard,
         timelineAccessory: AnyView? = nil
     ) {
         self.vm = vm
-        self.accountPanel = accountPanel
+        self.openAccountsSettings = openAccountsSettings
         self.layout = layout
         self.timelineAccessory = timelineAccessory
     }
@@ -15307,16 +15307,6 @@ public struct AgentAppView: View {
             .onChange(of: vm.showPlanSidebar) { _ in
                 applyAdaptiveSidebars(width: proxy.size.width, event: .structural)
             }
-            .sheet(isPresented: $showingAccounts) {
-                if let accountPanel {
-                    accountPanel
-                        .padding(DS.Space.xxl)
-                        // A native sheet can ignore idealWidth; size it to the available host surface.
-                        .frame(width: min(820, proxy.size.width), height: min(640, proxy.size.height))
-                        .background(DS.Palette.bg)
-                        .foregroundStyle(DS.Palette.text)
-                }
-            }
             .onChange(of: vm.checkpointRevealGeneration) { _ in
                 planSidebarIntent = .forcedVisible
                 applyAdaptiveSidebars(width: proxy.size.width, event: .structural)
@@ -15711,14 +15701,6 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textSecondary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
-            if accountPanel != nil {
-                Button { showingAccounts = true } label: {
-                    Label("Accounts", systemImage: "person.crop.circle")
-                }
-                .buttonStyle(.bordered).controlSize(.small)
-                .help("Manage Distill accounts and Auto routing")
-                .accessibilityIdentifier("agent.accounts.open")
-            }
             botScreenControls
             // Unified working phase strip (replaces separate awaiting/shell/status pills).
             workingPhaseStrip
@@ -17107,8 +17089,8 @@ public struct AgentAppView: View {
                 title: vm.embedding?.emptyConversationTitle ?? "No messages",
                 subtitle: vm.embedding?.emptyConversationSubtitle ?? "Start a new agent run."
             ) {
-                if accountPanel != nil {
-                    Button("Accounts & Auto") { showingAccounts = true }
+                if let openAccountsSettings {
+                    Button("Accounts & Auto", action: openAccountsSettings)
                         .buttonStyle(.bordered).frame(minHeight: 44)
                         .accessibilityIdentifier("agent.accounts.open.empty")
                 }
@@ -20488,12 +20470,12 @@ public final class AgentAppSurface: NSObject, Surface {
     /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
     public var onClose: (() -> Void)?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, sideThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(), accountPanel: AnyView? = nil) {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, sideThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(), openAccountsSettings: (() -> Void)? = nil) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
         if let binding = sideThreadId ?? initialThreadId { metadata["selected_thread"] = binding.value.uuidString }
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
         self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, sideThreadId: sideThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared, orchestrationRuntime: orchestrationRuntime)
-        let host = NSHostingView(rootView: AgentAppView(vm: viewModel, accountPanel: accountPanel))
+        let host = NSHostingView(rootView: AgentAppView(vm: viewModel, openAccountsSettings: openAccountsSettings))
         host.sizingOptions = []
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

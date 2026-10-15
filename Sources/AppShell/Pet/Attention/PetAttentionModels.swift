@@ -74,6 +74,7 @@ public enum PetNotificationCategory: String, CaseIterable, Sendable, Equatable {
 public enum PetSettingsRoute: Sendable, Equatable {
     case general
     case providers
+    case accounts
 }
 
 public enum PetAttentionItemKind: Sendable, Equatable {
