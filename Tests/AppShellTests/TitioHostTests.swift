@@ -356,6 +356,27 @@ final class TitioHostTests: XCTestCase {
         XCTAssertEqual(f.vm.studioDraft.soul, TitioBot.soul, "the open Studio shows the restored profile")
     }
 
+    func test_renamingTitioInItsStudioKeepsItsSlug() throws {
+        // WHY: the slug field is locked, but the name still derived a new slug
+        // ("Tio Bot" → "tio-bot") and saving renamed the handle. Everything
+        // finds Titio by its slug, so the next launch made a second Titio and
+        // split the pet, the inbox and the notice hub.
+        let f = try makeFixture()
+        let titioID = try f.router.openTitio()
+        f.vm.reload()
+        f.vm.openStudio(try XCTUnwrap(try f.context.botStore.get(id: titioID)))
+        f.vm.didEditStudioName("Tio Bot")
+        XCTAssertEqual(f.vm.studioDraft.handle, TitioBot.handle, "the name never drives Titio's slug")
+        _ = try f.vm.saveStudio()
+        let bot = try XCTUnwrap(try f.context.botStore.get(id: titioID))
+        XCTAssertEqual(bot.name, "Tio Bot")
+        XCTAssertEqual(bot.handle, TitioBot.handle)
+        XCTAssertThrowsError(try f.context.botStore.renameHandle(id: titioID, handle: "other"),
+                             "no path (Studio or bot.handle.set) can move Titio off its slug")
+        XCTAssertEqual(try TitioBot.ensure(store: f.context.botStore, appSupportDirectory: f.context.appSupportDirectory).id,
+                       titioID, "still one Titio")
+    }
+
     func test_onlyTitiosStudioHidesTheAvatarAndOffersFactoryReset() throws {
         // WHY: Titio's avatar is the pet, so its Studio has no avatar editor;
         // every other Bot keeps its blobatar editor and gets no Titio reset.

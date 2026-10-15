@@ -183,6 +183,32 @@ public final class TitioNoticeRepository: @unchecked Sendable {
         }
     }
 
+    /// Rows in `states`, oldest first. Startup reconciliation reads `acting`
+    /// rows (an act no live task owns) and open request rows with it.
+    public func rows(inStates states: Set<TitioNoticeState>, limit: Int = 500) throws -> [TitioNoticeRecord] {
+        guard !states.isEmpty else { return [] }
+        let values = states.map(\.rawValue).sorted()
+        let placeholders = Array(repeating: "?", count: values.count).joined(separator: ",")
+        return try query("""
+            SELECT \(Self.columns) FROM titio_notices WHERE state IN (\(placeholders))
+            ORDER BY occurred_at, key LIMIT ?;
+            """) { statement in
+            for (index, value) in values.enumerated() { try statement.bind(Int32(index + 1), value) }
+            try statement.bind(Int32(values.count + 1), limit)
+        }
+    }
+
+    /// Labels of recently posted cards. A card tap is stored as a user row
+    /// with its label, so the §16 language rule skips texts equal to one.
+    public func recentCardLabels(limit: Int = 50) throws -> Set<String> {
+        let rows = try query("""
+            SELECT \(Self.columns) FROM titio_notices
+            WHERE actions_json IS NOT NULL AND posted_at IS NOT NULL
+            ORDER BY posted_at DESC LIMIT ?;
+            """) { try $0.bind(1, limit) }
+        return Set(rows.flatMap { $0.actions ?? [] }.compactMap { $0.label?.trimmingCharacters(in: .whitespacesAndNewlines) })
+    }
+
     /// Posted rows whose card the user can still tap (`posted` or
     /// `awaiting_reply` with `actions_json`), oldest first. The hub mirrors
     /// them in memory for the old-iOS exact-option-text intercept (§7).
@@ -392,16 +418,25 @@ public final class TitioNoticeRepository: @unchecked Sendable {
 
     // MARK: Retention
 
-    /// Deletes `resolved`/`dropped` rows that ended before `cutoff`. Messages are untouched.
+    /// Deletes `resolved`/`dropped` rows that ended before `cutoff`, and
+    /// posted rows nothing can ever resolve: no card, not a decision, banner
+    /// delivered, posted before `cutoff` (run completions, Bot replies,
+    /// card-less alerts, the non-owner rows of a digest). Without the second
+    /// rule those rows stay `posted` forever and the ledger grows with every
+    /// run. Open decisions and rows with a card are never pruned. Messages
+    /// are untouched.
     @discardableResult
     public func prune(endedBefore cutoff: Date) throws -> Int {
         try db.performSync { database in
             try database.transaction {
                 let statement = try database.prepare("""
                     DELETE FROM titio_notices
-                    WHERE state IN ('resolved', 'dropped') AND COALESCE(resolved_at, occurred_at) < ?;
+                    WHERE (state IN ('resolved', 'dropped') AND COALESCE(resolved_at, occurred_at) < ?)
+                       OR (state = 'posted' AND urgency != 'decision' AND actions_json IS NULL
+                           AND banner_at IS NOT NULL AND posted_at < ?);
                     """)
                 try statement.bind(1, cutoff.timeIntervalSince1970)
+                try statement.bind(2, cutoff.timeIntervalSince1970)
                 _ = try statement.step()
                 return try Self.changes(database)
             }

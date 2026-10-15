@@ -125,7 +125,7 @@ final class TitioNoticeRemoteControlTests: XCTestCase {
                 "unread_count": 2,
                 "open_decisions": 1,
                 "last_preview": "I need you to decide something",
-                "last_at": "2026-10-15T03:00:00Z",
+                "last_at": 1_792_094_460.0,
             ]
         }
 

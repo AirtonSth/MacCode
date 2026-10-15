@@ -300,6 +300,50 @@ final class TitioNoticeRepositoryTests: XCTestCase {
         XCTAssertEqual(try rowCount(db), 2)
     }
 
+    func test_pruneAlsoRemovesOldPostedRowsNothingCanResolve() throws {
+        // WHY: a run completion, a Bot reply or a digest's non-owner row has no
+        // card and no source that ever resolves it, so it stayed `posted`
+        // forever and the ledger grew with every run (and the MainActor
+        // directive scan with it). Open decisions and live cards must stay.
+        let (_, repo) = try make()
+        let now = t0.addingTimeInterval(60 * 86_400)
+        try repo.ingest(fact("oldInfo", .runCompleted))
+        try repo.ingest(fact("oldInfoNoBanner", .runCompleted))
+        try repo.ingest(fact("oldCardlessDecision", .manualAction))
+        try repo.ingest(fact("oldAlertWithCard", .runFailed, actions: [.openThread, .ack]))
+        try repo.ingest(fact("recentInfo", .runCompleted))
+        try post(repo, ["oldInfo"])
+        try post(repo, ["oldInfoNoBanner"])
+        try post(repo, ["oldCardlessDecision"])
+        try post(repo, ["oldAlertWithCard"], card: [TitioNoticeCardOption(label: "Open thread", action: .openThread),
+                                                    TitioNoticeCardOption(label: "Got it", action: .ack)])
+        try post(repo, ["recentInfo"], at: 59 * 86_400)
+        try repo.markBanner(keys: ["oldInfo", "oldCardlessDecision", "oldAlertWithCard", "recentInfo"], at: t0)
+
+        XCTAssertEqual(try repo.prune(endedBefore: now.addingTimeInterval(-TitioNoticeTiming.retention)), 1)
+        XCTAssertNil(try repo.get(key: "oldInfo"))
+        XCTAssertNotNil(try repo.get(key: "oldInfoNoBanner"), "its banner may still be re-posted")
+        XCTAssertNotNil(try repo.get(key: "oldCardlessDecision"), "an open decision is never pruned")
+        XCTAssertNotNil(try repo.get(key: "oldAlertWithCard"), "a card the user can still tap stays")
+        XCTAssertNotNil(try repo.get(key: "recentInfo"))
+    }
+
+    func test_postedAtHasAnIndexForTheDirectiveScan() throws {
+        // WHY: `recentPosted` runs on every inbox send on the MainActor; it
+        // must not scan and sort the whole ledger.
+        let (db, _) = try make()
+        let plan = try db.performSync { database -> String in
+            let statement = try database.prepare(
+                "EXPLAIN QUERY PLAN SELECT key FROM titio_notices WHERE posted_at IS NOT NULL AND posted_at > 0 ORDER BY posted_at DESC LIMIT 12;"
+            )
+            defer { statement.reset() }
+            var details: [String] = []
+            while try statement.step() { details.append(statement.columnText(3) ?? "") }
+            return details.joined(separator: " | ")
+        }
+        XCTAssertTrue(plan.contains("idx_titio_notices_posted"), plan)
+    }
+
     // MARK: Schema
 
     func test_step93AppliesOnAVersion92Database() throws {

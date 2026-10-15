@@ -193,13 +193,48 @@ final class TitioInboxThreadTests: XCTestCase {
         let (context, router, vm) = try makeFixture()
         let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
         let key = try await armReplyHere(context, target: target)
-        let receipt = try vm.enqueueHostMessage(botID: target.botID, text: "use staging", conversationID: target.conversationID)
+        let receipt = try vm.enqueueHostMessage(botID: target.botID, text: "use staging", conversationID: target.conversationID,
+                                                origin: .pairedClient)
         XCTAssertEqual(receipt.objectValue?["host_consumed"]?.boolValue, true)
         XCTAssertNil(receipt.objectValue?["run_id"], "no run id: nothing was started")
         await context.titioNoticeCenter.settleActs()
         await context.titioNoticeCenter.idle()
         XCTAssertNil(try context.runRepo.latestActive(for: target.threadID))
         XCTAssertEqual(try TitioNoticeRepository(db: context.db).get(key: key)?.state, .resolved)
+    }
+
+    func test_agentHostToolsCannotAnswerANoticeOrWriteIntoTheInbox() async throws {
+        // WHY (§0.2): `rc_bot_send` / `rc_bot_delegate` reach enqueueHostMessage
+        // with any conversation id. An LLM (or a prompt injection) sending an
+        // option's text, or any text while "Reply here" is armed, approved or
+        // answered a request for the user.
+        let (context, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let key = try await armReplyHere(context, target: target)
+        XCTAssertThrowsError(try vm.enqueueHostMessage(botID: target.botID, text: "use staging",
+                                                       conversationID: target.conversationID))
+        await context.titioNoticeCenter.settleActs()
+        await context.titioNoticeCenter.idle()
+        XCTAssertEqual(try TitioNoticeRepository(db: context.db).get(key: key)?.state, .awaitingReply,
+                       "the arm is still the user's")
+        XCTAssertFalse(try context.messageRepo.list(threadId: target.threadID).map(\.content).contains("use staging"),
+                       "nothing was written into the inbox as the user")
+    }
+
+    func test_aDeskRestoredOntoTheInboxAtLaunchMountsWithItsNoticeHooks() throws {
+        // WHY: the inbox id was in memory only and set when the hub resolved
+        // the inbox, after the restored desk had mounted. That desk drew the
+        // notice as a plain card and sent "Approve" to Titio's LLM as text.
+        let (context, router, firstVM) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        withExtendedLifetime(firstVM) {}
+        let relaunched = BotsViewModel(context: context, router: router)
+        router.botsViewModel = relaunched
+        XCTAssertEqual(relaunched.titioInboxConversationID, target.conversationID, "seeded from the ledger")
+        try openInbox(relaunched, router: router, target: target)
+        let desk = try XCTUnwrap(relaunched.deskAgentVM)
+        XCTAssertNotNil(desk.embedding?.noticeChoiceHandler, "the restored inbox desk acts on notice cards")
+        XCTAssertNotNil(desk.embedding?.hostReplyHandler)
     }
 
     func test_theInboxRouteIsLockedAgainstAPairedProviderChange() throws {

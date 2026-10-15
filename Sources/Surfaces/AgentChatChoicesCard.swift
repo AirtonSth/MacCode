@@ -194,15 +194,16 @@ extension AgentChatChoicesCard {
         public let messageID: String
         public let choices: BotChoicesBlock
 
-        /// `excludingNotices`: a host that acts on notice cards (Titio's
-        /// inbox) shows them in the notice stack instead, so the newest
-        /// message's card is not drawn twice. Every other card is unchanged.
-        public static func latest(in messages: [AgentMessage], isRunning: Bool, excludingNotices: Bool = false) -> Pending? {
+        /// Never a notice card: a notice is answered by (message id, option
+        /// index) through the host's notice stack. Drawn here, its label would
+        /// be sent as chat text, which acts on nothing (a surface without the
+        /// notice hook, such as a desk mounted before the inbox was known).
+        public static func latest(in messages: [AgentMessage], isRunning: Bool) -> Pending? {
             guard !isRunning,
                   let last = messages.last(where: { $0.role != .system }),
                   last.role == .assistant,
                   let choices = BotChoicesBlock.parse(last.content).choices,
-                  !(excludingNotices && choices.notice != nil) else { return nil }
+                  choices.notice == nil else { return nil }
             return Pending(messageID: last.id.value.uuidString.lowercased(), choices: choices)
         }
 

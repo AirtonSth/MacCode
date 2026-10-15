@@ -112,6 +112,25 @@ public enum TitioNoticeCopy {
         return preferredLanguages.first?.lowercased().hasPrefix("pt") == true ? .ptBR : .en
     }
 
+    /// The §16 rule over the user's recent Titio messages, newest first: the
+    /// first one the recognizer is confident about decides. Card taps are
+    /// stored as user rows with the option's label ("Got it", "PostgreSQL"),
+    /// so texts equal to a card label are skipped, and a short ambiguous reply
+    /// ("ok") never flips the language: the walk goes back to an older,
+    /// confident message before falling back to the system language.
+    public static func language(
+        recentUserTexts: [String],
+        excluding cardLabels: Set<String> = [],
+        preferredLanguages: [String]
+    ) -> TitioNoticeLanguage {
+        for text in recentUserTexts {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cardLabels.contains(trimmed) else { continue }
+            if let detected = detectedLanguage(trimmed) { return detected }
+        }
+        return language(lastUserText: nil, preferredLanguages: preferredLanguages)
+    }
+
     /// pt-BR / en when the recognizer is confident, else nil.
     public static func detectedLanguage(_ text: String?) -> TitioNoticeLanguage? {
         guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
@@ -130,19 +149,68 @@ public enum TitioNoticeCopy {
     /// One notice as its own message.
     public static func compose(_ item: TitioNoticeRenderItem, language: TitioNoticeLanguage, timeZone: TimeZone = .current) -> TitioNoticeComposed {
         let body = body(for: item, language: language, timeZone: timeZone)
+        let itemPreview = singlePreview(item, body: body)
         guard let actions = item.actions else {
-            return TitioNoticeComposed(text: body, preview: preview(body), cardOptions: nil, cardOwnerKey: nil)
+            return TitioNoticeComposed(text: body, preview: itemPreview, cardOptions: nil, cardOwnerKey: nil)
         }
         let options = labeledOptions(actions, language: language, botName: clean(item.facts.botName, max: 80))
         guard options.count >= 2 else {
-            return TitioNoticeComposed(text: body, preview: preview(body), cardOptions: nil, cardOwnerKey: nil)
+            return TitioNoticeComposed(text: body, preview: itemPreview, cardOptions: nil, cardOwnerKey: nil)
         }
-        let block = choicesBlock(
-            question: cardQuestion(for: item, language: language),
-            options: options.compactMap(\.label),
-            notice: item.key
-        )
-        return TitioNoticeComposed(text: body + "\n\n" + block, preview: preview(body), cardOptions: options, cardOwnerKey: item.key)
+        let question = cardQuestion(for: item, language: language)
+        // The card asks; the body above it does not repeat the question.
+        let lead = droppingTrailingQuestion(body, language: language)
+        let block = choicesBlock(question: question, options: options.compactMap(\.label), notice: item.key)
+        return TitioNoticeComposed(text: lead + "\n\n" + block, preview: singlePreview(item, body: lead),
+                                   cardOptions: options, cardOwnerKey: item.key)
+    }
+
+    /// The roster / pet preview of one notice: its first line, except an
+    /// external notice, whose caller-written body is on line 2 and would be
+    /// lost ("Build: All 300 tests passed", not just "New notice: Build").
+    static func singlePreview(_ item: TitioNoticeRenderItem, body: String) -> String {
+        guard item.kind == .external else { return preview(body) }
+        return externalHeadline(item.facts) ?? preview(body)
+    }
+
+    private static func externalHeadline(_ facts: TitioNoticeFacts) -> String? {
+        let title = clean(facts.title, max: 120)
+        let text = clean(facts.body, max: 300)
+        switch (title, text) {
+        case let (title?, text?): return clip("\(title): \(text)", max: previewMaxCharacters)
+        case let (nil, text?): return clip(text, max: previewMaxCharacters)
+        case let (title?, nil): return clip(title, max: previewMaxCharacters)
+        case (nil, nil): return nil
+        }
+    }
+
+    /// Trailing generic questions the card itself asks.
+    private static let cardRepeatedQuestions = [" O que deseja fazer?", " What should I do?", " Qual opção?", " Which option?"]
+
+    static func droppingTrailingQuestion(_ body: String, language: TitioNoticeLanguage) -> String {
+        for question in cardRepeatedQuestions where body.hasSuffix(question) {
+            return String(body.dropLast(question.count))
+        }
+        return body
+    }
+
+    /// The banner and push body (§8/§9) for a flushed message. It goes to the
+    /// relay, APNs and the lock screen, so it never carries the request
+    /// detail (a command or tool input can hold a secret), the run summary
+    /// (the agent's last message) or the question text: those stay in the
+    /// inbox message, which only syncs over the paired channel. An external
+    /// notice keeps the caller's own title and body, as today's banner did.
+    public static func bannerBody(_ items: [TitioNoticeRenderItem], language: TitioNoticeLanguage, catchUp: Bool = false, timeZone: TimeZone = .current) -> String {
+        guard items.count == 1, let item = items.first else {
+            return composeBatch(items, language: language, catchUp: catchUp, timeZone: timeZone)?.preview ?? ""
+        }
+        if item.kind == .external { return singlePreview(item, body: body(for: item, language: language, timeZone: timeZone)) }
+        var redacted = item
+        redacted.facts.detail = nil
+        redacted.facts.summary = nil
+        redacted.facts.prompt = nil
+        redacted.facts.options = nil
+        return preview(body(for: redacted, language: language, timeZone: timeZone))
     }
 
     /// A flushed batch: one item uses its single template; two or more become a
@@ -157,7 +225,9 @@ public enum TitioNoticeCopy {
         if catchUp {
             lines.append(pt ? "Enquanto o app estava fechado, ficou isso pendente:" : "While the app was closed, this was pending:")
         } else {
-            lines.append(pt ? "Enquanto você estava fora, rolou isso:" : "While you were away:")
+            // Digests are count-based, not idle-based: they fire while the
+            // user sits at the Mac, so the opener never claims they were away.
+            lines.append(pt ? "Algumas novidades:" : "A few updates:")
         }
         let maxBullets = TitioNoticeTiming.digestMaxBullets
         lines += ordered.prefix(maxBullets).map { "• " + digestLine($0, language: language) }
@@ -182,12 +252,24 @@ public enum TitioNoticeCopy {
             ]
         }
         let body = lines.joined(separator: "\n")
+        let headline = digestHeadline(ordered, language: language)
         guard let cardOptions, let owner = firstFailure else {
-            return TitioNoticeComposed(text: body, preview: preview(body), cardOptions: nil, cardOwnerKey: nil)
+            return TitioNoticeComposed(text: body, preview: headline, cardOptions: nil, cardOwnerKey: nil)
         }
         let block = choicesBlock(question: pt ? "O que deseja fazer?" : "What should I do?",
                                  options: cardOptions.compactMap(\.label), notice: owner.key)
-        return TitioNoticeComposed(text: body + "\n\n" + block, preview: preview(body), cardOptions: cardOptions, cardOwnerKey: owner.key)
+        return TitioNoticeComposed(text: body + "\n\n" + block, preview: headline, cardOptions: cardOptions, cardOwnerKey: owner.key)
+    }
+
+    /// One line that says what a digest holds (banner, push, pet, roster):
+    /// "3 novidades — Fix login: falhou · Deploy: concluída +1". The opener
+    /// alone ("A few updates:") would tell the user nothing.
+    static func digestHeadline(_ ordered: [TitioNoticeRenderItem], language: TitioNoticeLanguage) -> String {
+        let pt = language == .ptBR
+        let shown = ordered.prefix(2).map { "\(digestTitle($0, language: language)): \(digestState($0.kind, language: language))" }
+        let extra = ordered.count - shown.count
+        let head = pt ? "\(ordered.count) novidades — " : "\(ordered.count) updates — "
+        return clip(head + shown.joined(separator: " · ") + (extra > 0 ? " +\(extra)" : ""), max: previewMaxCharacters)
     }
 
     /// The message text for one notice, without any choices block.
@@ -239,13 +321,13 @@ public enum TitioNoticeCopy {
             return "\(bot.map { "**\($0)**" } ?? "A Bot") replied\(wsEn)" + (summary.map { ": “\($0)”" } ?? ".")
 
         case .approval:
-            let requestTitle = clean(f.requestTitle, max: 120)
-            let code = detail.map { $0.replacingOccurrences(of: "`", with: "'") }
-            let codePart = (code == nil || code == requestTitle) ? "" : " (`\(code!)`)"
+            let verb = approvalVerb(kind: f.requestKind, requestTitle: f.requestTitle, language: language)
+            let code = approvalSnippet(f.detail).map { $0.replacingOccurrences(of: "`", with: "'") }
+            let codePart = code.map { " (`\($0)`)" } ?? ""
             if pt {
-                return "Preciso que você decida uma coisa\(wsNoPt): o agente\(title.map { " de **\($0)**" } ?? "") quer \(requestTitle ?? "executar uma ação")\(codePart). O que deseja fazer?"
+                return "Preciso que você decida uma coisa\(wsNoPt): o agente\(title.map { " de **\($0)**" } ?? "") quer \(verb)\(codePart). O que deseja fazer?"
             }
-            return "I need you to decide something\(wsEn): the agent\(title.map { " on **\($0)**" } ?? "") wants to \(requestTitle ?? "take an action")\(codePart). What should I do?"
+            return "I need you to decide something\(wsEn): the agent\(title.map { " on **\($0)**" } ?? "") wants to \(verb)\(codePart). What should I do?"
 
         case .userInput:
             let prompt = clean(f.prompt, max: 200)
@@ -426,15 +508,79 @@ public enum TitioNoticeCopy {
         return "```choices\n" + (String(data: data, encoding: .utf8) ?? "{}") + "\n```"
     }
 
-    private static func cardQuestion(for item: TitioNoticeRenderItem, language: TitioNoticeLanguage) -> String {
+    /// Cards stack at the bottom of the inbox, away from their messages, so
+    /// each one names its subject: "elephant · Fix login: rodar um comando
+    /// (npm install)?" instead of a generic "O que deseja fazer?" that two
+    /// pending approvals would share.
+    static func cardQuestion(for item: TitioNoticeRenderItem, language: TitioNoticeLanguage) -> String {
         let pt = language == .ptBR
+        let f = item.facts
         let picksAnOption = item.actions?.contains {
             if case .providerOption = $0 { return true }
             if case .botOption = $0 { return true }
             return false
         } ?? false
-        if picksAnOption { return pt ? "Qual opção?" : "Which option?" }
-        return pt ? "O que deseja fazer?" : "What should I do?"
+        let generic = picksAnOption ? (pt ? "Qual opção?" : "Which option?") : (pt ? "O que deseja fazer?" : "What should I do?")
+        let named: String?
+        switch item.kind {
+        case .botQuestion, .botBlocked, .manualAction:
+            named = clean(f.botName, max: 60) ?? clean(f.title, max: 60)
+        default:
+            named = clean(f.title, max: 60)
+        }
+        let subject = [clean(f.workspaceName, max: 40), named].compactMap { $0 }.joined(separator: " · ")
+        let ask: String
+        switch item.kind {
+        case .approval:
+            let verb = approvalVerb(kind: f.requestKind, requestTitle: f.requestTitle, language: language)
+            ask = verb + (approvalSnippet(f.detail).map { " (\(clip($0, max: 60)))" } ?? "") + "?"
+        case .userInput, .botQuestion:
+            ask = clean(f.prompt ?? f.detail, max: 80) ?? generic
+        default:
+            ask = generic
+        }
+        guard !subject.isEmpty else { return ask }
+        return "\(subject): \(ask)"
+    }
+
+    /// What the agent wants to do, as a verb phrase from the request kind.
+    /// Provider titles ("Command approval", "Bash") are labels, not verbs, so
+    /// they never fill the verb slot; a tool name only names the tool.
+    static func approvalVerb(kind: String?, requestTitle: String?, language: TitioNoticeLanguage) -> String {
+        let pt = language == .ptBR
+        switch kind {
+        case "commandExecution", "exec":
+            return pt ? "rodar um comando" : "run a command"
+        case "fileChange", "applyPatch":
+            return pt ? "alterar arquivos" : "change files"
+        case "fileRead":
+            return pt ? "ler um arquivo" : "read a file"
+        case "authTokensRefresh":
+            return pt ? "renovar o acesso" : "refresh its sign-in"
+        case "toolUserInput", "dynamic":
+            if let tool = clean(requestTitle, max: 40), !tool.contains(" ") {
+                return pt ? "usar a ferramenta \(tool)" : "use the \(tool) tool"
+            }
+            return pt ? "usar uma ferramenta" : "use a tool"
+        default:
+            return pt ? "executar uma ação" : "take an action"
+        }
+    }
+
+    /// The command or path an approval is about, never a raw JSON dump: a
+    /// tool-input JSON object yields its `command` (or path/url/pattern).
+    static func approvalSnippet(_ detail: String?) -> String? {
+        guard let raw = detail?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        if raw.hasPrefix("{") {
+            guard let data = raw.data(using: .utf8),
+                  let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+            for key in ["command", "cmd", "file_path", "path", "url", "pattern"] {
+                if let text = object[key] as? String { return clean(text, max: 200) }
+                if let parts = object[key] as? [String] { return clean(parts.joined(separator: " "), max: 200) }
+            }
+            return nil
+        }
+        return clean(raw, max: 200)
     }
 
     // MARK: Digest
@@ -451,6 +597,10 @@ public enum TitioNoticeCopy {
     public static func digestLine(_ item: TitioNoticeRenderItem, language: TitioNoticeLanguage) -> String {
         let ws = clean(item.facts.workspaceName, max: 80).map { "**\($0)** · " } ?? ""
         let duration = item.facts.durationMs.map { " (\(self.duration(ms: $0, language: language)))" } ?? ""
+        // An external notice keeps the caller's own words, not a bare "ok".
+        if item.kind == .external, let body = clean(item.facts.body, max: 80) {
+            return "\(ws)\(digestTitle(item, language: language)): “\(body)”"
+        }
         return "\(ws)\(digestTitle(item, language: language)): \(digestState(item.kind, language: language))\(duration)"
     }
 
@@ -488,6 +638,8 @@ public enum TitioNoticeCopy {
         case .runCompleted: return pt ? "concluída" : "done"
         case .runInterrupted: return pt ? "interrompida" : "interrupted"
         case .approval, .userInput, .manualAction, .botQuestion, .fileConflict: return pt ? "precisa de você" : "needs you"
+        case .botReply: return pt ? "respondeu" : "replied"
+        case .external: return pt ? "aviso" : "notice"
         default: return kind.isFailure ? (pt ? "falhou" : "failed") : "ok"
         }
     }

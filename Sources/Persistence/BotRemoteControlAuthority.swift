@@ -1538,8 +1538,14 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             if authoritativeSend["host_consumed"] as? Bool == true,
                authoritativeSend["bot_id"] as? String == botID {
                 consumeAttachments(attachmentIDs)
+                // The full send identity, so a paired client decodes this as
+                // a delivered send (`BotSend.Result.Disposition.hostConsumed`)
+                // instead of a failed one it would put back in the composer.
                 var readback = authoritativeSend
                 readback["host_id"] = hostID
+                readback["bot_id"] = botID
+                readback["request_id"] = requestID
+                readback["client_request_id"] = requestID
                 var consumed = receipt(requestID: requestID, status: .completed, botID: botID, readback: readback)
                 consumed["host_id"] = hostID
                 consumed["client_request_id"] = requestID

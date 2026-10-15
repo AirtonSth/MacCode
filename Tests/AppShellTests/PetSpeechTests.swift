@@ -55,6 +55,7 @@ final class PetSpeechTests: XCTestCase {
         var spoken: [PetSpeech] = []
         var presentSucceeds = true
         var onClick: (() -> Void)?
+        var announced: [PetSpeech] = []
     }
 
     private func harness() -> Harness {
@@ -75,6 +76,7 @@ final class PetSpeechTests: XCTestCase {
         controller.dismiss = { box.dismissals.append($0) }
         controller.openRoute = { box.routes.append($0) }
         controller.onSpoke = { box.spoken.append($0) }
+        controller.announce = { box.announced.append($0) }
         return Harness(clock: clock, model: model, controller: controller, box: box)
     }
 
@@ -113,6 +115,42 @@ final class PetSpeechTests: XCTestCase {
             XCTAssertNil(h.model.speech, "\(urgency) leaves at 12 s")
         }
         XCTAssertEqual(h.clock.pendingTimerCount, 0, "no timer outlives its bubble")
+    }
+
+    func test_aNewBubbleIsAnnouncedToVoiceOver() {
+        // WHY: the bubble lives in a non-activating panel that never takes
+        // focus, so VoiceOver users never learned Titio spoke (banners are
+        // suppressed while RemoteCode is frontmost).
+        let h = harness()
+        let decision = speech(.decision, "Preciso que você decida uma coisa.")
+        h.controller.speak(decision)
+        XCTAssertEqual(h.box.announced, [decision])
+        h.box.inputs.inboxIsKeyDesk = true
+        h.controller.speak(speech(.info))
+        XCTAssertEqual(h.box.announced.count, 1, "a suppressed bubble is not announced either")
+    }
+
+    func test_theBubbleNeverExpiresUnderThePointer() {
+        // WHY: the TTL fired mid-hover, so the bubble vanished as the user
+        // reached for it. Hovering pauses it; leaving gives a short grace.
+        let h = harness()
+        h.controller.speak(speech(.info))
+        h.clock.advance(by: 5)
+        h.controller.setHovering(true)
+        h.clock.advance(by: 20)
+        XCTAssertNotNil(h.model.speech, "still up while the pointer is on it")
+        h.controller.setHovering(false)
+        h.clock.advance(by: PetSpeechController.hoverGrace - 0.1)
+        XCTAssertNotNil(h.model.speech, "a short grace after the pointer leaves")
+        h.clock.advance(by: 0.1)
+        XCTAssertNil(h.model.speech)
+    }
+
+    func test_theNeedsYouChipAgreesInNumber() {
+        // WHY: "1 need you" is wrong English in the pet popover and its tooltip.
+        XCTAssertEqual(PetAttentionCountFormatter.needYouText(badgeText: "1"), "1 needs you")
+        XCTAssertEqual(PetAttentionCountFormatter.needYouText(badgeText: "3"), "3 need you")
+        XCTAssertEqual(PetAttentionCountFormatter.needYouText(badgeText: "99+"), "99+ need you")
     }
 
     func test_newerInfoReplacesOlderInfoShownOrWaiting() {

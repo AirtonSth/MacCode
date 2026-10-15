@@ -1010,7 +1010,8 @@ public final class AppContext {
                         legacyActionTitle: "Approve: \(PetApprovalActionLabel.label(for: request.kind))",
                         requestTitle: request.title,
                         detail: request.detail,
-                        allowsSessionApproval: request.allowsSessionApproval
+                        allowsSessionApproval: request.allowsSessionApproval,
+                        requestKind: request.kind.rawValue
                     )
                 )
             case .requestResolved(let requestId, let state):

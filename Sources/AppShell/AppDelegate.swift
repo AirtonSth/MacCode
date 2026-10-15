@@ -1248,7 +1248,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             // binds inside the window resolves it before it posts (§4).
             if context.titioNoticeCenter.isEnabled(SettingsStore(db: context.db).load()) {
                 context.titioNoticeCenter.ingest(TitioNoticeFact(
-                    key: Self.petServerFailureID(server: server),
+                    // One row per failure: a listener that fails again after
+                    // a recovery must alert again. `sourceResolved` with the
+                    // base id resolves every open occurrence.
+                    key: TitioNoticeIDs.occurrence(
+                        of: Self.petServerFailureID(server: server),
+                        String(Int64(Date().timeIntervalSince1970 * 1_000))
+                    ),
                     kind: .serverListenerFailed,
                     facts: TitioNoticeFacts(
                         title: server,

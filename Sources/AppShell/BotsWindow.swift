@@ -3518,10 +3518,25 @@ public final class BotsViewModel: ObservableObject {
             }
         }
     }
-    /// Titio's Notifications conversation, once the notice hub resolved it.
-    var titioInboxConversationID: BotConversationID?
+    /// Titio's Notifications conversation. Seeded from the ledger at init so
+    /// a desk restored onto the inbox at launch mounts with its notice hooks;
+    /// a change rebuilds the desk embedding (its key carries `isTitioInbox`).
+    var titioInboxConversationID: BotConversationID? {
+        didSet {
+            guard oldValue != titioInboxConversationID else { return }
+            syncDeskAgentVM()
+        }
+    }
     /// Selecting the inbox on the Mac marks it read (hub spec §8 "Read state").
-    var onTitioInboxSelected: ((BotConversationID) -> Void)?
+    /// Installed once the hub resolves the inbox; a desk already showing the
+    /// inbox (restored at launch) is marked read then.
+    var onTitioInboxSelected: ((BotConversationID) -> Void)? {
+        didSet {
+            guard oldValue == nil, let inbox = titioInboxConversationID,
+                  selectedConversation?.id == inbox else { return }
+            onTitioInboxSelected?(inbox)
+        }
+    }
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
     /// Agent App VM pinned to the selected conversation's linked thread.
     @Published public private(set) var deskAgentVM: AgentAppViewModel?
@@ -3774,6 +3789,8 @@ public final class BotsViewModel: ObservableObject {
             recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
         context.botPeerHandoffAuthority.addObserver(self)
+        titioInboxConversationID = ((try? TitioNoticeRepository(db: context.db).inboxState())?.conversationID)
+            .flatMap(UUID.init(uuidString:)).map(BotConversationID.init)
         // Queued bot-thread sends can drain before any desk is opened.
         if let router { installBotQueueHooks(on: router) }
         restoreQueuedFollowUpsIfNeeded()
@@ -4638,8 +4655,8 @@ public final class BotsViewModel: ObservableObject {
 
     public func didEditStudioName(_ name: String) {
         var next = studioDraft
-        let followsName = next.slugFollowsName
-            ?? BotHandle.shouldFollowName(handle: next.handle, name: next.name)
+        let followsName = next.handle != TitioBot.handle && (next.slugFollowsName
+            ?? BotHandle.shouldFollowName(handle: next.handle, name: next.name))
         next.name = name
         if followsName, let derived = BotHandle.derive(from: name) {
             next.handle = derived
@@ -4709,7 +4726,10 @@ public final class BotsViewModel: ObservableObject {
             notificationsEnabled: bot.notificationsEnabled,
             desktopKind: resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace),
             expectedRevisionID: bot.currentRevisionID,
-            slugFollowsName: BotHandle.shouldFollowName(handle: bot.handle, name: bot.name),
+            // Titio's slug is how the app finds it: renaming Titio never
+            // derives a new slug from the name.
+            slugFollowsName: bot.handle == TitioBot.handle
+                ? false : BotHandle.shouldFollowName(handle: bot.handle, name: bot.name),
             verbosity: bot.verbosity,
             cavemanEnabled: bot.cavemanEnabled
         )
@@ -5485,7 +5505,7 @@ public final class BotsViewModel: ObservableObject {
                 throw BotStoreError.notFound
             }
             let renamed: BotDefinition
-            if let normalized = BotHandle.normalize(handle), normalized != bot.handle {
+            if let normalized = BotHandle.normalize(handle), normalized != bot.handle, bot.handle != TitioBot.handle {
                 do {
                     renamed = try botStore.renameHandle(id: botID, handle: normalized)
                 } catch {
@@ -6271,6 +6291,14 @@ public final class BotsViewModel: ObservableObject {
         flushPendingDraftPersistence()
     }
 
+    /// Who sent a host message. Only the paired device's own `bot.send` (the
+    /// user typing on iOS) may answer a Titio notice by text; agent host tools
+    /// (`rc_bot_send` / `rc_bot_delegate`), routines and acts never can.
+    enum HostSendOrigin: Equatable {
+        case host
+        case pairedClient
+    }
+
     /// Host-catalog Bot sends use the same persisted user line, compiled Bot
     /// brain, routing, provider start, and follow-through as a Desk send. They
     /// never change the user's currently selected Bot or conversation.
@@ -6280,7 +6308,8 @@ public final class BotsViewModel: ObservableObject {
         conversationID: BotConversationID?,
         attachments: [AgentAttachment] = [],
         routing explicitRouting: BotDeskRouting? = nil,
-        adoptAsDeskRoute: Bool = false
+        adoptAsDeskRoute: Bool = false,
+        origin: HostSendOrigin = .host
     ) throws -> JSONValue {
         guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
             throw BotStoreError.notFound
@@ -6297,9 +6326,17 @@ public final class BotsViewModel: ObservableObject {
                   existing.botID == bot.id, existing.groupID == nil else {
                 throw BotStoreError.notFound
             }
-            if existing.id == titioInboxConversationID, attachments.isEmpty,
-               let consumed = interceptTitioInboxSend(bot: bot, conversation: existing, text: message) {
-                return consumed
+            if existing.id == titioInboxConversationID {
+                // An LLM must never approve or answer for the user (§0.2):
+                // only the paired user's own text may reach the intercept,
+                // and nothing else may write into the inbox as the user.
+                guard origin == .pairedClient else {
+                    throw BotStoreError.invalidRow("Titio's Notifications inbox only takes messages from you.")
+                }
+                if attachments.isEmpty,
+                   let consumed = interceptTitioInboxSend(bot: bot, conversation: existing, text: message) {
+                    return consumed
+                }
             }
             if let threadID = existing.linkedAgentThreadID,
                let activeRunID = context.coordinator.activeRunId(threadId: threadID) {

@@ -213,7 +213,8 @@ public final class PetController {
                 speech,
                 reduceMotion: self.model.settings.petReduceMotion
                     || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
-                onClick: onClick
+                onClick: onClick,
+                onHover: { [weak self] hovering in self?.speechController.setHovering(hovering) }
             )
         }
         speechController.dismiss = { [weak self] animated in

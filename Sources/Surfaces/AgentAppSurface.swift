@@ -7196,6 +7196,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Bot reply style (```choices blocks shown as a card) applies to Bot
+    /// threads only: the Bot desk, or a thread a Bot runs. A plain Agent App
+    /// reply that quotes a ```choices fence keeps it as written.
+    public var showsBotChoices: Bool {
+        embedding != nil || selectedRunActor.botID != nil
+    }
+
     var linkedBotVMRequiresFullAccess: Bool {
         guard selectedRunActor.botID != nil,
               let selectedThreadId,
@@ -15558,7 +15565,14 @@ public struct AgentAppView: View {
             }
             backgroundAwaitBanner
             pendingCallbackRows
-            choicesCardRow
+            // The card reads the composer draft and the transcript, which
+            // publish on their own objects (not the VM): observe both here so
+            // typing a draft disables the card and new replies refresh it.
+            ComposerReactiveScope(composerState: vm.composerState) {
+                TranscriptReactiveScope(transcriptState: vm.transcriptState) {
+                    choicesCardRow
+                }
+            }
             // A failed page read stays on screen with Retry; the transcript
             // above shows no "No messages" for it. No dismiss: without the
             // strip the unread thread would be a blank column with no Retry.
@@ -16302,10 +16316,10 @@ public struct AgentAppView: View {
     @ViewBuilder
     private var choicesCardRow: some View {
         noticeCardStack
-        if let pending = AgentChatChoicesCard.Pending.latest(
+        if vm.showsBotChoices,
+           let pending = AgentChatChoicesCard.Pending.latest(
             in: vm.messages,
-            isRunning: vm.hasRunningWorkForChrome,
-            excludingNotices: vm.embedding?.noticeChoiceHandler != nil
+            isRunning: vm.hasRunningWorkForChrome
         ), !dismissedChoices.contains(pending.messageID) {
             AgentChatChoicesCard(
                 choices: pending.choices,
@@ -16315,6 +16329,9 @@ public struct AgentAppView: View {
                 isBlockedByDraft: !vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     || !vm.attachments.isEmpty,
                 onAnswer: { answer in
+                    // Re-checked at tap time: never overwrite a draft.
+                    guard vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                          vm.attachments.isEmpty else { return }
                     vm.prompt = answer
                     Task { await vm.send() }
                 },
@@ -16915,8 +16932,11 @@ public struct AgentAppView: View {
         // R4-B: live streaming rows pass cacheMarkdown: false so growing partials
         // do not thrash AgentMessageMarkdown NSCache occupancy.
         AgentMessageMarkdownView(
-            // A ready-made answers block shows as the choices card instead.
-            text: BotChoicesBlock.parse(BackgroundAwaitContinuation.strippingAwaitingMarker(text)).text,
+            // A ready-made answers block shows as the choices card instead
+            // (Bot threads only: a plain agent reply is shown as written).
+            text: vm.showsBotChoices
+                ? BotChoicesBlock.parse(BackgroundAwaitContinuation.strippingAwaitingMarker(text)).text
+                : BackgroundAwaitContinuation.strippingAwaitingMarker(text),
             cacheResults: cacheMarkdown
         )
             .foregroundColor(DS.Palette.text)
@@ -17309,6 +17329,7 @@ public struct AgentAppView: View {
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
                         onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
+                        stripsChoices: vm.showsBotChoices,
                         content: AnyView(
                             VStack(alignment: .leading, spacing: DS.Space.xs) {
                                 AgentChatPeerIdentityHeader(
@@ -17333,7 +17354,8 @@ public struct AgentAppView: View {
                         roleIdentifier: "agent.role.assistant",
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
-                        onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil
+                        onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
+                        stripsChoices: vm.showsBotChoices
                     )
                 }
             }
@@ -17517,6 +17539,7 @@ public struct AgentAppView: View {
             copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
             branchIdentifier: "agent.assistantMessage.branch.\(turn.turnId)",
             onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(turn.turnId) } : nil,
+            stripsChoices: vm.showsBotChoices,
             content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
         )
     }

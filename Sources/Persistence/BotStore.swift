@@ -382,6 +382,11 @@ public final class BotStore: @unchecked Sendable {
                 throw BotStoreError.notFound
             }
             if bot.handle == normalized { return bot }
+            // Titio is found by its slug (pet, inbox, notice hub): a rename
+            // would orphan it and make a second Titio on the next launch.
+            if bot.handle == TitioIdentity.handle {
+                throw BotStoreError.invalidRow("Titio's slug is fixed.")
+            }
             try assertHandleAvailable(normalized, excluding: bot.handle, database: db)
             let updateBot = try db.prepare(
                 "UPDATE bots SET handle = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL;"

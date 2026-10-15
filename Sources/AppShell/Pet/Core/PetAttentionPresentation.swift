@@ -171,6 +171,11 @@ public enum PetAttentionCountFormatter {
         return count > 99 ? "99+" : String(count)
     }
 
+    /// "1 needs you" / "3 need you" / "99+ need you" from a badge text.
+    public static func needYouText(badgeText: String) -> String {
+        badgeText == "1" ? "1 needs you" : "\(badgeText) need you"
+    }
+
     public static func accessibilityValue(count: Int) -> String {
         switch max(0, count) {
         case 0: return "No items need attention"

@@ -280,7 +280,7 @@ private struct PetSpriteView: View {
                     Spacer(minLength: 0)
                     if let badge = model.badgeText {
                         PetCountDot(text: badge, color: .red)
-                            .help("\(badge) need you")
+                            .help(PetAttentionCountFormatter.needYouText(badgeText: badge))
                     }
                 }
                 Spacer(minLength: 0)
@@ -447,7 +447,9 @@ private struct PetAttentionPopoverView: View {
                 }
                 if counts.needsYou > 0 {
                     statusChip(
-                        text: "\(PetAttentionCountFormatter.badgeText(count: counts.needsYou, isEnabled: true) ?? "\(counts.needsYou)") need you",
+                        text: PetAttentionCountFormatter.needYouText(
+                            badgeText: PetAttentionCountFormatter.badgeText(count: counts.needsYou, isEnabled: true) ?? "\(counts.needsYou)"
+                        ),
                         color: .red,
                         identifier: "pet.status.needsYou"
                     )
@@ -998,7 +1000,12 @@ public final class PetWindowController: NSObject {
     /// Shows Titio's speech bubble next to the pet, in its own window. False
     /// when the pet is not on screen to speak from.
     @discardableResult
-    func showSpeech(_ speech: PetSpeech, reduceMotion: Bool, onClick: @escaping () -> Void) -> Bool {
+    func showSpeech(
+        _ speech: PetSpeech,
+        reduceMotion: Bool,
+        onClick: @escaping () -> Void,
+        onHover: @escaping (Bool) -> Void = { _ in }
+    ) -> Bool {
         guard isVisible, !isPopoverVisible,
               let anchor = petPanel?.frame,
               let screen = popoverTargetScreen() else { return false }
@@ -1009,7 +1016,8 @@ public final class PetWindowController: NSObject {
             anchorFrame: anchor,
             visibleFrame: screen.visibleFrame,
             reduceMotion: reduceMotion,
-            onClick: onClick
+            onClick: onClick,
+            onHover: onHover
         )
         return true
     }

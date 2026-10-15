@@ -340,8 +340,27 @@ private struct PetSpeechBubbleCard: View {
 /// click works while another app is active, and never becomes key.
 final class PetSpeechHostingView: NSHostingView<PetSpeechBubbleView> {
     var onClick: (() -> Void)?
+    /// The pointer entered (true) or left (false) the bubble.
+    var onHoverChanged: ((Bool) -> Void)?
+    private var hoverArea: NSTrackingArea?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { onHoverChanged?(true) }
+    override func mouseExited(with event: NSEvent) { onHoverChanged?(false) }
 
     override func mouseDown(with event: NSEvent) {}
 
@@ -366,6 +385,7 @@ final class PetSpeechPanel {
     private var speech: PetSpeech?
     private var reduceMotion = false
     private var onClick: (() -> Void)?
+    private var onHover: ((Bool) -> Void)?
     /// Latest-wins: a fade-out that finishes after a newer show must not hide it.
     private var generation = 0
 
@@ -378,12 +398,14 @@ final class PetSpeechPanel {
         anchorFrame: CGRect,
         visibleFrame: CGRect,
         reduceMotion: Bool,
-        onClick: @escaping () -> Void
+        onClick: @escaping () -> Void,
+        onHover: @escaping (Bool) -> Void = { _ in }
     ) {
         generation &+= 1
         self.speech = speech
         self.reduceMotion = reduceMotion
         self.onClick = onClick
+        self.onHover = onHover
         let window = ensureWindow()
         layout(anchorFrame: anchorFrame, visibleFrame: visibleFrame)
         window.alphaValue = 1
@@ -469,6 +491,7 @@ final class PetSpeechPanel {
             window.contentView = hosting
         }
         hosting.onClick = click
+        hosting.onHoverChanged = { [weak self] hovering in self?.onHover?(hovering) }
         hosting.layoutSubtreeIfNeeded()
         let size = hosting.fittingSize
         let placement = PetPopoverPlacement.resolve(
@@ -526,6 +549,26 @@ final class PetSpeechController {
     private(set) var queue = PetSpeechQueue()
     private var cancelTimer: (() -> Void)?
     private var timerGeneration = 0
+    /// The pointer is over the bubble: it never expires under the pointer.
+    private(set) var isHovering = false
+    /// After the pointer leaves an expired bubble, it stays this long.
+    static let hoverGrace: TimeInterval = 2
+
+    /// The bubble appears in a non-activating panel that never takes focus,
+    /// so VoiceOver would not notice it: announce it (decisions first).
+    static let liveAnnounce: (PetSpeech) -> Void = { speech in
+        guard let app = NSApp else { return }
+        let priority: NSAccessibilityPriorityLevel = speech.urgency == .info ? .medium : .high
+        NSAccessibility.post(
+            element: app,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: "Titio: \(speech.text)",
+                .priority: priority.rawValue,
+            ]
+        )
+    }
+    var announce: (PetSpeech) -> Void = PetSpeechController.liveAnnounce
 
     /// The suppression inputs for a speech about this conversation.
     var inputs: (BotConversationID) -> PetSpeechSuppression.Inputs = { _ in
@@ -572,6 +615,7 @@ final class PetSpeechController {
     }
 
     func clear(animated: Bool) {
+        isHovering = false
         queue.clear()
         cancelTimer?()
         cancelTimer = nil
@@ -595,19 +639,34 @@ final class PetSpeechController {
             return
         }
         onSpoke(current)
+        announce(current)
         armTimer()
     }
 
-    private func armTimer() {
+    /// Hovering pauses the TTL; leaving re-arms it, with `hoverGrace` left at
+    /// least, so the bubble never vanishes as the user reaches for it.
+    func setHovering(_ hovering: Bool) {
+        guard hovering != isHovering else { return }
+        isHovering = hovering
+        if hovering {
+            cancelTimer?()
+            cancelTimer = nil
+            timerGeneration &+= 1
+        } else if queue.current != nil {
+            armTimer(minimumDelay: Self.hoverGrace)
+        }
+    }
+
+    private func armTimer(minimumDelay: TimeInterval = 0) {
         cancelTimer?()
         timerGeneration &+= 1
         let owner = timerGeneration
-        guard let expiresAt = queue.currentExpiresAt else {
+        guard !isHovering, let expiresAt = queue.currentExpiresAt else {
             cancelTimer = nil
             return
         }
-        cancelTimer = schedule(max(0, expiresAt.timeIntervalSince(now()))) { [weak self] in
-            guard let self, self.timerGeneration == owner else { return }
+        cancelTimer = schedule(max(minimumDelay, expiresAt.timeIntervalSince(now()))) { [weak self] in
+            guard let self, self.timerGeneration == owner, !self.isHovering else { return }
             if self.queue.advance(now: self.now()) {
                 self.showCurrent()
             } else {

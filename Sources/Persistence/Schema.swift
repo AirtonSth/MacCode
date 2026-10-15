@@ -1870,6 +1870,7 @@ public enum Schema {
         );
         CREATE INDEX IF NOT EXISTS idx_titio_notices_state ON titio_notices(state, occurred_at);
         CREATE INDEX IF NOT EXISTS idx_titio_notices_message ON titio_notices(message_id);
+        CREATE INDEX IF NOT EXISTS idx_titio_notices_posted ON titio_notices(posted_at);
         CREATE TABLE IF NOT EXISTS titio_inbox_state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             conversation_id TEXT,

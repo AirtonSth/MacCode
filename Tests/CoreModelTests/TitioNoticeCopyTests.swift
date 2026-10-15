@@ -39,8 +39,11 @@ final class TitioNoticeCopyTests: XCTestCase {
             (.botReply, TitioNoticeFacts(workspaceName: "api", botName: "Scout", summary: "Sent the report."),
              "O **Scout** respondeu no **api**: “Sent the report.”",
              "**Scout** replied in **api**: “Sent the report.”"),
-            (.approval, TitioNoticeFacts(title: "Deploy", workspaceName: "api", detail: "rm -rf build", requestTitle: "run a command"),
-             "Preciso que você decida uma coisa no **api**: o agente de **Deploy** quer run a command (`rm -rf build`). O que deseja fazer?",
+            // The provider title ("Command approval") is a label, never the
+            // verb: the request kind is (real Codex/Claude input below).
+            (.approval, TitioNoticeFacts(title: "Deploy", workspaceName: "api", detail: "rm -rf build",
+                                         requestTitle: "Command approval", requestKind: "commandExecution"),
+             "Preciso que você decida uma coisa no **api**: o agente de **Deploy** quer rodar um comando (`rm -rf build`). O que deseja fazer?",
              "I need you to decide something in **api**: the agent on **Deploy** wants to run a command (`rm -rf build`). What should I do?"),
             (.userInput, ask,
              "O agente de **Deploy** no **api** perguntou: *Which DB?* Qual opção?",
@@ -179,18 +182,55 @@ final class TitioNoticeCopyTests: XCTestCase {
                             actions: TitioNoticeAction.defaultActions(kind: .approval, facts: TitioNoticeFacts()))
         let composed = TitioNoticeCopy.compose(approval, language: .ptBR, timeZone: utc)
         let parsed = BotChoicesBlock.parse(composed.text)
-        XCTAssertEqual(parsed.text, TitioNoticeCopy.body(for: approval, language: .ptBR, timeZone: utc))
+        // The card asks; the body above it does not end with the same question.
+        XCTAssertEqual(parsed.text, "Preciso que você decida uma coisa no **api**: o agente de **Deploy** quer executar uma ação (`make ship`).")
         XCTAssertEqual(parsed.choices?.notice, "thread.T.attention.R")
-        XCTAssertEqual(parsed.choices?.question, "O que deseja fazer?")
-        XCTAssertEqual(parsed.choices?.options, ["Aprovar", "Aprovar nesta sessão", "Recusar", "Abrir conversa"])
-        XCTAssertEqual(composed.cardOptions?.map(\.action), [.approve, .approveSession, .decline, .openThread])
+        // Stacked cards sit away from their messages: each names its subject.
+        XCTAssertEqual(parsed.choices?.question, "api · Deploy: executar uma ação (make ship)?")
+        // No one-tap "Approve for session": it grants thread-wide Full Access,
+        // which both Agent Apps only allow behind a confirmation.
+        XCTAssertEqual(parsed.choices?.options, ["Aprovar", "Recusar", "Abrir conversa"])
+        XCTAssertEqual(composed.cardOptions?.map(\.action), [.approve, .decline, .openThread])
         XCTAssertEqual(composed.cardOptions?.compactMap(\.label), parsed.choices?.options)
         XCTAssertEqual(composed.cardOwnerKey, "thread.T.attention.R")
         XCTAssertEqual(composed.preview,
-                       "Preciso que você decida uma coisa no api: o agente de Deploy quer executar uma ação (make ship). O que deseja fazer?")
+                       "Preciso que você decida uma coisa no api: o agente de Deploy quer executar uma ação (make ship).")
 
         let en = TitioNoticeCopy.compose(approval, language: .en, timeZone: utc)
-        XCTAssertEqual(BotChoicesBlock.parse(en.text).choices?.options, ["Approve", "Approve for session", "Decline", "Open thread"])
+        XCTAssertEqual(BotChoicesBlock.parse(en.text).choices?.options, ["Approve", "Decline", "Open thread"])
+    }
+
+    func test_twoStackedApprovalCardsNameTheirOwnSubject() {
+        // WHY: open decision cards stack at the bottom of the inbox; with one
+        // generic question two approvals look identical and the user can
+        // approve the wrong command.
+        let actions = TitioNoticeAction.defaultActions(kind: .approval, facts: TitioNoticeFacts())
+        let first = item(.approval, TitioNoticeFacts(title: "Fix login", workspaceName: "elephant", detail: "rm -rf build",
+                                                     requestKind: "commandExecution"), key: "a", actions: actions)
+        let second = item(.approval, TitioNoticeFacts(title: "Release", workspaceName: "api", detail: "git push --force",
+                                                      requestKind: "commandExecution"), key: "b", actions: actions)
+        let q1 = BotChoicesBlock.parse(TitioNoticeCopy.compose(first, language: .ptBR, timeZone: utc).text).choices?.question
+        let q2 = BotChoicesBlock.parse(TitioNoticeCopy.compose(second, language: .ptBR, timeZone: utc).text).choices?.question
+        XCTAssertEqual(q1, "elephant · Fix login: rodar um comando (rm -rf build)?")
+        XCTAssertEqual(q2, "api · Release: rodar um comando (git push --force)?")
+        XCTAssertNotEqual(q1, q2)
+    }
+
+    func test_approvalVerbComesFromTheRequestKindAndJSONDetailsShowOnlyTheCommand() {
+        // WHY: providers send labels ("Command approval", "File change
+        // approval", the tool name "Bash") and Claude sends the raw tool-input
+        // JSON as detail. Dropped into the sentence they read as "quer Command
+        // approval (`{"command":…`)": broken copy on every approval.
+        let codex = item(.approval, TitioNoticeFacts(title: "Fix", workspaceName: "api", detail: "npm install",
+                                                     requestTitle: "File change approval", requestKind: "fileChange"))
+        XCTAssertEqual(TitioNoticeCopy.body(for: codex, language: .ptBR, timeZone: utc),
+                       "Preciso que você decida uma coisa no **api**: o agente de **Fix** quer alterar arquivos (`npm install`). O que deseja fazer?")
+        let claude = item(.approval, TitioNoticeFacts(title: "Fix", workspaceName: "api",
+                                                      detail: #"{"command":"rm -rf build","description":"clean"}"#,
+                                                      requestTitle: "Bash", requestKind: "dynamic"))
+        XCTAssertEqual(TitioNoticeCopy.body(for: claude, language: .en, timeZone: utc),
+                       "I need you to decide something in **api**: the agent on **Fix** wants to use the Bash tool (`rm -rf build`). What should I do?")
+        XCTAssertNil(TitioNoticeCopy.approvalSnippet(#"{"description":"no command here"}"#), "never a raw JSON dump")
     }
 
     func test_duplicateLabelsAreDroppedSoOptionIndexesStayAligned() {
@@ -203,7 +243,8 @@ final class TitioNoticeCopyTests: XCTestCase {
         let parsed = try? XCTUnwrap(BotChoicesBlock.parse(composed.text).choices)
         XCTAssertEqual(parsed?.options, ["Abrir conversa", "Yes"])
         XCTAssertEqual(composed.cardOptions?.map(\.action), [.providerOption(index: 0, text: "Abrir conversa"), .providerOption(index: 1, text: "Yes")])
-        XCTAssertEqual(parsed?.question, "Qual opção?")
+        // The card names the question it answers (it sits away from its message).
+        XCTAssertEqual(parsed?.question, "Pick")
     }
 
     func test_defaultCardsMatchTheSpecTable() {
@@ -211,6 +252,8 @@ final class TitioNoticeCopyTests: XCTestCase {
         let none = TitioNoticeFacts()
         XCTAssertEqual(TitioNoticeAction.defaultActions(kind: .runFailed, facts: none), [.openThread, .ack])
         XCTAssertEqual(TitioNoticeAction.defaultActions(kind: .runInterrupted, facts: none), [.continue, .openThread, .ack])
+        XCTAssertEqual(TitioNoticeAction.defaultActions(kind: .approval, facts: none), [.approve, .decline, .openThread],
+                       "no one-tap Approve for session: it grants Full Access, which needs a confirmation")
         XCTAssertEqual(TitioNoticeAction.defaultActions(kind: .userInput, facts: none), [.replyHere, .openThread])
         XCTAssertNil(TitioNoticeAction.defaultActions(kind: .userInput, facts: TitioNoticeFacts(isSecret: true)))
         XCTAssertNil(TitioNoticeAction.defaultActions(kind: .userInput, facts: TitioNoticeFacts(options: ["a", "b"], questionCount: 2)))
@@ -258,8 +301,10 @@ final class TitioNoticeCopyTests: XCTestCase {
             run("run.b.failed", .runFailed, "Deploy", "web", minute: 1),
         ]
         let pt = TitioNoticeCopy.composeBatch(items, language: .ptBR, timeZone: utc)
+        // Digests are count-based (they fire while the user is at the Mac),
+        // so the opener never claims the user was away.
         XCTAssertEqual(pt?.text, """
-            Enquanto você estava fora, rolou isso:
+            Algumas novidades:
             • **web** · Deploy: falhou
             • **api** · Build: concluída (2 min)
             Se quiser, abro a **Deploy**.
@@ -270,11 +315,12 @@ final class TitioNoticeCopyTests: XCTestCase {
             """)
         XCTAssertEqual(pt?.cardOwnerKey, "run.b.failed")
         XCTAssertEqual(pt?.cardOptions?.map(\.action), [.openThread, .openAllActivity])
-        XCTAssertEqual(pt?.preview, "Enquanto você estava fora, rolou isso:")
+        // The banner/push/pet/roster line says what happened, not just the opener.
+        XCTAssertEqual(pt?.preview, "2 novidades — Deploy: falhou · Build: concluída")
 
         let en = TitioNoticeCopy.composeBatch(items, language: .en, timeZone: utc)
         XCTAssertEqual(en?.text, """
-            While you were away:
+            A few updates:
             • **web** · Deploy: failed
             • **api** · Build: done (2 min)
             Want me to open **Deploy**?
@@ -399,7 +445,78 @@ final class TitioNoticeCopyTests: XCTestCase {
         XCTAssertEqual(TitioNoticeCopy.language(lastUserText: "ok", preferredLanguages: ["en-US"]), .en, "\"ok\" is ambiguous")
     }
 
+    func test_languageWalksBackPastShortRepliesAndCardTaps() {
+        // WHY (§16): the owner writes Portuguese on an English macOS. A card tap
+        // is stored as a user row with its label ("PostgreSQL", "Got it") and
+        // a short reply ("ok") is ambiguous: neither may flip every later
+        // notice to English. The newest confident message decides.
+        let recent = ["Got it", "PostgreSQL", "ok", "roda os testes de novo por favor, valeu"]
+        XCTAssertEqual(TitioNoticeCopy.language(recentUserTexts: recent, excluding: ["Got it", "PostgreSQL"],
+                                                preferredLanguages: ["en-US"]), .ptBR)
+        XCTAssertEqual(TitioNoticeCopy.language(recentUserTexts: ["ok"], excluding: [], preferredLanguages: ["en-US"]), .en,
+                       "no confident message: the system language")
+        XCTAssertEqual(TitioNoticeCopy.language(recentUserTexts: ["can you check the build again please?", "roda os testes"],
+                                                excluding: [], preferredLanguages: ["pt-BR"]), .en,
+                       "the newest confident message wins")
+    }
+
+    // MARK: Banner and push body
+
+    func test_bannerAndPushBodyNeverCarryTheCommandSummaryOrPrompt() {
+        // WHY: the banner/push body goes to the relay, APNs and the lock
+        // screen. A command or tool input can hold a secret (an API key in an
+        // `export` or an auth header), the summary is the agent's last
+        // message, the prompt is the question: those stay in the inbox.
+        let secret = "export OPENAI_API_KEY=sk-live-123"
+        let approval = item(.approval, TitioNoticeFacts(title: "Deploy", workspaceName: "api", detail: secret,
+                                                        requestKind: "commandExecution"))
+        let failed = item(.runFailed, TitioNoticeFacts(title: "Deploy", workspaceName: "api", summary: "token sk-live-123 rejected"))
+        let question = item(.userInput, TitioNoticeFacts(title: "Deploy", workspaceName: "api", prompt: "Paste the sk-live-123 key?"))
+        let bot = item(.botQuestion, TitioNoticeFacts(botName: "Scout", detail: "Use key sk-live-123?"))
+        for (notice, language) in [(approval, TitioNoticeLanguage.ptBR), (failed, .en), (question, .ptBR), (bot, .en)] {
+            let body = TitioNoticeCopy.bannerBody([notice], language: language, timeZone: utc)
+            XCTAssertFalse(body.contains("sk-live-123"), "\(notice.kind) leaked into the push: \(body)")
+            XCTAssertFalse(body.isEmpty)
+        }
+        XCTAssertEqual(TitioNoticeCopy.bannerBody([approval], language: .ptBR, timeZone: utc),
+                       "Preciso que você decida uma coisa no api: o agente de Deploy quer rodar um comando. O que deseja fazer?")
+    }
+
+    func test_externalNoticeKeepsTheCallersBodyInItsPreviewAndBanner() {
+        // WHY: `rc notify --title Build --body "All 300 tests passed"` showed
+        // the body in today's banner; the template puts it on line 2, so a
+        // first-line preview alone would drop it.
+        let external = item(.external, TitioNoticeFacts(title: "Build", body: "All 300 tests passed"))
+        XCTAssertEqual(TitioNoticeCopy.compose(external, language: .ptBR, timeZone: utc).preview, "Build: All 300 tests passed")
+        XCTAssertEqual(TitioNoticeCopy.bannerBody([external], language: .en, timeZone: utc), "Build: All 300 tests passed")
+    }
+
+    func test_digestLinesSayWhatHappenedForBotRepliesAndExternalNotices() {
+        // WHY: "Muse: ok" or "Build: ok" says nothing; a Bot replied, and an
+        // external notice carries the caller's own words.
+        let reply = item(.botReply, TitioNoticeFacts(botName: "Muse", summary: "Sent it."), key: "bot.reply.r")
+        let external = item(.external, TitioNoticeFacts(title: "Build", body: "All green"), key: "notification.n")
+        XCTAssertEqual(TitioNoticeCopy.digestLine(reply, language: .ptBR), "Muse: respondeu")
+        XCTAssertEqual(TitioNoticeCopy.digestLine(external, language: .en), "Build: “All green”")
+        XCTAssertEqual(TitioNoticeCopy.bannerBody([reply, external], language: .en, timeZone: utc),
+                       "2 updates — Muse: replied · Build: notice")
+    }
+
     // MARK: Ids and keys
+
+    func test_requestAndStatefulAlertKeysAreOneRowPerOccurrence() {
+        // WHY: a finished row is frozen. Keyed by the source alone, a second
+        // SSH drop after a flap, or a provider request id recycled after a
+        // restart, would hit the old row and post nothing (or a stale card
+        // would answer the new request). Occurrences share the base key, so a
+        // resolution by source still finds them.
+        let first = TitioNoticeIDs.threadAttention(threadId: "T", requestId: "2", runId: "R1")
+        let second = TitioNoticeIDs.threadAttention(threadId: "T", requestId: "2", runId: "R2")
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(TitioNoticeIDs.baseKey(of: first), "thread.T.attention.2")
+        XCTAssertTrue(first.hasPrefix(TitioNoticeIDs.threadAttention(threadId: "T", requestId: "2") + TitioNoticeIDs.occurrenceSeparator))
+        XCTAssertEqual(TitioNoticeIDs.baseKey(of: "run.R.failed"), "run.R.failed")
+    }
 
     func test_messageIdsAreDeterministicUUIDv5() {
         // WHY (§3): deterministic ids make the message append idempotent across

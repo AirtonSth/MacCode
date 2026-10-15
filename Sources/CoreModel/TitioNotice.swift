@@ -169,8 +169,12 @@ public struct TitioNoticeFacts: Codable, Equatable, Sendable {
     public var summary: String?
     /// Request detail (command, manual-action detail, Bot question, block reason).
     public var detail: String?
-    /// Provider request title for approvals ("what the agent wants to do").
+    /// Provider request title for approvals (a provider label such as
+    /// "Command approval" or a tool name; never put in a verb slot).
     public var requestTitle: String?
+    /// `AssistantRequestKind` raw value of an approval (commandExecution,
+    /// fileChange…): the copy turns it into a localized verb phrase.
+    public var requestKind: String?
     /// The provider's question text for user input.
     public var prompt: String?
     /// External notification body.
@@ -190,6 +194,7 @@ public struct TitioNoticeFacts: Codable, Equatable, Sendable {
         summary: String? = nil,
         detail: String? = nil,
         requestTitle: String? = nil,
+        requestKind: String? = nil,
         prompt: String? = nil,
         body: String? = nil,
         exitCode: Int? = nil,
@@ -205,6 +210,7 @@ public struct TitioNoticeFacts: Codable, Equatable, Sendable {
         self.summary = summary
         self.detail = detail
         self.requestTitle = requestTitle
+        self.requestKind = requestKind
         self.prompt = prompt
         self.body = body
         self.exitCode = exitCode
@@ -222,6 +228,7 @@ public struct TitioNoticeFacts: Codable, Equatable, Sendable {
         case summary
         case detail
         case requestTitle = "request_title"
+        case requestKind = "request_kind"
         case prompt
         case body
         case exitCode = "exit_code"
@@ -351,7 +358,11 @@ public enum TitioNoticeAction: Codable, Equatable, Hashable, Sendable {
         case .runInterrupted:
             return [.continue, .openThread, .ack]
         case .approval:
-            return [.approve, .approveSession, .decline, .openThread]
+            // No "Approve for session" on the card: it switches the whole
+            // thread to Full Access, which both Agent Apps only grant behind
+            // an explicit "Allow full access" confirmation. A one-tap card
+            // (or an exact-text reply) must never skip that gate.
+            return [.approve, .decline, .openThread]
         case .userInput:
             switch facts.userInputShape {
             case .options:
@@ -532,6 +543,10 @@ public enum TitioNoticeTiming {
     public static let retention: TimeInterval = 30 * 24 * 60 * 60
     /// Open notice cards stacked at the bottom of the transcript before "+N open decisions".
     public static let openNoticeCardsMax = 3
+    /// Bot attention items older than this never become a notice: the first
+    /// pass after an upgrade must not turn a weeks-old backlog into a burst of
+    /// messages, banners and pushes (those items stay in Activity).
+    public static let attentionMaxAge: TimeInterval = 24 * 60 * 60
 }
 
 /// Deterministic ids and source keys (§3).
@@ -575,7 +590,31 @@ public enum TitioNoticeIDs {
     public enum RunOutcome: String, Sendable { case completed, failed, interrupted }
 
     public static func runOutcome(runId: String, outcome: RunOutcome) -> String { "run.\(runId).\(outcome.rawValue)" }
+    /// The request's base key. Resolutions use it; `sourceResolved` also
+    /// resolves every occurrence (`base#…`) of it.
     public static func threadAttention(threadId: String, requestId: String) -> String { "thread.\(threadId).attention.\(requestId)" }
+    /// One request instance: provider request ids are per-process JSON-RPC
+    /// ids that restart after a provider or app restart, so the run id
+    /// keeps a recycled id from landing on an older request's row.
+    public static func threadAttention(threadId: String, requestId: String, runId: String) -> String {
+        occurrence(of: threadAttention(threadId: threadId, requestId: requestId), runId)
+    }
+
+    /// Separates a stateful source key from one occurrence of it.
+    public static let occurrenceSeparator = "#"
+
+    /// One occurrence of a stateful source (an SSH surface that drops again,
+    /// a second conflict in the same edit session, a recycled request id).
+    /// A finished row never blocks a later occurrence of the same source.
+    public static func occurrence(of base: String, _ occurrence: String) -> String {
+        base + occurrenceSeparator + occurrence
+    }
+
+    /// The source key without its occurrence suffix.
+    public static func baseKey(of key: String) -> String {
+        guard let range = key.range(of: occurrenceSeparator, options: .backwards) else { return key }
+        return String(key[..<range.lowerBound])
+    }
     public static func botAttention(itemId: String) -> String { "bot.attention.\(itemId)" }
     public static func botReply(runId: String) -> String { "bot.reply.\(runId)" }
     /// A scheduled failure with an `agentRunID` shares the run's failure key.

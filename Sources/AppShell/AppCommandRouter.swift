@@ -4103,7 +4103,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 conversationID: conversationID,
                 attachments: attachments,
                 routing: routing,
-                adoptAsDeskRoute: routingValues.map(Self.pairedRouteKeepsItsProvider) ?? false
+                adoptAsDeskRoute: routingValues.map(Self.pairedRouteKeepsItsProvider) ?? false,
+                origin: .pairedClient
             )
             return Self.foundationObject(result.objectValue ?? [:])
         }
@@ -9431,7 +9432,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             windowController?.refreshFromState()
         }
         // Mirror into macOS notification center, or as a Titio notice (§5 "External").
+        let titioNoticeKey: String?
         if ctx.titioNoticeCenter.isEnabled(SettingsStore(db: ctx.db).load()) {
+            titioNoticeKey = TitioNoticeIDs.externalNotification(id: n.id)
             ctx.titioNoticeCenter.ingest(TitioNoticeFact(
                 key: TitioNoticeIDs.externalNotification(id: n.id),
                 kind: .external,
@@ -9439,9 +9442,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 facts: TitioNoticeFacts(title: title, body: body)
             ))
         } else {
+            titioNoticeKey = nil
             SystemNotifier.shared.post(title: title, body: body, category: category)
         }
         var eventPayload: [String: JSONValue] = ["id": .string(n.id)]
+        // Titio's push already alerts the phone for this one: a paired client
+        // that sees the key must not schedule its own local notification too.
+        if let titioNoticeKey { eventPayload["titio_notice_key"] = .string(titioNoticeKey) }
         if let workspaceId { eventPayload["workspace_id"] = .string(workspaceId.value.uuidString) }
         if let surfaceId { eventPayload["surface_id"] = .string(surfaceId.value.uuidString) }
         if let category { eventPayload["category"] = .string(category) }

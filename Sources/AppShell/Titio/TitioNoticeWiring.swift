@@ -18,44 +18,49 @@ final class TitioNoticeContextBox: @unchecked Sendable {
     }
 }
 
-/// The §16 language input: the newest user message in any Titio
-/// conversation, read off the MainActor and cached briefly.
+/// The §16 language inputs: the user's recent messages in any Titio
+/// conversation (newest first) and recent card labels (a card tap is stored
+/// as a user row with its label), read off the MainActor and cached briefly.
 final class TitioLanguageInputCache: @unchecked Sendable {
     static let lifetime: TimeInterval = 30
+    /// How many recent user messages the walk-back may look at.
+    static let recentLimit = 12
     private let lock = NSLock()
-    private var cached: (text: String?, at: Date)?
+    private var cached: (texts: [String], labels: Set<String>, at: Date)?
     private let botStore: BotStore
     private let messageRepo: AgentMessageRepository
+    private let notices: TitioNoticeRepository?
 
-    init(botStore: BotStore, messageRepo: AgentMessageRepository) {
+    init(botStore: BotStore, messageRepo: AgentMessageRepository, notices: TitioNoticeRepository? = nil) {
         self.botStore = botStore
         self.messageRepo = messageRepo
+        self.notices = notices
     }
 
     func invalidate() {
         lock.withLock { cached = nil }
     }
 
-    func lastUserText(now: Date = Date()) -> String? {
+    func recentUserTexts(now: Date = Date()) -> (texts: [String], labels: Set<String>) {
         if let cached = lock.withLock({ cached }), now.timeIntervalSince(cached.at) < Self.lifetime {
-            return cached.text
+            return (cached.texts, cached.labels)
         }
-        let text = readLastUserText()
-        lock.withLock { cached = (text, now) }
-        return text
+        let texts = readRecentUserTexts()
+        let labels = (try? notices?.recentCardLabels()) ?? []
+        lock.withLock { cached = (texts, labels, now) }
+        return (texts, labels)
     }
 
-    private func readLastUserText() -> String? {
+    private func readRecentUserTexts() -> [String] {
         guard let titio = (try? botStore.list(includeHidden: true))?
             .first(where: { $0.handle.lowercased() == TitioBot.handle && $0.deletedAt == nil }),
-              let conversations = try? botStore.listConversations(botID: titio.id) else { return nil }
-        var newest: AgentMessage?
+              let conversations = try? botStore.listConversations(botID: titio.id) else { return [] }
+        var users: [AgentMessage] = []
         for thread in Set(conversations.compactMap(\.linkedAgentThreadID)) {
-            guard let recent = try? messageRepo.listRecent(threadId: thread, limit: 30),
-                  let user = recent.last(where: { $0.role == .user }) else { continue }
-            if newest.map({ user.createdAt > $0.createdAt }) ?? true { newest = user }
+            guard let recent = try? messageRepo.listRecent(threadId: thread, limit: 30) else { continue }
+            users += recent.filter { $0.role == .user }
         }
-        return newest?.content
+        return users.sorted { $0.createdAt > $1.createdAt }.prefix(Self.recentLimit).map(\.content)
     }
 }
 
@@ -72,7 +77,7 @@ extension AppContext {
         bridge: PrivateNotificationBridge,
         hostID: String
     ) -> TitioNoticeHooks {
-        let language = TitioLanguageInputCache(botStore: botStore, messageRepo: messageRepo)
+        let language = TitioLanguageInputCache(botStore: botStore, messageRepo: messageRepo, notices: TitioNoticeRepository(db: db))
         let bindings = BotAttentionPushBindingStore(db: db)
         let settings = SettingsStore(db: db)
         return TitioNoticeHooks(
@@ -86,8 +91,10 @@ extension AppContext {
                 ((try? runRepo.latestActive(for: target.threadID)) ?? nil) != nil
             },
             languageInputs: {
-                TitioNoticeLanguageInputs(
-                    lastUserText: language.lastUserText(),
+                let recent = language.recentUserTexts()
+                return TitioNoticeLanguageInputs(
+                    recentUserTexts: recent.texts,
+                    cardLabels: recent.labels,
                     preferredLanguages: Locale.preferredLanguages
                 )
             },
@@ -108,12 +115,7 @@ extension AppContext {
                 }
             },
             inboxChanged: { snapshot in
-                EventBus.shared.publish(kind: .botUpdated, payload: .object([
-                    "method": .string("bot.titio_inbox"),
-                    "reason": .string("titio_inbox"),
-                    "bot_id": .string(snapshot.botID.value.uuidString.lowercased()),
-                    "titio_inbox": snapshot.wireObject,
-                ]))
+                EventBus.shared.publish(kind: .botUpdated, payload: AppContext.titioInboxEventPayload(snapshot))
             },
             postBanner: { content in
                 SystemNotifier.shared.post(content, settings: settings.load())
@@ -131,6 +133,17 @@ extension AppContext {
                 await MainActor.run { box.context?.router?.isFocusedPetSuccess(event) ?? false }
             }
         )
+    }
+
+    /// The `bot.updated` payload of an inbox change. No `method`: it is not a
+    /// mutation, and a paired roster applies a method-less `titio_inbox`
+    /// payload as is, without a full `bot.list` refetch per notice (§10).
+    nonisolated static func titioInboxEventPayload(_ snapshot: TitioInboxSnapshot) -> JSONValue {
+        .object([
+            "reason": .string("titio_inbox"),
+            "bot_id": .string(snapshot.botID.value.uuidString.lowercased()),
+            "titio_inbox": snapshot.wireObject,
+        ])
     }
 
     /// Production host side effects of card actions (§7 step 4). The pending
@@ -215,6 +228,50 @@ extension AppContext {
         let durationMs: Int?
         /// Titio's reply text for the direct reply banner.
         let finalMessageText: String?
+        /// The scheduled task this run executes, if any.
+        var scheduled: TitioScheduledRunFacts? = nil
+    }
+
+    /// A run started by a scheduled task: its failure is the task's
+    /// `scheduledFailed` notice (with "Run again"), not a generic run failure.
+    struct TitioScheduledRunFacts: Sendable, Equatable {
+        let scheduledRunID: UUID
+        let taskID: UUID
+        let taskTitle: String?
+    }
+
+    /// The failure notice of a scheduled run, posted by the run hook the
+    /// moment the run fails. Its key is the run's failure key, which is also
+    /// what `ScheduledTaskRuntime.notifyFailure` ingests up to one scheduler
+    /// tick later; posting the rich notice first means that later ingest is a
+    /// no-op instead of being dropped against a generic run notice (a posted
+    /// row is frozen), which lost the "Run again" card.
+    nonisolated static func scheduledRunFailureFact(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        workspaceId: WorkspaceID?,
+        workspaceName: String?,
+        finalMessageId: String?,
+        scheduled: TitioScheduledRunFacts,
+        occurredAt: Date = Date()
+    ) -> TitioNoticeFact {
+        let rid = runId.value.uuidString
+        let facts = TitioNoticeFacts(title: scheduled.taskTitle, workspaceName: workspaceName)
+        return TitioNoticeFact(
+            key: TitioNoticeIDs.scheduledFailure(scheduledRunId: scheduled.scheduledRunID.uuidString, agentRunId: rid),
+            kind: .scheduledFailed,
+            source: TitioNoticeSource(
+                threadId: threadId.value.uuidString,
+                runId: rid,
+                workspaceId: workspaceId?.value.uuidString,
+                scheduledTaskId: scheduled.taskID.uuidString.lowercased(),
+                activityItemId: "run:\(rid.lowercased())",
+                finalMessageId: finalMessageId
+            ),
+            facts: facts,
+            actions: TitioNoticeAction.defaultActions(kind: .scheduledFailed, facts: facts),
+            occurredAt: occurredAt
+        )
     }
 
     nonisolated static func titioRunFacts(
@@ -233,6 +290,13 @@ extension AppContext {
             guard let finished = run.finishedAt else { return nil }
             return max(0, Int(finished.timeIntervalSince(run.startedAt) * 1_000))
         }
+        let scheduledStore = ScheduledTaskStore(db: db)
+        let scheduled = ((try? scheduledStore.activeRun(forThreadID: threadId)) ?? nil)
+            .flatMap { run -> TitioScheduledRunFacts? in
+                guard run.agentRunID == runId else { return nil }
+                let task = (try? scheduledStore.get(id: run.taskID)) ?? nil
+                return TitioScheduledRunFacts(scheduledRunID: run.id, taskID: run.taskID, taskTitle: task?.title)
+            }
         var finalText: String?
         if bot?.handle.lowercased() == TitioBot.handle,
            let finalMessageId, let uuid = UUID(uuidString: finalMessageId) {
@@ -243,7 +307,8 @@ extension AppContext {
             bot: bot,
             summary: result?.summary,
             durationMs: durationMs,
-            finalMessageText: finalText
+            finalMessageText: finalText,
+            scheduled: scheduled
         )
     }
 
@@ -313,6 +378,20 @@ extension AppContext {
         }
         // Successes whose destination is focused are excluded; failures never are.
         if status == .completed, router?.isAgentThreadFocused(threadId) == true { return true }
+        if status == .failed, let scheduled = facts.scheduled {
+            titioNoticeCenter.ingest(
+                Self.scheduledRunFailureFact(
+                    runId: runId,
+                    threadId: threadId,
+                    workspaceId: workspaceId,
+                    workspaceName: workspaceId.flatMap { state.workspaces[$0]?.name },
+                    finalMessageId: finalMessageId,
+                    scheduled: scheduled
+                ),
+                legacy: TitioNoticeLegacyDelivery(content: legacy, pushes: true)
+            )
+            return true
+        }
         let noticeFacts = TitioNoticeFacts(
             title: threadTitle,
             workspaceName: workspaceId.flatMap { state.workspaces[$0]?.name },
@@ -358,6 +437,8 @@ struct TitioRequestFacts: Sendable, Equatable {
     /// False when the provider cannot approve for the session: the card then
     /// offers no "Approve for session".
     var allowsSessionApproval: Bool
+    /// `AssistantRequestKind` raw value of an approval (the copy's verb).
+    var requestKind: String?
 
     init(
         kind: Kind,
@@ -369,7 +450,8 @@ struct TitioRequestFacts: Sendable, Equatable {
         isSecret: Bool = false,
         questionCount: Int = 0,
         botName: String? = nil,
-        allowsSessionApproval: Bool = true
+        allowsSessionApproval: Bool = true,
+        requestKind: String? = nil
     ) {
         self.kind = kind
         self.requestTitle = requestTitle
@@ -381,6 +463,7 @@ struct TitioRequestFacts: Sendable, Equatable {
         self.botName = botName
         self.legacyActionTitle = legacyActionTitle
         self.allowsSessionApproval = allowsSessionApproval
+        self.requestKind = requestKind
     }
 
     /// The card for this request (§2), without "Approve for session" when the
@@ -406,6 +489,7 @@ struct TitioRequestFacts: Sendable, Equatable {
             botName: botName,
             detail: detail,
             requestTitle: requestTitle,
+            requestKind: requestKind,
             prompt: prompt,
             options: options,
             isSecret: isSecret ? true : nil,
@@ -439,7 +523,9 @@ extension AppContext {
         )
         titioNoticeCenter.ingest(
             TitioNoticeFact(
-                key: TitioNoticeIDs.threadAttention(threadId: tid, requestId: requestId),
+                // One row per request instance (run id): a recycled provider
+                // id never lands on, or is answered by, an older card.
+                key: TitioNoticeIDs.threadAttention(threadId: tid, requestId: requestId, runId: runId.value.uuidString),
                 kind: request.noticeKind,
                 source: TitioNoticeSource(
                     threadId: tid,

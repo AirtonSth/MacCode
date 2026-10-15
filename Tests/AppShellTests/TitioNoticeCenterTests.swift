@@ -242,7 +242,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(messages.count, 1)
         let keys = ["run.R1.completed", "run.R2.completed", "run.R3.completed"]
         XCTAssertEqual(messages[0].id.value, TitioNoticeIDs.digestMessageID(forKeys: keys))
-        XCTAssertTrue(messages[0].content.hasPrefix("While you were away:"), messages[0].content)
+        XCTAssertTrue(messages[0].content.hasPrefix("A few updates:"), messages[0].content)
         let digestID = TitioNoticeIDs.digestBannerIdentifier(messageID: messages[0].id.value)
         XCTAssertEqual(f.recorder.banners.map(\.identifier), [digestID])
         XCTAssertEqual(f.recorder.pushes.map(\.identifier), [digestID], "one push per flushed message")
@@ -280,7 +280,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         ])
         let decision = try XCTUnwrap(try f.repo.get(key: "thread.T.attention.Q1"))
         XCTAssertEqual(decision.state, .posted)
-        XCTAssertEqual(decision.actions?.compactMap(\.label), ["Approve", "Approve for session", "Decline", "Open thread"])
+        XCTAssertEqual(decision.actions?.compactMap(\.label), ["Approve", "Decline", "Open thread"])
         let text = try XCTUnwrap(f.messages.get(id: AgentMessageID(TitioNoticeIDs.messageID(forKey: "thread.T.attention.Q1"))))
         XCTAssertEqual(BotChoicesBlock.parse(text.content).choices?.notice, "thread.T.attention.Q1")
         XCTAssertEqual(f.recorder.posted.last?.conversation?.attentionState, .needsAttention)
@@ -737,10 +737,12 @@ final class TitioNoticeHookTests: XCTestCase {
         try context.threadRepo.upsert(thread)
         let facts = TitioRequestFacts(kind: .approval, legacyActionTitle: "Approve: Run command",
                                       requestTitle: "Run command", detail: "rm -rf build", allowsSessionApproval: false)
-        XCTAssertTrue(context.ingestTitioRequest(threadId: thread.id, runId: AgentRunID(), requestId: "R1",
+        let runID = AgentRunID()
+        XCTAssertTrue(context.ingestTitioRequest(threadId: thread.id, runId: runID, requestId: "R1",
                                                  facts: facts, chrome: nil, legacy: legacy()))
         await context.titioNoticeCenter.idle()
-        let key = TitioNoticeIDs.threadAttention(threadId: thread.id.value.uuidString, requestId: "R1")
+        let key = TitioNoticeIDs.threadAttention(threadId: thread.id.value.uuidString, requestId: "R1",
+                                                 runId: runID.value.uuidString)
         let row = try XCTUnwrap(TitioNoticeRepository(db: context.db).get(key: key))
         XCTAssertEqual(row.kind, .approval)
         XCTAssertEqual(row.facts.requestTitle, "Run command")

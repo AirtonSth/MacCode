@@ -210,7 +210,7 @@ final class TitioNoticeActTests: XCTestCase {
         let f = try makeFixture()
         let fact = approval("Q1", f)
         let messageID = await post(fact, f)
-        let outcome = await f.center.act(messageID: messageID, optionIndex: 3)
+        let outcome = await f.center.act(messageID: messageID, optionIndex: 2)
         XCTAssertEqual(outcome, .navigate(route: ["threadId": requestThread.value.uuidString]))
         await settle(f)
         XCTAssertEqual(try f.repo.get(key: fact.key)?.state, .posted)
@@ -269,7 +269,7 @@ final class TitioNoticeActTests: XCTestCase {
         await settle(f)
         let other = approval("Q3", f)
         let otherMessage = await post(other, f)
-        let tapped = await f.center.act(messageID: otherMessage, optionIndex: 2)
+        let tapped = await f.center.act(messageID: otherMessage, optionIndex: 1)
         XCTAssertEqual(tapped, .accepted)
         await settle(f)
         XCTAssertFalse(f.center.takeArmedReply(text: "hello"))
@@ -342,7 +342,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(f.actions.calls, [.request(requestThread, "Q1", .approve)])
 
         let countBefore = try transcript(f).count
-        let tapped = await f.center.act(messageID: messageID, optionIndex: 2)
+        let tapped = await f.center.act(messageID: messageID, optionIndex: 1)
         XCTAssertEqual(tapped, .alreadyResolved)
         await settle(f)
         let rows = try transcript(f)
@@ -358,9 +358,9 @@ final class TitioNoticeActTests: XCTestCase {
         let fact = approval("Q1", f)
         let messageID = await post(fact, f)
         f.actions.failure = "the provider session ended"
-        _ = await f.center.act(messageID: messageID, optionIndex: 1)
+        _ = await f.center.act(messageID: messageID, optionIndex: 0)
         await settle(f)
-        XCTAssertEqual(f.actions.calls, [.request(requestThread, "Q1", .approveForSession)])
+        XCTAssertEqual(f.actions.calls, [.request(requestThread, "Q1", .approve)])
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .failed)
         let rows = try transcript(f)
         XCTAssertTrue(rows[0].content.hasSuffix("_Didn't go through; open the thread._"))
