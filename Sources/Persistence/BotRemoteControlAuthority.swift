@@ -1110,6 +1110,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try dockerClear(params: params, requestID: requestID)
         case "notify.set":
             return try notifySet(params: params, requestID: requestID, now: now)
+        case "verbosity.set":
+            return try verbositySet(params: params, requestID: requestID, now: now)
+        case "caveman.set":
+            return try cavemanSet(params: params, requestID: requestID, now: now)
+        case "factory_reset":
+            return try factoryReset(params: params, requestID: requestID, now: now)
         case "desktop.set":
             return try desktopSet(params: params, requestID: requestID)
         case "avatar.set":
@@ -3057,6 +3063,44 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         ])
     }
 
+    private func verbositySet(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard let verbosity = string(params, "verbosity").flatMap(BotReplyVerbosity.init(rawValue:)) else {
+            throw Error.invalidParams
+        }
+        _ = try store.setReplyStyle(id: bot.id, verbosity: verbosity, now: now)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "verbosity": verbosity.rawValue,
+            "route": "bot",
+        ])
+    }
+
+    private func cavemanSet(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard let enabled = bool(params, "enabled") else {
+            throw Error.invalidParams
+        }
+        _ = try store.setReplyStyle(id: bot.id, cavemanEnabled: enabled, now: now)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "caveman_enabled": enabled,
+            "route": "bot",
+        ])
+    }
+
+    /// Titio only: a paired device can put a broken Titio back to its
+    /// built-in profile, like the Mac Studio's Restore Factory Settings.
+    private func factoryReset(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard bot.handle.lowercased() == TitioIdentity.handle else {
+            throw Error.invalidParams
+        }
+        let restored = try store.restoreTitioFactorySettings(id: bot.id, now: now)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "bot": try encodeBot(restored),
+            "route": "bot",
+        ])
+    }
+
     private func desktopSet(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let rawKind = string(params, "kind") ?? BotDesktopKind.logicalExecutionSpace.rawValue
@@ -3363,6 +3407,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "pinned": bot.pinned,
             "hidden": bot.hidden,
             "notifications_enabled": bot.notificationsEnabled,
+            "verbosity": bot.verbosity.rawValue,
+            "caveman_enabled": bot.cavemanEnabled,
             "soul": revision.soul,
             "desktop_kind": revision.desktopKind.advertisedOrLogical.rawValue,
             "current_revision_id": revision.id.value.uuidString.lowercased(),

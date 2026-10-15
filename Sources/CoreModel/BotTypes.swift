@@ -348,11 +348,37 @@ public enum BotStandingInstructions {
     Ação manual: Peça ação manual com bot_request_user_action só para login, captcha, 2FA, pagamento ou confirmação humana. Nunca peça senha, código ou dados de cartão no chat. Depois de retomar, sempre tire screenshot antes de agir.
     """
 
-    /// How a bot talks to the user, on every provider. Distill bots also get
-    /// it at system level (`BotRunMCPAdmission.distillBotReplyRules`); this
-    /// per-turn copy also reaches resumed sessions and Claude/Codex bots.
+    /// How a Bot with Caveman off talks to the user, on every provider.
+    /// Distill bots also get it at system level
+    /// (`BotRunMCPAdmission.distillBotReplyRules`); this per-turn copy also
+    /// reaches resumed sessions and Claude/Codex bots.
     public static let replyStyleLine =
         "Reply style: write to the user like a real person, in the user's language: natural, warm, complete sentences with articles and connecting words. No telegraphic fragments, shorthand or robotic status lines, and no AI filler. Stay concise: a greeting gets a short, friendly greeting back. Keep code, commands, paths and names exact."
+
+    /// Caveman on (every Bot but Titio by default): short and terse, still
+    /// exact. Replaces `replyStyleLine`, which asks for full sentences.
+    public static let cavemanStyleLine =
+        "Reply style: caveman. Talk short and terse, in the user's language: drop filler, pleasantries and hedging; short sentences or fragments are fine and articles are optional. Keep facts, numbers, code, commands, paths and names exact."
+
+    /// Verbosity Human (the default): the chat shows only the Bot's messages,
+    /// so it writes like a person (the humanizer rules) and never narrates
+    /// tool work the user cannot see.
+    public static let humanVerbosityLine =
+        "Write like a human, not an AI: no openers like \"Great question\" or \"Certainly!\", no flattery, no inflated or promotional words, no em dashes, no lists of three added for rhythm, no signposting such as \"Here's the thing\", no headings or bold in a short reply, no closing offers of more help. The user does not see your commands, edits or tool calls: never narrate your process or list what you ran. Tell them the result, what changed and what you need from them."
+
+    /// Ready-made answers: when the user must pick from a few likely answers,
+    /// the Bot ends its message with a `choices` block that the chat turns
+    /// into a tappable card (`BotChoicesBlock`).
+    public static let choicesLine =
+        "When the user has to choose and the likely answers are few (2 to 6), offer them ready-made: end your message with a fenced block whose info string is choices, holding one JSON object, e.g. ```choices\n{\"question\":\"Which one?\",\"hint\":\"optional short note\",\"multiple\":false,\"options\":[\"First option\",\"Second option\"]}\n```. Keep options short, in the user's language; set multiple to true when several can apply. The chat shows it as buttons and the user can still type their own answer. Do not use it for open-ended questions."
+
+    /// The reply style lines one Bot gets on every turn.
+    public static func replyStyleLines(for bot: BotDefinition) -> [String] {
+        var lines = [bot.cavemanEnabled ? cavemanStyleLine : replyStyleLine]
+        if bot.verbosity == .human { lines.append(humanVerbosityLine) }
+        lines.append(choicesLine)
+        return lines
+    }
 
     /// Must stay identical to `BotSelfConfigCatalog.getSettings`.
     public static let getSettingsTool = "bot_get_settings"
@@ -503,8 +529,21 @@ public enum BotStandingInstructions {
     }
 }
 
+/// How much of a Bot's work its chat shows, and how it writes.
+public enum BotReplyVerbosity: String, Codable, Sendable, Equatable, CaseIterable {
+    /// Writes like a person; the chat shows only its messages.
+    case human
+    /// Today's chat: every command, edit and tool row shows too.
+    case verbose
+}
+
 public struct BotDefinition: Codable, Sendable, Equatable {
     public static let liveAccountCap = 50
+
+    /// Every Bot talks caveman by default except Titio, who explains RemoteCode.
+    public static func defaultCavemanEnabled(handle: String) -> Bool {
+        handle.lowercased() != TitioIdentity.handle
+    }
 
     public var id: BotID
     public var handle: String
@@ -517,6 +556,8 @@ public struct BotDefinition: Codable, Sendable, Equatable {
     public var currentRevisionID: BotRevisionID?
     public var directoryEpoch: Int
     public var notificationsEnabled: Bool
+    public var verbosity: BotReplyVerbosity
+    public var cavemanEnabled: Bool
     public var createdAt: Date
     public var updatedAt: Date
     public var deletedAt: Date?
@@ -534,6 +575,8 @@ public struct BotDefinition: Codable, Sendable, Equatable {
         currentRevisionID: BotRevisionID? = nil,
         directoryEpoch: Int = 1,
         notificationsEnabled: Bool = true,
+        verbosity: BotReplyVerbosity = .human,
+        cavemanEnabled: Bool? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         deletedAt: Date? = nil,
@@ -550,10 +593,41 @@ public struct BotDefinition: Codable, Sendable, Equatable {
         self.currentRevisionID = currentRevisionID
         self.directoryEpoch = directoryEpoch
         self.notificationsEnabled = notificationsEnabled
+        self.verbosity = verbosity
+        self.cavemanEnabled = cavemanEnabled ?? Self.defaultCavemanEnabled(handle: handle)
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.deletedAt = deletedAt
         self.workspaceID = workspaceID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, handle, name, title, description, avatarSymbol, pinned, hidden
+        case currentRevisionID, directoryEpoch, notificationsEnabled, verbosity, cavemanEnabled
+        case createdAt, updatedAt, deletedAt, workspaceID
+    }
+
+    /// Encoded Bots written before reply style existed still decode.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(BotID.self, forKey: .id)
+        handle = try c.decode(String.self, forKey: .handle)
+        name = try c.decode(String.self, forKey: .name)
+        title = try c.decode(String.self, forKey: .title)
+        description = try c.decode(String.self, forKey: .description)
+        avatarSymbol = try c.decode(String.self, forKey: .avatarSymbol)
+        pinned = try c.decode(Bool.self, forKey: .pinned)
+        hidden = try c.decode(Bool.self, forKey: .hidden)
+        currentRevisionID = try c.decodeIfPresent(BotRevisionID.self, forKey: .currentRevisionID)
+        directoryEpoch = try c.decode(Int.self, forKey: .directoryEpoch)
+        notificationsEnabled = try c.decode(Bool.self, forKey: .notificationsEnabled)
+        verbosity = try c.decodeIfPresent(BotReplyVerbosity.self, forKey: .verbosity) ?? .human
+        cavemanEnabled = try c.decodeIfPresent(Bool.self, forKey: .cavemanEnabled)
+            ?? Self.defaultCavemanEnabled(handle: handle)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
+        workspaceID = try c.decodeIfPresent(WorkspaceID.self, forKey: .workspaceID)
     }
 }
 

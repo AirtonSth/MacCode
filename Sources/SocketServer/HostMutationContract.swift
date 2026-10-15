@@ -164,6 +164,9 @@ public enum HostMutationContract {
     bot.guest.control
     bot.docker.clear
     bot.notify.set
+    bot.verbosity.set
+    bot.caveman.set
+    bot.factory_reset
     bot.desktop.set
     bot.avatar.set
     bot.handle.set

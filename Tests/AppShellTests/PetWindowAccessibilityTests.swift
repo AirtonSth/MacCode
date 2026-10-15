@@ -339,8 +339,13 @@ final class PetWindowAccessibilityTests: XCTestCase {
         controller.show()
         controller.openPopoverForTests()
 
+        // WHY: the panel must hug the measured card. A fixed formula (or a
+        // floor taller than the card) leaves a clear strip under the card
+        // that still swallows clicks meant for the desktop.
         let panel = try XCTUnwrap(controller.popoverPanelForTests)
-        XCTAssertGreaterThan(panel.frame.height, 180)
+        let content = try XCTUnwrap(panel.contentView)
+        XCTAssertEqual(panel.frame.height, content.fittingSize.height, accuracy: 0.5)
+        XCTAssertGreaterThan(panel.frame.height, PetPopoverSizing.minimumHeight)
         XCTAssertLessThanOrEqual(panel.frame.height, 520)
         if let screen = panel.screen ?? NSScreen.main {
             XCTAssertLessThanOrEqual(panel.frame.height, screen.visibleFrame.height - 24 + 0.5)

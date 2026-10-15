@@ -385,7 +385,8 @@ public struct AgentChatAssistantReply: View, Equatable {
         onBranch: (() -> Void)? = nil,
         content: AnyView? = nil
     ) {
-        self.text = text
+        // A ready-made answers block is shown (and answered) as the choices card.
+        self.text = BotChoicesBlock.parse(text).text
         self.roleIdentifier = roleIdentifier
         self.copyIdentifier = copyIdentifier
         self.branchIdentifier = branchIdentifier

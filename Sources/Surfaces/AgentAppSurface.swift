@@ -468,6 +468,9 @@ public typealias AgentAppSendInterceptor = @MainActor (
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let embedding: AgentAppEmbedding?
+    /// A Bot desk with Verbosity Human shows only the Bot's messages: no tool,
+    /// command, edit or work-log rows. The live turn keeps a "Working" line.
+    @Published public var hidesToolActivity = false
     @Published public var threads: [AgentThread] = [] { didSet { filteredThreadsCache = nil } }
     @Published public var selectedThreadId: AgentThreadID?
     /// True when the selected thread is an ephemeral side chat (hidden from the
@@ -12850,6 +12853,7 @@ public struct AgentAppView: View {
     @State private var lastAutomaticPlanSidebarChange: TimeInterval?
     @State private var proposedPlanExpanded = false
     @State private var showWorkLog = false
+    @State private var dismissedChoices = AgentChatChoicesCard.DismissedStore.load()
     /// User-opened finished (or non-default) work disclosures.
     @State private var expandedCompletedWorkTurns: Set<String> = []
     /// Live turns the user manually collapsed (suppresses default-open latest live).
@@ -15500,7 +15504,7 @@ public struct AgentAppView: View {
             // not rebuild chrome, rail, or composer through the parent VM.
             TranscriptReactiveScope(transcriptState: vm.transcriptState) {
                 Group {
-                    if !vm.timeline.workActivities.isEmpty {
+                    if !vm.hidesToolActivity, !vm.timeline.workActivities.isEmpty {
                         workLogRow
                             .padding(.horizontal, 22)
                             .padding(.vertical, DS.Space.md)
@@ -15521,6 +15525,7 @@ public struct AgentAppView: View {
             }
             backgroundAwaitBanner
             pendingCallbackRows
+            choicesCardRow
             // A failed page read stays on screen with Retry; the transcript
             // above shows no "No messages" for it. No dismiss: without the
             // strip the unread thread would be a blank column with no Retry.
@@ -16258,6 +16263,36 @@ public struct AgentAppView: View {
         }
     }
 
+    /// Ready-made answers from the newest reply, while the user still has to
+    /// answer it. Picking sends the answer like the composer would.
+    @ViewBuilder
+    private var choicesCardRow: some View {
+        if let pending = AgentChatChoicesCard.Pending.latest(
+            in: vm.messages,
+            isRunning: vm.hasRunningWorkForChrome
+        ), !dismissedChoices.contains(pending.messageID) {
+            AgentChatChoicesCard(
+                choices: pending.choices,
+                identifier: "agent.choices.\(pending.messageID)",
+                // Answering goes through the composer's send; never replace a
+                // draft the user is writing.
+                isBlockedByDraft: !vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !vm.attachments.isEmpty,
+                onAnswer: { answer in
+                    vm.prompt = answer
+                    Task { await vm.send() }
+                },
+                onDismiss: {
+                    dismissedChoices.insert(pending.messageID)
+                    AgentChatChoicesCard.DismissedStore.insert(pending.messageID)
+                }
+            )
+            .padding(.horizontal, 22)
+            .padding(.vertical, DS.Space.md)
+            .id(pending.messageID)
+        }
+    }
+
     @ViewBuilder
     private var workLogRow: some View {
         let activities = Array(vm.timeline.workActivities.suffix(8))
@@ -16796,7 +16831,8 @@ public struct AgentAppView: View {
         // R4-B: live streaming rows pass cacheMarkdown: false so growing partials
         // do not thrash AgentMessageMarkdown NSCache occupancy.
         AgentMessageMarkdownView(
-            text: BackgroundAwaitContinuation.strippingAwaitingMarker(text),
+            // A ready-made answers block shows as the choices card instead.
+            text: BotChoicesBlock.parse(BackgroundAwaitContinuation.strippingAwaitingMarker(text)).text,
             cacheResults: cacheMarkdown
         )
             .foregroundColor(DS.Palette.text)
@@ -17301,6 +17337,7 @@ public struct AgentAppView: View {
                 ? hideAssistantOutput
                 : false,
             showsWorkHeader: AgentChatLiveTurnChrome.showsWorkHeader(for: segment),
+            hidesWork: vm.hidesToolActivity,
             renderFinal: segment.isLast
                 ? { final in
                     AnyView(agentTurnFinal(final, turn: turn))
@@ -17370,6 +17407,7 @@ public struct AgentAppView: View {
             turn: turn,
             live: !turn.finished,
             hideAssistantOutput: hideAssistantOutput,
+            hidesWork: vm.hidesToolActivity,
             renderFinal: { final in
                 AnyView(agentTurnFinal(final, turn: turn))
             },

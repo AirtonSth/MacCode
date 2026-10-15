@@ -46,7 +46,8 @@ public enum Schema {
     /// and v87 adds agent_threads.guest_runtime (bot agent runs inside its guest),
     /// and v88 adds Bot teams and group conversations plus
     /// bot_conversations.group_id (column added only when missing),
-    /// and v89 adds bot_conversation_routing (per-conversation Bot desk route).
+    /// and v89 adds bot_conversation_routing (per-conversation Bot desk route),
+    /// and v92 adds per-Bot reply style columns on bots.
     private static let scheduledTaskModelColumnsSchemaVersion = 85
     private static let threadActorSchemaVersion = 86
     private static let threadGuestRuntimeSchemaVersion = 87
@@ -56,7 +57,10 @@ public enum Schema {
     static let threadForkColumnsSchemaVersion = 90
     /// v91 adds durable per-run result and read/acknowledgment projection.
     private static let agentRunResultsSchemaVersion = 91
-    public static let currentVersion: Int = agentRunResultsSchemaVersion
+    /// v92 adds per-Bot reply style: bots.reply_verbosity (human/verbose) and
+    /// bots.caveman_enabled (on for every Bot except Titio).
+    static let botReplyStyleSchemaVersion = 92
+    public static let currentVersion: Int = botReplyStyleSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1831,6 +1835,11 @@ public enum Schema {
             viewed_at TEXT,
             acknowledged_at TEXT
         );
+        """),
+        SchemaStep(botReplyStyleSchemaVersion, """
+        ALTER TABLE bots ADD COLUMN reply_verbosity TEXT NOT NULL DEFAULT 'human';
+        ALTER TABLE bots ADD COLUMN caveman_enabled INTEGER NOT NULL DEFAULT 1;
+        UPDATE bots SET caveman_enabled = 0 WHERE lower(handle) = 'titio';
         """),
     ]
 

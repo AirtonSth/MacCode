@@ -414,6 +414,7 @@ public final class PetController {
         windowController.onOpenActiveThread = { [weak self] item in self?.openActive(item) }
         windowController.onOpenRemoteCode = { [weak self] in self?.showActivity() }
         windowController.onOpenTitio = { [weak self] in self?.openTitio() }
+        windowController.onSendToTitio = { [weak self] in self?.sendToTitio($0) }
         windowController.onOpenSettings = { [weak self] in
             _ = self?.openSettings(.general)
         }
@@ -1385,6 +1386,16 @@ public final class PetController {
         }
     }
 
+    /// Popover field: same path as Option+Space, a new Titio conversation, opened.
+    func sendToTitio(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        windowController?.closePopover(restoringPreviousKeyWindow: false)
+        if router.sendTitioQuickMessage(trimmed) == nil {
+            model.routeError = "Titio could not be reached."
+        }
+    }
+
     private func showActivity() {
         NSApplication.shared.activate(ignoringOtherApps: true)
         router.windowController?.show()
@@ -1412,6 +1423,12 @@ public final class PetController {
 
     private func applySettings(_ settings: AppSettings) {
         model.apply(settings: settings)
+        // Titio's avatars move like the pet and pause with it.
+        TitioAvatarAnimator.shared.setMotionAllowed(
+            settings.petAnimationsEnabled
+                && !settings.petReduceMotion
+                && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        )
         if settings.petEnabled {
             do {
                 let visualRuntimeWasLoaded = animationController != nil

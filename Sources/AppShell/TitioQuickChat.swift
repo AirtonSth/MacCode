@@ -15,6 +15,8 @@ public final class TitioQuickChatController {
     private var panel: NSPanel?
     private var onSend: ((String) -> Void)?
     private(set) var registrationStatus: OSStatus = noErr
+    /// True once Option+Space is registered, so hints never promise a dead shortcut.
+    private(set) static var isHotKeyRegistered = false
 
     public init() {}
 
@@ -35,6 +37,7 @@ public final class TitioQuickChatController {
         registrationStatus = RegisterEventHotKey(
             Self.keyCode, Self.modifiers, id, GetApplicationEventTarget(), 0, &hotKeyRef
         )
+        Self.isHotKeyRegistered = registrationStatus == noErr
     }
 
     public func toggle() {
@@ -46,7 +49,6 @@ public final class TitioQuickChatController {
         self.panel = panel
         // Fresh content each time so the field is empty and takes focus.
         panel.contentView = NSHostingView(rootView: TitioQuickChatView(
-            avatar: TitioBot.avatarImage,
             onSubmit: { [weak self] in self?.submit($0) },
             onCancel: { [weak self] in self?.close() }
         ))
@@ -113,48 +115,23 @@ private final class TitioQuickChatPanel: NSPanel {
     override var canBecomeKey: Bool { true }
 }
 
+/// Opened from the keyboard many times a day, so it appears at once: no
+/// entrance animation to wait through.
 struct TitioQuickChatView: View {
-    let avatar: NSImage?
     let onSubmit: (String) -> Void
     let onCancel: () -> Void
-    @State private var text = ""
-    @FocusState private var focused: Bool
 
     var body: some View {
         VStack(spacing: 6) {
-            if let avatar {
-                Image(nsImage: avatar)
-                    .resizable()
-                    .interpolation(.none)
-                    .scaledToFit()
-                    .frame(width: 110, height: 110)
-                    .accessibilityLabel("Titio")
-            }
-            HStack(spacing: 10) {
-                TextField("Ask Titio anything", text: $text)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 17))
-                    .focused($focused)
-                    .onSubmit { onSubmit(text); text = "" }
-                    .accessibilityIdentifier("titio.quickChat.field")
-                Button {
-                    onSubmit(text); text = ""
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(text.isEmpty ? Color.secondary : Color.accentColor)
-                .disabled(text.isEmpty)
-                .accessibilityLabel("Send to Titio")
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .background(.regularMaterial, in: Capsule())
-            .overlay(Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1))
+            TitioAvatarView(size: 110)
+            TitioComposerField(
+                size: .spotlight,
+                identifier: "titio.quickChat.field",
+                onSubmit: onSubmit,
+                onCancel: onCancel
+            )
         }
         .padding(12)
         .frame(width: 520)
-        .onAppear { DispatchQueue.main.async { focused = true } }
-        .onExitCommand { onCancel() }
     }
 }

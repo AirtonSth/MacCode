@@ -487,7 +487,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         // durable RCW1 request/response/display rows (67-69), Bot
         // control-plane identity (70-71), content-free request
         // selection receipts (72-74), Bot context receipts (75), and the
-        // later steps through head (76-89). Versions 63-66 are retired.
+        // later steps through head (76-92). Versions 63-66 are retired.
         let postBase = Schema.steps.filter {
             $0.version > Schema.sharedIntegrationBaseVersion
         }
@@ -522,9 +522,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             88,
             89,
             90,
-            91
+            91,
+            92
         ])
-        XCTAssertEqual(Schema.currentVersion, 91)
+        XCTAssertEqual(Schema.currentVersion, 92)
         XCTAssertFalse(
             Schema.steps.contains { (63...66).contains($0.version) },
             "schema versions 63-66 are retired and must never be reused"
@@ -551,7 +552,7 @@ final class SchemaMigrationMatrixTests: XCTestCase {
 
         try Schema.migrateSteps(db, Schema.steps)
         XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
-        XCTAssertEqual(Schema.currentVersion, 91)
+        XCTAssertEqual(Schema.currentVersion, 92)
         XCTAssertEqual(try rowCount(db, table: "agent_run_results"), 0,
                        "v91 creates empty result projection without unsafe historical backfill")
 
@@ -634,10 +635,10 @@ final class SchemaMigrationMatrixTests: XCTestCase {
             Schema.steps.filter { $0.version == 71 }.count, 1,
             "HEAD/origin production last published step is 71"
         )
-        XCTAssertEqual(Schema.currentVersion, 91)
+        XCTAssertEqual(Schema.currentVersion, 92)
         XCTAssertEqual(
-            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91],
-            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs; v82 indexes audit_log(action, id); v83 indexes agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list; v84 adds agent_threads.reasoning_model; v85 adds scheduled-task model fields; v86 adds thread actor/execution target; v87 adds thread guest_runtime; v88 adds Bot teams and group conversations; v89 adds bot_conversation_routing; v90 adds thread parent/fork + is_ephemeral; v91 adds agent_run_results"
+            Schema.steps.filter { $0.version > 71 }.map(\.version), [72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92],
+            "v72 remains the first unpublished C10 step; v73 admits winner rcs1; v74 owns context-slot receipts; v75 owns Bot context receipts; v76 owns Bot routine schedule spec; v77 owns nullable agent_runs.terminal_reason; v78 deduplicates savings retries; v79 preserves host attestations outside rolling replay; v80 owns Bot queued follow-ups; v81 indexes running thread IDs; v82 indexes audit_log(action, id); v83 indexes agent_threads(workspace_id, updated_at DESC, id DESC) for the rail list; v84 adds agent_threads.reasoning_model; v85 adds scheduled-task model fields; v86 adds thread actor/execution target; v87 adds thread guest_runtime; v88 adds Bot teams and group conversations; v89 adds bot_conversation_routing; v90 adds thread parent/fork + is_ephemeral; v91 adds agent_run_results; v92 adds Bot reply style columns"
         )
         let v72 = try XCTUnwrap(Schema.steps.first { $0.version == 72 })
         XCTAssertTrue(v72.sql.contains("CHECK(format IN ('human', 'rcw1', 'rcs1'))"))

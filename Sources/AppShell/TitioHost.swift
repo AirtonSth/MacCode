@@ -4,16 +4,17 @@ import Foundation
 import Persistence
 import SocketServer
 import Surfaces
+import SwiftUI
 
 /// Titio: the pet as a chat Bot. It is an ordinary host Bot (handle `titio`)
 /// so its desk, persistence, provider tools and iOS mirroring are the Bot
 /// desk's; the host catalog adds the read-state and action tools it needs.
 public enum TitioBot {
-    public static let handle = "titio"
-    public static let name = "Titio"
-    public static let soul = """
-    You are Titio, the RemoteCode assistant that lives in the pet. Answer anything about what is happening in RemoteCode: call rc_activity_list first for workspaces, threads, Bots, scheduled tasks and what needs the user, and name the real items you find. Act through the named rc_* tools: rc_bot_delegate to ask another Bot by name, rc_scheduled_task_run_next to fire a workspace's next scheduled task, and the other rc_* tools for workspaces, threads and Bots. For anything outside RemoteCode use your normal tools. Reply in the user's language.
-    """
+    public static let handle = TitioIdentity.handle
+    public static let name = TitioIdentity.name
+    public static let title = TitioIdentity.title
+    public static let description = TitioIdentity.description
+    public static let soul = TitioIdentity.soul
 
     /// Finds or creates the single Titio Bot.
     @discardableResult
@@ -26,8 +27,8 @@ public enum TitioBot {
         }
         let bot = try store.create(
             name: name,
-            title: "RemoteCode assistant",
-            description: "Ask about anything in RemoteCode or ask it to act.",
+            title: title,
+            description: description,
             handle: handle,
             soul: soul
         )
@@ -38,7 +39,7 @@ public enum TitioBot {
         return try store.get(id: bot.id) ?? bot
     }
 
-    /// The pet's idle frame, used as Titio's avatar everywhere a Bot avatar shows.
+    /// The pet's idle frame: the still fallback for Titio's animated avatar.
     @MainActor public static let avatarImage: NSImage? = {
         guard let bundle = try? AppShellResourceBundle.bundle(),
               let url = bundle.url(forResource: "titio-avatar", withExtension: "png", subdirectory: "Pet")
@@ -46,8 +47,31 @@ public enum TitioBot {
         return NSImage(contentsOf: url)
     }()
 
+    /// Every Bot avatar for Titio is the animated pet, with no plate behind it.
     @MainActor public static func installAvatar() {
-        BotsAvatarView.imageOverride = { $0 == handle ? avatarImage : nil }
+        BotsAvatarView.viewOverride = { avatarHandle, size in
+            avatarHandle == handle ? AnyView(TitioAvatarView(size: size)) : nil
+        }
+    }
+
+    /// The draft "Restore Factory Settings" publishes: Titio's built-in
+    /// identity, instructions, avatar, notifications and reply style, like
+    /// `BotStore.restoreTitioFactorySettings` (the paired-device path). Its
+    /// desktop, conversations, files and schedules are not part of it.
+    public static func factoryDraft(for bot: BotDefinition, current: BotStudioDraft) -> BotStudioDraft {
+        var draft = current
+        draft.botID = bot.id
+        draft.name = name
+        draft.title = title
+        draft.description = description
+        draft.handle = handle
+        draft.avatarSymbol = BotBlobatarSpec.default.token
+        draft.soul = soul
+        draft.notificationsEnabled = true
+        draft.slugFollowsName = false
+        draft.verbosity = TitioIdentity.verbosity
+        draft.cavemanEnabled = TitioIdentity.cavemanEnabled
+        return draft
     }
 }
 

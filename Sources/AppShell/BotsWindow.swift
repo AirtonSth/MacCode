@@ -281,6 +281,9 @@ public struct BotStudioDraft: Equatable, Codable {
     public var expectedRevisionID: BotRevisionID?
     /// nil means infer from handle vs name (legacy drafts).
     public var slugFollowsName: Bool? = true
+    /// nil (drafts saved before reply style) means the Bot's current value.
+    public var verbosity: BotReplyVerbosity?
+    public var cavemanEnabled: Bool?
 
     public init(
         botID: BotID? = nil,
@@ -293,7 +296,9 @@ public struct BotStudioDraft: Equatable, Codable {
         notificationsEnabled: Bool = true,
         desktopKind: BotDesktopKind = .logicalExecutionSpace,
         expectedRevisionID: BotRevisionID? = nil,
-        slugFollowsName: Bool? = true
+        slugFollowsName: Bool? = true,
+        verbosity: BotReplyVerbosity? = nil,
+        cavemanEnabled: Bool? = nil
     ) {
         self.botID = botID
         self.name = name
@@ -306,6 +311,8 @@ public struct BotStudioDraft: Equatable, Codable {
         self.desktopKind = desktopKind
         self.expectedRevisionID = expectedRevisionID
         self.slugFollowsName = slugFollowsName
+        self.verbosity = verbosity
+        self.cavemanEnabled = cavemanEnabled
     }
 
     public var isNew: Bool { botID == nil }
@@ -3234,6 +3241,7 @@ public final class BotsViewModel: ObservableObject {
             selectedBotFallbackCache = nil
             refreshActiveBotCount()
             publishRosterIfNeeded()
+            applyDeskReplyStyle()
         }
     }
     /// Stored working-bot count so roster/Active Bots bodies never run the
@@ -4693,7 +4701,9 @@ public final class BotsViewModel: ObservableObject {
             notificationsEnabled: bot.notificationsEnabled,
             desktopKind: resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace),
             expectedRevisionID: bot.currentRevisionID,
-            slugFollowsName: BotHandle.shouldFollowName(handle: bot.handle, name: bot.name)
+            slugFollowsName: BotHandle.shouldFollowName(handle: bot.handle, name: bot.name),
+            verbosity: bot.verbosity,
+            cavemanEnabled: bot.cavemanEnabled
         )
         applyPersistedStudioDraftIfMatching(bot.id)
         isApplyingStudioDraft = false
@@ -5413,6 +5423,22 @@ public final class BotsViewModel: ObservableObject {
         errorMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
     }
 
+    /// Titio's own Studio: its avatar is the pet and its slug is how the app
+    /// finds it, so both stay fixed.
+    public var studioEditsTitio: Bool {
+        guard let botID = studioDraft.botID else { return false }
+        return selectedBot?.id == botID && selectedBot?.handle == TitioBot.handle
+    }
+
+    /// Publishes Titio's built-in profile over whatever the user changed.
+    /// Conversations, files and scheduled tasks stay.
+    @discardableResult
+    public func restoreTitioFactorySettings() throws -> BotDefinition {
+        guard studioEditsTitio, let bot = selectedBot else { throw BotStoreError.notFound }
+        studioDraft = TitioBot.factoryDraft(for: bot, current: studioDraft)
+        return try saveStudio()
+    }
+
     @discardableResult
     public func saveStudio() throws -> BotDefinition {
         defer { flushPendingDraftPersistence() }
@@ -5490,6 +5516,10 @@ public final class BotsViewModel: ObservableObject {
             saved.notificationsEnabled = studioDraft.notificationsEnabled
             saved.currentRevisionID = published.id
             saved.updatedAt = Date()
+            if let styled = try saveStudioReplyStyle(for: saved) {
+                saved.verbosity = styled.verbosity
+                saved.cavemanEnabled = styled.cavemanEnabled
+            }
             adoptPublishedRevision(published, bot: saved)
             syncPublishedHome(saved, revision: published)
             clearUnpublishedNewBot(botID)
@@ -5512,9 +5542,21 @@ public final class BotsViewModel: ObservableObject {
         if desktop == .dockerDesktop {
             presentGuestDesktop(botID: created.id)
         }
-        beginEdit(created)
+        let createdStyled = (try saveStudioReplyStyle(for: created)) ?? created
+        beginEdit(createdStyled)
         clearUnpublishedNewBot(created.id)
-        return created
+        return createdStyled
+    }
+
+    /// Reply style is a Bot-row setting, written beside the published revision
+    /// only when the Studio draft changed it.
+    private func saveStudioReplyStyle(for bot: BotDefinition) throws -> BotDefinition? {
+        let verbosity = studioDraft.verbosity ?? bot.verbosity
+        let caveman = studioDraft.cavemanEnabled ?? bot.cavemanEnabled
+        guard verbosity != bot.verbosity || caveman != bot.cavemanEnabled else { return nil }
+        let styled = try botStore.setReplyStyle(id: bot.id, verbosity: verbosity, cavemanEnabled: caveman)
+        rememberFleetBot(styled)
+        return styled
     }
 
     @discardableResult
@@ -6752,6 +6794,8 @@ public final class BotsViewModel: ObservableObject {
         var bot = selectedOrDraft
         if screen == .studio {
             bot.notificationsEnabled = studioDraft.notificationsEnabled
+            bot.verbosity = studioDraft.verbosity ?? bot.verbosity
+            bot.cavemanEnabled = studioDraft.cavemanEnabled ?? bot.cavemanEnabled
         }
         guard let revision = studioPreviewRevision(for: bot) ?? selectedRevision else { return nil }
         let turnDirective = BotPeerDelegation.turnDirective(
@@ -6784,6 +6828,8 @@ public final class BotsViewModel: ObservableObject {
             ownedSkillTexts(for: bot).map { "\($0.slug):\($0.body)" }.joined(separator: ","),
             selectedConversation?.id.value.uuidString ?? "",
             bot.notificationsEnabled ? "n1" : "n0",
+            bot.verbosity.rawValue,
+            bot.cavemanEnabled ? "c1" : "c0",
             turnDirective ?? "",
             previewInGuest ? "g1" : "g0",
         ].joined(separator: "\u{1f}")
@@ -6812,6 +6858,16 @@ public final class BotsViewModel: ObservableObject {
         return receipt
     }
 
+    /// The reply style the Studio shows: the draft's, else the Bot's, else the default.
+    public var studioDraftReplyStyle: (verbosity: BotReplyVerbosity, caveman: Bool) {
+        let bot = studioDraft.botID.flatMap { id in bots.first { $0.id == id } }
+        return (
+            studioDraft.verbosity ?? bot?.verbosity ?? .human,
+            studioDraft.cavemanEnabled ?? bot?.cavemanEnabled
+                ?? BotDefinition.defaultCavemanEnabled(handle: studioDraft.handle)
+        )
+    }
+
     public var studioHasUnpublishedChanges: Bool {
         guard let revision = selectedRevision else { return studioDraft.isNew }
         let bot = selectedBot
@@ -6821,6 +6877,9 @@ public final class BotsViewModel: ObservableObject {
             || studioDraft.soul != revision.soul
             || resolvedDesktopKind(studioDraft.desktopKind) != resolvedDesktopKind(revision.desktopKind)
             || studioDraft.notificationsEnabled != (bot?.notificationsEnabled ?? true)
+            || studioDraftReplyStyle.verbosity != (bot?.verbosity ?? .human)
+            || studioDraftReplyStyle.caveman
+                != (bot?.cavemanEnabled ?? BotDefinition.defaultCavemanEnabled(handle: studioDraft.handle))
             || studioDraft.avatarSymbol != (bot?.avatarSymbol ?? "person.crop.circle")
             || BotHandle.normalize(studioDraft.handle) != bot?.handle
     }
@@ -7894,6 +7953,8 @@ public final class BotsViewModel: ObservableObject {
             && current?.description == fresh.description
             && current?.avatarSymbol == fresh.avatarSymbol
             && current?.notificationsEnabled == fresh.notificationsEnabled
+            && current?.verbosity == fresh.verbosity
+            && current?.cavemanEnabled == fresh.cavemanEnabled
         if !unchanged {
             rememberFleetBot(fresh)
             if let revisionID = fresh.currentRevisionID,
@@ -10103,6 +10164,19 @@ public final class BotsViewModel: ObservableObject {
     /// Keeps at most one pinned Agent App VM on the selected conversation's
     /// linked thread. An unlinked conversation gets no VM: its thread is created
     /// lazily by the first send (`ensureLinkedThread`).
+    /// Verbosity Human: the desk shows only the Bot's messages.
+    static func deskHidesToolActivity(_ bot: BotDefinition) -> Bool {
+        bot.verbosity == .human
+    }
+
+    /// Follows a Verbosity change (Studio, a paired device) on the open desk.
+    private func applyDeskReplyStyle() {
+        guard let vm = deskAgentVM, let botID = deskAgentKey?.botID,
+              let bot = bots.first(where: { $0.id == botID }) ?? selectedBot.flatMap({ $0.id == botID ? $0 : nil }) else { return }
+        let hides = Self.deskHidesToolActivity(bot)
+        if vm.hidesToolActivity != hides { vm.hidesToolActivity = hides }
+    }
+
     func syncDeskAgentVM() {
         guard !isSyncingDeskAgent else { return }
         isSyncingDeskAgent = true
@@ -10125,7 +10199,10 @@ public final class BotsViewModel: ObservableObject {
         }
         let live = conversation
         let key = DeskAgentKey(botID: bot.id, conversationID: live.id, threadID: threadID, botName: bot.name)
-        if deskAgentKey == key, deskAgentVM != nil { return }
+        if deskAgentKey == key, deskAgentVM != nil {
+            applyDeskReplyStyle()
+            return
+        }
         tearDownDeskAgentVM()
         let threadReadsBefore = context.threadRepo.durableGetCountForTesting
         // One read of the thread row serves the cwd, the embedded Agent App's
@@ -10236,6 +10313,7 @@ public final class BotsViewModel: ObservableObject {
         vm.markThreadRead = { [weak router] id in
             try router?.markAgentThreadRead(thread: id)
         }
+        vm.hidesToolActivity = Self.deskHidesToolActivity(bot)
         vm.refreshProviderSnapshotsInBackground()
         deskAgentKey = key
         deskAgentVM = vm
@@ -12368,6 +12446,7 @@ public struct BotsRootView: View {
     private let embedsRosterRail: Bool
     @State private var pendingClearAllDeskThreads = false
     @State private var pendingDockerDataClear: BotID?
+    @State private var isConfirmingTitioFactoryReset = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
@@ -12725,19 +12804,106 @@ public struct BotsRootView: View {
                 studioIdentity
                 studioRule
                 studioSoul
+                studioRule
+                studioReplyStyle
+                if vm.studioEditsTitio {
+                    studioRule
+                    studioTitioFactoryReset
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.trailing, DS.Space.huge)
-            studioAvatarPane
-                .frame(width: 280, alignment: .top)
-                .padding(.leading, DS.Space.huge)
-                .overlay(alignment: .leading) {
-                    Rectangle()
-                        .fill(DS.Palette.line)
-                        .frame(width: DS.Border.hairline)
-                        .accessibilityHidden(true)
-                }
+            .padding(.trailing, vm.studioEditsTitio ? 0 : DS.Space.huge)
+            // Titio's avatar is the pet; there is nothing to pick.
+            if !vm.studioEditsTitio {
+                studioAvatarPane
+                    .frame(width: 280, alignment: .top)
+                    .padding(.leading, DS.Space.huge)
+                    .overlay(alignment: .leading) {
+                        Rectangle()
+                            .fill(DS.Palette.line)
+                            .frame(width: DS.Border.hairline)
+                            .accessibilityHidden(true)
+                    }
+            }
         }
+    }
+
+    /// How the Bot writes and how much of its work the chat shows.
+    private var studioReplyStyle: some View {
+        let style = vm.studioDraftReplyStyle
+        return VStack(alignment: .leading, spacing: DS.Space.xl) {
+            studioSectionHeader("Reply Style")
+            labeledField(
+                "Verbosity",
+                caption: "Human: the Bot writes like a person and the chat shows only its messages. Verbose: the chat also shows every command, edit and tool it runs."
+            ) {
+                Picker("Verbosity", selection: Binding(
+                    get: { style.verbosity },
+                    set: { vm.studioDraft.verbosity = $0 }
+                )) {
+                    Text("Human").tag(BotReplyVerbosity.human)
+                    Text("Verbose").tag(BotReplyVerbosity.verbose)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 260, alignment: .leading)
+                .accessibilityIdentifier("bots.studio.verbosity")
+            }
+            Toggle(isOn: Binding(
+                get: { style.caveman },
+                set: { vm.studioDraft.cavemanEnabled = $0 }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Caveman")
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.text)
+                    Text("Short, terse replies.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .accessibilityIdentifier("bots.studio.caveman")
+        }
+        .disabled(!vm.isControlPlaneActive)
+        .accessibilityIdentifier("bots.studio.replyStyle")
+    }
+
+    /// Way back for a Titio the user broke: one quiet button, confirmed.
+    private var studioTitioFactoryReset: some View {
+        HStack(alignment: .center, spacing: DS.Space.xl) {
+            studioSectionHeader(
+                "Factory Settings",
+                caption: "Put Titio's name, role, description and instructions back to the built-in defaults. Conversations, files and scheduled tasks stay."
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Restore Factory Settings…") {
+                isConfirmingTitioFactoryReset = true
+            }
+            .buttonStyle(DSSecondaryButtonStyle())
+            .disabled(!vm.isControlPlaneActive)
+            .accessibilityIdentifier("bots.studio.titio.factoryReset")
+        }
+        .confirmationDialog(
+            "Restore Titio's factory settings?",
+            isPresented: $isConfirmingTitioFactoryReset,
+            titleVisibility: .visible
+        ) {
+            Button("Restore Factory Settings", role: .destructive) {
+                vm.errorMessage = nil
+                do {
+                    _ = try vm.restoreTitioFactorySettings()
+                } catch {
+                    vm.presentAlertError(error)
+                }
+            }
+            .accessibilityIdentifier("bots.studio.titio.factoryReset.confirm")
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your changes to Titio's profile and instructions are replaced. Conversations, files and scheduled tasks are kept.")
+        }
+        .accessibilityIdentifier("bots.studio.titio.factorySettings")
     }
 
     private var studioIdentity: some View {
@@ -12775,6 +12941,9 @@ public struct BotsRootView: View {
                             set: { vm.didEditStudioSlug($0) }
                         )
                     )
+                    // The app finds Titio by its slug; renaming it would orphan the pet.
+                    .disabled(vm.studioEditsTitio)
+                    .help(vm.studioEditsTitio ? "Titio's slug is fixed." : "")
                     .accessibilityLabel("Slug")
                     .accessibilityValue(vm.studioDraft.handle.isEmpty ? "" : "@\(vm.studioDraft.handle)")
                     .accessibilityIdentifier("bots.studio.slug")

@@ -298,6 +298,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // Titio lives in the Bot roster so paired devices can chat with it too.
         if let botStore = context?.botStore, let support = context?.appSupportDirectory {
             _ = try? TitioBot.ensure(store: botStore, appSupportDirectory: support)
+            // The roster may have loaded before Titio existed (first launch).
+            router?.botsViewModel?.reload()
         }
         titioQuickChat.install { [weak self] text in self?.router?.sendTitioQuickMessage(text) }
         activityDockBadge.start()

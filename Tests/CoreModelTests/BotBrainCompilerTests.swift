@@ -1855,7 +1855,10 @@ final class BotBrainCompilerTests: XCTestCase {
         // Fala tarefa." The turn payload carried no reply style at all; it now
         // asks for natural, complete sentences in the user's language on every
         // provider, ahead of Instructions so a custom soul still has the last word.
-        let (bot, revision) = greetingFixture()
+        // Since 2026-10-15 this is the Caveman-off style (Titio's default);
+        // caveman Bots get `cavemanStyleLine` instead (see the reply style tests).
+        var (bot, revision) = greetingFixture()
+        bot.cavemanEnabled = false
         let payload = BotBrainCompiler.composeRunPrompt(bot: bot, revision: revision, userText: "bom dia")
         let style = try XCTUnwrap(payload.range(of: BotStandingInstructions.replyStyleLine))
         let instructions = try XCTUnwrap(payload.range(of: "Instructions:"))
@@ -1863,5 +1866,78 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertTrue(BotStandingInstructions.replyStyleLine.contains("in the user's language"))
         XCTAssertTrue(BotStandingInstructions.replyStyleLine.contains("complete sentences with articles"))
         XCTAssertTrue(BotStandingInstructions.replyStyleLine.contains("No telegraphic fragments"))
+    }
+}
+
+/// Per-Bot reply style (2026-10-15): what each Bot is told about how to write.
+final class BotReplyStylePromptTests: XCTestCase {
+    private func prompt(for bot: BotDefinition) -> String {
+        let revision = BotRevision(
+            botID: bot.id,
+            revisionNumber: 1,
+            name: bot.name,
+            title: "Developer",
+            description: "",
+            soul: "",
+            permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace,
+            digest: "x",
+            publishedAt: Date(timeIntervalSince1970: 0)
+        )
+        return BotBrainCompiler.composeRunPrompt(bot: bot, revision: revision, userText: "oi")
+    }
+
+    func test_cavemanBotIsToldToBeTerseAndNotToWriteFullSentences() {
+        // WHY: caveman is the default for every Bot; the full-sentence style
+        // would contradict it in the same prompt.
+        let bot = BotDefinition(handle: "ceo", name: "Ceo", title: "", description: "")
+        XCTAssertTrue(bot.cavemanEnabled)
+        let payload = prompt(for: bot)
+        XCTAssertTrue(payload.contains(BotStandingInstructions.cavemanStyleLine))
+        XCTAssertFalse(payload.contains(BotStandingInstructions.replyStyleLine))
+    }
+
+    func test_titioWritesFullSentencesByDefault() {
+        let titio = BotDefinition(handle: TitioIdentity.handle, name: "Titio", title: "", description: "")
+        XCTAssertFalse(titio.cavemanEnabled, "Titio explains RemoteCode, so it is not caveman")
+        let payload = prompt(for: titio)
+        XCTAssertTrue(payload.contains(BotStandingInstructions.replyStyleLine))
+        XCTAssertFalse(payload.contains(BotStandingInstructions.cavemanStyleLine))
+    }
+
+    func test_humanVerbosityGetsHumanizerRulesAndVerboseDoesNot() {
+        // WHY: Human hides tool rows, so the Bot must not narrate commands the
+        // user cannot see; Verbose keeps today's prompt.
+        var bot = BotDefinition(handle: "dev", name: "Dev", title: "", description: "")
+        XCTAssertEqual(bot.verbosity, .human)
+        XCTAssertTrue(prompt(for: bot).contains(BotStandingInstructions.humanVerbosityLine))
+        XCTAssertTrue(BotStandingInstructions.humanVerbosityLine.contains("never narrate your process"))
+        bot.verbosity = .verbose
+        XCTAssertFalse(prompt(for: bot).contains(BotStandingInstructions.humanVerbosityLine))
+    }
+
+    func test_everyBotIsTaughtTheChoicesBlockTheChatParses() throws {
+        // WHY: the example in the prompt must be a block the chat really turns
+        // into a card, or Bots would learn a format nothing renders.
+        let payload = prompt(for: BotDefinition(handle: "dev", name: "Dev", title: "", description: ""))
+        XCTAssertTrue(payload.contains(BotStandingInstructions.choicesLine))
+        let example = BotStandingInstructions.choicesLine
+        let start = try XCTUnwrap(example.range(of: "```choices"))
+        let end = try XCTUnwrap(example.range(of: "```", range: start.upperBound..<example.endIndex))
+        let block = String(example[start.lowerBound..<end.upperBound]).replacingOccurrences(of: "\\n", with: "\n")
+        let parsed = BotChoicesBlock.parse("Pick one\n" + block)
+        XCTAssertEqual(parsed.text, "Pick one")
+        XCTAssertEqual(parsed.choices?.options, ["First option", "Second option"])
+    }
+
+    func test_botsEncodedBeforeReplyStyleStillDecodeWithTheDefaults() throws {
+        // WHY: encoded Bots from older builds must keep decoding.
+        let bot = BotDefinition(handle: "titio", name: "Titio", title: "", description: "")
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(bot)) as? [String: Any])
+        object.removeValue(forKey: "verbosity")
+        object.removeValue(forKey: "cavemanEnabled")
+        let decoded = try JSONDecoder().decode(BotDefinition.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertEqual(decoded.verbosity, .human)
+        XCTAssertFalse(decoded.cavemanEnabled)
     }
 }

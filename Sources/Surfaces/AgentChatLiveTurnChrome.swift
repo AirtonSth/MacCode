@@ -932,6 +932,8 @@ public struct AgentChatLiveTurnView: View, Equatable {
     /// Used after an interleaved bot message so the chat keeps appending
     /// instead of stacking headers.
     public var showsWorkHeader: Bool
+    /// Verbosity Human: no work rows; a live turn shows only its "Working" line.
+    public var hidesWork: Bool
     public var renderFinal: ((String) -> AnyView)?
     public var afterWork: AnyView?
 
@@ -946,6 +948,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
         live: Bool,
         hideAssistantOutput: Bool = false,
         showsWorkHeader: Bool = true,
+        hidesWork: Bool = false,
         renderFinal: ((String) -> AnyView)? = nil,
         afterWork: AnyView? = nil
     ) {
@@ -953,6 +956,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
         self.live = live
         self.hideAssistantOutput = hideAssistantOutput
         self.showsWorkHeader = showsWorkHeader
+        self.hidesWork = hidesWork
         self.renderFinal = renderFinal
         self.afterWork = afterWork
     }
@@ -962,6 +966,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
             && lhs.live == rhs.live
             && lhs.hideAssistantOutput == rhs.hideAssistantOutput
             && lhs.showsWorkHeader == rhs.showsWorkHeader
+            && lhs.hidesWork == rhs.hidesWork
             && lhs.turn.finished == rhs.turn.finished
             && lhs.turn.items.count == rhs.turn.items.count
             && lhs.turn.finalAssistantMessage == rhs.turn.finalAssistantMessage
@@ -979,7 +984,11 @@ public struct AgentChatLiveTurnView: View, Equatable {
         let blocks = AgentChatLiveTurnChrome.workBlocks(from: composition.activity)
         let slice = AgentChatLiveTurnChrome.visibleWorkBlocks(blocks, revealCount: earlierWorkReveal)
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            if !composition.activity.isEmpty {
+            if hidesWork {
+                if live && showsWorkHeader {
+                    AgentChatHiddenWorkStatus(turn: turn)
+                }
+            } else if !composition.activity.isEmpty {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     if showsWorkHeader {
                         HStack(spacing: DS.Space.sm) {
@@ -1052,6 +1061,27 @@ public struct AgentChatLiveTurnView: View, Equatable {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("bots.desk.liveTurn.\(turn.turnId)")
+    }
+}
+
+/// The only trace of a hidden-work turn while it runs: the Bot is working,
+/// with no command, edit or tool detail.
+struct AgentChatHiddenWorkStatus: View {
+    let turn: AssistantTurnSnapshot
+
+    var body: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "circle.dotted")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityHidden(true)
+            Text("Working…")
+                .font(DS.Font.body.weight(.medium))
+                .foregroundColor(DS.Palette.textTertiary)
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("agent.hiddenWork.\(turn.turnId)")
     }
 }
 
