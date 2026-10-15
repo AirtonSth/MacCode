@@ -4773,7 +4773,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
+    func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
         viewModel.forceQueuedMessage = { [weak context] messageID in
             guard let router = context?.router else {
                 throw JSONRPCError(code: -32000, message: "App router is not ready.")

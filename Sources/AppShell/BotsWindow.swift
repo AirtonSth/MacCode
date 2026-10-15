@@ -10437,6 +10437,7 @@ public final class BotsViewModel: ObservableObject {
             guard let self else { return "Bot indisponível." }
             return await self.deskGuestDesktopFailure(botID)
         }
+        router.wireQueueDrainControl(on: vm, context: context)
         vm.botNameProvider = { [weak self] botID in
             (try? self?.botStore.get(id: botID))??.name
         }

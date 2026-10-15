@@ -17908,6 +17908,84 @@ final class BotsWindowTests: XCTestCase {
                       "bot threads run in the bot home, not the process cwd")
     }
 
+    func test_linkedDeskAgentCanForceQueuedMessageThroughRouter_becauseRecoveryMustNotBeUnavailable() async throws {
+        // WHY: The embedded Desk VM owns queue recovery controls too; forcing a
+        // queued row must route it to the provider instead of leaving it queued.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let setupRunner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: setupRunner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok, model: "grok-4.6")
+        vm.openDesk(bot)
+        vm.setDeskProvider(.grok, instanceID: "grok")
+        vm.setDeskModel("grok-4.6")
+        XCTAssertTrue(vm.createDeskThread())
+        let threadID = try await linkDeskThreadByFirstSend(
+            vm, context: context, router: router, providerAlreadyInstalled: true
+        )
+        let setupReachedFake = await waitUntil(timeout: 5) { setupRunner.requests.count == 1 }
+        XCTAssertTrue(setupReachedFake, "setup first-send must reach configured Grok fake")
+        XCTAssertTrue(setupRunner.finish(promptContaining: "hello", reply: "setup complete"))
+        let firstRunSettled = await waitUntil(timeout: 5) {
+            context.coordinator.activeRunId(threadId: threadID) == nil && !vm.deskSendInFlight
+        }
+        XCTAssertTrue(firstRunSettled, "the setup run must finish before idle recovery")
+        let runner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: runner)
+        var thread = try XCTUnwrap(try context.threadRepo.get(id: threadID))
+        thread.status = .completed
+        thread.provider = .grok
+        thread.model = "grok-4.6"
+        thread.providerInstanceId = "grok"
+        thread.routingConfiguration = AgentRoutingConfiguration(
+            mode: .manual,
+            manualSelection: AgentModelSelection(
+                provider: .grok,
+                modelId: "grok-4.6",
+                reasoningEffort: .medium,
+                serviceTier: .auto
+            ),
+            manualProviderInstanceId: "grok",
+            revision: 0
+        )
+        try context.threadRepo.upsert(thread)
+        let queuedText = "recover this queued message"
+        _ = try context.queuedMessageRepo.enqueue(
+            threadId: threadID,
+            text: queuedText,
+            attachments: [],
+            interactionMode: .default
+        )
+
+        let deskAgent = try XCTUnwrap(vm.deskAgentVM)
+        XCTAssertNotNil(deskAgent.forceQueuedMessage, "linked Desk VM must have router force wiring")
+        deskAgent.reloadQueuedMessages()
+        let queued = try XCTUnwrap(deskAgent.queuedMessages.first)
+        let requestsBeforeForce = runner.requests.count
+        await deskAgent.forceQueuedMessageNow(queued)
+
+        let started = await waitUntil(timeout: 5) { runner.requests.count > requestsBeforeForce }
+        XCTAssertTrue(started, "the linked Desk force action must reach the provider")
+        let request = try XCTUnwrap(runner.requests.last)
+        XCTAssertEqual(request.userMessageContent, queuedText, "forced queue text must not be lost")
+        XCTAssertTrue(try context.queuedMessageRepo.list(threadId: threadID).isEmpty)
+        XCTAssertFalse(
+            deskAgent.queueStatusMessage?.contains("unavailable") ?? false,
+            "embedded Desk queue recovery must have router wiring"
+        )
+    }
+
     func test_openingUnlinkedConversationDoesNotMarkItStarted_becauseViewingIsNotSending() async throws {
         // WHY: lastStartedConversationByBot drives "the bot just ran" bookkeeping
         // and must only move on a real send, never on viewing.
