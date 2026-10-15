@@ -203,6 +203,44 @@ final class TitioInboxThreadTests: XCTestCase {
         XCTAssertFalse(vm.deskShowsNewConversationComposer)
     }
 
+    func test_botDesksOfferForkLikeTheAgentAppButTitiosInboxDoesNot() throws {
+        // WHY: the owner wants every Bot message forkable like the Agent App;
+        // a fork of Titio's Notifications would copy notices into a chat.
+        let (_, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        try openInbox(vm, router: router, target: target)
+        XCTAssertNil(try XCTUnwrap(vm.deskAgentVM).onForkInNewChat, "no fork in the inbox")
+
+        let context = try XCTUnwrap(router.context)
+        let bot = try XCTUnwrap(try context.botStore.get(id: target.botID))
+        var chat = BotConversation(botID: bot.id, title: "Chat")
+        try context.botStore.upsertConversation(chat)
+        chat = try vm.ensureLinkedThread(
+            bot: bot, conversation: chat, routing: vm.frozenDeskRouting(for: chat), router: router, markStarted: false
+        ).conversation
+        vm.reload()
+        vm.openDesk(bot)
+        vm.selectDeskThread(chat.id)
+        XCTAssertNotNil(try XCTUnwrap(vm.deskAgentVM).onForkInNewChat, "Bot chats fork from any message")
+        XCTAssertEqual(BotsViewModel.forkTitle("Deploy"), "Fork · Deploy")
+        XCTAssertEqual(BotsViewModel.forkTitle("  "), "Fork")
+    }
+
+    func test_pairedForkRejectsAConversationOfAnotherBot() async throws {
+        // WHY: bot.conversation.fork must never fork a conversation the
+        // request's Bot does not own.
+        let (_, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let other = try vm.create(name: "Dev", title: "Builds")
+        do {
+            _ = try await router.forkPairedBotConversation(params: [
+                "bot_id": .string(other.id.value.uuidString.lowercased()),
+                "conversation_id": .string(target.conversationID.value.uuidString.lowercased()),
+            ])
+            XCTFail("must refuse")
+        } catch {}
+    }
+
     func test_selectingTheInboxMarksItRead() throws {
         // WHY: opening the inbox on the Mac clears its unread count (§8 "Read state").
         let (_, router, vm) = try makeFixture()

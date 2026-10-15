@@ -17357,7 +17357,7 @@ public struct AgentAppView: View {
                         roleIdentifier: "agent.role.assistant",
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
-                        onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
+                        onBranch: vm.onForkInNewChat == nil ? nil : { vm.onForkInNewChat?(msg.id.value.uuidString) },
                         stripsChoices: vm.showsBotChoices,
                         attachments: msg.attachments,
                         content: AnyView(
@@ -17384,7 +17384,7 @@ public struct AgentAppView: View {
                         roleIdentifier: "agent.role.assistant",
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
-                        onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(msg.id.value.uuidString) } : nil,
+                        onBranch: vm.onForkInNewChat == nil ? nil : { vm.onForkInNewChat?(msg.id.value.uuidString) },
                         stripsChoices: vm.showsBotChoices,
                         attachments: msg.attachments,
                         onClear: vm.embedding?.noticeClearHandler == nil ? nil : { vm.clearHostMessage(msg.id) }
@@ -17570,7 +17570,7 @@ public struct AgentAppView: View {
             roleIdentifier: "agent.role.assistant",
             copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
             branchIdentifier: "agent.assistantMessage.branch.\(turn.turnId)",
-            onBranch: vm.embedding == nil ? { vm.onForkInNewChat?(turn.turnId) } : nil,
+            onBranch: vm.onForkInNewChat == nil ? nil : { vm.onForkInNewChat?(turn.turnId) },
             stripsChoices: vm.showsBotChoices,
             showsImages: turn.finished,
             content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))

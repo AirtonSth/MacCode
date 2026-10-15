@@ -4477,7 +4477,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // Cursor only. A leftover 26-column + routing `get` hitchs fork
             // recovery just to copy provider_thread_id.
             sourceProviderThreadId: try threadRepo.providerThreadId(of: intent.sourceThreadId)
-                .flatMap { $0.isEmpty ? nil : $0 }
+                .flatMap { $0.isEmpty ? nil : $0 },
+            sourceWorkingDirectory: ((try? providerSessionRepo?.get(threadId: intent.sourceThreadId)) ?? nil)?
+                .cwd.flatMap { $0.isEmpty ? nil : $0 }
         )
 
         if intent.state == .compensated {
@@ -4511,6 +4513,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             let providerChildThreadId: String
             do {
                 providerChildThreadId = try await adapter.forkThread(request)
+            } catch AgentProviderAdapterError.forkRejected(let reason) {
+                // Nothing was created: retire the intent so the next fork works.
+                try? threadRepo.retireRejectedForkIntent(childThreadId: intent.childThread.id)
+                throw AgentProviderAdapterError.forkRejected(reason)
             } catch {
                 try? threadRepo.recordForkIntentError(
                     childThreadId: intent.childThread.id,

@@ -2194,6 +2194,21 @@ public final class AgentThreadRepository {
         }
     }
 
+    /// The provider refused the fork outright and created no child: the intent
+    /// is retired (deleted, like an abandoned one) so it never blocks the next
+    /// fork of the same source as `recoverableIntentExists`.
+    public func retireRejectedForkIntent(childThreadId: AgentThreadID) throws {
+        let delete = try db.prepare("""
+            DELETE FROM agent_thread_fork_intents
+            WHERE child_thread_id = ?
+              AND state = 'prepared'
+              AND provider_child_thread_id IS NULL;
+        """)
+        defer { delete.reset() }
+        try delete.bind(1, childThreadId.value.uuidString)
+        _ = try delete.step()
+    }
+
     /// A missing source is safe to retire only before the durable intent records
     /// that a provider call could have begun. The delete itself is the terminal
     /// outcome: retaining an `abandoned` tombstone would reintroduce row growth.

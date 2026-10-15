@@ -1013,6 +1013,7 @@ public final class JSONRPCDispatcher {
         "bot.guest.control",
         "bot.docker.clear",
         "bot.notify.set",
+        "bot.conversation.fork",
         "bot.verbosity.set",
         "bot.caveman.set",
         "bot.factory_reset",
@@ -5185,6 +5186,10 @@ public final class JSONRPCDispatcher {
                 NSLog("[RC2.Dispatch] %@ provider unsupported: %@", method, verbose)
                 return JSONRPCError(code: -32010, message: "Agent operation is not available right now.",
                                     data: .object(["domain": .string("agent"), "kind": .string("unsupported"), "detail": .string(op)]))
+            case .forkRejected(let reason):
+                NSLog("[RC2.Dispatch] %@ provider fork rejected: %@", method, verbose)
+                return JSONRPCError(code: -32010, message: "This thread could not be forked: \(reason)",
+                                    data: .object(["domain": .string("agent"), "kind": .string("fork_rejected"), "detail": .string(reason)]))
             }
         case let e as PersistenceDataError:
             NSLog("[RC2.Dispatch] %@ persistence error: %@", method, verbose)

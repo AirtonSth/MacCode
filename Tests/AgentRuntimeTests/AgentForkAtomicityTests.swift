@@ -21,6 +21,7 @@ final class AgentForkAtomicityTests: XCTestCase {
         private var _providerCreations = 0
         private var _compensationCalls = 0
         private var _failForkCount = 0
+        private var _rejectForkCount = 0
         private var _failCompensationCount = 0
         private var _onFork: (() throws -> Void)?
 
@@ -38,6 +39,7 @@ final class AgentForkAtomicityTests: XCTestCase {
         var providerChildren: [String: String] { withLock { childrenByKey } }
 
         func failNextForks(_ count: Int) { withLock { _failForkCount = count } }
+        func rejectNextForks(_ count: Int) { withLock { _rejectForkCount = count } }
         func failNextCompensations(_ count: Int) { withLock { _failCompensationCount = count } }
         func onFork(_ action: @escaping () throws -> Void) { withLock { _onFork = action } }
 
@@ -47,6 +49,10 @@ final class AgentForkAtomicityTests: XCTestCase {
                 if _failForkCount > 0 {
                     _failForkCount -= 1
                     throw TestFailure.provider
+                }
+                if _rejectForkCount > 0 {
+                    _rejectForkCount -= 1
+                    throw AgentProviderAdapterError.forkRejected("Method not found")
                 }
                 if let existing = childrenByKey[request.idempotencyKey] {
                     return (existing, _onFork)
@@ -666,6 +672,40 @@ final class AgentForkAtomicityTests: XCTestCase {
         XCTAssertEqual(Set(adapter.forkRequests.map(\.idempotencyKey)), [stableKey(harness.child.id)])
         XCTAssertEqual(adapter.providerCreations, 1)
         XCTAssertEqual(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id)?.state, .localCommitted)
+    }
+
+    func test_aProviderRefusalRetiresTheIntentSoTheNextForkOfTheThreadWorks() async throws {
+        // WHY: Distill answered "Method not found" and the intent stayed
+        // 'prepared', so every later fork of that thread failed with
+        // recoverableIntentExists. A refusal creates nothing: retire it.
+        let harness = try makeHarness()
+        let adapter = KeyedForkAdapter()
+        adapter.rejectNextForks(1)
+        do {
+            _ = try await harness.coordinator(adapter: adapter).forkThread(
+                sourceThreadId: harness.parent.id,
+                childThread: harness.child
+            )
+            XCTFail("the refusal must surface")
+        } catch AgentProviderAdapterError.forkRejected {}
+        XCTAssertNil(try harness.threadRepo.getForkIntent(childThreadId: harness.child.id),
+                     "a refused fork leaves no recoverable intent behind")
+        try assertNoLocalChild(harness)
+
+        let retry = AgentThread(
+            workspaceId: harness.parent.workspaceId,
+            title: "retry",
+            provider: harness.parent.provider,
+            model: harness.parent.model,
+            status: .completed,
+            worktreePath: harness.root
+        )
+        let forked = try await harness.coordinator(adapter: adapter).forkThread(
+            sourceThreadId: harness.parent.id,
+            childThread: retry
+        )
+        XCTAssertEqual(forked.id, retry.id, "the next fork of the same thread goes through")
+        XCTAssertEqual(adapter.providerCreations, 1)
     }
 
     func test_preparedIntentWithDeletedSourceAbandonsWithoutProviderMutation() async throws {

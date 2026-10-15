@@ -1045,21 +1045,62 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         guard !isGuestThread(request.sourceThreadId) else {
             throw AgentProviderAdapterError.unsupported("Distill guest threads cannot fork a provider session")
         }
-        guard let source = synchronized({ sessions[request.sourceThreadId] }) else {
-            throw AgentProviderAdapterError.unsupported("Distill ACP fork requires the source session to be live")
-        }
         let childId = Self.deterministicForkChildId(idempotencyKey: request.idempotencyKey)
-        guard childId != source.providerThreadId else {
+        // A live session forks through its own client. Otherwise Distill forks
+        // the saved session from disk, so a thread not used since launch can
+        // still fork (a short-lived process, like `compensateFork`).
+        if let source = synchronized({ sessions[request.sourceThreadId] }) {
+            guard childId != source.providerThreadId else {
+                throw AgentProviderAdapterError.unsupported("provider-native fork did not return a distinct child session")
+            }
+            let newCwd = request.workingDirectory.flatMap { $0.isEmpty ? nil : $0 } ?? source.cwd
+            return try await Self.rejectingFork {
+                try await source.client.forkSession(
+                    sourceSessionId: source.providerThreadId,
+                    sourceCwd: source.cwd,
+                    newCwd: newCwd,
+                    newSessionId: childId,
+                    kind: "fork"
+                )
+            }
+        }
+        guard let sourceSessionId = request.sourceProviderThreadId, !sourceSessionId.isEmpty else {
+            throw AgentProviderAdapterError.forkRejected("this thread has no Distill session to fork yet")
+        }
+        guard childId != sourceSessionId else {
             throw AgentProviderAdapterError.unsupported("provider-native fork did not return a distinct child session")
         }
-        let newCwd = request.workingDirectory.flatMap { $0.isEmpty ? nil : $0 } ?? source.cwd
-        return try await source.client.forkSession(
-            sourceSessionId: source.providerThreadId,
-            sourceCwd: source.cwd,
-            newCwd: newCwd,
-            newSessionId: childId,
-            kind: "fork"
+        // Distill stores sessions per directory: the source's own cwd finds it.
+        guard let sourceCwd = request.sourceWorkingDirectory ?? request.workingDirectory.flatMap({ $0.isEmpty ? nil : $0 }) else {
+            throw AgentProviderAdapterError.forkRejected("the saved Distill session's folder is unknown")
+        }
+        let newCwd = request.workingDirectory.flatMap { $0.isEmpty ? nil : $0 } ?? sourceCwd
+        let client = try DistillACPClient(
+            binary: binaryNameOverride ?? DistillProvisioner.binaryName,
+            cwd: sourceCwd
         )
+        defer { client.stop() }
+        _ = try await client.initialize()
+        return try await Self.rejectingFork {
+            try await client.forkSession(
+                sourceSessionId: sourceSessionId,
+                sourceCwd: sourceCwd,
+                newCwd: newCwd,
+                newSessionId: childId,
+                kind: "fork"
+            )
+        }
+    }
+
+    /// JSON-RPC refusals (method not found, invalid params or request) mean
+    /// Distill created no child; anything else (timeouts, a dead process) may
+    /// have, so it stays recoverable and retries converge on the same child.
+    static func rejectingFork(_ body: () async throws -> String) async throws -> String {
+        do {
+            return try await body()
+        } catch let DistillACPError.rpcError(code, message, detail, _) where [-32601, -32602, -32600].contains(code ?? 0) {
+            throw AgentProviderAdapterError.forkRejected(ACPRPCErrorPayload.describe(message: message, detail: detail))
+        }
     }
 
     /// Deletes the provider child session. Uses the live client when the source or child is

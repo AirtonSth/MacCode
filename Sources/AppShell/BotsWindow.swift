@@ -9947,6 +9947,46 @@ public final class BotsViewModel: ObservableObject {
 
     /// Persist dest used to listConversations after the store wrote
     /// this thread. Patch it locally so dest does not reread threads.
+    /// Forks a desk conversation: the provider thread is forked (Agent App
+    /// semantics, `AppCommandRouter.forkAgentThread`) and a new conversation of
+    /// the same Bot, linked to the child, opens on the desk. Paired devices
+    /// reach it through `bot.conversation.fork`.
+    @discardableResult
+    func forkDeskConversation(conversationID: BotConversationID, messageID: String?) async throws -> BotConversation {
+        guard let router = resolvedRouter(),
+              let source = try botStore.conversation(id: conversationID),
+              let sourceThread = source.linkedAgentThreadID else {
+            throw BotStoreError.notFound
+        }
+        guard source.id != titioInboxConversationID else {
+            throw BotStoreError.invalidRow("Titio's Notifications can't be forked")
+        }
+        let child = try await router.forkAgentThread(sourceThreadId: sourceThread, messageID: messageID)
+        var conversation = BotConversation(
+            botID: source.botID,
+            title: Self.forkTitle(source.title),
+            linkedAgentThreadID: child.id
+        )
+        conversation.updatedAt = Date()
+        try botStore.upsertConversation(conversation)
+        if let stored = try botStore.conversation(id: conversation.id) { conversation = stored }
+        if selectedBotID == source.botID {
+            adoptWrittenConversation(conversation)
+        } else {
+            patchStudioSupportConversation(conversation, botID: source.botID)
+        }
+        EventBus.shared.publish(kind: .botConversationUpdated, payload: .object([
+            "bot_id": .string(source.botID.value.uuidString.lowercased()),
+            "conversation_id": .string(conversation.id.value.uuidString.lowercased()),
+        ]))
+        return conversation
+    }
+
+    static func forkTitle(_ title: String) -> String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Fork" : "Fork · \(trimmed)"
+    }
+
     private func adoptWrittenConversation(_ conversation: BotConversation) {
         selectedConversation = conversation
         selectedConversationByBot[conversation.botID] = conversation.id
@@ -10396,6 +10436,20 @@ public final class BotsViewModel: ObservableObject {
                     try router?.startBotHandoff(from: oldID, actor: actor)
                 } catch {
                     self?.errorMessage = String(describing: error)
+                }
+            }
+        }
+        // Fork from any message (like the Agent App): a new conversation of
+        // the same Bot on a forked copy of this thread. Not in Titio's inbox.
+        if !isTitioInbox {
+            vm.onForkInNewChat = { [weak self, weak vm] messageID in
+                guard let self else { return }
+                Task { @MainActor in
+                    do {
+                        _ = try await self.forkDeskConversation(conversationID: live.id, messageID: messageID)
+                    } catch {
+                        vm?.statusMessage = "Could not fork thread: \(error)"
+                    }
                 }
             }
         }

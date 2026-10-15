@@ -3814,6 +3814,42 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Test seam: the projector whose queued settles those reads wait for.
     var botRuntimeEvidenceProjectorForTesting: BotRuntimeEvidenceProjector { botRuntimeEvidenceProjector }
 
+    /// `bot.conversation.fork {bot_id, conversation_id, message_id?}`: forks a
+    /// Bot conversation from a paired device, like the Mac desk's fork button.
+    /// The receipt names the new conversation so the phone can open it.
+    func forkPairedBotConversation(params: [String: JSONValue]) async throws -> JSONValue {
+        guard let botID = params["bot_id"]?.stringValue.flatMap(UUID.init).map(BotID.init),
+              let conversationID = params["conversation_id"]?.stringValue.flatMap(UUID.init).map(BotConversationID.init) else {
+            throw JSONRPCError.invalidParams
+        }
+        guard let vm = botsViewModel else {
+            throw JSONRPCError(code: -32091, message: "Bot runtime is unavailable.")
+        }
+        guard (try? context?.botStore.conversation(id: conversationID))??.botID == botID else {
+            throw JSONRPCError.invalidParams
+        }
+        let forked = try await vm.forkDeskConversation(
+            conversationID: conversationID,
+            messageID: params["message_id"]?.stringValue
+        )
+        let requestID = params["client_request_id"]?.stringValue ?? UUID().uuidString.lowercased()
+        var readback: [String: JSONValue] = [
+            "conversation_id": .string(forked.id.value.uuidString.lowercased()),
+            "title": .string(forked.title),
+            "route": .string("bot"),
+        ]
+        if let thread = forked.linkedAgentThreadID {
+            readback["thread_id"] = .string(thread.value.uuidString.lowercased())
+        }
+        return .object([
+            "request_id": .string(requestID),
+            "receipt_id": .string(UUID().uuidString.lowercased()),
+            "status": .string("completed"),
+            "bot_id": .string(botID.value.uuidString.lowercased()),
+            "readback": .object(readback),
+        ])
+    }
+
     public func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
         if BotTeamGroupService.handles(method) {
             guard let ctx = context, ctx.hostsBotGroupConversations else {
@@ -3826,6 +3862,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ))
             }
             return try await ctx.botTeamGroupService.dispatchRemote(method: method, params: params)
+        }
+        if method == "bot.conversation.fork" {
+            return try await forkPairedBotConversation(params: params)
         }
         let authority = try pairedBotAuthority()
         let foundation = Self.foundationObject(params)
@@ -4962,7 +5001,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw LayoutError.workspaceNotFound
         }
         let child = makeForkChild(source: source, ephemeral: false, title: source.title)
-        let forked = try await ctx.coordinator.forkThread(sourceThreadId: sourceThreadId, childThread: child)
+        let forked: AgentThread
+        do {
+            forked = try await ctx.coordinator.forkThread(sourceThreadId: sourceThreadId, childThread: child)
+        } catch AgentThreadForkPersistenceError.recoverableIntentExists {
+            // An earlier fork of this thread was interrupted (a crash, a
+            // provider timeout). Finish it now in the background, the way
+            // launch recovery would, and say so instead of an opaque error.
+            let coordinator = ctx.coordinator
+            Task { await coordinator.reconcileForkIntentsOnLaunch() }
+            throw AgentProviderAdapterError.forkRejected(
+                "an earlier fork of this thread is still finishing; it will appear in the list shortly"
+            )
+        }
         EventBus.shared.publish(kind: .agentThreadCreated, payload: agentThreadPayload(forked))
         return forked
     }

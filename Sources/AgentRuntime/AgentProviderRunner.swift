@@ -344,11 +344,16 @@ public enum AgentProviderRequestResponse: Sendable, Equatable {
 public enum AgentProviderAdapterError: Error, CustomStringConvertible {
     case unsupported(String)
     case sessionNotFound(AgentThreadID)
+    /// The provider refused the fork outright (bad method, bad params, no
+    /// source session) and created no child, so the fork intent can be
+    /// retired instead of blocking every later fork of the same thread.
+    case forkRejected(String)
 
     public var description: String {
         switch self {
         case .unsupported(let operation): return "Provider adapter operation unsupported: \(operation)"
         case .sessionNotFound(let threadId): return "Provider session not found: \(threadId.value.uuidString)"
+        case .forkRejected(let reason): return "The provider could not fork this thread: \(reason)"
         }
     }
 }
@@ -382,19 +387,24 @@ public struct AgentProviderForkRequest: Sendable, Equatable {
     public let idempotencyKey: String
     public let workingDirectory: String?
     public let sourceProviderThreadId: String?
+    /// The cwd the source's provider session was last opened with; a provider
+    /// that stores sessions per directory needs it to fork a saved session.
+    public let sourceWorkingDirectory: String?
 
     public init(
         sourceThreadId: AgentThreadID,
         childThreadId: AgentThreadID,
         idempotencyKey: String,
         workingDirectory: String? = nil,
-        sourceProviderThreadId: String? = nil
+        sourceProviderThreadId: String? = nil,
+        sourceWorkingDirectory: String? = nil
     ) {
         self.sourceThreadId = sourceThreadId
         self.childThreadId = childThreadId
         self.idempotencyKey = idempotencyKey
         self.workingDirectory = workingDirectory
         self.sourceProviderThreadId = sourceProviderThreadId
+        self.sourceWorkingDirectory = sourceWorkingDirectory
     }
 }
 
