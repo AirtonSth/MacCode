@@ -279,7 +279,7 @@ final class PetWindowAccessibilityTests: XCTestCase {
         let sprite = try XCTUnwrap(controller.spriteAccessibilityViewForTests)
 
         XCTAssertEqual(sprite.accessibilityRole(), .button)
-        XCTAssertEqual(sprite.accessibilityLabel(), "Remote Code pet")
+        XCTAssertEqual(sprite.accessibilityLabel(), "Titio")
         XCTAssertTrue(sprite.accessibilityPerformPress())
         XCTAssertTrue(controller.isPopoverVisible)
     }

@@ -174,6 +174,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        // Before any window paints a Bot avatar.
+        TitioBot.installAvatar()
         let appSupportDirectory = AppPaths.appSupportDirectory(
             for: channel,
             override: appSupportOverride
@@ -293,6 +295,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         startInProcessScheduledTaskScheduler()
         installScheduledTaskStoreObserver()
         startPetController()
+        // Titio lives in the Bot roster so paired devices can chat with it too.
+        if let botStore = context?.botStore, let support = context?.appSupportDirectory {
+            _ = try? TitioBot.ensure(store: botStore, appSupportDirectory: support)
+        }
+        titioQuickChat.install { [weak self] text in self?.router?.sendTitioQuickMessage(text) }
         activityDockBadge.start()
 
         // start unix socket server
@@ -1490,7 +1497,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         keybindableMenuItems = [(item: paletteItem, command: "commandPalette.toggle")]
         viewMenu.addItem(paletteItem)
         let petItem = NSMenuItem(
-            title: "Open Remote Code Pet",
+            title: "Open Titio",
             action: #selector(togglePetPopoverFromMenu),
             keyEquivalent: "p"
         )
@@ -1854,6 +1861,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             NSSound.beep()
         }
     }
+
+    let titioQuickChat = TitioQuickChatController()
 
     func togglePetPopover() -> Bool {
         petController?.togglePopoverFromKeyboard() == true

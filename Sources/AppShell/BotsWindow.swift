@@ -3875,6 +3875,9 @@ public final class BotsViewModel: ObservableObject {
             }
         }
         var result = filtered.sorted { lhs, rhs in
+            // Titio is the pet: always the first Bot.
+            let lhsTitio = lhs.handle == TitioBot.handle, rhsTitio = rhs.handle == TitioBot.handle
+            if lhsTitio != rhsTitio { return lhsTitio }
             if lhs.pinned != rhs.pinned { return lhs.pinned && !rhs.pinned }
             return lhs.updatedAt > rhs.updatedAt
         }
@@ -10590,7 +10593,8 @@ public final class BotsViewModel: ObservableObject {
         markStarted: Bool = true
     ) throws -> (thread: AgentThread, conversation: BotConversation) {
         var routing = routing
-        if BotExecutionDefault.target(for: try currentRevision(for: bot)) == .vm {
+        if BotExecutionDefault.target(for: try currentRevision(for: bot)) == .vm
+            || bot.handle == TitioBot.handle {
             routing.permissionMode = .fullAccess
         }
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
@@ -10756,7 +10760,8 @@ public final class BotsViewModel: ObservableObject {
             return nil
         }
         var routing = routingOverride ?? frozenDeskRouting(for: conversation)
-        if BotExecutionDefault.target(for: revision) == .vm {
+        // Titio acts through host catalog mutations, which require fullAccess.
+        if BotExecutionDefault.target(for: revision) == .vm || bot.handle == TitioBot.handle {
             routing.permissionMode = .fullAccess
         }
         let prepared = try prepareSupervisedRun(
@@ -13115,21 +13120,9 @@ public struct BotsRootView: View {
     /// Accent, bottom-trailing above the composer; scroll-to-latest stacks on
     /// top of it, so the two never overlap.
     private var deskNewThreadFAB: some View {
-        Button {
+        AgentChatNewThreadFAB(identifier: "bots.desk.thread.new.fab") {
             vm.createDeskThread()
-        } label: {
-            Image(systemName: "plus")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(DS.Palette.onAccent)
-                .frame(width: DSIconButton.hitTargetSize, height: DSIconButton.hitTargetSize)
-                .background(DS.Palette.accent)
-                .clipShape(Circle())
-                .shadow(color: .black.opacity(0.25), radius: 10, x: 0, y: 4)
         }
-        .buttonStyle(.plain)
-        .help(AgentChatThreadRailCopy.newHelp)
-        .accessibilityLabel(AgentChatThreadRailCopy.newHelp)
-        .accessibilityIdentifier("bots.desk.thread.new.fab")
     }
 
     /// Visual gap between Desk header glyphs. DSIconButton lays out at

@@ -712,6 +712,15 @@ public final class ScheduledTaskScheduler {
         }
     }
 
+    /// Claims synchronously so callers see a busy or missing task as an error,
+    /// then starts the run like `runNow`.
+    @discardableResult
+    public func claimAndRunNow(taskID: UUID) throws -> ScheduledTaskClaim {
+        let claim = try store.claimManual(taskID: taskID, owner: owner)
+        Task { await execute(claim) }
+        return claim
+    }
+
     private func execute(_ claim: ScheduledTaskClaim) async {
         do {
             // Spent-slot advance (+1s) so whole-second persistence / subsecond

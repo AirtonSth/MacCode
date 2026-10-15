@@ -413,6 +413,7 @@ public final class PetController {
         windowController.onOpenItem = { [weak self] item in self?.open(item) }
         windowController.onOpenActiveThread = { [weak self] item in self?.openActive(item) }
         windowController.onOpenRemoteCode = { [weak self] in self?.showActivity() }
+        windowController.onOpenTitio = { [weak self] in self?.openTitio() }
         windowController.onOpenSettings = { [weak self] in
             _ = self?.openSettings(.general)
         }
@@ -1373,6 +1374,15 @@ public final class PetController {
 
     private func destinationWindowIsKey(_ window: NSWindow) -> Bool {
         destinationWindowIsKeyForTests?(window) ?? window.isKeyWindow
+    }
+
+    func openTitio() {
+        windowController?.closePopover(restoringPreviousKeyWindow: false)
+        do {
+            try router.openTitio()
+        } catch {
+            model.routeError = "Titio could not be opened."
+        }
     }
 
     private func showActivity() {

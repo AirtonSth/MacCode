@@ -654,6 +654,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     // while unfinished.
     private var autoContinuationCounts: [AgentThreadID: Int] = [:]
     private var autoContinuationTokens: [AgentThreadID: Int] = [:]
+    /// Consecutive automatic resumes after transient provider network failures.
+    private var networkRetryCounts: [AgentThreadID: Int] = [:]
     // PERF-MAC_AGENT-006: last assistant text persisted per thread, to dedup the
     // turnCompleted/finished pair without reloading the whole thread history.
     private var lastPersistedAssistantContent: [AgentThreadID: String] = [:]
@@ -733,6 +735,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// background job is auto-nudged to resume. Gives the background job time to make
     /// progress before the agent polls it. Injectable so tests drive it to ~0.
     public var backgroundAwaitContinuationDelay: TimeInterval = 45
+    /// Backoff before each automatic resume of a turn that failed on a transient
+    /// network error (e.g. Distill "error decoding response body"). The count
+    /// bounds the retries; injectable so tests drive it to ~0.
+    public var networkRetryDelays: [TimeInterval] = [3, 10, 30]
     /// AG-002: normal provider shutdown gets two seconds before hard escalation;
     /// deletion never waits beyond five seconds without failing loud.
     var gracefulStopTimeout: TimeInterval = 2
@@ -2976,6 +2982,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lastStreamFlushMs.removeValue(forKey: threadId)
         mirrorPersistenceFailures.removeValue(forKey: threadId)
         autoContinuationCounts.removeValue(forKey: threadId)
+        networkRetryCounts.removeValue(forKey: threadId)
         autoContinuationTokens.removeValue(forKey: threadId)
         lastPersistedAssistantContent.removeValue(forKey: threadId)
         preparationStates.removeValue(forKey: threadId)
@@ -3592,6 +3599,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // UX-MAC_AGENT-BG-AWAIT: a stop ends the streak and invalidates the token,
         // so any scheduled auto-continuation for this thread aborts when it fires.
         autoContinuationCounts.removeValue(forKey: threadId)
+        networkRetryCounts.removeValue(forKey: threadId)
         autoContinuationTokens[threadId] = (autoContinuationTokens[threadId] ?? 0) + 1
         lock.unlock()
         if let activeProjection {
@@ -3613,6 +3621,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func forgetThread(_ threadId: AgentThreadID) {
         lock.lock()
         autoContinuationCounts.removeValue(forKey: threadId)
+        networkRetryCounts.removeValue(forKey: threadId)
         autoContinuationTokens.removeValue(forKey: threadId)
         lock.unlock()
     }
@@ -3697,6 +3706,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         discardRunThreadOwnershipIfReleasedLocked(runId)
         lastPersistedAssistantContent.removeValue(forKey: threadId)
         autoContinuationCounts.removeValue(forKey: threadId)
+        networkRetryCounts.removeValue(forKey: threadId)
         autoContinuationTokens[threadId] = (autoContinuationTokens[threadId] ?? 0) + 1
         let projection = activeRunProjectionLocked()
         lock.unlock()
@@ -3898,7 +3908,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     // MARK: - Background-await auto-continuation (UX-MAC_AGENT-BG-AWAIT)
 
     private func resetAutoContinuationStreak(_ threadId: AgentThreadID) {
-        lock.lock(); autoContinuationCounts[threadId] = 0; lock.unlock()
+        lock.lock(); autoContinuationCounts[threadId] = 0; networkRetryCounts[threadId] = nil; lock.unlock()
     }
 
     /// F37: bump the thread's continuation token so any pending scheduled
@@ -3968,6 +3978,81 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 await self.autoContinuationReleasesBotVM?(request.runId)
             }
         }
+    }
+
+    /// A turn that failed on a transient network error (the provider stream
+    /// dropped mid-response) is resumed automatically on the same session, a
+    /// bounded number of times with backoff, instead of stopping on a red
+    /// "Retry" the user must press.
+    private func maybeScheduleNetworkRetry(
+        threadId: AgentThreadID,
+        status: AgentRunStatus,
+        errorMessage: String?,
+        runMetadata: RunMetadata?,
+        resumeCursor: String?
+    ) {
+        if status == .completed {
+            lock.lock(); networkRetryCounts[threadId] = nil; lock.unlock()
+            return
+        }
+        guard status == .failed,
+              let runMetadata,
+              TransientNetworkRetry.isTransientNetworkFailure(errorMessage) else { return }
+        lock.lock()
+        let attempt = (networkRetryCounts[threadId] ?? 0) + 1
+        guard attempt <= networkRetryDelays.count else {
+            lock.unlock()
+            return
+        }
+        networkRetryCounts[threadId] = attempt
+        let token = (autoContinuationTokens[threadId] ?? 0) + 1
+        autoContinuationTokens[threadId] = token
+        let delay = networkRetryDelays[attempt - 1]
+        lock.unlock()
+        let identity = try? threadRepo.identity(of: threadId)
+        let request = AgentRunRequest(
+            threadId: threadId,
+            provider: runMetadata.provider,
+            providerInstanceId: runMetadata.providerInstanceId,
+            model: runMetadata.model,
+            cwd: runMetadata.cwd,
+            prompt: TransientNetworkRetry.prompt,
+            userMessageContent: TransientNetworkRetry.prompt,
+            providerThreadId: resumeCursor,
+            permissionMode: runMetadata.runtimeMode,
+            reasoningModel: identity?.reasoningModel,
+            serviceTier: runMetadata.serviceTier,
+            interactionMode: runMetadata.interactionMode,
+            runAsUser: identity?.runAsUser
+        )
+        agentRunLog.info("run.networkRetry.scheduled thread=\(threadId.value.uuidString, privacy: .public) attempt=\(attempt, privacy: .public)")
+        Task { [weak self] in
+            guard let self else { return }
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64((delay * 1_000_000_000).rounded()))
+            }
+            guard self.networkRetryStillValid(threadId: threadId, token: token) else { return }
+            if let claim = self.autoContinuationClaimsBotVM {
+                guard await claim(threadId, request.runId) else { return }
+            }
+            do {
+                _ = try await self.startRun(request, isAutoContinuation: true)
+            } catch {
+                await self.autoContinuationReleasesBotVM?(request.runId)
+            }
+        }
+    }
+
+    /// Same guard as the background-await nudge, but the thread must still be
+    /// in the failed state the retry was scheduled for.
+    private func networkRetryStillValid(threadId: AgentThreadID, token: Int) -> Bool {
+        lock.lock()
+        let ok = autoContinuationTokens[threadId] == token
+            && activeThreads[threadId] == nil
+            && !pendingThreadStops.contains(threadId)
+        lock.unlock()
+        guard ok else { return false }
+        return (try? threadRepo.status(of: threadId)) == .failed
     }
 
     /// True iff the scheduled continuation is still the latest one for the thread
@@ -6377,6 +6462,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 threadId: threadId,
                 status: status,
                 finalMessage: finalMessage,
+                runMetadata: runMetadata,
+                resumeCursor: resumeCursor
+            )
+            maybeScheduleNetworkRetry(
+                threadId: threadId,
+                status: status,
+                errorMessage: pendingTerminal.errorMessage,
                 runMetadata: runMetadata,
                 resumeCursor: resumeCursor
             )

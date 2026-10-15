@@ -18,6 +18,9 @@ final class RemoteCodeHostCatalogTests: XCTestCase {
             RemoteCodeHostCatalog.botThreadCreate,
             RemoteCodeHostCatalog.botSkillCreate,
             RemoteCodeHostCatalog.botSkillView,
+            RemoteCodeHostCatalog.activityList,
+            RemoteCodeHostCatalog.botDelegate,
+            RemoteCodeHostCatalog.scheduledTaskRunNext,
         ])
         XCTAssertFalse(names.contains(RemoteCodeHostCatalog.genericHostCallTool))
         XCTAssertFalse(names.contains("rc_host"))
