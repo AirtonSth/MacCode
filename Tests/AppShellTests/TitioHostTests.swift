@@ -1,5 +1,6 @@
 import XCTest
 import Carbon.HIToolbox
+import SwiftUI
 import Surfaces
 @testable import AgentRuntime
 import CoreModel
@@ -290,6 +291,37 @@ final class TitioHostTests: XCTestCase {
         XCTAssertTrue(branch.contains("custom.frame(width: size, height: size)"))
         XCTAssertFalse(branch.contains(".background"), "no plate behind Titio")
         XCTAssertFalse(source.contains("Color(white: 0.92)"), "the old light plate is gone")
+    }
+
+    func test_titioRosterAvatarHasTheSameOpticalSizeAsBlobatars() throws {
+        // WHY: the owner saw (2026-10-15) Titio's roster row look cramped next
+        // to the other Bots: the cat filled the whole 48 pt avatar frame while
+        // a blobatar's body spans at most ~76% of it, leaving the same vertical
+        // breathing room above and below. The Bot-avatar override must keep the
+        // pet inside that share; the popover keeps the full-size pet.
+        TitioBot.installAvatar()
+        let size: CGFloat = 48
+        let rosterHeight = try opaqueHeight(of: XCTUnwrap(BotsAvatarView.viewOverride(TitioBot.handle, size)), size: size)
+        let fullHeight = try opaqueHeight(of: AnyView(TitioAvatarView(size: size)), size: size)
+        XCTAssertLessThanOrEqual(rosterHeight, size * TitioAvatarView.botAvatarFill + 1, "roster pet stays inside a blobatar's share")
+        XCTAssertGreaterThan(rosterHeight, size * 0.6, "but is not shrunk below a blobatar's body")
+        XCTAssertGreaterThan(fullHeight, rosterHeight, "the popover pet still fills its frame")
+    }
+
+    private func opaqueHeight(of view: AnyView, size: CGFloat) throws -> CGFloat {
+        let renderer = ImageRenderer(content: view.frame(width: size, height: size))
+        renderer.scale = 1
+        let image = try XCTUnwrap(renderer.cgImage)
+        let width = image.width, height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let context = try XCTUnwrap(CGContext(
+            data: &pixels, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let rows = (0..<height).filter { y in (0..<width).contains { x in pixels[(y * width + x) * 4 + 3] > 16 } }
+        guard let top = rows.first, let bottom = rows.last else { return 0 }
+        return CGFloat(bottom - top + 1)
     }
 
     func test_titioAvatarAnimatesOnlyWhileMountedAndStopsWithPetMotion() {

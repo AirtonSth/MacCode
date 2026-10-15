@@ -89,7 +89,7 @@ public enum TitioBot {
     /// Every Bot avatar for Titio is the animated pet, with no plate behind it.
     @MainActor public static func installAvatar() {
         BotsAvatarView.viewOverride = { avatarHandle, size in
-            avatarHandle == handle ? AnyView(TitioAvatarView(size: size)) : nil
+            avatarHandle == handle ? AnyView(TitioAvatarView(size: size, matchesBotAvatars: true)) : nil
         }
     }
 

@@ -303,6 +303,9 @@ public struct AgentChatUserBubble: View, Equatable {
     }
 
     public var body: some View {
+        // A reply shows its quote above the bubble, never the raw quote line.
+        let reply = AgentReplyQuote.parse(text)
+        let text = reply?.body ?? self.text
         let bubbleMax = AgentChatTranscriptChrome.userMessageBubbleWidthCap(columnWidth: columnWidth)
         let textWidth = AgentChatTranscriptChrome.userMessageBubbleContentWidth(
             text: text,
@@ -314,7 +317,11 @@ public struct AgentChatUserBubble: View, Equatable {
                 if let header {
                     header
                 }
-                bubbleLabel(textWidth: textWidth)
+                if let reply {
+                    AgentChatReplyQuoteStrip(excerpt: reply.excerpt)
+                        .frame(maxWidth: bubbleMax, alignment: .trailing)
+                }
+                bubbleLabel(text: text, textWidth: textWidth)
                     .frame(maxWidth: bubbleMax, alignment: .trailing)
                     .accessibilityIdentifier(accessibilityIdentifier)
                 HStack(spacing: DS.Space.xs) {
@@ -357,7 +364,7 @@ public struct AgentChatUserBubble: View, Equatable {
             && (lhs.header != nil) == (rhs.header != nil)
     }
 
-    private func bubbleLabel(textWidth: CGFloat) -> some View {
+    private func bubbleLabel(text: String, textWidth: CGFloat) -> some View {
         AgentSelectablePlainText(text: text, fontSize: 13, textColor: DS.NS.text)
             .frame(width: textWidth, alignment: .leading)
             .fixedSize(horizontal: false, vertical: true)
@@ -369,12 +376,61 @@ public struct AgentChatUserBubble: View, Equatable {
     }
 }
 
+/// The quoted Bot message of a reply: above the composer while composing
+/// (with a cancel button) and above the sent bubble in the transcript.
+public struct AgentChatReplyQuoteStrip: View {
+    public let excerpt: String
+    public var onCancel: (() -> Void)? = nil
+
+    public init(excerpt: String, onCancel: (() -> Void)? = nil) {
+        self.excerpt = excerpt
+        self.onCancel = onCancel
+    }
+
+    public var body: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "ellipsis.bubble")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundColor(DS.Palette.textSecondary)
+                .accessibilityHidden(true)
+            Text("“\(excerpt)”")
+                .font(onCancel == nil ? DS.Font.caption : DS.Font.body)
+                .foregroundColor(DS.Palette.textSecondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(excerpt)
+            if let onCancel {
+                Spacer(minLength: DS.Space.sm)
+                Button(action: onCancel) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityLabel("Cancel reply")
+                .accessibilityIdentifier("agent.composer.reply.cancel")
+                .help("Cancel reply")
+            }
+        }
+        .padding(.horizontal, onCancel == nil ? 0 : DS.Space.md)
+        .padding(.vertical, onCancel == nil ? 0 : DS.Space.sm)
+        .frame(maxWidth: onCancel == nil ? nil : .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Replying to \(excerpt)")
+        .accessibilityIdentifier(onCancel == nil ? "agent.userMessage.replyQuote" : "agent.composer.reply")
+    }
+}
+
 public struct AgentChatAssistantReply: View, Equatable {
     public let text: String
     public var roleIdentifier: String = "bots.desk.role.assistant"
     public var copyIdentifier: String? = nil
     public var branchIdentifier: String? = nil
     public var onBranch: (() -> Void)? = nil
+    /// Bot desks: "Reply" quotes this message into the composer.
+    public var onReply: (() -> Void)? = nil
     public var content: AnyView? = nil
     /// Message attachments; image ones (bot screenshots) join the gallery.
     public var attachments: [AgentAttachment] = []
@@ -390,6 +446,7 @@ public struct AgentChatAssistantReply: View, Equatable {
         copyIdentifier: String? = nil,
         branchIdentifier: String? = nil,
         onBranch: (() -> Void)? = nil,
+        onReply: (() -> Void)? = nil,
         stripsChoices: Bool = true,
         attachments: [AgentAttachment] = [],
         showsImages: Bool = true,
@@ -403,6 +460,7 @@ public struct AgentChatAssistantReply: View, Equatable {
         self.copyIdentifier = copyIdentifier
         self.branchIdentifier = branchIdentifier
         self.onBranch = onBranch
+        self.onReply = onReply
         self.attachments = attachments
         self.showsImages = showsImages
         self.content = content
@@ -450,6 +508,19 @@ public struct AgentChatAssistantReply: View, Equatable {
                     .accessibilityIdentifier(branchIdentifier ?? "agent.assistantMessage.branch")
                     .help("Branch in new chat")
                 }
+                if let onReply {
+                    Button(action: onReply) {
+                        Image(systemName: "arrowshape.turn.up.left")
+                            .font(.system(size: 11, weight: .regular))
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityLabel("Reply")
+                    .accessibilityIdentifier("agent.assistantMessage.reply")
+                    .help("Reply")
+                }
                 if let onClear {
                     Spacer(minLength: DS.Space.xs)
                     Button(action: onClear) {
@@ -476,6 +547,7 @@ public struct AgentChatAssistantReply: View, Equatable {
             && lhs.copyIdentifier == rhs.copyIdentifier
             && lhs.branchIdentifier == rhs.branchIdentifier
             && (lhs.onBranch != nil) == (rhs.onBranch != nil)
+            && (lhs.onReply != nil) == (rhs.onReply != nil)
             && (lhs.content != nil) == (rhs.content != nil)
             && lhs.attachments == rhs.attachments
             && lhs.showsImages == rhs.showsImages

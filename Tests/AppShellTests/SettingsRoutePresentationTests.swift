@@ -24,6 +24,31 @@ final class SettingsRoutePresentationTests: XCTestCase {
         XCTAssertFalse(controller.isRouteVisibleForTests(.general))
     }
 
+    func test_showAccountsRoutePresentsAccountsAndAutoSection() throws {
+        // WHY: the owner moved Accounts & Auto out of the Agent App header into
+        // Settings (2026-10-15). The Agent App's empty-state link and any other
+        // entry must land on that section, not on the top of Settings.
+        let controller = try makeController()
+        defer { close(controller) }
+
+        XCTAssertTrue(controller.show(route: .accounts))
+        XCTAssertEqual(controller.presentedRouteForTests, .accounts)
+        XCTAssertTrue(controller.isRouteVisibleForTests(.accounts))
+    }
+
+    func test_accountsSummaryNeverClaimsAutoStateBeforeTheSavedProfileLoads() {
+        // WHY: cache-first must stay honest — before Distill's saved state is
+        // read, Settings must not say Auto is off (it may be on).
+        XCTAssertEqual(
+            DistillAccountsSettingsSection.summary(statuses: [], routing: .init(), loaded: false),
+            "Loading accounts…"
+        )
+        XCTAssertEqual(
+            DistillAccountsSettingsSection.summary(statuses: [], routing: .init(), loaded: true),
+            "No accounts yet · Auto off"
+        )
+    }
+
     func test_showRouteAttachedToMainWindowUsesTheSameVerifiedAnchorPath() throws {
         let parent = NSWindow(
             contentRect: CGRect(x: 0, y: 0, width: 900, height: 700),

@@ -12,52 +12,6 @@ import Surfaces
 
 private let appRouterLog = Logger(subsystem: "io.remotecode.appshell", category: "router")
 
-private struct DistillAccountsPanelHost: View {
-    @ObservedObject var controller: DistillAccountsController
-    let loadModels: () async -> [AgentModelDescriptor]
-
-    var body: some View {
-        DistillAccountsPanel(
-            presentation: DistillAccountsPanelPresentation(
-                statuses: controller.statuses,
-                busyProvider: controller.busyProvider,
-                signInURL: controller.signInURL,
-                lastError: controller.lastError,
-                installState: {
-                    switch controller.installState {
-                    case .unknown: return .unknown
-                    case .installed: return .installed
-                    case .installing: return .installing
-                    case .failed(let message): return .failed(message)
-                    }
-                }(),
-                busyAccountID: controller.busyAccountID,
-                isBusy: controller.isBusy,
-                routing: controller.routing,
-                models: controller.models,
-                routingLoaded: controller.hasLoadedState,
-                isRefreshing: controller.isRefreshing
-            ),
-            cancel: controller.cancel,
-            openAgain: { NSWorkspace.shared.open($0) },
-            dismissError: controller.dismissError,
-            retryInstall: controller.retryDistillInstall,
-            refreshAccounts: controller.refresh,
-            add: { controller.add(provider: $0, label: $1) },
-            rename: { controller.rename(accountID: $0, label: $1) },
-            connectAccount: { controller.login(accountID: $0) },
-            disconnectAccount: { controller.logout(accountID: $0) },
-            remove: { controller.remove(accountID: $0) },
-            refreshQuota: { controller.refreshUsage(accountID: $0) },
-            saveRouting: controller.saveRouting
-        )
-        .onAppear { controller.refresh() }
-        .task(id: controller.statuses.filter(\.connected).map(\.id) + [controller.routing.enabled ? "auto-enabled" : "auto-disabled"]) {
-            _ = await loadModels()
-        }
-    }
-}
-
 private struct AgentProviderInstanceConfig: Decodable, Equatable {
     var id: String
     var provider: AgentProvider
@@ -551,9 +505,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public weak var context: AppContext?
 
-    private var distillAccountsPanel: AnyView? {
-        guard let controller = context?.distillAccountsController else { return nil }
-        return AnyView(DistillAccountsPanelHost(controller: controller, loadModels: { await self.listAgentModels(provider: .distill) }))
+    /// Accounts & Auto lives in Settings; the Agent App's empty state links there.
+    private var openAccountsSettings: (() -> Void)? {
+        guard context != nil else { return nil }
+        return {
+            guard let settings = (NSApp.delegate as? AppDelegate)?.settings else { return }
+            settings.show(route: .accounts)
+        }
     }
     public weak var windowController: MainWindowController?
     /// H3: throttles terminal OSC title commits (persist + surface.renamed) per surface.
@@ -1141,7 +1099,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             }
                             return nil
                         }()
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title, initialThreadId: restoredThreadId, orchestrationRuntime: ctx.orchestrationRuntime, accountPanel: distillAccountsPanel)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title, initialThreadId: restoredThreadId, orchestrationRuntime: ctx.orchestrationRuntime, openAccountsSettings: openAccountsSettings)
                         agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
                             guard let self, let agent else { return }
                             self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
@@ -7674,6 +7632,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let agent = surface as? AgentAppSurface else { continue }
             await agent.viewModel.loadProviderSnapshots(forceCatalogRefresh: true)
         }
+        // The open Bot desk lists the same Distill models: Auto appears there
+        // as soon as the profile is saved, not after the next desk rebuild.
+        await botsViewModel?.deskAgentVM?.loadProviderSnapshots(forceCatalogRefresh: true)
         if let controller = context?.distillAccountsController {
             _ = await controller.discoverModels {
                 await self.listAgentModels(provider: .distill, runAsUser: nil, forceCatalogRefresh: true)
@@ -9892,7 +9853,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: restore.flatMap(restoredBrowserURL(from:)), title: baseTitle, botID: botID), workspace: workspace)
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, sideThreadId: sideThreadId, orchestrationRuntime: ctx.orchestrationRuntime, accountPanel: distillAccountsPanel)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, sideThreadId: sideThreadId, orchestrationRuntime: ctx.orchestrationRuntime, openAccountsSettings: openAccountsSettings)
                 // Per-surface thread binding: persist this surface's selected
                 // thread into its descriptor metadata so app restart restores it.
                 agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in

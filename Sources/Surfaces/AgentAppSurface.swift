@@ -81,6 +81,21 @@ public final class AgentComposerState: ObservableObject {
     }
     /// PF-12: focusing the composer must not republish the 78-field Agent App VM.
     @Published public var focusTick: Int = 0
+    /// Bot desks: the message the next send replies to (quote strip above the
+    /// composer). Scoped to the thread it was picked in.
+    @Published public var replyTarget: AgentReplyTarget?
+}
+
+/// The Bot message a composer send answers: its excerpt becomes the quote line
+/// (`AgentReplyQuote`) of the sent text.
+public struct AgentReplyTarget: Equatable, Sendable {
+    public let threadId: AgentThreadID
+    public let excerpt: String
+
+    public init(threadId: AgentThreadID, excerpt: String) {
+        self.threadId = threadId
+        self.excerpt = excerpt
+    }
 }
 
 /// Stream/transcript paint state on its OWN ObservableObject so token/tool storms
@@ -748,6 +763,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Wired by AppCommandRouter. Branches the selected thread into a new
     /// persisted child chat (optionally from a message id) and selects it.
     public var onForkInNewChat: ((String?) -> Void)?
+    /// Bot desks: assistant messages offer Reply (quote + "Reply…" composer).
+    public var supportsReplies = false
     /// Wired by AppCommandRouter. Creates the ephemeral side thread for the
     /// selected thread and opens it in a right split pane. The string is the
     /// optional `/side` inline first message.
@@ -4914,6 +4931,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// `!selectedThreadRunIsStartingOrRunning` guard keeps the neutral copy during
     /// the brief window a resume run is starting.
     public var composerPlaceholder: String {
+        if activeReplyTarget != nil { return "Reply…" }
         if let placeholder = embedding?.composerPlaceholder { return placeholder }
         let defaultPlaceholder = "Ask \(provider.rawValue.capitalized) for changes…"
         guard !selectedThreadRunIsStartingOrRunning,
@@ -8623,7 +8641,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             && (providerSnapshotsEmpty || providerSnapshotsLoading || modelListLoading)
     }
 
+    /// Starts a reply to `message` in the selected thread and focuses the composer.
+    public func beginReply(to message: String) {
+        guard supportsReplies, let threadId = selectedThreadId else { return }
+        let excerpt = AgentReplyQuote.excerpt(of: message)
+        guard !excerpt.isEmpty else { return }
+        composerState.replyTarget = AgentReplyTarget(threadId: threadId, excerpt: excerpt)
+        focusTick += 1
+    }
+
+    public func cancelReply() {
+        composerState.replyTarget = nil
+    }
+
+    /// The reply in effect for the selected thread (a pick made in another
+    /// thread never quotes into this one).
+    public var activeReplyTarget: AgentReplyTarget? {
+        guard let target = composerState.replyTarget, target.threadId == selectedThreadId else { return nil }
+        return target
+    }
+
     public func send() async {
+        // A reply sends the quote line first; text-less sends (attachments
+        // only) keep no quote.
+        if let reply = activeReplyTarget,
+           !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            prompt = AgentReplyQuote.compose(
+                excerpt: reply.excerpt,
+                text: prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            composerState.replyTarget = nil
+        }
         let originalPrompt = prompt
         let sendThreadId = selectedThreadId
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -12892,8 +12940,8 @@ public struct AgentAppView: View {
         return QueueStatusBannerPresentation(message: message, offersCopy: true, offersRetry: true)
     }
     @ObservedObject var vm: AgentAppViewModel
-    private let accountPanel: AnyView?
-    @State private var showingAccounts = false
+    /// Opens Settings at Accounts & Auto (nil when no Distill accounts host).
+    private let openAccountsSettings: (() -> Void)?
     private let layout: AgentAppViewLayout
     /// Host action on the transcript's bottom-trailing corner (Bots Desk +).
     private let timelineAccessory: AnyView?
@@ -12965,12 +13013,12 @@ public struct AgentAppView: View {
 
     public init(
         vm: AgentAppViewModel,
-        accountPanel: AnyView? = nil,
+        openAccountsSettings: (() -> Void)? = nil,
         layout: AgentAppViewLayout = .standard,
         timelineAccessory: AnyView? = nil
     ) {
         self.vm = vm
-        self.accountPanel = accountPanel
+        self.openAccountsSettings = openAccountsSettings
         self.layout = layout
         self.timelineAccessory = timelineAccessory
     }
@@ -15307,16 +15355,6 @@ public struct AgentAppView: View {
             .onChange(of: vm.showPlanSidebar) { _ in
                 applyAdaptiveSidebars(width: proxy.size.width, event: .structural)
             }
-            .sheet(isPresented: $showingAccounts) {
-                if let accountPanel {
-                    accountPanel
-                        .padding(DS.Space.xxl)
-                        // A native sheet can ignore idealWidth; size it to the available host surface.
-                        .frame(width: min(820, proxy.size.width), height: min(640, proxy.size.height))
-                        .background(DS.Palette.bg)
-                        .foregroundStyle(DS.Palette.text)
-                }
-            }
             .onChange(of: vm.checkpointRevealGeneration) { _ in
                 planSidebarIntent = .forcedVisible
                 applyAdaptiveSidebars(width: proxy.size.width, event: .structural)
@@ -15711,14 +15749,6 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textSecondary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
-            if accountPanel != nil {
-                Button { showingAccounts = true } label: {
-                    Label("Accounts", systemImage: "person.crop.circle")
-                }
-                .buttonStyle(.bordered).controlSize(.small)
-                .help("Manage Distill accounts and Auto routing")
-                .accessibilityIdentifier("agent.accounts.open")
-            }
             botScreenControls
             // Unified working phase strip (replaces separate awaiting/shell/status pills).
             workingPhaseStrip
@@ -17107,8 +17137,8 @@ public struct AgentAppView: View {
                 title: vm.embedding?.emptyConversationTitle ?? "No messages",
                 subtitle: vm.embedding?.emptyConversationSubtitle ?? "Start a new agent run."
             ) {
-                if accountPanel != nil {
-                    Button("Accounts & Auto") { showingAccounts = true }
+                if let openAccountsSettings {
+                    Button("Accounts & Auto", action: openAccountsSettings)
                         .buttonStyle(.bordered).frame(minHeight: 44)
                         .accessibilityIdentifier("agent.accounts.open.empty")
                 }
@@ -17358,6 +17388,7 @@ public struct AgentAppView: View {
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
                         onBranch: vm.onForkInNewChat == nil ? nil : { vm.onForkInNewChat?(msg.id.value.uuidString) },
+                        onReply: vm.supportsReplies ? { vm.beginReply(to: parsed.body) } : nil,
                         stripsChoices: vm.showsBotChoices,
                         attachments: msg.attachments,
                         content: AnyView(
@@ -17385,6 +17416,7 @@ public struct AgentAppView: View {
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
                         onBranch: vm.onForkInNewChat == nil ? nil : { vm.onForkInNewChat?(msg.id.value.uuidString) },
+                        onReply: vm.supportsReplies ? { vm.beginReply(to: msg.content) } : nil,
                         stripsChoices: vm.showsBotChoices,
                         attachments: msg.attachments,
                         onClear: vm.embedding?.noticeClearHandler == nil ? nil : { vm.clearHostMessage(msg.id) }
@@ -17571,6 +17603,7 @@ public struct AgentAppView: View {
             copyIdentifier: "agent.assistantMessage.copy.\(turn.turnId)",
             branchIdentifier: "agent.assistantMessage.branch.\(turn.turnId)",
             onBranch: vm.onForkInNewChat == nil ? nil : { vm.onForkInNewChat?(turn.turnId) },
+            onReply: vm.supportsReplies && turn.finished ? { vm.beginReply(to: final) } : nil,
             stripsChoices: vm.showsBotChoices,
             showsImages: turn.finished,
             content: AnyView(assistantProse(final, cacheMarkdown: turn.finished))
@@ -18531,8 +18564,15 @@ public struct AgentAppView: View {
     }
 
     private var composerHeader: AnyView? {
-        guard let s = vm.gitSummary, !s.files.isEmpty else { return nil }
-        return AnyView(changedFilesStrip(s))
+        let reply = vm.activeReplyTarget
+        let summary = vm.gitSummary.flatMap { $0.files.isEmpty ? nil : $0 }
+        guard reply != nil || summary != nil else { return nil }
+        return AnyView(VStack(spacing: 0) {
+            if let reply {
+                AgentChatReplyQuoteStrip(excerpt: reply.excerpt, onCancel: { vm.cancelReply() })
+            }
+            if let summary { changedFilesStrip(summary) }
+        })
     }
 
     private var composerLeadingControls: some View {
@@ -20488,12 +20528,12 @@ public final class AgentAppSurface: NSObject, Surface {
     /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
     public var onClose: (() -> Void)?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, sideThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(), accountPanel: AnyView? = nil) {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil, sideThreadId: AgentThreadID? = nil, orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime(), openAccountsSettings: (() -> Void)? = nil) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
         if let binding = sideThreadId ?? initialThreadId { metadata["selected_thread"] = binding.value.uuidString }
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
         self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, sideThreadId: sideThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared, orchestrationRuntime: orchestrationRuntime)
-        let host = NSHostingView(rootView: AgentAppView(vm: viewModel, accountPanel: accountPanel))
+        let host = NSHostingView(rootView: AgentAppView(vm: viewModel, openAccountsSettings: openAccountsSettings))
         host.sizingOptions = []
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

@@ -1268,6 +1268,7 @@ public final class SettingsViewModel: ObservableObject {
 private final class SettingsRouteRegistry {
     private weak var generalAnchor: NSView?
     private weak var providersAnchor: NSView?
+    private weak var accountsAnchor: NSView?
 
     func register(_ view: NSView, for route: PetSettingsRoute) {
         switch route {
@@ -1275,6 +1276,8 @@ private final class SettingsRouteRegistry {
             generalAnchor = view
         case .providers:
             providersAnchor = view
+        case .accounts:
+            accountsAnchor = view
         }
     }
 
@@ -1299,6 +1302,8 @@ private final class SettingsRouteRegistry {
             return generalAnchor
         case .providers:
             return providersAnchor
+        case .accounts:
+            return accountsAnchor
         }
     }
 }
@@ -1482,6 +1487,14 @@ public struct SettingsView: View {
                     remoteAccessSection
                         .background(routeAnchor(.general))
                         .accessibilityIdentifier("settings.section.general")
+                    DistillAccountsSettingsSection(
+                        controller: vm.context.distillAccountsController,
+                        loadModels: { [weak context = vm.context] in
+                            await context?.router?.listAgentModels(provider: .distill) ?? []
+                        }
+                    )
+                    .background(routeAnchor(.accounts))
+                    .accessibilityIdentifier("settings.section.accounts")
                     hostFileAccessSection
                     ChromeExtensionSettingsSection()
                     diffDefaultsSection

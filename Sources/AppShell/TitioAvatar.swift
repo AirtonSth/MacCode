@@ -57,20 +57,31 @@ final class TitioAvatarAnimator: ObservableObject {
 
 /// Titio's avatar: the pet itself, animated, with no plate behind it.
 struct TitioAvatarView: View {
+    /// Share of the frame a Bot avatar's figure fills: blobatars draw their
+    /// body across 62–76% of their canvas, so Titio uses the same optical size
+    /// wherever it sits beside them (roster, headers, composer chips).
+    static let botAvatarFill: CGFloat = 0.76
+
     let size: CGFloat
+    /// True when shown as a Bot avatar next to blobatars; false for the
+    /// popover and Option+Space, where the pet fills its frame.
+    let matchesBotAvatars: Bool
     @ObservedObject private var animator = TitioAvatarAnimator.shared
 
-    init(size: CGFloat) {
+    init(size: CGFloat, matchesBotAvatars: Bool = false) {
         self.size = size
+        self.matchesBotAvatars = matchesBotAvatars
     }
 
     var body: some View {
+        let figure = matchesBotAvatars ? (size * Self.botAvatarFill).rounded() : size
         Group {
             if let image = animator.image ?? TitioBot.avatarImage {
                 Image(nsImage: image)
                     .resizable()
                     .interpolation(.none)
                     .scaledToFit()
+                    .frame(width: figure, height: figure)
             } else {
                 Color.clear
             }
