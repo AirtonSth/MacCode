@@ -1012,6 +1012,7 @@ public final class JSONRPCDispatcher {
         "bot.factory_reset",
         "bot.notice.act",
         "bot.notice.read",
+        "bot.notice.clear",
         "bot.desktop.set",
         "bot.avatar.set",
         "bot.handle.set",

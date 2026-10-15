@@ -19,7 +19,9 @@ public enum TitioNoticeDirective {
         var lines = ["Notices RemoteCode posted in this Titio inbox since the user's last message (oldest first):"]
         for row in ordered {
             let body = TitioNoticeCopy.body(for: TitioNoticeRenderItem(record: row), language: language, timeZone: timeZone)
-            let text = TitioNoticeCopy.clean(body, max: maxTextCharacters) ?? ""
+            // The factual sentence leaves the run summary out; the model still needs it.
+            let summary = TitioNoticeCopy.clean(row.facts.summary, max: maxTextCharacters).map { " Summary: \($0)" } ?? ""
+            let text = TitioNoticeCopy.clean(body + summary, max: maxTextCharacters) ?? ""
             lines.append("- [\(row.kind.rawValue) · \(row.state.rawValue)] \(text) (\(ids(row)))")
         }
         lines.append(closingRule)

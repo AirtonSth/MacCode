@@ -23,6 +23,9 @@ public enum RemoteCodeEventKind: String, Codable, CaseIterable, Sendable {
     case agentMessageQueueForceRequested = "agent.message.queue.force_requested"
     case agentMessageQueueUpdated = "agent.message.queue.updated"
     case agentMessageQueued = "agent.message.queued"
+    /// Messages left a thread (a cleared Titio notice): payload
+    /// `{thread_id, message_ids}`; clients drop those ids from transcripts.
+    case agentMessagesRemoved = "agent.messages.removed"
     case agentPlanActiveUpdated = "agent.plan.active_updated"
     case agentPlanImplemented = "agent.plan.implemented"
     case agentPlanNotesUpdated = "agent.plan.notes.updated"

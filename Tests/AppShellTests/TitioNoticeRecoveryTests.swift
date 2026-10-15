@@ -342,7 +342,7 @@ final class TitioNoticeRecoveryTests: XCTestCase {
         XCTAssertEqual(interrupted.actions?.first?.action, .continue)
         let messages = try transcript(f)
         XCTAssertEqual(messages.count, 2)
-        XCTAssertTrue(messages.contains { $0.content.hasPrefix("While the app was closed, this was pending:") })
+        XCTAssertTrue(messages.contains { $0.content.hasPrefix("• ") }, "the catch-up digest, with no canned opener")
     }
 
     // MARK: 8. Fail-loud fallback, then recovery

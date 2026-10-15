@@ -4329,8 +4329,10 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func rosterPreview(for bot: BotDefinition) -> String {
+        // One plain line: a subtitle never shows raw `**`, links or fences.
         if let preview = lastPreviewByBot[bot.id], !preview.isEmpty {
-            return BotsDeskFollowThrough.displayUserText(from: preview)
+            let plain = MarkdownPlainText.firstLine(BotsDeskFollowThrough.displayUserText(from: preview))
+            if !plain.isEmpty { return plain }
         }
         if !bot.title.isEmpty { return bot.title }
         return "No job yet"
@@ -4354,11 +4356,11 @@ public final class BotsViewModel: ObservableObject {
         let cached = messagesByBot[bot.id] ?? []
         let source = cached.isEmpty && selectedBotID == bot.id ? deskMessages : cached
         let rows = source.suffix(4).map { message in
-            BotActivityRow(id: message.id, text: message.text, createdAt: message.createdAt)
+            BotActivityRow(id: message.id, text: MarkdownPlainText.firstLine(message.text), createdAt: message.createdAt)
         }
         if !rows.isEmpty { return Array(rows) }
         if let preview = lastPreviewByBot[bot.id], let stamp = lastUpdatedByBot[bot.id] {
-            return [BotActivityRow(text: preview, createdAt: stamp)]
+            return [BotActivityRow(text: MarkdownPlainText.firstLine(preview), createdAt: stamp)]
         }
         return []
     }
@@ -10325,7 +10327,8 @@ public final class BotsViewModel: ObservableObject {
             emptyConversationSubtitle: "This thread has no messages yet.",
             pinnedThread: thread,
             noticeChoiceHandler: isTitioInbox ? titioNoticeChoiceHandler() : nil,
-            hostReplyHandler: isTitioInbox ? titioHostReplyHandler() : nil
+            hostReplyHandler: isTitioInbox ? titioHostReplyHandler() : nil,
+            noticeClearHandler: isTitioInbox ? titioNoticeClearHandler() : nil
         )
         let vm = AgentAppViewModel(
             workspaceID: Self.botDeskWorkspaceID,
@@ -10801,6 +10804,16 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// The inbox desk's clear button (contract §3): the hub removes the
+    /// message off the MainActor; false puts the row back.
+    private func titioNoticeClearHandler() -> @MainActor (AgentMessageID) async -> Bool {
+        let center = context.titioNoticeCenter
+        return { messageID in
+            if case .cleared = await center.clear(messageID: messageID.value.uuidString) { return true }
+            return false
+        }
+    }
+
     /// The inbox desk's send hook: an armed "Reply here" takes the text.
     private func titioHostReplyHandler() -> @MainActor (String, AgentThreadID) -> Bool {
         { [weak self] text, _ in
@@ -10908,6 +10921,31 @@ public final class BotsViewModel: ObservableObject {
             )
         }
         Self.publishDestAttentionChanged()
+    }
+
+    /// Messages the hub removed from a conversation (a cleared Titio notice):
+    /// the desk caches drop them and the roster preview falls back to the
+    /// newest message left.
+    func removeHostMessages(botID: BotID, conversationID: BotConversationID, messageIDs: [AgentMessageID]) {
+        let removed = Set(messageIDs)
+        func drop(_ messages: inout [BotDeskMessage]) {
+            messages.removeAll { $0.agentMessageID.map(removed.contains) ?? false }
+        }
+        if var cached = messagesByConversation[conversationID] {
+            drop(&cached)
+            messagesByConversation[conversationID] = cached
+        }
+        if messagesConversationIDByBot[botID] == conversationID, var cached = messagesByBot[botID] {
+            drop(&cached)
+            messagesByBot[botID] = cached
+            if let last = cached.last(where: { $0.role != .user }) {
+                lastPreviewByBot[botID] = last.text
+                lastUpdatedByBot[botID] = last.createdAt
+            }
+        }
+        if selectedBotID == botID, selectedConversation?.id == conversationID {
+            drop(&deskMessages)
+        }
     }
 
     /// A Titio card act acknowledged this Bot attention item off the

@@ -169,6 +169,7 @@ public enum HostMutationContract {
     bot.factory_reset
     bot.notice.act
     bot.notice.read
+    bot.notice.clear
     bot.desktop.set
     bot.avatar.set
     bot.handle.set
@@ -429,6 +430,8 @@ public enum HostMutationContract {
                 return [.uuid("bot_id"), .uuid("message_id"), .int("option_index")]
             case "bot.notice.read":
                 return [.uuid("bot_id"), .uuid("conversation_id")]
+            case "bot.notice.clear":
+                return [.uuid("bot_id"), .uuid("message_id")]
             case "bot.team.create":
                 return [.string("name", nonempty: true)]
             case "bot.team.update":

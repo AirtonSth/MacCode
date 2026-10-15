@@ -275,8 +275,102 @@ final class TitioInboxThreadTests: XCTestCase {
         let desk = try XCTUnwrap(vm.deskAgentVM)
         XCTAssertNil(desk.embedding?.noticeChoiceHandler)
         XCTAssertNil(desk.embedding?.hostReplyHandler)
+        XCTAssertNil(desk.embedding?.noticeClearHandler, "no clear button outside the Notifications inbox")
         XCTAssertNil(vm.titioNoticeTurnDirective(conversationID: chat.id, threadID: target.threadID, userText: "oi"),
                      "the notice directive is for the inbox only")
+    }
+
+    private func waitUntil(_ condition: @MainActor () throws -> Bool) async rethrows {
+        let deadline = Date().addingTimeInterval(5)
+        while try !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    func test_theInboxDeskClearButtonRemovesTheNoticeAtOnceAndForGood() async throws {
+        // WHY (voice contract §3): the trailing clear button must take the
+        // row away on the same turn, then really delete it on the host and
+        // settle its notice, so it never comes back on a reload.
+        let (context, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let key = TitioNoticeIDs.runOutcome(runId: "R1", outcome: .failed)
+        context.titioNoticeCenter.ingest(TitioNoticeFact(
+            key: key, kind: .runFailed,
+            source: TitioNoticeSource(threadId: AgentThreadID().value.uuidString, runId: "R1", activityItemId: "run:r1"),
+            facts: TitioNoticeFacts(title: "Build", workspaceName: "api"), actions: [.openThread, .ack]
+        ))
+        await context.titioNoticeCenter.idle()
+        try openInbox(vm, router: router, target: target)
+        let desk = try XCTUnwrap(vm.deskAgentVM)
+        XCTAssertNotNil(desk.embedding?.noticeClearHandler, "the inbox desk shows the clear button")
+        let id = AgentMessageID(TitioNoticeIDs.messageID(forKey: key))
+        await waitUntil { desk.messages.contains { $0.id == id } }
+        XCTAssertTrue(desk.messages.contains { $0.id == id })
+
+        desk.clearHostMessage(id)
+        XCTAssertFalse(desk.messages.contains { $0.id == id }, "removed on the interaction turn")
+        await waitUntil { (try? context.messageRepo.get(id: id)) ?? nil == nil }
+        await context.titioNoticeCenter.settleActs()
+        await context.titioNoticeCenter.idle()
+        XCTAssertNil(try context.messageRepo.get(id: id), "deleted on the host")
+        XCTAssertEqual(try TitioNoticeRepository(db: context.db).get(key: key)?.resolution, .cleared)
+        XCTAssertFalse(desk.messages.contains { $0.id == id }, "agent.messages.removed never brings it back")
+    }
+
+    func test_aClearTheHostRefusesPutsTheRowBackWithAReason() async throws {
+        // WHY: optimistic removal must roll back honestly: the user's own
+        // message is not a notice and stays.
+        let (_, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        try openInbox(vm, router: router, target: target)
+        let desk = try XCTUnwrap(vm.deskAgentVM)
+        let user = AgentMessage(threadId: target.threadID, role: .user, content: "oi Titio")
+        try router.context?.messageRepo.append(user)
+        desk.applyHostWrittenMessage(user)
+        XCTAssertTrue(desk.messages.contains { $0.id == user.id })
+        desk.clearHostMessage(user.id)
+        XCTAssertFalse(desk.messages.contains { $0.id == user.id })
+        await waitUntil { desk.messages.contains { $0.id == user.id } }
+        XCTAssertTrue(desk.messages.contains { $0.id == user.id }, "rolled back")
+        XCTAssertEqual(desk.statusMessage, "Could not clear the notification.")
+        XCTAssertNotNil(try router.context?.messageRepo.get(id: user.id))
+    }
+
+    func test_rosterSubtitlesArePlainSingleLines() throws {
+        // WHY: the owner saw raw `**` in Titio's roster subtitle. Every Mac
+        // preview of a Bot message is one plain line (contract vector M10).
+        let (context, router, vm) = try makeFixture()
+        let target = try XCTUnwrap(router.resolveTitioInbox(language: .en))
+        let bot = try XCTUnwrap(context.botStore.get(id: target.botID))
+        vm.reload()
+        vm.appendHostAssistantMessage(
+            botID: target.botID, conversationID: target.conversationID,
+            message: AgentMessage(threadId: target.threadID, role: .assistant,
+                                  content: "Ó, a tarefa **X** — [PR](https://a.b) `code`\n2nd"),
+            conversation: nil
+        )
+        XCTAssertEqual(vm.rosterPreview(for: bot), "Ó, a tarefa X — PR code")
+        XCTAssertEqual(
+            ActiveBotScreenItem(bot: bot, preview: "**[Draft PR #3109](https://github.com/o/r/pull/3109)** ok\nmore",
+                                providerName: "Distill").preview,
+            "Draft PR #3109 ok"
+        )
+    }
+
+    func test_titioLanguageTravelsThroughSettingsRPCAndRejectsGarbage() throws {
+        // WHY (voice contract §1): iOS reads and writes Titio's language with
+        // `settings.get/set {titio_language}`. It lives in AppSettings (so it
+        // survives a restart), and anything but `auto` or a BCP-47 tag is
+        // refused before it can reach a prompt.
+        let (context, router, _) = try makeFixture()
+        XCTAssertEqual(try router.settingsGet(keys: ["titio_language"])["titio_language"], "auto")
+        try router.settingsSet(key: "titio_language", value: "pt-br")
+        XCTAssertEqual(SettingsStore(db: context.db).load().titioLanguage, "pt-BR")
+        XCTAssertEqual(try router.settingsGet(keys: ["titio_language"])["titio_language"], "pt-BR")
+        XCTAssertThrowsError(try router.settingsSet(key: "titio_language", value: "klingon please"))
+        XCTAssertThrowsError(try router.settingsSet(key: "titio_language", value: ""))
+        XCTAssertEqual(SettingsStore(db: context.db).load().titioLanguage, "pt-BR", "a rejected value changes nothing")
+        XCTAssertNil(try context.settingsRepo.get("titio_language"), "never a stray raw settings row")
     }
 
     func test_pairedSendIntoTheInboxIsTakenByAnArmAndStartsNoRun() async throws {

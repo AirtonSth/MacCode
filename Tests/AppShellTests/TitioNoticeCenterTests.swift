@@ -71,6 +71,7 @@ final class TitioHookRecorder: @unchecked Sendable {
     private var inboxValue: [TitioInboxSnapshot] = []
     private var speechValue: [TitioNoticeSpeech] = []
     private var offMainValue: [Bool] = []
+    private var removedValue: [[AgentMessageID]] = []
     var target: TitioInboxTarget?
     var titioRunActive = false
     var viewing = false
@@ -83,6 +84,7 @@ final class TitioHookRecorder: @unchecked Sendable {
     var inbox: [TitioInboxSnapshot] { lock.withLock { inboxValue } }
     var speech: [TitioNoticeSpeech] { lock.withLock { speechValue } }
     var postedOffMain: [Bool] { lock.withLock { offMainValue } }
+    var removed: [[AgentMessageID]] { lock.withLock { removedValue } }
 
     func hooks(profileID: String? = "profile-1") -> TitioNoticeHooks {
         TitioNoticeHooks(
@@ -95,6 +97,7 @@ final class TitioHookRecorder: @unchecked Sendable {
                 lock.withLock { postedValue.append(posted); offMainValue.append(offMain) }
             },
             inboxChanged: { [self] snapshot in lock.withLock { inboxValue.append(snapshot) } },
+            messagesRemoved: { [self] _, ids in lock.withLock { removedValue.append(ids) } },
             postBanner: { [self] content in lock.withLock { bannersValue.append(content) } },
             deliverPush: { [self] content in lock.withLock { pushesValue.append(content) } },
             pushBinding: { TitioNoticePushBinding(profileID: profileID, hostID: "host-1") },
@@ -242,7 +245,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(messages.count, 1)
         let keys = ["run.R1.completed", "run.R2.completed", "run.R3.completed"]
         XCTAssertEqual(messages[0].id.value, TitioNoticeIDs.digestMessageID(forKeys: keys))
-        XCTAssertTrue(messages[0].content.hasPrefix("A few updates:"), messages[0].content)
+        XCTAssertTrue(messages[0].content.hasPrefix("• "), "the fallback digest has no canned opener: \(messages[0].content)")
         let digestID = TitioNoticeIDs.digestBannerIdentifier(messageID: messages[0].id.value)
         XCTAssertEqual(f.recorder.banners.map(\.identifier), [digestID])
         XCTAssertEqual(f.recorder.pushes.map(\.identifier), [digestID], "one push per flushed message")
@@ -511,7 +514,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(outOfRange, .invalidOption)
     }
 
-    func test_startupPrunesOldResolvedRowsAndCatchUpUsesTheStartupOpener() async throws {
+    func test_startupPrunesOldResolvedRowsAndCatchesUpPendingRowsInOneDigest() async throws {
         // WHY: rows that piled up while the app was closed read as one catch-up
         // digest, decisions keep their own card, and the ledger stays bounded.
         let f = try makeFixture()
@@ -527,7 +530,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertNil(try f.repo.get(key: "run.OLD.completed"), "pruned after 30 days")
         let messages = try threadMessages(f)
         XCTAssertEqual(messages.count, 2)
-        XCTAssertTrue(messages.contains { $0.content.hasPrefix("While the app was closed, this was pending:") })
+        XCTAssertTrue(messages.contains { $0.content.hasPrefix("• ") }, "the catch-up digest, with no canned opener")
         XCTAssertTrue(messages.contains { BotChoicesBlock.parse($0.content).choices?.notice == "thread.T.attention.Q1" })
     }
 

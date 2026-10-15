@@ -98,6 +98,8 @@ public enum TitioNoticeResolution: String, Codable, CaseIterable, Sendable {
     case expired
     case failed
     case flap
+    /// The user cleared the notice's message from the inbox (`bot.notice.clear`).
+    case cleared
 }
 
 /// Ids of the thing the notice is about, captured at ingest. Stored as

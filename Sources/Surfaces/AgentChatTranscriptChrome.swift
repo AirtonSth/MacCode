@@ -376,6 +376,8 @@ public struct AgentChatAssistantReply: View, Equatable {
     public var branchIdentifier: String? = nil
     public var onBranch: (() -> Void)? = nil
     public var content: AnyView? = nil
+    /// Titio's inbox: a trailing "Clear notification" button.
+    public var onClear: (() -> Void)? = nil
 
     public init(
         text: String,
@@ -384,7 +386,8 @@ public struct AgentChatAssistantReply: View, Equatable {
         branchIdentifier: String? = nil,
         onBranch: (() -> Void)? = nil,
         stripsChoices: Bool = true,
-        content: AnyView? = nil
+        content: AnyView? = nil,
+        onClear: (() -> Void)? = nil
     ) {
         // A ready-made answers block is shown (and answered) as the choices
         // card, in Bot threads only (`stripsChoices`).
@@ -394,6 +397,7 @@ public struct AgentChatAssistantReply: View, Equatable {
         self.branchIdentifier = branchIdentifier
         self.onBranch = onBranch
         self.content = content
+        self.onClear = onClear
     }
 
     public var body: some View {
@@ -431,6 +435,20 @@ public struct AgentChatAssistantReply: View, Equatable {
                     .accessibilityIdentifier(branchIdentifier ?? "agent.assistantMessage.branch")
                     .help("Branch in new chat")
                 }
+                if let onClear {
+                    Spacer(minLength: DS.Space.xs)
+                    Button(action: onClear) {
+                        Image(systemName: "xmark.circle")
+                            .font(.system(size: 12, weight: .regular))
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityLabel("Clear notification")
+                    .accessibilityIdentifier("agent.assistantMessage.clear")
+                    .help("Clear notification")
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -444,6 +462,7 @@ public struct AgentChatAssistantReply: View, Equatable {
             && lhs.branchIdentifier == rhs.branchIdentifier
             && (lhs.onBranch != nil) == (rhs.onBranch != nil)
             && (lhs.content != nil) == (rhs.content != nil)
+            && (lhs.onClear != nil) == (rhs.onClear != nil)
     }
 }
 

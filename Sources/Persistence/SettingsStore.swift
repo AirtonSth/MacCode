@@ -52,6 +52,9 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// conversation (hub spec §11). Off restores today's banners, identifiers
     /// and userInfo byte for byte (the kill switch). Default true.
     public var titioNotificationsEnabled: Bool
+    /// The language Titio writes in (wire key `titio_language`): `auto` (the
+    /// language of the user's own messages, else the Mac's) or a BCP-47 tag.
+    public var titioLanguage: String
     /// Base terminal font size in points. 0 means use Ghostty's configured default.
     public var terminalFontSize: Double
 
@@ -118,6 +121,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 notificationSoundEnabled: Bool = false,
                 notificationMutedWorkspaceIDs: [String] = [],
                 titioNotificationsEnabled: Bool = true,
+                titioLanguage: String = TitioLanguageSetting.automatic,
                 terminalFontSize: Double = 0,
                 petEnabled: Bool = true,
                 petAnimationsEnabled: Bool = true,
@@ -147,6 +151,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.notificationSoundEnabled = notificationSoundEnabled
         self.notificationMutedWorkspaceIDs = notificationMutedWorkspaceIDs
         self.titioNotificationsEnabled = titioNotificationsEnabled
+        self.titioLanguage = titioLanguage
         self.terminalFontSize = terminalFontSize
         self.petEnabled = petEnabled
         self.petAnimationsEnabled = petAnimationsEnabled
@@ -179,6 +184,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case notificationSoundEnabled
         case notificationMutedWorkspaceIDs
         case titioNotificationsEnabled
+        case titioLanguage
         case terminalFontSize
         case petEnabled
         case petAnimationsEnabled
@@ -212,6 +218,10 @@ public struct AppSettings: Codable, Sendable, Equatable {
         notificationSoundEnabled = try c.decodeIfPresent(Bool.self, forKey: .notificationSoundEnabled) ?? false
         notificationMutedWorkspaceIDs = try c.decodeIfPresent([String].self, forKey: .notificationMutedWorkspaceIDs) ?? []
         titioNotificationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .titioNotificationsEnabled) ?? true
+        // An unknown or garbled value degrades to `auto`, never to a bad prompt.
+        titioLanguage = TitioLanguageSetting.normalized(
+            try c.decodeIfPresent(String.self, forKey: .titioLanguage)
+        ) ?? TitioLanguageSetting.automatic
         terminalFontSize = try c.decodeIfPresent(Double.self, forKey: .terminalFontSize) ?? 0
         petEnabled = try c.decodeIfPresent(Bool.self, forKey: .petEnabled) ?? true
         petAnimationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .petAnimationsEnabled) ?? true

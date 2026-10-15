@@ -109,6 +109,17 @@ public final class TitioNoticeRepository: @unchecked Sendable {
         }
     }
 
+    /// The rows of `keys` that are still `pending`, oldest first (what a
+    /// flush would post). The voice writes their text before the flush.
+    public func pendingRows(keys: [String]) throws -> [TitioNoticeRecord] {
+        let unique = Array(Set(keys)).sorted()
+        guard !unique.isEmpty else { return [] }
+        return try db.performSync { database in
+            try Self.fetchAll(database, keys: unique).filter { $0.state == .pending }
+                .sorted { $0.occurredAt == $1.occurredAt ? $0.key < $1.key : $0.occurredAt < $1.occurredAt }
+        }
+    }
+
     /// The row that owns the card in `messageID` (a digest shares one message
     /// across rows; the card owner has `actions_json`), else its oldest row.
     public func notice(messageID: String) throws -> TitioNoticeRecord? {

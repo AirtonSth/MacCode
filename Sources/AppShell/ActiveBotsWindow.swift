@@ -39,7 +39,7 @@ public struct ActiveBotScreenItem: Identifiable, Equatable, Sendable {
         } else {
             self.detail = "\(handleLine) · \(job) · \(providerName)"
         }
-        let clean = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clean = MarkdownPlainText.firstLine(preview)
         self.preview = clean.isEmpty || clean == "No job yet" ? nil : clean
         self.symbol = bot.avatarSymbol
         self.startedAt = startedAt

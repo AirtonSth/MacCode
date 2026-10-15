@@ -117,6 +117,19 @@ extension AppContext {
             inboxChanged: { snapshot in
                 EventBus.shared.publish(kind: .botUpdated, payload: AppContext.titioInboxEventPayload(snapshot))
             },
+            messagesRemoved: { target, ids in
+                EventBus.shared.publish(
+                    kind: .agentMessagesRemoved,
+                    payload: AppContext.messagesRemovedEventPayload(threadID: target.threadID, messageIDs: ids)
+                )
+                await MainActor.run {
+                    guard let router = box.context?.router else { return }
+                    router.botsViewModel?.removeHostMessages(
+                        botID: target.botID, conversationID: target.conversationID, messageIDs: ids
+                    )
+                    router.projectTitioInboxRemoval(ids, threadID: target.threadID)
+                }
+            },
             postBanner: { content in
                 SystemNotifier.shared.post(content, settings: settings.load())
             },
@@ -133,6 +146,37 @@ extension AppContext {
                 await MainActor.run { box.context?.router?.isFocusedPetSuccess(event) ?? false }
             }
         )
+    }
+
+    /// `agent.messages.removed {thread_id, message_ids}` (contract §3).
+    nonisolated static func messagesRemovedEventPayload(threadID: AgentThreadID, messageIDs: [AgentMessageID]) -> JSONValue {
+        .object([
+            "thread_id": .string(threadID.value.uuidString.lowercased()),
+            "message_ids": .array(messageIDs.map { .string($0.value.uuidString.lowercased()) }),
+        ])
+    }
+
+    /// Titio's writer: one headless call on the inbox thread's own provider,
+    /// model and run-as-user. The thread is read here, off the MainActor;
+    /// the binary and environment come from the same resolution a provider
+    /// update uses (one short MainActor hop, no process work there).
+    nonisolated static func makeTitioVoiceWriter(box: TitioNoticeContextBox, db: SQLiteDB) -> TitioVoiceWriting {
+        // Its own repository: the shared one's test counters are not thread-safe.
+        let threadRepo = AgentThreadRepository(db: db)
+        return TitioVoiceCLIWriter { threadID in
+            guard let threadID, let thread = (try? threadRepo.get(id: threadID)) ?? nil else { return nil }
+            let resolved = await MainActor.run {
+                box.context?.router?.providerUpdateTarget(provider: thread.provider, instanceId: thread.providerInstanceId)
+            }
+            guard let resolved else { return nil }
+            return TitioVoiceRoute(
+                provider: thread.provider,
+                binaryPath: resolved.binaryPath,
+                model: thread.model,
+                environment: resolved.environment,
+                runAsUser: thread.runAsUser
+            )
+        }
     }
 
     /// The `bot.updated` payload of an inbox change. No `method`: it is not a
@@ -215,6 +259,10 @@ extension AppContext {
             acknowledgeActivity: { item in
                 let router = try await router()
                 _ = try await MainActor.run { try router.activityAcknowledge(params: ["item_id": .string(item)]) }
+            },
+            dismissNotification: { id in
+                let router = try await router()
+                try await MainActor.run { try router.notificationDismiss(id: id) }
             }
         )
     }
@@ -589,6 +637,16 @@ extension AppCommandRouter {
         for surface in SurfaceRegistry.shared.all() {
             guard let agent = surface as? AgentAppSurface else { continue }
             agent.viewModel.applyHostWrittenMessage(message)
+        }
+    }
+
+    /// A cleared inbox message leaves every open Agent App on that thread
+    /// (the in-process side of `agent.messages.removed`).
+    func projectTitioInboxRemoval(_ ids: [AgentMessageID], threadID: AgentThreadID) {
+        botsViewModel?.deskAgentVM?.applyHostRemovedMessages(ids, threadId: threadID)
+        for surface in SurfaceRegistry.shared.all() {
+            guard let agent = surface as? AgentAppSurface else { continue }
+            agent.viewModel.applyHostRemovedMessages(ids, threadId: threadID)
         }
     }
 

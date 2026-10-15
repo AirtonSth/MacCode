@@ -34,6 +34,7 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
             "notificationSoundEnabled",
             "notificationMutedWorkspaceIDs",
             "titioNotificationsEnabled",
+            "titioLanguage",
             "insomniaAllowDisplaySleep",
             "insomniaAllowSystemSleepWhenDisplayClosed",
             "insomniaAllowScreenSaverAfter45MinutesOfInactivity",

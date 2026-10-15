@@ -188,6 +188,14 @@ extension TitioNoticeActOutcome {
     }
 }
 
+/// The outcome of `bot.notice.clear` / the Mac clear button (contract §3).
+public enum TitioNoticeClearOutcome: Equatable, Sendable {
+    /// The message was (or is being) removed from the inbox thread.
+    case cleared(threadID: AgentThreadID)
+    /// Not an assistant message of Titio's Notifications inbox thread.
+    case invalid
+}
+
 /// The host side effects of a consequential card action (§7 step 4). The
 /// center claims the row, writes the transcript rows and the resolution;
 /// these only talk to the host. Production wiring is
@@ -215,6 +223,9 @@ public struct TitioNoticeActionHooks: Sendable {
     public var rerunScheduledTask: @Sendable (UUID) async throws -> Void
     /// The Activity acknowledge path (`ActivityService.acknowledge`).
     public var acknowledgeActivity: @Sendable (String) async throws -> Void
+    /// `notification.dismiss` for an external notice's notification row
+    /// (`bot.notice.clear`).
+    public var dismissNotification: @Sendable (String) async throws -> Void
 
     public init(
         isRequestOpen: @escaping @Sendable (AgentThreadID, String, RequestKind) -> Bool,
@@ -224,7 +235,8 @@ public struct TitioNoticeActionHooks: Sendable {
         acknowledgeBotAttention: @escaping @Sendable (BotAttentionItemID) async throws -> Void,
         continueRun: @escaping @Sendable (AgentThreadID) async throws -> Void,
         rerunScheduledTask: @escaping @Sendable (UUID) async throws -> Void,
-        acknowledgeActivity: @escaping @Sendable (String) async throws -> Void
+        acknowledgeActivity: @escaping @Sendable (String) async throws -> Void,
+        dismissNotification: @escaping @Sendable (String) async throws -> Void = { _ in }
     ) {
         self.isRequestOpen = isRequestOpen
         self.respondRequest = respondRequest
@@ -234,6 +246,7 @@ public struct TitioNoticeActionHooks: Sendable {
         self.continueRun = continueRun
         self.rerunScheduledTask = rerunScheduledTask
         self.acknowledgeActivity = acknowledgeActivity
+        self.dismissNotification = dismissNotification
     }
 }
 
@@ -272,6 +285,9 @@ public struct TitioNoticeHooks: Sendable {
     public var messagePosted: @Sendable (TitioNoticePostedMessage) async -> Void
     /// `bot.updated` for Titio with `titio_inbox`.
     public var inboxChanged: @Sendable (TitioInboxSnapshot) async -> Void
+    /// A cleared message left the inbox thread: `agent.messages.removed`,
+    /// the desk caches and every open Agent App on that thread.
+    public var messagesRemoved: @Sendable (TitioInboxTarget, [AgentMessageID]) async -> Void
     /// Mac banner (`SystemNotifier.post`).
     public var postBanner: @Sendable (RemoteCodeNotificationContent) -> Void
     /// iOS push (`PrivateNotificationBridge.deliver`).
@@ -292,6 +308,7 @@ public struct TitioNoticeHooks: Sendable {
         },
         messagePosted: @escaping @Sendable (TitioNoticePostedMessage) async -> Void = { _ in },
         inboxChanged: @escaping @Sendable (TitioInboxSnapshot) async -> Void = { _ in },
+        messagesRemoved: @escaping @Sendable (TitioInboxTarget, [AgentMessageID]) async -> Void = { _, _ in },
         postBanner: @escaping @Sendable (RemoteCodeNotificationContent) -> Void = { _ in },
         deliverPush: @escaping @Sendable (RemoteCodeNotificationContent) async -> Void = { _ in },
         pushBinding: @escaping @Sendable () -> TitioNoticePushBinding = { TitioNoticePushBinding(profileID: nil, hostID: nil) },
@@ -304,6 +321,7 @@ public struct TitioNoticeHooks: Sendable {
         self.languageInputs = languageInputs
         self.messagePosted = messagePosted
         self.inboxChanged = inboxChanged
+        self.messagesRemoved = messagesRemoved
         self.postBanner = postBanner
         self.deliverPush = deliverPush
         self.pushBinding = pushBinding
@@ -335,7 +353,24 @@ public actor TitioNoticeCenter {
         case petEvent(EventBus.Event)
         case refreshMirrors
         case expireArm(String)
+        case voiced(VoiceCompletion)
+        case clear(AgentMessageID)
         case barrier(CheckedContinuation<Void, Never>)
+    }
+
+    /// The notice rows one voice call writes for, captured before the call.
+    struct VoicePlan: Sendable {
+        var keys: [String]
+        var catchUp: Bool
+        var language: TitioNoticeLanguage
+    }
+
+    /// A finished voice call, applied on this actor in command order. A nil
+    /// text means the writer could not deliver: the factual fallback posts.
+    enum VoiceCompletion: Sendable {
+        case notice(VoicePlan, TitioVoiceReply?)
+        case resultLine(fallback: String, text: String?)
+        case statusLine(messageID: AgentMessageID, fallback: String, text: String?)
     }
 
     enum TimerID: Hashable {
@@ -361,6 +396,9 @@ public actor TitioNoticeCenter {
     private let botStore: BotStore
     private let hooks: TitioNoticeHooks
     private let scheduler: TitioNoticeScheduling
+    /// Titio's writer (nil: every text is the factual fallback).
+    private let voice: TitioVoiceWriting?
+    private let voiceTiming: TitioVoiceTiming
     private let now: @Sendable () -> Date
     private let timeZone: TimeZone
     private nonisolated let continuation: AsyncStream<Command>.Continuation
@@ -377,6 +415,11 @@ public actor TitioNoticeCenter {
     private nonisolated let snapshotBox = TitioNoticeLockedBox<TitioInboxSnapshot?>(nil)
     /// Running act executions, so tests (and teardown) can wait for them.
     private nonisolated let actTasks = TitioNoticeLockedBox<[UUID: Task<Void, Never>]>([:])
+    /// Running voice calls, so `idle()` (tests, teardown) can wait for them.
+    private nonisolated let voiceTasks = TitioNoticeLockedBox<[UUID: Task<Void, Never>]>([:])
+    /// Voice calls started and not yet applied on this actor (a call that
+    /// returned has left `voiceTasks` before its `.voiced` command runs).
+    private nonisolated let voiceInFlight = TitioNoticeLockedBox(0)
     private nonisolated let eventSubscription = TitioNoticeLockedBox<UUID?>(nil)
 
     // Scheduler state (actor-isolated)
@@ -399,6 +442,10 @@ public actor TitioNoticeCenter {
     /// Act transcript rows get strictly increasing timestamps so the user row
     /// always sorts before its result line.
     private var lastActMessageAt: Date?
+    /// Pending rows whose message the voice is writing. They stay `pending`
+    /// in the ledger (a restart writes them again); this only stops a second
+    /// flush from starting a second call for them.
+    private var composing = Set<String>()
 
     /// The events that re-run the bot-attention projector (§5).
     static let botAttentionEventKinds: Set<String> = ["bots.attention.changed", "bot.attention.updated"]
@@ -412,6 +459,8 @@ public actor TitioNoticeCenter {
         botStore: BotStore,
         hooks: TitioNoticeHooks,
         scheduler: TitioNoticeScheduling = DispatchTitioNoticeScheduler(),
+        voice: TitioVoiceWriting? = nil,
+        voiceTiming: TitioVoiceTiming = .production,
         now: @escaping @Sendable () -> Date = { Date() },
         timeZone: TimeZone = .current
     ) {
@@ -421,6 +470,8 @@ public actor TitioNoticeCenter {
         self.botStore = botStore
         self.hooks = hooks
         self.scheduler = scheduler
+        self.voice = voice
+        self.voiceTiming = voiceTiming
         self.now = now
         self.timeZone = timeZone
         var made: AsyncStream<Command>.Continuation!
@@ -517,8 +568,22 @@ public actor TitioNoticeCenter {
         }
     }
 
-    /// Waits until every command sent before this call has been handled.
+    /// Waits until every command sent before this call has been handled,
+    /// including the voice calls they started and what those posted.
     public func idle() async {
+        while true {
+            await withCheckedContinuation { (waiter: CheckedContinuation<Void, Never>) in
+                continuation.yield(.barrier(waiter))
+            }
+            if voiceInFlight.value == 0 { return }
+            // The next barrier applies whatever these calls yield.
+            for task in voiceTasks.value.values { await task.value }
+        }
+    }
+
+    /// Waits for the commands sent so far, but not for voice calls still
+    /// running (tests that hold a writer mid-call).
+    func commandsDrained() async {
         await withCheckedContinuation { (waiter: CheckedContinuation<Void, Never>) in
             continuation.yield(.barrier(waiter))
         }
@@ -528,6 +593,39 @@ public actor TitioNoticeCenter {
     /// (on this actor); see `actNow`.
     public func act(messageID: String, optionIndex: Int) async -> TitioNoticeActOutcome {
         actNow(messageID: messageID, optionIndex: optionIndex)
+    }
+
+    /// The Mac clear button (contract §3). Runs the removal on this actor
+    /// and answers once it is done.
+    public func clear(messageID: String) async -> TitioNoticeClearOutcome {
+        guard let (id, thread) = validateClear(messageID) else { return .invalid }
+        await performClear(id)
+        return .cleared(threadID: thread)
+    }
+
+    /// `bot.notice.clear` (off the MainActor, under the authority lock):
+    /// checks the message right away and queues the removal in command
+    /// order, so it can never overtake a post or rewrite of that message.
+    public nonisolated func clearNow(messageID: String) -> TitioNoticeClearOutcome {
+        guard let (id, thread) = validateClear(messageID) else { return .invalid }
+        continuation.yield(.clear(id))
+        return .cleared(threadID: thread)
+    }
+
+    /// Only an assistant message of the Notifications inbox thread clears.
+    private nonisolated func validateClear(_ raw: String) -> (AgentMessageID, AgentThreadID)? {
+        guard let uuid = UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let inbox = inboxThreadID(),
+              let message = (try? messageRepo.get(id: AgentMessageID(uuid))) ?? nil,
+              message.threadId == inbox, message.role == .assistant else { return nil }
+        return (message.id, inbox)
+    }
+
+    private nonisolated func inboxThreadID() -> AgentThreadID? {
+        if let snapshot = snapshotBox.value { return snapshot.threadID }
+        guard let raw = (try? repo.inboxState())?.conversationID, let uuid = UUID(uuidString: raw),
+              let conversation = (try? botStore.conversation(id: BotConversationID(uuid))) ?? nil else { return nil }
+        return conversation.linkedAgentThreadID
     }
 
     // MARK: Command handling
@@ -554,6 +652,10 @@ public actor TitioNoticeCenter {
             refreshMirrors()
         case .expireArm(let key):
             handleExpireArm(key)
+        case .voiced(let completion):
+            await handleVoiced(completion)
+        case .clear(let messageID):
+            await performClear(messageID)
         case .barrier(let waiter):
             waiter.resume()
         }
@@ -684,11 +786,30 @@ public actor TitioNoticeCenter {
 
     // MARK: Flush (§3 steps 3–4)
 
+    /// The Settings choice (`titioLanguage`), read fresh: another store
+    /// instance (Settings window, `settings.set`) may have written it.
+    private func languageSetting() -> String {
+        settingsStore.reload().titioLanguage
+    }
+
+    /// pt-BR or en for the factual fallback and ids that need a language.
     private func language() -> TitioNoticeLanguage {
         let inputs = hooks.languageInputs()
-        return TitioNoticeCopy.language(
+        return TitioLanguageSetting.fallbackLanguage(
+            setting: languageSetting(),
             recentUserTexts: inputs.recentUserTexts,
-            excluding: inputs.cardLabels,
+            cardLabels: inputs.cardLabels,
+            preferredLanguages: inputs.preferredLanguages
+        )
+    }
+
+    /// What the writer is told about language (setting or the user's texts).
+    private func voiceLanguage() -> TitioVoiceLanguage {
+        let inputs = hooks.languageInputs()
+        return TitioLanguageSetting.voiceLanguage(
+            setting: languageSetting(),
+            recentUserTexts: inputs.recentUserTexts,
+            cardLabels: inputs.cardLabels,
             preferredLanguages: inputs.preferredLanguages
         )
     }
@@ -713,10 +834,15 @@ public actor TitioNoticeCenter {
         return resolved
     }
 
-    /// Posts `keys` (those still pending) as one message. Returns false when
-    /// the inbox is unavailable or the write failed (rows stay pending).
+    /// Posts `keys` (those still pending) as one message. With a writer,
+    /// Titio's text is written first, off this actor, and the message is
+    /// committed when it returns (`handleVoiced`); the rows stay `pending`
+    /// meanwhile, so a restart writes them again and the deterministic
+    /// message id keeps a retry from ever posting twice. Returns false when
+    /// the inbox is unavailable or the read failed (rows stay pending).
     @discardableResult
-    private func flush(keys: [String], catchUp: Bool) async -> Bool {
+    private func flush(keys requested: [String], catchUp: Bool) async -> Bool {
+        let keys = requested.filter { !composing.contains($0) }
         guard !keys.isEmpty else { return true }
         let language = language()
         guard let target = await target(language: language) else {
@@ -725,17 +851,142 @@ public actor TitioNoticeCenter {
             scheduleRetry()
             return false
         }
+        guard let writer = voice else {
+            titioNoticeLog.info("titio.voice.fallback purpose=notice reason=no_writer keys=\(keys.count, privacy: .public)")
+            return await commit(keys: keys, catchUp: catchUp, target: target, language: language, reply: nil)
+        }
+        let rows: [TitioNoticeRecord]
+        do {
+            rows = try repo.pendingRows(keys: keys)
+        } catch {
+            titioNoticeLog.error("titio.notice.flush_failed keys=\(keys.count, privacy: .public) error=\(String(describing: error), privacy: .public)")
+            armFallbacks(keys)
+            scheduleRetry()
+            return false
+        }
+        guard !rows.isEmpty else { return true }
+        startNoticeVoice(rows: rows, catchUp: catchUp, target: target, language: language, writer: writer)
+        return true
+    }
+
+    /// One writer call for `rows` (a digest is one call for the batch).
+    private func startNoticeVoice(
+        rows: [TitioNoticeRecord],
+        catchUp: Bool,
+        target: TitioInboxTarget,
+        language: TitioNoticeLanguage,
+        writer: TitioVoiceWriting
+    ) {
+        let keys = rows.map(\.key)
+        composing.formUnion(keys)
+        let items = rows.map(TitioNoticeRenderItem.init(record:))
+        let cardOptions = TitioNoticeCopy.composeBatch(items, language: language, catchUp: catchUp, timeZone: timeZone)?.cardOptions
+        let sensitive = items.contains { $0.kind.isLockScreenSensitive }
+        let expectsJSON = cardOptions != nil || sensitive
+        let optionCount = cardOptions?.count
+        let forbidden = TitioVoicePrompt.lockScreenForbidden(items)
+        let request = TitioVoiceRequest(
+            purpose: items.count > 1 ? .digest : .notice,
+            prompt: TitioVoicePrompt.notice(items, cardOptions: cardOptions, catchUp: catchUp,
+                                            language: voiceLanguage(), timeZone: timeZone),
+            threadID: target.threadID,
+            expectsJSON: expectsJSON
+        )
+        let parse: @Sendable (String) -> TitioVoiceReply? = { raw in
+            expectsJSON
+                ? TitioVoiceOutput.parseCard(raw, optionCount: optionCount, forbidden: forbidden)
+                : TitioVoiceOutput.sanitize(raw).map { TitioVoiceReply(message: $0) }
+        }
+        let urgent = rows.contains { $0.urgency != .info }
+        let plan = VoicePlan(keys: keys, catchUp: catchUp, language: language)
+        spawnVoice(
+            request, writer: writer,
+            deadline: urgent ? voiceTiming.urgentDeadline : voiceTiming.infoDeadline,
+            accept: { parse($0) != nil }
+        ) { raw in
+            .notice(plan, raw.flatMap(parse))
+        }
+    }
+
+    /// Runs one writer call off this actor (retries and deadline inside
+    /// `TitioVoiceRunner`) and hands the result back as a command.
+    private nonisolated func spawnVoice(
+        _ request: TitioVoiceRequest,
+        writer: TitioVoiceWriting,
+        deadline: TimeInterval,
+        accept: @escaping @Sendable (String) -> Bool,
+        complete: @escaping @Sendable (String?) -> VoiceCompletion
+    ) {
+        let id = UUID()
+        let tasks = voiceTasks
+        let timing = voiceTiming
+        let continuation = continuation
+        voiceInFlight.mutate { $0 += 1 }
+        tasks.mutate { running in
+            running[id] = Task.detached(priority: .utility) {
+                let (outcome, raw) = await TitioVoiceRunner.run(
+                    request, writer: writer, timing: timing, deadline: deadline, accept: accept
+                )
+                if case .fallback(let reason) = outcome {
+                    titioNoticeLog.error("titio.voice.fallback purpose=\(request.purpose.rawValue, privacy: .public) reason=\(reason, privacy: .public)")
+                }
+                continuation.yield(.voiced(complete(raw)))
+                tasks.mutate { $0[id] = nil }
+            }
+        }
+    }
+
+    private func handleVoiced(_ completion: VoiceCompletion) async {
+        defer { voiceInFlight.mutate { $0 -= 1 } }
+        switch completion {
+        case .notice(let plan, let reply):
+            composing.subtract(plan.keys)
+            guard let target = await target(language: plan.language) else {
+                titioNoticeLog.info("titio.notice.inbox_unavailable keys=\(plan.keys.count, privacy: .public)")
+                armFallbacks(plan.keys)
+                scheduleRetry()
+                return
+            }
+            _ = await commit(keys: plan.keys, catchUp: plan.catchUp, target: target, language: plan.language,
+                             reply: reply, voicedKeys: reply == nil ? nil : Set(plan.keys))
+        case .resultLine(let fallback, let text):
+            await appendActMessage(role: .assistant, text: text ?? fallback)
+        case .statusLine(let messageID, let fallback, let text):
+            await applyStatusLine(messageID: messageID, line: text.map(Self.italicStatus) ?? fallback)
+        }
+    }
+
+    /// The one-transaction post (§3 step 3): re-reads which rows are still
+    /// pending, writes the message (Titio's text, or the fallback when
+    /// `reply` is nil) and marks them posted. When rows resolved while the
+    /// voice wrote (`voicedKeys` differs), nothing is written and the rest is
+    /// written again: the text must not mention a notice that is gone.
+    @discardableResult
+    private func commit(
+        keys: [String],
+        catchUp: Bool,
+        target: TitioInboxTarget,
+        language: TitioNoticeLanguage,
+        reply: TitioVoiceReply?,
+        voicedKeys: Set<String>? = nil
+    ) async -> Bool {
         let viewing = await hooks.isInboxViewed(target)
         let postedAt = now()
         var written: AgentMessage?
         var bannerText = ""
+        var revoice: [String] = []
         let result: TitioNoticeFlushResult?
         do {
             result = try repo.flush(keys: keys, postedAt: postedAt) { rows in
-                let items = rows.map(TitioNoticeRenderItem.init(record:))
-                guard let composed = TitioNoticeCopy.composeBatch(items, language: language, catchUp: catchUp, timeZone: timeZone) else {
+                if let voicedKeys, Set(rows.map(\.key)) != voicedKeys {
+                    revoice = rows.map(\.key)
                     return nil
                 }
+                let items = rows.map(TitioNoticeRenderItem.init(record:))
+                guard let fallback = TitioNoticeCopy.composeBatch(items, language: language, catchUp: catchUp, timeZone: timeZone) else {
+                    return nil
+                }
+                let composed = Self.composed(fallback: fallback, reply: reply)
                 let uuid = rows.count == 1
                     ? TitioNoticeIDs.messageID(forKey: rows[0].key)
                     : TitioNoticeIDs.digestMessageID(forKeys: rows.map(\.key))
@@ -748,7 +999,7 @@ public actor TitioNoticeCenter {
                 )
                 try messageRepo.append(message)
                 written = message
-                bannerText = TitioNoticeCopy.bannerBody(items, language: language, catchUp: catchUp, timeZone: timeZone)
+                bannerText = Self.bannerText(items: items, reply: reply, language: language, catchUp: catchUp, timeZone: timeZone)
                 return TitioNoticePosting(
                     messageID: uuid.uuidString,
                     batchID: rows.count > 1 ? uuid.uuidString : nil,
@@ -765,6 +1016,10 @@ public actor TitioNoticeCenter {
             scheduleRetry()
             return false
         }
+        if !revoice.isEmpty {
+            titioNoticeLog.info("titio.voice.rewrite_after_resolution keys=\(revoice.count, privacy: .public)")
+            return await flush(keys: revoice, catchUp: catchUp)
+        }
         retryAttempt = 0
         guard let result, let message = written else { return true }
         for record in result.records {
@@ -775,6 +1030,57 @@ public actor TitioNoticeCenter {
         await fanOut(result, message: message, bannerText: bannerText, target: target, viewing: viewing)
         refreshMirrors()
         return true
+    }
+
+    /// Titio's text with the host's own card appended (labels may be the
+    /// writer's translation, but every action stays the ledger's), or the
+    /// fallback as is.
+    static func composed(fallback: TitioNoticeComposed, reply: TitioVoiceReply?) -> TitioNoticeComposed {
+        guard let reply else { return fallback }
+        var text = reply.message
+        var options = fallback.cardOptions
+        if let defaults = fallback.cardOptions, let owner = fallback.cardOwnerKey {
+            if let labels = reply.labels, labels.count == defaults.count {
+                let merged = zip(defaults, labels).map { option, label in
+                    option.action.keepsLabelVerbatim ? option : TitioNoticeCardOption(label: label, action: option.action)
+                }
+                // Labels must stay distinct, or `option_index` would not map 1:1.
+                if Set(merged.compactMap(\.label)).count == merged.count { options = merged }
+            }
+            let question = reply.question ?? BotChoicesBlock.parse(fallback.text).choices?.question
+            text += "\n\n" + TitioNoticeCopy.choicesBlock(
+                question: question, options: (options ?? defaults).compactMap(\.label), notice: owner
+            )
+        }
+        return TitioNoticeComposed(
+            text: text,
+            preview: TitioNoticeCopy.preview(reply.message),
+            cardOptions: options,
+            cardOwnerKey: fallback.cardOwnerKey
+        )
+    }
+
+    /// Banner / push body: the first sentence of Titio's text, except for
+    /// approvals and questions, whose lock-screen line is the writer's
+    /// checked `notification` line or the redacted fallback.
+    static func bannerText(
+        items: [TitioNoticeRenderItem],
+        reply: TitioVoiceReply?,
+        language: TitioNoticeLanguage,
+        catchUp: Bool,
+        timeZone: TimeZone
+    ) -> String {
+        let redacted = TitioNoticeCopy.bannerBody(items, language: language, catchUp: catchUp, timeZone: timeZone)
+        guard let reply else { return redacted }
+        if items.contains(where: { $0.kind.isLockScreenSensitive }) {
+            return reply.notificationLine ?? redacted
+        }
+        let sentence = TitioVoiceOutput.firstSentence(reply.message)
+        return sentence.isEmpty ? redacted : sentence
+    }
+
+    static func italicStatus(_ line: String) -> String {
+        line.contains("_") || line.contains("*") ? line : "_\(line)_"
     }
 
     /// Post-commit effects, in the §3 step 4 order.
@@ -1037,7 +1343,13 @@ public actor TitioNoticeCenter {
             let identifier = allInBatch.count == 1 ? allInBatch[0].key : TitioNoticeIDs.digestBannerIdentifier(messageID: uuid)
             let owner = allInBatch.first { $0.actions != nil }?.key ?? (allInBatch.count == 1 ? allInBatch[0].key : nil)
             let bannerLanguage = TitioNoticeCopy.detectedLanguage(message.content) ?? language()
-            let text = TitioNoticeCopy.bannerBody(allInBatch.map(TitioNoticeRenderItem.init(record:)), language: bannerLanguage, timeZone: timeZone)
+            let items = allInBatch.map(TitioNoticeRenderItem.init(record:))
+            let redacted = TitioNoticeCopy.bannerBody(items, language: bannerLanguage, timeZone: timeZone)
+            // The writer's lock-screen line is not stored: an approval or
+            // question re-posts the redacted line; anything else re-posts the
+            // first sentence of what Titio wrote.
+            let sentence = TitioVoiceOutput.firstSentence(BotChoicesBlock.parse(message.content).text)
+            let text = items.contains(where: { $0.kind.isLockScreenSensitive }) || sentence.isEmpty ? redacted : sentence
             deliver(identifier: identifier, text: text, message: message, target: target,
                     noticeKey: owner, records: allInBatch)
         }
@@ -1093,7 +1405,8 @@ public actor TitioNoticeCenter {
     /// Rewrites the original message: strips its choices block and appends
     /// the status line. A digest message is rewritten only by its card owner.
     /// A message that transcript retention already removed is left removed
-    /// (an upsert would resurrect it as a new row).
+    /// (an upsert would resurrect it as a new row). With a writer, the card
+    /// goes at once and Titio's own status note follows when it is written.
     private func rewrite(_ record: TitioNoticeRecord, at date: Date) async {
         guard let raw = record.messageID, let uuid = UUID(uuidString: raw),
               let resolution = record.resolution,
@@ -1105,22 +1418,53 @@ public actor TitioNoticeCenter {
             return
         }
         let messageLanguage = TitioNoticeCopy.detectedLanguage(original.content) ?? language()
-        let text = TitioNoticeCopy.resolvedText(
-            original: original.content,
-            statusLine: TitioNoticeCopy.statusLine(status, language: messageLanguage, at: date, timeZone: timeZone)
+        let fallbackStatus = TitioNoticeCopy.statusLine(status, language: messageLanguage, at: date, timeZone: timeZone)
+        let text = TitioNoticeCopy.resolvedText(original: original.content, statusLine: voice == nil ? fallbackStatus : nil)
+        if text != original.content {
+            await writeRewrite(original, text: text, language: messageLanguage, key: record.key)
+        }
+        guard let writer = voice else { return }
+        let request = TitioVoiceRequest(
+            purpose: .status,
+            prompt: TitioVoicePrompt.status(status, at: date, language: voiceLanguage(), timeZone: timeZone),
+            threadID: original.threadId
         )
+        spawnVoice(
+            request, writer: writer, deadline: voiceTiming.lineDeadline,
+            accept: { TitioVoiceOutput.sanitizeLine($0, max: Self.statusLineMaxCharacters) != nil }
+        ) { raw in
+            .statusLine(
+                messageID: id, fallback: fallbackStatus,
+                text: raw.flatMap { TitioVoiceOutput.sanitizeLine($0, max: Self.statusLineMaxCharacters) }
+            )
+        }
+    }
+
+    static let statusLineMaxCharacters = 90
+
+    /// Appends the status line once it is written. A message cleared in the
+    /// meantime stays cleared.
+    private func applyStatusLine(messageID: AgentMessageID, line: String) async {
+        guard let original = try? messageRepo.get(id: messageID) else { return }
+        let text = TitioNoticeCopy.resolvedText(original: original.content, statusLine: line)
         guard text != original.content else { return }
+        let language = TitioNoticeCopy.detectedLanguage(original.content) ?? language()
+        await writeRewrite(original, text: text, language: language, key: nil)
+    }
+
+    /// Writes a rewritten inbox message and repaints it everywhere.
+    private func writeRewrite(_ original: AgentMessage, text: String, language: TitioNoticeLanguage, key: String?) async {
         let updated = AgentMessage(
             id: original.id, threadId: original.threadId, role: original.role,
             content: text, createdAt: original.createdAt, attachments: original.attachments
         )
         do { try messageRepo.append(updated) } catch {
-            titioNoticeLog.error("titio.notice.rewrite_failed key=\(record.key, privacy: .public) error=\(String(describing: error), privacy: .public)")
+            titioNoticeLog.error("titio.notice.rewrite_failed key=\(key ?? "-", privacy: .public) error=\(String(describing: error), privacy: .public)")
             return
         }
-        let revision = ((try? messageRepo.bodyRevision(id: id)) ?? nil) ?? 1
+        let revision = ((try? messageRepo.bodyRevision(id: original.id)) ?? nil) ?? 1
         var resolvedTarget = cachedTarget
-        if resolvedTarget == nil { resolvedTarget = await target(language: messageLanguage) }
+        if resolvedTarget == nil { resolvedTarget = await target(language: language) }
         guard let target = resolvedTarget, target.threadID == original.threadId else { return }
         let openDecisions = (try? repo.openDecisionCount()) ?? 0
         let conversation = settleAttention(target: target, openDecisions: openDecisions)
@@ -1137,6 +1481,80 @@ public actor TitioNoticeCenter {
         conversation.attentionState = conversation.unread ? .unreadActivity : .none
         try? botStore.upsertConversation(conversation)
         return conversation
+    }
+
+    // MARK: Clear (contract §3)
+
+    /// Deletes the message, settles every open ledger row it carries as
+    /// `cleared` (acking each source: Activity for run outcomes, the Bot
+    /// attention item, the notification row of an external notice; a provider
+    /// request stays pending in its own thread), then updates the inbox and
+    /// tells every client (`agent.messages.removed`, `bot.updated`).
+    private func performClear(_ id: AgentMessageID) async {
+        guard let message = (try? messageRepo.get(id: id)) ?? nil else { return }
+        let at = now()
+        var settled: [TitioNoticeRecord] = []
+        for row in (try? repo.notices(messageID: id.value.uuidString)) ?? [] where [.posted, .awaitingReply].contains(row.state) {
+            if case .resolved(let record)? = try? repo.resolveFromSource(key: row.key, resolution: .cleared, at: at) {
+                settled.append(record)
+            }
+        }
+        do {
+            try messageRepo.delete(ids: [id])
+        } catch {
+            titioNoticeLog.error("titio.notice.clear_failed error=\(String(describing: error), privacy: .public)")
+            refreshMirrors()
+            return
+        }
+        titioNoticeLog.info("titio.notice.cleared rows=\(settled.count, privacy: .public)")
+        if let actions = actionsBox.value, !settled.isEmpty {
+            let rows = settled
+            spawnAct { _ in await Self.acknowledgeCleared(rows, actions: actions) }
+        }
+        var resolvedTarget = cachedTarget
+        if resolvedTarget == nil { resolvedTarget = await target(language: language()) }
+        guard let target = resolvedTarget, target.threadID == message.threadId else {
+            refreshMirrors()
+            return
+        }
+        let remaining = ((try? messageRepo.listRecent(threadId: target.threadID, limit: 30)) ?? [])
+            .last { $0.role == .assistant }
+        let inbox = try? repo.updateInboxState { state in
+            state.unreadCount = max(0, state.unreadCount - 1)
+            state.lastPreview = remaining.map { TitioNoticeCopy.preview($0.content) }
+            state.lastAt = remaining?.createdAt
+        }
+        let openDecisions = (try? repo.openDecisionCount()) ?? 0
+        _ = settleAttention(target: target, openDecisions: openDecisions)
+        refreshMirrors()
+        await hooks.messagesRemoved(target, [id])
+        await publishInbox(target: target, fallback: inbox.map { snapshot(target: target, inbox: $0, openDecisions: openDecisions) })
+    }
+
+    /// Best effort: the source may already be gone; failures are logged.
+    static func acknowledgeCleared(_ rows: [TitioNoticeRecord], actions: TitioNoticeActionHooks) async {
+        for row in rows {
+            do {
+                switch row.kind {
+                case .external:
+                    if let id = row.source.notificationId { try await actions.dismissNotification(id) }
+                case .runCompleted, .runFailed, .runInterrupted, .scheduledFailed:
+                    if let item = row.source.activityItemId ?? row.source.runId.map({ "run:\($0.lowercased())" }) {
+                        try await actions.acknowledgeActivity(item)
+                    }
+                case .botQuestion, .botBlocked:
+                    if let item = row.source.attentionItemId.flatMap(UUID.init(uuidString:)).map(BotAttentionItemID.init) {
+                        try await actions.acknowledgeBotAttention(item)
+                    }
+                default:
+                    // Provider requests stay pending in their own thread; Bot
+                    // replies and pet alerts have no source row to ack.
+                    break
+                }
+            } catch {
+                titioNoticeLog.info("titio.notice.clear_ack_failed key=\(row.key, privacy: .public) error=\(String(describing: error), privacy: .public)")
+            }
+        }
     }
 
     // MARK: Read state (§8)
@@ -1520,7 +1938,26 @@ public actor TitioNoticeCenter {
     }
 
     private func reportAlreadyResolved(_ record: TitioNoticeRecord) async {
-        await appendActMessage(role: .assistant, text: TitioNoticeCopy.resultLine(.alreadyResolved, language: messageLanguage(record)))
+        await speakResult(.alreadyResolved, language: messageLanguage(record))
+    }
+
+    /// Titio's line after an act, written by the voice (the factual line
+    /// when no writer can run). The user's own tap row is already in.
+    private func speakResult(_ result: TitioNoticeResult, language: TitioNoticeLanguage) async {
+        let fallback = TitioNoticeCopy.resultLine(result, language: language)
+        guard let writer = voice else {
+            await appendActMessage(role: .assistant, text: fallback)
+            return
+        }
+        let request = TitioVoiceRequest(
+            purpose: .result,
+            prompt: TitioVoicePrompt.result(result, language: voiceLanguage()),
+            threadID: cachedTarget?.threadID
+        )
+        spawnVoice(request, writer: writer, deadline: voiceTiming.lineDeadline,
+                   accept: { TitioVoiceOutput.sanitize($0) != nil }) { raw in
+            .resultLine(fallback: fallback, text: raw.flatMap(TitioVoiceOutput.sanitize))
+        }
     }
 
     /// §7 steps 4–5 for a claimed row.
@@ -1590,7 +2027,7 @@ public actor TitioNoticeCenter {
             }
             takenArmKeys.mutate { _ = $0.remove(record.key) }
             refreshMirrors()
-            await appendActMessage(role: .assistant, text: TitioNoticeCopy.resultLine(.armed(target: replyTarget(record)), language: language))
+            await speakResult(.armed(target: replyTarget(record)), language: language)
         case .openThread, .openBot, .openActivity, .openAllActivity:
             // Navigation never claims; `actNow` answers it before the claim.
             _ = try? repo.reopen(key: record.key)
@@ -1607,7 +2044,7 @@ public actor TitioNoticeCenter {
         guard let record, (try? repo.claim(key: key)) == true else {
             refreshMirrors()
             let language = record.map(messageLanguage) ?? self.language()
-            await appendActMessage(role: .assistant, text: TitioNoticeCopy.resultLine(.alreadyResolved, language: language))
+            await speakResult(.alreadyResolved, language: language)
             return
         }
         let language = messageLanguage(record)
@@ -1686,7 +2123,7 @@ public actor TitioNoticeCenter {
         }
         refreshMirrors()
         if let result {
-            await appendActMessage(role: .assistant, text: TitioNoticeCopy.resultLine(result, language: language))
+            await speakResult(result, language: language)
         }
     }
 

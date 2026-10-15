@@ -3792,6 +3792,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     nonisolated static let pairedBotOffMainMutationMethods: Set<String> = [
         "bot.notice.act",
         "bot.notice.read",
+        "bot.notice.clear",
     ]
     nonisolated static let pairedBotMainActorReadMethods: Set<String> = [
         "bot.attention.list",
@@ -4126,6 +4127,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             noticeCenter.markInboxRead()
             return ["unread_count": 0]
+        }
+        created.onNoticeClear = { _, messageID in
+            guard case .cleared(let threadID) = noticeCenter.clearNow(messageID: messageID) else {
+                throw BotRemoteControlAuthority.Error.invalidParams
+            }
+            return ["thread_id": threadID.value.uuidString.lowercased()]
         }
         created.onTitioInbox = {
             noticeCenter.inboxSnapshot?.foundationObject
@@ -9624,6 +9631,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context else { return [:] }
         var values: [String: String] = [:]
         for key in keys {
+            // `titio_language` lives inside the AppSettings blob, not as its own row.
+            if key == TitioLanguageSetting.wireKey {
+                values[key] = SettingsStore(db: ctx.db).load().titioLanguage
+                continue
+            }
             values[key] = (try? ctx.settingsRepo.get(key)) ?? ""
         }
         return values
@@ -9631,6 +9643,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func settingsSet(key: String, value: String) throws {
         guard let ctx = context else { return }
+        if key == TitioLanguageSetting.wireKey {
+            // `auto` or a well-formed BCP-47 tag, else invalidParams: a bad
+            // value must never reach Titio's prompts.
+            guard let tag = TitioLanguageSetting.normalized(value) else { throw JSONRPCError.invalidParams }
+            let store = SettingsStore(db: ctx.db)
+            var failure: Error?
+            store.onWriteError = { failure = $0 }
+            store.update { $0.titioLanguage = tag }
+            if let failure { throw failure }
+            return
+        }
         try ctx.settingsRepo.set(key, value)
     }
 

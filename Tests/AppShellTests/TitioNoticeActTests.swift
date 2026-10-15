@@ -14,6 +14,7 @@ final class TitioActionRecorder: @unchecked Sendable {
         case continueRun(AgentThreadID)
         case rerun(UUID)
         case ackActivity(String)
+        case dismissNotification(String)
     }
 
     private let lock = NSLock()
@@ -52,7 +53,8 @@ final class TitioActionRecorder: @unchecked Sendable {
             acknowledgeBotAttention: { [self] in try record(.ackBot($0)) },
             continueRun: { [self] in try record(.continueRun($0)) },
             rerunScheduledTask: { [self] in try record(.rerun($0)) },
-            acknowledgeActivity: { [self] in try record(.ackActivity($0)) }
+            acknowledgeActivity: { [self] in try record(.ackActivity($0)) },
+            dismissNotification: { [self] in try record(.dismissNotification($0)) }
         )
     }
 }
@@ -164,7 +166,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertNil(BotChoicesBlock.parse(rows[0].content).choices, "the card is gone from the original")
         XCTAssertTrue(rows[0].content.hasSuffix("_Approved by you at 8:01 PM._"), rows[0].content)
         XCTAssertEqual(rows[1].content, "Approve", "the user's tap is a user row with the option label")
-        XCTAssertEqual(rows[2].content, "Done, approved in **api**.")
+        XCTAssertEqual(rows[2].content, "Approved in **api**.")
         XCTAssertTrue(f.recorder.posted.contains { $0.isRewrite && $0.message.id.value.uuidString == messageID },
                       "the rewrite is published so open clients repaint the same bubble")
     }
@@ -229,7 +231,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(tapped, .accepted)
         await settle(f)
         XCTAssertEqual(try f.repo.get(key: fact.key)?.state, .awaitingReply)
-        XCTAssertEqual(try transcript(f).last?.content, "Go ahead. I'll pass your next message to the agent in **api**.")
+        XCTAssertEqual(try transcript(f).last?.content, "I'll pass your next message to the agent in **api**.")
 
         XCTAssertTrue(f.center.takeArmedReply(text: "  use staging "), "the armed text is taken before any run")
         XCTAssertFalse(f.center.takeArmedReply(text: "again"), "an arm is used once")
@@ -275,7 +277,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertFalse(f.center.takeArmedReply(text: "hello"))
         XCTAssertEqual(try f.repo.get(key: armed.key)?.state, .posted)
         XCTAssertEqual(f.actions.calls, [.request(requestThread, "Q3", .decline)])
-        XCTAssertEqual(try transcript(f).last?.content, "OK, declined. The agent in **api** was told.")
+        XCTAssertEqual(try transcript(f).last?.content, "Declined, and the agent in **api** was told.")
     }
 
     func test_aBotOptionLandsInThatBotsConversationAndAcksItsAttention() async throws {
