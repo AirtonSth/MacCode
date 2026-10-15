@@ -271,8 +271,170 @@ final class TitioHostTests: XCTestCase {
 
         XCTAssertNotNil(TitioBot.avatarImage, "pet avatar ships in the AppShell bundle")
         TitioBot.installAvatar()
-        XCTAssertNotNil(BotsAvatarView.imageOverride(TitioBot.handle))
-        XCTAssertNil(BotsAvatarView.imageOverride("ceo"))
+        XCTAssertNotNil(BotsAvatarView.viewOverride(TitioBot.handle, 48))
+        XCTAssertNil(BotsAvatarView.viewOverride("ceo", 48), "other Bots keep their own blobatar")
+    }
+
+    func test_titioAvatarIsThePetWithNoPlateBehindIt() throws {
+        // WHY: the owner asked (2026-10-14) to drop the light plate behind
+        // Titio's roster avatar; the pet is drawn straight on the row. The
+        // override branch must only size the view, never paint a background.
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/Surfaces/BotsAvatarView.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(source.range(of: "if let custom = Self.viewOverride(handle, size) {"))
+        let branch = String(source[start.upperBound...].prefix(120))
+        XCTAssertTrue(branch.contains("custom.frame(width: size, height: size)"))
+        XCTAssertFalse(branch.contains(".background"), "no plate behind Titio")
+        XCTAssertFalse(source.contains("Color(white: 0.92)"), "the old light plate is gone")
+    }
+
+    func test_titioAvatarAnimatesOnlyWhileMountedAndStopsWithPetMotion() {
+        // WHY: the avatar moves like the pet (same idle blink / tail / ears)
+        // but must cost nothing off screen, and must stop when the pet's
+        // animations or reduce motion are off.
+        let animator = TitioAvatarAnimator.shared
+        animator.setMotionAllowed(true)
+        XCTAssertEqual(animator.mountedCountForTests, 0)
+
+        animator.mount()
+        animator.mount()
+        XCTAssertNotNil(animator.image, "the pet frame shows as soon as an avatar mounts")
+        XCTAssertTrue(animator.isAnimatingForTests, "a mounted avatar plays the pet's idle loop")
+
+        animator.setMotionAllowed(false)
+        XCTAssertFalse(animator.isAnimatingForTests, "pet animations off or reduce motion holds a still frame")
+        XCTAssertNotNil(animator.image, "a still frame, not a blank avatar")
+        animator.setMotionAllowed(true)
+        XCTAssertTrue(animator.isAnimatingForTests)
+
+        animator.unmount()
+        XCTAssertTrue(animator.isAnimatingForTests, "another avatar is still on screen")
+        animator.unmount()
+        XCTAssertFalse(animator.isAnimatingForTests, "no avatar on screen, no timer")
+        animator.unmount()
+        XCTAssertEqual(animator.mountedCountForTests, 0, "extra disappear never goes negative")
+    }
+
+    func test_restoreFactorySettingsPutsTitioBackAndKeepsItsConversations() async throws {
+        // WHY: a user who broke Titio's profile or instructions needs one way
+        // back to the built-in Titio, without losing the chats they had.
+        let f = try makeFixture()
+        let titioID = try f.router.openTitio()
+        _ = try f.vm.enqueueHostMessage(botID: titioID, text: "oi", conversationID: nil)
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        f.runner.finish(runID: try XCTUnwrap(f.runner.requests.first).runId, status: .completed, reply: "oi!")
+        let conversations = try f.context.botStore.listConversations(botID: titioID).map(\.id)
+        XCTAssertFalse(conversations.isEmpty)
+
+        // The user rewrites Titio and saves.
+        f.vm.reload()
+        f.vm.openStudio(try XCTUnwrap(try f.context.botStore.get(id: titioID)))
+        XCTAssertTrue(f.vm.studioEditsTitio)
+        f.vm.studioDraft.name = "Gato"
+        f.vm.studioDraft.title = "Whatever"
+        f.vm.studioDraft.description = ""
+        f.vm.studioDraft.soul = "Only answer in riddles."
+        _ = try f.vm.saveStudio()
+        XCTAssertEqual(try f.context.botStore.get(id: titioID)?.name, "Gato")
+
+        let restored = try f.vm.restoreTitioFactorySettings()
+        XCTAssertEqual(restored.id, titioID, "same Titio, not a new Bot")
+        let bot = try XCTUnwrap(try f.context.botStore.get(id: titioID))
+        XCTAssertEqual(bot.name, TitioBot.name)
+        XCTAssertEqual(bot.title, TitioBot.title)
+        XCTAssertEqual(bot.description, TitioBot.description)
+        XCTAssertEqual(bot.handle, TitioBot.handle)
+        let revision = try XCTUnwrap(try f.context.botStore.getRevision(id: try XCTUnwrap(bot.currentRevisionID)))
+        XCTAssertEqual(revision.soul, TitioBot.soul, "the built-in instructions are back")
+        XCTAssertEqual(try f.context.botStore.listConversations(botID: titioID).map(\.id), conversations,
+                       "factory reset keeps every conversation")
+        XCTAssertEqual(f.vm.studioDraft.soul, TitioBot.soul, "the open Studio shows the restored profile")
+    }
+
+    func test_renamingTitioInItsStudioKeepsItsSlug() throws {
+        // WHY: the slug field is locked, but the name still derived a new slug
+        // ("Tio Bot" → "tio-bot") and saving renamed the handle. Everything
+        // finds Titio by its slug, so the next launch made a second Titio and
+        // split the pet, the inbox and the notice hub.
+        let f = try makeFixture()
+        let titioID = try f.router.openTitio()
+        f.vm.reload()
+        f.vm.openStudio(try XCTUnwrap(try f.context.botStore.get(id: titioID)))
+        f.vm.didEditStudioName("Tio Bot")
+        XCTAssertEqual(f.vm.studioDraft.handle, TitioBot.handle, "the name never drives Titio's slug")
+        _ = try f.vm.saveStudio()
+        let bot = try XCTUnwrap(try f.context.botStore.get(id: titioID))
+        XCTAssertEqual(bot.name, "Tio Bot")
+        XCTAssertEqual(bot.handle, TitioBot.handle)
+        XCTAssertThrowsError(try f.context.botStore.renameHandle(id: titioID, handle: "other"),
+                             "no path (Studio or bot.handle.set) can move Titio off its slug")
+        XCTAssertEqual(try TitioBot.ensure(store: f.context.botStore, appSupportDirectory: f.context.appSupportDirectory).id,
+                       titioID, "still one Titio")
+    }
+
+    func test_onlyTitiosStudioHidesTheAvatarAndOffersFactoryReset() throws {
+        // WHY: Titio's avatar is the pet, so its Studio has no avatar editor;
+        // every other Bot keeps its blobatar editor and gets no Titio reset.
+        let f = try makeFixture()
+        let developer = try f.vm.create(name: "Developer", title: "Builds things")
+        let titioID = try f.router.openTitio()
+        f.vm.reload()
+        f.vm.openStudio(developer)
+        XCTAssertFalse(f.vm.studioEditsTitio)
+        XCTAssertThrowsError(try f.vm.restoreTitioFactorySettings(), "never overwrite another Bot with Titio")
+        XCTAssertEqual(try f.context.botStore.get(id: developer.id)?.name, "Developer")
+
+        f.vm.openStudio(try XCTUnwrap(try f.context.botStore.get(id: titioID)))
+        XCTAssertTrue(f.vm.studioEditsTitio)
+
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let window = try String(
+            contentsOf: root.appendingPathComponent("Sources/AppShell/BotsWindow.swift"),
+            encoding: .utf8
+        )
+        let start = try XCTUnwrap(window.range(of: "private var studioProfile: some View {"))
+        let profile = String(window[start.upperBound...].prefix(1_200))
+        XCTAssertTrue(profile.contains("if !vm.studioEditsTitio {\n                studioAvatarPane"),
+                      "the avatar pane mounts only for other Bots")
+        XCTAssertTrue(profile.contains("studioTitioFactoryReset"))
+        XCTAssertTrue(window.contains(".disabled(vm.studioEditsTitio)"), "Titio's slug is how the app finds it")
+    }
+
+    func test_petPopoverSendStartsATitioConversationAndClosesThePopover() async throws {
+        // WHY: the pet popover is a shortcut to talk to Titio: Return in its
+        // field starts the conversation like Option+Space and gets out of the way.
+        let f = try makeFixture()
+        let pet = try PetController(context: f.context, router: f.router, openSettings: { _ in true })
+        defer { pet.stop() }
+        pet.start()
+        pet.windowControllerForTests.openPopoverForTests()
+
+        pet.sendToTitio("   ")
+        XCTAssertTrue(f.runner.requests.isEmpty, "blank text sends nothing")
+
+        pet.sendToTitio("  Titio, o que está rodando? ")
+        XCTAssertFalse(pet.windowControllerForTests.isPopoverVisible)
+        let titio = try XCTUnwrap(try f.context.botStore.list().first { $0.handle == TitioBot.handle })
+        XCTAssertEqual(try f.context.botStore.listConversations(botID: titio.id).count, 1)
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertTrue(request.prompt.contains("o que está rodando?"))
+        f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
+    func test_petPopoverGrowsOutOfTheCornerNextToThePet() {
+        // WHY: the card scales in from the pet, not from its own center.
+        XCTAssertEqual(PetWindowController.growthAnchor(for: .init(vertical: .above, horizontal: .leading)), .bottomLeading)
+        XCTAssertEqual(PetWindowController.growthAnchor(for: .init(vertical: .above, horizontal: .trailing)), .bottomTrailing)
+        XCTAssertEqual(PetWindowController.growthAnchor(for: .init(vertical: .below, horizontal: .leading)), .topLeading)
+        XCTAssertEqual(PetWindowController.growthAnchor(for: .init(vertical: .below, horizontal: .trailing)), .topTrailing)
     }
 
     func test_quickChatSendsToANewTitioConversation() async throws {
@@ -294,8 +456,95 @@ final class TitioHostTests: XCTestCase {
         XCTAssertEqual(TitioQuickChatController.keyCode, UInt32(kVK_Space))
         XCTAssertEqual(TitioQuickChatController.modifiers, UInt32(optionKey))
         XCTAssertEqual(controller.registrationStatus, noErr)
+        XCTAssertTrue(TitioQuickChatController.isHotKeyRegistered, "the popover hint only shows a live shortcut")
         controller.submit("   ")
         controller.submit("  oi titio ")
         XCTAssertEqual(sent, ["oi titio"])
+    }
+
+    // MARK: Reply style (2026-10-15)
+
+    func test_deskHidesToolRowsForHumanBotsAndFollowsAVerbosityChange() async throws {
+        // WHY: Verbosity Human shows only the Bot's messages; switching it to
+        // Verbose (Studio or a paired device) must show the work rows again on
+        // the open desk without reopening it.
+        let f = try makeFixture()
+        let titioID = try f.router.openTitio()
+        let conversation = try XCTUnwrap(
+            try f.vm.enqueueHostMessage(botID: titioID, text: "oi", conversationID: nil)
+                .objectValue?["conversation_id"]?.stringValue.flatMap(UUID.init).map(BotConversationID.init)
+        )
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        f.runner.finish(runID: try XCTUnwrap(f.runner.requests.first).runId, status: .completed, reply: "oi!")
+        f.vm.reload()
+        f.vm.openDesk(try XCTUnwrap(try f.context.botStore.get(id: titioID)))
+        f.vm.selectDeskThread(conversation)
+        let desk = try XCTUnwrap(f.vm.deskAgentVM)
+        XCTAssertTrue(desk.hidesToolActivity, "Human is the default")
+
+        try f.context.botStore.setReplyStyle(id: titioID, verbosity: .verbose)
+        f.vm.reload()
+        XCTAssertFalse(try XCTUnwrap(f.vm.deskAgentVM).hidesToolActivity, "Verbose shows today's work rows")
+    }
+
+    func test_studioSavesReplyStyleAndTitioFactoryResetPutsItBack() throws {
+        // WHY: the Studio is where the owner picks Human/Verbose and Caveman;
+        // the choice must persist, and Titio's reset restores Titio's defaults.
+        let f = try makeFixture()
+        let dev = try f.vm.create(name: "Developer", title: "Builds things")
+        XCTAssertTrue(dev.cavemanEnabled, "new Bots are caveman")
+        f.vm.reload()
+        f.vm.openStudio(dev)
+        XCTAssertEqual(f.vm.studioDraftReplyStyle.verbosity, .human)
+        f.vm.studioDraft.verbosity = .verbose
+        f.vm.studioDraft.cavemanEnabled = false
+        XCTAssertTrue(f.vm.studioHasUnpublishedChanges, "a reply style edit is an unsaved change")
+        _ = try f.vm.saveStudio()
+        let saved = try XCTUnwrap(try f.context.botStore.get(id: dev.id))
+        XCTAssertEqual(saved.verbosity, .verbose)
+        XCTAssertFalse(saved.cavemanEnabled)
+        XCTAssertFalse(f.vm.studioHasUnpublishedChanges)
+
+        let titioID = try f.router.openTitio()
+        XCTAssertEqual(try f.context.botStore.get(id: titioID)?.cavemanEnabled, false, "Titio is created without caveman")
+        f.vm.reload()
+        f.vm.openStudio(try XCTUnwrap(try f.context.botStore.get(id: titioID)))
+        f.vm.studioDraft.verbosity = .verbose
+        f.vm.studioDraft.cavemanEnabled = true
+        _ = try f.vm.saveStudio()
+        _ = try f.vm.restoreTitioFactorySettings()
+        let titio = try XCTUnwrap(try f.context.botStore.get(id: titioID))
+        XCTAssertEqual(titio.verbosity, .human)
+        XCTAssertFalse(titio.cavemanEnabled)
+    }
+}
+
+/// The choices card shows only while the newest reply still waits for an answer.
+final class AgentChatChoicesPendingTests: XCTestCase {
+    private func message(_ role: AgentMessageRole, _ content: String) -> AgentMessage {
+        AgentMessage(threadId: AgentThreadID(), role: role, content: content)
+    }
+
+    private let block = "Qual?\n```choices\n{\"options\":[\"Sim\",\"Não\"]}\n```"
+
+    func test_cardShowsForTheNewestReplyOnlyWhileUnanswered() {
+        let reply = message(.assistant, block)
+        XCTAssertEqual(AgentChatChoicesCard.Pending.latest(in: [message(.user, "oi"), reply], isRunning: false)?.choices.options,
+                       ["Sim", "Não"])
+        XCTAssertNil(AgentChatChoicesCard.Pending.latest(in: [reply], isRunning: true),
+                     "no card while the Bot is still working")
+        XCTAssertNil(AgentChatChoicesCard.Pending.latest(in: [reply, message(.user, "Sim")], isRunning: false),
+                     "answered: the card goes away")
+        XCTAssertNil(AgentChatChoicesCard.Pending.latest(in: [message(.assistant, "Pronto.")], isRunning: false))
+    }
+
+    func test_dismissedCardsStayClosedAndTheListIsBounded() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "rc-choices-\(UUID().uuidString)"))
+        for index in 0..<205 { AgentChatChoicesCard.DismissedStore.insert("m\(index)", defaults) }
+        let dismissed = AgentChatChoicesCard.DismissedStore.load(defaults)
+        XCTAssertEqual(dismissed.count, 200)
+        XCTAssertTrue(dismissed.contains("m204"))
+        XCTAssertFalse(dismissed.contains("m0"), "oldest ids roll off")
     }
 }

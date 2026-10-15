@@ -84,7 +84,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// Routing is nil when the send carries no routing receipt: the host then
     /// runs the conversation's own desk route (or the resolved Distill default)
     /// and reports it back as `effective_routing`.
-    public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]?) throws -> [String: Any])?
+    /// The last argument is the client's `client_capabilities` from `bot.send`
+    /// (e.g. `titio_notice_act_v1`: the client taps Titio cards through
+    /// `bot.notice.act`, so its text is never read as a card answer).
+    public var onSend: ((BotID, String, BotConversationID?, [AgentAttachment], [String: Any]?, Set<String>) throws -> [String: Any])?
     /// A routine execution (scheduled slot or `bot.routine.run`): the same
     /// host send as `bot.send`, in a new conversation on the routine's own
     /// route. Returns the send's `bot_id`, `conversation_id` and `run_id`.
@@ -98,6 +101,15 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     public var onDelegatedAttentionSnapshot: (() throws -> [[String: Any]])?
     public var onOpenFile: ((BotID, String, Bool, String) throws -> Void)?
     public var onImportFile: ((BotID, URL) throws -> AgentAttachment)?
+    /// `bot.notice.act` (hub spec §7): Titio's notice hub claims the row and
+    /// answers `{"outcome", "route"?}`. Runs off the MainActor under the
+    /// authority lock, so it must not call back into this authority.
+    public var onNoticeAct: ((BotID, String, Int) throws -> [String: Any])?
+    /// `bot.notice.read`: the inbox unread count goes to 0.
+    public var onNoticeRead: ((BotID, BotConversationID) throws -> [String: Any])?
+    /// The `titio_inbox` object for Titio's `bot.list` row and the inbox's
+    /// `bot.conversation.list` kind (in-memory, no SQLite). Nil: no inbox yet.
+    public var onTitioInbox: (() -> [String: Any]?)?
     public var notifyBrowserPendingOpen: ((Notification.Name) throws -> Void)?
 
     private var receipts: [String: [String: Any]] = [:]
@@ -886,6 +898,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func conversationList(params: [String: Any]) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
+        let inboxID = bot.handle.lowercased() == TitioIdentity.handle
+            ? onTitioInbox?()?["conversation_id"] as? String : nil
         let rows = try store.listConversations(botID: bot.id).map { conversation in
             var row: [String: Any] = [
                 "id": conversation.id.value.uuidString.lowercased(),
@@ -893,6 +907,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 "bot_id": botID,
                 "updated_at": conversation.updatedAt.timeIntervalSince1970,
             ]
+            if row["id"] as? String == inboxID {
+                row["kind"] = "titio_inbox"
+            }
             let conversationID = conversation.id.value.uuidString.lowercased()
             if let identity = liveConversationIdentity(
                 botID: botID,
@@ -1110,6 +1127,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try dockerClear(params: params, requestID: requestID)
         case "notify.set":
             return try notifySet(params: params, requestID: requestID, now: now)
+        case "verbosity.set":
+            return try verbositySet(params: params, requestID: requestID, now: now)
+        case "caveman.set":
+            return try cavemanSet(params: params, requestID: requestID, now: now)
+        case "factory_reset":
+            return try factoryReset(params: params, requestID: requestID, now: now)
+        case "notice.act":
+            return try noticeAct(params: params, requestID: requestID)
+        case "notice.read":
+            return try noticeRead(params: params, requestID: requestID)
         case "desktop.set":
             return try desktopSet(params: params, requestID: requestID)
         case "avatar.set":
@@ -1507,7 +1534,27 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         let authoritativeSend: [String: Any]
         if let onSend {
-            authoritativeSend = try onSend(bot.id, text, conversation, boundAttachments, routing)
+            let clientCapabilities = Set((params["client_capabilities"] as? [Any] ?? []).compactMap { $0 as? String })
+            authoritativeSend = try onSend(bot.id, text, conversation, boundAttachments, routing, clientCapabilities)
+            // Titio's inbox took the text for a notice (an armed "Reply here"
+            // or an old build's option text, hub spec §7): no run starts, so
+            // no live run or working attention is registered.
+            if authoritativeSend["host_consumed"] as? Bool == true,
+               authoritativeSend["bot_id"] as? String == botID {
+                consumeAttachments(attachmentIDs)
+                // The full send identity, so a paired client decodes this as
+                // a delivered send (`BotSend.Result.Disposition.hostConsumed`)
+                // instead of a failed one it would put back in the composer.
+                var readback = authoritativeSend
+                readback["host_id"] = hostID
+                readback["bot_id"] = botID
+                readback["request_id"] = requestID
+                readback["client_request_id"] = requestID
+                var consumed = receipt(requestID: requestID, status: .completed, botID: botID, readback: readback)
+                consumed["host_id"] = hostID
+                consumed["client_request_id"] = requestID
+                return consumed
+            }
             guard authoritativeSend["bot_id"] as? String == botID,
                   let admittedConversationID = authoritativeSend["conversation_id"] as? String,
                   let admittedConversationUUID = UUID(uuidString: admittedConversationID),
@@ -3057,6 +3104,88 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         ])
     }
 
+    private func verbositySet(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard let verbosity = string(params, "verbosity").flatMap(BotReplyVerbosity.init(rawValue:)) else {
+            throw Error.invalidParams
+        }
+        _ = try store.setReplyStyle(id: bot.id, verbosity: verbosity, now: now)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "verbosity": verbosity.rawValue,
+            "route": "bot",
+        ])
+    }
+
+    private func cavemanSet(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard let enabled = bool(params, "enabled") else {
+            throw Error.invalidParams
+        }
+        _ = try store.setReplyStyle(id: bot.id, cavemanEnabled: enabled, now: now)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "caveman_enabled": enabled,
+            "route": "bot",
+        ])
+    }
+
+    /// Titio only: a paired device can put a broken Titio back to its
+    /// built-in profile, like the Mac Studio's Restore Factory Settings.
+    private func factoryReset(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard bot.handle.lowercased() == TitioIdentity.handle else {
+            throw Error.invalidParams
+        }
+        let restored = try store.restoreTitioFactorySettings(id: bot.id, now: now)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "bot": try encodeBot(restored),
+            "route": "bot",
+        ])
+    }
+
+    /// A tap on a Titio notice card (hub spec §7). The receipt is completed
+    /// once the host claimed (or navigated); Titio's result message reports
+    /// the final outcome of an `accepted` act.
+    private func noticeAct(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard bot.handle.lowercased() == TitioIdentity.handle,
+              let messageID = string(params, "message_id")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              UUID(uuidString: messageID) != nil,
+              let optionIndex = int(params, "option_index"), optionIndex >= 0 else {
+            throw Error.invalidParams
+        }
+        guard let onNoticeAct else { throw Error(code: -32091, message: "Bot runtime is unavailable.") }
+        let answer = try onNoticeAct(bot.id, messageID, optionIndex)
+        var readback: [String: Any] = [
+            "message_id": messageID.lowercased(),
+            "option_index": optionIndex,
+            "outcome": answer["outcome"] ?? "not_found",
+            "route": "bot",
+        ]
+        // `route` in a readback names the readback route ("bot"); the
+        // navigation target travels as `navigation` there and as `route` at
+        // the receipt's top level (spec `{status, outcome, route?}`).
+        if let navigation = answer["route"] { readback["navigation"] = navigation }
+        var result = receipt(requestID: requestID, status: .completed, botID: id(bot), readback: readback)
+        result["outcome"] = readback["outcome"]
+        if let navigation = answer["route"] { result["route"] = navigation }
+        return result
+    }
+
+    /// iOS opened Titio's inbox: unread goes to 0 (hub spec §8 "Read state").
+    private func noticeRead(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard bot.handle.lowercased() == TitioIdentity.handle,
+              let raw = string(params, "conversation_id"),
+              let uuid = UUID(uuidString: raw) else {
+            throw Error.invalidParams
+        }
+        guard let onNoticeRead else { throw Error(code: -32091, message: "Bot runtime is unavailable.") }
+        var readback = try onNoticeRead(bot.id, BotConversationID(uuid))
+        readback["conversation_id"] = raw.lowercased()
+        readback["route"] = "bot"
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: readback)
+    }
+
     private func desktopSet(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let rawKind = string(params, "kind") ?? BotDesktopKind.logicalExecutionSpace.rawValue
@@ -3363,6 +3492,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "pinned": bot.pinned,
             "hidden": bot.hidden,
             "notifications_enabled": bot.notificationsEnabled,
+            "verbosity": bot.verbosity.rawValue,
+            "caveman_enabled": bot.cavemanEnabled,
             "soul": revision.soul,
             "desktop_kind": revision.desktopKind.advertisedOrLogical.rawValue,
             "current_revision_id": revision.id.value.uuidString.lowercased(),
@@ -3370,6 +3501,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         ]
         if let routing = routingPref[id(bot)] {
             body["routing"] = routing
+        }
+        if bot.handle.lowercased() == TitioIdentity.handle, let inbox = onTitioInbox?() {
+            body["titio_inbox"] = inbox
         }
         for (key, value) in extra { body[key] = value }
         return body

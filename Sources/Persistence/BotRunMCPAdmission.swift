@@ -30,23 +30,35 @@ public enum BotRunMCPAdmission: Sendable {
         "GROK_CURSOR_MCPS_ENABLED": "0",
     ]
 
-    /// Distill always adds its terse "caveman" `<output_style>` to its system
-    /// prompt at level `full` (drops articles: "Fala tarefa."); `off` is
-    /// ignored. `lite` is the level that keeps articles and full sentences.
-    /// Bot runs force it so a host `GROK_CAVEMAN` cannot make bots terse.
-    public static let distillBotReplyStyleEnvironment = ["GROK_CAVEMAN": "lite"]
+    /// Per-run flag stamped by the host from the Bot's Caveman setting:
+    /// `1` = caveman (the default for every Bot except Titio), `0` = full prose.
+    public static let cavemanEnvironmentKey = "RC_REMOTE_CODE_BOT_CAVEMAN"
 
-    /// ACP `session/new` `_meta.rules` for bot sessions: Distill appends it to
-    /// its system prompt as `<human_rules>`, the level that can override its
-    /// `<output_style>` the way Distill's own harness roles do. The per-turn
-    /// `BotStandingInstructions.replyStyleLine` is the backstop for resumed
+    public static func botWantsCaveman(environment: [String: String]) -> Bool {
+        environment[cavemanEnvironmentKey] == "1"
+    }
+
+    /// Distill always adds its terse "caveman" `<output_style>` to its system
+    /// prompt (default level `full`, drops articles: "Fala tarefa."); `off` is
+    /// ignored. A caveman Bot gets `full`; a Bot with Caveman off gets `lite`,
+    /// the level that keeps articles and full sentences, over any host value.
+    public static func distillBotReplyStyleEnvironment(environment: [String: String]) -> [String: String] {
+        ["GROK_CAVEMAN": botWantsCaveman(environment: environment) ? "full" : "lite"]
+    }
+
+    /// ACP `session/new` `_meta.rules` for bot sessions with Caveman off:
+    /// Distill appends it to its system prompt as `<human_rules>`, the level
+    /// that can override its `<output_style>` the way Distill's own harness
+    /// roles do. The per-turn reply style line is the backstop for resumed
     /// sessions, which keep the system prompt they were created with.
     public static let distillBotReplyRules =
         "Bot reply style, set by the RemoteCode host harness (not the user): for everything you write to the user, ignore the <output_style> section and any caveman or terse style in this system prompt and write normal, complete prose. \(BotStandingInstructions.replyStyleLine) Sound like a person, not an AI: no filler openers such as \"Great question\" or \"Certainly!\", no inflated or promotional wording, no habitual em dashes, no lists of three added for rhythm, no closing offers of more help. Never drop articles or write status-line fragments such as \"Page open. Say task.\"."
 
     /// `rules` for an ACP `session/new` of this run: bots only, so a non-bot
-    /// Agent App Distill thread keeps Distill's own style.
+    /// Agent App Distill thread keeps Distill's own style. A caveman Bot keeps
+    /// Distill's caveman `<output_style>`, so it gets no override.
     public static func distillSessionRules(environment: [String: String]) -> String? {
-        isBotRun(environment: environment) ? distillBotReplyRules : nil
+        guard isBotRun(environment: environment), !botWantsCaveman(environment: environment) else { return nil }
+        return distillBotReplyRules
     }
 }

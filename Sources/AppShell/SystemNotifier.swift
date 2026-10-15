@@ -142,20 +142,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         // without an app bundle and would crash on .current().
         guard Self.canUseNotificationCenter else { return }
         notificationCenterClient.setDelegate(self)
-        notificationCenterClient.setNotificationCategories([
-            UNNotificationCategory(
-                identifier: RemoteCodeNotificationContent.threadUpdateCategoryIdentifier,
-                actions: [
-                    UNNotificationAction(
-                        identifier: RemoteCodeNotificationContent.openActionIdentifier,
-                        title: "Open",
-                        options: [.foreground]
-                    )
-                ],
-                intentIdentifiers: [],
-                options: []
-            )
-        ])
+        notificationCenterClient.setNotificationCategories(Self.notificationCategories)
         notificationCenterClient.requestAuthorization(options: Self.authorizationOptions) { [notificationCenterClient] granted, _ in
             self.authorized = granted
             // The Dock badge only shows while macOS allows badges for the app.
@@ -164,6 +151,30 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
                 Self.log.info("notifications.authorized granted=\(granted, privacy: .public) badge=\(badge.rawValue, privacy: .public)")
             }
         }
+    }
+
+    /// Thread updates and Titio notices. Titio's category has only Open
+    /// (approve/decline from the lock screen is out of scope, hub spec §14).
+    static var notificationCategories: Set<UNNotificationCategory> {
+        let open = UNNotificationAction(
+            identifier: RemoteCodeNotificationContent.openActionIdentifier,
+            title: "Open",
+            options: [.foreground]
+        )
+        return [
+            UNNotificationCategory(
+                identifier: RemoteCodeNotificationContent.threadUpdateCategoryIdentifier,
+                actions: [open],
+                intentIdentifiers: [],
+                options: []
+            ),
+            UNNotificationCategory(
+                identifier: RemoteCodeNotificationContent.titioNoticeCategoryIdentifier,
+                actions: [open],
+                intentIdentifiers: [],
+                options: []
+            ),
+        ]
     }
 
     public func post(title: String, body: String?, category: String?) {

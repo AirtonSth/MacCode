@@ -1394,6 +1394,14 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         await deliver(content)
     }
 
+    /// True when `deliver(_:)` can send a visible alert at all: a subscribed
+    /// account and a registered phone push target. Without one, a paired
+    /// phone's only alert is its own local notification.
+    public var hasAlertPushTarget: Bool {
+        guard let session = accountStore.load(), session.user.subscribed else { return false }
+        return pushTargetStore.load() != nil
+    }
+
     public func deliver(_ content: RemoteCodeNotificationContent) async {
         guard let session = accountStore.load() else {
             recordWakeNotSent(reason: "no_session")

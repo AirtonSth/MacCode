@@ -75,7 +75,7 @@ final class BotAttentionRelaunchSettleTests: XCTestCase {
         if let rowStatus {
             try writeRun(runID, threadID: threadID, status: rowStatus)
         }
-        authority.onSend = { _, _, _, _, _ in
+        authority.onSend = { _, _, _, _, _, _ in
             [
                 "bot_id": botID,
                 "conversation_id": conversationID,

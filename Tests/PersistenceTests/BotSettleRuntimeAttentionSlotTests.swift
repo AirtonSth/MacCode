@@ -74,7 +74,7 @@ final class BotSettleRuntimeAttentionSlotTests: XCTestCase {
         )
         let runID = UUID().uuidString.lowercased()
         let threadID = UUID().uuidString.lowercased()
-        authority.onSend = { _, _, _, _, _ in
+        authority.onSend = { _, _, _, _, _, _ in
             [
                 "bot_id": botID,
                 "conversation_id": conversationID,

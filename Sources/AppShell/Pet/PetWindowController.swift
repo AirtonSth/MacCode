@@ -82,7 +82,7 @@ enum PetAttentionVisualStatus: Equatable {
 
 enum PetPopoverSizing {
     static let preferredWidth: CGFloat = 360
-    static let minimumHeight: CGFloat = 178
+    static let minimumHeight: CGFloat = 120
     static let maximumHeight: CGFloat = 520
     static let screenMargin: CGFloat = 12
 
@@ -280,7 +280,7 @@ private struct PetSpriteView: View {
                     Spacer(minLength: 0)
                     if let badge = model.badgeText {
                         PetCountDot(text: badge, color: .red)
-                            .help("\(badge) need you")
+                            .help(PetAttentionCountFormatter.needYouText(badgeText: badge))
                     }
                 }
                 Spacer(minLength: 0)
@@ -326,59 +326,48 @@ private struct PetAttentionPopoverView: View {
     let onOpenActive: (PetActiveThreadItem) -> Void
     let onOpenApp: () -> Void
     let onOpenTitio: () -> Void
+    let onSendToTitio: (String) -> Void
     let onClose: () -> Void
     let contentWidth: CGFloat
+    /// The corner nearest the pet; the card grows out of it.
+    let growthAnchor: UnitPoint
+    let showsQuickChatShortcut: Bool
+    @State private var appeared = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Titio")
-                        .font(.title2.weight(.semibold))
-                    Text(model.accessibilityValue)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button {
-                    onClose()
-                } label: {
-                    Image(systemName: "xmark")
-                }
-                .buttonStyle(.plain)
-                .help("Close")
-                .accessibilityLabel("Close")
-                .accessibilityIdentifier("pet.close")
-            }
-            .padding(18)
+            header
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
 
-            Divider()
+            // The whole card is a way to talk to Titio: type and press Return.
+            TitioComposerField(
+                size: .compact,
+                identifier: "pet.titioField",
+                onSubmit: onSendToTitio,
+                onCancel: onClose
+            )
+            .padding(.horizontal, 14)
+            .padding(.bottom, 14)
 
             // What is running right now stays one glance away; everything else lives in Activity.
             if !model.activeThreads.isEmpty {
+                Divider()
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         activeGroupedSection(Array(model.activeThreads.prefix(50)))
                     }
+                    .padding(.bottom, 6)
                 }
                 .frame(maxHeight: 260)
-
-                Divider()
             }
 
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Review work and requests in Activity.")
-                    .foregroundStyle(.secondary)
-                VStack(alignment: .leading, spacing: 8) {
-                    Button("Chat with Titio") { onOpenTitio() }
-                        .buttonStyle(.borderedProminent)
-                        .accessibilityIdentifier("pet.openTitio")
-                    Button("Open Activity") { onOpenApp() }
-                        .accessibilityIdentifier("pet.openActivity")
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(18)
+            Divider()
+            footer
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
 
             if let routeError = model.routeError {
                 Text(routeError)
@@ -391,10 +380,143 @@ private struct PetAttentionPopoverView: View {
         }
         .frame(width: contentWidth)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.14), lineWidth: 1))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 1))
+        // Grows out of the pet: short, ease-out, never from zero.
+        .opacity(appeared ? 1 : 0)
+        .scaleEffect(appeared || reduceMotion ? 1 : 0.96, anchor: growthAnchor)
+        .onAppear {
+            withAnimation(reduceMotion
+                ? .easeOut(duration: 0.12)
+                : .timingCurve(0.23, 1, 0.32, 1, duration: 0.18)) { appeared = true }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("pet.popover")
         .onExitCommand { onClose() }
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Button(action: onOpenTitio) {
+                TitioAvatarView(size: 44)
+            }
+            .buttonStyle(TitioPressableStyle())
+            .help("Open Titio's chat")
+            .accessibilityLabel("Open Titio's chat")
+            .accessibilityIdentifier("pet.avatar")
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Titio")
+                    .font(.title3.weight(.semibold))
+                statusChips
+            }
+            Spacer(minLength: 8)
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(PetPopoverHoverStyle(cornerRadius: 12))
+            .help("Close")
+            .accessibilityLabel("Close")
+            .accessibilityIdentifier("pet.close")
+        }
+    }
+
+    /// Counts are shortcuts: each one opens Activity, where that work lives.
+    @ViewBuilder
+    private var statusChips: some View {
+        let counts = model.activityCounts
+        if !counts.isAvailable {
+            Text("Activity status unavailable")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else if counts.running == 0, counts.needsYou == 0 {
+            Text("All quiet. Ask me anything.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("pet.status.quiet")
+        } else {
+            HStack(spacing: 4) {
+                if counts.running > 0 {
+                    statusChip(
+                        text: "\(PetActiveThreadCountFormatter.badgeText(count: counts.running) ?? "\(counts.running)") running",
+                        color: .blue,
+                        identifier: "pet.status.running"
+                    )
+                }
+                if counts.needsYou > 0 {
+                    statusChip(
+                        text: PetAttentionCountFormatter.needYouText(
+                            badgeText: PetAttentionCountFormatter.badgeText(count: counts.needsYou, isEnabled: true) ?? "\(counts.needsYou)"
+                        ),
+                        color: .red,
+                        identifier: "pet.status.needsYou"
+                    )
+                }
+            }
+        }
+    }
+
+    private func statusChip(text: String, color: Color, identifier: String) -> some View {
+        Button(action: onOpenApp) {
+            HStack(spacing: 5) {
+                Circle().fill(color).frame(width: 7, height: 7)
+                Text(text)
+                    .font(.caption.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(.primary)
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Color.primary.opacity(0.06)))
+        }
+        .buttonStyle(PetPopoverHoverStyle(cornerRadius: 10))
+        .help("Open Activity")
+        .accessibilityLabel("\(text). Open Activity")
+        .accessibilityIdentifier(identifier)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 4) {
+            if showsQuickChatShortcut {
+                HStack(spacing: 5) {
+                    Text("\u{2325}Space")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .stroke(Color.secondary.opacity(0.5), lineWidth: 1)
+                        )
+                    Text("from anywhere")
+                        .font(.caption2)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.leading, 6)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Option Space opens Titio from anywhere")
+            }
+            Spacer(minLength: 4)
+            footerButton("Activity", systemImage: "tray.full", identifier: "pet.openActivity", action: onOpenApp)
+            footerButton("Open Chat", systemImage: "bubble.left.and.bubble.right", identifier: "pet.openTitio", action: onOpenTitio)
+        }
+    }
+
+    private func footerButton(
+        _ title: String,
+        systemImage: String,
+        identifier: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(.callout)
+                .padding(.horizontal, 8)
+                .frame(minHeight: 28)
+        }
+        .buttonStyle(PetPopoverHoverStyle(cornerRadius: 7))
+        .accessibilityIdentifier(identifier)
     }
 
     @ViewBuilder
@@ -456,36 +578,39 @@ private struct PetAttentionPopoverView: View {
     }
 
     private func activeRow(_ item: PetActiveThreadItem) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .foregroundStyle(Color.blue)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(item.title)
-                    .font(.headline)
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                if let detail = item.detail {
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                        .help(detail)
+        Button { onOpenActive(item) } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(Color.blue)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.title)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if let detail = item.detail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.tail)
+                            .help(detail)
+                    }
                 }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
             }
-            Spacer(minLength: 8)
-            Button("Open") { onOpenActive(item) }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .frame(minWidth: 44, minHeight: 44)
-                .accessibilityIdentifier("pet.activeRow.\(PetAccessibilityIdentifier.row(item.id)).open")
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 8)
-        .frame(minHeight: 52)
-        .accessibilityElement(children: .contain)
+        .buttonStyle(PetPopoverHoverStyle(cornerRadius: 10))
+        .padding(.horizontal, 8)
         .accessibilityLabel(Self.rowAccessibilityLabel(status: "Active", title: item.title, detail: item.detail))
+        .accessibilityHint("Opens the thread")
         .accessibilityIdentifier("pet.activeRow.\(PetAccessibilityIdentifier.row(item.id))")
     }
 
@@ -536,6 +661,34 @@ private struct PetAttentionPopoverView: View {
     }
 }
 
+/// Quiet hover and press wash for the popover's clickable rows, chips and
+/// footer actions, so every target answers the pointer.
+private struct PetPopoverHoverStyle: ButtonStyle {
+    let cornerRadius: CGFloat
+
+    func makeBody(configuration: Configuration) -> some View {
+        HoverBody(configuration: configuration, cornerRadius: cornerRadius)
+    }
+
+    private struct HoverBody: View {
+        let configuration: ButtonStyleConfiguration
+        let cornerRadius: CGFloat
+        @State private var hovering = false
+
+        var body: some View {
+            let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            configuration.label
+                .background(shape.fill(Color.primary.opacity(
+                    configuration.isPressed ? 0.12 : hovering ? 0.07 : 0
+                )))
+                .contentShape(shape)
+                .onHover { hovering = $0 }
+                .animation(.easeOut(duration: 0.12), value: hovering)
+                .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
+        }
+    }
+}
+
 @MainActor
 public final class PetWindowController: NSObject {
     private struct PetPlacementContext {
@@ -553,6 +706,7 @@ public final class PetWindowController: NSObject {
     public var onOpenActiveThread: ((PetActiveThreadItem) -> Void)?
     public var onOpenRemoteCode: (() -> Void)?
     public var onOpenTitio: (() -> Void)?
+    public var onSendToTitio: ((String) -> Void)?
     public var onOpenSettings: (() -> Void)?
     public var onHidePet: (() -> Void)?
     public var onToggleAnimations: (() -> Void)?
@@ -560,12 +714,15 @@ public final class PetWindowController: NSObject {
     public var onInteraction: (() -> Void)?
     public var onCareAction: ((PetCareAction) -> Void)?
     public var onDragStateChanged: ((Bool) -> Void)?
+    /// The popover is about to open; the speech bubble yields to it.
+    var onPopoverWillOpen: (() -> Void)?
 
     private let model: PetViewModel
     private let placementStore: PetPlacementStore
     private var petPanel: NSPanel?
     private var spriteView: PetSpriteHostingView<PetSpriteView>?
     private var popoverPanel: PetPopoverPanel?
+    private var speechPanel: PetSpeechPanel?
     private var localMouseMonitor: Any?
     private var globalMouseMonitor: Any?
     private var popoverLocalMonitor: Any?
@@ -595,6 +752,9 @@ public final class PetWindowController: NSObject {
     public var isPopoverVisible: Bool { popoverPanel?.isVisible == true }
     var petPanelForTests: NSPanel? { petPanel }
     var popoverPanelForTests: NSPanel? { popoverPanel }
+    var speechPanelForTests: NSPanel? { speechPanel?.windowForTests }
+    var speechHostingForTests: PetSpeechHostingView? { speechPanel?.hostingForTests }
+    public var isSpeechVisible: Bool { speechPanel?.isVisible == true }
     var spriteAccessibilityViewForTests: NSView? { spriteView }
     var dragLifecycleForTests: (active: Bool, monitoring: Bool, cursorPushed: Bool)? {
         spriteView?.dragLifecycleForTests
@@ -617,6 +777,7 @@ public final class PetWindowController: NSObject {
 
     public func hide() {
         closePopover()
+        hideSpeech(animated: false)
         cancelActiveDrag()
         petPanel?.orderOut(nil)
         removeMouseMonitors()
@@ -631,8 +792,10 @@ public final class PetWindowController: NSObject {
         uninstallDockPlacementCacheObservers()
         petPanel?.close()
         popoverPanel?.close()
+        speechPanel?.close()
         petPanel = nil
         popoverPanel = nil
+        speechPanel = nil
         spriteView = nil
     }
 
@@ -655,6 +818,7 @@ public final class PetWindowController: NSObject {
             installMouseMonitors()
         }
         if isPopoverVisible { positionPopover() }
+        if isSpeechVisible { positionSpeech() }
     }
 
     public func resetPosition() {
@@ -747,6 +911,8 @@ public final class PetWindowController: NSObject {
 
     private func openPopover() {
         ensurePetPanel()
+        onPopoverWillOpen?()
+        hideSpeech(animated: false)
         let panel: PetPopoverPanel
         if let existing = popoverPanel {
             panel = existing
@@ -776,14 +942,25 @@ public final class PetWindowController: NSObject {
         let visibleFrame = popoverTargetScreen()?.visibleFrame
             ?? CGRect(x: 0, y: 0, width: PetPopoverSizing.preferredWidth + 24, height: 544)
         let contentWidth = PetPopoverSizing.contentWidth(visibleFrame: visibleFrame)
+        // Orientation depends only on where the pet sits, not on the card's size.
+        let orientation = petPanel.map {
+            PetPopoverPlacement.resolve(
+                anchorFrame: $0.frame,
+                requestedSize: panel.frame.size,
+                visibleFrame: visibleFrame
+            ).orientation
+        }
         let hosting = NSHostingView(rootView: PetAttentionPopoverView(
             model: model,
             onOpen: { [weak self] in self?.onOpenItem?($0) },
             onOpenActive: { [weak self] in self?.onOpenActiveThread?($0) },
             onOpenApp: { [weak self] in self?.onOpenRemoteCode?() },
             onOpenTitio: { [weak self] in self?.onOpenTitio?() },
+            onSendToTitio: { [weak self] in self?.onSendToTitio?($0) },
             onClose: { [weak self] in self?.closePopover() },
-            contentWidth: contentWidth
+            contentWidth: contentWidth,
+            growthAnchor: Self.growthAnchor(for: orientation),
+            showsQuickChatShortcut: TitioQuickChatController.isHotKeyRegistered
         ))
         hosting.setAccessibilityIdentifier("pet.popover")
         panel.contentView = hosting
@@ -797,6 +974,17 @@ public final class PetWindowController: NSObject {
         installPopoverMonitors()
     }
 
+    /// The card's corner that sits next to the pet.
+    static func growthAnchor(for orientation: PetPopoverOrientation?) -> UnitPoint {
+        guard let orientation else { return .bottom }
+        switch (orientation.vertical, orientation.horizontal) {
+        case (.above, .leading): return .bottomLeading
+        case (.above, .trailing): return .bottomTrailing
+        case (.below, .leading): return .topLeading
+        case (.below, .trailing): return .topTrailing
+        }
+    }
+
     private func positionPopover() {
         guard let anchor = petPanel?.frame,
               let panel = popoverPanel,
@@ -807,6 +995,40 @@ public final class PetWindowController: NSObject {
             visibleFrame: screen.visibleFrame
         )
         panel.setFrame(placement.frame, display: true)
+    }
+
+    /// Shows Titio's speech bubble next to the pet, in its own window. False
+    /// when the pet is not on screen to speak from.
+    @discardableResult
+    func showSpeech(
+        _ speech: PetSpeech,
+        reduceMotion: Bool,
+        onClick: @escaping () -> Void,
+        onHover: @escaping (Bool) -> Void = { _ in }
+    ) -> Bool {
+        guard isVisible, !isPopoverVisible,
+              let anchor = petPanel?.frame,
+              let screen = popoverTargetScreen() else { return false }
+        let panel = speechPanel ?? PetSpeechPanel()
+        speechPanel = panel
+        panel.show(
+            speech,
+            anchorFrame: anchor,
+            visibleFrame: screen.visibleFrame,
+            reduceMotion: reduceMotion,
+            onClick: onClick,
+            onHover: onHover
+        )
+        return true
+    }
+
+    func hideSpeech(animated: Bool) {
+        speechPanel?.hide(animated: animated)
+    }
+
+    private func positionSpeech() {
+        guard let anchor = petPanel?.frame, let screen = popoverTargetScreen() else { return }
+        speechPanel?.reposition(anchorFrame: anchor, visibleFrame: screen.visibleFrame)
     }
 
     private func finishDrag(frame: CGRect) {
@@ -826,6 +1048,7 @@ public final class PetWindowController: NSObject {
         ))
         onAdoptFreePosition?()
         if isPopoverVisible { positionPopover() }
+        if isSpeechVisible { positionSpeech() }
     }
 
     private func resolvePetFrame(size: CGSize, settings: AppSettings) -> CGRect? {
@@ -887,6 +1110,7 @@ public final class PetWindowController: NSObject {
             return
         }
         if isPopoverVisible { positionPopover() }
+        if isSpeechVisible { positionSpeech() }
     }
 
     private func petSize(scale: Double) -> CGSize {

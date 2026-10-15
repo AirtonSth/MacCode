@@ -319,3 +319,47 @@ final class DistillACPClientSessionParamsTests: XCTestCase {
         XCTAssertNil(DistillACPClient.sessionOpenParams(cwd: "/tmp", mcpServers: [], rules: nil)["_meta"])
     }
 }
+
+
+/// Per-Bot Caveman (2026-10-15): the host stamps the Bot's setting on the run;
+/// Distill's own caveman style is kept for caveman Bots and overridden otherwise.
+final class DistillBotCavemanEnvironmentTests: XCTestCase {
+    private func botRun(caveman: Bool) -> [String: String] {
+        [
+            BotSelfConfigCatalog.callerEnvironmentKey: UUID().uuidString,
+            BotRunMCPAdmission.cavemanEnvironmentKey: caveman ? "1" : "0",
+            "GROK_CAVEMAN": "ultra",
+        ]
+    }
+
+    func test_cavemanBotRunsDistillCavemanFullWithNoOverrideRules() {
+        let env = botRun(caveman: true)
+        XCTAssertEqual(DistillACPClient.launchEnvironment(env)["GROK_CAVEMAN"], "full",
+                       "a host value never changes a Bot's level")
+        XCTAssertNil(BotRunMCPAdmission.distillSessionRules(environment: env),
+                     "telling a caveman Bot to ignore caveman would undo its setting")
+    }
+
+    func test_cavemanOffBotKeepsFullSentences() {
+        let env = botRun(caveman: false)
+        XCTAssertEqual(DistillACPClient.launchEnvironment(env)["GROK_CAVEMAN"], "lite")
+        XCTAssertEqual(BotRunMCPAdmission.distillSessionRules(environment: env), BotRunMCPAdmission.distillBotReplyRules)
+    }
+
+    func test_guestRunsFollowTheSameBotSetting() {
+        let guest = DistillGuestEnvironment.build(
+            providerEnvironment: botRun(caveman: true),
+            runID: "run",
+            gatewayToken: "token",
+            modelSecrets: [:],
+            gitIdentity: nil
+        )
+        XCTAssertEqual(guest["GROK_CAVEMAN"], "full")
+    }
+
+    func test_nonBotThreadsKeepTheUsersOwnDistillStyle() {
+        let env = ["GROK_CAVEMAN": "ultra", BotRunMCPAdmission.cavemanEnvironmentKey: "1"]
+        XCTAssertEqual(DistillACPClient.launchEnvironment(env)["GROK_CAVEMAN"], "ultra")
+        XCTAssertNil(BotRunMCPAdmission.distillSessionRules(environment: env))
+    }
+}

@@ -19,6 +19,8 @@ public final class PetViewModel: ObservableObject {
     @Published private(set) var activityCounts = PetActivityCounts.zero
     @Published public private(set) var settings: AppSettings
     @Published public var routeError: String?
+    /// What Titio is saying from the pet right now (hub spec §9), or nil.
+    @Published public private(set) var speech: PetSpeech?
 
     private(set) var currentFrame: PetAtlasFrame?
     let frameModel = PetFrameModel()
@@ -81,5 +83,10 @@ public final class PetViewModel: ObservableObject {
 
     public func apply(settings: AppSettings) {
         self.settings = settings
+    }
+
+    func setSpeech(_ speech: PetSpeech?) {
+        guard speech != self.speech else { return }
+        self.speech = speech
     }
 }

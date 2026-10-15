@@ -248,6 +248,8 @@ final class SettingsPaletteGapTests: XCTestCase {
             "terminalFontSize",
             "petEnabled", "petAnimationsEnabled", "petReadyCounterEnabled",
             "petPosition", "petSize", "petAttentionFilter", "petReduceMotion",
+            // Titio hub (§11): the kill switch and the pet speech toggle.
+            "titioNotificationsEnabled", "petSpeechEnabled",
             "botsControlPlaneEnabled", "botsMemoryEnabled", "botsEffectsEnabled",
             "botsAutonomyEnabled",
             "botsChannelsEnabled",

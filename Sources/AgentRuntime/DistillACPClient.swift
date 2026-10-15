@@ -763,13 +763,13 @@ public final class DistillACPClient: @unchecked Sendable {
     /// DISTILL_HOME planned for in-VM execution, not a per-bot home here
     /// (that would copy the user's provider credentials).
     ///
-    /// Bot runs also pin Distill's reply style to `lite`, over any host value,
-    /// so bots keep articles and full sentences.
+    /// Bot runs also pin Distill's reply style over any host value: `full`
+    /// for a caveman Bot, `lite` (articles, full sentences) otherwise.
     static func launchEnvironment(_ environment: [String: String]) -> [String: String] {
         guard BotRunMCPAdmission.isBotRun(environment: environment) else { return environment }
         return environment
             .merging(BotRunMCPAdmission.distillUserMCPImportOffEnvironment) { _, off in off }
-            .merging(BotRunMCPAdmission.distillBotReplyStyleEnvironment) { _, forced in forced }
+            .merging(BotRunMCPAdmission.distillBotReplyStyleEnvironment(environment: environment)) { _, forced in forced }
     }
 
     public static func initializeParams(clientVersion: String) -> JSONObject {

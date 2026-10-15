@@ -235,7 +235,8 @@ final class PetWindowAccessibilityTests: XCTestCase {
         XCTAssertLessThan(spacer.lowerBound, red.lowerBound, "red sits on the right")
         XCTAssertTrue(sprite.contains("if let active = model.activeBadgeText {"), "blue counts active threads")
         XCTAssertTrue(sprite.contains("if let badge = model.badgeText {"), "red counts needs-you items")
-        XCTAssertTrue(sprite.contains(".help(\"\\(badge) need you\")"), "the count stays readable on hover")
+        XCTAssertTrue(sprite.contains(".help(PetAttentionCountFormatter.needYouText(badgeText: badge))"),
+                      "the count stays readable on hover (\"1 needs you\", \"3 need you\")")
         XCTAssertTrue(sprite.contains(".accessibilityValue(model.accessibilityValue)"))
         let dotStart = try XCTUnwrap(window.range(of: "private struct PetCountDot: View {"))
         let dot = String(window[dotStart.upperBound...].prefix(700))
@@ -339,8 +340,13 @@ final class PetWindowAccessibilityTests: XCTestCase {
         controller.show()
         controller.openPopoverForTests()
 
+        // WHY: the panel must hug the measured card. A fixed formula (or a
+        // floor taller than the card) leaves a clear strip under the card
+        // that still swallows clicks meant for the desktop.
         let panel = try XCTUnwrap(controller.popoverPanelForTests)
-        XCTAssertGreaterThan(panel.frame.height, 180)
+        let content = try XCTUnwrap(panel.contentView)
+        XCTAssertEqual(panel.frame.height, content.fittingSize.height, accuracy: 0.5)
+        XCTAssertGreaterThan(panel.frame.height, PetPopoverSizing.minimumHeight)
         XCTAssertLessThanOrEqual(panel.frame.height, 520)
         if let screen = panel.screen ?? NSScreen.main {
             XCTAssertLessThanOrEqual(panel.frame.height, screen.visibleFrame.height - 24 + 0.5)

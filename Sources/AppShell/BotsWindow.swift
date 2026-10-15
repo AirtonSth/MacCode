@@ -281,6 +281,9 @@ public struct BotStudioDraft: Equatable, Codable {
     public var expectedRevisionID: BotRevisionID?
     /// nil means infer from handle vs name (legacy drafts).
     public var slugFollowsName: Bool? = true
+    /// nil (drafts saved before reply style) means the Bot's current value.
+    public var verbosity: BotReplyVerbosity?
+    public var cavemanEnabled: Bool?
 
     public init(
         botID: BotID? = nil,
@@ -293,7 +296,9 @@ public struct BotStudioDraft: Equatable, Codable {
         notificationsEnabled: Bool = true,
         desktopKind: BotDesktopKind = .logicalExecutionSpace,
         expectedRevisionID: BotRevisionID? = nil,
-        slugFollowsName: Bool? = true
+        slugFollowsName: Bool? = true,
+        verbosity: BotReplyVerbosity? = nil,
+        cavemanEnabled: Bool? = nil
     ) {
         self.botID = botID
         self.name = name
@@ -306,6 +311,8 @@ public struct BotStudioDraft: Equatable, Codable {
         self.desktopKind = desktopKind
         self.expectedRevisionID = expectedRevisionID
         self.slugFollowsName = slugFollowsName
+        self.verbosity = verbosity
+        self.cavemanEnabled = cavemanEnabled
     }
 
     public var isNew: Bool { botID == nil }
@@ -3234,6 +3241,7 @@ public final class BotsViewModel: ObservableObject {
             selectedBotFallbackCache = nil
             refreshActiveBotCount()
             publishRosterIfNeeded()
+            applyDeskReplyStyle()
         }
     }
     /// Stored working-bot count so roster/Active Bots bodies never run the
@@ -3504,6 +3512,29 @@ public final class BotsViewModel: ObservableObject {
             }
             publishInterestedDeskThreadID()
             syncDeskAgentVM()
+            if let inbox = titioInboxConversationID,
+               selectedConversation?.id == inbox, oldValue?.id != inbox {
+                onTitioInboxSelected?(inbox)
+            }
+        }
+    }
+    /// Titio's Notifications conversation. Seeded from the ledger at init so
+    /// a desk restored onto the inbox at launch mounts with its notice hooks;
+    /// a change rebuilds the desk embedding (its key carries `isTitioInbox`).
+    var titioInboxConversationID: BotConversationID? {
+        didSet {
+            guard oldValue != titioInboxConversationID else { return }
+            syncDeskAgentVM()
+        }
+    }
+    /// Selecting the inbox on the Mac marks it read (hub spec §8 "Read state").
+    /// Installed once the hub resolves the inbox; a desk already showing the
+    /// inbox (restored at launch) is marked read then.
+    var onTitioInboxSelected: ((BotConversationID) -> Void)? {
+        didSet {
+            guard oldValue == nil, let inbox = titioInboxConversationID,
+                  selectedConversation?.id == inbox else { return }
+            onTitioInboxSelected?(inbox)
         }
     }
     @Published public private(set) var attentionItems: [BotAttentionItem] = []
@@ -3758,6 +3789,8 @@ public final class BotsViewModel: ObservableObject {
             recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
         context.botPeerHandoffAuthority.addObserver(self)
+        titioInboxConversationID = ((try? TitioNoticeRepository(db: context.db).inboxState())?.conversationID)
+            .flatMap(UUID.init(uuidString:)).map(BotConversationID.init)
         // Queued bot-thread sends can drain before any desk is opened.
         if let router { installBotQueueHooks(on: router) }
         restoreQueuedFollowUpsIfNeeded()
@@ -4622,8 +4655,8 @@ public final class BotsViewModel: ObservableObject {
 
     public func didEditStudioName(_ name: String) {
         var next = studioDraft
-        let followsName = next.slugFollowsName
-            ?? BotHandle.shouldFollowName(handle: next.handle, name: next.name)
+        let followsName = next.handle != TitioBot.handle && (next.slugFollowsName
+            ?? BotHandle.shouldFollowName(handle: next.handle, name: next.name))
         next.name = name
         if followsName, let derived = BotHandle.derive(from: name) {
             next.handle = derived
@@ -4693,7 +4726,12 @@ public final class BotsViewModel: ObservableObject {
             notificationsEnabled: bot.notificationsEnabled,
             desktopKind: resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace),
             expectedRevisionID: bot.currentRevisionID,
-            slugFollowsName: BotHandle.shouldFollowName(handle: bot.handle, name: bot.name)
+            // Titio's slug is how the app finds it: renaming Titio never
+            // derives a new slug from the name.
+            slugFollowsName: bot.handle == TitioBot.handle
+                ? false : BotHandle.shouldFollowName(handle: bot.handle, name: bot.name),
+            verbosity: bot.verbosity,
+            cavemanEnabled: bot.cavemanEnabled
         )
         applyPersistedStudioDraftIfMatching(bot.id)
         isApplyingStudioDraft = false
@@ -5413,6 +5451,22 @@ public final class BotsViewModel: ObservableObject {
         errorMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
     }
 
+    /// Titio's own Studio: its avatar is the pet and its slug is how the app
+    /// finds it, so both stay fixed.
+    public var studioEditsTitio: Bool {
+        guard let botID = studioDraft.botID else { return false }
+        return selectedBot?.id == botID && selectedBot?.handle == TitioBot.handle
+    }
+
+    /// Publishes Titio's built-in profile over whatever the user changed.
+    /// Conversations, files and scheduled tasks stay.
+    @discardableResult
+    public func restoreTitioFactorySettings() throws -> BotDefinition {
+        guard studioEditsTitio, let bot = selectedBot else { throw BotStoreError.notFound }
+        studioDraft = TitioBot.factoryDraft(for: bot, current: studioDraft)
+        return try saveStudio()
+    }
+
     @discardableResult
     public func saveStudio() throws -> BotDefinition {
         defer { flushPendingDraftPersistence() }
@@ -5451,7 +5505,7 @@ public final class BotsViewModel: ObservableObject {
                 throw BotStoreError.notFound
             }
             let renamed: BotDefinition
-            if let normalized = BotHandle.normalize(handle), normalized != bot.handle {
+            if let normalized = BotHandle.normalize(handle), normalized != bot.handle, bot.handle != TitioBot.handle {
                 do {
                     renamed = try botStore.renameHandle(id: botID, handle: normalized)
                 } catch {
@@ -5490,6 +5544,10 @@ public final class BotsViewModel: ObservableObject {
             saved.notificationsEnabled = studioDraft.notificationsEnabled
             saved.currentRevisionID = published.id
             saved.updatedAt = Date()
+            if let styled = try saveStudioReplyStyle(for: saved) {
+                saved.verbosity = styled.verbosity
+                saved.cavemanEnabled = styled.cavemanEnabled
+            }
             adoptPublishedRevision(published, bot: saved)
             syncPublishedHome(saved, revision: published)
             clearUnpublishedNewBot(botID)
@@ -5512,9 +5570,21 @@ public final class BotsViewModel: ObservableObject {
         if desktop == .dockerDesktop {
             presentGuestDesktop(botID: created.id)
         }
-        beginEdit(created)
+        let createdStyled = (try saveStudioReplyStyle(for: created)) ?? created
+        beginEdit(createdStyled)
         clearUnpublishedNewBot(created.id)
-        return created
+        return createdStyled
+    }
+
+    /// Reply style is a Bot-row setting, written beside the published revision
+    /// only when the Studio draft changed it.
+    private func saveStudioReplyStyle(for bot: BotDefinition) throws -> BotDefinition? {
+        let verbosity = studioDraft.verbosity ?? bot.verbosity
+        let caveman = studioDraft.cavemanEnabled ?? bot.cavemanEnabled
+        guard verbosity != bot.verbosity || caveman != bot.cavemanEnabled else { return nil }
+        let styled = try botStore.setReplyStyle(id: bot.id, verbosity: verbosity, cavemanEnabled: caveman)
+        rememberFleetBot(styled)
+        return styled
     }
 
     @discardableResult
@@ -6221,6 +6291,21 @@ public final class BotsViewModel: ObservableObject {
         flushPendingDraftPersistence()
     }
 
+    /// Who sent a host message. Only the paired device's own `bot.send` (the
+    /// user typing on iOS) may answer a Titio notice by text; agent host tools
+    /// (`rc_bot_send` / `rc_bot_delegate`), routines and acts never can.
+    enum HostSendOrigin: Equatable {
+        case host
+        /// `tapsNoticeCards`: the client acts on Titio cards through
+        /// `bot.notice.act`, so its plain text is never taken as a card option
+        /// (an option word typed in a sentence must stay chat). Older clients
+        /// send the option text, so they keep the exact-text fallback.
+        case pairedClient(tapsNoticeCards: Bool)
+    }
+
+    /// `bot.send` capability of clients that tap Titio cards through `bot.notice.act`.
+    static let noticeActClientCapability = "titio_notice_act_v1"
+
     /// Host-catalog Bot sends use the same persisted user line, compiled Bot
     /// brain, routing, provider start, and follow-through as a Desk send. They
     /// never change the user's currently selected Bot or conversation.
@@ -6230,7 +6315,8 @@ public final class BotsViewModel: ObservableObject {
         conversationID: BotConversationID?,
         attachments: [AgentAttachment] = [],
         routing explicitRouting: BotDeskRouting? = nil,
-        adoptAsDeskRoute: Bool = false
+        adoptAsDeskRoute: Bool = false,
+        origin: HostSendOrigin = .host
     ) throws -> JSONValue {
         guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else {
             throw BotStoreError.notFound
@@ -6246,6 +6332,23 @@ public final class BotsViewModel: ObservableObject {
             guard let existing = try botStore.conversation(id: conversationID),
                   existing.botID == bot.id, existing.groupID == nil else {
                 throw BotStoreError.notFound
+            }
+            if existing.id == titioInboxConversationID {
+                // An LLM must never approve or answer for the user (§0.2):
+                // only the paired user's own text may reach the intercept,
+                // and nothing else may write into the inbox as the user.
+                guard case .pairedClient(let tapsNoticeCards) = origin else {
+                    throw BotStoreError.invalidRow("Titio's Notifications inbox only takes messages from you.")
+                }
+                if attachments.isEmpty,
+                   let consumed = interceptTitioInboxSend(
+                    bot: bot,
+                    conversation: existing,
+                    text: message,
+                    acceptsOptionText: !tapsNoticeCards
+                   ) {
+                    return consumed
+                }
             }
             if let threadID = existing.linkedAgentThreadID,
                let activeRunID = context.coordinator.activeRunId(threadId: threadID) {
@@ -6315,7 +6418,11 @@ public final class BotsViewModel: ObservableObject {
         adopt: Bool,
         conversation: BotConversation
     ) -> BotDeskRouting {
-        guard let explicitRouting else { return frozenDeskRouting(for: conversation) }
+        // Titio's inbox route is locked (hub spec §16): another provider
+        // would replace the thread that holds every notice.
+        guard let explicitRouting, conversation.id != titioInboxConversationID else {
+            return frozenDeskRouting(for: conversation)
+        }
         guard adopt else { return explicitRouting }
         return adoptHostSendRouting(explicitRouting, conversation: conversation)
     }
@@ -6752,6 +6859,8 @@ public final class BotsViewModel: ObservableObject {
         var bot = selectedOrDraft
         if screen == .studio {
             bot.notificationsEnabled = studioDraft.notificationsEnabled
+            bot.verbosity = studioDraft.verbosity ?? bot.verbosity
+            bot.cavemanEnabled = studioDraft.cavemanEnabled ?? bot.cavemanEnabled
         }
         guard let revision = studioPreviewRevision(for: bot) ?? selectedRevision else { return nil }
         let turnDirective = BotPeerDelegation.turnDirective(
@@ -6784,6 +6893,8 @@ public final class BotsViewModel: ObservableObject {
             ownedSkillTexts(for: bot).map { "\($0.slug):\($0.body)" }.joined(separator: ","),
             selectedConversation?.id.value.uuidString ?? "",
             bot.notificationsEnabled ? "n1" : "n0",
+            bot.verbosity.rawValue,
+            bot.cavemanEnabled ? "c1" : "c0",
             turnDirective ?? "",
             previewInGuest ? "g1" : "g0",
         ].joined(separator: "\u{1f}")
@@ -6812,6 +6923,16 @@ public final class BotsViewModel: ObservableObject {
         return receipt
     }
 
+    /// The reply style the Studio shows: the draft's, else the Bot's, else the default.
+    public var studioDraftReplyStyle: (verbosity: BotReplyVerbosity, caveman: Bool) {
+        let bot = studioDraft.botID.flatMap { id in bots.first { $0.id == id } }
+        return (
+            studioDraft.verbosity ?? bot?.verbosity ?? .human,
+            studioDraft.cavemanEnabled ?? bot?.cavemanEnabled
+                ?? BotDefinition.defaultCavemanEnabled(handle: studioDraft.handle)
+        )
+    }
+
     public var studioHasUnpublishedChanges: Bool {
         guard let revision = selectedRevision else { return studioDraft.isNew }
         let bot = selectedBot
@@ -6821,6 +6942,9 @@ public final class BotsViewModel: ObservableObject {
             || studioDraft.soul != revision.soul
             || resolvedDesktopKind(studioDraft.desktopKind) != resolvedDesktopKind(revision.desktopKind)
             || studioDraft.notificationsEnabled != (bot?.notificationsEnabled ?? true)
+            || studioDraftReplyStyle.verbosity != (bot?.verbosity ?? .human)
+            || studioDraftReplyStyle.caveman
+                != (bot?.cavemanEnabled ?? BotDefinition.defaultCavemanEnabled(handle: studioDraft.handle))
             || studioDraft.avatarSymbol != (bot?.avatarSymbol ?? "person.crop.circle")
             || BotHandle.normalize(studioDraft.handle) != bot?.handle
     }
@@ -7894,6 +8018,8 @@ public final class BotsViewModel: ObservableObject {
             && current?.description == fresh.description
             && current?.avatarSymbol == fresh.avatarSymbol
             && current?.notificationsEnabled == fresh.notificationsEnabled
+            && current?.verbosity == fresh.verbosity
+            && current?.cavemanEnabled == fresh.cavemanEnabled
         if !unchanged {
             rememberFleetBot(fresh)
             if let revisionID = fresh.currentRevisionID,
@@ -10009,7 +10135,9 @@ public final class BotsViewModel: ObservableObject {
         return working
     }
 
-    private func frozenDeskRouting(for conversation: BotConversation) -> BotDeskRouting {
+    /// Internal so the Titio notice hub creates the inbox thread with the same
+    /// route a desk send would freeze (hub spec §8).
+    func frozenDeskRouting(for conversation: BotConversation) -> BotDeskRouting {
         if selectedConversation?.id == conversation.id {
             return deskRouting
         }
@@ -10060,6 +10188,8 @@ public final class BotsViewModel: ObservableObject {
               conversation.botID == botID, conversation.groupID == nil else {
             throw BotStoreError.notFound
         }
+        // The inbox route is locked (hub spec §16): answer the route it keeps.
+        guard conversation.id != titioInboxConversationID else { return frozenDeskRouting(for: conversation) }
         return adoptHostSendRouting(routing, conversation: conversation)
     }
 
@@ -10084,6 +10214,9 @@ public final class BotsViewModel: ObservableObject {
         let threadID: AgentThreadID
         /// The embedding captures the name for its composer and empty copy.
         let botName: String
+        /// Titio's inbox gets the notice hooks; a VM built before the hub
+        /// resolved the inbox is rebuilt once it is known.
+        var isTitioInbox = false
     }
 
     private var deskAgentKey: DeskAgentKey?
@@ -10103,6 +10236,28 @@ public final class BotsViewModel: ObservableObject {
     /// Keeps at most one pinned Agent App VM on the selected conversation's
     /// linked thread. An unlinked conversation gets no VM: its thread is created
     /// lazily by the first send (`ensureLinkedThread`).
+    /// The selected Bot has no conversation at all and nothing is still
+    /// loading: the desk offers the new-conversation composer (the first send
+    /// creates the conversation) instead of a "Loading…" strip that never ends.
+    public var deskShowsNewConversationComposer: Bool {
+        guard selectedConversation == nil, navigationFreshnessTask == nil,
+              let botID = selectedBotID else { return false }
+        return !conversations.contains { $0.botID == botID }
+    }
+
+    /// Verbosity Human: the desk shows only the Bot's messages.
+    static func deskHidesToolActivity(_ bot: BotDefinition) -> Bool {
+        bot.verbosity == .human
+    }
+
+    /// Follows a Verbosity change (Studio, a paired device) on the open desk.
+    private func applyDeskReplyStyle() {
+        guard let vm = deskAgentVM, let botID = deskAgentKey?.botID,
+              let bot = bots.first(where: { $0.id == botID }) ?? selectedBot.flatMap({ $0.id == botID ? $0 : nil }) else { return }
+        let hides = Self.deskHidesToolActivity(bot)
+        if vm.hidesToolActivity != hides { vm.hidesToolActivity = hides }
+    }
+
     func syncDeskAgentVM() {
         guard !isSyncingDeskAgent else { return }
         isSyncingDeskAgent = true
@@ -10124,8 +10279,14 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         let live = conversation
-        let key = DeskAgentKey(botID: bot.id, conversationID: live.id, threadID: threadID, botName: bot.name)
-        if deskAgentKey == key, deskAgentVM != nil { return }
+        let isTitioInbox = live.id == titioInboxConversationID
+        let key = DeskAgentKey(
+            botID: bot.id, conversationID: live.id, threadID: threadID, botName: bot.name, isTitioInbox: isTitioInbox
+        )
+        if deskAgentKey == key, deskAgentVM != nil {
+            applyDeskReplyStyle()
+            return
+        }
         tearDownDeskAgentVM()
         let threadReadsBefore = context.threadRepo.durableGetCountForTesting
         // One read of the thread row serves the cwd, the embedded Agent App's
@@ -10162,7 +10323,9 @@ public final class BotsViewModel: ObservableObject {
             composerPlaceholder: Self.deskComposerPlaceholder(botName: bot.name),
             emptyConversationTitle: "Message \(Self.displayName(bot.name))",
             emptyConversationSubtitle: "This thread has no messages yet.",
-            pinnedThread: thread
+            pinnedThread: thread,
+            noticeChoiceHandler: isTitioInbox ? titioNoticeChoiceHandler() : nil,
+            hostReplyHandler: isTitioInbox ? titioHostReplyHandler() : nil
         )
         let vm = AgentAppViewModel(
             workspaceID: Self.botDeskWorkspaceID,
@@ -10236,6 +10399,7 @@ public final class BotsViewModel: ObservableObject {
         vm.markThreadRead = { [weak router] id in
             try router?.markAgentThreadRead(thread: id)
         }
+        vm.hidesToolActivity = Self.deskHidesToolActivity(bot)
         vm.refreshProviderSnapshotsInBackground()
         deskAgentKey = key
         deskAgentVM = vm
@@ -10492,12 +10656,15 @@ public final class BotsViewModel: ObservableObject {
             liveRunMode: routing.permissionMode,
             runProvider: routing.provider,
             runModel: model,
-            turnDirective: BotPeerDelegation.turnDirective(
-                mentionedBots: BotMentionParser.mentionedBots(
-                    in: text,
-                    bots: bots,
-                    excluding: bot.id
-                )
+            turnDirective: Self.combinedTurnDirective(
+                BotPeerDelegation.turnDirective(
+                    mentionedBots: BotMentionParser.mentionedBots(
+                        in: text,
+                        bots: bots,
+                        excluding: bot.id
+                    )
+                ),
+                titioNoticeTurnDirective(conversationID: conversationID, threadID: threadID, userText: text)
             ),
             runsInGuest: inGuest
         )
@@ -10518,6 +10685,29 @@ public final class BotsViewModel: ObservableObject {
             executionTarget: thread?.executionTarget,
             runsInGuest: inGuest
         )
+    }
+
+    /// Titio's inbox only (hub spec §7): the notices the host posted since the
+    /// user's last message, which the provider session never saw, plus the
+    /// rule that Titio cannot approve or answer them itself. Nil elsewhere.
+    func titioNoticeTurnDirective(conversationID: BotConversationID, threadID: AgentThreadID, userText: String) -> String? {
+        guard conversationID == titioInboxConversationID else { return nil }
+        let request = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var users = ((try? context.messageRepo.listRecent(threadId: threadID, limit: 60)) ?? []).filter { $0.role == .user }
+        // The desk may already have stored this turn's own line.
+        if users.last?.content.trimmingCharacters(in: .whitespacesAndNewlines) == request { users.removeLast() }
+        let since = users.last?.createdAt ?? .distantPast
+        let rows = (try? TitioNoticeRepository(db: context.db).recentPosted(since: since)) ?? []
+        return TitioNoticeDirective.text(
+            rows: rows,
+            language: TitioNoticeCopy.language(lastUserText: request, preferredLanguages: Locale.preferredLanguages)
+        )
+    }
+
+    /// The peer directive and the inbox directive, in that order.
+    nonisolated static func combinedTurnDirective(_ parts: String?...) -> String? {
+        let kept = parts.compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        return kept.isEmpty ? nil : kept.joined(separator: "\n\n")
     }
 
     /// The run's agent runs inside the bot's Linux guest: the thread is on the
@@ -10569,6 +10759,163 @@ public final class BotsViewModel: ObservableObject {
         restoreDeskLiveTurn(botID: botID)
     }
 
+    /// The Titio inbox thread: the conversation's linked thread, created with
+    /// the route a desk send would freeze and reused by the next send, never
+    /// replaced while the route stays the same (hub spec §8).
+    func ensureTitioInboxThread(bot: BotDefinition, conversation: BotConversation) throws -> (thread: AgentThread, conversation: BotConversation) {
+        guard let router else { throw JSONRPCError.internalError }
+        let linked = try ensureLinkedThread(
+            bot: bot,
+            conversation: conversation,
+            routing: frozenDeskRouting(for: conversation),
+            router: router,
+            markStarted: false
+        )
+        titioInboxConversationID = linked.conversation.id
+        if linked.conversation != conversation {
+            adoptFollowThroughConversation(linked.conversation)
+        }
+        return linked
+    }
+
+    /// A Mac tap on an inbox notice card (hub spec §7): the hub claims and
+    /// runs it off the MainActor; a navigation option opens its route here
+    /// with the same mapper a banner click uses.
+    func actOnTitioNotice(messageID: String, optionIndex: Int) {
+        let center = context.titioNoticeCenter
+        Task { @MainActor [weak self] in
+            let outcome = await center.act(messageID: messageID, optionIndex: optionIndex)
+            guard case .navigate(let route) = outcome else { return }
+            if let openRoute = self?.openTitioNoticeRoute {
+                openRoute(route)
+            } else {
+                (NSApp?.delegate as? AppDelegate)?.openNotificationUserInfo(route)
+            }
+        }
+    }
+
+    /// The inbox desk's card hook (hub spec §7 "Mac hooks").
+    private func titioNoticeChoiceHandler() -> @MainActor (String, Int) -> Void {
+        { [weak self] messageID, optionIndex in
+            self?.actOnTitioNotice(messageID: messageID, optionIndex: optionIndex)
+        }
+    }
+
+    /// The inbox desk's send hook: an armed "Reply here" takes the text.
+    private func titioHostReplyHandler() -> @MainActor (String, AgentThreadID) -> Bool {
+        { [weak self] text, _ in
+            self?.context.titioNoticeCenter.takeArmedReply(text: text) ?? false
+        }
+    }
+
+    /// Test seam for the navigation route of a notice card.
+    var openTitioNoticeRoute: (([String: String]) -> Void)?
+
+    /// iOS `bot.send` into Titio's inbox (hub spec §7): an armed "Reply here"
+    /// takes the text, else an old build's exact option text acts on its one
+    /// open notice. Nil means the text is a normal Titio message.
+    private func interceptTitioInboxSend(
+        bot: BotDefinition,
+        conversation: BotConversation,
+        text: String,
+        acceptsOptionText: Bool
+    ) -> JSONValue? {
+        let center = context.titioNoticeCenter
+        let consumed: String
+        if center.takeArmedReply(text: text) {
+            consumed = "reply"
+        } else if acceptsOptionText, center.takeOptionText(text) {
+            consumed = "option"
+        } else {
+            return nil
+        }
+        var receipt: [String: JSONValue] = [
+            "bot_id": .string(bot.id.value.uuidString.lowercased()),
+            "conversation_id": .string(conversation.id.value.uuidString.lowercased()),
+            "enqueued": .bool(false),
+            "queued_follow_up": .bool(false),
+            "host_consumed": .bool(true),
+            "titio_notice": .string(consumed),
+        ]
+        if let thread = conversation.linkedAgentThreadID {
+            receipt["thread_id"] = .string(thread.value.uuidString.lowercased())
+        }
+        return .object(receipt)
+    }
+
+    /// True while the Mac desk shows `conversationID` (the caller also checks
+    /// that the Bots window is key).
+    func isDeskShowing(conversationID: BotConversationID) -> Bool {
+        screen == .desk && selectedConversation?.id == conversationID
+    }
+
+    /// A host-written Titio message (hub spec §3 step 4, §8). The notice hub
+    /// already persisted `message` and the conversation's unread/attention
+    /// state off the MainActor; this repaints the desk cache, roster preview
+    /// and attention without another SQLite write. A rewrite (same message id,
+    /// new body) replaces the cached bubble instead of appending one.
+    func appendHostAssistantMessage(
+        botID: BotID,
+        conversationID: BotConversationID,
+        message: AgentMessage,
+        conversation: BotConversation?
+    ) {
+        // The act's user rows (an option label, an armed reply) paint as the
+        // user's; every other host row is Titio's.
+        let desk = BotDeskMessage(
+            role: message.role == .user ? .user : .assistant,
+            text: message.content,
+            createdAt: message.createdAt,
+            agentMessageID: message.id
+        )
+        // Upsert by message id in the caches that already hold this
+        // conversation only: Titio's bot-level cache may show another of its
+        // conversations, which a notice must not replace. An uncached
+        // conversation reads the row from SQLite when it opens.
+        func upsert(_ messages: inout [BotDeskMessage]) {
+            if let index = messages.firstIndex(where: { $0.agentMessageID == message.id }) {
+                messages[index] = desk
+            } else {
+                messages.append(desk)
+            }
+        }
+        if var cached = messagesByConversation[conversationID] {
+            upsert(&cached)
+            messagesByConversation[conversationID] = cached
+        }
+        if messagesConversationIDByBot[botID] == conversationID, var cached = messagesByBot[botID] {
+            upsert(&cached)
+            messagesByBot[botID] = cached
+        }
+        if selectedBotID == botID, selectedConversation?.id == conversationID {
+            upsert(&deskMessages)
+        }
+        if message.role != .user {
+            lastPreviewByBot[botID] = message.content
+            lastUpdatedByBot[botID] = message.createdAt
+        }
+        if let conversation {
+            adoptFollowThroughConversation(conversation)
+            // Titio's empty desk (opened before its first notice) shows the
+            // inbox that just appeared instead of the new-conversation composer.
+            if selectedBotID == botID, selectedConversation == nil, screen == .desk {
+                selectedConversation = conversation
+                selectedConversationByBot[botID] = conversation.id
+            }
+            applyAttentionState(
+                for: botID,
+                conversations: destConversations(botID: botID, patched: conversation)
+            )
+        }
+        Self.publishDestAttentionChanged()
+    }
+
+    /// A Titio card act acknowledged this Bot attention item off the
+    /// MainActor; drop it locally (the caller publishes the change).
+    func noteAttentionAcknowledged(_ id: BotAttentionItemID) {
+        dropAcknowledgedAttention(id)
+    }
+
     /// Peer rows persisted for the linked thread repaint in the embedded desk.
     func applyDeskPeerMessage(
         messageID: AgentMessageID,
@@ -10584,8 +10931,9 @@ public final class BotsViewModel: ObservableObject {
     }
 
     /// Reuses the conversation's linked thread (drifting model/effort/permission
-    /// in place) or creates it. Shared by the send path and the embedded desk.
-    private func ensureLinkedThread(
+    /// in place) or creates it. Shared by the send path, the embedded desk and
+    /// the Titio notice inbox (internal for the latter, hub spec §8).
+    func ensureLinkedThread(
         bot: BotDefinition,
         conversation: BotConversation,
         routing: BotDeskRouting,
@@ -10914,11 +11262,18 @@ public final class BotsViewModel: ObservableObject {
                 liveRunMode: routing.permissionMode,
                 runProvider: routing.provider,
                 runModel: model,
-                turnDirective: BotPeerDelegation.turnDirective(
-                    mentionedBots: BotMentionParser.mentionedBots(
-                        in: userText,
-                        bots: bots,
-                        excluding: bot.id
+                turnDirective: Self.combinedTurnDirective(
+                    BotPeerDelegation.turnDirective(
+                        mentionedBots: BotMentionParser.mentionedBots(
+                            in: userText,
+                            bots: bots,
+                            excluding: bot.id
+                        )
+                    ),
+                    titioNoticeTurnDirective(
+                        conversationID: prepared.conversation.id,
+                        threadID: prepared.thread.id,
+                        userText: userText
                     )
                 ),
                 runsInGuest: inGuest
@@ -12368,6 +12723,7 @@ public struct BotsRootView: View {
     private let embedsRosterRail: Bool
     @State private var pendingClearAllDeskThreads = false
     @State private var pendingDockerDataClear: BotID?
+    @State private var isConfirmingTitioFactoryReset = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
@@ -12725,19 +13081,106 @@ public struct BotsRootView: View {
                 studioIdentity
                 studioRule
                 studioSoul
+                studioRule
+                studioReplyStyle
+                if vm.studioEditsTitio {
+                    studioRule
+                    studioTitioFactoryReset
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.trailing, DS.Space.huge)
-            studioAvatarPane
-                .frame(width: 280, alignment: .top)
-                .padding(.leading, DS.Space.huge)
-                .overlay(alignment: .leading) {
-                    Rectangle()
-                        .fill(DS.Palette.line)
-                        .frame(width: DS.Border.hairline)
-                        .accessibilityHidden(true)
-                }
+            .padding(.trailing, vm.studioEditsTitio ? 0 : DS.Space.huge)
+            // Titio's avatar is the pet; there is nothing to pick.
+            if !vm.studioEditsTitio {
+                studioAvatarPane
+                    .frame(width: 280, alignment: .top)
+                    .padding(.leading, DS.Space.huge)
+                    .overlay(alignment: .leading) {
+                        Rectangle()
+                            .fill(DS.Palette.line)
+                            .frame(width: DS.Border.hairline)
+                            .accessibilityHidden(true)
+                    }
+            }
         }
+    }
+
+    /// How the Bot writes and how much of its work the chat shows.
+    private var studioReplyStyle: some View {
+        let style = vm.studioDraftReplyStyle
+        return VStack(alignment: .leading, spacing: DS.Space.xl) {
+            studioSectionHeader("Reply Style")
+            labeledField(
+                "Verbosity",
+                caption: "Human: the Bot writes like a person and the chat shows only its messages. Verbose: the chat also shows every command, edit and tool it runs."
+            ) {
+                Picker("Verbosity", selection: Binding(
+                    get: { style.verbosity },
+                    set: { vm.studioDraft.verbosity = $0 }
+                )) {
+                    Text("Human").tag(BotReplyVerbosity.human)
+                    Text("Verbose").tag(BotReplyVerbosity.verbose)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 260, alignment: .leading)
+                .accessibilityIdentifier("bots.studio.verbosity")
+            }
+            Toggle(isOn: Binding(
+                get: { style.caveman },
+                set: { vm.studioDraft.cavemanEnabled = $0 }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Caveman")
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.text)
+                    Text("Short, terse replies.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .accessibilityIdentifier("bots.studio.caveman")
+        }
+        .disabled(!vm.isControlPlaneActive)
+        .accessibilityIdentifier("bots.studio.replyStyle")
+    }
+
+    /// Way back for a Titio the user broke: one quiet button, confirmed.
+    private var studioTitioFactoryReset: some View {
+        HStack(alignment: .center, spacing: DS.Space.xl) {
+            studioSectionHeader(
+                "Factory Settings",
+                caption: "Put Titio's name, role, description and instructions back to the built-in defaults. Conversations, files and scheduled tasks stay."
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Restore Factory Settings…") {
+                isConfirmingTitioFactoryReset = true
+            }
+            .buttonStyle(DSSecondaryButtonStyle())
+            .disabled(!vm.isControlPlaneActive)
+            .accessibilityIdentifier("bots.studio.titio.factoryReset")
+        }
+        .confirmationDialog(
+            "Restore Titio's factory settings?",
+            isPresented: $isConfirmingTitioFactoryReset,
+            titleVisibility: .visible
+        ) {
+            Button("Restore Factory Settings", role: .destructive) {
+                vm.errorMessage = nil
+                do {
+                    _ = try vm.restoreTitioFactorySettings()
+                } catch {
+                    vm.presentAlertError(error)
+                }
+            }
+            .accessibilityIdentifier("bots.studio.titio.factoryReset.confirm")
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Your changes to Titio's profile and instructions are replaced. Conversations, files and scheduled tasks are kept.")
+        }
+        .accessibilityIdentifier("bots.studio.titio.factorySettings")
     }
 
     private var studioIdentity: some View {
@@ -12775,6 +13218,9 @@ public struct BotsRootView: View {
                             set: { vm.didEditStudioSlug($0) }
                         )
                     )
+                    // The app finds Titio by its slug; renaming it would orphan the pet.
+                    .disabled(vm.studioEditsTitio)
+                    .help(vm.studioEditsTitio ? "Titio's slug is fixed." : "")
                     .accessibilityLabel("Slug")
                     .accessibilityValue(vm.studioDraft.handle.isEmpty ? "" : "@\(vm.studioDraft.handle)")
                     .accessibilityIdentifier("bots.studio.slug")
@@ -13254,6 +13700,8 @@ public struct BotsRootView: View {
                 } else if let conversation = vm.selectedConversation,
                           conversation.botID == bot.id,
                           conversation.linkedAgentThreadID == nil {
+                    deskUnlinkedComposer(bot)
+                } else if vm.deskShowsNewConversationComposer {
                     deskUnlinkedComposer(bot)
                 } else {
                     AgentChatLoadingStatusStrip()

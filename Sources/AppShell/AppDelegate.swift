@@ -298,6 +298,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // Titio lives in the Bot roster so paired devices can chat with it too.
         if let botStore = context?.botStore, let support = context?.appSupportDirectory {
             _ = try? TitioBot.ensure(store: botStore, appSupportDirectory: support)
+            // Titio's notice hub: catch-up flush, banner re-post, retention and
+            // its event subscriptions (hub spec §3 step 5).
+            context?.titioNoticeCenter.start()
+            // The roster may have loaded before Titio existed (first launch).
+            router?.botsViewModel?.reload()
         }
         titioQuickChat.install { [weak self] text in self?.router?.sendTitioQuickMessage(text) }
         activityDockBadge.start()
@@ -323,6 +328,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 server: "rc2 socket",
                 repository: NotificationRepository(db: context.db)
             )
+            context.titioNoticeCenter.sourceResolved(key: Self.petServerFailureID(server: "rc2 socket"))
         } catch {
             NSLog("Failed to start socket server: \(error)")
             recordServerStartupFailure("rc2 socket", reason: error.localizedDescription)
@@ -552,12 +558,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             )
             petController = controller
             controller.start()
+            // Titio speaks new notices from the pet (hub spec §9).
+            context.titioNoticeCenter.setOnSpeech { [weak controller] speech in
+                Task { @MainActor in controller?.speak(speech) }
+            }
         } catch {
             appLifecycleLog.error("pet.start_failed error=\(error.localizedDescription, privacy: .public)")
         }
     }
 
     func stopPetController() {
+        context?.titioNoticeCenter.setOnSpeech(nil)
         petController?.stop()
         petController = nil
     }
@@ -1233,6 +1244,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             } catch {
                 appLifecycleLog.error("pet.server_failure_projection_failed error=\(error.localizedDescription, privacy: .public)")
             }
+            // A listener failure is an alert held 8 s (flap); a restart that
+            // binds inside the window resolves it before it posts (§4).
+            if context.titioNoticeCenter.isEnabled(SettingsStore(db: context.db).load()) {
+                context.titioNoticeCenter.ingest(TitioNoticeFact(
+                    // One row per failure: a listener that fails again after
+                    // a recovery must alert again. `sourceResolved` with the
+                    // base id resolves every open occurrence.
+                    key: TitioNoticeIDs.occurrence(
+                        of: Self.petServerFailureID(server: server),
+                        String(Int64(Date().timeIntervalSince1970 * 1_000))
+                    ),
+                    kind: .serverListenerFailed,
+                    facts: TitioNoticeFacts(
+                        title: server,
+                        port: server == "HTTP server" ? Int(DirectAccessConfiguration.port()) : nil
+                    )
+                ))
+            }
         }
         NotificationCenter.default.post(name: Self.serverStartupFailureNotification, object: self)
     }
@@ -1393,6 +1422,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             server: "HTTP server",
             repository: NotificationRepository(db: context.db)
         )
+        context.titioNoticeCenter.sourceResolved(key: Self.petServerFailureID(server: "HTTP server"))
         NSLog(
             "Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):\(port) (loopback=\(loopbackOnly) keepAliveIdle=\(keepAliveSeconds)s wakePhaseA=\(ConnectionFeatureFlags.wakePhaseAEnabled))"
         )
@@ -2105,6 +2135,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         guard Self.shouldFireDeniedNotice(alreadyFired: notificationsDeniedNoticeFired) else { return }
         notificationsDeniedNoticeFired = true
         if let context {
+            // In-app only (no banner, no push): the denied banner is why we are here.
+            if context.titioNoticeCenter.isEnabled(SettingsStore(db: context.db).load()) {
+                context.titioNoticeCenter.ingest(TitioNoticeFact(
+                    key: TitioNoticeIDs.notificationsDenied,
+                    kind: .notificationsDenied
+                ))
+            }
             do {
                 _ = try Self.projectPetNotificationsDenied(
                     content: content,
@@ -2142,9 +2179,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             guard let ks = k as? String, let vs = v as? String else { return nil }
             return (ks, vs)
         }, uniquingKeysWith: { a, _ in a })
+        openNotificationUserInfo(stringInfo)
+    }
+
+    /// Opens a notification-shaped route: a banner click, or a Titio notice
+    /// card's navigation option (the same `[String: String]` map, hub spec §7).
+    func openNotificationUserInfo(_ stringInfo: [String: String]) {
         notificationRouteGeneration = UUID()
         let generation = notificationRouteGeneration
         guard let intent = Self.routeFromNotification(userInfo: stringInfo) else { return }
+        if let bot = intent.bot {
+            openBotNotificationRoute(bot, generation: generation)
+            return
+        }
         if intent.opensActivity {
             windowController?.openActivityRoute(intent: intent)
             return
@@ -2171,6 +2218,34 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
+    /// Opens the Bots desk at the notice's conversation, then reveals the
+    /// message on the embedded desk once its Agent App view model is bound.
+    private func openBotNotificationRoute(_ bot: NotificationRouteIntent.BotRoute, generation: UUID) {
+        guard let router else { return }
+        do {
+            guard try router.openBotsDesk(botID: bot.botId, conversationID: bot.conversationId) else { return }
+        } catch {
+            NSLog("RemoteCode notification bot route failed bot=%@ conversation=%@ error=%@",
+                  bot.botId.value.uuidString, bot.conversationId.value.uuidString, error.localizedDescription)
+            return
+        }
+        guard let messageID = bot.messageId else { return }
+        Task { @MainActor [weak self] in
+            // The desk binds its Agent App view model on the next turns; give it a
+            // short bounded wait, then reveal best-effort.
+            for _ in 0..<20 {
+                guard let self, self.notificationRouteGeneration == generation else { return }
+                if let vm = router.botsViewModel?.deskAgentVM,
+                   let threadID = router.botsViewModel?.selectedConversation?.linkedAgentThreadID,
+                   vm.selectedThreadId == threadID {
+                    try? await vm.revealMessage(id: messageID, expectedThreadID: threadID)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+    }
+
     /// Testable notification seam. The thread repository is authoritative for
     /// workspace selection; `workspaceId` remains payload metadata for backwards
     /// compatibility. The canonical router verifies exact surface binding before
@@ -2186,6 +2261,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Returns nil when `threadId` key is absent or not a valid UUID.
     /// `workspaceId` is optional; absent or invalid value yields nil workspace.
     public static func routeFromNotification(userInfo: [String: String]) -> NotificationRouteIntent? {
+        // Bot branch first: a Titio notice opens its conversation. Payloads
+        // without both ids (every legacy payload) fall through unchanged.
+        if let botId = userInfo["botId"].flatMap(UUID.init(uuidString:)).map(BotID.init),
+           let conversationId = userInfo["conversationId"].flatMap(UUID.init(uuidString:)).map(BotConversationID.init) {
+            return NotificationRouteIntent(
+                threadId: nil,
+                workspaceId: nil,
+                bot: NotificationRouteIntent.BotRoute(
+                    botId: botId,
+                    conversationId: conversationId,
+                    messageId: userInfo["messageId"].flatMap(UUID.init(uuidString:)).map(AgentMessageID.init)
+                )
+            )
+        }
         let activityItemId = userInfo["activityItemId"].flatMap { value -> String? in
             guard value.utf8.count <= 256,
                   ["run:", "notification:", "scheduled-occurrence:"].contains(where: value.hasPrefix) else { return nil }
@@ -2309,19 +2398,36 @@ public struct NotificationRouteIntent: Equatable {
     public let finalMessageId: AgentMessageID?
     public let opensActivity: Bool
     public let activityItemId: String?
+    /// Bot conversation route (Titio notices, hub spec §9): opens the Bots
+    /// desk at `conversationId` and reveals `messageId` best-effort.
+    public let bot: BotRoute?
+
+    public struct BotRoute: Equatable {
+        public let botId: BotID
+        public let conversationId: BotConversationID
+        public let messageId: AgentMessageID?
+
+        public init(botId: BotID, conversationId: BotConversationID, messageId: AgentMessageID? = nil) {
+            self.botId = botId
+            self.conversationId = conversationId
+            self.messageId = messageId
+        }
+    }
 
     public init(
         threadId: AgentThreadID?,
         workspaceId: WorkspaceID?,
         finalMessageId: AgentMessageID? = nil,
         opensActivity: Bool = false,
-        activityItemId: String? = nil
+        activityItemId: String? = nil,
+        bot: BotRoute? = nil
     ) {
         self.threadId = threadId
         self.workspaceId = workspaceId
         self.finalMessageId = finalMessageId
         self.opensActivity = opensActivity
         self.activityItemId = activityItemId
+        self.bot = bot
     }
 }
 

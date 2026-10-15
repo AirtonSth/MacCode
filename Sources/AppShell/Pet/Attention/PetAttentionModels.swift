@@ -164,17 +164,23 @@ public struct PetDestAttentionSnapshot: Sendable, Equatable {
     public let conversations: [BotConversation]
     public let attention: [BotAttentionItem]
     public let linkedThreadIDs: Set<AgentThreadID>
+    /// Conversations the pet never counts: Titio's Notifications inbox. Its
+    /// notices already reach the pet (speech bubble) and the counts would
+    /// otherwise show every notice twice (hub spec §8 "Read state").
+    public let excludedConversationIDs: Set<BotConversationID>
 
     public init(
         bots: [BotDefinition],
         conversations: [BotConversation],
         attention: [BotAttentionItem],
-        linkedThreadIDs: Set<AgentThreadID> = []
+        linkedThreadIDs: Set<AgentThreadID> = [],
+        excludedConversationIDs: Set<BotConversationID> = []
     ) {
         self.bots = bots
         self.conversations = conversations
         self.attention = attention
         self.linkedThreadIDs = linkedThreadIDs
+        self.excludedConversationIDs = excludedConversationIDs
     }
 }
 

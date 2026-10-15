@@ -375,6 +375,7 @@ public final class PetAttentionStore {
 
         for conversation in dest.conversations {
             guard enabled.contains(conversation.botID) else { continue }
+            if dest.excludedConversationIDs.contains(conversation.id) { continue }
             if coveredConversations.contains(conversation.id) { continue }
             if botsWithUnscopedAttention.contains(conversation.botID) { continue }
             let bot = botsByID[conversation.botID]

@@ -391,7 +391,7 @@ public enum BotBrainCompiler {
         }
         // Before Instructions, so a custom soul that asks for another
         // style still has the last word.
-        lines.append(BotStandingInstructions.replyStyleLine)
+        lines.append(contentsOf: BotStandingInstructions.replyStyleLines(for: bot))
         let soul = BotStandingInstructions.resolved(
             name: bot.name,
             title: revision.title,

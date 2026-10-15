@@ -92,6 +92,11 @@ public enum BotSend: RemoteCodeRPCContract {
         public enum Disposition: Equatable, Sendable {
             case started(threadID: String)
             case queued(queueID: String)
+            /// The host took the text itself and started no run: Titio's
+            /// inbox forwarded it to a notice (an armed "Reply here", or an
+            /// option's exact text). The send is delivered; nothing waits on
+            /// a run. `notice` names how ("reply" or "option").
+            case hostConsumed(notice: String?)
         }
 
         public let requestID: String
@@ -129,8 +134,21 @@ public enum BotSend: RemoteCodeRPCContract {
                   object["host_id"]?.stringValue == decodedHostID,
                   object["bot_id"]?.stringValue == decodedBotID,
                   object["request_id"]?.stringValue == requestID,
-                  object["client_request_id"]?.stringValue == clientRequestID,
-                  let runID = object["run_id"]?.stringValue else {
+                  object["client_request_id"]?.stringValue == clientRequestID else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .readback,
+                    in: container,
+                    debugDescription: "Bot send receipt identity is incomplete."
+                )
+            }
+            if object["host_consumed"]?.boolValue == true {
+                runID = object["run_id"]?.stringValue ?? ""
+                conversationID = object["conversation_id"]?.stringValue
+                disposition = .hostConsumed(notice: object["titio_notice"]?.stringValue)
+                routingReadback = nil
+                return
+            }
+            guard let runID = object["run_id"]?.stringValue else {
                 throw DecodingError.dataCorruptedError(
                     forKey: .readback,
                     in: container,

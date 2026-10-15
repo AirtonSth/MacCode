@@ -46,7 +46,9 @@ public enum Schema {
     /// and v87 adds agent_threads.guest_runtime (bot agent runs inside its guest),
     /// and v88 adds Bot teams and group conversations plus
     /// bot_conversations.group_id (column added only when missing),
-    /// and v89 adds bot_conversation_routing (per-conversation Bot desk route).
+    /// and v89 adds bot_conversation_routing (per-conversation Bot desk route),
+    /// and v92 adds per-Bot reply style columns on bots,
+    /// and v93 adds the Titio notice ledger (titio_notices + titio_inbox_state).
     private static let scheduledTaskModelColumnsSchemaVersion = 85
     private static let threadActorSchemaVersion = 86
     private static let threadGuestRuntimeSchemaVersion = 87
@@ -56,7 +58,14 @@ public enum Schema {
     static let threadForkColumnsSchemaVersion = 90
     /// v91 adds durable per-run result and read/acknowledgment projection.
     private static let agentRunResultsSchemaVersion = 91
-    public static let currentVersion: Int = agentRunResultsSchemaVersion
+    /// v92 adds per-Bot reply style: bots.reply_verbosity (human/verbose) and
+    /// bots.caveman_enabled (on for every Bot except Titio).
+    static let botReplyStyleSchemaVersion = 92
+    /// v93 adds the Titio notice ledger: one durable row per host notice keyed by
+    /// its source (exactly-once delivery across replays, producers and restarts)
+    /// and the singleton inbox state (conversation id, unread, preview, armed reply).
+    static let titioNoticesSchemaVersion = 93
+    public static let currentVersion: Int = titioNoticesSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1832,7 +1841,46 @@ public enum Schema {
             acknowledged_at TEXT
         );
         """),
+        SchemaStep(botReplyStyleSchemaVersion, """
+        ALTER TABLE bots ADD COLUMN reply_verbosity TEXT NOT NULL DEFAULT 'human';
+        ALTER TABLE bots ADD COLUMN caveman_enabled INTEGER NOT NULL DEFAULT 1;
+        UPDATE bots SET caveman_enabled = 0 WHERE lower(handle) = 'titio';
+        """),
+        SchemaStep(titioNoticesSchemaVersion, titioNoticesMigrationSQL),
     ]
+
+    /// Additive and idempotent. `key` reuses today's banner identifiers, so a
+    /// replayed or second producer upserts the same row instead of posting twice.
+    static let titioNoticesMigrationSQL: String = """
+        CREATE TABLE IF NOT EXISTS titio_notices (
+            key TEXT PRIMARY KEY NOT NULL,
+            kind TEXT NOT NULL,
+            urgency TEXT NOT NULL,
+            source_json TEXT NOT NULL,
+            facts_json TEXT NOT NULL,
+            actions_json TEXT,
+            state TEXT NOT NULL,
+            resolution TEXT,
+            message_id TEXT,
+            batch_id TEXT,
+            occurred_at REAL NOT NULL,
+            posted_at REAL,
+            banner_at REAL,
+            resolved_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_titio_notices_state ON titio_notices(state, occurred_at);
+        CREATE INDEX IF NOT EXISTS idx_titio_notices_message ON titio_notices(message_id);
+        CREATE INDEX IF NOT EXISTS idx_titio_notices_posted ON titio_notices(posted_at);
+        CREATE TABLE IF NOT EXISTS titio_inbox_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            conversation_id TEXT,
+            unread_count INTEGER NOT NULL DEFAULT 0,
+            last_preview TEXT,
+            last_at REAL,
+            armed_reply_key TEXT,
+            armed_at REAL
+        );
+        """
 
     /// Fork/side columns are added only when missing so a database that already
     /// recorded v90 (or a partial prior run) does not fail the ALTER.

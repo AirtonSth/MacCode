@@ -611,6 +611,9 @@ struct ScheduledTaskSchedulerContext: @unchecked Sendable {
     let db: SQLiteDB
     let runRepo: AgentRunRepository
     let coordinator: AgentRunCoordinator
+    /// Scheduled failures become Titio notices while the hub is on (§5).
+    let titioNoticeCenter: TitioNoticeCenter
+    let workspaceName: @MainActor (WorkspaceID) -> String?
 }
 
 @MainActor
@@ -636,7 +639,9 @@ public final class ScheduledTaskScheduler {
         self.context = ScheduledTaskSchedulerContext(
             db: context.db,
             runRepo: context.runRepo,
-            coordinator: context.coordinator
+            coordinator: context.coordinator,
+            titioNoticeCenter: context.titioNoticeCenter,
+            workspaceName: { [weak context] id in context?.state.workspaces[id]?.name }
         )
         self.store = ScheduledTaskStore(db: context.db)
         self.executor = ScheduledTaskExecutor(context: context, router: router)
@@ -923,7 +928,41 @@ public final class ScheduledTaskScheduler {
             userInfo: ["activityItemId": Self.failureActivityItemID(for: run), "workspaceId": task?.workspaceID.value.uuidString ?? "", "outcome": "failed"],
             soundEnabled: settings.notificationSoundEnabled
         )
-        SystemNotifier.shared.post(content, settings: settings)
+        let center = context.titioNoticeCenter
+        guard center.isEnabled(settings) else {
+            SystemNotifier.shared.post(content, settings: settings)
+            return
+        }
+        // With an agent run the key is the run's failure key, so the run's own
+        // failure notice and this one merge into one (§3).
+        let key = TitioNoticeIDs.scheduledFailure(
+            scheduledRunId: run.id.uuidString,
+            agentRunId: run.agentRunID?.value.uuidString
+        )
+        let workspaceID = task?.workspaceID
+        let source = TitioNoticeSource(
+            runId: run.agentRunID?.value.uuidString,
+            workspaceId: workspaceID?.value.uuidString,
+            scheduledTaskId: task?.id.uuidString.lowercased() ?? run.taskID.uuidString.lowercased(),
+            activityItemId: Self.failureActivityItemID(for: run)
+        )
+        let title = task?.title
+        let occurredAt = Date()
+        let workspaceName = context.workspaceName
+        Task { @MainActor in
+            let facts = TitioNoticeFacts(title: title, workspaceName: workspaceID.flatMap { workspaceName($0) })
+            center.ingest(
+                TitioNoticeFact(
+                    key: key,
+                    kind: .scheduledFailed,
+                    source: source,
+                    facts: facts,
+                    actions: TitioNoticeAction.defaultActions(kind: .scheduledFailed, facts: facts),
+                    occurredAt: occurredAt
+                ),
+                legacy: TitioNoticeLegacyDelivery(content: content, pushes: false)
+            )
+        }
     }
 
     nonisolated private func reconcileNextRunDates(now: Date) throws {

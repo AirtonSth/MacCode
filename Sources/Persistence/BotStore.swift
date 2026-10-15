@@ -382,6 +382,11 @@ public final class BotStore: @unchecked Sendable {
                 throw BotStoreError.notFound
             }
             if bot.handle == normalized { return bot }
+            // Titio is found by its slug (pet, inbox, notice hub): a rename
+            // would orphan it and make a second Titio on the next launch.
+            if bot.handle == TitioIdentity.handle {
+                throw BotStoreError.invalidRow("Titio's slug is fixed.")
+            }
             try assertHandleAvailable(normalized, excluding: bot.handle, database: db)
             let updateBot = try db.prepare(
                 "UPDATE bots SET handle = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL;"
@@ -416,6 +421,68 @@ public final class BotStore: @unchecked Sendable {
             _ = try statement.step()
         }
         bumpBotsListRevision()
+    }
+
+    /// Reply style lives on the Bot row, not in revisions: it changes how the
+    /// Bot writes and how its chat renders, not who the Bot is.
+    @discardableResult
+    public func setReplyStyle(
+        id: BotID,
+        verbosity: BotReplyVerbosity? = nil,
+        cavemanEnabled: Bool? = nil,
+        now: Date = Date()
+    ) throws -> BotDefinition {
+        let updated = try db.transaction {
+            guard let bot = try loadBot(id: id, database: db), bot.deletedAt == nil else {
+                throw BotStoreError.notFound
+            }
+            let statement = try db.prepare("""
+                UPDATE bots SET reply_verbosity = ?, caveman_enabled = ?, updated_at = ?
+                WHERE id = ? AND deleted_at IS NULL;
+                """)
+            defer { statement.reset() }
+            try statement.bind(1, (verbosity ?? bot.verbosity).rawValue)
+            try statement.bind(2, cavemanEnabled ?? bot.cavemanEnabled)
+            try statement.bind(3, string(now))
+            try statement.bind(4, id.value.uuidString.lowercased())
+            _ = try statement.step()
+            guard let updated = try loadBot(id: id, database: db) else { throw BotStoreError.notFound }
+            return updated
+        }
+        bumpBotsListRevision()
+        return updated
+    }
+
+    /// Puts Titio back to its built-in identity, instructions, avatar,
+    /// notifications and reply style. Its desktop, conversations, files and
+    /// scheduled tasks are untouched.
+    @discardableResult
+    public func restoreTitioFactorySettings(id: BotID, now: Date = Date()) throws -> BotDefinition {
+        guard let bot = try get(id: id), bot.deletedAt == nil else { throw BotStoreError.notFound }
+        // Never overwrite another Bot with Titio.
+        guard bot.handle.lowercased() == TitioIdentity.handle else { throw BotPublishError.invalidRevision }
+        let current = try bot.currentRevisionID.flatMap { try getRevision(id: $0) }
+        _ = try publish(
+            botID: id,
+            expectedCurrentRevisionID: bot.currentRevisionID,
+            draft: BotRevisionDraft(
+                name: TitioIdentity.name,
+                title: TitioIdentity.title,
+                description: TitioIdentity.description,
+                soul: TitioIdentity.soul,
+                permissionMode: .supervised,
+                desktopKind: current?.desktopKind ?? .logicalExecutionSpace
+            ),
+            avatarSymbol: BotBlobatarSpec.default.token,
+            notificationsEnabled: true,
+            now: now
+        )
+        return try setReplyStyle(
+            id: id,
+            verbosity: TitioIdentity.verbosity,
+            cavemanEnabled: TitioIdentity.cavemanEnabled,
+            now: now
+        )
     }
 
     public func setHidden(id: BotID, hidden: Bool, now: Date = Date()) throws {
@@ -514,6 +581,8 @@ public final class BotStore: @unchecked Sendable {
                 currentRevisionID: revisionID,
                 directoryEpoch: 1,
                 notificationsEnabled: source.notificationsEnabled,
+                verbosity: source.verbosity,
+                cavemanEnabled: source.cavemanEnabled,
                 createdAt: now,
                 updatedAt: now,
                 workspaceID: source.workspaceID
@@ -1908,8 +1977,9 @@ public final class BotStore: @unchecked Sendable {
             INSERT INTO bots(
                 id, handle, name, title, description, avatar_symbol, pinned, hidden,
                 current_revision_id, directory_epoch, notifications_enabled,
-                created_at, updated_at, deleted_at, workspace_id
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                created_at, updated_at, deleted_at, workspace_id,
+                reply_verbosity, caveman_enabled
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """)
         defer { statement.reset() }
         try statement.bind(1, bot.id.value.uuidString.lowercased())
@@ -1927,6 +1997,8 @@ public final class BotStore: @unchecked Sendable {
         try statement.bind(13, string(bot.updatedAt))
         try statement.bind(14, string(bot.deletedAt))
         try statement.bind(15, bot.workspaceID?.value.uuidString.lowercased())
+        try statement.bind(16, bot.verbosity.rawValue)
+        try statement.bind(17, bot.cavemanEnabled)
         _ = try statement.step()
     }
 
@@ -2299,6 +2371,8 @@ public final class BotStore: @unchecked Sendable {
             currentRevisionID: revision,
             directoryEpoch: Int(statement.columnInt64(9)),
             notificationsEnabled: statement.columnInt64(10) != 0,
+            verbosity: statement.columnText(15).flatMap(BotReplyVerbosity.init(rawValue:)) ?? .human,
+            cavemanEnabled: statement.columnInt64(16) != 0,
             createdAt: created,
             updatedAt: updated,
             deletedAt: date(statement.columnText(13)),
@@ -2493,7 +2567,8 @@ public final class BotStore: @unchecked Sendable {
     private static let botSelect = """
         SELECT id, handle, name, title, description, avatar_symbol, pinned, hidden,
                current_revision_id, directory_epoch, notifications_enabled,
-               created_at, updated_at, deleted_at, workspace_id
+               created_at, updated_at, deleted_at, workspace_id,
+               reply_verbosity, caveman_enabled
         FROM bots
         """
 

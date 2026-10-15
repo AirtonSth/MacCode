@@ -2872,6 +2872,17 @@ public final class AgentMessageRepository: @unchecked Sendable {
         limit: Int = AgentMessageRepository.maxMessagesPerThread
     ) throws {
         let keep = max(1, limit)
+        // A Titio notice message whose notice is still open keeps its card:
+        // pruning it would leave an open decision (and the inbox's
+        // needs-attention state) with nothing to tap.
+        let keepsOpenNotices = try hasTitioNoticesTable()
+            ? """
+              AND id NOT IN (
+                SELECT message_id FROM titio_notices
+                WHERE message_id IS NOT NULL AND state IN ('posted', 'acting', 'awaiting_reply')
+              )
+              """
+            : ""
         // Nested SELECT required: SQLite rejects LIMIT directly inside DELETE … NOT IN.
         let st = try db.prepare("""
             DELETE FROM agent_messages
@@ -2883,12 +2894,27 @@ public final class AgentMessageRepository: @unchecked Sendable {
                     ORDER BY created_at DESC, rowid DESC
                     LIMIT ?
                 )
-              );
+              )
+              \(keepsOpenNotices);
             """)
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, threadId.value.uuidString)
         try st.bind(3, Int64(keep))
         _ = try st.step()
+    }
+
+    /// Whether the v93 Titio ledger exists (a partially migrated database in
+    /// a migration test may not have it). Only a positive answer is cached.
+    private let titioTableLock = NSLock()
+    private var titioNoticesTableKnown = false
+
+    private func hasTitioNoticesTable() throws -> Bool {
+        if titioTableLock.withLock({ titioNoticesTableKnown }) { return true }
+        let st = try db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'titio_notices' LIMIT 1;")
+        defer { st.reset() }
+        let exists = try st.step()
+        if exists { titioTableLock.withLock { titioNoticesTableKnown = true } }
+        return exists
     }
 
     public func list(threadId: AgentThreadID) throws -> [AgentMessage] {

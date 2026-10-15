@@ -1233,7 +1233,8 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 172)
+        // 175 + bot.notice.act and bot.notice.read (Titio notice cards, hub spec §7).
+        XCTAssertEqual(canonical.count, 177)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -2332,6 +2333,54 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         params["client_request_id"] = "attention-ack-failed"
         _ = try await failedLive.rpc(method: "bot.attention.ack", params: params)
         XCTAssertTrue(failedRouter.finalizedEvents["bot.attention.ack:attention-ack-failed"]?.isEmpty ?? true)
+    }
+
+    /// WHY: a Titio notice card tap (`bot.notice.act`) and opening the inbox
+    /// (`bot.notice.read`) are host mutations: they must pass the Phase 4 gate
+    /// with their syntax checked, replay from the receipt, and tell other
+    /// devices through `bot.updated` (hub spec §8).
+    func test_titioNoticeMutationsAreGatedAndPublishBotUpdated() async throws {
+        XCTAssertTrue(JSONRPCDispatcher.hostMutationMethods.isSuperset(of: ["bot.notice.act", "bot.notice.read"]))
+        XCTAssertThrowsError(try HostMutationContract.preflight(method: "bot.notice.act", params: [
+            "bot_id": .string(UUID().uuidString), "message_id": .string("forged"), "option_index": .number(0),
+        ]), "a message id that is not a UUID never reaches the host")
+        XCTAssertThrowsError(try HostMutationContract.preflight(method: "bot.notice.read", params: [
+            "bot_id": .string(UUID().uuidString),
+        ]), "reading needs the inbox conversation id")
+
+        let botID = UUID().uuidString.lowercased()
+        let messageID = UUID().uuidString.lowercased()
+        let router = Phase4ReceiptFakeRouter()
+        router.pairedBotRemoteResult = .object([
+            "status": .string("completed"),
+            "request_id": .string("notice-act"),
+            "receipt_id": .string("notice-act-receipt"),
+            "bot_id": .string(botID),
+            "outcome": .string("accepted"),
+            "readback": .object([
+                "message_id": .string(messageID),
+                "option_index": .number(0),
+                "outcome": .string("accepted"),
+                "route": .string("bot"),
+            ]),
+        ])
+        let live = try await Phase4LiveServer.start(router: router, bootEpoch: 1_736)
+        defer { live.stop() }
+        var params = live.mutationParams(requestId: "notice-act", threadId: AgentThreadID(), text: "unused")
+        params.removeValue(forKey: "thread_id")
+        params.removeValue(forKey: "text")
+        params["bot_id"] = botID
+        params["message_id"] = messageID
+        params["option_index"] = 0
+        let first = try await live.rpc(method: "bot.notice.act", params: params)
+        let retry = try await live.rpc(method: "bot.notice.act", params: params)
+        XCTAssertNil(first["error"])
+        XCTAssertNil(retry["error"])
+        XCTAssertEqual(router.pairedBotRemoteCallCount, 1, "a retried tap is answered from its receipt")
+        let event = try XCTUnwrap(router.finalizedEvents["bot.notice.act:notice-act"]?.first)
+        XCTAssertEqual(event.kind, .botUpdated)
+        XCTAssertEqual(event.payload.objectValue?["method"]?.stringValue, "bot.notice.act")
+        XCTAssertEqual(event.payload.objectValue?["bot_id"]?.stringValue, botID)
     }
 
     /// WHY: iOS schedules Bot OS notifications only from notification.created.
