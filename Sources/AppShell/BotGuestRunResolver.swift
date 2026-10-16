@@ -788,19 +788,23 @@ enum BotGuestLaunchSweep {
     /// `docker` nil skips the in-guest step. `beforeOpening` trims the guest
     /// distill cache after the leftovers are ended and before `barrier`
     /// opens, the only moment no guest executes a cached build.
+    @discardableResult
     static func run(
         docker: (any BotComputerDockerClienting)?,
         appSupport: URL,
         botIDs: [BotID],
         barrier: DistillGuestLaunchBarrier,
         beforeOpening: @escaping @Sendable () async -> Void = {}
-    ) {
+    ) -> BotContextGuestRecovery.Report {
+        let recovery = BotContextGuestRecovery.reconcile(docker: docker, appSupport: appSupport)
+        guestResolverLog.info("bot.context.launch_recovery reconciled=\(recovery.reconciled.count, privacy: .public) uncertain=\(recovery.failures.count, privacy: .public)")
         if let docker { endLeftoverRuns(docker: docker, appSupport: appSupport, botIDs: botIDs) }
         removeLeftovers(appSupport: appSupport)
         Task {
             await beforeOpening()
             await barrier.open()
         }
+        return recovery
     }
 
     /// Ends what a previous session of this app left running in the

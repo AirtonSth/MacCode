@@ -15,16 +15,19 @@ final class BotContextGuestResources {
     private(set) var container = ""
     private(set) var envFileURL: URL?
     private(set) var configDirectory: URL?
+    private let appSupport: URL
     private let service: BotComputerGuestService
     private let gateway: BotGuestMCPGateway
     private var networkLease: BotContextGatewayLease?
     private var installationAttempted = false
+    private var recordStarted = false
     private var homeDirectory: PrivateDirectory?
     private let operationLock = NSLock()
     private var finished = false
     private var directoryName: String { ".distill-context-\(runID.value.uuidString.lowercased())" }
 
-    private init(identity: BotContextRuntimeIdentity, runID: AgentRunID, service: BotComputerGuestService, gateway: BotGuestMCPGateway) {
+    private init(identity: BotContextRuntimeIdentity, runID: AgentRunID, service: BotComputerGuestService, gateway: BotGuestMCPGateway, appSupport: URL) {
+        self.appSupport = appSupport
         self.identity = identity
         self.runID = runID
         self.service = service
@@ -81,7 +84,7 @@ final class BotContextGuestResources {
             }
             let context = BotGuestMCPGateway.ContextBinding(pin: pin, threadID: request.threadId)
             let gateway = BotGuestMCPGateway(context: context, contextStore: store, secretStore: secretStore)
-            let resources = BotContextGuestResources(identity: identity, runID: request.runId, service: service, gateway: gateway)
+            let resources = BotContextGuestResources(identity: identity, runID: request.runId, service: service, gateway: gateway, appSupport: appSupport)
             let claimed = lock.withLock {
                 guard live[identity.storageBotID] == nil else { return false }
                 live[identity.storageBotID] = resources
@@ -89,6 +92,8 @@ final class BotContextGuestResources {
             }
             guard claimed else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
             do {
+                try BotContextGuestRecovery.begin(identity: identity, runID: request.runId, appSupport: appSupport)
+                resources.recordStarted = true
                 let adapter = BotContextSecretStore(identity: identity, store: secretStore, authorizes: authorize)
                 let trustedEnvironment = try BotSecretEnvironment.applying(to: [
                     BotSecretEnvironment.botIDEnvironmentKey: pin.botID.value.uuidString,
@@ -148,9 +153,18 @@ final class BotContextGuestResources {
         }
         gateway.stop()
         if let homeDirectory {
-            if configDirectory != nil { homeDirectory.removeTree(directoryName) }
+            if configDirectory != nil {
+                homeDirectory.removeTree(directoryName)
+                guard try !homeDirectory.entriesChecked().contains(directoryName) else {
+                    throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+                }
+            }
+            try homeDirectory.synchronize()
             homeDirectory.close()
             self.homeDirectory = nil
+        }
+        if recordStarted {
+            try BotContextGuestRecovery.end(identity: identity, runID: runID, appSupport: appSupport)
         }
         finished = true
         Self.lock.withLock { _ = Self.live.removeValue(forKey: identity.storageBotID) }

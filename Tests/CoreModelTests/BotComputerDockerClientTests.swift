@@ -28,6 +28,33 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertFalse(try absent.containerExists(name: "remotecode-bot-exact"))
         let unknown = BotComputerDockerCLI { _ in throw BotComputerDockerError.daemonUnavailable }
         XCTAssertThrowsError(try unknown.containerExists(name: "remotecode-bot-exact"))
+        XCTAssertThrowsError(try BotComputerDockerCLI { _ in Data([0xff]) }
+            .containerExists(name: "remotecode-bot-exact")) { error in
+                XCTAssertEqual(error as? BotComputerDockerError, .provisioningFailed)
+            }
+    }
+
+    func test_inspectRejectsMalformedRunningTokenWithOtherwiseValidOwnedFields() throws {
+        let cli = BotComputerDockerCLI { _ in
+            Data("unknown sha256:abc 36385 net-a, {\"remotecode.botId\":\"b\"}\n\"/owned/home\"\n".utf8)
+        }
+        XCTAssertThrowsError(try cli.inspect(name: "remotecode-bot-b")) { error in
+            XCTAssertEqual(error as? BotComputerDockerError, .provisioningFailed)
+        }
+    }
+
+    func test_inspectAcceptsOnlyExplicitTrueOrFalseRunningTokens() throws {
+        for (token, expected) in [("true", true), ("TRUE", true), ("false", false)] {
+            let cli = BotComputerDockerCLI { _ in Data("\(token) sha256:abc 36385 net-a, {}\n\n".utf8) }
+            XCTAssertEqual(try cli.inspect(name: "container").running, expected)
+        }
+        XCTAssertThrowsError(try BotComputerDockerCLI { _ in Data("unknown sha256:abc 0 net-a, {}\n\n".utf8) }.inspect(name: "container"))
+    }
+
+    func test_inspectRejectsInvalidUTF8() {
+        XCTAssertThrowsError(try BotComputerDockerCLI { _ in Data([0xff]) }.inspect(name: "container")) { error in
+            XCTAssertEqual(error as? BotComputerDockerError, .provisioningFailed)
+        }
     }
 
     func test_inspectReadsTheHomeBindSource_soAContainerOfAnotherAppIsToldApart() throws {
@@ -403,27 +430,48 @@ final class BotComputerDockerClientTests: XCTestCase {
         let containerA = "remotecode-isolation-a-\(suffix)"
         let containerB = "remotecode-isolation-b-\(suffix)"
         let cli = BotComputerDockerCLI()
+        let fixtureSupport = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-cross-bot-\(suffix)", isDirectory: true)
         defer {
             try? cli.remove(name: containerA)
             try? cli.remove(name: containerB)
+            if (try? cli.containerExists(name: containerA)) == false,
+               (try? cli.containerExists(name: containerB)) == false {
+                try? FileManager.default.removeItem(at: fixtureSupport)
+            }
         }
 
         let repository = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        try cli.build(
-            context: repository.appendingPathComponent("Sources/AppShell/Resources/ComputerGuest"),
-            tag: BotComputerGuestSpec.imageTag
+        let recipe = repository.appendingPathComponent("Sources/AppShell/Resources/ComputerGuest")
+        let digest = BotComputerGuestSpec.recipeDigest(context: recipe)
+        let image = try XCTUnwrap(try cli.imageStates(tags: [BotComputerGuestSpec.imageTag])[BotComputerGuestSpec.imageTag])
+        guard image.labels[BotComputerGuestSpec.recipeLabelKey] == BotComputerGuestSpec.recipeRevision,
+              image.labels[BotComputerGuestSpec.recipeDigestLabelKey] == digest else {
+            throw XCTSkip("the current shared guest image does not match this recipe revision and digest")
+        }
+
+        let botIDB = BotID()
+        let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: fixtureSupport, botID: botIDB)
+        try FileManager.default.createDirectory(at: guestHome, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: BotComputerGuestSpec.guestToolsURL(appSupport: fixtureSupport),
+            withIntermediateDirectories: true
         )
+        var optionsB = try BotComputerGuestSpec.containerCreateOptions(
+            botID: botIDB,
+            guestHome: guestHome.path,
+            appSupport: fixtureSupport,
+            viewerToken: String(repeating: "b", count: 32)
+        )
+        optionsB.name = containerB
+        optionsB.network = "bridge"
+        _ = try cli.create(options: optionsB)
+        try cli.start(name: containerB)
         let tokenA = String(repeating: "a", count: 32)
-        let tokenB = String(repeating: "b", count: 32)
-        _ = try BotComputerDockerCLI.defaultRun([
-            "run", "-d", "--name", containerB, "--network", "bridge",
-            "--publish", "127.0.0.1::6080",
-            "--env", "REMOTECODE_VIEWER_TOKEN=\(tokenB)",
-            BotComputerGuestSpec.imageTag,
-        ])
+        let tokenB = optionsB.environment["REMOTECODE_VIEWER_TOKEN"]!
         _ = try BotComputerDockerCLI.defaultRun([
             "run", "-d", "--name", containerA, "--network", "bridge",
             "--env", "REMOTECODE_VIEWER_TOKEN=\(tokenA)",

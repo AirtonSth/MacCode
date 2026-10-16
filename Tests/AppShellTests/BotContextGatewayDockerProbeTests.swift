@@ -119,7 +119,7 @@ final class BotContextGatewayDockerProbeTests: XCTestCase {
         XCTAssertEqual(try invoke(0, env: envURLs[0])["status"] as? Int, 401)
         XCTAssertEqual(try invoke(1, env: envURLs[1])["status"] as? Int, 200)
         try resources[1].finish()
-        try assertContextCleanupDoesNotWaitForOtherPreparation(preparedA: resources[0], requestB: requests[1], hostID: host, store: store, threadRepo: AgentThreadRepository(db: db), appSupport: support, secretStore: secrets)
+        try assertContextCleanupDoesNotWaitForOtherPreparation(preparedA: resources[0], requestB: AgentRunRequest(threadId: requests[1].threadId, provider: .distill, model: "test", cwd: requests[1].cwd, prompt: "fresh probe", environment: requests[1].environment), hostID: host, store: store, threadRepo: AgentThreadRepository(db: db), appSupport: support, secretStore: secrets)
         for resource in resources { try resource.finish(); try resource.finish() }
         for url in envURLs { XCTAssertFalse(FileManager.default.fileExists(atPath: url.path)) }
         print("Prepared context gateway HTTP/authentication probe passed; resources cleaned: \(root.path)")

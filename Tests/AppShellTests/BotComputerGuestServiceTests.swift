@@ -23,6 +23,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var bootstrapOutput = Data("context-network-policy-v1\n".utf8)
     var bootstrapError: Error?
     var stopError: Error?
+    var stopLeavesRunning = false
     var lastExec: (name: String, command: [String], user: String?, detach: Bool)?
     var lastExecAt: Date?
     var execUsers: [String?] = []
@@ -97,7 +98,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
         stopped.append(name)
         lifecycle.append("stop:\(name)")
         if let stopError { throw stopError }
-        if var value = containers[name] {
+        if !stopLeavesRunning, var value = containers[name] {
             value.running = false
             containers[name] = value
         }
@@ -627,6 +628,103 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertThrowsError(try service.provision(contextBinding: descendantBinding, workspace: descendant, registeredWorkspaces: [descendant.cwd]))
         XCTAssertTrue(fake.created.isEmpty)
         XCTAssertTrue(fake.builds.isEmpty)
+    }
+
+    func test_stopForContextRecoveryStopsOnlyOwnedRuntimeAndPreservesScopedResources() throws {
+        let support = makeSupport("rc-context-recovery-stop")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(appSupport: support, docker: fake)
+        let identity = try BotContextRuntimeIdentity(hostID: "host", botID: BotID(), context: .general, policyRevision: 2)
+        let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+        let network = BotComputerGuestSpec.networkName(botID: identity.storageBotID)
+        let home = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: identity.storageBotID)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let memory = home.appendingPathComponent("memory.txt")
+        try Data("keep".utf8).write(to: memory)
+        let labels = [
+            BotComputerGuestSpec.botIDLabelKey: identity.storageBotID.value.uuidString.lowercased(),
+            "remotecode.context.network": "private-egress-v1",
+            BotComputerGuestSpec.runtimeLabelKey: BotComputerGuestSpec.runtimeRevision,
+        ]
+        func ownedInspect(running: Bool, homeSource: String?, labels: [String: String]) -> BotComputerContainerInspect {
+            BotComputerContainerInspect(
+                running: running,
+                imageID: "img",
+                hostPort: 49152,
+                networkNames: [network],
+                labels: labels,
+                homeSource: homeSource
+            )
+        }
+        fake.networkSet.insert(network)
+        fake.containers[name] = ownedInspect(running: true, homeSource: home.standardizedFileURL.path, labels: labels)
+
+        try service.stopForContextRecovery(identity: identity)
+        XCTAssertEqual(fake.stopped, [name])
+        XCTAssertFalse(fake.containers[name]?.running ?? true)
+        XCTAssertEqual(try Data(contentsOf: memory), Data("keep".utf8))
+        XCTAssertTrue(fake.networkSet.contains(network))
+        XCTAssertTrue(fake.removed.isEmpty)
+        XCTAssertTrue(fake.removedNetworks.isEmpty)
+
+        fake.stopped.removeAll()
+        fake.containers[name] = ownedInspect(running: false, homeSource: home.standardizedFileURL.path, labels: labels)
+        try service.stopForContextRecovery(identity: identity)
+        XCTAssertTrue(fake.stopped.isEmpty)
+
+        fake.containers[name] = ownedInspect(running: true, homeSource: "/foreign/home", labels: labels)
+        XCTAssertThrowsError(try service.stopForContextRecovery(identity: identity))
+        XCTAssertTrue(fake.stopped.isEmpty)
+        fake.containers[name] = ownedInspect(running: true, homeSource: nil, labels: labels)
+        XCTAssertThrowsError(try service.stopForContextRecovery(identity: identity))
+        XCTAssertTrue(fake.stopped.isEmpty)
+        var foreignLabels = labels
+        foreignLabels[BotComputerGuestSpec.runtimeLabelKey] = "foreign-runtime"
+        fake.containers[name] = ownedInspect(running: true, homeSource: home.standardizedFileURL.path, labels: foreignLabels)
+        XCTAssertThrowsError(try service.stopForContextRecovery(identity: identity))
+        XCTAssertTrue(fake.stopped.isEmpty)
+    }
+
+    func test_stopForContextRecoveryRequiresProvenAbsenceAndConfirmedStop() throws {
+        let support = makeSupport("rc-context-recovery-confirm")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(appSupport: support, docker: fake)
+        let identity = try BotContextRuntimeIdentity(hostID: "host", botID: BotID(), context: .general, policyRevision: 2)
+        let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+        let home = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: identity.storageBotID)
+        let inspect = BotComputerContainerInspect(
+            running: true,
+            imageID: "img",
+            hostPort: 49152,
+            networkNames: [BotComputerGuestSpec.networkName(botID: identity.storageBotID)],
+            labels: [
+                BotComputerGuestSpec.botIDLabelKey: identity.storageBotID.value.uuidString.lowercased(),
+                "remotecode.context.network": "private-egress-v1",
+                BotComputerGuestSpec.runtimeLabelKey: BotComputerGuestSpec.runtimeRevision,
+            ],
+            homeSource: home.standardizedFileURL.path
+        )
+
+        XCTAssertNoThrow(try service.stopForContextRecovery(identity: identity))
+        XCTAssertTrue(fake.stopped.isEmpty)
+
+        fake.inspectFailure = { _ in true }
+        XCTAssertThrowsError(try service.stopForContextRecovery(identity: identity))
+        XCTAssertTrue(fake.stopped.isEmpty)
+        fake.inspectFailure = nil
+        fake.containers[name] = inspect
+        fake.stopError = BotComputerGuestError.dockerUnavailable
+        XCTAssertThrowsError(try service.stopForContextRecovery(identity: identity))
+        XCTAssertEqual(fake.stopped, [name])
+        fake.stopError = nil
+        fake.stopped.removeAll()
+        fake.containers[name] = inspect
+        fake.stopLeavesRunning = true
+        XCTAssertThrowsError(try service.stopForContextRecovery(identity: identity))
+        XCTAssertEqual(fake.stopped, [name])
+        XCTAssertTrue(fake.containers[name]?.running == true)
     }
 
     func test_contextualStopAndWipeTargetDurableIdentityAndPropagateFailure() throws {
@@ -1373,7 +1471,7 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(ready, service.lastReason)
         XCTAssertEqual(magic, "89504e47")
         XCTAssertEqual(host, "127.0.0.1")
-        XCTAssertEqual(image, "remotecode/computer:r5")
+        XCTAssertEqual(service.lastReady?.imageReference, try docker.imageID(tag: image))
 
         let botID = BotID()
         let shot = try service.observe(botID: botID)

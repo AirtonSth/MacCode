@@ -380,7 +380,10 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             name,
         ])
         // Line 2: the home bind's source, JSON-quoted (it may hold spaces).
-        let lines = (String(data: data, encoding: .utf8) ?? "")
+        guard let decoded = String(data: data, encoding: .utf8) else {
+            throw BotComputerDockerError.provisioningFailed
+        }
+        let lines = decoded
             .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
         let text = (lines.first.map(String.init) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -388,7 +391,17 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .flatMap { try? JSONDecoder().decode(String.self, from: Data($0.utf8)) }
         let parts = text.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: false)
-        let running = parts.first.map { $0.caseInsensitiveCompare("true") == .orderedSame } ?? false
+        guard let runningToken = parts.first else {
+            throw BotComputerDockerError.provisioningFailed
+        }
+        let running: Bool
+        if runningToken.caseInsensitiveCompare("true") == .orderedSame {
+            running = true
+        } else if runningToken.caseInsensitiveCompare("false") == .orderedSame {
+            running = false
+        } else {
+            throw BotComputerDockerError.provisioningFailed
+        }
         let image = parts.dropFirst().first.map(String.init) ?? ""
         let port = Int(parts.dropFirst(2).first.map(String.init) ?? "") ?? 0
         let rest = parts.dropFirst(3).first.map(String.init) ?? ""
@@ -410,9 +423,10 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
 
     public func containerExists(name: String) throws -> Bool {
         let data = try run(["ps", "-aq", "--filter", "name=^/\(name)$"])
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty == false
+        guard let output = String(data: data, encoding: .utf8) else {
+            throw BotComputerDockerError.provisioningFailed
+        }
+        return output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
     public func exec(
