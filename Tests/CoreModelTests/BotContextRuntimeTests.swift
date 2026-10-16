@@ -18,6 +18,16 @@ final class BotContextRuntimeTests: XCTestCase {
         XCTAssertEqual(original.schemaVersion, BotContextRuntimeIdentity.schemaVersion)
     }
 
+    func test_durableIdentityUsesContextAndIgnoresPolicyRevision() throws {
+        let bot = BotID()
+        let context = BotContext.workspace(WorkspaceID())
+        let first = try BotContextRuntimeIdentity(hostID: "host", botID: bot, context: context, policyRevision: 1)
+        let later = try BotContextRuntimeIdentity(hostID: "host", botID: bot, context: context, policyRevision: 8)
+        XCTAssertEqual(first.storageBotID, later.storageBotID)
+        XCTAssertThrowsError(try BotContextRuntimeIdentity(hostID: " ", botID: bot, context: context, policyRevision: 1))
+        XCTAssertThrowsError(try BotContextRuntimeIdentity(hostID: "host", botID: bot, context: context, policyRevision: 0))
+    }
+
     func test_runtimeIdentityRejectsInvalidBindings() {
         let bot = BotID()
         let context = BotContext.general

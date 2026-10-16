@@ -25,8 +25,12 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     /// Stands in for a cold `docker start` + desktop boot during provisioning.
     var startDelay: TimeInterval = 0
     var networks: [String] = []
+    var networkSet: Set<String> = []
     var removedNetworks: [String] = []
     var networkError: Error?
+    var removeNetworkError: Error?
+    var networkReadError: Error?
+    var networkReads: [String] = []
     var renamed: [(String, String)] = []
     var imageLabels: [String: String] = [
         BotComputerGuestSpec.imageTag: BotComputerGuestSpec.recipeRevision
@@ -113,10 +117,18 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     }
     func ensureNetwork(name: String) throws {
         networks.append(name)
+        networkSet.insert(name)
         if let networkError { throw networkError }
     }
     func removeNetwork(name: String) throws {
         removedNetworks.append(name)
+        if let removeNetworkError { throw removeNetworkError }
+        networkSet.remove(name)
+    }
+    func networkExists(name: String) throws -> Bool {
+        networkReads.append(name)
+        if let networkReadError { throw networkReadError }
+        return networkSet.contains(name)
     }
     func remove(name: String) throws {
         removed.append(name)
@@ -242,6 +254,139 @@ final class BotComputerGuestServiceTests: XCTestCase {
             (failed["recovery"] as? [String: Any])?["requires_new_start_grant"] as? Bool,
             true
         )
+    }
+
+    func test_contextualProvisionPartitionsWorkspaceRuntimeAndGeneralHasNoMount() throws {
+        let support = makeSupport("rc-context-guest-partition")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0)
+        let bot = BotID()
+        let pathA = makeSupport("workspace-a")
+        let pathB = makeSupport("workspace-b")
+        try FileManager.default.createDirectory(at: pathA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: pathB, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: pathA); try? FileManager.default.removeItem(at: pathB) }
+        let a = Workspace.empty(name: "A", cwd: pathA.path)
+        let b = Workspace.empty(name: "B", cwd: pathB.path)
+        let bindA = BotContextBinding(hostID: "host", botID: bot, context: .workspace(a.id), state: .active, policyRevision: 1, actions: [.send, .files])
+        let bindB = BotContextBinding(hostID: "host", botID: bot, context: .workspace(b.id), state: .active, policyRevision: 1, actions: [.send, .files])
+        let general = BotContextBinding(hostID: "host", botID: bot, context: .general, state: .active, policyRevision: 1, actions: [.send])
+        _ = try service.provision(contextBinding: bindA, workspace: a, registeredWorkspaces: [pathA.path])
+        _ = try service.provision(contextBinding: bindB, workspace: b, registeredWorkspaces: [pathB.path])
+        _ = try service.provision(contextBinding: general, workspace: nil, registeredWorkspaces: [])
+        let idA = try BotContextRuntimeIdentity(binding: bindA).storageBotID
+        let idB = try BotContextRuntimeIdentity(binding: bindB).storageBotID
+        let idGeneral = try BotContextRuntimeIdentity(binding: general).storageBotID
+        let options = Dictionary(uniqueKeysWithValues: fake.createdOptions.map { ($0.name, $0) })
+        let optionA = try XCTUnwrap(options[BotComputerGuestSpec.containerName(botID: idA)])
+        let optionB = try XCTUnwrap(options[BotComputerGuestSpec.containerName(botID: idB)])
+        let optionGeneral = try XCTUnwrap(options[BotComputerGuestSpec.containerName(botID: idGeneral)])
+        XCTAssertNotEqual(optionA.name, optionB.name)
+        XCTAssertNotEqual(optionA.network, optionB.network)
+        XCTAssertNotEqual(optionA.binds.first(where: { $0.contains(pathA.path) }), nil)
+        XCTAssertNotEqual(optionB.binds.first(where: { $0.contains(pathB.path) }), nil)
+        XCTAssertFalse(optionGeneral.binds.contains(where: { $0.contains(pathA.path) || $0.contains(pathB.path) }))
+        XCTAssertEqual(try JSONDecoder().decode([String].self, from: Data(contentsOf: BotComputerGuestSpec.workspacesURL(appSupport: support, botID: idA))), [pathA.path])
+        XCTAssertEqual(try JSONDecoder().decode([String].self, from: Data(contentsOf: BotComputerGuestSpec.workspacesURL(appSupport: support, botID: idB))), [pathB.path])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: idA).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: idB).path))
+    }
+
+    func test_contextualProvisionRejectsInvalidGrantAndCorruptOrMismatchedManifestBeforeDocker() throws {
+        let support = makeSupport("rc-context-guest-denial")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0)
+        let bot = BotID()
+        let path = makeSupport("workspace-denial")
+        try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: path) }
+        let workspace = Workspace.empty(name: "A", cwd: path.path)
+        let wrong = BotContextBinding(hostID: "host", botID: bot, context: .workspace(WorkspaceID()), state: .active, policyRevision: 1, actions: [.send, .files])
+        let noFiles = BotContextBinding(hostID: "host", botID: bot, context: .workspace(workspace.id), state: .active, policyRevision: 1, actions: [.send])
+        let revoked = BotContextBinding(hostID: "host", botID: bot, context: .workspace(workspace.id), state: .revoked, policyRevision: 1, actions: [.send, .files])
+        for binding in [wrong, noFiles, revoked] {
+            XCTAssertThrowsError(try service.provision(contextBinding: binding, workspace: workspace, registeredWorkspaces: [path.path]))
+        }
+        let active = BotContextBinding(hostID: "host", botID: bot, context: .workspace(workspace.id), state: .active, policyRevision: 1, actions: [.send, .files])
+        let identity = try BotContextRuntimeIdentity(binding: active)
+        let manifest = BotComputerGuestSpec.workspacesURL(appSupport: support, botID: identity.storageBotID)
+        try FileManager.default.createDirectory(at: manifest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("not-json".utf8).write(to: manifest)
+        XCTAssertThrowsError(try service.provision(contextBinding: active, workspace: workspace, registeredWorkspaces: [path.path]))
+        XCTAssertEqual(try Data(contentsOf: manifest), Data("not-json".utf8))
+        try JSONEncoder().encode(["/tmp/other-context-root"]).write(to: manifest)
+        XCTAssertThrowsError(try service.provision(contextBinding: active, workspace: workspace, registeredWorkspaces: [path.path]))
+        XCTAssertEqual(try JSONDecoder().decode([String].self, from: Data(contentsOf: manifest)), ["/tmp/other-context-root"])
+        XCTAssertTrue(fake.created.isEmpty)
+        XCTAssertTrue(fake.builds.isEmpty)
+        XCTAssertTrue(fake.stopped.isEmpty)
+        XCTAssertTrue(fake.removed.isEmpty)
+        XCTAssertTrue(fake.removedNetworks.isEmpty)
+        let ancestor = Workspace.empty(name: "Private ancestor", cwd: support.deletingLastPathComponent().path)
+        let descendant = Workspace.empty(name: "Private descendant", cwd: support.appendingPathComponent("nested").path)
+        let ancestorBinding = BotContextBinding(hostID: "host", botID: bot, context: .workspace(ancestor.id), state: .active, policyRevision: 1, actions: [.send, .files])
+        let descendantBinding = BotContextBinding(hostID: "host", botID: bot, context: .workspace(descendant.id), state: .active, policyRevision: 1, actions: [.send, .files])
+        XCTAssertThrowsError(try service.provision(contextBinding: ancestorBinding, workspace: ancestor, registeredWorkspaces: [ancestor.cwd]))
+        XCTAssertThrowsError(try service.provision(contextBinding: descendantBinding, workspace: descendant, registeredWorkspaces: [descendant.cwd]))
+        XCTAssertTrue(fake.created.isEmpty)
+        XCTAssertTrue(fake.builds.isEmpty)
+    }
+
+    func test_contextualStopAndWipeTargetDurableIdentityAndPropagateFailure() throws {
+        let support = makeSupport("rc-context-guest-cleanup")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0)
+        let bot = BotID()
+        let a = try BotContextRuntimeIdentity(hostID: "host", botID: bot, context: .workspace(WorkspaceID()), policyRevision: 2)
+        let b = try BotContextRuntimeIdentity(hostID: "host", botID: bot, context: .general, policyRevision: 2)
+        let legacy = BotID()
+        try FileManager.default.createDirectory(at: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: a.storageBotID), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: b.storageBotID), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: legacy), withIntermediateDirectories: true)
+        fake.networkSet.formUnion([BotComputerGuestSpec.networkName(botID: a.storageBotID), BotComputerGuestSpec.networkName(botID: b.storageBotID), BotComputerGuestSpec.networkName(botID: legacy)])
+        fake.containers[BotComputerGuestSpec.containerName(botID: a.storageBotID)] = BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152, labels: [:])
+        fake.containers[BotComputerGuestSpec.containerName(botID: b.storageBotID)] = BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152, labels: [:])
+        fake.containers[BotComputerGuestSpec.containerName(botID: legacy)] = BotComputerContainerInspect(running: false, imageID: "img", hostPort: 49152, labels: [:])
+        try service.stop(identity: a)
+        XCTAssertEqual(fake.stopped, [BotComputerGuestSpec.containerName(botID: a.storageBotID)])
+        fake.removeNetworkError = BotComputerGuestError.dockerUnavailable
+        XCTAssertThrowsError(try service.wipe(identity: a))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: a.storageBotID).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: b.storageBotID).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: legacy).path))
+        XCTAssertTrue(fake.networkSet.contains(BotComputerGuestSpec.networkName(botID: a.storageBotID)))
+        fake.removeNetworkError = nil
+        try service.wipe(identity: a)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestBotRootURL(appSupport: support, botID: a.storageBotID).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: b.storageBotID).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: legacy).path))
+        XCTAssertFalse(fake.networkSet.contains(BotComputerGuestSpec.networkName(botID: a.storageBotID)))
+        fake.containers[BotComputerGuestSpec.containerName(botID: b.storageBotID)] = BotComputerContainerInspect(
+            running: false, imageID: "img", hostPort: 49152, labels: [:]
+        )
+        fake.removeError = BotComputerGuestError.dockerUnavailable
+        XCTAssertThrowsError(try service.wipe(identity: b))
+    }
+
+    func test_contextualWipePreservesHomeOnUnknownReadbackAndAcceptsProvenAbsence() throws {
+        let support = makeSupport("rc-context-unknown-cleanup")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let service = BotComputerGuestService(appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0)
+        let identity = try BotContextRuntimeIdentity(hostID: "host", botID: BotID(), context: .general, policyRevision: 2)
+        let home = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: identity.storageBotID)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        fake.networkReadError = BotComputerGuestError.dockerUnavailable
+        XCTAssertThrowsError(try service.wipe(identity: identity))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.path))
+        fake.networkReadError = nil
+        fake.removeError = BotComputerGuestError.notReady
+        fake.removeNetworkError = BotComputerGuestError.notReady
+        try service.wipe(identity: identity)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.path))
     }
 
     func test_remoteFrameExportsBoundedPNGIdentityWithoutViewerSecret() throws {

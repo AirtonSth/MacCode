@@ -2,6 +2,16 @@ import XCTest
 @testable import CoreModel
 
 final class BotComputerDockerClientTests: XCTestCase {
+    func test_networkExistsRequiresReadableExactCensus() throws {
+        let present = BotComputerDockerCLI { args in
+            XCTAssertEqual(args, ["network", "ls", "-q", "--filter", "name=^context-network$"])
+            return Data("network-id\n".utf8)
+        }
+        XCTAssertTrue(try present.networkExists(name: "context-network"))
+        XCTAssertFalse(try BotComputerDockerCLI { _ in Data() }.networkExists(name: "context-network"))
+        XCTAssertThrowsError(try BotComputerDockerCLI { _ in Data([0xff]) }.networkExists(name: "context-network"))
+    }
+
     func test_containerExistsUsesAnExactAnchoredDockerCensus() throws {
         // WHY: cleanup may forgive a failed rm only after Docker proves the
         // exact canonical container is absent; prefix matches are not proof.

@@ -102,6 +102,7 @@ public protocol BotComputerDockerClienting: Sendable {
     func rename(from: String, to: String) throws
     func ensureNetwork(name: String) throws
     func removeNetwork(name: String) throws
+    func networkExists(name: String) throws -> Bool
     func remove(name: String) throws
     func removeMatching(namePrefix: String) throws
     func top(name: String) throws -> String
@@ -109,6 +110,10 @@ public protocol BotComputerDockerClienting: Sendable {
 
 public extension BotComputerDockerClienting {
     func removeNetwork(name: String) throws {}
+
+    func networkExists(name: String) throws -> Bool {
+        throw BotComputerDockerError.provisioningFailed
+    }
 
     func top(name: String) throws -> String { "" }
 
@@ -436,6 +441,14 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
 
     public func removeNetwork(name: String) throws {
         _ = try run(["network", "rm", name])
+    }
+
+    public func networkExists(name: String) throws -> Bool {
+        let data = try run(["network", "ls", "-q", "--filter", "name=^\(name)$"])
+        guard let output = String(data: data, encoding: .utf8) else {
+            throw BotComputerDockerError.provisioningFailed
+        }
+        return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     public func top(name: String) throws -> String {

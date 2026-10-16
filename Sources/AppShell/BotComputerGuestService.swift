@@ -30,6 +30,7 @@ public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStri
     case screenshotTooLarge(actualBytes: Int, maximumBytes: Int)
     case screenshotResultTooLarge(actualBytes: Int, maximumBytes: Int)
     case rebuildWhileRunActive(threadTitle: String)
+    case contextualRuntimeUnavailable
 
     public var description: String {
         switch self {
@@ -40,6 +41,8 @@ public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStri
         case .rebuildWhileRunActive(let threadTitle):
             return "The Linux desktop was not rebuilt: \(threadTitle) is running on it. "
                 + "Rebuild after that run finishes."
+        case .contextualRuntimeUnavailable:
+            return "Contextual guest runtime is unavailable."
         }
     }
 }
@@ -190,6 +193,57 @@ public final class BotComputerGuestService: @unchecked Sendable {
     /// outdated container. nil treats any run holding the bot as another's.
     public func provision(botID: BotID, requestingThreadID: AgentThreadID? = nil) throws -> BotComputerGuestReady {
         try provision(botID: botID, keeping: [], requestingThreadID: requestingThreadID)
+    }
+
+    public func provision(
+        contextBinding: BotContextBinding,
+        workspace: Workspace?,
+        registeredWorkspaces: Set<String>,
+        requestingThreadID: AgentThreadID? = nil
+    ) throws -> BotComputerGuestReady {
+        guard contextBinding.state == .active, contextBinding.actions.contains(.send) else {
+            throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+        }
+        let identity = try BotContextRuntimeIdentity(binding: contextBinding)
+        let desired: Set<String>
+        switch contextBinding.context {
+        case .general:
+            guard workspace == nil else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+            desired = []
+        case .workspace(let workspaceID):
+            guard contextBinding.actions.contains(.files), let workspace,
+                  workspace.id == workspaceID,
+                  registeredWorkspaces.contains(workspace.cwd) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            try BotComputerGuestSpec.assertWorkspaceMountPath(workspace.cwd, registeredWorkspaces: registeredWorkspaces)
+            let canonicalWorkspace = URL(fileURLWithPath: workspace.cwd).resolvingSymlinksInPath().standardizedFileURL.path
+            let canonicalSupport = appSupport.resolvingSymlinksInPath().standardizedFileURL.path
+            guard canonicalWorkspace != canonicalSupport,
+                  !canonicalWorkspace.hasPrefix(canonicalSupport + "/"),
+                  !canonicalSupport.hasPrefix(canonicalWorkspace + "/") else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            desired = [workspace.cwd]
+        }
+        let manifestURL = BotComputerGuestSpec.workspacesURL(appSupport: appSupport, botID: identity.storageBotID)
+        let existing: Set<String>
+        if FileManager.default.fileExists(atPath: manifestURL.path) {
+            guard let data = try? Data(contentsOf: manifestURL),
+                  let paths = try? JSONDecoder().decode([String].self, from: data) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            existing = Set(paths)
+        } else {
+            existing = []
+        }
+        guard existing.isSubset(of: desired) else {
+            throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+        }
+        if let path = desired.first {
+            try ensureWorkspaceMounted(botID: identity.storageBotID, workspace: path, registered: registeredWorkspaces, requestingThreadID: requestingThreadID)
+        }
+        return try provision(botID: identity.storageBotID, keeping: desired, requestingThreadID: requestingThreadID)
     }
 
     private func provision(
@@ -434,6 +488,31 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     public func stop(botID: BotID) throws {
         try docker.stop(name: BotComputerGuestSpec.containerName(botID: botID))
+    }
+
+    public func stop(identity: BotContextRuntimeIdentity) throws {
+        try stop(botID: identity.storageBotID)
+    }
+
+    public func wipe(identity: BotContextRuntimeIdentity) throws {
+        let botID = identity.storageBotID
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        let network = BotComputerGuestSpec.networkName(botID: botID)
+        var containerRemovalError: Error?
+        do { try docker.remove(name: name) } catch { containerRemovalError = error }
+        var networkRemovalError: Error?
+        do { try docker.removeNetwork(name: network) } catch { networkRemovalError = error }
+
+        let containerExists: Bool
+        do { containerExists = try docker.containerExists(name: name) }
+        catch { throw containerRemovalError ?? networkRemovalError ?? error }
+        let networkExists: Bool
+        do { networkExists = try docker.networkExists(name: network) }
+        catch { throw containerRemovalError ?? networkRemovalError ?? error }
+        guard !containerExists, !networkExists else {
+            throw containerRemovalError ?? networkRemovalError ?? BotComputerDockerError.provisioningFailed
+        }
+        try BotGuestHome.wipe(appSupport: appSupport, botID: botID)
     }
 
     /// What Docker says right now (one `docker inspect`): false when the
