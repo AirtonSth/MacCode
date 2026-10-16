@@ -137,6 +137,26 @@ final class BotContextDispatcherTests: XCTestCase {
         XCTAssertEqual(pin.columnText(0), "host-a")
         XCTAssertEqual(pin.columnText(1), "general:v1")
         XCTAssertEqual(pin.columnInt64(2), 1)
+        var sendCallbacks = 0
+        fixture.authority.onSend = { _, _, _, _, _, _ in
+            sendCallbacks += 1
+            return [:]
+        }
+        _ = try fixture.authority.dispatch(method: "bot.conversation.select", params: ["client_request_id": "select-context", "bot_id": botID, "conversation_id": conversationID])
+        for params: [String: JSONValue] in [
+            ["client_request_id": .string("send-explicit"), "bot_id": .string(botID), "text": .string("explicit"), "conversation_id": .string(conversationID)],
+            ["client_request_id": .string("send-selected"), "bot_id": .string(botID), "text": .string("selected fallback")],
+        ] {
+            let response = await dispatcher.dispatchHTTP(request("bot.send", params), mutationContext: context)
+            XCTAssertNil(response.error)
+            XCTAssertEqual(response.result?.objectValue?["status"]?.stringValue, "failed")
+            XCTAssertEqual(response.result?.objectValue?["readback"]?.objectValue?["error_code"]?.intValue, -32602)
+            XCTAssertEqual(response.result?.objectValue?["readback"]?.objectValue?["error"]?.stringValue, "Context resource unavailable.")
+        }
+        XCTAssertEqual(sendCallbacks, 0)
+        XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM agent_messages;"), 0)
+        XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM agent_queued_messages;"), 0)
+        XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM agent_runs;"), 0)
         let replay = await dispatcher.dispatchHTTP(forgedCreate, mutationContext: context)
         XCTAssertEqual(replay.result?.objectValue?["readback"]?.objectValue?["conversation_id"]?.stringValue, conversationID)
         XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM bot_conversations;"), 1)

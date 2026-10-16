@@ -6212,6 +6212,26 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    private struct BotContextualSendUnavailable: LocalizedError {
+        var errorDescription: String? {
+            "Contextual execution is unavailable until runtime isolation is verified."
+        }
+    }
+
+    private func rejectContextualConversationSend(for bot: BotDefinition) throws {
+        let conversation = selectedConversation.flatMap { $0.botID == bot.id ? $0 : nil }
+            ?? selectedConversationByBot[bot.id].flatMap { rememberedID in
+                destConversations(botID: bot.id).first { $0.id == rememberedID }
+            }
+        guard let conversation else { return }
+        try rejectContextualConversationSend(conversation)
+    }
+
+    private func rejectContextualConversationSend(_ conversation: BotConversation) throws {
+        guard try botStore.conversationContextPin(conversationID: conversation.id) != nil else { return }
+        throw BotContextualSendUnavailable()
+    }
+
     private func deskLinkedThreadID(for conversationID: BotConversationID) -> AgentThreadID? {
         if let selected = selectedConversation, selected.id == conversationID {
             return selected.linkedAgentThreadID
@@ -6227,6 +6247,12 @@ public final class BotsViewModel: ObservableObject {
         guard let bot = selectedBot else { return false }
         if let message = deskDistillEffortValidationMessage {
             errorMessage = message
+            return false
+        }
+        do {
+            try rejectContextualConversationSend(for: bot)
+        } catch {
+            errorMessage = error.localizedDescription
             return false
         }
         do {
@@ -6335,6 +6361,7 @@ public final class BotsViewModel: ObservableObject {
                   existing.botID == bot.id, existing.groupID == nil else {
                 throw BotStoreError.notFound
             }
+            try rejectContextualConversationSend(existing)
             if existing.id == titioInboxConversationID {
                 // An LLM must never approve or answer for the user (§0.2):
                 // only the paired user's own text may reach the intercept,
@@ -9924,6 +9951,7 @@ public final class BotsViewModel: ObservableObject {
                 title: Self.titleFromFirstMessage(text)
             )
         }
+        try rejectContextualConversationSend(conversation)
         if conversation.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || conversation.title == "New thread" {
             conversation.title = Self.titleFromFirstMessage(text)

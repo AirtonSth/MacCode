@@ -1532,6 +1532,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let hostID = string(params, "host_id") ?? ""
         let requestedConversationID = string(params, "conversation_id")
         let targetConversationID = requestedConversationID ?? selectedConversation[botID]
+        if let targetConversationID, let uuid = UUID(uuidString: targetConversationID),
+           try store.conversationContextPin(conversationID: BotConversationID(uuid)) != nil {
+            throw Error(code: -32602, message: "Context resource unavailable.")
+        }
         let conversation: BotConversationID?
         if let requestedConversationID, !requestedConversationID.isEmpty {
             guard let uuid = UUID(uuidString: requestedConversationID),

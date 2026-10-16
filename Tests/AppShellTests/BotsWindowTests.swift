@@ -8460,6 +8460,51 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.composerText.contains("/sam more"))
     }
 
+    func test_pinnedDeskSendRejectsBeforeMutatingDraftOrPersistingMessage() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Pinned", title: "Context", provider: .distill)
+        let binding = try context.botStore.grantContext(
+            hostID: context.liveActivityHostIdentity.serverId,
+            botID: bot.id,
+            context: .general,
+            actions: [.read, .send],
+            expectedRevision: nil
+        )
+        let thread = AgentThread(title: "Pinned", provider: .distill, model: "test-main")
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "New thread",
+            linkedAgentThreadID: thread.id
+        )
+        try context.botStore.createContextualConversation(
+            conversation,
+            newThread: thread,
+            hostID: context.liveActivityHostIdentity.serverId,
+            context: .general,
+            policyRevision: binding.policyRevision
+        )
+        vm.openDesk(bot)
+        vm.replaceProvidersForTests([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .distill,
+                models: [],
+                capabilitiesOverride: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
+            )
+        ])
+        vm.selectDeskThread(conversation.id)
+        vm.composerText = "Keep draft"
+
+        XCTAssertFalse(vm.send())
+        XCTAssertEqual(vm.errorMessage, "Contextual execution is unavailable until runtime isolation is verified.")
+        XCTAssertEqual(vm.composerText, "Keep draft")
+        XCTAssertTrue(vm.attachments.isEmpty)
+        XCTAssertTrue(vm.deskMessages.isEmpty)
+        XCTAssertTrue(vm.queuedFollowUpsForTesting(botID: bot.id).isEmpty)
+        XCTAssertTrue(try context.messageRepo.listRecent(threadId: thread.id, limit: 10).isEmpty)
+        XCTAssertNil(try context.threadRepo.get(id: thread.id)?.providerThreadId)
+    }
+
     func test_createDeskThreadStartsEmptyConversation() throws {
         // WHY: Desk had no + thread. Agent App can start a blank thread
         // before the first send.
