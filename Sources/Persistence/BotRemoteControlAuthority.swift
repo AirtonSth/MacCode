@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import CoreModel
 import os
 
@@ -253,7 +254,24 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         if Self.reservedCapabilityIDs.contains(params["capability_id"] as? String ?? "") {
             throw Error.reserved
         }
+        let contextMethods: Set<String> = ["context.list", "context.grant", "context.revoke"]
+        if contextMethods.contains(name) {
+            guard Set(params.keys).isSubset(of: ["host_id", "bot_id", "context_key", "context_version", "policy_revision", "actions", "client_request_id"]) else { throw Error.invalidParams }
+        }
+        if ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil }), !contextMethods.contains(name) {
+            guard let context = parseContext(params), let (hostID, botID) = contextIdentity(params),
+                  let revision = integer(params["policy_revision"]), revision > 0,
+                  let action = contextAction(for: name) else { throw Error.invalidParams }
+            guard try store.authorizes(hostID: hostID, botID: botID, context: context, action: action, policyRevision: revision) else {
+                throw Error(code: -32084, message: "Bot context authority is not active for this request.")
+            }
+            throw Error(code: -32602, message: "Context resource unavailable.")
+        }
         switch name {
+        case "context.list":
+            return try contextList(params: params)
+        case "context.grant", "context.revoke":
+            return try mutate(name: name, params: params, now: now)
         case "list":
             return try list(params: params)
         case "get":
@@ -868,6 +886,60 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     // MARK: - Reads
 
+    private func contextList(params: [String: Any]) throws -> [String: Any] {
+        guard Set(params.keys).isSubset(of: ["host_id", "bot_id"]),
+              let (hostID, botID) = contextIdentity(params) else { throw Error.invalidParams }
+        return ["bindings": try store.listContextBindings(hostID: hostID, botID: botID).map(encodeContextBinding)]
+    }
+
+    private func encodeContextBinding(_ binding: BotContextBinding) -> [String: Any] {
+        ["host_id": binding.hostID, "bot_id": binding.botID.value.uuidString.lowercased(),
+         "context_key": binding.context.storageKey, "context_version": BotContext.contractVersion,
+         "policy_revision": binding.policyRevision, "state": binding.state.rawValue,
+         "actions": binding.actions.map(\.rawValue).sorted()]
+    }
+
+    private func contextIdentity(_ params: [String: Any]) -> (String, BotID)? {
+        guard let host = string(params, "host_id"), !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let raw = string(params, "bot_id"), let uuid = UUID(uuidString: raw) else { return nil }
+        return (host, BotID(uuid))
+    }
+
+    private func contextTarget(_ params: [String: Any]) throws -> (String, BotID, BotContext) {
+        guard let (host, botID) = contextIdentity(params), let context = parseContext(params) else { throw Error.invalidParams }
+        return (host, botID, context)
+    }
+
+    private func contextAction(for method: String) -> BotContextAction? {
+        switch method {
+        case "get", "list", "settings.get", "queue.list", "conversation.list", "attachment.list", "routine.list", "files.list", "browser.state", "guest.state": return .read
+        case "send", "queue.force_now", "conversation.create", "conversation.select", "conversation.clear_all", "conversation.fork": return .send
+        case "attachment.stage", "attachment.import", "attachment.remove", "files.mutate", "files.open_tab", "files.split", "files.location.set", "browser.action", "link.open", "guest.input", "guest.start", "guest.stop", "guest.rebuild", "guest.revoke", "guest.control": return .files
+        case "soul.set": return .memory
+        case "settings.set", "save", "set_pinned", "set_hidden", "desktop.set", "avatar.set", "handle.set", "verbosity.set", "caveman.set", "routing.set": return .configure
+        case "routine.create", "routine.update", "routine.enable", "routine.run", "routine.delete", "scheduler.tick": return .schedule
+        case "peer.ask", "peer.self_config": return .delegate
+        default: return nil
+        }
+    }
+
+    private func parseContext(_ params: [String: Any]) -> BotContext? {
+        guard let version = integer(params["context_version"]), version == BotContext.contractVersion,
+              let key = string(params, "context_key") else { return nil }
+        if key == "general:v1" { return .general }
+        let prefix = "workspace:v1:"
+        guard key.hasPrefix(prefix), let uuid = UUID(uuidString: String(key.dropFirst(prefix.count))),
+              key == "workspace:v1:\(uuid.uuidString.lowercased())" else { return nil }
+        return .workspace(WorkspaceID(uuid))
+    }
+
+    private func integer(_ value: Any?) -> Int64? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue.rounded(.towardZero) == number.doubleValue,
+              number.doubleValue >= Double(Int64.min), number.doubleValue < Double(Int64.max) else { return nil }
+        return number.int64Value
+    }
+
     private func list(params: [String: Any]) throws -> [String: Any] {
         let includeHidden = (params["include_hidden"] as? Bool) ?? false
         let bots = try store.list(includeHidden: includeHidden).map { try encodeBot($0) }
@@ -1065,6 +1137,24 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func perform(name: String, params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         switch name {
+        case "context.grant", "context.revoke":
+            let (hostID, botID, context) = try contextTarget(params)
+            guard let revision = integer(params["policy_revision"]) else { throw Error.invalidParams }
+            let binding: BotContextBinding
+            do {
+                if name == "context.grant" {
+                    guard let rawActions = params["actions"] as? [String], !rawActions.isEmpty,
+                          rawActions.count == Set(rawActions).count,
+                          let actions = Optional(Set(rawActions.compactMap(BotContextAction.init(rawValue:)))),
+                          actions.count == rawActions.count else { throw Error.invalidParams }
+                    binding = try store.grantContext(hostID: hostID, botID: botID, context: context, actions: actions, expectedRevision: revision)
+                } else {
+                    binding = try store.revokeContext(hostID: hostID, botID: botID, context: context, expectedRevision: revision)
+                }
+            } catch let error as BotStoreError {
+                throw Error(code: -32602, message: error.description)
+            }
+            return receipt(requestID: requestID, status: .completed, botID: botID.value.uuidString.lowercased(), readback: encodeContextBinding(binding))
         case "create":
             return try create(params: params, requestID: requestID, now: now)
         case "discard_new":

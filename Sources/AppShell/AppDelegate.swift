@@ -772,14 +772,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func configureManagedProviderAdmission() {
-        guard ManagedProviderAdmissionPolicy.requiresProviderStartPreflight else {
-            return
-        }
+        let requiresResourceAdmission = ManagedProviderAdmissionPolicy.requiresProviderStartPreflight
         let profile = managedProcessMemoryProfile
         let gate = ManagedProviderAdmissionGate()
-        // Best-effort accounting only: never refuse a user-started provider for
-        // session count, memory ceilings, incomplete scans, or store errors.
-        context.coordinator.providerAdmissionCheck = { provider, threadId in
+        // Resource accounting stays best-effort; contextual authorization fails closed.
+        context.coordinator.providerAdmissionCheck = { [weak self] provider, threadId in
+            guard let self else { throw NSError(domain: "RemoteCode.BotContext", code: 2, userInfo: [NSLocalizedDescriptionKey: "Bot context authority is unavailable."]) }
+            let pin = try await MainActor.run { try self.context.botStore.conversationContextPin(linkedTo: threadId) }
+            if pin != nil {
+                let authorized = try await MainActor.run {
+                    guard let conversation = try self.context.botStore.conversationLinked(to: threadId) else { return false }
+                    return try self.context.botStore.authorizesConversation(conversation, hostID: self.context.liveActivityHostIdentity.serverId, action: .send)
+                }
+                guard authorized else { throw NSError(domain: "RemoteCode.BotContext", code: 1, userInfo: [NSLocalizedDescriptionKey: "Bot conversation context is no longer authorized."]) }
+                throw NSError(domain: "RemoteCode.BotContext", code: 2, userInfo: [NSLocalizedDescriptionKey: "Contextual Bot execution is unavailable until scoped runtime isolation is supported."])
+            }
+            guard requiresResourceAdmission else { return }
             guard let store = ProviderProcessOwnership.shared.store() else { return }
             let scan: ManagedProcessScan
             let appFootprintKB: Int?

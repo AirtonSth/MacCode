@@ -128,6 +128,8 @@ public enum HostMutationContract {
     bot.discard_new
     bot.save
     bot.delete
+    bot.context.grant
+    bot.context.revoke
     bot.set_pinned
     bot.set_hidden
     bot.duplicate
@@ -224,6 +226,8 @@ public enum HostMutationContract {
         /// `actor` `{"kind":"none"}` or `{"kind":"bot","bot_id":<uuid>}`, and an
         /// optional `execution_target` `vm` / `mac` (absent or null for the default).
         case threadActor
+        case activityItemIDs(allowSingle: Bool)
+        case optionalBool(String)
     }
 
     /// Private managed-provider mutations reuse the same syntactic and durable
@@ -286,6 +290,24 @@ public enum HostMutationContract {
                   params[key]?.intValue != nil else { throw JSONRPCError.invalidParams }
         case .bool(let key):
             guard params[key]?.boolValue != nil else { throw JSONRPCError.invalidParams }
+        case .optionalBool(let key):
+            guard params[key] == nil || params[key]?.boolValue != nil else { throw JSONRPCError.invalidParams }
+        case .activityItemIDs(let allowSingle):
+            if let itemIDs = params["item_ids"]?.arrayValue {
+                guard itemIDs.count <= 200,
+                      itemIDs.allSatisfy({ $0.stringValue != nil }),
+                      Set(itemIDs.compactMap(\.stringValue)).count == itemIDs.count else {
+                    throw JSONRPCError.invalidParams
+                }
+            } else if allowSingle {
+                guard params["item_ids"] == nil,
+                      params["item_id"]?.stringValue != nil else { throw JSONRPCError.invalidParams }
+            } else {
+                throw JSONRPCError.invalidParams
+            }
+            if params["item_id"] != nil, params["item_id"]?.stringValue == nil {
+                throw JSONRPCError.invalidParams
+            }
         case .object(let key):
             guard params[key]?.objectValue != nil else { throw JSONRPCError.invalidParams }
         case .nestedInt(let object, let key):
@@ -485,6 +507,8 @@ public enum HostMutationContract {
         case "agent.thread.set_pinned": return [.uuid("thread_id"), .bool("pinned")]
         case "agent.thread.set_color": return [.uuid("thread_id"), .string("color")]
         case "agent.thread.execution.configure": return [.uuid("thread_id"), .stringEnum("execution_mode", ["local", "worktree"])]
+        case "agent.activity.viewed.set": return [.activityItemIDs(allowSingle: false), .bool("viewed")]
+        case "agent.activity.acknowledge": return [.activityItemIDs(allowSingle: true), .optionalBool("acknowledged")]
         case "agent.thread.prepare_pr": return [.uuid("workspace_id"), .string("url")]
         case "agent.thread.rollback": return [.uuid("thread_id"), .string("turn_id")]
         case "agent.message.send": return [.uuid("thread_id"), .string("text")]
@@ -573,6 +597,8 @@ public enum HostMutationContract {
         case .int(let key): params[key] = .number(1)
         case .firstPresentInt(let keys): params[keys[0]] = .number(1)
         case .bool(let key): params[key] = .bool(true)
+        case .optionalBool: break
+        case .activityItemIDs: params["item_ids"] = .array([])
         case .object(let key):
             if params[key]?.objectValue == nil { params[key] = .object([:]) }
         case .nestedInt(let object, let key):
@@ -638,6 +664,15 @@ public enum HostMutationContract {
         case .bool(let key):
             add("\(key).missing") { $0.removeValue(forKey: key) }
             add("\(key).type") { $0[key] = .string("true") }
+        case .optionalBool(let key):
+            add("\(key).type") { $0[key] = .string("true") }
+        case .activityItemIDs(let allowSingle):
+            add("item_ids.missing") { $0.removeValue(forKey: "item_ids"); $0.removeValue(forKey: "item_id") }
+            add("item_ids.type") { $0["item_ids"] = .string("item") }
+            add("item_ids.nonstring") { $0["item_ids"] = .array([.number(1)]) }
+            add("item_ids.duplicate") { $0["item_ids"] = .array([.string("item"), .string("item")]) }
+            add("item_ids.too_many") { $0["item_ids"] = .array((0..<201).map { .string("item-\($0)") }) }
+            if allowSingle { add("item_id.type") { $0.removeValue(forKey: "item_ids"); $0["item_id"] = .number(1) } }
         case .object(let key):
             add("\(key).missing") { $0.removeValue(forKey: key) }
             add("\(key).type") { $0[key] = .bool(true) }

@@ -977,6 +977,8 @@ public final class JSONRPCDispatcher {
         "bot.discard_new",
         "bot.save",
         "bot.delete",
+        "bot.context.grant",
+        "bot.context.revoke",
         "bot.set_pinned",
         "bot.set_hidden",
         "bot.duplicate",
@@ -1758,6 +1760,9 @@ public final class JSONRPCDispatcher {
 
     private func dispatchManagedHostUnix(_ req: JSONRPCRequest) async -> JSONRPCResponse {
         let params = req.params ?? [:]
+        if req.method == "bot.context.grant" || req.method == "bot.context.revoke" {
+            return .init(id: req.id, error: JSONRPCError(code: -32098, message: "Bot context grants require an authenticated paired connection or native UI."))
+        }
         let peerReceiptMethod = params["method"]?.stringValue
         let isPeerReceiptStatus = req.method == "bot.peer.receipt.status"
             || (req.method == "bot.receipt.status"
@@ -2585,6 +2590,10 @@ public final class JSONRPCDispatcher {
                     inBatch: Self.rpcInBatch,
                     isExplicitV1: AgentCheckpointListContract.isExplicitV1(params: params)
                 )
+            }
+            if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.context."),
+               ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil }) {
+                throw JSONRPCError(code: -32602, message: "Context resource unavailable.")
             }
             if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.peer.") {
                 let result = try await router.dispatchPairedBotRemote(method: req.method, params: params)
@@ -5238,7 +5247,7 @@ public final class JSONRPCDispatcher {
         "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
         "project.scripts",
         "agent.models.list", "agent.providers.list", "distill.accounts.list", "distill.accounts.routing.get", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
-        "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list", "bot.attachment.list",
+        "bot.context.list", "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list", "bot.attachment.list",
         "bot.routine.list", "bot.files.list", "bot.browser.state", "bot.guest.state",
         "bot.receipt.status", "bot.peer.receipt.status", "bot.attention.list",
         "bot.team.list", "bot.group.list", "bot.group.get",

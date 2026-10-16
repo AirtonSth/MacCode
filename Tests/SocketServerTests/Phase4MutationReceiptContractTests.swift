@@ -1126,29 +1126,43 @@ private final class Phase4LiveServer {
         bootEpoch: UInt64,
         commandReceiptMetrics: CommandReceiptMetrics = CommandReceiptMetrics()
     ) async throws -> Phase4LiveServer {
-        let port = UInt16.random(in: 33_000...44_000)
         let auth = Phase4MutationAuth(tokens: [ownerToken, otherOwnerToken])
-        let server = DirectHTTPServer(
-            port: port,
-            loopbackOnly: false,
-            dispatcher: JSONRPCDispatcher(
-                router: router,
-                commandReceiptMetrics: commandReceiptMetrics
-            ),
-            auth: auth,
-            serverId: hostId,
-            bootEpoch: bootEpoch
-        )
-        try server.start()
+        let (server, port): (DirectHTTPServer, UInt16) = try {
+            var attempts = 0
+            while true {
+                let port = UInt16.random(in: 33_000...44_000)
+                let server = DirectHTTPServer(
+                    port: port,
+                    loopbackOnly: true,
+                    dispatcher: JSONRPCDispatcher(router: router, commandReceiptMetrics: commandReceiptMetrics),
+                    auth: auth,
+                    serverId: hostId,
+                    bootEpoch: bootEpoch
+                )
+                do {
+                    try server.start()
+                    return (server, port)
+                } catch {
+                    server.stop()
+                    attempts += 1
+                    let failure = error as NSError
+                    guard attempts < 3, failure.domain == "RC2.HTTP", failure.code == EADDRINUSE else { throw error }
+                }
+            }
+        }()
+        var handedOff = false
+        defer { if !handedOff { server.stop() } }
         try await Task.sleep(nanoseconds: 80_000_000)
 
         var request = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
         request.setValue("Bearer \(ownerToken)", forHTTPHeaderField: "Authorization")
         request.setValue("\(EventBus.shared.currentSeq)", forHTTPHeaderField: "x-rc2-since-seq")
         let socket = URLSession.shared.webSocketTask(with: request)
+        defer { if !handedOff { socket.cancel(with: .goingAway, reason: nil) } }
         socket.resume()
         let welcome = try await receiveObject(socket)
         let connectionId = try XCTUnwrap(welcome["connectionId"] as? String)
+        handedOff = true
         return Phase4LiveServer(
             server: server,
             socket: socket,
@@ -1230,12 +1244,25 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     private let legacyReceiptUnverifiable = -32092
     private let commandReceiptUnavailable = -32091
 
+    func test_activitySelectionPreflightPreservesSingularAndBulkBoundaries() throws {
+        let maximumIDs = (0..<200).map { JSONValue.string("notification:item-\($0)") }
+        for ids: [JSONValue] in [[], maximumIDs] {
+            XCTAssertNoThrow(try HostMutationContract.preflight(method: "agent.activity.viewed.set", params: ["item_ids": .array(ids), "viewed": .bool(true)]))
+            XCTAssertNoThrow(try HostMutationContract.preflight(method: "agent.activity.acknowledge", params: ["item_ids": .array(ids), "acknowledged": .bool(false)]))
+        }
+        XCTAssertNoThrow(try HostMutationContract.preflight(method: "agent.activity.acknowledge", params: ["item_id": .string("notification:single")]))
+        let tooMany = maximumIDs + [.string("notification:one-too-many")]
+        XCTAssertThrowsError(try HostMutationContract.preflight(method: "agent.activity.viewed.set", params: ["item_ids": .array(tooMany), "viewed": .bool(true)]))
+        XCTAssertThrowsError(try HostMutationContract.preflight(method: "agent.activity.acknowledge", params: ["item_ids": .array(tooMany)]))
+    }
+
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
         // 175 + bot.notice.act and bot.notice.read (Titio notice cards, hub spec §7)
-        // + bot.notice.clear (clear a Titio notification, voice contract §3).
-        XCTAssertEqual(canonical.count, 179)
+        // + bot.notice.clear (clear a Titio notification, voice contract §3),
+        // + explicit context grant/revoke and existing activity viewed/acknowledge.
+        XCTAssertEqual(canonical.count, 183)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
