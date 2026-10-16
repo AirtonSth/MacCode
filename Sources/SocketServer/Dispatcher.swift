@@ -2592,7 +2592,8 @@ public final class JSONRPCDispatcher {
                 )
             }
             if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.context."),
-               ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil }) {
+               ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil }),
+               !(req.method == "bot.conversation.create" && Self.centralMutationExecution) {
                 throw JSONRPCError(code: -32602, message: "Context resource unavailable.")
             }
             if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.peer.") {

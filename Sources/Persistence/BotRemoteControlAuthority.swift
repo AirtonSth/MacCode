@@ -258,14 +258,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         if contextMethods.contains(name) {
             guard Set(params.keys).isSubset(of: ["host_id", "bot_id", "context_key", "context_version", "policy_revision", "actions", "client_request_id"]) else { throw Error.invalidParams }
         }
-        if ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil }), !contextMethods.contains(name) {
+        let hasContext = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
+        if hasContext, !contextMethods.contains(name) {
             guard let context = parseContext(params), let (hostID, botID) = contextIdentity(params),
                   let revision = integer(params["policy_revision"]), revision > 0,
                   let action = contextAction(for: name) else { throw Error.invalidParams }
             guard try store.authorizes(hostID: hostID, botID: botID, context: context, action: action, policyRevision: revision) else {
                 throw Error(code: -32084, message: "Bot context authority is not active for this request.")
             }
-            throw Error(code: -32602, message: "Context resource unavailable.")
+            if name != "conversation.create" { throw Error(code: -32602, message: "Context resource unavailable.") }
+            guard Set(params.keys).isSubset(of: ["client_request_id", "bot_id", "title", "host_id", "context_key", "context_version", "policy_revision"]) else { throw Error.invalidParams }
         }
         switch name {
         case "context.list":
@@ -1914,6 +1916,36 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func conversationCreate(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let title = string(params, "title") ?? "New thread"
+        if ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil }) {
+            guard Set(params.keys).isSubset(of: ["client_request_id", "bot_id", "title", "host_id", "context_key", "context_version", "policy_revision"]),
+                  let context = parseContext(params), let (hostID, contextBotID) = contextIdentity(params),
+                  contextBotID == bot.id, let revision = integer(params["policy_revision"]), revision > 0,
+                  bot.currentRevisionID != nil,
+                  try store.authorizes(hostID: hostID, botID: bot.id, context: context, action: .read, policyRevision: revision),
+                  try store.authorizes(hostID: hostID, botID: bot.id, context: context, action: .send, policyRevision: revision) else {
+                throw Error(code: -32084, message: "Bot context authority is not active for this request.")
+            }
+            let route = routingPref[id(bot)]
+            guard route?["provider"] as? String == AgentProvider.distill.rawValue,
+                  let model = route?["model"] as? String,
+                  !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw Error(code: -32602, message: "Select an explicit Distill Main model before creating a contextual conversation.")
+            }
+            let workspaceID: WorkspaceID?
+            switch context {
+            case .general: workspaceID = nil
+            case .workspace(let workspace): workspaceID = workspace
+            }
+            let thread = AgentThread(workspaceId: workspaceID, title: title, provider: .distill, model: model)
+            let conversation = BotConversation(botID: bot.id, title: title, linkedAgentThreadID: thread.id)
+            let pin = try store.createContextualConversation(conversation, newThread: thread, hostID: hostID, context: context, policyRevision: revision)
+            selectedConversation[id(bot)] = conversation.id.value.uuidString.lowercased()
+            return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+                "conversation_id": conversation.id.value.uuidString.lowercased(), "thread_id": thread.id.value.uuidString.lowercased(),
+                "context_key": pin.context.storageKey, "context_version": pin.contextVersion,
+                "policy_revision": pin.policyRevision, "host_id": pin.hostID, "title": conversation.title,
+            ])
+        }
         let conversation = BotConversation(botID: bot.id, title: title)
         try store.upsertConversation(conversation)
         selectedConversation[id(bot)] = conversation.id.value.uuidString.lowercased()
