@@ -510,6 +510,93 @@ public final class BotComputerGuestService: @unchecked Sendable {
         try stop(botID: identity.storageBotID)
     }
 
+    public func installGatewayLease(
+        identity: BotContextRuntimeIdentity,
+        runID: AgentRunID,
+        port: UInt16
+    ) throws -> BotContextGatewayLease {
+        guard port > 0 else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+        let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+        do {
+            let inspect = try docker.inspect(name: name)
+            try validateGatewayRuntime(inspect, identity: identity)
+            guard inspect.running else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+            let hosts = try docker.exec(name: name, command: ["/bin/cat", "/etc/hosts"], user: "0", detach: false)
+            guard let hostAddress = Self.gatewayIPv4(from: hosts) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            let run = runID.value.uuidString.lowercased()
+            let output = try docker.exec(
+                name: name,
+                command: ["/usr/local/bin/rc-context-network", "--allow-gateway", run, hostAddress, String(port)],
+                user: "0", detach: false
+            )
+            guard output == Data("context-gateway-lease-v1\n".utf8) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            return BotContextGatewayLease(identity: identity, runID: runID, hostAddress: hostAddress, port: port)
+        } catch {
+            stateLock.withLock { _lastReady = nil; _lastReason = "Context gateway lease failed; runtime cleanup unconfirmed." }
+            Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }
+            throw error
+        }
+    }
+
+    public func revokeGatewayLease(_ lease: BotContextGatewayLease) throws {
+        let name = BotComputerGuestSpec.containerName(botID: lease.identity.storageBotID)
+        do {
+            let inspect = try docker.inspect(name: name)
+            try validateGatewayRuntime(inspect, identity: lease.identity)
+            guard inspect.running else { return }
+            let output = try docker.exec(
+                name: name,
+                command: ["/usr/local/bin/rc-context-network", "--revoke-gateway", lease.runID.value.uuidString.lowercased(), lease.hostAddress, String(lease.port)],
+                user: "0", detach: false
+            )
+            guard output == Data("context-gateway-revoked-v1\n".utf8) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+        } catch {
+            stateLock.withLock { _lastReady = nil; _lastReason = "Context gateway cleanup unconfirmed." }
+            Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }
+            throw error
+        }
+    }
+
+    private func validateGatewayRuntime(_ inspect: BotComputerContainerInspect, identity: BotContextRuntimeIdentity) throws {
+        guard inspect.labels[BotComputerGuestSpec.botIDLabelKey] == identity.storageBotID.value.uuidString.lowercased(),
+              inspect.labels["remotecode.context.network"] == "private-egress-v1",
+              inspect.labels[BotComputerGuestSpec.runtimeLabelKey] == BotComputerGuestSpec.runtimeRevision,
+              inspect.networkNames == [BotComputerGuestSpec.networkName(botID: identity.storageBotID)] else {
+            throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+        }
+    }
+
+    static func gatewayIPv4(from data: Data) -> String? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let matches = text.split(whereSeparator: \.isNewline).compactMap { line -> String? in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count > 1, fields.dropFirst().contains("host.docker.internal") else { return nil }
+            return String(fields[0])
+        }
+        guard matches.count == 1 else { return nil }
+        let parts = matches[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        let nums = parts.compactMap { part -> UInt8? in
+            guard let value = UInt8(part), String(value) == part else { return nil }
+            return value
+        }
+        guard nums.count == 4, nums != [0, 0, 0, 0],
+              (nums[0] == 10)
+                || (nums[0] == 172 && (16...31).contains(nums[1]))
+                || (nums[0] == 192 && nums[1] == 168)
+                || (nums[0] == 100 && (64...127).contains(nums[1]))
+                || (nums[0] == 169 && nums[1] == 254)
+                || (nums[0] == 198 && (18...19).contains(nums[1]))
+                || (nums[0] == 0 && nums[1...].contains(where: { $0 != 0 })) else { return nil }
+        return matches[0]
+    }
+
     public func wipe(identity: BotContextRuntimeIdentity) throws {
         let botID = identity.storageBotID
         let name = BotComputerGuestSpec.containerName(botID: botID)

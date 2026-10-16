@@ -26,6 +26,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
     var lastExec: (name: String, command: [String], user: String?, detach: Bool)?
     var lastExecAt: Date?
     var execUsers: [String?] = []
+    var execCommands: [(name: String, command: [String], user: String?)] = []
     var operations: [String] = []
     /// Stands in for a cold `docker start` + desktop boot during provisioning.
     var startDelay: TimeInterval = 0
@@ -111,6 +112,7 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
         lastExec = (name, command, user, detach)
         lastExecAt = Date()
         execUsers.append(user)
+        execCommands.append((name, command, user))
         if command == ["/usr/local/bin/rc-context-network"] {
             operations.append("bootstrap")
             if let bootstrapError { throw bootstrapError }
@@ -159,6 +161,97 @@ private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable 
 
 @MainActor
 final class BotComputerGuestServiceTests: XCTestCase {
+    func test_gatewayLeaseInstallAndRevokeUseExactRootCommandsAndStoppedRevokeIsNoop() throws {
+        let support = makeSupport("rc-gateway-lease")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let bot = BotID()
+        let binding = BotContextBinding(hostID: "host", botID: bot, context: .general, state: .active, policyRevision: 1, actions: [.send])
+        let identity = try BotContextRuntimeIdentity(binding: binding)
+        let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+        fake.containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152, networkNames: [BotComputerGuestSpec.networkName(botID: identity.storageBotID)], labels: [BotComputerGuestSpec.botIDLabelKey: identity.storageBotID.value.uuidString.lowercased(), "remotecode.context.network": "private-egress-v1", BotComputerGuestSpec.runtimeLabelKey: BotComputerGuestSpec.runtimeRevision])
+        fake.execOutput = { command in
+            if command == ["/bin/cat", "/etc/hosts"] { return Data("10.0.0.2 host.docker.internal\n".utf8) }
+            if command.contains("--allow-gateway") { return Data("context-gateway-lease-v1\n".utf8) }
+            if command.contains("--revoke-gateway") { return Data("context-gateway-revoked-v1\n".utf8) }
+            return nil
+        }
+        let service = BotComputerGuestService(appSupport: support, docker: fake)
+        let runID = AgentRunID()
+        let lease = try service.installGatewayLease(identity: identity, runID: runID, port: 8080)
+        let allow = ["/usr/local/bin/rc-context-network", "--allow-gateway", runID.value.uuidString.lowercased(), "10.0.0.2", "8080"]
+        XCTAssertEqual(fake.execCommands.map(\.command).suffix(2), [["/bin/cat", "/etc/hosts"], allow])
+        XCTAssertEqual(fake.execUsers.suffix(1), ["0"])
+        try service.revokeGatewayLease(lease)
+        XCTAssertEqual(fake.execCommands.last?.command, ["/usr/local/bin/rc-context-network", "--revoke-gateway", runID.value.uuidString.lowercased(), "10.0.0.2", "8080"])
+        fake.containers[name]?.running = false
+        let calls = fake.execCalls
+        try service.revokeGatewayLease(lease)
+        XCTAssertEqual(fake.execCalls, calls)
+        XCTAssertTrue(fake.stopped.isEmpty)
+    }
+
+    func test_gatewayLeaseRejectsForeignRuntimeAndMalformedOrFailedRootCommandsWithoutStopping() throws {
+        let support = makeSupport("rc-gateway-lease-rejection")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let bot = BotID()
+        let binding = BotContextBinding(hostID: "host", botID: bot, context: .general, state: .active, policyRevision: 1, actions: [.send])
+        let identity = try BotContextRuntimeIdentity(binding: binding)
+        let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+        let network = BotComputerGuestSpec.networkName(botID: identity.storageBotID)
+        let validLabels = [
+            BotComputerGuestSpec.botIDLabelKey: identity.storageBotID.value.uuidString.lowercased(),
+            "remotecode.context.network": "private-egress-v1",
+            BotComputerGuestSpec.runtimeLabelKey: BotComputerGuestSpec.runtimeRevision,
+        ]
+        fake.containers[name] = BotComputerContainerInspect(running: true, imageID: "img", hostPort: 49152, networkNames: [network], labels: validLabels)
+        fake.execOutput = { command in
+            if command == ["/bin/cat", "/etc/hosts"] { return Data("10.0.0.2 host.docker.internal\n".utf8) }
+            return Data("context-gateway-lease-v1\n".utf8)
+        }
+        let service = BotComputerGuestService(appSupport: support, docker: fake)
+        let lease = BotContextGatewayLease(identity: identity, runID: AgentRunID(), hostAddress: "10.0.0.2", port: 8080)
+
+        fake.containers[name]?.labels[BotComputerGuestSpec.runtimeLabelKey] = "foreign-runtime"
+        XCTAssertThrowsError(try service.installGatewayLease(identity: identity, runID: lease.runID, port: 8080))
+        XCTAssertEqual(fake.execCalls, 0)
+        XCTAssertTrue(fake.stopped.isEmpty)
+
+        fake.containers[name]?.labels = validLabels
+        fake.containers[name]?.networkNames = ["foreign-network"]
+        XCTAssertThrowsError(try service.revokeGatewayLease(lease))
+        XCTAssertEqual(fake.execCalls, 0)
+        XCTAssertTrue(fake.stopped.isEmpty)
+
+        fake.containers[name]?.networkNames = [network]
+        fake.execOutput = { command in
+            if command == ["/bin/cat", "/etc/hosts"] { return Data("10.0.0.2 host.docker.internal\n".utf8) }
+            return Data("bad-ack\n".utf8)
+        }
+        XCTAssertThrowsError(try service.installGatewayLease(identity: identity, runID: lease.runID, port: 8080))
+        XCTAssertTrue(fake.stopped.isEmpty)
+        XCTAssertThrowsError(try service.revokeGatewayLease(lease))
+        XCTAssertTrue(fake.stopped.isEmpty)
+
+        fake.execOutput = nil
+        fake.execError = BotComputerGuestError.dockerUnavailable
+        XCTAssertThrowsError(try service.installGatewayLease(identity: identity, runID: lease.runID, port: 8080))
+        XCTAssertTrue(fake.stopped.isEmpty)
+        XCTAssertThrowsError(try service.revokeGatewayLease(lease))
+        XCTAssertTrue(fake.stopped.isEmpty)
+    }
+
+    func test_gatewayIPv4PolicyAcceptsOrbStackAndRejectsNoncanonicalAndPublicAddresses() throws {
+        for address in ["0.250.250.254", "10.1.2.3", "100.64.0.1", "169.254.1.1", "198.18.0.1"] {
+            XCTAssertEqual(BotComputerGuestService.gatewayIPv4(from: Data("127.0.0.1 localhost\n\(address) host.docker.internal\n".utf8)), address)
+        }
+        for address in ["000.250.250.254", "8.8.8.8", "127.0.0.1", "0.0.0.0", "bad"] {
+            XCTAssertNil(BotComputerGuestService.gatewayIPv4(from: Data("\(address) host.docker.internal\n".utf8)))
+        }
+        XCTAssertNil(BotComputerGuestService.gatewayIPv4(from: Data("10.0.0.1 host.docker.internal\n192.168.1.1 host.docker.internal\n".utf8)))
+    }
+
     func test_guestInputStepsAcceptsIntegralJSONNumbersForPointerAndDrag() throws {
         // WHY: JSONValue stores every JSON number as a Double before the
         // paired router reaches this parser; integral coordinates must keep

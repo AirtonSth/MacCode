@@ -147,15 +147,15 @@ final class BotComputerGuestSpecTests: XCTestCase {
         )
     }
 
-    func test_recipeRevision6ShipsTheInGuestAgentToolchain() throws {
+    func test_recipeRevision7ShipsTheInGuestAgentToolchain() throws {
         // WHY: the bot's agent runs inside this image. It needs git and ps for
         // its own shell, wmctrl + xwd for linux-use, and a pinned Playwright MCP
         // that only runs on Node >= 20 (bookworm's apt node is 18). Only the
         // revision bump makes existing guests pick the recipe up, and the tag
         // carries the revision so another app build on r4 never rebuilds it.
-        XCTAssertEqual(BotComputerGuestSpec.recipeRevision, "6")
-        XCTAssertEqual(BotComputerGuestSpec.imageTag, "remotecode/computer:r6")
-        XCTAssertEqual(BotComputerGuestSpec.runtimeRevision, "6")
+        XCTAssertEqual(BotComputerGuestSpec.recipeRevision, "7")
+        XCTAssertEqual(BotComputerGuestSpec.imageTag, "remotecode/computer:r7")
+        XCTAssertEqual(BotComputerGuestSpec.runtimeRevision, "7")
         XCTAssertTrue(BotComputerGuestSpec.recipeFileNames.contains("context-network.sh"))
         let recipe = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -196,7 +196,7 @@ final class BotComputerGuestSpecTests: XCTestCase {
         XCTAssertEqual(options.capAdd, ["NET_ADMIN"])
         XCTAssertEqual(options.securityOptions, ["no-new-privileges:true"])
         XCTAssertEqual(options.tmpfs, ["/run:rw,nosuid,nodev,noexec,mode=0755"])
-        XCTAssertEqual(options.image, "remotecode/computer:r6")
+        XCTAssertEqual(options.image, "remotecode/computer:r7")
     }
 
     func test_createOptionsMountTheAgentKitReadOnlyAndRunAnInitWithTheHostAlias() throws {

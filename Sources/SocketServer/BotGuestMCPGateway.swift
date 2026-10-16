@@ -18,14 +18,26 @@ import Persistence
 /// handlers block on sockets, files and the network. The listener binds
 /// 127.0.0.1 on the first `issue`.
 public final class BotGuestMCPGateway: @unchecked Sendable {
+    public struct ContextBinding: Equatable, Sendable {
+        public var pin: BotConversationContextPin
+        public var threadID: AgentThreadID
+
+        public init(pin: BotConversationContextPin, threadID: AgentThreadID) {
+            self.pin = pin
+            self.threadID = threadID
+        }
+    }
+
     public struct Binding: Sendable, Equatable {
         public var runID: String
+        public var context: ContextBinding?
         /// What the handlers read: bot, thread and run identity, delegation
         /// capability, app socket and App Support. Never sent to the guest.
         public var hostEnvironment: [String: String]
 
-        public init(runID: String, hostEnvironment: [String: String]) {
+        public init(runID: String, hostEnvironment: [String: String], context: ContextBinding? = nil) {
             self.runID = runID
+            self.context = context
             self.hostEnvironment = hostEnvironment
         }
 
@@ -132,15 +144,26 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
 
     private let routes: [String: Route]
     private let maxConcurrentCallsPerRun: Int
+    private let context: ContextBinding?
+    private let contextStore: BotStore?
+    private let secretStore: any BotSecretStore
     private let lock = NSLock()
     private var bindings: [LiveBinding] = []
     private var listener: LoopbackHTTPListener!
 
     public init(
         routes: [Route] = BotGuestMCPGateway.defaultRoutes,
-        maxConcurrentCallsPerRun: Int = BotGuestMCPGateway.defaultMaxConcurrentCallsPerRun
+        maxConcurrentCallsPerRun: Int = BotGuestMCPGateway.defaultMaxConcurrentCallsPerRun,
+        context: ContextBinding? = nil,
+        contextStore: BotStore? = nil,
+        secretStore: any BotSecretStore = BotKeychainSecretStore()
     ) {
-        self.routes = Dictionary(uniqueKeysWithValues: routes.map { ($0.name, $0) })
+        self.context = context
+        self.contextStore = contextStore
+        self.secretStore = secretStore
+        self.routes = context == nil
+            ? Dictionary(uniqueKeysWithValues: routes.map { ($0.name, $0) })
+            : [:]
         self.maxConcurrentCallsPerRun = maxConcurrentCallsPerRun
         self.listener = LoopbackHTTPListener(name: "rc2.guest-gateway") { [weak self] request, isClientGone in
             self?.respond(to: request, isClientGone: isClientGone) ?? LoopbackHTTPResponse(status: 503)
@@ -150,6 +173,9 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
     /// Starts the listener if needed and returns a new 256-bit bearer for one
     /// run. Only its SHA-256 is kept.
     public func issue(_ binding: Binding) throws -> Issued {
+        guard binding.context == context,
+              (context == nil || (contextStore != nil && UUID(uuidString: binding.runID) != nil)),
+              bindingIsAuthorized(binding) else { throw BotStoreError.notFound }
         let port = try listener.start()
         var bytes = [UInt8](repeating: 0, count: 32)
         guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
@@ -208,11 +234,13 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
         guard request.method == "POST" else {
             return LoopbackHTTPResponse(status: 405, headers: ["Allow": "POST"])
         }
-        guard let live = authenticate(request.headers["authorization"]) else {
+        guard let live = authenticate(request.headers["authorization"]),
+              bindingIsAuthorized(live.binding) else {
             return LoopbackHTTPResponse(status: 401)
         }
         let path = request.path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? ""
-        guard path.hasPrefix("/mcp/"), let route = routes[String(path.dropFirst("/mcp/".count))] else {
+        let requestedRouteName = path.hasPrefix("/mcp/") ? String(path.dropFirst("/mcp/".count)) : ""
+        guard path.hasPrefix("/mcp/"), let route = route(named: requestedRouteName, binding: live.binding) else {
             return LoopbackHTTPResponse(status: 404)
         }
         let contentType = request.headers["content-type"]?.lowercased() ?? ""
@@ -280,6 +308,9 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
         let revoked = live.revoked
         lock.unlock()
 
+        guard !revoked, bindingIsAuthorized(live.binding) else {
+            return Self.runEndedResponse(id: id)
+        }
         guard let finished else {
             return revoked ? Self.runEndedResponse(id: id) : nil
         }
@@ -287,6 +318,59 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
             return Self.errorResponse(id: id, code: -32603, message: "RemoteCode returned no reply.")
         }
         return .json(filtered(data, method: method, route: route))
+    }
+
+    private func bindingIsAuthorized(_ binding: Binding) -> Bool {
+        guard binding.context == context else { return false }
+        guard let context else { return true }
+        guard let store = contextStore,
+              UUID(uuidString: binding.runID) != nil,
+              (try? store.authorizes(hostID: context.pin.hostID, botID: context.pin.botID, context: context.pin.context, action: .read, policyRevision: context.pin.policyRevision)) == true,
+              (try? store.authorizes(hostID: context.pin.hostID, botID: context.pin.botID, context: context.pin.context, action: .send, policyRevision: context.pin.policyRevision)) == true,
+              (try? store.authorizes(hostID: context.pin.hostID, botID: context.pin.botID, context: context.pin.context, action: .configure, policyRevision: context.pin.policyRevision)) == true,
+              (try? store.conversationContextPin(conversationID: context.pin.conversationID)) == context.pin,
+              let conversation = try? store.conversation(id: context.pin.conversationID),
+              conversation.botID == context.pin.botID,
+              conversation.linkedAgentThreadID == context.threadID,
+              (try? store.conversationContextPin(linkedTo: context.threadID)) == context.pin else { return false }
+        return true
+    }
+
+    private func route(named name: String, binding: Binding) -> Route? {
+        guard context != nil else { return routes[name] }
+        guard name == BotSelfConfigCatalog.serverName,
+              let context, let store = contextStore,
+              bindingIsAuthorized(binding) else { return nil }
+        let identity: BotContextRuntimeIdentity
+        do { identity = try BotContextRuntimeIdentity(hostID: context.pin.hostID, botID: context.pin.botID, context: context.pin.context, policyRevision: context.pin.policyRevision) }
+        catch { return nil }
+        let environment = [
+            BotSelfConfigCatalog.callerEnvironmentKey: context.pin.botID.value.uuidString,
+            BotPeerDelegation.threadEnvironmentKey: context.threadID.value.uuidString,
+            BotPeerDelegation.runEnvironmentKey: binding.runID,
+        ]
+        let adapter = BotContextSecretStore(identity: identity, store: secretStore) { [weak self] in
+            guard let self, let context = binding.context else { return false }
+            return self.bindingIsAuthorized(binding) && self.context == context
+        }
+        return Route(name: name, allowedTools: [BotSelfConfigCatalog.listSecrets], keepsServerInstructions: false) { _, line in
+            guard Self.contextualArgumentsAreSupported(line, botID: context.pin.botID) else { return nil }
+            return ManagedBotSelfConfigMCP(environment: environment, storeFactory: { _ in store }, secretStore: adapter).handle(line)
+        }
+    }
+
+    private static func contextualArgumentsAreSupported(_ line: String, botID: BotID) -> Bool {
+        guard let data = line.data(using: .utf8),
+              let message = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              message["method"] as? String == "tools/call" else { return true }
+        let params = message["params"] as? [String: Any] ?? [:]
+        guard params["name"] as? String == BotSelfConfigCatalog.listSecrets else { return true }
+        guard params["arguments"] == nil || params["arguments"] is [String: Any] else { return false }
+        let arguments = params["arguments"] as? [String: Any] ?? [:]
+        guard Set(arguments.keys).isSubset(of: ["bot_id"]) else { return false }
+        guard let raw = arguments["bot_id"] else { return true }
+        guard let value = raw as? String, let id = UUID(uuidString: value) else { return false }
+        return id == botID.value
     }
 
     /// The Mac handlers' text sends website writes to `bot_browser_open` (the

@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         procps \
         iptables \
+        conntrack \
         wmctrl \
         x11-apps \
     && rm -rf /var/lib/apt/lists/*

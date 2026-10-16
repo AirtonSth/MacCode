@@ -55,6 +55,20 @@ public struct BotContextRuntimeIdentity: Equatable, Sendable {
     }
 }
 
+public struct BotContextGatewayLease: Equatable, Sendable {
+    public let identity: BotContextRuntimeIdentity
+    public let runID: AgentRunID
+    public let hostAddress: String
+    public let port: UInt16
+
+    public init(identity: BotContextRuntimeIdentity, runID: AgentRunID, hostAddress: String, port: UInt16) {
+        self.identity = identity
+        self.runID = runID
+        self.hostAddress = hostAddress
+        self.port = port
+    }
+}
+
 public enum BotContextRuntimeIdentityError: Error, Equatable, Sendable {
     case invalidBinding
 }

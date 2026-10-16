@@ -42,6 +42,21 @@ final class BotContextRuntimeTests: XCTestCase {
         }
     }
 
+    func test_gatewayLeaseEqualityIncludesRunAndContext() throws {
+        let bot = BotID()
+        let workspace = BotContext.workspace(WorkspaceID())
+        let identity = try BotContextRuntimeIdentity(hostID: "host", botID: bot, context: workspace, policyRevision: 1)
+        let sameLease = BotContextGatewayLease(identity: identity, runID: AgentRunID(), hostAddress: "127.0.0.1", port: 1234)
+        let sameLeaseCopy = BotContextGatewayLease(identity: identity, runID: sameLease.runID, hostAddress: "127.0.0.1", port: 1234)
+        let otherRun = BotContextGatewayLease(identity: identity, runID: AgentRunID(), hostAddress: "127.0.0.1", port: 1234)
+        let otherIdentity = try BotContextRuntimeIdentity(hostID: "host", botID: bot, context: .general, policyRevision: 1)
+        let otherContext = BotContextGatewayLease(identity: otherIdentity, runID: sameLease.runID, hostAddress: "127.0.0.1", port: 1234)
+
+        XCTAssertEqual(sameLease, sameLeaseCopy)
+        XCTAssertNotEqual(sameLease, otherRun)
+        XCTAssertNotEqual(sameLease, otherContext)
+    }
+
     private func makeBinding(
         host: String,
         bot: BotID,
