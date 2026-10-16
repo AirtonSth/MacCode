@@ -233,6 +233,42 @@ final class BotGuestRunResolverTests: XCTestCase {
         await plan.finish(.completed).value
     }
 
+    func test_contextPinnedThreadRefusesBeforeGuestPreparationOrMacFallback() async throws {
+        for marked in [true, false] {
+            let f = try await makeFixture()
+            let grant = try f.ctx.botStore.grantContext(
+                hostID: f.ctx.liveActivityHostIdentity.serverId,
+                botID: f.bot.id,
+                context: .general,
+                actions: [.read, .send],
+                expectedRevision: nil
+            )
+            let thread = try makeThread(f, marked: marked)
+            let conversation = BotConversation(botID: f.bot.id, title: "Pinned", linkedAgentThreadID: thread.id)
+            try f.ctx.botStore.createContextualConversation(
+                conversation,
+                hostID: f.ctx.liveActivityHostIdentity.serverId,
+                context: .general,
+                policyRevision: grant.policyRevision
+            )
+            let marker = try Data(contentsOf: f.hostHome.appendingPathComponent("claude-auth.json"))
+
+            do {
+                _ = try await f.resolver.prepare(request(thread)) { _ in }
+                XCTFail("context-pinned thread must refuse execution")
+            } catch let error as DistillGuestLaunchError {
+                XCTAssertEqual(error, .unavailable("Contextual execution is unavailable until runtime isolation is verified."))
+            }
+
+            XCTAssertEqual(try Data(contentsOf: f.hostHome.appendingPathComponent("claude-auth.json")), marker)
+            XCTAssertEqual(f.vm.calls.count, 0)
+            XCTAssertTrue(f.refreshes.values.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.guestDistillHome.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.runsDirectory.path))
+            XCTAssertNil(f.registry.active(botID: f.bot.id))
+        }
+    }
+
     // MARK: - Routing
 
     func test_legacyVMThreadWithoutTheMarker_andAMarkedThreadMovedToTheMac_stayOnTheMac() async throws {

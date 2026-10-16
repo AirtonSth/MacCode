@@ -136,3 +136,9 @@ SHA-256 of the ten changed code/test/resource files:
 - `Tests/CoreModelTests/BotComputerGuestSpecTests.swift`: `78e0eb19046cd780568325cc8d820fe43fa3fbc49ab2841b65fa76e06dfb9958`
 
 Limits: proof covers bounded controlled-context networking only. It does not establish inbound isolation from unmanaged legacy guests, public proxies, credential/MCP gateway security, revocation or Stop-tree behavior, full adversarial IPv6 coverage, Docker Desktop portability, migration safety or capacity. Restricted/contextual execution remains unavailable.
+
+### Native guest resolver prerequisite checkpoint
+
+The resolver now checks the actual persisted context pin before the guest-marker early return. Pinned threads refuse execution before the legacy global sign-in mirror or nil/Mac fallback; persistence errors propagate. Tests cover marked and unmarked pinned threads, unchanged synthetic global credentials, and zero VM, refresh, copy, lease or claim effects. Parent ran `BotGuestRunResolverTests` with `--build-system native`: 36 tests passed, 0 failed, exit 0, on the current two-file diff. Independent focused source review found no concrete defect. This is a prerequisite refusal checkpoint, not positive proof of the contextual gateway or credential path; that remains next.
+
+Base HEAD: `dceec5a71054c6aff28d8957bc4b51d87f166afb`. Source SHA-256: `Sources/AppShell/BotGuestRunResolver.swift` `28705499bd561204ef36888d5f4927bda34543ef96580a14b9ef329e50565923`; `Tests/AppShellTests/BotGuestRunResolverTests.swift` `5e939cbbd6620bacbf0bba32f839f8ef986b1ef511334cff2d07a92ec6e5aff`.

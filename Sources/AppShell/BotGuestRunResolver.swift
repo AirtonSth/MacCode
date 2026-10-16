@@ -107,6 +107,11 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         _ request: AgentRunRequest,
         progress: @escaping @Sendable (DistillGuestStage) -> Void
     ) async throws -> DistillGuestLaunchPlan? {
+        if try deps.botStore.conversationContextPin(linkedTo: request.threadId) != nil {
+            throw DistillGuestLaunchError.unavailable(
+                "Contextual execution is unavailable until runtime isolation is verified."
+            )
+        }
         guard let placement = try deps.threadRepo.guestPlacement(of: request.threadId),
               placement.runsInGuest else { return nil }
         let stamps = BotGuestPrepareIntervals()
