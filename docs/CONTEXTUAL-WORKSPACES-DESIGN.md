@@ -38,6 +38,14 @@ The prescribed `ui-ux-pro-max` generator recommended a Real-Time / Operations La
 |---|---|---|---|---|
 | taste-accessibility | Direction | applied | Carry accessibility through native controls: readable contrast, visible focus, accessible names, usable targets, explicit non-color status, and reduced motion. Validate against platform behavior rather than copying web-only semantic HTML/WCAG implementation recipes. | Installed skill read; native token/control files inspected. |
 
+## iOS implementation follow-up — commit `8780451af7bd29db26413bd00013526a26328659`
+
+The iOS implementation uses a native authorized-context picker built with existing SwiftUI `List` and `NavigationStack`, and existing menu/header components and design-system tokens. It does not infer grants; the legacy badge remains unchanged when no context exists. Header context labeling for VoiceOver and Large Content Size was reviewed and fixed. Narrow-column iPad layout can visually truncate the runtime line; its accessible label remains full, and the sheet is explicit.
+
+Reported verification for this iOS commit: parent final run completed 242 iOS unit/session tests with 0 failures (exit 0). Native iPad Pro 13-inch, M4, iOS 26.5 journey completed 1 pass, 0 failures (exit 0) at 09:28:58; covered tap/cancel, reopen General, settled hydration, type/send refusal, exact draft, no Bot send, and upload. The phone journey passed earlier; stronger assertions also passed after the combined wrapper failed on a fixture test, then the fixture was isolated and corrected and passed. Phone and iPad screenshots were inspected; no viewport dimensions are asserted. No real-host provider, UI grants/revocation, workspace journey, Dynamic Type, VoiceOver navigation, reduced-motion, human-trial, or full-plan verification is claimed.
+
+The initial verification-pending statement below records the consultation-stage state only; it does not supersede this implementation follow-up. The existing skill coverage ledger and consultation claims remain unchanged.
+
 ## Precedence and verification
 
 - User requirement to preserve current UI/UX and repository-native token/control systems override generated web direction and visual recommendations.
