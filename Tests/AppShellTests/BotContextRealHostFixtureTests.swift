@@ -3,6 +3,7 @@ import XCTest
 import AgentRuntime
 import CoreModel
 import Persistence
+@testable import Surfaces
 @testable import AppShell
 
 @MainActor
@@ -57,10 +58,65 @@ final class BotContextRealHostFixtureTests: XCTestCase {
             XCTFail("refusing to overwrite existing fixture database")
             return
         }
+        ctx.saveSnapshot()
+        XCTAssertNotNil(try ctx.snapshotRepo.latest()?.layout.workspaces[workspace.id])
         let escaped = snapshot.path.replacingOccurrences(of: "'", with: "''")
         try ctx.db.execute("VACUUM INTO '\(escaped)';")
         let fixture = Fixture(hostID: host, botID: botA.id, bBotID: botB.id, workspaceID: workspace.id, expectedBRevision: grantB.policyRevision)
         try JSONEncoder().encode(fixture).write(to: root.appendingPathComponent("fixture.json"), options: .atomic)
+    }
+
+    func test_exportCanonicalNavigationFixture() throws {
+        guard let rootPath = ProcessInfo.processInfo.environment[Self.rootKey] else {
+            throw XCTSkip("set RC_CONTEXT_REAL_HOST_FIXTURE_ROOT to export the real-host fixture")
+        }
+        try test_exportRealHostFixture()
+        let root = try Self.validatedRoot(rootPath)
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: root.appendingPathComponent("fixture.json")))
+        let support = root.appendingPathComponent("app-support", isDirectory: true)
+        let runtimeDB = support.appendingPathComponent("remotecode.sqlite")
+        let ctx = try AppContext(channel: .debug, dbPathOverride: runtimeDB.path, appSupportOverride: support.path, privateAccountAPI: SilentWakeRecordingAPI(), performLaunchRunReconciliation: false)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let store = ctx.botStore
+        let workspaceBinding = try store.grantContext(hostID: fixture.hostID, botID: fixture.botID, context: .workspace(fixture.workspaceID), actions: [.read, .send], expectedRevision: nil)
+        let generalBinding = try store.grantContext(hostID: fixture.hostID, botID: fixture.botID, context: .general, actions: [.read, .send], expectedRevision: nil)
+        XCTAssertEqual(workspaceBinding.policyRevision, 1)
+        XCTAssertEqual(generalBinding.policyRevision, 1)
+
+        var workspaceThread = AgentThread(workspaceId: fixture.workspaceID, title: "Navigation Workspace A", provider: .distill, model: "fixture-context-main")
+        workspaceThread.status = .completed
+        let workspaceConversation = BotConversation(botID: fixture.botID, title: "Navigation Workspace A", linkedAgentThreadID: workspaceThread.id)
+        try store.createContextualConversation(workspaceConversation, newThread: workspaceThread, hostID: fixture.hostID, context: .workspace(fixture.workspaceID), policyRevision: workspaceBinding.policyRevision)
+        var generalThread = AgentThread(title: "Navigation General", provider: .distill, model: "fixture-context-main")
+        generalThread.status = .completed
+        let generalConversation = BotConversation(botID: fixture.botID, title: "Navigation General", linkedAgentThreadID: generalThread.id)
+        try store.createContextualConversation(generalConversation, newThread: generalThread, hostID: fixture.hostID, context: .general, policyRevision: generalBinding.policyRevision)
+        let finishedAt = Date()
+        try ctx.runRepo.upsert(AgentRun(threadId: workspaceThread.id, provider: .distill, model: "fixture-context-main", status: .completed, startedAt: finishedAt, finishedAt: finishedAt))
+        try ctx.runRepo.upsert(AgentRun(threadId: generalThread.id, provider: .distill, model: "fixture-context-main", status: .completed, startedAt: finishedAt, finishedAt: finishedAt))
+
+        let descriptor = try router.createSurface(workspace: fixture.workspaceID, type: .agentApp, paneID: nil, title: "Navigation Workspace A")
+        defer {
+            if let surface = SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface {
+                surface.close()
+                SurfaceRegistry.shared.unregister(descriptor.id)
+            }
+        }
+        try router.selectAgentThread(thread: workspaceThread.id, surfaceID: descriptor.id)
+        ctx.saveSnapshot()
+        XCTAssertNotNil(try ctx.snapshotRepo.latest()?.layout.workspaces[fixture.workspaceID])
+        let navigation: [String: String] = [
+            "hostID": fixture.hostID,
+            "botID": fixture.botID.value.uuidString.lowercased(),
+            "workspaceID": fixture.workspaceID.value.uuidString.lowercased(),
+            "workspaceThreadID": workspaceThread.id.value.uuidString.lowercased(),
+            "workspaceConversationID": workspaceConversation.id.value.uuidString.lowercased(),
+            "generalThreadID": generalThread.id.value.uuidString.lowercased(),
+            "generalConversationID": generalConversation.id.value.uuidString.lowercased(),
+            "surfaceID": descriptor.id.value.uuidString.lowercased(),
+        ]
+        try JSONEncoder().encode(navigation).write(to: root.appendingPathComponent("navigation.json"), options: .atomic)
     }
 
     func test_verifyRealHostFixtureAfterRevoke() throws {
@@ -120,7 +176,7 @@ final class BotContextRealHostFixtureTests: XCTestCase {
               root.resolvingSymlinksInPath().path == root.path else {
             throw NSError(domain: "ContextFixturePath", code: 1)
         }
-        for child in ["source-support", "source.sqlite", "app-support", "app-support/remotecode.sqlite", "fixture.json"] {
+        for child in ["source-support", "source.sqlite", "app-support", "app-support/remotecode.sqlite", "fixture.json", "navigation.json"] {
             let target = root.appendingPathComponent(child)
             guard target.resolvingSymlinksInPath().path == target.path,
                   (try? target.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {

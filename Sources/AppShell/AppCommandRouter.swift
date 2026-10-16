@@ -2981,11 +2981,36 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// In-process schedule owner (main app). Run Now / ticks call this instead of XPC.
     public weak var scheduledTaskScheduler: ScheduledTaskScheduler?
 
+    /// Resolve authorization for a context-pinned thread without applying legacy routing.
+    static func contextPinnedThreadDestination(
+        _ threadID: AgentThreadID,
+        context ctx: AppContext
+    ) throws -> AgentThreadOpenDestination? {
+        guard let pin = try ctx.botStore.conversationContextPin(linkedTo: threadID) else { return nil }
+        guard pin.hostID == ctx.liveActivityHostIdentity.serverId,
+              let conversation = try ctx.botStore.conversation(id: pin.conversationID),
+              conversation.linkedAgentThreadID == threadID,
+              conversation.botID == pin.botID,
+              let thread = try ctx.threadRepo.get(id: threadID),
+              thread.actor == .bot(pin.botID),
+              ((pin.context == .general && thread.workspaceId == nil)
+               || (thread.workspaceId.map { pin.context == .workspace($0) } ?? false)),
+              try ctx.botStore.authorizes(
+                hostID: pin.hostID,
+                botID: pin.botID,
+                context: pin.context,
+                action: .read,
+                policyRevision: pin.policyRevision
+              ) else {
+            return .unavailable
+        }
+        return .bot(conversation.botID, conversation.id)
+    }
+
     /// Where `openAgentThread` could land, checked before a caller leaves its own screen.
-    /// Same workspace check as its guard; a thread with no open workspace that a bot
-    /// conversation owns belongs in that bot's Desk instead.
     public func agentThreadOpenDestination(_ threadID: AgentThreadID) throws -> AgentThreadOpenDestination {
         guard let ctx = context else { return .unavailable }
+        if let pinned = try Self.contextPinnedThreadDestination(threadID, context: ctx) { return pinned }
         if let workspaceID = try ctx.threadRepo.workspaceId(of: threadID),
            ctx.state.workspaces[workspaceID] != nil {
             return .workspace(workspaceID)
@@ -3075,20 +3100,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     @discardableResult
     public func openBotsDesk(botID: BotID, conversationID: BotConversationID? = nil) throws -> Bool {
+        guard let ctx = context,
+              let bot = try ctx.botStore.get(id: botID) else { return false }
+        if let conversationID {
+            guard let conversation = try ctx.botStore.conversation(id: conversationID),
+                  conversation.botID == botID else { return false }
+            if try ctx.botStore.conversationContextPin(conversationID: conversationID) != nil {
+                guard let threadID = conversation.linkedAgentThreadID,
+                      try Self.contextPinnedThreadDestination(threadID, context: ctx)
+                        == .bot(botID, conversationID) else { return false }
+            }
+        }
         NSApplication.shared.activate(ignoringOtherApps: true)
         windowController?.show()
         windowController?.presentBotsInMainContent()
         windowController?.flushPendingRefresh()
         guard let vm = botsViewModel else { return false }
-        guard let bot = vm.bots.first(where: { $0.id == botID })
-                ?? (context.flatMap { try? $0.botStore.get(id: botID) }) else { return false }
-        if let conversationID {
-            guard try context?.botStore.conversation(id: conversationID)?.botID == botID else { return false }
-        }
         vm.openDesk(bot)
         if let conversationID { vm.selectDeskThread(conversationID) }
         windowController?.flushPendingRefresh()
         guard vm.selectedBotID == botID, vm.screen == .desk else { return false }
+        if let conversationID { guard vm.selectedConversation?.id == conversationID else { return false } }
         guard let destination = windowController?.window else { return false }
         return destination.isVisible && destination.isMiniaturized == false
     }

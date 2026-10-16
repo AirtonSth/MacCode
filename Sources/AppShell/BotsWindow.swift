@@ -5292,7 +5292,33 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func selectDeskThread(_ id: BotConversationID) {
-        guard let conversation = conversations.first(where: { $0.id == id }) else { return }
+        let conversation: BotConversation
+        do {
+            guard let resolved = try conversations.first(where: { $0.id == id })
+                    ?? context.botStore.conversation(id: id) else {
+                errorMessage = "Could not open conversation: It no longer exists."
+                return
+            }
+            guard resolved.botID == selectedBotID else {
+                errorMessage = "Could not open conversation: It belongs to another Bot."
+                return
+            }
+            if try context.botStore.conversationContextPin(conversationID: id) != nil {
+                guard let threadID = resolved.linkedAgentThreadID,
+                      try AppCommandRouter.contextPinnedThreadDestination(threadID, context: context)
+                        == .bot(resolved.botID, resolved.id) else {
+                    errorMessage = "Could not open conversation: Its pinned context is unavailable."
+                    return
+                }
+            }
+            conversation = resolved
+        } catch {
+            errorMessage = "Could not open conversation: \(error.localizedDescription)"
+            return
+        }
+        if !conversations.contains(where: { $0.id == id }) {
+            conversations.append(conversation)
+        }
         captureDeskRouting()
         selectedConversation = conversation
         publishInterestedDeskThreadID()
