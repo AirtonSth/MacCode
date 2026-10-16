@@ -71,6 +71,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     public var onHasLiveRun: ((BotID) -> Bool)?
     public var onStopRun: ((BotID, String?, String?, String?, Bool, String) -> Void)?
+    public var onContextBindingChanged: ((BotContextBinding) -> Bool)?
     public var onStartGuest: ((BotID, String, String, [String: Any]) -> Void)?
     public var onStopGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onRebuildGuest: ((BotID, String, [String: Any]) -> Void)?
@@ -1182,7 +1183,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             } catch let error as BotStoreError {
                 throw Error(code: -32602, message: error.description)
             }
-            return receipt(requestID: requestID, status: .completed, botID: botID.value.uuidString.lowercased(), readback: encodeContextBinding(binding))
+            var readback = encodeContextBinding(binding)
+            readback["run_cancellation_requested"] = onContextBindingChanged?(binding) ?? false
+            return receipt(requestID: requestID, status: .completed, botID: botID.value.uuidString.lowercased(), readback: readback)
         case "create":
             return try create(params: params, requestID: requestID, now: now)
         case "discard_new":

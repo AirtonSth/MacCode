@@ -1094,6 +1094,11 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         continuationConversationID: BotConversationID? = nil,
         continuationPeerThreadID: AgentThreadID? = nil
     ) -> Task<Void, Never>? {
+        do {
+            guard try botStore.conversationContextPin(linkedTo: originThread.id) == nil else { return nil }
+        } catch {
+            return nil
+        }
         let display = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let peerDisplay = peerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !display.isEmpty,

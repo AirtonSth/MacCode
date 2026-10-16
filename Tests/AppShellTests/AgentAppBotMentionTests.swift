@@ -75,6 +75,203 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(parsed.body, "Inbox is clear.")
     }
 
+    func test_pinnedCallerCannotListOrAskPeersAndAgentAppMentionCreatesNothing() async throws {
+        // WHY: a contextual Bot may not inspect peer identity or dispatch a
+        // Mac-hosted peer before scoped execution exists.
+        let (_, botsVM, _, quinn, _, ctx) = try makeWiredMentionSurface(peerReply: "unused")
+        defer {
+            for threadID in ctx.coordinator.activeThreadIdsSnapshot() { ctx.coordinator.stopRun(threadId: threadID) }
+            try? FileManager.default.removeItem(at: ctx.appSupportDirectory.deletingLastPathComponent())
+        }
+        let runner = ControlledBotHandoffRunner(provider: .distill)
+        ctx.coordinator.replaceProvider(.distill, runner: runner)
+        let workspace = try XCTUnwrap(ctx.state.workspaces.values.first)
+        let bot = try XCTUnwrap(try ctx.botStore.get(id: quinn.id))
+        let hostID = ctx.liveActivityHostIdentity.serverId
+        let context = BotContext.workspace(workspace.id)
+        let binding = try ctx.botStore.grantContext(
+            hostID: hostID, botID: bot.id, context: context,
+            actions: [.read, .send, .delegate], expectedRevision: nil
+        )
+        let peerA = try botsVM.create(name: "Peer A", title: "Peer", provider: .distill)
+        let peerB = try botsVM.create(name: "Peer B", title: "Peer", provider: .distill)
+        _ = try ctx.botStore.grantContext(
+            hostID: hostID, botID: peerB.id, context: .general,
+            actions: [.read, .send, .delegate], expectedRevision: nil
+        )
+        _ = try ctx.botStore.grantContext(
+            hostID: hostID, botID: peerA.id, context: context,
+            actions: [.read, .send, .delegate], expectedRevision: nil
+        )
+        let pinnedThread = AgentThread(
+            workspaceId: workspace.id, title: "Pinned caller", provider: .distill,
+            model: "fake-model", status: .completed,
+            modelSelection: AgentModelSelection(provider: .distill, modelId: "fake-model")
+        )
+        let conversation = BotConversation(
+            botID: bot.id, title: "Pinned caller", linkedAgentThreadID: pinnedThread.id
+        )
+        _ = try ctx.botStore.createContextualConversation(
+            conversation, newThread: pinnedThread, hostID: hostID,
+            context: context, policyRevision: binding.policyRevision
+        )
+        _ = try await ctx.router!.sendAgentMessage(
+            thread: pinnedThread.id, text: "test", provider: .distill,
+            model: "fake-model", permissionMode: nil, reasoningEffort: nil
+        )
+        let started = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(runner.requests.first)
+        let capability = try XCTUnwrap(
+            request.environment[AgentDelegationCapabilityTransport.environmentKey]
+        )
+        XCTAssertThrowsError(try ctx.router!.listBotPeers(
+            callerThread: pinnedThread.id, callerRun: request.runId,
+            delegationCapability: capability
+        )) { error in
+            XCTAssertEqual((error as? JSONRPCError)?.code, -32084)
+            XCTAssertEqual((error as? JSONRPCError)?.message, "Contextual Bot delegation is unavailable until scoped peer execution is supported.")
+        }
+        for handle in [peerA.handle, peerB.handle, "unknown-peer"] {
+            do {
+                _ = try await ctx.router!.askBotPeer(
+                    callerThread: pinnedThread.id, callerRun: request.runId,
+                    handle: handle, prompt: "inspect", replyMode: .consult,
+                    delegationCapability: capability
+                )
+                XCTFail("pinned caller must not ask peer")
+            } catch {
+                XCTAssertEqual((error as? JSONRPCError)?.code, -32084)
+                XCTAssertEqual((error as? JSONRPCError)?.message, "Contextual Bot delegation is unavailable until scoped peer execution is supported.")
+            }
+        }
+        XCTAssertThrowsError(try ctx.router!.invokeDelegatedBotSelfConfig(
+            callerThread: pinnedThread.id,
+            callerRun: request.runId,
+            toolName: BotSelfConfigCatalog.getSettings,
+            arguments: [:],
+            delegationCapability: capability
+        )) { error in
+            XCTAssertEqual((error as? JSONRPCError)?.code, -32084)
+            XCTAssertEqual((error as? JSONRPCError)?.message, "Contextual Bot delegation is unavailable until scoped peer execution is supported.")
+        }
+        let beforeConversations = try ctx.botStore.listConversations(botID: peerB.id).count
+        let beforeMessages = try ctx.messageRepo.list(threadId: pinnedThread.id).count
+        let accepted = ctx.botPeerHandoffAuthority.submitAgentAppMention(
+            peer: peerB, text: "@peer-b inspect", peerText: "inspect",
+            originThread: try XCTUnwrap(try ctx.threadRepo.get(id: pinnedThread.id)),
+            activityID: AgentMessageID(), hostRunID: request.runId,
+            providerSnapshots: [], resumeHostAfterPeer: false
+        )
+        XCTAssertNil(accepted)
+        XCTAssertEqual(try ctx.botStore.listConversations(botID: peerB.id).count, beforeConversations)
+        XCTAssertEqual(try ctx.messageRepo.list(threadId: pinnedThread.id).count, beforeMessages)
+        XCTAssertEqual(runner.requests.count, 1)
+        ctx.coordinator.stopRun(threadId: pinnedThread.id)
+    }
+
+    func test_stopAndContextRevokeCancelLegacyDescendantsButNotOtherContext() async throws {
+        // WHY: host Stop and context revocation must clean up preregistered legacy descendants without cancelling another live context.
+        let (_, _, _, quinn, _, ctx) = try makeWiredMentionSurface(peerReply: "unused")
+        let rootDir = ctx.appSupportDirectory.deletingLastPathComponent()
+        var createdThreads: [AgentThreadID] = []
+        defer {
+            for threadID in createdThreads { ctx.coordinator.stopRun(threadId: threadID) }
+            try? FileManager.default.removeItem(at: rootDir)
+        }
+        let runner = ControlledBotHandoffRunner(provider: .distill)
+        ctx.coordinator.replaceProvider(.distill, runner: runner)
+        let bot = try XCTUnwrap(try ctx.botStore.get(id: quinn.id))
+        let hostID = ctx.liveActivityHostIdentity.serverId
+        let workspace = try XCTUnwrap(ctx.state.workspaces.values.first)
+        let contextA = BotContext.workspace(workspace.id)
+        let contextB = BotContext.general
+        let bindingA = try ctx.botStore.grantContext(hostID: hostID, botID: bot.id, context: contextA, actions: [.read, .send], expectedRevision: nil)
+        let bindingB = try ctx.botStore.grantContext(hostID: hostID, botID: bot.id, context: contextB, actions: [.read, .send], expectedRevision: nil)
+
+        func makeThread(_ title: String, contextual: BotContext? = nil, revision: Int64? = nil) throws -> AgentThread {
+            let thread = AgentThread(workspaceId: contextual == .general ? nil : workspace.id, title: title, provider: .distill, model: "fake-model", status: .completed, modelSelection: AgentModelSelection(provider: .distill, modelId: "fake-model"))
+            createdThreads.append(thread.id)
+            if let contextual, let revision {
+                let conversation = BotConversation(botID: bot.id, title: title, linkedAgentThreadID: thread.id)
+                _ = try ctx.botStore.createContextualConversation(conversation, newThread: thread, hostID: hostID, context: contextual, policyRevision: revision)
+            } else {
+                try ctx.threadRepo.upsert(thread)
+            }
+            return thread
+        }
+        func start(_ thread: AgentThread, expectedRequests: Int) async throws -> AgentRunID {
+            _ = try await ctx.router!.sendAgentMessage(thread: thread.id, text: "test", provider: .distill, model: "fake-model", permissionMode: nil, reasoningEffort: nil)
+            let started = await waitUntil(timeout: 5) { runner.requests.count >= expectedRequests }
+            XCTAssertTrue(started, "Expected provider request for \(thread.title)")
+            return try XCTUnwrap(runner.requests.first { $0.threadId == thread.id }?.runId)
+        }
+        func legacyChain(_ parent: AgentRunID, title: String, expected: Int) async throws -> (AgentThread, AgentRunID, AgentThread, AgentRunID) {
+            let child = try makeThread("\(title) child")
+            let childRun = try await start(child, expectedRequests: expected)
+            ctx.coordinator.registerDelegatedRun(childRun, threadId: child.id, parentRunId: parent)
+            let grandchild = try makeThread("\(title) grandchild")
+            let grandchildRun = try await start(grandchild, expectedRequests: expected + 1)
+            ctx.coordinator.registerDelegatedRun(grandchildRun, threadId: grandchild.id, parentRunId: childRun)
+            return (child, childRun, grandchild, grandchildRun)
+        }
+
+        let rootA = try makeThread("Context A root", contextual: contextA, revision: bindingA.policyRevision)
+        let rootB = try makeThread("Context B root", contextual: contextB, revision: bindingB.policyRevision)
+        let runA = try await start(rootA, expectedRequests: 1)
+        // Seed pre-existing coordinator work; public contextual provider admission remains closed.
+        let runB = try await ctx.coordinator.startRun(AgentRunRequest(
+            threadId: rootB.id, provider: .distill, model: "fake-model",
+            cwd: BotHome(appSupportDirectory: ctx.appSupportDirectory, bot: bot).root.path, prompt: "existing B"
+        ))
+        let chainA = try await legacyChain(runA, title: "A", expected: 3)
+        ctx.coordinator.stopRun(threadId: rootA.id)
+        let stoppedA = await waitUntil(timeout: 5) {
+            (try? ctx.runRepo.get(id: runA)?.status) == .cancelled
+                && (try? ctx.runRepo.get(id: chainA.1)?.status) == .cancelled
+                && (try? ctx.runRepo.get(id: chainA.3)?.status) == .cancelled
+        }
+        XCTAssertTrue(stoppedA, "Stop must durably cancel preregistered legacy descendants")
+        XCTAssertEqual(ctx.coordinator.activeRunId(threadId: rootB.id), runB)
+
+        let rootA2 = try makeThread("Context A replacement", contextual: contextA, revision: bindingA.policyRevision)
+        let runA2 = try await start(rootA2, expectedRequests: 5)
+        let chainA2 = try await legacyChain(runA2, title: "A replacement", expected: 6)
+        XCTAssertTrue(runner.finish(runID: runA2, status: .completed, reply: "parent done"))
+        let completedParent = await waitUntil(timeout: 5) {
+            (try? ctx.runRepo.get(id: runA2)?.status) == .completed
+                && ctx.coordinator.activeRunId(threadId: rootA2.id) == nil
+        }
+        XCTAssertTrue(completedParent)
+        XCTAssertEqual(try ctx.runRepo.get(id: chainA2.1)?.status, .running)
+        XCTAssertEqual(try ctx.runRepo.get(id: chainA2.3)?.status, .running)
+        let rootA3 = try makeThread("Context A active revoke", contextual: contextA, revision: bindingA.policyRevision)
+        let runA3 = try await start(rootA3, expectedRequests: 8)
+        let chainA3 = try await legacyChain(runA3, title: "A active revoke", expected: 9)
+        let authority = try XCTUnwrap(ctx.router!.botRoutineAuthority)
+        let result = try authority.dispatch(method: "bot.context.revoke", params: [
+            "client_request_id": UUID().uuidString,
+            "host_id": hostID,
+            "bot_id": bot.id.value.uuidString.lowercased(),
+            "context_key": contextA.storageKey,
+            "context_version": 1,
+            "policy_revision": bindingA.policyRevision,
+        ])
+        XCTAssertEqual((result["readback"] as? [String: Any])?["run_cancellation_requested"] as? Bool, true)
+        XCTAssertEqual(try ctx.botStore.getContextBinding(hostID: hostID, botID: bot.id, context: contextA)?.state, .revoked)
+        let revokedA = await waitUntil(timeout: 5) {
+            (try? ctx.runRepo.get(id: runA2)?.status) == .completed
+                && (try? ctx.runRepo.get(id: chainA2.1)?.status) == .cancelled
+                && (try? ctx.runRepo.get(id: chainA2.3)?.status) == .cancelled
+                && (try? ctx.runRepo.get(id: runA3)?.status) == .cancelled
+                && (try? ctx.runRepo.get(id: chainA3.1)?.status) == .cancelled
+                && (try? ctx.runRepo.get(id: chainA3.3)?.status) == .cancelled
+        }
+        XCTAssertTrue(revokedA, "revoke must durably cancel legacy descendants")
+        XCTAssertEqual(try ctx.botStore.getContextBinding(hostID: hostID, botID: bot.id, context: contextB)?.state, .active)
+        XCTAssertEqual(ctx.coordinator.activeRunId(threadId: rootB.id), runB)
+    }
+
     func test_configureAgentAppBotMentionsReadsBotStore() throws {
         // WHY: the router must publish live bots into the composer. A
         // hard-coded empty provider would show @ suggestions that never resolve.

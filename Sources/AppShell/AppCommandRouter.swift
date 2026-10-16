@@ -3507,6 +3507,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             mutation: mutation,
             method: method
         )
+        if try ctx.botStore.conversationContextPin(linkedTo: threadID) != nil {
+            throw JSONRPCError(code: -32084, message: "Contextual Bot delegation is unavailable until scoped peer execution is supported.")
+        }
         return ctx
     }
 
@@ -3971,6 +3974,29 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
         created.onHasLiveRun = { [weak self] id in
             self?.botsViewModel?.hasLiveRun(botID: id) ?? false
+        }
+        created.onContextBindingChanged = { [weak self] binding in
+            guard let self, let ctx = self.context,
+                  binding.hostID == ctx.liveActivityHostIdentity.serverId else { return false }
+            do {
+                let conversations = try ctx.botStore.listConversations(botID: binding.botID, includeGroupMembers: true)
+                let threads = try conversations.compactMap { conversation -> AgentThreadID? in
+                    guard let threadID = conversation.linkedAgentThreadID,
+                          let pin = try ctx.botStore.conversationContextPin(conversationID: conversation.id),
+                          pin.hostID == binding.hostID,
+                          pin.botID == binding.botID,
+                          pin.context == binding.context,
+                          (binding.state != .active || pin.policyRevision != binding.policyRevision) else { return nil }
+                    return threadID
+                }
+                for threadID in threads {
+                    ctx.coordinator.stopRun(threadId: threadID)
+                    try ctx.coordinator.stopDelegatedRunsForThread(threadId: threadID)
+                }
+                return true
+            } catch {
+                return false
+            }
         }
         created.onStopRun = { [weak self] id, conversationID, runID, runRequestID, force, requestID in
             guard let self else { return }

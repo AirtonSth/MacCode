@@ -2052,6 +2052,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func stopRun(_ runId: AgentRunID) {
         lock.lock()
         let threadId = activeThreads.first(where: { $0.value == runId })?.key
+            ?? pendingProviderStarts.first(where: { $0.value.runId == runId })?.key
+        if let owner = reservedProviderStarts.removeValue(forKey: runId) {
+            cancelledProviderStartRuns[runId] = owner
+        }
         let handle = active[runId]
         lock.unlock()
         if let threadId {
@@ -4879,27 +4883,43 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Stops every delegated child of `runId` by THREAD, including children
-    /// whose provider start is still in preflight. Direct children are stopped
-    /// through the normal stop path, which cascades again for deeper chains
-    /// (bot asking bot); `cascadeStopsInFlight` breaks accidental cycles.
+    /// Stops delegated descendants owned by this thread without stopping the
+    /// parent run itself. Snapshot parent IDs before resolving their durable routes.
+    public func stopDelegatedRunsForThread(threadId: AgentThreadID) throws {
+        lock.lock()
+        let parentRunIds = Set(delegatedRuns.values.map(\.parentRunId))
+        lock.unlock()
+        for parentRunId in parentRunIds {
+            guard try runRepo.route(of: parentRunId)?.threadId == threadId else { continue }
+            stopDelegatedChildRuns(of: parentRunId)
+        }
+    }
+
     private func stopDelegatedChildRuns(of runId: AgentRunID) {
         lock.lock()
         guard !cascadeStopsInFlight.contains(runId) else {
             lock.unlock()
             return
         }
-        cascadeStopsInFlight.insert(runId)
-        let childThreadIds = delegatedRuns.compactMap { _, link -> AgentThreadID? in
-            link.parentRunId == runId ? link.threadId : nil
+        var visited: Set<AgentRunID> = [runId]
+        var frontier = [runId]
+        var descendantRunIds: [AgentRunID] = []
+        while let parentRunId = frontier.popLast() {
+            for (childRunId, link) in delegatedRuns where link.parentRunId == parentRunId {
+                guard visited.insert(childRunId).inserted else { continue }
+                frontier.append(childRunId)
+                descendantRunIds.append(childRunId)
+            }
         }
+        let ownedStops = visited.subtracting(cascadeStopsInFlight)
+        cascadeStopsInFlight.formUnion(ownedStops)
         lock.unlock()
         defer {
             lock.lock()
-            cascadeStopsInFlight.remove(runId)
+            cascadeStopsInFlight.subtract(ownedStops)
             lock.unlock()
         }
-        childThreadIds.forEach { stopRun(threadId: $0) }
+        descendantRunIds.forEach { stopRun($0) }
     }
 
     private func activeRunProjectionLocked() -> ActiveRunProjection {

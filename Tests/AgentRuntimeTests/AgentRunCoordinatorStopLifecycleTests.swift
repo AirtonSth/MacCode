@@ -97,6 +97,61 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         }
     }
 
+    func test_stopRun_cascadesThroughUnmappedDelegationAndLeavesUnrelatedRun() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("delegated-stop-transitive")
+        let root = AgentThread(title: "root", provider: .codex, model: "fake-model")
+        let grandchild = AgentThread(title: "grandchild", provider: .codex, model: "fake-model")
+        let unrelated = AgentThread(title: "unrelated", provider: .codex, model: "fake-model")
+        try [root, grandchild, unrelated].forEach { try threadRepo.upsert($0) }
+        final class CountingCancelRunner: AgentProviderRunner, @unchecked Sendable {
+            let provider: AgentProvider = .codex
+            private let lock = NSLock()
+            private var cancellations = 0
+            var cancelledCount: Int { lock.withLock { cancellations } }
+            func listModels() async -> [AgentModelDescriptor] { [] }
+            func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+                onEvent(.status(.running))
+                return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+                    guard let self else { return }
+                    self.lock.withLock { self.cancellations += 1 }
+                    onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
+                }
+            }
+        }
+        let runner = CountingCancelRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo, providers: [.codex: runner]
+        )
+        let rootRun = try await coordinator.startRun(AgentRunRequest(
+            threadId: root.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "root"
+        ))
+        let grandchildRun = try await coordinator.startRun(AgentRunRequest(
+            threadId: grandchild.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "grandchild"
+        ))
+        let unrelatedRun = try await coordinator.startRun(AgentRunRequest(
+            threadId: unrelated.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "unrelated"
+        ))
+        let pendingChild = AgentThread(title: "pending child", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(pendingChild)
+        let pendingRun = AgentRunID()
+        coordinator.registerDelegatedRun(pendingRun, threadId: pendingChild.id, parentRunId: rootRun)
+        coordinator.registerDelegatedRun(grandchildRun, threadId: grandchild.id, parentRunId: pendingRun)
+        coordinator.registerDelegatedRun(AgentRunID(), threadId: unrelated.id, parentRunId: rootRun)
+        coordinator.registerDelegatedRun(rootRun, threadId: root.id, parentRunId: grandchildRun)
+
+        coordinator.stopRun(rootRun)
+        coordinator.stopRun(rootRun)
+
+        XCTAssertEqual(runner.cancelledCount, 2,
+                       "registered running descendants must stop once, cycle must terminate, and repeated stop must stay idempotent")
+        XCTAssertNil(coordinator.activeRunId(threadId: root.id))
+        XCTAssertNil(coordinator.activeRunId(threadId: grandchild.id))
+        XCTAssertEqual(coordinator.activeRunId(threadId: unrelated.id), unrelatedRun,
+                       "cascade must preserve unrelated worker")
+        XCTAssertEqual(try runRepo.get(id: unrelatedRun)?.status, .running)
+    }
+
     func test_stopRun_whenCancelFinishesSynchronously_firesExactlyOneTerminalBroadcast() async throws {
         let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-double-fire")
         let thread = AgentThread(title: "stop me", provider: .codex, model: "fake-model")
@@ -467,6 +522,54 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
                       "no cancelled race iteration may leave a hidden active run")
         XCTAssertTrue(try threadIds.allSatisfy { try threadRepo.get(id: $0)?.status == .cancelled },
                       "every pending/running stop must persist a terminal cancelled thread")
+    }
+
+    func test_stopRootCancelsDelegatedChildWhileProviderStartIsPending() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-pending-delegated-child")
+        let root = AgentThread(title: "root", provider: .codex, model: "fake-model")
+        let child = AgentThread(title: "child", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(root)
+        try threadRepo.upsert(child)
+        let runner = PendingStopStressRunner()
+        defer { runner.releaseThrough(.max) }
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+
+        runner.releaseThrough(1)
+        let rootRun = try await coordinator.startRun(AgentRunRequest(
+            threadId: root.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "root"
+        ))
+        XCTAssertEqual(coordinator.activeRunId(threadId: root.id), rootRun)
+
+        let childRun = AgentRunID()
+        coordinator.registerDelegatedRun(childRun, threadId: child.id, parentRunId: rootRun)
+        let childStart = Task {
+            try await coordinator.startRun(AgentRunRequest(
+                runId: childRun, threadId: child.id, provider: .codex,
+                model: "fake-model", cwd: tmp, prompt: "child"
+            ))
+        }
+        await waitUntil { runner.enteredCount == 2 }
+        XCTAssertEqual(runner.enteredCount, 2, "child provider start must remain pending before Stop")
+
+        coordinator.stopRun(rootRun)
+        runner.releaseThrough(2)
+        _ = try await childStart.value
+        await waitUntil { runner.cancelledCount == 2 }
+
+        XCTAssertEqual(runner.cancelledCount, 2, "Stop must cancel root and pending delegated child")
+        XCTAssertEqual(try runRepo.get(id: rootRun)?.status, .cancelled)
+        XCTAssertEqual(try runRepo.get(id: childRun)?.status, .cancelled,
+                       "pending child run must remain durable and cancelled")
+        XCTAssertEqual(try threadRepo.get(id: root.id)?.status, .cancelled)
+        XCTAssertEqual(try threadRepo.get(id: child.id)?.status, .cancelled)
+        XCTAssertTrue(coordinator.activeThreadIdsSnapshot().isEmpty,
+                      "Stop must not lose the pending child or leave active threads")
     }
 
     // MARK: - F37: user run invalidates a scheduled auto-continuation

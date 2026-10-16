@@ -719,6 +719,69 @@ final class ProviderPreparationProductionWiringTests: XCTestCase {
         )
     }
 
+    func test_stopRunByID_cancelsReservedOnlyDelegatedRunWithoutStoppingReusedThread() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("prep-runid-stop")
+        let parent = AgentThread(title: "parent", provider: .codex, model: "fake-model")
+        let reusedThread = AgentThread(title: "reused", provider: .codex, model: "fake-model")
+        let idleThread = AgentThread(title: "idle", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(parent)
+        try threadRepo.upsert(reusedThread)
+        try threadRepo.upsert(idleThread)
+        final class HeldRunner: AgentProviderRunner, @unchecked Sendable {
+            let provider: AgentProvider = .codex
+            private let lock = NSLock()
+            private var _startCount = 0
+            var startCount: Int { lock.withLock { _startCount } }
+            func listModels() async -> [AgentModelDescriptor] { [] }
+            func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+                lock.withLock { _startCount += 1 }
+                onEvent(.status(.running))
+                return AgentRunHandle(runId: request.runId, process: nil) {
+                    onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
+                }
+            }
+        }
+        let runner = HeldRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo, providers: [.codex: runner]
+        )
+        let parentRun = try await coordinator.startRun(AgentRunRequest(
+            threadId: parent.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "parent"
+        ))
+        let liveRun = try await coordinator.startRun(AgentRunRequest(
+            threadId: reusedThread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "live"
+        ))
+        let reservedChild = AgentRunID()
+        let reservedIdleChild = AgentRunID()
+        coordinator.reserveProviderStart(threadId: reusedThread.id, runId: reservedChild)
+        coordinator.reserveProviderStart(threadId: idleThread.id, runId: reservedIdleChild)
+        coordinator.registerDelegatedRun(reservedChild, threadId: reusedThread.id, parentRunId: parentRun)
+        coordinator.registerDelegatedRun(reservedIdleChild, threadId: idleThread.id, parentRunId: parentRun)
+
+        coordinator.stopRun(parentRun)
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: reservedChild, threadId: reusedThread.id, provider: .codex,
+                model: "fake-model", cwd: tmp, prompt: "must not spawn"
+            ))
+            XCTFail("stopped reserved run must not start")
+        } catch { /* reused thread may reject for its own active run */ }
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: reservedIdleChild, threadId: idleThread.id, provider: .codex,
+                model: "fake-model", cwd: tmp, prompt: "must be cancelled"
+            ))
+            XCTFail("stopped idle reserved run must not start")
+        } catch AgentRunAcceptanceError.cancelled { }
+        catch { XCTFail("expected cancelled acceptance, got \\(error)") }
+
+        XCTAssertEqual(runner.startCount, 2, "cancelled reserved children must never reach runner")
+        XCTAssertEqual(coordinator.activeRunId(threadId: reusedThread.id), liveRun,
+                       "stopping stale child reservation must not stop live run on reused thread")
+        XCTAssertEqual(try runRepo.get(id: liveRun)?.status, .running)
+    }
+
     /// Cancelled preflight without startRun must not leave residual bookkeeping.
     func test_discardReservation_clearsCancelTokens() {
         let tmp = NSTemporaryDirectory() + "rc2-prep-discard-" + UUID().uuidString
