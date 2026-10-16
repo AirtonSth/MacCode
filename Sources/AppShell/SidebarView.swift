@@ -174,6 +174,25 @@ public final class SidebarViewModel: ObservableObject {
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
 
+    public struct AuthorizedBotConversationRow: Identifiable, Equatable, Sendable {
+        public let botID: BotID
+        public let botName: String
+        public let context: BotContext
+        public let conversationID: BotConversationID?
+        public let title: String
+        public var id: String { "\(botID.value.uuidString):\(context.storageKey)" }
+
+        nonisolated public init(botID: BotID, botName: String, context: BotContext, conversationID: BotConversationID?, title: String) {
+            self.botID = botID
+            self.botName = botName
+            self.context = context
+            self.conversationID = conversationID
+            self.title = title
+        }
+    }
+
+    @Published public private(set) var authorizedBotConversationRows: [AuthorizedBotConversationRow] = []
+
     @Published public var workspaces: [Workspace] = [] {
         didSet {
             busyStateCache.removeAll(keepingCapacity: true)
@@ -286,6 +305,12 @@ public final class SidebarViewModel: ObservableObject {
     /// In-flight off-main reload of usage.json. A new notification cancels the
     /// prior task so a burst of usage changes coalesces into one read.
     private var accountUsageReloadTask: Task<Void, Never>?
+    private var authorizedBotRowsTask: Task<Void, Never>?
+    private var authorizedBotRowsGeneration: UInt64 = 0
+    private var authorizedBotRowsNeedsRefresh = false
+    private var authorizedBotRowsHostID: String?
+    private var authorizedBotRowsWorkspaceIDs: Set<WorkspaceID>?
+    var authorizedBotRowsLoaderForTesting: (@Sendable (BotStore, AgentThreadRepository, String, Set<WorkspaceID>) -> [AuthorizedBotConversationRow]?)?
     private let updateChecker: AppUpdateChecking?
     private let settingsStore: SettingsStore
     private let insomniaPower: InsomniaPowerManaging
@@ -381,11 +406,151 @@ public final class SidebarViewModel: ObservableObject {
             ProviderUsageCrossProcess.removeObserver(accountUsageDistributedObserver)
         }
         accountUsageReloadTask?.cancel()
+        authorizedBotRowsTask?.cancel()
         if let activityCountsObserver {
             Task { @MainActor in PetActivityCountsProjection.shared.removeObserver(activityCountsObserver) }
         }
         powerMonitor.stop()
         insomniaPower.releaseProcessAssertions()
+    }
+
+    private func reloadAuthorizedBotConversationRows() {
+        guard let context else {
+            authorizedBotRowsTask?.cancel()
+            authorizedBotRowsTask = nil
+            authorizedBotRowsGeneration &+= 1
+            authorizedBotConversationRows = []
+            return
+        }
+        let hostID = context.liveActivityHostIdentity.serverId
+        let workspaceIDs = Set(context.state.workspaces.keys)
+        if authorizedBotRowsTask != nil {
+            guard authorizedBotRowsHostID == hostID, authorizedBotRowsWorkspaceIDs == workspaceIDs else {
+                authorizedBotRowsGeneration &+= 1
+                authorizedBotRowsTask?.cancel()
+                authorizedBotRowsTask = nil
+                authorizedBotRowsNeedsRefresh = false
+                authorizedBotConversationRows = []
+                authorizedBotRowsHostID = nil
+                authorizedBotRowsWorkspaceIDs = nil
+                return reloadAuthorizedBotConversationRows()
+            }
+            authorizedBotRowsNeedsRefresh = true
+            return
+        }
+        let botStore = context.botStore
+        let threadRepo = context.threadRepo
+        authorizedBotRowsGeneration &+= 1
+        let generation = authorizedBotRowsGeneration
+        authorizedBotRowsNeedsRefresh = false
+        authorizedBotRowsHostID = hostID
+        authorizedBotRowsWorkspaceIDs = workspaceIDs
+        let loader = authorizedBotRowsLoaderForTesting
+        authorizedBotRowsTask = Task { [weak self] in
+            let result = await Task.detached {
+                if let loader { loader(botStore, threadRepo, hostID, workspaceIDs) }
+                else { Self.loadAuthorizedBotConversationRows(botStore: botStore, threadRepo: threadRepo, hostID: hostID, workspaceIDs: workspaceIDs) }
+            }.value
+            guard let self, !Task.isCancelled, self.authorizedBotRowsGeneration == generation else { return }
+            if self.authorizedBotRowsNeedsRefresh {
+                self.authorizedBotRowsTask = nil
+                self.authorizedBotRowsHostID = nil
+                self.authorizedBotRowsWorkspaceIDs = nil
+                self.reloadAuthorizedBotConversationRows()
+                return
+            }
+            guard let currentContext = self.context,
+                  currentContext.liveActivityHostIdentity.serverId == hostID,
+                  Set(currentContext.state.workspaces.keys) == workspaceIDs else {
+                self.authorizedBotRowsTask = nil
+                self.authorizedBotRowsHostID = nil
+                self.authorizedBotRowsWorkspaceIDs = nil
+                if self.context != nil {
+                    self.authorizedBotConversationRows = []
+                    self.reloadAuthorizedBotConversationRows()
+                } else {
+                    self.authorizedBotConversationRows = []
+                }
+                return
+            }
+            if let rows = result {
+                if self.authorizedBotConversationRows != rows { self.authorizedBotConversationRows = rows }
+            } else {
+                self.authorizedBotConversationRows = []
+            }
+            self.authorizedBotRowsTask = nil
+            if self.authorizedBotRowsNeedsRefresh { self.reloadAuthorizedBotConversationRows() }
+        }
+    }
+
+    func reloadAuthorizedBotConversationRowsAndWait() async {
+        reloadAuthorizedBotConversationRows()
+        while let task = authorizedBotRowsTask {
+            await task.value
+        }
+    }
+
+    nonisolated static func loadAuthorizedBotConversationRows(
+        botStore: BotStore,
+        threadRepo: AgentThreadRepository,
+        hostID: String,
+        workspaceIDs: Set<WorkspaceID>
+    ) -> [AuthorizedBotConversationRow]? {
+        do {
+            let bots = try botStore.list()
+            var rows: [AuthorizedBotConversationRow] = []
+            for bot in bots {
+                for binding in try botStore.listContextBindings(hostID: hostID, botID: bot.id)
+                where binding.state == .active && binding.actions.contains(.read) {
+                    if case .workspace(let workspaceID) = binding.context, !workspaceIDs.contains(workspaceID) { continue }
+                    let matching = try botStore.listConversations(botID: bot.id).compactMap { conversation -> (BotConversation, AgentThread)? in
+                        guard !conversation.hidden, conversation.groupID == nil,
+                              try botStore.authorizesConversation(conversation, hostID: hostID, action: .read),
+                              let pin = try botStore.conversationContextPin(conversationID: conversation.id),
+                              pin.hostID == hostID, pin.botID == bot.id, pin.context == binding.context,
+                              pin.policyRevision == binding.policyRevision, pin.conversationID == conversation.id,
+                              let threadID = conversation.linkedAgentThreadID,
+                              let thread = try threadRepo.get(id: threadID),
+                              thread.actor == .bot(bot.id), thread.actorLockedAt != nil,
+                              thread.workspaceId == (binding.context == .general ? nil : workspaceID(for: binding.context)) else { return nil }
+                        return (conversation, thread)
+                    }.sorted {
+                        if $0.0.updatedAt != $1.0.updatedAt { return $0.0.updatedAt > $1.0.updatedAt }
+                        return $0.0.id.value.uuidString < $1.0.id.value.uuidString
+                    }
+                    let conversation = matching.first?.0
+                    rows.append(AuthorizedBotConversationRow(botID: bot.id, botName: bot.name, context: binding.context, conversationID: conversation?.id, title: conversation?.title ?? "No conversations"))
+                }
+            }
+            return rows
+        } catch { return nil }
+    }
+
+    nonisolated private static func workspaceID(for context: BotContext) -> WorkspaceID? {
+        if case .workspace(let id) = context { return id }
+        return nil
+    }
+
+    public func openAuthorizedBotConversation(_ row: AuthorizedBotConversationRow) {
+        guard let conversationID = row.conversationID, let context, let router else { return }
+        do {
+            guard let conversation = try context.botStore.conversation(id: conversationID),
+                  conversation.botID == row.botID,
+                  let pin = try context.botStore.conversationContextPin(conversationID: conversationID),
+                  pin.hostID == context.liveActivityHostIdentity.serverId,
+                  pin.botID == row.botID, pin.context == row.context,
+                  let threadID = conversation.linkedAgentThreadID,
+                  try AppCommandRouter.contextPinnedThreadDestination(threadID, context: context)
+                    == .bot(row.botID, conversationID),
+                  try router.openBotsDesk(botID: row.botID, conversationID: conversationID) else {
+                showOperationError("Could not open Bot conversation", detail: "This Bot context is no longer available.")
+                reloadAuthorizedBotConversationRows()
+                return
+            }
+        } catch {
+            showOperationError("Could not open Bot conversation", detail: error.localizedDescription)
+            reloadAuthorizedBotConversationRows()
+        }
     }
 
     public func reload() {
@@ -419,6 +584,7 @@ public final class SidebarViewModel: ObservableObject {
             }
         }
         refreshActiveCount()
+        reloadAuthorizedBotConversationRows()
         // PF-13: the account blob is peeked once at mount. Later rereads are
         // driven by `.rc2PrivateAccountChanged`, not every refreshFromState.
         if !didPeekPrivateAccountJSON {
@@ -1829,25 +1995,37 @@ public struct SidebarRootView: View {
                 ScrollView {
                     let rows = vm.filteredWorkspaces
                     LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
-                        if vm.workspaces.isEmpty {
+                        if vm.workspaces.isEmpty && !vm.authorizedBotConversationRows.contains(where: { $0.context == .general && botRowMatchesFilter($0) }) {
                             Text("No workspaces")
                                 .font(DS.Font.body)
                                 .foregroundColor(DS.Palette.textTertiary)
                                 .padding(.horizontal, DS.Space.md)
                                 .padding(.vertical, DS.Space.sm)
-                        } else if rows.isEmpty {
+                        } else if rows.isEmpty && !vm.authorizedBotConversationRows.contains(where: { $0.context == .general && botRowMatchesFilter($0) }) {
                             Text("No matches")
                                 .font(DS.Font.body)
                                 .foregroundColor(DS.Palette.textTertiary)
                                 .padding(.horizontal, DS.Space.md)
                                 .padding(.vertical, DS.Space.sm)
                         } else {
+                            let generalRows = vm.authorizedBotConversationRows.filter { $0.context == .general && botRowMatchesFilter($0) }
+                            if !generalRows.isEmpty {
+                                Text("General")
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                                    .padding(.horizontal, DS.Space.md)
+                                ForEach(generalRows) { botConversationRow($0) }
+                            }
                             let separatorIdx = SidebarViewModel.pinnedSeparatorIndex(in: rows)
                             ForEach(Array(rows.enumerated()), id: \.element.id) { index, ws in
                                 if index == separatorIdx {
                                     pinnedGroupDivider
                                 }
                                 workspaceRow(ws)
+                                ForEach(vm.authorizedBotConversationRows.filter { row in
+                                    guard row.context == .workspace(ws.id) else { return false }
+                                    return botRowMatchesFilter(row)
+                                }) { botConversationRow($0) }
                             }
                         }
                     }
@@ -2345,6 +2523,43 @@ public struct SidebarRootView: View {
         case .none:
             return Color.clear
         }
+    }
+
+    private func botRowMatchesFilter(_ row: SidebarViewModel.AuthorizedBotConversationRow) -> Bool {
+        let query = vm.filterText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return true }
+        return row.botName.range(of: query, options: .caseInsensitive) != nil
+            || row.title.range(of: query, options: .caseInsensitive) != nil
+    }
+
+    private func botContextLabel(_ context: BotContext) -> String {
+        if case .workspace(let id) = context { return vm.workspaces.first { $0.id == id }?.name ?? "Workspace" }
+        return "General"
+    }
+
+    private func botConversationRow(_ row: SidebarViewModel.AuthorizedBotConversationRow) -> some View {
+        Button { vm.openAuthorizedBotConversation(row) } label: {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "sparkle")
+                    .font(.system(size: 12, weight: .regular))
+                    .frame(width: 20, height: 20)
+                    .foregroundColor(DS.Palette.textSecondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(row.botName).font(DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
+                    Text(row.title).font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, DS.Space.lg)
+            .padding(.horizontal, DS.Space.sm)
+            .frame(minHeight: 36)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(row.conversationID == nil)
+        .help("\(row.botName), \(row.title)")
+        .accessibilityLabel("\(botContextLabel(row.context)), \(row.botName), \(row.title)")
+        .accessibilityIdentifier("sidebar.botConversation.\(row.id)")
     }
 
     @ViewBuilder
