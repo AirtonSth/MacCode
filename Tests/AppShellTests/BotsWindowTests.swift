@@ -18295,6 +18295,241 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.deskLiveTimeline.turns.isEmpty)
     }
 
+    func test_allowReadAndSendRequiresSelectedBotAndPreservesOnlyActiveMemoryGrant() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let botA = try vm.create(name: "A", title: "A")
+        let botB = try vm.create(name: "B", title: "B")
+        let hostID = context.liveActivityHostIdentity.serverId
+        let target = BotContext.general
+
+        XCTAssertNil(try context.botStore.getContextBinding(hostID: hostID, botID: botA.id, context: target))
+        vm.openDesk(botB)
+        XCTAssertFalse(vm.allowReadAndSend(botID: botA.id, context: target))
+        XCTAssertNil(try context.botStore.getContextBinding(hostID: hostID, botID: botA.id, context: target))
+
+        let memory = try context.botStore.grantContext(
+            hostID: hostID, botID: botB.id, context: target,
+            actions: [.memory], expectedRevision: nil
+        )
+        vm.openDesk(botB)
+        XCTAssertTrue(vm.allowReadAndSend(botID: botB.id, context: target))
+        let granted = try XCTUnwrap(context.botStore.getContextBinding(hostID: hostID, botID: botB.id, context: target))
+        XCTAssertEqual(granted.actions, [.memory, .read, .send])
+        XCTAssertEqual(granted.policyRevision, memory.policyRevision + 1)
+        XCTAssertTrue(vm.allowReadAndSend(botID: botB.id, context: target))
+        XCTAssertEqual(try context.botStore.getContextBinding(hostID: hostID, botID: botB.id, context: target)?.policyRevision, granted.policyRevision)
+
+        let revoked = try context.botStore.revokeContext(
+            hostID: hostID, botID: botB.id, context: target, expectedRevision: granted.policyRevision
+        )
+        XCTAssertTrue(vm.allowReadAndSend(botID: botB.id, context: target))
+        let restored = try XCTUnwrap(context.botStore.getContextBinding(hostID: hostID, botID: botB.id, context: target))
+        XCTAssertEqual(restored.actions, [.read, .send])
+        XCTAssertEqual(restored.policyRevision, revoked.policyRevision + 1)
+    }
+
+    func test_contextualDeskThreadCreatesPinnedLockedThreadForExplicitGrant() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let botA = try vm.create(name: "A", title: "A")
+        let botB = try vm.create(name: "B", title: "B")
+        let deskContext = BotContext.general
+        let hostID = context.liveActivityHostIdentity.serverId
+        for bot in [botA, botB] {
+            _ = try context.botStore.grantContext(
+                hostID: hostID, botID: bot.id, context: deskContext,
+                actions: [.read, .send], expectedRevision: nil
+            )
+        }
+        vm.openDesk(botA)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread(in: deskContext))
+        let conversationA = try XCTUnwrap(vm.selectedConversation)
+        vm.openDesk(botB)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread(in: deskContext))
+        let conversationB = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(conversationA.id, conversationB.id)
+        XCTAssertNotEqual(conversationA.linkedAgentThreadID, conversationB.linkedAgentThreadID)
+        for conversation in [conversationA, conversationB] {
+            let pin = try XCTUnwrap(context.botStore.conversationContextPin(conversationID: conversation.id))
+            XCTAssertEqual(pin.context, deskContext)
+            let threadID = try XCTUnwrap(conversation.linkedAgentThreadID)
+            XCTAssertEqual(try context.botStore.conversationContextPin(linkedTo: threadID), pin)
+            let thread = try XCTUnwrap(context.threadRepo.get(id: threadID))
+            XCTAssertEqual(thread.actor, .bot(conversation.botID))
+            XCTAssertNotNil(thread.actorLockedAt)
+            XCTAssertEqual(thread.model, "main-model")
+        }
+    }
+
+    func test_workspaceContextualDeskThreadPinsCurrentWorkspaceAndPreservesPriorPin() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("BotDeskContext-\(UUID().uuidString)", isDirectory: true)
+        let dirA = base.appendingPathComponent("A", isDirectory: true)
+        let dirB = base.appendingPathComponent("B", isDirectory: true)
+        try FileManager.default.createDirectory(at: dirA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dirB, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let workspaceA = try router.createWorkspace(name: "Workspace A", cwd: dirA.path)
+        let workspaceB = try router.createWorkspace(name: "Workspace B", cwd: dirB.path)
+        let hostID = context.liveActivityHostIdentity.serverId
+        let contextA = BotContext.workspace(workspaceA.id)
+        let contextB = BotContext.workspace(workspaceB.id)
+        _ = try context.botStore.grantContext(hostID: hostID, botID: bot.id, context: contextA, actions: [.read, .send], expectedRevision: nil)
+        _ = try context.botStore.grantContext(hostID: hostID, botID: bot.id, context: contextB, actions: [.read, .send], expectedRevision: nil)
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "main-model", routingMode: .manual, runAsUser: .current())
+        XCTAssertTrue(vm.createDeskThread(in: contextA))
+        let conversationA = try XCTUnwrap(vm.selectedConversation)
+        let pinA = try XCTUnwrap(context.botStore.conversationContextPin(conversationID: conversationA.id))
+        let threadA = try XCTUnwrap(context.threadRepo.get(id: try XCTUnwrap(conversationA.linkedAgentThreadID)))
+        XCTAssertEqual(pinA.context, contextA)
+        XCTAssertEqual(pinA.policyRevision, try XCTUnwrap(context.botStore.getContextBinding(hostID: hostID, botID: bot.id, context: contextA)).policyRevision)
+        XCTAssertEqual(threadA.workspaceId, workspaceA.id)
+
+        context.state.window.selectedWorkspaceID = workspaceB.id
+        XCTAssertTrue(vm.createDeskThread(in: contextB))
+        let conversationB = try XCTUnwrap(vm.selectedConversation)
+        let pinB = try XCTUnwrap(context.botStore.conversationContextPin(conversationID: conversationB.id))
+        let threadB = try XCTUnwrap(context.threadRepo.get(id: try XCTUnwrap(conversationB.linkedAgentThreadID)))
+        XCTAssertEqual(vm.selectedPinnedContextLabel, "Workspace B")
+        XCTAssertEqual(pinB.context, contextB)
+        XCTAssertEqual(pinB.policyRevision, try XCTUnwrap(context.botStore.getContextBinding(hostID: hostID, botID: bot.id, context: contextB)).policyRevision)
+        XCTAssertEqual(threadB.workspaceId, workspaceB.id)
+
+        let priorID = conversationB.id
+        XCTAssertTrue(vm.createDeskThread())
+        let conversationB2 = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(conversationB2.id, priorID)
+        XCTAssertEqual(try context.botStore.conversationContextPin(conversationID: conversationB2.id)?.context, contextB)
+        XCTAssertEqual(try context.botStore.conversationContextPin(conversationID: conversationA.id), pinA)
+        XCTAssertEqual(try context.botStore.conversationContextPin(conversationID: priorID), pinB)
+        let threadB2 = try XCTUnwrap(context.threadRepo.get(id: try XCTUnwrap(conversationB2.linkedAgentThreadID)))
+        XCTAssertEqual(threadB2.workspaceId, workspaceB.id)
+    }
+
+    func test_contextualDeskThreadWithoutGrantCreatesNothingOrChangesSelection() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        vm.openDesk(bot)
+        let selection = vm.selectedConversation?.id
+        XCTAssertFalse(vm.createDeskThread(in: .general))
+        XCTAssertEqual(vm.selectedConversation?.id, selection)
+        XCTAssertTrue(try context.botStore.listConversations(botID: bot.id).isEmpty)
+    }
+
+    func test_createDeskThreadOnPinnedConversationPreservesContext() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        let deskContext = BotContext.general
+        let hostID = context.liveActivityHostIdentity.serverId
+        _ = try context.botStore.grantContext(
+            hostID: hostID, botID: bot.id, context: deskContext,
+            actions: [.read, .send], expectedRevision: nil
+        )
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread(in: deskContext))
+        let old = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertTrue(vm.createDeskThread())
+        let created = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertEqual(try context.botStore.conversationContextPin(conversationID: created.id)?.context, deskContext)
+        XCTAssertNotEqual(old.id, created.id)
+    }
+
+    func test_missingWorkspaceGrantAndThreadCreationHaveNoEffects() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread())
+        vm.composerText = "Keep"
+        let selected = try XCTUnwrap(vm.selectedConversation?.id)
+        let hostID = context.liveActivityHostIdentity.serverId
+        let missingContext = BotContext.workspace(WorkspaceID(UUID()))
+        let conversationsBefore = try context.botStore.listConversations(botID: bot.id).count
+        let threadsBefore = try context.threadRepo.list().count
+
+        XCTAssertFalse(vm.allowReadAndSend(botID: bot.id, context: missingContext))
+        XCTAssertNil(try context.botStore.getContextBinding(hostID: hostID, botID: bot.id, context: missingContext))
+        _ = try context.botStore.grantContext(
+            hostID: hostID, botID: bot.id, context: missingContext,
+            actions: [.read, .send], expectedRevision: nil
+        )
+        XCTAssertFalse(vm.createDeskThread(in: missingContext))
+        XCTAssertEqual(vm.selectedConversation?.id, selected)
+        XCTAssertEqual(vm.composerText, "Keep")
+        XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, conversationsBefore)
+        XCTAssertEqual(try context.threadRepo.list().count, threadsBefore)
+    }
+
+    func test_workspaceDeletedAfterGrantConfirmationRejectsGrantAndThreadCreation() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread())
+        let selected = try XCTUnwrap(vm.selectedConversation?.id)
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("BotDeskDeleted-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let workspace = try router.createWorkspace(name: "Grant target", cwd: base.path)
+        let capturedBotID = bot.id
+        let target = BotContext.workspace(workspace.id)
+        try router.closeWorkspace(workspace.id)
+        XCTAssertNil(context.state.workspaces[workspace.id])
+        XCTAssertFalse(vm.allowReadAndSend(botID: capturedBotID, context: target))
+        let hostID = context.liveActivityHostIdentity.serverId
+        XCTAssertNil(try context.botStore.getContextBinding(hostID: hostID, botID: capturedBotID, context: target))
+        _ = try context.botStore.grantContext(
+            hostID: hostID, botID: capturedBotID, context: target,
+            actions: [.read, .send], expectedRevision: nil
+        )
+        let conversationsBefore = try context.botStore.listConversations(botID: bot.id).count
+        let threadsBefore = try context.threadRepo.list().count
+        XCTAssertFalse(vm.createDeskThread(in: target))
+        XCTAssertEqual(vm.selectedConversation?.id, selected)
+        XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, conversationsBefore)
+        XCTAssertEqual(try context.threadRepo.list().count, threadsBefore)
+    }
+
     private func makeContext() throws -> AppContext {
         try AppContext(channel: .debug, appSupportOverride: directory)
     }

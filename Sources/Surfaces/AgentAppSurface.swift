@@ -5544,6 +5544,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 && previousInstanceId == previousProvider.rawValue
             let sourceChanged = current.provider != previousProvider
                 || (current.id != previousInstanceId && !isDefaultInstanceAlias)
+            if isDefaultInstanceAlias,
+               let threadId = selectedThreadId,
+               composerDraftsByThread[threadId]?[previousInstanceId] == nil,
+               prompt.isEmpty,
+               attachments.isEmpty {
+                restoreComposerDraft(
+                    threadId: threadId,
+                    providerInstanceId: current.id,
+                    fallbackInteractionMode: interactionMode
+                )
+            }
             if sourceChanged {
                 // SC-ux-1: auto-rebind must reset model like setProvider — do not
                 // keep a Codex id (e.g. gpt-5.6-sol) after switching to Claude.

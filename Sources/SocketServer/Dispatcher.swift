@@ -2575,7 +2575,7 @@ public final class JSONRPCDispatcher {
         eventIdentity: MutationRequestContext? = nil
     ) async -> JSONRPCResponse {
         let id = req.id
-        let params = req.params ?? [:]
+        var params = req.params ?? [:]
         do {
             if Self.managedProviderSocketMethods.contains(req.method),
                !Self.managedProviderSocketAuthenticated {
@@ -2591,10 +2591,18 @@ public final class JSONRPCDispatcher {
                     isExplicitV1: AgentCheckpointListContract.isExplicitV1(params: params)
                 )
             }
-            if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.context."),
-               ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil }),
-               !(req.method == "bot.conversation.create" && Self.centralMutationExecution) {
-                throw JSONRPCError(code: -32602, message: "Context resource unavailable.")
+            let hasScopedContext = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
+            if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.context."), hasScopedContext {
+                let admitted = (req.method == "bot.conversation.list" && eventIdentity != nil)
+                    || ((req.method == "bot.conversation.create" || req.method == "bot.conversation.select") && Self.centralMutationExecution)
+                guard admitted else {
+                    throw JSONRPCError(code: -32602, message: "Context resource unavailable.")
+                }
+            }
+            if req.method == "bot.context.list", let eventIdentity {
+                params["host_id"] = .string(eventIdentity.hostId)
+            } else if req.method == "bot.conversation.list", hasScopedContext, let eventIdentity {
+                params["host_id"] = .string(eventIdentity.hostId)
             }
             if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.peer.") {
                 let result = try await router.dispatchPairedBotRemote(method: req.method, params: params)
@@ -2639,7 +2647,7 @@ public final class JSONRPCDispatcher {
                             id: .number(index),
                             method: method,
                             params: callParams
-                        ))
+                        ), eventIdentity: eventIdentity)
                     }
                     if let error = response.error {
                         results.append(.object([

@@ -142,7 +142,6 @@ final class BotContextDispatcherTests: XCTestCase {
             sendCallbacks += 1
             return [:]
         }
-        _ = try fixture.authority.dispatch(method: "bot.conversation.select", params: ["client_request_id": "select-context", "bot_id": botID, "conversation_id": conversationID])
         for params: [String: JSONValue] in [
             ["client_request_id": .string("send-explicit"), "bot_id": .string(botID), "text": .string("explicit"), "conversation_id": .string(conversationID)],
             ["client_request_id": .string("send-selected"), "bot_id": .string(botID), "text": .string("selected fallback")],
@@ -223,7 +222,8 @@ final class BotContextDispatcherTests: XCTestCase {
         let workspaces = [WorkspaceID(), WorkspaceID()]
         var conversationIDs = Set<String>()
         var threadIDs = Set<String>()
-        for workspace in workspaces {
+        var firstID: String?
+        for (index, workspace) in workspaces.enumerated() {
             let context = BotContext.workspace(workspace)
             try await grant(context.storageKey)
             let response = await dispatcher.dispatchHTTP(request("bot.conversation.create", scoped(context.storageKey)), mutationContext: owner)
@@ -232,6 +232,7 @@ final class BotContextDispatcherTests: XCTestCase {
             let readback = try XCTUnwrap(response.result?.objectValue?["readback"]?.objectValue)
             let conversationID = try XCTUnwrap(readback["conversation_id"]?.stringValue)
             let threadID = try XCTUnwrap(readback["thread_id"]?.stringValue)
+            if firstID == nil { firstID = conversationID }
             conversationIDs.insert(conversationID)
             threadIDs.insert(threadID)
             let stored = try XCTUnwrap(AgentThreadRepository(db: fixture.db).get(id: AgentThreadID(try XCTUnwrap(UUID(uuidString: threadID)))))
@@ -241,11 +242,75 @@ final class BotContextDispatcherTests: XCTestCase {
             let pin = try XCTUnwrap(BotStore(db: fixture.db).conversationContextPin(conversationID: BotConversationID(try XCTUnwrap(UUID(uuidString: conversationID)))))
             XCTAssertEqual(pin.context, context)
             XCTAssertEqual(pin.hostID, "host-a")
+
+            var listParams = scoped(context.storageKey)
+            listParams.removeValue(forKey: "client_request_id")
+            listParams["host_id"] = .string("attacker")
+            let list = await dispatcher.dispatchHTTP(request("bot.conversation.list", listParams), mutationContext: owner)
+            XCTAssertNil(list.error)
+            let rows = try XCTUnwrap(list.result?.objectValue?["conversations"]?.arrayValue)
+            XCTAssertEqual(rows.count, 1)
+            XCTAssertEqual(rows.first?.objectValue?["id"]?.stringValue, conversationID)
+            XCTAssertEqual(rows.first?.objectValue?["host_id"]?.stringValue, "host-a")
+
+            let batchRequest = request("rpc.batch", ["calls": .array([.object([
+                "method": .string("bot.conversation.list"), "params": .object(listParams),
+            ])])])
+            let batch = await dispatcher.dispatchHTTP(batchRequest, mutationContext: owner)
+            XCTAssertNil(batch.error)
+            let batchResults = try XCTUnwrap(batch.result?.arrayValue)
+            XCTAssertEqual(batchResults.count, 1)
+            let batchRows = try XCTUnwrap(batchResults.first?.objectValue?["conversations"]?.arrayValue)
+            XCTAssertEqual(batchRows.count, 1)
+            XCTAssertEqual(batchRows.first?.objectValue?["id"]?.stringValue, conversationID)
+            XCTAssertEqual(batchRows.first?.objectValue?["host_id"]?.stringValue, "host-a")
+
+            let beforeDeniedBatch = router.dispatchCount
+            let unauthenticatedBatch = await dispatcher.dispatchHTTP(batchRequest, mutationContext: nil)
+            XCTAssertNil(unauthenticatedBatch.error)
+            let unauthenticatedBatchItems = try XCTUnwrap(unauthenticatedBatch.result?.arrayValue)
+            XCTAssertNotNil(unauthenticatedBatchItems.first?.objectValue?["error"])
+            XCTAssertNil(unauthenticatedBatchItems.first?.objectValue?["conversations"])
+            let unixBatch = await dispatcher.dispatchUnixSocket(batchRequest)
+            XCTAssertNil(unixBatch.error)
+            let unixBatchItems = try XCTUnwrap(unixBatch.result?.arrayValue)
+            XCTAssertNotNil(unixBatchItems.first?.objectValue?["error"])
+            XCTAssertNil(unixBatchItems.first?.objectValue?["conversations"])
+            XCTAssertEqual(router.dispatchCount, beforeDeniedBatch)
+
+            let selectParams = scoped(context.storageKey)
+            var select = selectParams
+            select["conversation_id"] = .string(conversationID)
+            let selected = await dispatcher.dispatchHTTP(request("bot.conversation.select", select), mutationContext: owner)
+            XCTAssertNil(selected.error)
+            XCTAssertEqual(selected.result?.objectValue?["status"]?.stringValue, "completed")
+            if index == 1 {
+                var crossSelect = scoped(context.storageKey)
+                crossSelect["conversation_id"] = .string(try XCTUnwrap(firstID))
+                let crossRequest = request("bot.conversation.select", crossSelect)
+                let cross = await dispatcher.dispatchHTTP(crossRequest, mutationContext: owner)
+                XCTAssertEqual(cross.result?.objectValue?["status"]?.stringValue, "failed")
+                let crossReplay = await dispatcher.dispatchHTTP(crossRequest, mutationContext: owner)
+                XCTAssertEqual(crossReplay.result?.objectValue?["status"]?.stringValue, "failed")
+            }
         }
         XCTAssertEqual(conversationIDs.count, 2)
         XCTAssertEqual(threadIDs.count, 2)
         XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM bot_conversations;"), 2)
         XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM agent_threads;"), 2)
+
+        let beforeDeniedReads = router.dispatchCount
+        var deniedListParams = scoped(BotContext.workspace(workspaces[1]).storageKey)
+        deniedListParams.removeValue(forKey: "client_request_id")
+        let unixList = await dispatcher.dispatchUnixSocket(request("bot.conversation.list", deniedListParams))
+        XCTAssertNotNil(unixList.error)
+        let unauthenticatedList = await dispatcher.dispatchHTTP(request("bot.conversation.list", deniedListParams), mutationContext: nil)
+        XCTAssertNotNil(unauthenticatedList.error)
+        var deniedSelectParams = scoped(BotContext.workspace(workspaces[1]).storageKey)
+        deniedSelectParams["conversation_id"] = .string(try XCTUnwrap(firstID))
+        let unauthenticatedSelect = await dispatcher.dispatchHTTP(request("bot.conversation.select", deniedSelectParams), mutationContext: nil)
+        XCTAssertNotNil(unauthenticatedSelect.error)
+        XCTAssertEqual(router.dispatchCount, beforeDeniedReads)
     }
 
     func test_unixSocketRejectsContextGrantBeforeAuthorityDispatch() async throws {

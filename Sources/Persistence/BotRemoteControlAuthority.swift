@@ -259,6 +259,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             guard Set(params.keys).isSubset(of: ["host_id", "bot_id", "context_key", "context_version", "policy_revision", "actions", "client_request_id"]) else { throw Error.invalidParams }
         }
         let hasContext = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
+        if hasContext && ["conversation.list", "conversation.select"].contains(name) {
+            let fields: Set<String> = name == "conversation.list"
+                ? ["host_id", "bot_id", "context_key", "context_version", "policy_revision"]
+                : ["host_id", "bot_id", "context_key", "context_version", "policy_revision", "client_request_id", "conversation_id"]
+            guard Set(params.keys).isSubset(of: fields) else { throw Error.invalidParams }
+        }
         if hasContext, !contextMethods.contains(name) {
             guard let context = parseContext(params), let (hostID, botID) = contextIdentity(params),
                   let revision = integer(params["policy_revision"]), revision > 0,
@@ -266,8 +272,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             guard try store.authorizes(hostID: hostID, botID: botID, context: context, action: action, policyRevision: revision) else {
                 throw Error(code: -32084, message: "Bot context authority is not active for this request.")
             }
-            if name != "conversation.create" { throw Error(code: -32602, message: "Context resource unavailable.") }
-            guard Set(params.keys).isSubset(of: ["client_request_id", "bot_id", "title", "host_id", "context_key", "context_version", "policy_revision"]) else { throw Error.invalidParams }
+            if !["conversation.create", "conversation.list", "conversation.select"].contains(name) { throw Error(code: -32602, message: "Context resource unavailable.") }
+            if name == "conversation.create" {
+                guard Set(params.keys).isSubset(of: ["client_request_id", "bot_id", "title", "host_id", "context_key", "context_version", "policy_revision"]) else { throw Error.invalidParams }
+            }
         }
         switch name {
         case "context.list":
@@ -978,7 +986,21 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let botID = id(bot)
         let inboxID = bot.handle.lowercased() == TitioIdentity.handle
             ? onTitioInbox?()?["conversation_id"] as? String : nil
-        let rows = try store.listConversations(botID: bot.id).map { conversation in
+        let scoped = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
+        let requestedContext = scoped ? parseContext(params) : nil
+        let requestedHost = scoped ? string(params, "host_id") : nil
+        let requestedRevision = scoped ? integer(params["policy_revision"]) : nil
+        var selectedIsVisible = false
+        let rows = try store.listConversations(botID: bot.id).compactMap { conversation -> [String: Any]? in
+            let pin = try store.conversationContextPin(conversationID: conversation.id)
+            if scoped {
+                guard let pin, let requestedContext, let requestedHost, let requestedRevision,
+                      let requestedVersion = integer(params["context_version"]),
+                      pin.hostID == requestedHost, pin.botID == bot.id, pin.context == requestedContext,
+                      Int64(pin.contextVersion) == requestedVersion, pin.policyRevision == requestedRevision else { return nil }
+            } else if pin != nil { return nil }
+            let conversationID = conversation.id.value.uuidString.lowercased()
+            if selectedConversation[botID] == conversationID { selectedIsVisible = true }
             var row: [String: Any] = [
                 "id": conversation.id.value.uuidString.lowercased(),
                 "title": conversation.title,
@@ -988,7 +1010,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             if row["id"] as? String == inboxID {
                 row["kind"] = "titio_inbox"
             }
-            let conversationID = conversation.id.value.uuidString.lowercased()
+            if let pin {
+                row["context_key"] = pin.context.storageKey
+                row["context_version"] = pin.contextVersion
+                row["policy_revision"] = pin.policyRevision
+                row["host_id"] = pin.hostID
+            }
             if let identity = liveConversationIdentity(
                 botID: botID,
                 conversationID: conversationID,
@@ -1004,10 +1031,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             }
             return row
         }
-        return [
-            "conversations": rows,
-            "selected_id": selectedConversation[botID] as Any,
-        ]
+        var result: [String: Any] = ["conversations": rows]
+        if selectedIsVisible, let selected = selectedConversation[botID] { result["selected_id"] = selected }
+        return result
     }
 
     private func routineList(params: [String: Any]) throws -> [String: Any] {
@@ -1965,6 +1991,20 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard let uuid = UUID(uuidString: conversationID),
               let conversation = try store.conversation(id: BotConversationID(uuid)) else { throw Error.conversationGone }
         guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
+        let scoped = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
+        let pin = try store.conversationContextPin(conversationID: conversation.id)
+        if scoped {
+            guard Set(params.keys).isSubset(of: ["client_request_id", "conversation_id", "bot_id", "host_id", "context_key", "context_version", "policy_revision"]),
+                  let requestedContext = parseContext(params), let hostID = string(params, "host_id"),
+                  let revision = integer(params["policy_revision"]),
+                  let version = integer(params["context_version"]),
+                  let pin, pin.hostID == hostID, pin.botID == bot.id, pin.context == requestedContext,
+                  pin.contextVersion == version, pin.policyRevision == revision else {
+                throw Error(code: -32602, message: "Context resource unavailable.")
+            }
+        } else if pin != nil {
+            throw Error(code: -32602, message: "Context resource unavailable.")
+        }
         let normalizedID = conversation.id.value.uuidString.lowercased()
         selectedConversation[id(bot)] = normalizedID
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [

@@ -3503,8 +3503,10 @@ public final class BotsViewModel: ObservableObject {
     private var studioSupportByBot: [BotID: BotStudioSupportSnapshot] = [:]
     private var revisionByID: [BotRevisionID: BotRevision] = [:]
     @Published public private(set) var conversations: [BotConversation] = []
+    @Published public private(set) var selectedPinnedContextLabel = "Legacy"
     @Published public private(set) var selectedConversation: BotConversation? {
         didSet {
+            if oldValue?.id != selectedConversation?.id { refreshPinnedContextLabel() }
             let previousThreadID = oldValue?.linkedAgentThreadID
             if let previousThreadID,
                previousThreadID != selectedConversation?.linkedAgentThreadID {
@@ -5054,24 +5056,143 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    public var existingWorkspaceContexts: [(id: WorkspaceID, name: String)] {
+        context.state.workspaces.values.map { ($0.id, $0.name) }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func refreshPinnedContextLabel() {
+        guard let conversation = selectedConversation else { selectedPinnedContextLabel = "Legacy"; return }
+        do {
+            guard let pin = try botStore.conversationContextPin(conversationID: conversation.id) else {
+                selectedPinnedContextLabel = "Legacy"
+                return
+            }
+            switch pin.context {
+            case .general: selectedPinnedContextLabel = "General"
+            case .workspace(let id): selectedPinnedContextLabel = context.state.workspaces[id].map { $0.name } ?? "Context unavailable"
+            }
+        } catch { selectedPinnedContextLabel = "Context unavailable" }
+    }
+
+    @discardableResult
+    public func allowReadAndSend(botID: BotID, context: BotContext) -> Bool {
+        guard selectedBotID == botID else { return false }
+        if case .workspace(let id) = context, self.context.state.workspaces[id] == nil {
+            errorMessage = "This workspace no longer exists."
+            return false
+        }
+        let hostID = self.context.liveActivityHostIdentity.serverId
+        do {
+            let current = try botStore.getContextBinding(hostID: hostID, botID: botID, context: context)
+            if let current, current.state == .active, current.actions.isSuperset(of: [.read, .send]) { return true }
+            let actions: Set<BotContextAction>
+            if let current, current.state == .active {
+                actions = current.actions.union([.read, .send])
+            } else {
+                actions = [.read, .send]
+            }
+            try botStore.grantContext(hostID: hostID, botID: botID, context: context, actions: actions, expectedRevision: current?.policyRevision)
+            return true
+        } catch { errorMessage = error.localizedDescription; return false }
+    }
+
     @discardableResult
     public func createDeskThread() -> Bool {
+        if let conversation = selectedConversation, conversation.botID == selectedBotID {
+            do {
+                if let pin = try botStore.conversationContextPin(conversationID: conversation.id) {
+                    return createDeskThread(in: pin.context)
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+                return false
+            }
+        }
+        return insertDeskConversation(botID: selectedBot?.id, routing: deskRouting)
+    }
+
+    @discardableResult
+    public func createDeskThread(in context: BotContext) -> Bool {
         guard let bot = selectedBot else { return false }
-        // No rail reveal: every + (header, rail, FAB) and test runs keep the
-        // user's panel layout and its saved hide choice.
-        let conversation = BotConversation(botID: bot.id, title: "New thread")
+        if case .workspace(let id) = context, self.context.state.workspaces[id] == nil {
+            errorMessage = "This workspace no longer exists."
+            return false
+        }
+        let hostID = self.context.liveActivityHostIdentity.serverId
+        do {
+            guard let binding = try botStore.getContextBinding(hostID: hostID, botID: bot.id, context: context),
+                  binding.state == .active,
+                  binding.actions.isSuperset(of: [.read, .send]) else {
+                errorMessage = "This Bot has no active read and send grant for this context."
+                return false
+            }
+            let route = deskRouting
+            guard route.provider == .distill,
+                  route.runAsUser.isCurrentAccount else {
+                errorMessage = "Contextual threads require the current Distill account."
+                return false
+            }
+            let model = Self.resolvedUnlinkedDeskModel(
+                route,
+                snapshot: selectedDeskSnapshot,
+                lastUsed: lastModelStore.model(for: route.provider)
+            )
+            guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                errorMessage = "Select a Main model before creating a contextual thread."
+                return false
+            }
+            var routing = route
+            routing.provider = .distill
+            routing.model = model
+            let workspaceID: WorkspaceID? = if case .workspace(let id) = context { id } else { nil }
+            var thread = AgentThread(
+                workspaceId: workspaceID, title: "New thread", provider: .distill,
+                providerInstanceId: route.providerInstanceID, model: model,
+                permissionMode: route.permissionMode, reasoningEffort: route.reasoningEffort,
+                serviceTier: route.serviceTier,
+                modelSelection: AgentModelSelection(
+                    provider: .distill, modelId: model,
+                    reasoningEffort: route.reasoningEffort, serviceTier: route.serviceTier,
+                    distillMainEffortSelection: route.distillMainEffortSelection ?? .fixed(route.reasoningEffort),
+                    distillReasoningEffortSelection: route.distillReasoningEffortSelection ?? .automatic,
+                    distillUltracode: route.distillUltracode
+                ),
+                runAsUser: route.runAsUser
+            )
+            thread.reasoningModel = route.reasoningModel
+            let conversation = BotConversation(botID: bot.id, title: "New thread", linkedAgentThreadID: thread.id)
+            try botStore.createContextualConversation(
+                conversation, newThread: thread, hostID: hostID,
+                context: context, policyRevision: binding.policyRevision
+            )
+            return insertDeskConversation(conversation, botID: bot.id, routing: routing)
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    private func insertDeskConversation(_ conversation: BotConversation, botID: BotID, routing: BotDeskRouting) -> Bool {
+        conversations.removeAll { $0.id == conversation.id }
+        conversations.insert(conversation, at: 0)
+        deskRoutingByConversation[conversation.id] = routing
+        persistDeskRouting(for: conversation.id, botID: botID)
+        selectDeskThread(conversation.id)
+        return true
+    }
+
+    @discardableResult
+    private func insertDeskConversation(botID: BotID?, routing: BotDeskRouting) -> Bool {
+        guard let botID else { return false }
+        let conversation = BotConversation(botID: botID, title: "New thread")
         do {
             try botStore.upsertConversation(conversation)
         } catch {
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
             return false
         }
-        conversations.removeAll { $0.id == conversation.id }
-        conversations.insert(conversation, at: 0)
-        deskRoutingByConversation[conversation.id] = deskRouting
-        persistDeskRouting(for: conversation.id, botID: bot.id)
-        selectDeskThread(conversation.id)
-        return true
+        return insertDeskConversation(conversation, botID: botID, routing: routing)
     }
 
     public var filteredDeskConversations: [BotConversation] {
@@ -12846,6 +12967,7 @@ public struct BotsRootView: View {
     @State private var pendingClearAllDeskThreads = false
     @State private var pendingDockerDataClear: BotID?
     @State private var isConfirmingTitioFactoryReset = false
+    @State private var pendingContextGrant: (botID: BotID, context: BotContext, contextName: String)?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
@@ -13762,6 +13884,34 @@ public struct BotsRootView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Open Studio for \(BotsViewModel.displayName(bot.name))")
             .accessibilityIdentifier("bots.desk.identity")
+            Menu {
+                Text(vm.selectedPinnedContextLabel)
+                Text("Contextual execution unavailable")
+                Divider()
+                Button("New conversation in General") { vm.createDeskThread(in: .general) }
+                ForEach(vm.existingWorkspaceContexts, id: \.id) { workspace in
+                    Button("New conversation in \(workspace.name)") { vm.createDeskThread(in: .workspace(workspace.id)) }
+                }
+                if let botID = vm.selectedBotID {
+                    Divider()
+                    Button("Allow read and send in General…") {
+                        pendingContextGrant = (botID, .general, "General")
+                    }
+                    ForEach(vm.existingWorkspaceContexts, id: \.id) { workspace in
+                        Button("Allow read and send in \(workspace.name)…") {
+                            pendingContextGrant = (botID, .workspace(workspace.id), workspace.name)
+                        }
+                    }
+                }
+            } label: {
+                Text("Context: \(vm.selectedPinnedContextLabel)\(vm.selectedPinnedContextLabel == "Legacy" ? "" : " · execution unavailable")")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(1)
+            }
+            .help("Contextual conversations keep a fixed context. Contextual execution is unavailable.")
+            .accessibilityLabel("Conversation context: \(vm.selectedPinnedContextLabel). Contextual execution unavailable.")
+            .accessibilityIdentifier("bots.desk.context")
             Spacer(minLength: DS.Space.lg)
             HStack(spacing: Self.deskHeaderIconSpacing) {
                 DSIconButton("gearshape", help: "Studio") {
@@ -13795,6 +13945,15 @@ public struct BotsRootView: View {
         .padding(.trailing, DS.Space.xl)
         .frame(height: 44)
         .dsBar(edge: .bottom)
+        .confirmationDialog("Allow read and send in \(pendingContextGrant?.contextName ?? "context") for \(pendingContextGrant?.botID.description ?? "Bot")?", isPresented: Binding(get: { pendingContextGrant != nil }, set: { if !$0 { pendingContextGrant = nil } }), titleVisibility: .visible) {
+            Button("Allow read and send") {
+                if let target = pendingContextGrant { _ = vm.allowReadAndSend(botID: target.botID, context: target.context) }
+                pendingContextGrant = nil
+            }
+            Button("Cancel", role: .cancel) { pendingContextGrant = nil }
+        } message: {
+            Text("Grant only conversation read and send rights in \(pendingContextGrant?.contextName ?? "this context") for Bot \(pendingContextGrant?.botID.description ?? "unknown"). Execution remains unavailable.")
+        }
     }
 
     private func deskChat(_ bot: BotDefinition) -> some View {
