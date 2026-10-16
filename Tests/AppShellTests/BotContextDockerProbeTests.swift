@@ -64,6 +64,202 @@ final class BotContextDockerProbeTests: XCTestCase {
         let observedB = try docker.inspect(name: nameB)
         XCTAssertNotEqual(observedA.homeSource, observedB.homeSource)
         XCTAssertTrue(Set(observedA.networkNames).isDisjoint(with: observedB.networkNames))
+        let networkProbe = #"""
+        const net = require('node:net');
+        const http = require('node:http');
+        const os = require('node:os');
+        const timeout = 1000;
+
+        function tcp(host, port) {
+          return new Promise(resolve => {
+            const socket = net.createConnection({ host, port, timeout });
+            let done = false;
+            const finish = status => {
+              if (done) return;
+              done = true;
+              socket.destroy();
+              resolve(status);
+            };
+            socket.once('connect', () => finish('connected'));
+            socket.once('timeout', () => finish('unreachable'));
+            socket.once('error', () => finish('unreachable'));
+          });
+        }
+
+        function upgradeStatus(host, port, token) {
+          return new Promise(resolve => {
+            let connected = false;
+            const finish = (status, errorCode = null) => resolve({ connected, status, errorCode });
+            const request = http.request({
+              host, port, agent: false,
+              path: '/websockify?token=' + encodeURIComponent(token),
+              headers: {
+                Connection: 'Upgrade', Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': Buffer.from('0123456789abcdef').toString('base64'),
+              },
+            }, response => {
+              finish(response.statusCode);
+              response.destroy();
+            });
+            request.once('socket', socket => {
+              connected = !socket.connecting;
+              socket.once('connect', () => { connected = true; });
+            });
+            request.setTimeout(3000, () => request.destroy(Object.assign(Error(), { code: 'ETIMEDOUT' })));
+            request.once('upgrade', (_response, socket) => { finish(101); socket.destroy(); });
+            request.once('error', error => finish(null, error.code ?? 'unknown'));
+            request.end();
+          });
+        }
+
+        function probeWebSocket(host, port, token) {
+          return new Promise(resolve => {
+            let opened = false;
+            let sawFrame = false;
+            let settled = false;
+            const socket = new WebSocket(
+              `ws://${host}:${port}/websockify?token=${encodeURIComponent(token)}`,
+            );
+            socket.binaryType = 'arraybuffer';
+            const finish = result => {
+              if (settled) return;
+              settled = true;
+              socket.close();
+              resolve(result);
+            };
+            const timer = setTimeout(() => finish({ state: 'timeout' }), 3000);
+            socket.addEventListener('open', () => { opened = true; });
+            socket.addEventListener('message', event => {
+              sawFrame = true;
+              const value = event.data instanceof ArrayBuffer
+                ? Buffer.from(event.data).toString('ascii')
+                : String(event.data);
+              if (value.startsWith('RFB ')) finish({ state: 'rfb' });
+              else finish({ state: 'unexpected-frame' });
+            });
+            socket.addEventListener('error', () => {
+              clearTimeout(timer);
+              finish({ state: opened ? 'closed-no-data' : 'handshake-failed' });
+            });
+            socket.addEventListener('close', event => {
+              clearTimeout(timer);
+              if (sawFrame) finish({ state: 'unexpected-frame', closeCode: event.code });
+              else finish({ state: opened ? 'closed-no-data' : 'handshake-failed', closeCode: event.code });
+            });
+          });
+        }
+
+        (async () => {
+          const token = process.env.REMOTECODE_VIEWER_TOKEN;
+          if (!token) throw Error('token-missing');
+          const ipv4 = Object.values(os.networkInterfaces()).flat().find(value =>
+            value && value.family === 'IPv4' && !value.internal,
+          )?.address;
+          if (!ipv4) throw Error('ipv4-missing');
+          for (const port of [5900, 9222]) {
+            const deadline = Date.now() + 10000;
+            let ready = false;
+            while (Date.now() < deadline) {
+              if (await tcp('127.0.0.1', port) === 'connected') {
+                ready = true;
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 200));
+            }
+            if (!ready) throw Error('own-listener-not-ready');
+          }
+
+          const mode = process.argv[1];
+          const ownHttpValid = await upgradeStatus('127.0.0.1', 6080, token);
+          const ownHttpInvalid = await upgradeStatus('127.0.0.1', 6080, 'invalid-context-probe');
+          const ownWebSocket = await probeWebSocket('127.0.0.1', 6080, token);
+          const ownInvalidAuth = await probeWebSocket('127.0.0.1', 6080, 'invalid-context-probe');
+          if (mode === 'control') {
+            console.log(JSON.stringify({ ownHttpValid, ownHttpInvalid, ownWebSocket, ownInvalidAuth }));
+            process.exit(0);
+          }
+          const peerIPv4 = mode;
+          const peerHostPort = Number(process.argv[2]);
+          const peerTCP = [];
+          for (const port of [5900, 6080, 9222]) {
+            peerTCP.push({ port, status: await tcp(peerIPv4, port) });
+          }
+          const peerDirectHttp = await upgradeStatus(peerIPv4, 6080, token);
+          const peerHostHttp = await upgradeStatus('host.docker.internal', peerHostPort, token);
+          const peerDirectWebSocket = await probeWebSocket(peerIPv4, 6080, token);
+          const peerWebSocket = await probeWebSocket('host.docker.internal', peerHostPort, token);
+          console.log(JSON.stringify({ ipv4, peerTCP, peerDirectHttp, peerHostHttp, peerDirectWebSocket, peerWebSocket }));
+          process.exit(0);
+        })().catch(() => {
+          console.log(JSON.stringify({ phase: 'node-probe', status: 'probe-error' }));
+          process.exit(0);
+        });
+        """#
+        func viewerTokenDigest(_ name: String) throws -> String {
+            let output = try docker.exec(name: name, command: [
+                "node", "-e",
+                "process.stdout.write(require('node:crypto').createHash('sha256').update(process.env.REMOTECODE_VIEWER_TOKEN).digest('hex'))",
+            ])
+            return String(decoding: output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let tokenDigestA = try viewerTokenDigest(nameA)
+        let tokenDigestB = try viewerTokenDigest(nameB)
+        XCTAssertNotEqual(tokenDigestA, tokenDigestB)
+
+        func handshakeDenied(_ value: Any?, allowUnreachable: Bool) -> Bool {
+            guard let result = value as? [String: Any], let connected = result["connected"] as? Bool else { return false }
+            if !connected { return allowUnreachable }
+            if let status = result["status"] as? Int, (400..<500).contains(status) { return true }
+            return result["errorCode"] as? String == "ECONNRESET"
+        }
+        func runNetworkProbe(name: String, mode: String, peerHostPort: Int? = nil) throws -> [String: Any] {
+            let arguments = ["node", "-e", networkProbe, mode] + (peerHostPort.map { [String($0)] } ?? [])
+            let output = try docker.exec(name: name, command: arguments)
+            let result = String(decoding: output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            print("Context network probe \(name): \(result)")
+            guard let data = result.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                XCTFail("Network probe returned invalid semantic JSON")
+                return [:]
+            }
+            if mode == "control" {
+                guard let ownWebSocket = object["ownWebSocket"] as? [String: Any],
+                      let ownInvalidAuth = object["ownInvalidAuth"] as? [String: Any] else {
+                    XCTFail("Control probe omitted WebSocket results")
+                    return object
+                }
+                XCTAssertEqual((object["ownHttpValid"] as? [String: Any])?["status"] as? Int, 101)
+                XCTAssertTrue(handshakeDenied(object["ownHttpInvalid"], allowUnreachable: false), "Invalid token must be rejected after TCP connects")
+                XCTAssertEqual(ownWebSocket["state"] as? String, "rfb", "Own token must receive RFB data")
+                XCTAssertTrue(["closed-no-data", "handshake-failed"].contains(ownInvalidAuth["state"] as? String ?? ""), "Invalid token must not receive a frame")
+                return object
+            }
+            guard let peerTCP = object["peerTCP"] as? [[String: Any]],
+                  let peerDirectWebSocket = object["peerDirectWebSocket"] as? [String: Any],
+                  let peerWebSocket = object["peerWebSocket"] as? [String: Any] else {
+                XCTFail("Cross-probe omitted semantic results")
+                return object
+            }
+            XCTAssertEqual(peerTCP.map { $0["port"] as? Int }, [5900, 6080, 9222])
+            XCTAssertTrue(peerTCP.allSatisfy { $0["status"] as? String == "unreachable" }, "Every peer TCP port, including published 6080, must be unreachable")
+            XCTAssertTrue(handshakeDenied(object["peerDirectHttp"], allowUnreachable: true), "Peer direct viewer must not accept this context's token")
+            XCTAssertTrue(handshakeDenied(object["peerHostHttp"], allowUnreachable: true), "Peer host viewer must not accept this context's token")
+            for peer in [peerDirectWebSocket, peerWebSocket] {
+                XCTAssertTrue(["unreachable", "closed-no-data", "handshake-failed"].contains(peer["state"] as? String ?? ""), "Peer viewer must not receive any frame")
+            }
+            return object
+        }
+        func guestIPv4(_ name: String) throws -> String {
+            let output = try docker.exec(name: name, command: ["node", "-e", "const n=require('node:os').networkInterfaces();const x=Object.values(n).flat().find(i=>i&&i.family==='IPv4'&&!i.internal);if(!x)process.exit(1);process.stdout.write(x.address)"])
+            return String(decoding: output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let ipv4A = try guestIPv4(nameA)
+        let ipv4B = try guestIPv4(nameB)
+        _ = try runNetworkProbe(name: nameA, mode: "control")
+        _ = try runNetworkProbe(name: nameB, mode: "control")
+        _ = try runNetworkProbe(name: nameA, mode: ipv4B, peerHostPort: observedB.hostPort)
+        _ = try runNetworkProbe(name: nameB, mode: ipv4A, peerHostPort: observedA.hostPort)
         let homeMarker = BotComputerGuestSpec.guestUserHome + "/context-probe-marker"
         let verify = "test \"$(cat \"$1\")\" = \"$2\" && test ! -e \"$3\" && printf %s \"$2\" > \"$4\" && cat \"$4\""
         XCTAssertEqual(String(decoding: try docker.exec(name: nameA, command: ["sh", "-c", verify, "probe", markerA.path, "A", markerB.path, homeMarker]), as: UTF8.self), "A")
