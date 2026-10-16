@@ -2206,6 +2206,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         guard let threadId = intent.threadId else { return }
         do {
+            switch try router?.agentThreadOpenDestination(threadId) ?? .unavailable {
+            case .bot(let botID, let conversationID):
+                openBotNotificationRoute(
+                    NotificationRouteIntent.BotRoute(
+                        botId: botID,
+                        conversationId: conversationID,
+                        messageId: intent.finalMessageId
+                    ),
+                    generation: generation
+                )
+                return
+            case .unavailable:
+                NSLog("RemoteCode notification route unavailable thread=%@", threadId.value.uuidString)
+                return
+            case .workspace:
+                break
+            }
             let surface = try openNotificationRoute(intent)
             guard let messageID = intent.finalMessageId else { return }
             Task { @MainActor [weak self] in
@@ -2244,7 +2261,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             for _ in 0..<20 {
                 guard let self, self.notificationRouteGeneration == generation else { return }
                 if let vm = router.botsViewModel?.deskAgentVM,
-                   let threadID = router.botsViewModel?.selectedConversation?.linkedAgentThreadID,
+                   let selected = router.botsViewModel?.selectedConversation,
+                   selected.botID == bot.botId,
+                   selected.id == bot.conversationId,
+                   let threadID = selected.linkedAgentThreadID,
                    vm.selectedThreadId == threadID {
                     try? await vm.revealMessage(id: messageID, expectedThreadID: threadID)
                     return

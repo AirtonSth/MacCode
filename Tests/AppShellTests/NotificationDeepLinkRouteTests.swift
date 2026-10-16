@@ -185,11 +185,12 @@ final class NotificationDeepLinkRouteTests: XCTestCase {
         let controller = MainWindowController(context: context, router: router)
         router.windowController = controller
         router.destinationWindowIsKeyForTests = { $0 === controller.window }
+        controller.window.isReleasedWhenClosed = false
         let delegate = AppDelegate(channel: .debug, appSupportOverride: dir)
         delegate.context = context
         delegate.router = router
         delegate.windowController = controller
-        defer { controller.window.orderOut(nil) }
+        defer { controller.window.close() }
 
         let workspace = try router.createWorkspace(name: "NOTIFICATION", cwd: NSTemporaryDirectory())
         defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
@@ -213,5 +214,99 @@ final class NotificationDeepLinkRouteTests: XCTestCase {
             "notification taps must use the same exact-surface binding route as the pet")
         XCTAssertTrue(try XCTUnwrap(context.threadRepo.get(id: thread.id)).hasUnread,
             "routing must not mark a thread read before the user views it")
+    }
+
+    func test_openNotificationUserInfo_routesAuthorizedPinnedWorkspaceAndGeneralToExactBotDesk() throws {
+        let dir = NSTemporaryDirectory() + "RC2NotificationBotRoute-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let context = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let controller = MainWindowController(context: context, router: router)
+        router.windowController = controller
+        controller.window.isReleasedWhenClosed = false
+        defer { controller.window.close() }
+        let delegate = AppDelegate(channel: .debug, appSupportOverride: dir)
+        delegate.context = context
+        delegate.router = router
+        delegate.windowController = controller
+
+        let workspace = try router.createWorkspace(name: "Pinned target", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let bot = try context.botStore.create(name: "Pinned bot", title: "Pinned bot", description: "", provider: .distill)
+        let host = context.liveActivityHostIdentity.serverId
+
+        func createPinnedConversation(_ pinContext: BotContext, workspaceID: WorkspaceID?) throws -> (AgentThread, BotConversation) {
+            let grant = try context.botStore.grantContext(
+                hostID: host, botID: bot.id, context: pinContext, actions: [.read], expectedRevision: nil
+            )
+            let thread = AgentThread(workspaceId: workspaceID, title: "Pinned notification", provider: .distill, model: "test")
+            let conversation = BotConversation(botID: bot.id, title: "Pinned notification", linkedAgentThreadID: thread.id)
+            try context.botStore.createContextualConversation(
+                conversation, newThread: thread, hostID: host, context: pinContext, policyRevision: grant.policyRevision
+            )
+            return (thread, conversation)
+        }
+
+        let pinned = try createPinnedConversation(.workspace(workspace.id), workspaceID: workspace.id)
+        delegate.openNotificationUserInfo(["threadId": pinned.0.id.value.uuidString])
+        XCTAssertEqual(router.botsViewModel?.selectedBotID, bot.id)
+        XCTAssertEqual(router.botsViewModel?.selectedConversation?.id, pinned.1.id)
+        XCTAssertEqual(router.botsViewModel?.selectedConversation?.linkedAgentThreadID, pinned.0.id)
+
+        let general = try createPinnedConversation(.general, workspaceID: nil)
+        let messageID = AgentMessageID()
+        delegate.openNotificationUserInfo([
+            "threadId": general.0.id.value.uuidString,
+            "finalMessageId": messageID.value.uuidString
+        ])
+        XCTAssertEqual(router.botsViewModel?.selectedBotID, bot.id)
+        XCTAssertEqual(router.botsViewModel?.screen, .desk)
+        XCTAssertEqual(router.botsViewModel?.selectedConversation?.id, general.1.id)
+        XCTAssertEqual(router.botsViewModel?.selectedConversation?.linkedAgentThreadID, general.0.id)
+    }
+
+    func test_openNotificationUserInfo_refusesRevokedAndForeignPinsWithoutSelectingOtherDestination() throws {
+        let dir = NSTemporaryDirectory() + "RC2NotificationDeniedBotRoute-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let context = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let controller = MainWindowController(context: context, router: router)
+        router.windowController = controller
+        controller.window.isReleasedWhenClosed = false
+        defer { controller.window.close() }
+        let delegate = AppDelegate(channel: .debug, appSupportOverride: dir)
+        delegate.context = context
+        delegate.router = router
+        delegate.windowController = controller
+        let workspace = try router.createWorkspace(name: "Alternate", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        let bot = try context.botStore.create(name: "Denied bot", title: "Denied bot", description: "", provider: .distill)
+        let host = context.liveActivityHostIdentity.serverId
+
+        func createPinnedConversation(_ pinHost: String, context pinContext: BotContext, workspaceID: WorkspaceID?) throws -> (AgentThread, BotConversation, Int64) {
+            let grant = try context.botStore.grantContext(
+                hostID: pinHost, botID: bot.id, context: pinContext, actions: [.read], expectedRevision: nil
+            )
+            let thread = AgentThread(workspaceId: workspaceID, title: "Denied notification", provider: .distill, model: "test")
+            let conversation = BotConversation(botID: bot.id, title: "Denied notification", linkedAgentThreadID: thread.id)
+            try context.botStore.createContextualConversation(
+                conversation, newThread: thread, hostID: pinHost, context: pinContext, policyRevision: grant.policyRevision
+            )
+            return (thread, conversation, grant.policyRevision)
+        }
+
+        let revoked = try createPinnedConversation(host, context: .workspace(workspace.id), workspaceID: workspace.id)
+        _ = try context.botStore.revokeContext(hostID: host, botID: bot.id, context: .workspace(workspace.id), expectedRevision: revoked.2)
+        let foreign = try createPinnedConversation("foreign-host", context: .general, workspaceID: nil)
+        delegate.openNotificationUserInfo(["threadId": revoked.0.id.value.uuidString])
+        XCTAssertNil(router.botsViewModel?.selectedBotID)
+        XCTAssertNil(router.botsViewModel?.selectedConversation)
+        XCTAssertFalse(controller.window.isVisible)
+        delegate.openNotificationUserInfo(["threadId": foreign.0.id.value.uuidString])
+        XCTAssertNil(router.botsViewModel?.selectedBotID)
+        XCTAssertNil(router.botsViewModel?.selectedConversation)
+        XCTAssertFalse(controller.window.isVisible)
     }
 }
