@@ -323,6 +323,26 @@ final class BotContextDockerProbeTests: XCTestCase {
         _ = try runNetworkProbe(name: nameB, mode: "control")
         _ = try runNetworkProbe(name: nameA, mode: ipv4B, peerHostPort: observedB.hostPort)
         _ = try runNetworkProbe(name: nameB, mode: ipv4A, peerHostPort: observedA.hostPort)
+        let gatewayPort = UInt16(observedB.hostPort)
+        let gatewayLease = try service.installGatewayLease(identity: identityA, runID: AgentRunID(), port: gatewayPort)
+        func assertLeaseTCP(_ lease: BotContextGatewayLease, connected: Bool, name: String) throws {
+            let script = "const net=require('node:net');const s=net.createConnection({host:process.argv[1],port:Number(process.argv[2])});let done=false;function finish(value){if(done)return;done=true;s.destroy();process.stdout.write(value)}s.setTimeout(1000);s.once('connect',()=>finish('connected'));s.once('timeout',()=>finish('unreachable'));s.once('error',()=>finish('unreachable'));"
+            let output = try docker.exec(name: name, command: ["node", "-e", script, lease.hostAddress, String(lease.port)], detach: false)
+            XCTAssertEqual(String(decoding: output, as: UTF8.self), connected ? "connected" : "unreachable")
+        }
+        try assertLeaseTCP(gatewayLease, connected: true, name: nameA)
+        let otherEndpoint = BotContextGatewayLease(identity: identityA, runID: gatewayLease.runID, hostAddress: gatewayLease.hostAddress, port: UInt16(observedA.hostPort))
+        try assertLeaseTCP(otherEndpoint, connected: false, name: nameA)
+        try assertLeaseTCP(otherEndpoint, connected: false, name: nameB)
+        let wrongRunLease = BotContextGatewayLease(identity: identityA, runID: AgentRunID(), hostAddress: gatewayLease.hostAddress, port: gatewayLease.port)
+        XCTAssertThrowsError(try service.revokeGatewayLease(wrongRunLease))
+        XCTAssertTrue(try docker.inspect(name: nameA).running, "Wrong-run revoke must not stop guest A runtime")
+        try assertLeaseTCP(gatewayLease, connected: true, name: nameA)
+        try service.revokeGatewayLease(gatewayLease)
+        let flowReadback = try docker.exec(name: nameA, command: ["conntrack", "-L", "-f", "ipv4", "-p", "tcp", "-d", gatewayLease.hostAddress, "--dport", String(gatewayLease.port)], user: "0", detach: false)
+        XCTAssertTrue(String(decoding: flowReadback, as: UTF8.self).isEmpty, "Revoked lease must have no conntrack flow")
+        try assertLeaseTCP(gatewayLease, connected: false, name: nameA)
+        try service.revokeGatewayLease(gatewayLease)
         let homeMarker = BotComputerGuestSpec.guestUserHome + "/context-probe-marker"
         let verify = "test \"$(cat \"$1\")\" = \"$2\" && test ! -e \"$3\" && printf %s \"$2\" > \"$4\" && cat \"$4\""
         XCTAssertEqual(String(decoding: try docker.exec(name: nameA, command: ["sh", "-c", verify, "probe", markerA.path, "A", markerB.path, homeMarker]), as: UTF8.self), "A")
