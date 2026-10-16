@@ -46,7 +46,6 @@ final class BotContextGatewayActiveHTTPTests: XCTestCase {
             if cleaned { do { try FileManager.default.removeItem(at: root) } catch { XCTFail("Fixture cleanup failed: \(error)") } }
         }
         let values = [UUID().uuidString, UUID().uuidString]
-        let runID = AgentRunID()
         for (index, context) in contexts.enumerated() {
             let binding = try store.grantContext(hostID: host, botID: bot.id, context: context, actions: [.read, .send, .configure, .files], expectedRevision: 0)
             let identity = try BotContextRuntimeIdentity(binding: binding)
@@ -56,7 +55,7 @@ final class BotContextGatewayActiveHTTPTests: XCTestCase {
             let thread = AgentThread(workspaceId: index == 0 ? workspace.id : nil, title: "Context", provider: .distill, model: "test")
             let conversation = BotConversation(botID: bot.id, title: "Context", linkedAgentThreadID: thread.id)
             _ = try store.createContextualConversation(conversation, newThread: thread, hostID: host, context: context, policyRevision: binding.policyRevision)
-            let request = AgentRunRequest(runId: runID, threadId: thread.id, provider: .distill, model: "test", cwd: index == 0 ? workspace.cwd : BotHome(appSupportDirectory: support, bot: bot).root.path, prompt: "probe", environment: ["CONTEXT_MARKER": "inherited", "ONLY_\(index)": "inherited", BotSecretEnvironment.secretNamesEnvironmentKey: "CONTEXT_MARKER,ONLY_\(index)"])
+            let request = AgentRunRequest(threadId: thread.id, provider: .distill, model: "test", cwd: index == 0 ? workspace.cwd : BotHome(appSupportDirectory: support, bot: bot).root.path, prompt: "probe", environment: ["CONTEXT_MARKER": "inherited", "ONLY_\(index)": "inherited", BotSecretEnvironment.secretNamesEnvironmentKey: "CONTEXT_MARKER,ONLY_\(index)"])
             resources.append(try BotContextGuestResources.prepare(request: request, hostID: host, store: store, threadRepo: AgentThreadRepository(db: db), service: service, appSupport: support, workspace: index == 0 ? workspace : nil, registeredWorkspaces: [workspace.cwd], secretStore: secrets))
         }
         envURLs = try resources.map { try XCTUnwrap($0.envFileURL) }

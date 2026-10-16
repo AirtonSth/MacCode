@@ -3993,6 +3993,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     ctx.coordinator.stopRun(threadId: threadID)
                     try ctx.coordinator.stopDelegatedRunsForThread(threadId: threadID)
                 }
+                try BotContextGuestResources.requestRevocation(
+                    binding: binding, store: ctx.botStore, appSupport: ctx.appSupportDirectory
+                )
                 return true
             } catch {
                 return false

@@ -54,7 +54,6 @@ final class BotContextGatewayDockerProbeTests: XCTestCase {
         }
         let values = [UUID().uuidString, UUID().uuidString]
         try secrets.save(botID: bot.id, name: "GLOBAL_CANARY", value: "global-only")
-        let sharedRun = AgentRunID()
         for (index, context) in contexts.enumerated() {
             let binding = try store.grantContext(hostID: host, botID: bot.id, context: context, actions: [.read, .send, .configure, .files], expectedRevision: 0)
             let identity = try BotContextRuntimeIdentity(binding: binding)
@@ -64,15 +63,19 @@ final class BotContextGatewayDockerProbeTests: XCTestCase {
             let thread = AgentThread(workspaceId: index == 0 ? workspace.id : nil, title: "Context", provider: .distill, model: "test")
             let conversation = BotConversation(botID: bot.id, title: "Context", linkedAgentThreadID: thread.id)
             _ = try store.createContextualConversation(conversation, newThread: thread, hostID: host, context: context, policyRevision: binding.policyRevision)
-            let request = AgentRunRequest(runId: sharedRun, threadId: thread.id, provider: .distill, model: "test", cwd: index == 0 ? workspace.cwd : BotHome(appSupportDirectory: support, bot: bot).root.path, prompt: "probe", environment: [
+            let request = AgentRunRequest(threadId: thread.id, provider: .distill, model: "test", cwd: index == 0 ? workspace.cwd : BotHome(appSupportDirectory: support, bot: bot).root.path, prompt: "probe", environment: [
                 "CONTEXT_MARKER": "inherited", "GLOBAL_CANARY": "inherited", "DISTILL_HOME": "/foreign",
                 BotSecretEnvironment.secretNamesEnvironmentKey: "CONTEXT_MARKER,GLOBAL_CANARY",
             ])
             requests.append(request)
+            if index == 1 {
+                let duplicate = AgentRunRequest(runId: resources[0].runID, threadId: request.threadId, provider: .distill, model: request.model, cwd: request.cwd, prompt: "duplicate", environment: request.environment)
+                XCTAssertThrowsError(try BotContextGuestResources.prepare(request: duplicate, hostID: host, store: store, threadRepo: AgentThreadRepository(db: db), service: service, appSupport: support, workspace: nil, registeredWorkspaces: [workspace.cwd], secretStore: secrets))
+            }
             resources.append(try BotContextGuestResources.prepare(request: request, hostID: host, store: store, threadRepo: AgentThreadRepository(db: db), service: service, appSupport: support, workspace: index == 0 ? workspace : nil, registeredWorkspaces: [workspace.cwd], secretStore: secrets))
         }
         let envURLs = try resources.map { try XCTUnwrap($0.envFileURL) }
-        XCTAssertNotEqual(envURLs[0], envURLs[1], "Identical run IDs must not overwrite another context's credentials")
+        XCTAssertNotEqual(envURLs[0], envURLs[1], "Independent context runs must use distinct private environment files")
         let client = #"""
         const fs=require('node:fs'),http=require('node:http'),path=require('node:path'),crypto=require('node:crypto');
         const config=fs.readFileSync(path.join(process.env.DISTILL_HOME,'config.toml'),'utf8');

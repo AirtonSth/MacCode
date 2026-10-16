@@ -18,6 +18,8 @@ final class BotContextGuestResources {
     private let appSupport: URL
     private let service: BotComputerGuestService
     private let gateway: BotGuestMCPGateway
+    private let store: BotStore
+    let threadID: AgentThreadID
     private var networkLease: BotContextGatewayLease?
     private var installationAttempted = false
     private var recordStarted = false
@@ -26,12 +28,14 @@ final class BotContextGuestResources {
     private var finished = false
     private var directoryName: String { ".distill-context-\(runID.value.uuidString.lowercased())" }
 
-    private init(identity: BotContextRuntimeIdentity, runID: AgentRunID, service: BotComputerGuestService, gateway: BotGuestMCPGateway, appSupport: URL) {
+    private init(identity: BotContextRuntimeIdentity, runID: AgentRunID, threadID: AgentThreadID, store: BotStore, service: BotComputerGuestService, gateway: BotGuestMCPGateway, appSupport: URL) {
         self.appSupport = appSupport
         self.identity = identity
         self.runID = runID
         self.service = service
         self.gateway = gateway
+        self.store = store
+        self.threadID = threadID
     }
 
     static func prepare(
@@ -43,7 +47,8 @@ final class BotContextGuestResources {
         appSupport: URL,
         workspace: Workspace?,
         registeredWorkspaces: Set<String>,
-        secretStore: any BotSecretStore
+        secretStore: any BotSecretStore,
+        parentRunID: AgentRunID? = nil
     ) throws -> BotContextGuestResources {
         do {
             guard request.runAsUser == nil || request.runAsUser?.uid == getuid() else {
@@ -66,6 +71,7 @@ final class BotContextGuestResources {
                 return actions.allSatisfy {
                     (try? store.authorizes(hostID: hostID, botID: pin.botID, context: pin.context, action: $0, policyRevision: pin.policyRevision)) == true
                 } && (try? store.conversationContextPin(linkedTo: request.threadId)) == pin
+                    && (try? store.authorizesContextDelegation(hostID: hostID, runID: request.runId, threadID: request.threadId)) == true
             }
             guard authorize() else {
                 throw BotComputerGuestServiceError.contextualRuntimeUnavailable
@@ -84,14 +90,19 @@ final class BotContextGuestResources {
             }
             let context = BotGuestMCPGateway.ContextBinding(pin: pin, threadID: request.threadId)
             let gateway = BotGuestMCPGateway(context: context, contextStore: store, secretStore: secretStore)
-            let resources = BotContextGuestResources(identity: identity, runID: request.runId, service: service, gateway: gateway, appSupport: appSupport)
+            let resources = BotContextGuestResources(identity: identity, runID: request.runId, threadID: request.threadId, store: store, service: service, gateway: gateway, appSupport: appSupport)
             let claimed = lock.withLock {
-                guard live[identity.storageBotID] == nil else { return false }
+                guard live[identity.storageBotID] == nil,
+                      !live.values.contains(where: { $0.appSupport.resolvingSymlinksInPath().standardizedFileURL == appSupport.resolvingSymlinksInPath().standardizedFileURL && $0.runID == request.runId }) else { return false }
                 live[identity.storageBotID] = resources
                 return true
             }
             guard claimed else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
             do {
+                if let parentRunID {
+                    _ = try store.recordContextDelegation(hostID: hostID, parentRunID: parentRunID, childRunID: request.runId, childThreadID: request.threadId)
+                }
+                guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                 try BotContextGuestRecovery.begin(identity: identity, runID: request.runId, appSupport: appSupport)
                 resources.recordStarted = true
                 let adapter = BotContextSecretStore(identity: identity, store: secretStore, authorizes: authorize)
@@ -126,17 +137,93 @@ final class BotContextGuestResources {
                 guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                 return resources
             } catch {
-                try? resources.finish()
+                do { try resources.finish() }
+                catch { NSLog("Bot context preparation cleanup unconfirmed run=%@ error=%@", request.runId.value.uuidString.lowercased(), String(describing: error)) }
                 throw error
             }
         }
     }
 
     func finish() throws {
-        try operationLock.withLock { try finishLocked() }
+        try operationLock.withLock { try finishLocked(stopRuntime: false) }
     }
 
-    private func finishLocked() throws {
+    private func cancelDescendant() throws {
+        try operationLock.withLock { try finishLocked(stopRuntime: true) }
+    }
+
+    static func requestFinish(runID: AgentRunID, threadID: AgentThreadID, store: BotStore, appSupport: URL) {
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                let edges = try store.closeContextDelegationTree(runID: runID)
+                let matches = lock.withLock {
+                    live.values.filter { resource in
+                        resource.appSupport.resolvingSymlinksInPath().standardizedFileURL == appSupport.resolvingSymlinksInPath().standardizedFileURL
+                            && ((resource.runID == runID && resource.threadID == threadID)
+                                || edges.contains { edge in
+                                    edge.childRunID == resource.runID && edge.childThreadID == resource.threadID
+                                        && (try? BotContextRuntimeIdentity(hostID: edge.childPin.hostID, botID: edge.childPin.botID, context: edge.childPin.context, policyRevision: edge.childPin.policyRevision).storageBotID) == resource.identity.storageBotID
+                                })
+                    }
+                }
+                for resource in matches {
+                    do {
+                        if resource.runID == runID && resource.threadID == threadID { try resource.finish() }
+                        else { try resource.cancelDescendant() }
+                    } catch {
+                        NSLog("Bot context finish failed run=%@ error=%@", resource.runID.value.uuidString.lowercased(), String(describing: error))
+                    }
+                }
+            } catch {
+                NSLog("Bot context finish failed run=%@ error=%@", runID.value.uuidString.lowercased(), String(describing: error))
+            }
+        }
+    }
+
+    static func requestRevocation(binding: BotContextBinding, store: BotStore, appSupport: URL) throws {
+        func invalid(_ pin: BotConversationContextPin) -> Bool {
+            pin.hostID == binding.hostID && pin.botID == binding.botID && pin.context == binding.context
+                && (binding.state != .active || pin.policyRevision != binding.policyRevision)
+        }
+        let edges = try store.contextDelegations()
+        let affectedEdges = edges.filter { invalid($0.parentPin) || invalid($0.childPin) }
+        let resources = lock.withLock {
+            live.values.filter { $0.appSupport.resolvingSymlinksInPath().standardizedFileURL == appSupport.resolvingSymlinksInPath().standardizedFileURL
+                && $0.identity.hostID == binding.hostID && $0.identity.botID == binding.botID && $0.identity.context == binding.context
+                && (binding.state != .active || $0.identity.policyRevision != binding.policyRevision) }
+        }
+        guard !affectedEdges.isEmpty || !resources.isEmpty else { return }
+        var roots = Set(resources.map(\.runID))
+        for edge in affectedEdges {
+            if invalid(edge.parentPin) { roots.insert(edge.parentRunID) }
+            if invalid(edge.childPin) { roots.insert(edge.childRunID) }
+        }
+        var allRunIDs = roots
+        var allEdges: [BotContextDelegation] = []
+        for runID in roots {
+            let descendants = try store.closeContextDelegationTree(runID: runID)
+            allEdges.append(contentsOf: descendants)
+            allRunIDs.formUnion(descendants.map(\.childRunID))
+        }
+        DispatchQueue.global(qos: .utility).async {
+            let captured = lock.withLock {
+                live.values.filter { resource in
+                    resource.appSupport.resolvingSymlinksInPath().standardizedFileURL == appSupport.resolvingSymlinksInPath().standardizedFileURL
+                        && ((allRunIDs.contains(resource.runID) && roots.contains(resource.runID))
+                            || allEdges.contains { edge in
+                                edge.childRunID == resource.runID && edge.childThreadID == resource.threadID
+                                    && (try? BotContextRuntimeIdentity(hostID: edge.childPin.hostID, botID: edge.childPin.botID, context: edge.childPin.context, policyRevision: edge.childPin.policyRevision).storageBotID) == resource.identity.storageBotID
+                            })
+                }
+            }
+            for resource in captured {
+                do { try resource.cancelDescendant() }
+                catch { NSLog("Bot context revocation failed run=%@ error=%@", resource.runID.value.uuidString.lowercased(), String(describing: error)) }
+            }
+        }
+    }
+
+    private func finishLocked(stopRuntime: Bool) throws {
         guard !finished else { return }
         gateway.revoke(runID: runID.value.uuidString.lowercased())
         // Remove distributed credentials even if the network cannot be reconciled.
@@ -146,6 +233,25 @@ final class BotContextGuestResources {
             }
             self.envFileURL = nil
         }
+        let edges = try store.closeContextDelegationTree(runID: runID)
+        let descendants = Self.lock.withLock {
+            edges.compactMap { edge -> BotContextGuestResources? in
+                guard edge.childRunID != runID,
+                      let child = Self.live.values.first(where: {
+                          $0.runID == edge.childRunID && $0.threadID == edge.childThreadID
+                              && (try? BotContextRuntimeIdentity(hostID: edge.childPin.hostID, botID: edge.childPin.botID, context: edge.childPin.context, policyRevision: edge.childPin.policyRevision).storageBotID) == $0.identity.storageBotID
+                              && $0.appSupport.resolvingSymlinksInPath().standardizedFileURL == appSupport.resolvingSymlinksInPath().standardizedFileURL
+                      }) else { return nil }
+                return child
+            }
+        }
+        var descendantError: Error?
+        for child in descendants {
+            do { try child.cancelDescendant() }
+            catch { if descendantError == nil { descendantError = error } }
+        }
+        if let descendantError { throw descendantError }
+        if stopRuntime { try service.stopForContextRecovery(identity: identity) }
         if let networkLease {
             try service.revokeGatewayLease(networkLease)
         } else if installationAttempted {

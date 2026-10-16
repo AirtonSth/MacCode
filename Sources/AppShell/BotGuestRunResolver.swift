@@ -726,7 +726,7 @@ extension AppContext {
                 }
                 BotGuestLaunchSweep.run(
                     docker: sweepDocker, appSupport: appSupport, botIDs: botIDs, barrier: barrier,
-                    beforeOpening: trimGuestCache
+                    contextStore: store, beforeOpening: trimGuestCache
                 )
             }
         }
@@ -794,17 +794,31 @@ enum BotGuestLaunchSweep {
         appSupport: URL,
         botIDs: [BotID],
         barrier: DistillGuestLaunchBarrier,
+        contextStore: BotStore? = nil,
         beforeOpening: @escaping @Sendable () async -> Void = {}
     ) -> BotContextGuestRecovery.Report {
         let recovery = BotContextGuestRecovery.reconcile(docker: docker, appSupport: appSupport)
         guestResolverLog.info("bot.context.launch_recovery reconciled=\(recovery.reconciled.count, privacy: .public) uncertain=\(recovery.failures.count, privacy: .public)")
+        var report = recovery
+        if recovery.failures.isEmpty, let contextStore {
+            do {
+                let roots = Set(try contextStore.contextDelegations().map(\.parentRunID))
+                for runID in roots {
+                    _ = try contextStore.closeContextDelegationTree(runID: runID)
+                }
+            } catch {
+                var failures = report.failures
+                failures["context-lineage"] = String(describing: error)
+                report = BotContextGuestRecovery.Report(reconciled: report.reconciled, failures: failures)
+            }
+        }
         if let docker { endLeftoverRuns(docker: docker, appSupport: appSupport, botIDs: botIDs) }
         removeLeftovers(appSupport: appSupport)
         Task {
             await beforeOpening()
             await barrier.open()
         }
-        return recovery
+        return report
     }
 
     /// Ends what a previous session of this app left running in the

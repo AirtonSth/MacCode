@@ -67,7 +67,8 @@ public enum Schema {
     static let titioNoticesSchemaVersion = 93
     static let botContextsSchemaVersion = 94
     static let botConversationContextsSchemaVersion = 95
-    public static let currentVersion: Int = botConversationContextsSchemaVersion
+    static let botContextDelegationsSchemaVersion = 96
+    public static let currentVersion: Int = botContextDelegationsSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1910,6 +1911,30 @@ public enum Schema {
               AND conversation_id <> OLD.id
         )
         BEGIN SELECT RAISE(ABORT, 'thread already has a contextual conversation'); END;
+        """),
+        SchemaStep(botContextDelegationsSchemaVersion, """
+        CREATE TABLE IF NOT EXISTS bot_context_delegations (
+            child_run_id TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+            parent_run_id TEXT NOT NULL COLLATE NOCASE,
+            payload_json TEXT NOT NULL CHECK(length(payload_json) <= 16384),
+            closed INTEGER NOT NULL DEFAULT 0 CHECK(typeof(closed) = 'integer' AND closed IN (0, 1))
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_context_delegations_parent_run
+            ON bot_context_delegations(parent_run_id);
+        CREATE TRIGGER IF NOT EXISTS bot_context_delegations_insert_guard
+        BEFORE INSERT ON bot_context_delegations
+        WHEN EXISTS (SELECT 1 FROM bot_context_delegations WHERE child_run_id = NEW.child_run_id)
+        BEGIN SELECT RAISE(ABORT, 'bot context delegation already exists'); END;
+        CREATE TRIGGER IF NOT EXISTS bot_context_delegations_update_guard
+        BEFORE UPDATE ON bot_context_delegations
+        WHEN NEW.child_run_id COLLATE BINARY IS NOT OLD.child_run_id COLLATE BINARY
+          OR NEW.parent_run_id COLLATE BINARY IS NOT OLD.parent_run_id COLLATE BINARY
+          OR NEW.payload_json IS NOT OLD.payload_json
+          OR NEW.closed < OLD.closed
+        BEGIN SELECT RAISE(ABORT, 'bot context delegation is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS bot_context_delegations_delete_guard
+        BEFORE DELETE ON bot_context_delegations
+        BEGIN SELECT RAISE(ABORT, 'bot context delegation cannot be deleted'); END;
         """),
     ]
 

@@ -1054,6 +1054,24 @@ final class BotGuestRunResolverTests: XCTestCase {
         await plan.finish(.completed).value
     }
 
+    func test_launchSweepReportsMalformedContextLineageWithPhysicalRecoveryEmpty() async throws {
+        let appSupport = root.appendingPathComponent("support", isDirectory: true)
+        let db = try SQLiteDB(path: root.appendingPathComponent("bots.sqlite").path)
+        try Schema.migrate(db)
+        try db.execute("INSERT INTO bot_context_delegations(child_run_id, parent_run_id, payload_json, closed) VALUES('bad-child', 'bad-parent', 'not-json', 0);")
+        let store = BotStore(db: db)
+        let barrier = DistillGuestLaunchBarrier()
+
+        let report = BotGuestLaunchSweep.run(
+            docker: nil, appSupport: appSupport, botIDs: [], barrier: barrier, contextStore: store
+        )
+
+        XCTAssertNotNil(report.failures["context-lineage"])
+        XCTAssertTrue(report.reconciled.isEmpty)
+        XCTAssertTrue(report.failures.keys.allSatisfy { $0 == "context-lineage" })
+        try await barrier.wait()
+    }
+
     func test_launchSweep_trimsTheGuestDistillCacheBeforeAdmittingGuestRuns() async throws {
         // WHY: the cache trim deletes old guest builds. A run admitted before
         // it finished could be handed the path of a build the trim then

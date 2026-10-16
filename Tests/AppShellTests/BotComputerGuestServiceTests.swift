@@ -1,7 +1,9 @@
 import XCTest
 import CryptoKit
+import AgentRuntime
 import CoreModel
 import Persistence
+import SocketServer
 @testable import AppShell
 
 private final class FakeDocker: BotComputerDockerClienting, @unchecked Sendable {
@@ -2184,6 +2186,87 @@ final class BotComputerGuestServiceTests: XCTestCase {
         registry.end(botID: botID, runID: run)
         XCTAssertFalse(try service.provision(botID: botID).resumed)
         XCTAssertEqual(fake.removed, [name])
+    }
+
+    func test_parentFinishThrowsUntilDelegatedChildStopSucceeds() throws {
+        let support = makeSupport("rc-context-delegation-finish")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let dbURL = support.appendingPathComponent("contexts.sqlite")
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let db = try SQLiteDB(path: dbURL.path)
+        try Schema.migrate(db)
+        let store = BotStore(db: db)
+        let parentBot = try store.create(name: "Parent", title: "Parent", description: "", handle: "context-parent", soul: "", provider: .distill, model: "distill")
+        let childBot = try store.create(name: "Child", title: "Child", description: "", handle: "context-child", soul: "", provider: .distill, model: "distill")
+        let hostID = "context-finish-host"
+        let parentGrant = try store.grantContext(hostID: hostID, botID: parentBot.id, context: .general, actions: [.read, .send, .configure, .delegate], expectedRevision: 0)
+        let childGrant = try store.grantContext(hostID: hostID, botID: childBot.id, context: .general, actions: [.read, .send, .configure], expectedRevision: 0)
+        let parentThread = AgentThread(workspaceId: nil, title: "Parent", provider: .distill, model: "distill")
+        let childThread = AgentThread(workspaceId: nil, title: "Child", provider: .distill, model: "distill")
+        _ = try store.createContextualConversation(BotConversation(botID: parentBot.id, title: "Parent", linkedAgentThreadID: parentThread.id), newThread: parentThread, hostID: hostID, context: .general, policyRevision: parentGrant.policyRevision)
+        _ = try store.createContextualConversation(BotConversation(botID: childBot.id, title: "Child", linkedAgentThreadID: childThread.id), newThread: childThread, hostID: hostID, context: .general, policyRevision: childGrant.policyRevision)
+        let parentRun = AgentRun(threadId: parentThread.id, provider: .distill, model: "distill", status: .running)
+        try AgentRunRepository(db: db).upsert(parentRun)
+        let fake = FakeDocker()
+        fake.execOutput = { command in
+            if command == ["/bin/cat", "/etc/hosts"] { return Data("10.250.250.254 host.docker.internal\n".utf8) }
+            if command.contains("--allow-gateway") { return Data("context-gateway-lease-v1\n".utf8) }
+            if command.contains("--revoke-gateway") { return Data("context-gateway-revoked-v1\n".utf8) }
+            return nil
+        }
+        let service = BotComputerGuestService(appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0)
+        let threadRepo = AgentThreadRepository(db: db)
+        let secrets = InMemoryBotSecretStore()
+        func owned(_ binding: BotContextBinding) throws -> (BotContextRuntimeIdentity, String) {
+            let identity = try BotContextRuntimeIdentity(binding: binding)
+            let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+            let network = BotComputerGuestSpec.networkName(botID: identity.storageBotID)
+            fake.networkSet.insert(network)
+            fake.containers[name] = BotComputerContainerInspect(
+                running: true, imageID: "img", hostPort: 49152, networkNames: [network],
+                labels: [BotComputerGuestSpec.botIDLabelKey: identity.storageBotID.value.uuidString.lowercased(),
+                         "remotecode.context.network": "private-egress-v1",
+                         BotComputerGuestSpec.runtimeLabelKey: BotComputerGuestSpec.runtimeRevision,
+                         BotComputerGuestSpec.workspacesLabelKey: BotComputerGuestSpec.workspacesLabel([])],
+                homeSource: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: identity.storageBotID).standardizedFileURL.path
+            )
+            return (identity, name)
+        }
+        let (_, parentName) = try owned(parentGrant)
+        let (_, childName) = try owned(childGrant)
+        let parentRequest = AgentRunRequest(runId: parentRun.id, threadId: parentThread.id, provider: .distill, model: "distill", cwd: "", prompt: "parent")
+        let childRequest = AgentRunRequest(threadId: childThread.id, provider: .distill, model: "distill", cwd: "", prompt: "child")
+        var resources: [BotContextGuestResources] = []
+        defer {
+            fake.stopError = nil
+            for resource in resources { try? resource.finish() }
+            try? FileManager.default.removeItem(at: support)
+        }
+        let parent = try BotContextGuestResources.prepare(request: parentRequest, hostID: hostID, store: store, threadRepo: threadRepo, service: service, appSupport: support, workspace: nil, registeredWorkspaces: [], secretStore: secrets)
+        resources.append(parent)
+        let child = try BotContextGuestResources.prepare(request: childRequest, hostID: hostID, store: store, threadRepo: threadRepo, service: service, appSupport: support, workspace: nil, registeredWorkspaces: [], secretStore: secrets, parentRunID: parentRun.id)
+        resources.append(child)
+        let parentEnv = try XCTUnwrap(parent.envFileURL)
+        let childEnv = try XCTUnwrap(child.envFileURL)
+        fake.stopError = BotComputerGuestError.dockerUnavailable
+        XCTAssertThrowsError(try parent.finish())
+        XCTAssertTrue(try XCTUnwrap(store.contextDelegation(childRunID: child.runID)).closed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: childEnv.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parentEnv.path))
+        XCTAssertTrue(fake.stopped == [childName])
+        let childJournal = DistillGuestEnvironment.runsDirectory(appSupport: support)
+            .appendingPathComponent(child.identity.storageBotID.value.uuidString.lowercased(), isDirectory: true)
+            .appendingPathComponent(child.runID.value.uuidString.lowercased() + ".context.json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: childJournal.path))
+        XCTAssertEqual(try JSONDecoder().decode(BotContextGuestRecovery.Record.self, from: Data(contentsOf: childJournal)).state, .pending)
+        fake.stopError = nil
+        try parent.finish()
+        XCTAssertTrue(try XCTUnwrap(store.contextDelegation(childRunID: child.runID)).closed)
+        XCTAssertFalse(fake.containers[childName]?.running ?? true)
+        XCTAssertTrue(fake.containers[parentName]?.running ?? false)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parentEnv.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: childEnv.path))
+        try parent.finish()
     }
 
     private func makeSupport(_ prefix: String) -> URL {

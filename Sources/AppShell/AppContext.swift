@@ -1176,6 +1176,11 @@ public final class AppContext {
             }
         }
         coordinator.onRunFinished = { [weak self] tid, rid, status in
+            if let self {
+                BotContextGuestResources.requestFinish(
+                    runID: rid, threadID: tid, store: self.botStore, appSupport: self.appSupportDirectory
+                )
+            }
             let nextWaiting = BotVMRunRegistry.shared.releaseAndNextWaiter(runID: rid)
             let streamErrorAction = runErrorActions.take(runId: rid)
             // Read before the hop: closing a side chat stops its run and deletes

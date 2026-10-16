@@ -332,7 +332,8 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
               let conversation = try? store.conversation(id: context.pin.conversationID),
               conversation.botID == context.pin.botID,
               conversation.linkedAgentThreadID == context.threadID,
-              (try? store.conversationContextPin(linkedTo: context.threadID)) == context.pin else { return false }
+              (try? store.conversationContextPin(linkedTo: context.threadID)) == context.pin,
+              (try? store.authorizesContextDelegation(hostID: context.pin.hostID, runID: AgentRunID(UUID(uuidString: binding.runID)!), threadID: context.threadID)) == true else { return false }
         return true
     }
 
