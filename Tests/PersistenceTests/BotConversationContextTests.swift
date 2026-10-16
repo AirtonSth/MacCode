@@ -44,6 +44,59 @@ final class BotConversationContextTests: XCTestCase {
         XCTAssertEqual(try BotStore(db: db).conversationContextPin(conversationID: conversation.id), pin)
     }
 
+    func test_newThreadAndConversationAreAtomicallyPinned() throws {
+        let (_, store, bot) = try makeStore()
+        let workspace = WorkspaceID()
+        let context = BotContext.workspace(workspace)
+        let grant = try store.grantContext(hostID: "host", botID: bot.id, context: context, actions: [.read], expectedRevision: nil)
+        let threadID = AgentThreadID()
+        let conversation = BotConversation(botID: bot.id, title: "Fresh", linkedAgentThreadID: threadID)
+        let thread = AgentThread(id: threadID, workspaceId: workspace, title: "Fresh", provider: .distill, model: "distill")
+
+        let pin = try store.createContextualConversation(conversation, newThread: thread, hostID: "host", context: context, policyRevision: grant.policyRevision)
+
+        XCTAssertEqual(try store.conversationContextPin(linkedTo: threadID), pin)
+        let stored = try XCTUnwrap(AgentThreadRepository(db: store.db).get(id: threadID))
+        XCTAssertEqual(stored.actor, .bot(bot.id))
+        XCTAssertNotNil(stored.actorLockedAt)
+        XCTAssertEqual(stored.executionTarget, .vm)
+        XCTAssertEqual(try AgentThreadRepository(db: store.db).guestPlacement(of: threadID)?.guestRuntime, BotGuestRuntime.distillV1)
+        XCTAssertNil(stored.providerThreadId)
+    }
+
+    func test_freshThreadValidationRejectsMismatchesAndStoredRows() throws {
+        let (db, store, bot) = try makeStore()
+        let workspace = WorkspaceID()
+        let context = BotContext.workspace(workspace)
+        let grant = try store.grantContext(hostID: "host", botID: bot.id, context: context, actions: [.read], expectedRevision: nil)
+        let invalidThreads = [
+            AgentThread(workspaceId: nil, title: "Wrong workspace", provider: .distill, model: "distill"),
+            AgentThread(workspaceId: workspace, title: "Wrong actor", provider: .distill, model: "distill", actor: .bot(bot.id)),
+            AgentThread(workspaceId: workspace, title: "Wrong provider", provider: .claude, model: "claude"),
+            AgentThread(workspaceId: workspace, title: "Existing session", provider: .distill, model: "distill", providerThreadId: "session")
+        ]
+        for thread in invalidThreads {
+            let conversation = BotConversation(botID: bot.id, title: thread.title, linkedAgentThreadID: thread.id)
+            XCTAssertThrowsError(try store.createContextualConversation(conversation, newThread: thread, hostID: "host", context: context, policyRevision: grant.policyRevision))
+            XCTAssertNil(try store.conversation(id: conversation.id))
+            XCTAssertNil(try AgentThreadRepository(db: db).get(id: thread.id))
+            XCTAssertNil(store.cachedBotID(linkedTo: thread.id))
+        }
+
+        let generalThread = AgentThread(workspaceId: workspace, title: "General context mismatch", provider: .distill, model: "distill")
+        let generalConversation = BotConversation(botID: bot.id, title: "General context mismatch", linkedAgentThreadID: generalThread.id)
+        let generalGrant = try store.grantContext(hostID: "host", botID: bot.id, context: .general, actions: [.read], expectedRevision: nil)
+        XCTAssertThrowsError(try store.createContextualConversation(generalConversation, newThread: generalThread, hostID: "host", context: .general, policyRevision: generalGrant.policyRevision))
+
+        let storedThread = AgentThread(workspaceId: workspace, title: "Already stored empty", provider: .distill, model: "distill")
+        try AgentThreadRepository(db: db).upsert(storedThread)
+        let storedConversation = BotConversation(botID: bot.id, title: "Stored row", linkedAgentThreadID: storedThread.id)
+        XCTAssertThrowsError(try store.createContextualConversation(storedConversation, newThread: storedThread, hostID: "host", context: context, policyRevision: grant.policyRevision))
+        XCTAssertNil(try store.conversation(id: storedConversation.id))
+        XCTAssertEqual(try AgentThreadRepository(db: db).get(id: storedThread.id)?.id, storedThread.id)
+        XCTAssertEqual(try AgentThreadRepository(db: db).get(id: storedThread.id)?.title, storedThread.title)
+    }
+
     func test_legacyLinkedThreadCannotBePinnedAndNoNewConversationIsInserted() throws {
         let (_, store, bot) = try makeStore()
         let threadID = AgentThreadID()
@@ -58,14 +111,18 @@ final class BotConversationContextTests: XCTestCase {
 
     func test_twoWorkspaceContextsCreateDistinctCanonicalConversations() throws {
         let (_, store, bot) = try makeStore()
-        let workspaceA = BotContext.workspace(WorkspaceID())
-        let workspaceB = BotContext.workspace(WorkspaceID())
+        let workspaceIDA = WorkspaceID()
+        let workspaceIDB = WorkspaceID()
+        let workspaceA = BotContext.workspace(workspaceIDA)
+        let workspaceB = BotContext.workspace(workspaceIDB)
         let grantA = try store.grantContext(hostID: "host", botID: bot.id, context: workspaceA, actions: [.read], expectedRevision: nil)
         let grantB = try store.grantContext(hostID: "host", botID: bot.id, context: workspaceB, actions: [.read], expectedRevision: nil)
-        let first = BotConversation(botID: bot.id, title: "A", linkedAgentThreadID: AgentThreadID())
-        let second = BotConversation(botID: bot.id, title: "B", linkedAgentThreadID: AgentThreadID())
-        let pinA = try store.createContextualConversation(first, hostID: "host", context: workspaceA, policyRevision: grantA.policyRevision)
-        let pinB = try store.createContextualConversation(second, hostID: "host", context: workspaceB, policyRevision: grantB.policyRevision)
+        let threadA = AgentThread(workspaceId: workspaceIDA, title: "A", provider: .distill, model: "distill")
+        let threadB = AgentThread(workspaceId: workspaceIDB, title: "B", provider: .distill, model: "distill")
+        let first = BotConversation(botID: bot.id, title: "A", linkedAgentThreadID: threadA.id)
+        let second = BotConversation(botID: bot.id, title: "B", linkedAgentThreadID: threadB.id)
+        let pinA = try store.createContextualConversation(first, newThread: threadA, hostID: "host", context: workspaceA, policyRevision: grantA.policyRevision)
+        let pinB = try store.createContextualConversation(second, newThread: threadB, hostID: "host", context: workspaceB, policyRevision: grantB.policyRevision)
         XCTAssertNotEqual(pinA.conversationID, pinB.conversationID)
         XCTAssertEqual(try store.conversationContextPin(linkedTo: try XCTUnwrap(first.linkedAgentThreadID)), pinA)
         XCTAssertEqual(try store.conversationContextPin(linkedTo: try XCTUnwrap(second.linkedAgentThreadID)), pinB)
@@ -93,10 +150,18 @@ final class BotConversationContextTests: XCTestCase {
         let grant = try store.grantContext(hostID: "host", botID: bot.id, context: .general, actions: [.read], expectedRevision: nil)
         let threadID = AgentThreadID()
         let conversation = BotConversation(botID: bot.id, title: "Rollback", linkedAgentThreadID: threadID)
+        let thread = AgentThread(id: threadID, title: "Rollback", provider: .distill, model: "distill")
+        let existingID = AgentThreadID()
+        let existingConversation = BotConversation(botID: bot.id, title: "Existing", linkedAgentThreadID: existingID)
+        try store.upsertConversation(existingConversation)
         try db.execute("CREATE TRIGGER reject_test_pin BEFORE INSERT ON bot_conversation_contexts BEGIN SELECT RAISE(ABORT, 'test rejection'); END;")
-        XCTAssertThrowsError(try store.createContextualConversation(conversation, hostID: "host", context: .general, policyRevision: grant.policyRevision))
+        XCTAssertThrowsError(try store.createContextualConversation(conversation, newThread: thread, hostID: "host", context: .general, policyRevision: grant.policyRevision))
         XCTAssertNil(try store.conversation(id: conversation.id))
+        XCTAssertNil(try AgentThreadRepository(db: db).get(id: threadID))
         XCTAssertNil(store.cachedBotID(linkedTo: threadID))
+        XCTAssertEqual(try store.conversation(id: existingConversation.id)?.id, existingConversation.id)
+        XCTAssertEqual(try store.conversation(id: existingConversation.id)?.title, existingConversation.title)
+        XCTAssertEqual(store.cachedBotID(linkedTo: existingID), bot.id)
     }
 
     func test_pinAndConversationSurviveFileBackedReopen() throws {
@@ -105,16 +170,18 @@ final class BotConversationContextTests: XCTestCase {
         let botID: BotID
         let conversation: BotConversation
         let pin: BotConversationContextPin
+        let thread: AgentThread
         do {
             let db = try SQLiteDB(path: path)
             try Schema.migrate(db)
             let store = BotStore(db: db)
             let bot = try store.create(name: "Context bot", title: "Context", description: "", handle: "context-bot", soul: "", provider: .claude, model: "opus")
             botID = bot.id
-            let context = BotContext.workspace(WorkspaceID())
+            let context = BotContext.general
             let grant = try store.grantContext(hostID: "host", botID: bot.id, context: context, actions: [.read], expectedRevision: nil)
-            conversation = BotConversation(botID: bot.id, title: "History", linkedAgentThreadID: AgentThreadID(), createdAt: Date(timeIntervalSince1970: 100), updatedAt: Date(timeIntervalSince1970: 200))
-            pin = try store.createContextualConversation(conversation, hostID: "host", context: context, policyRevision: grant.policyRevision)
+            thread = AgentThread(title: "History", provider: .distill, model: "distill")
+            conversation = BotConversation(botID: bot.id, title: "History", linkedAgentThreadID: thread.id, createdAt: Date(timeIntervalSince1970: 100), updatedAt: Date(timeIntervalSince1970: 200))
+            pin = try store.createContextualConversation(conversation, newThread: thread, hostID: "host", context: context, policyRevision: grant.policyRevision)
         }
         let reopenedDB = try SQLiteDB(path: path)
         try Schema.migrate(reopenedDB)
@@ -123,6 +190,7 @@ final class BotConversationContextTests: XCTestCase {
         XCTAssertEqual(try reopenedStore.conversation(id: conversation.id), conversation)
         XCTAssertEqual(try reopenedStore.conversationContextPin(conversationID: conversation.id), pin)
         XCTAssertEqual(try reopenedStore.conversationContextPin(linkedTo: try XCTUnwrap(conversation.linkedAgentThreadID)), pin)
+        XCTAssertEqual(try AgentThreadRepository(db: reopenedDB).get(id: thread.id)?.id, thread.id)
     }
 
     func test_legacyConversationHasNoPinAndUnsupportedVersionFailsClosed() throws {

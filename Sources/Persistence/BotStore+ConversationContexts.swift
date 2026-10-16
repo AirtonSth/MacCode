@@ -3,14 +3,48 @@ import CoreModel
 
 public extension BotStore {
     func createContextualConversation(_ conversation: BotConversation, hostID: String, context: BotContext, policyRevision: Int64) throws -> BotConversationContextPin {
+        try createContextualConversationBody(conversation, newThread: nil, hostID: hostID, context: context, policyRevision: policyRevision)
+    }
+
+    func createContextualConversation(
+        _ conversation: BotConversation,
+        newThread: AgentThread,
+        hostID: String,
+        context: BotContext,
+        policyRevision: Int64
+    ) throws -> BotConversationContextPin {
+        try createContextualConversationBody(conversation, newThread: newThread, hostID: hostID, context: context, policyRevision: policyRevision)
+    }
+
+    private func createContextualConversationBody(
+        _ conversation: BotConversation,
+        newThread: AgentThread?,
+        hostID: String,
+        context: BotContext,
+        policyRevision: Int64
+    ) throws -> BotConversationContextPin {
         guard conversation.groupID == nil,
               let threadID = conversation.linkedAgentThreadID,
               !hostID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               policyRevision > 0 else {
             throw BotStoreError.notFound
         }
+        if let newThread {
+            guard threadID == newThread.id,
+                  Self.threadMatchesContext(newThread.workspaceId, context: context),
+                  newThread.actor == .none,
+                  newThread.actorLockedAt == nil,
+                  newThread.providerThreadId == nil,
+                  newThread.parentThreadId == nil,
+                  !newThread.isEphemeral,
+                  newThread.provider == .distill,
+                  newThread.runAsUser == nil || newThread.runAsUser?.isCurrentAccount == true else {
+                throw BotStoreError.invalidInput("contextual conversation requires a fresh Distill thread")
+            }
+        }
         let pin = BotConversationContextPin(conversationID: conversation.id, hostID: hostID, botID: conversation.botID, context: context, policyRevision: policyRevision)
         var insertedConversation = false
+        var insertedThread = false
         do {
             try db.transaction {
                 guard try authorizes(hostID: hostID, botID: conversation.botID, context: context, action: .read, policyRevision: policyRevision) else {
@@ -21,6 +55,23 @@ public extension BotStore {
                 try existing.bind(2, threadID.value.uuidString.lowercased())
                 defer { existing.reset() }
                 guard try !existing.step() else { throw BotStoreError.invalidInput("context pin requires a new conversation and thread") }
+                if let newThread {
+                    let existingThread = try db.prepare("SELECT 1 FROM agent_threads WHERE id=? COLLATE NOCASE LIMIT 1;")
+                    try existingThread.bind(1, threadID.value.uuidString)
+                    defer { existingThread.reset() }
+                    guard try !existingThread.step() else { throw BotStoreError.invalidInput("contextual conversation requires a new thread") }
+                    let repository = AgentThreadRepository(db: db)
+                    try repository.upsert(newThread)
+                    insertedThread = true
+                    guard try repository.lockActorIfUnlocked(
+                        id: threadID,
+                        actor: .bot(conversation.botID),
+                        lockedAt: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)),
+                        executionTarget: .vm
+                    ), try repository.setGuestRuntime(id: threadID, BotGuestRuntime.distillV1) else {
+                        throw BotStoreError.invalidInput("could not lock contextual thread")
+                    }
+                }
                 try upsertConversation(conversation)
                 insertedConversation = true
                 let insert = try db.prepare("INSERT INTO bot_conversation_contexts(conversation_id, host_id, bot_id, context_key, policy_revision, context_version, thread_id) VALUES(?, ?, ?, ?, ?, ?, ?);")
@@ -35,9 +86,7 @@ public extension BotStore {
                 _ = try insert.step()
             }
         } catch {
-            if insertedConversation, let threadID = conversation.linkedAgentThreadID {
-                forgetLinkedThreads([threadID])
-            }
+            if insertedConversation || insertedThread { forgetLinkedThreads([threadID]) }
             throw error
         }
         return pin
@@ -74,6 +123,13 @@ public extension BotStore {
         guard let pin = try conversationContextPin(conversationID: conversation.id) else { return false }
         guard pin.hostID == hostID, pin.botID == conversation.botID else { return false }
         return try authorizes(hostID: pin.hostID, botID: pin.botID, context: pin.context, action: action, policyRevision: pin.policyRevision)
+    }
+
+    private static func threadMatchesContext(_ workspaceID: WorkspaceID?, context: BotContext) -> Bool {
+        switch context {
+        case .general: return workspaceID == nil
+        case .workspace(let expected): return workspaceID == expected
+        }
     }
 
     private static func decodeContext(_ key: String) -> BotContext? {
