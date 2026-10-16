@@ -18331,6 +18331,113 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(restored.policyRevision, revoked.policyRevision + 1)
     }
 
+    func test_pinnedDeskSendRejectsExactConversationBeforeProviderOrReceiptAndKeepsDraft() async throws {
+        // WHY: the embedded Agent App transform must enforce the canonical
+        // conversation pin, even if another conversation is selected later.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        let hostID = context.liveActivityHostIdentity.serverId
+        _ = try context.botStore.grantContext(
+            hostID: hostID, botID: bot.id, context: .general,
+            actions: [.read, .send], expectedRevision: nil
+        )
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread(in: .general))
+        let pinned = try XCTUnwrap(vm.selectedConversation)
+        let pinnedThreadID = try XCTUnwrap(pinned.linkedAgentThreadID)
+        let agent = try XCTUnwrap(vm.deskAgentVM)
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pinned-desk-\(UUID().uuidString).txt")
+        try Data("keep attachment".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        agent.attachments = [AgentAttachment(path: file.path, kind: .file)]
+        XCTAssertEqual(agent.attachments.map(\.displayName), [file.lastPathComponent])
+        agent.prompt = "keep this draft"
+        let transform = try XCTUnwrap(agent.embedding?.promptTransform)
+        let otherBot = try vm.create(name: "B", title: "B", provider: .claude, model: "opus")
+        let otherThread = AgentThread(title: "Other", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(otherThread)
+        let other = BotConversation(botID: otherBot.id, title: "Other", linkedAgentThreadID: otherThread.id)
+        try context.botStore.upsertConversation(other)
+        vm.openDesk(otherBot)
+        XCTAssertEqual(vm.selectedConversation?.id, other.id)
+        XCTAssertNotEqual(other.id, pinned.id)
+        let messagesBefore = try context.messageRepo.listRecent(threadId: pinnedThreadID, limit: 100)
+        let receiptBefore = try context.botStore.latestContextReceipt(botID: bot.id, conversationID: pinned.id)
+
+        do {
+            _ = try await transform("keep this draft", pinnedThreadID, AgentRunID())
+            XCTFail("pinned conversation transform must reject before compile")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Contextual execution is unavailable until runtime isolation is verified."
+            )
+        }
+
+        XCTAssertNil(context.coordinator.activeRunId(threadId: pinnedThreadID), "pinned send must not start provider")
+        XCTAssertEqual(try context.messageRepo.listRecent(threadId: pinnedThreadID, limit: 100), messagesBefore)
+        XCTAssertEqual(
+            try context.botStore.latestContextReceipt(botID: bot.id, conversationID: pinned.id), receiptBefore,
+            "rejected send must not compile a context receipt"
+        )
+        XCTAssertEqual(agent.prompt, "keep this draft")
+        XCTAssertEqual(agent.attachments.map(\.displayName), [file.lastPathComponent])
+    }
+
+    func test_openDeskPinnedConversationDoesNotProvisionDockerGuest() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Pinned", title: "Context", provider: .distill)
+        let binding = try context.botStore.grantContext(
+            hostID: context.liveActivityHostIdentity.serverId,
+            botID: bot.id,
+            context: .general,
+            actions: [.read, .send],
+            expectedRevision: nil
+        )
+        let thread = AgentThread(title: "Pinned", provider: .distill, model: "test-main")
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "Pinned",
+            linkedAgentThreadID: thread.id
+        )
+        try context.botStore.createContextualConversation(
+            conversation,
+            newThread: thread,
+            hostID: context.liveActivityHostIdentity.serverId,
+            context: .general,
+            policyRevision: binding.policyRevision
+        )
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+        vm.dockerGuestReadyOverrideForTesting = nil
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+
+        vm.openDesk(bot)
+
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedConversation?.id, conversation.id)
+        XCTAssertEqual(
+            vm.errorMessage,
+            "Contextual execution is unavailable until runtime isolation is verified."
+        )
+        XCTAssertEqual(fake.created.count, 0)
+        XCTAssertEqual(fake.startCallCount, 0)
+    }
+
     func test_contextualDeskThreadCreatesPinnedLockedThreadForExplicitGrant() throws {
         let context = try makeContext()
         let router = AppCommandRouter(context: context)

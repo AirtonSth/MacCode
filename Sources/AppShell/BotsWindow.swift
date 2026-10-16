@@ -4880,8 +4880,13 @@ public final class BotsViewModel: ObservableObject {
         drainQueuedFollowUp()
         deskTimelineRejoinToken &+= 1
         lastGuestScreenURL = guestScreenURLByBot[bot.id.value]
-        if displayedDesktopKind == .dockerDesktop {
-            presentGuestDesktop(botID: bot.id)
+        if (desktopKindOverrideForTesting ?? displayedDesktopKind) == .dockerDesktop {
+            do {
+                try rejectContextualConversationSend(for: bot)
+                presentGuestDesktop(botID: bot.id)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -5051,8 +5056,13 @@ public final class BotsViewModel: ObservableObject {
         guard navigationFreshnessIsCurrent(generation, botID: botID) else { return }
         deskTimelineRejoinToken &+= 1
         lastGuestScreenURL = guestScreenURLByBot[botID.value]
-        if displayedDesktopKind == .dockerDesktop {
-            presentGuestDesktop(botID: botID)
+        if (desktopKindOverrideForTesting ?? displayedDesktopKind) == .dockerDesktop {
+            do {
+                try rejectContextualConversationSend(for: storedBot)
+                presentGuestDesktop(botID: botID)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -10824,6 +10834,11 @@ public final class BotsViewModel: ObservableObject {
         threadID: AgentThreadID,
         runID: AgentRunID
     ) throws -> String {
+        guard let pinnedConversation = try botStore.conversation(id: conversationID),
+              pinnedConversation.botID == botID else {
+            throw BotStoreError.notFound
+        }
+        try rejectContextualConversationSend(pinnedConversation)
         guard let bot = bots.first(where: { $0.id == botID }) ?? (try? botStore.get(id: botID)),
               let revision = try currentRevision(for: bot) else {
             throw BotDeskSendRefused(reason: "Bot runtime is unavailable.")
