@@ -675,8 +675,9 @@ public struct PrivateDirectory {
         return PrivateDirectory(path: "\(path)/\(name)", descriptor: fd)
     }
 
-    /// Used only for the owned accounts mirror; symlinks are unlinked, never traversed.
-    func removeTree(_ name: String) {
+    /// Removes a managed child; symlinks are unlinked, never traversed.
+    public func removeTree(_ name: String) {
+        guard name != ".", name != "..", !name.contains("/"), !name.isEmpty else { return }
         if let directory = try? child(name, create: false) {
             for entry in directory.entries() { directory.removeTree(entry) }
             directory.close()

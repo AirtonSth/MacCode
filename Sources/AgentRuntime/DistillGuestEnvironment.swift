@@ -114,6 +114,35 @@ public enum DistillGuestEnvironment {
         return lines
     }
 
+    /// Writes one guest run's config and private environment file.
+    public static func writeRunFiles(
+        rendered: DistillGuestConfig.Rendered,
+        configDirectory: URL,
+        guestDistillHome: String,
+        providerEnvironment: [String: String],
+        runID: String,
+        gatewayToken: String,
+        gitIdentity: GitIdentity?,
+        codexClientVersion: String?,
+        runsDirectory: URL
+    ) throws -> URL {
+        guard UUID(uuidString: runID) != nil else { throw DistillGuestEnvironmentError.invalidRunID(runID) }
+        var environment = build(
+            providerEnvironment: providerEnvironment,
+            runID: runID,
+            gatewayToken: gatewayToken,
+            modelSecrets: rendered.secretEnvironment,
+            gitIdentity: gitIdentity,
+            codexClientVersion: codexClientVersion
+        )
+        environment["DISTILL_HOME"] = guestDistillHome
+        _ = try envFileContents(environment)
+        let distillDirectory = try PrivateDirectory(configDirectory, create: true)
+        defer { distillDirectory.close() }
+        try distillDirectory.writeAtomically(Data(rendered.toml.utf8), to: "config.toml")
+        return try writeEnvFile(environment, runID: runID, directory: runsDirectory)
+    }
+
     /// `<AppSupport>/guest-runs`: one env file per live run, swept at launch.
     public static func runsDirectory(appSupport: URL) -> URL {
         appSupport.appendingPathComponent("guest-runs", isDirectory: true)

@@ -285,23 +285,16 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                     "the model \(request.model) cannot run in the bot's Linux VM: \(reason)"
                 )
             }
-            // Relative to a no-follow descriptor: the guest can swap its
-            // `.distill` for a symlink to any Mac folder at any moment.
-            let distillDirectory = try PrivateDirectory(guestDistillHome, create: true)
-            defer { distillDirectory.close() }
-            try distillDirectory.writeAtomically(Data(rendered.toml.utf8), to: "config.toml")
-            let environment = DistillGuestEnvironment.build(
+            let envFile = try DistillGuestEnvironment.writeRunFiles(
+                rendered: rendered,
+                configDirectory: guestDistillHome,
+                guestDistillHome: DistillGuestEnvironment.distillHome,
                 providerEnvironment: request.environment,
                 runID: runID,
                 gatewayToken: issued.token,
-                modelSecrets: rendered.secretEnvironment,
                 gitIdentity: deps.gitIdentity(),
-                // Nil (no `codex` on the Mac, or it did not answer) is normal.
-                codexClientVersion: await codexClientVersionProbe.value
-            )
-            let envFile = try DistillGuestEnvironment.writeEnvFile(
-                environment, runID: runID,
-                directory: DistillGuestEnvironment.runsDirectory(appSupport: deps.appSupport)
+                codexClientVersion: await codexClientVersionProbe.value,
+                runsDirectory: DistillGuestEnvironment.runsDirectory(appSupport: deps.appSupport)
             )
             undo.append { unlink(envFile.path) }
             // Before the agent starts: its reaper ends a run with no lease.

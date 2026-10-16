@@ -174,6 +174,54 @@ final class DistillGuestEnvironmentTests: XCTestCase {
         }
     }
 
+    func test_writeRunFilesWritesConfigAndPrivateEnvWithGuestHome() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DistillGuestRunFiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let configDirectory = root.appendingPathComponent(".distill", isDirectory: true)
+        let rendered = DistillGuestConfig.Rendered(toml: "model = \"test\"\n", secretEnvironment: [:], droppedModels: [:])
+        let file = try DistillGuestEnvironment.writeRunFiles(
+            rendered: rendered,
+            configDirectory: configDirectory,
+            guestDistillHome: "/guest/.distill",
+            providerEnvironment: macProviderEnvironment,
+            runID: runID,
+            gatewayToken: "secret-gateway-token",
+            gitIdentity: nil,
+            codexClientVersion: nil,
+            runsDirectory: root.appendingPathComponent("guest-runs", isDirectory: true)
+        )
+        let config = try String(contentsOf: configDirectory.appendingPathComponent("config.toml"), encoding: .utf8)
+        let environment = try String(contentsOf: file, encoding: .utf8)
+        XCTAssertFalse(config.contains("secret-gateway-token"))
+        XCTAssertTrue(environment.contains("DISTILL_HOME=/guest/.distill\n"))
+        XCTAssertTrue(environment.contains("RC_GUEST_GATEWAY_TOKEN=secret-gateway-token\n"))
+        let mode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int
+        XCTAssertEqual(mode, 0o600)
+    }
+
+    func test_writeRunFilesRejectsInvalidEnvironmentBeforeConfigSideEffect() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DistillGuestRunFiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let configDirectory = root.appendingPathComponent(".distill", isDirectory: true)
+        let rendered = DistillGuestConfig.Rendered(toml: "model = \"test\"\n", secretEnvironment: [:], droppedModels: [:])
+        XCTAssertThrowsError(try DistillGuestEnvironment.writeRunFiles(
+            rendered: rendered,
+            configDirectory: configDirectory,
+            guestDistillHome: "/guest/.distill",
+            providerEnvironment: macProviderEnvironment,
+            runID: runID,
+            gatewayToken: "bad\nvalue",
+            gitIdentity: nil,
+            codexClientVersion: nil,
+            runsDirectory: root.appendingPathComponent("guest-runs", isDirectory: true)
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configDirectory.path))
+    }
+
     /// The file holds model keys and the gateway bearer: owner-only, in an
     /// owner-only directory, named by a real run id.
     func test_envFileIsOwnerOnlyAndNamedByTheRunID() throws {
