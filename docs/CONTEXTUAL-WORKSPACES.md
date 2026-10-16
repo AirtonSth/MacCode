@@ -111,3 +111,28 @@ Tested base HEAD `b5602a623692dadcbcd6f3a64e443d1399c72e20`; tested `Tests/AppSh
 ### Embedded Agent App send guard checkpoint
 
 Embedded Agent App compile now checks the exact canonical conversation pin before desktop, resource, compiler or message effects, even after another Bot is selected. Automatic immediate and deferred `openDesk` paths do not provision legacy guests for pinned conversations. Explicit Studio management remains unchanged. Parent isolated native run: 19 tests passed, 0 failures, exit 0, using filter `test_pinnedDeskSendRejectsExactConversationBeforeProviderOrReceiptAndKeepsDraft|test_openDesk.*[Pp]inned|BotConversationContextTests|BotContextAuthorityTests|BotContextDispatcherTests` on current sources. Independent guard source review found no concrete defect. Full-send UI E2E remains undone. Execution remains unavailable; no design or layout changes.
+
+### Network isolation checkpoint: context-scoped guest egress
+
+This section supersedes prior broader network-isolation conclusions. Base HEAD was `b7ebab416c60736046a9b9b127fb90247d04f04a`. Root cause: OrbStack resolves `host.docker.internal` to reserved address `0.250.250.254`; separate bridge networks and RFC1918-only rules did not prevent access to host-published viewers.
+
+Revision r6 adds a context-only startup gate and native per-namespace stateful OUTPUT policy rejecting new connections to nonpublic addresses, including `0/8`. Loopback, established replies and public egress remain allowed. Root controller installs and verifies policy. Default UID 1000 has `CapEff=0`, `NoNewPrivs=1`, cannot run iptables, elevate ambient capabilities or overwrite the policy marker. Legacy options remain unchanged, and legacy APIs cannot remove a known contextual policy. Bootstrap, inspect and stop-failure handling, plus unproven fast paths, received source review; all three independent review objections were closed by source inspection.
+
+The parent ran the supported isolated native runner. `BotComputerGuestServiceTests|BotComputerGuestSpecTests|BotComputerDockerClientTests`: 96 tests, 2 explicit skips, 0 failures at 2026-10-16 10:32:56. Then `RC_LIVE_DOCKER=1` with `BotContextDockerProbeTests`: 1 passed, 0 failed or skipped at 10:33:31. Overall exit status was 0. The real two-context probe kept strict peer TCP ports 5900, 6080 and 9222 unreachable, and explicitly required host-mapped `connected=false` in both directions. Each context's native Mac WebSockets and own guest token received RFB; invalid tokens were denied. DNS and public `example.com:443` worked, and privilege-denial checks passed. Containers/networks `b9ed9c79-1483-e9ed-adb2-818da7d77a27` and `db1a9ec0-ed45-c573-323a-f29c76e31acc` (prefix `remotecode-bot-`) and the owned fixture were independently verified absent.
+
+Image r5 remains unchanged: SHA-256 `99c85d8cb2836466aeeeb6a6a59c32411f762d7597726aa17cbab833d51bd538`. Image r6 SHA-256 is `3f1a0fdca05b7e64bf7544f672e0d095d40c8a53138ffe2977250b251771cfe5`; recipe digest is `5df2c6e33b8a74e50dbd13662bfea3f54b8f0f8bf7b11b018644b2129944b98f`. Cold starts: A 2687.061166 ms, B 2798.062917 ms. Warm A samples: 534.909, 523.266833, 536.043209, 572.241541, 523.472542 ms. No improvement or capacity claim is made.
+
+SHA-256 of the ten changed code/test/resource files:
+
+- `Sources/AppShell/BotComputerGuestService.swift`: `ce0804c8238d20299d3a6f18080d06468b814f5a8ac2584cde9da4170a6b970c`
+- `Sources/AppShell/Resources/ComputerGuest/Dockerfile`: `ad9ed4c9b4609b62c5b41d0f8151c5d4b29ce3b7ca30aeab3888ef0010c15e26`
+- `Sources/AppShell/Resources/ComputerGuest/start.sh`: `e91aa057e23e45af1c379bb8c0cf85548a293dbbfd028b9918fc7d7149e82a35`
+- `Sources/AppShell/Resources/ComputerGuest/context-network.sh`: `d155880f60eee72a0250f1b6bfb5c7a95b53308a613c875b9327a85fb0bd4e5b`
+- `Sources/CoreModel/BotComputerDockerClient.swift`: `a842568cb458df49aceacf7f75dcb5c0d2c5a719def9adb5da6d314e11a872fd`
+- `Sources/CoreModel/BotComputerGuestSpec.swift`: `f504cb7eceedcb23f5e25de2675c3831dc36b494056dff63c15b0974d861c09a`
+- `Tests/AppShellTests/BotComputerGuestServiceTests.swift`: `2421d317ab402c0099afe8560296c768b5b87e9442a180deb9aa59243ffbf2ac`
+- `Tests/AppShellTests/BotContextDockerProbeTests.swift`: `2bb750baabe6fcdeef7e5b4c6ee23d87b0aa40bb9d9df657f59c5dec5de92ded`
+- `Tests/CoreModelTests/BotComputerDockerClientTests.swift`: `a0280d4e30a8be66dc146623de1cff134da83b0797149db07207083afe2179c4`
+- `Tests/CoreModelTests/BotComputerGuestSpecTests.swift`: `78e0eb19046cd780568325cc8d820fe43fa3fbc49ab2841b65fa76e06dfb9958`
+
+Limits: proof covers bounded controlled-context networking only. It does not establish inbound isolation from unmanaged legacy guests, public proxies, credential/MCP gateway security, revocation or Stop-tree behavior, full adversarial IPv6 coverage, Docker Desktop portability, migration safety or capacity. Restricted/contextual execution remains unavailable.

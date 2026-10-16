@@ -4,7 +4,7 @@ import Persistence
 @testable import AppShell
 
 final class BotContextDockerProbeTests: XCTestCase {
-    func test_liveContextualRuntimesSeparateFilesAndHomes() throws {
+    func test_liveContextualRuntimesSeparateFilesAndHomes() async throws {
         guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {
             throw XCTSkip("set RC_LIVE_DOCKER=1 for the real contextual runtime probe")
         }
@@ -68,6 +68,9 @@ final class BotContextDockerProbeTests: XCTestCase {
         const net = require('node:net');
         const http = require('node:http');
         const os = require('node:os');
+        const fs = require('node:fs');
+        const cp = require('node:child_process');
+        const dns = require('node:dns').promises;
         const timeout = 1000;
 
         function tcp(host, port) {
@@ -157,6 +160,19 @@ final class BotContextDockerProbeTests: XCTestCase {
             value && value.family === 'IPv4' && !value.internal,
           )?.address;
           if (!ipv4) throw Error('ipv4-missing');
+          const status = fs.readFileSync('/proc/self/status', 'utf8');
+          const uid = Number(status.match(/^Uid:\s+(\d+)/m)?.[1]);
+          const capEff = status.match(/^CapEff:\s+([0-9a-f]+)/mi)?.[1];
+          const noNewPrivs = Number(status.match(/^NoNewPrivs:\s+(\d+)/m)?.[1]);
+          const iptables = cp.spawnSync('iptables', ['-S'], { encoding: 'utf8' });
+          const ambient = cp.spawnSync('setpriv', ['--inh-caps=+net_admin', '--ambient-caps=+net_admin', '/bin/true'], { encoding: 'utf8' });
+          let markerWriteDenied = false;
+          try { fs.writeFileSync('/run/remotecode-context-network-ready', 'probe'); }
+          catch (error) { markerWriteDenied = ['EACCES', 'EPERM'].includes(error.code); }
+          let dnsAvailable = false;
+          try { dnsAvailable = (await Promise.race([dns.lookup('example.com'), new Promise((_, reject) => setTimeout(reject, 3000))])).address.length > 0; } catch {}
+          const egress = await tcp('example.com', 443);
+          const privilege = { uid, capEff, noNewPrivs, iptablesDenied: !iptables.error && Number.isInteger(iptables.status) && iptables.status !== 0, ambientDenied: !ambient.error && Number.isInteger(ambient.status) && ambient.status !== 0, markerWriteDenied, dnsAvailable, egress };
           for (const port of [5900, 9222]) {
             const deadline = Date.now() + 10000;
             let ready = false;
@@ -176,7 +192,7 @@ final class BotContextDockerProbeTests: XCTestCase {
           const ownWebSocket = await probeWebSocket('127.0.0.1', 6080, token);
           const ownInvalidAuth = await probeWebSocket('127.0.0.1', 6080, 'invalid-context-probe');
           if (mode === 'control') {
-            console.log(JSON.stringify({ ownHttpValid, ownHttpInvalid, ownWebSocket, ownInvalidAuth }));
+            console.log(JSON.stringify({ ownHttpValid, ownHttpInvalid, ownWebSocket, ownInvalidAuth, privilege }));
             process.exit(0);
           }
           const peerIPv4 = mode;
@@ -189,7 +205,7 @@ final class BotContextDockerProbeTests: XCTestCase {
           const peerHostHttp = await upgradeStatus('host.docker.internal', peerHostPort, token);
           const peerDirectWebSocket = await probeWebSocket(peerIPv4, 6080, token);
           const peerWebSocket = await probeWebSocket('host.docker.internal', peerHostPort, token);
-          console.log(JSON.stringify({ ipv4, peerTCP, peerDirectHttp, peerHostHttp, peerDirectWebSocket, peerWebSocket }));
+          console.log(JSON.stringify({ ipv4, peerTCP, peerDirectHttp, peerHostHttp, peerDirectWebSocket, peerWebSocket, privilege }));
           process.exit(0);
         })().catch(() => {
           console.log(JSON.stringify({ phase: 'node-probe', status: 'probe-error' }));
@@ -223,6 +239,18 @@ final class BotContextDockerProbeTests: XCTestCase {
                 XCTFail("Network probe returned invalid semantic JSON")
                 return [:]
             }
+            guard let privilege = object["privilege"] as? [String: Any] else {
+                XCTFail("Guest policy probe omitted semantic results")
+                return object
+            }
+            XCTAssertEqual(privilege["uid"] as? Int, 1000)
+            XCTAssertEqual(privilege["capEff"] as? String, "0000000000000000")
+            XCTAssertEqual(privilege["noNewPrivs"] as? Int, 1)
+            XCTAssertEqual(privilege["iptablesDenied"] as? Bool, true)
+            XCTAssertEqual(privilege["ambientDenied"] as? Bool, true)
+            XCTAssertEqual(privilege["markerWriteDenied"] as? Bool, true)
+            XCTAssertEqual(privilege["dnsAvailable"] as? Bool, true)
+            XCTAssertEqual(privilege["egress"] as? String, "connected")
             if mode == "control" {
                 guard let ownWebSocket = object["ownWebSocket"] as? [String: Any],
                       let ownInvalidAuth = object["ownInvalidAuth"] as? [String: Any] else {
@@ -243,6 +271,8 @@ final class BotContextDockerProbeTests: XCTestCase {
             }
             XCTAssertEqual(peerTCP.map { $0["port"] as? Int }, [5900, 6080, 9222])
             XCTAssertTrue(peerTCP.allSatisfy { $0["status"] as? String == "unreachable" }, "Every peer TCP port, including published 6080, must be unreachable")
+            XCTAssertEqual((object["peerDirectHttp"] as? [String: Any])?["connected"] as? Bool, false, "Peer direct viewer TCP must be unreachable")
+            XCTAssertEqual((object["peerHostHttp"] as? [String: Any])?["connected"] as? Bool, false, "Peer host-published viewer TCP must be unreachable")
             XCTAssertTrue(handshakeDenied(object["peerDirectHttp"], allowUnreachable: true), "Peer direct viewer must not accept this context's token")
             XCTAssertTrue(handshakeDenied(object["peerHostHttp"], allowUnreachable: true), "Peer host viewer must not accept this context's token")
             for peer in [peerDirectWebSocket, peerWebSocket] {
@@ -256,6 +286,39 @@ final class BotContextDockerProbeTests: XCTestCase {
         }
         let ipv4A = try guestIPv4(nameA)
         let ipv4B = try guestIPv4(nameB)
+        func assertNativeViewer(_ url: URL) async throws {
+            var components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+            components.scheme = "ws"
+            let viewerPath = try XCTUnwrap(components.queryItems?.first(where: { $0.name == "path" })?.value)
+            let pathParts = viewerPath.split(separator: "?", maxSplits: 1).map(String.init)
+            guard pathParts.count == 2, pathParts[0] == "websockify", pathParts[1].hasPrefix("token=") else {
+                XCTFail("Native viewer returned an invalid path"); return
+            }
+            components.path = "/" + pathParts[0]
+            components.queryItems = [URLQueryItem(name: "token", value: String(pathParts[1].dropFirst("token=".count)))]
+            let socketURL = try XCTUnwrap(components.url)
+            let session = URLSession(configuration: .ephemeral)
+            let task = session.webSocketTask(with: socketURL)
+            task.resume()
+            defer { task.cancel(with: .normalClosure, reason: nil); session.invalidateAndCancel() }
+            let message = try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+                group.addTask { try await task.receive() }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(5))
+                    task.cancel(with: .goingAway, reason: nil)
+                    throw URLError(.timedOut)
+                }
+                let value = try await group.next()!
+                group.cancelAll()
+                return value
+            }
+            guard case .data(let data) = message else { XCTFail("Native viewer did not receive binary RFB data"); return }
+            XCTAssertTrue(data.starts(with: Data("RFB ".utf8)), "Native viewer did not receive RFB prefix")
+        }
+        for ready in [readyA, readyB] {
+            do { try await assertNativeViewer(ready.screenURL) }
+            catch { XCTFail("Native own viewer failed or timed out before RFB data") }
+        }
         _ = try runNetworkProbe(name: nameA, mode: "control")
         _ = try runNetworkProbe(name: nameB, mode: "control")
         _ = try runNetworkProbe(name: nameA, mode: ipv4B, peerHostPort: observedB.hostPort)

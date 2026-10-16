@@ -284,6 +284,10 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         for host in options.extraHosts {
             args += ["--add-host", host]
         }
+        for capability in options.capDrop { args += ["--cap-drop", capability] }
+        for capability in options.capAdd { args += ["--cap-add", capability] }
+        for option in options.securityOptions { args += ["--security-opt", option] }
+        for mount in options.tmpfs { args += ["--tmpfs", mount] }
         for (key, value) in options.labels.sorted(by: { $0.key < $1.key }) {
             args += ["--label", "\(key)=\(value)"]
         }

@@ -18,6 +18,12 @@ final class BotComputerGuestSpecTests: XCTestCase {
         XCTAssertEqual(options.hostIP, "127.0.0.1")
         XCTAssertEqual(options.hostPort, 0)
         XCTAssertEqual(options.image, BotComputerGuestSpec.imageTag)
+        XCTAssertEqual(options.capDrop, [])
+        XCTAssertEqual(options.capAdd, [])
+        XCTAssertEqual(options.securityOptions, [])
+        XCTAssertEqual(options.tmpfs, [])
+        XCTAssertNil(options.labels["remotecode.context.network"])
+        XCTAssertNil(options.environment["REMOTECODE_CONTEXT_NETWORK_POLICY"])
         XCTAssertEqual(options.labels["remotecode.managed"], "1")
         XCTAssertTrue(options.binds.first?.hasPrefix(home) == true)
         XCTAssertEqual(options.network, BotComputerGuestSpec.networkName(botID: botID))
@@ -141,14 +147,16 @@ final class BotComputerGuestSpecTests: XCTestCase {
         )
     }
 
-    func test_recipeRevision5ShipsTheInGuestAgentToolchain() throws {
+    func test_recipeRevision6ShipsTheInGuestAgentToolchain() throws {
         // WHY: the bot's agent runs inside this image. It needs git and ps for
         // its own shell, wmctrl + xwd for linux-use, and a pinned Playwright MCP
         // that only runs on Node >= 20 (bookworm's apt node is 18). Only the
         // revision bump makes existing guests pick the recipe up, and the tag
         // carries the revision so another app build on r4 never rebuilds it.
-        XCTAssertEqual(BotComputerGuestSpec.recipeRevision, "5")
-        XCTAssertEqual(BotComputerGuestSpec.imageTag, "remotecode/computer:r5")
+        XCTAssertEqual(BotComputerGuestSpec.recipeRevision, "6")
+        XCTAssertEqual(BotComputerGuestSpec.imageTag, "remotecode/computer:r6")
+        XCTAssertEqual(BotComputerGuestSpec.runtimeRevision, "6")
+        XCTAssertTrue(BotComputerGuestSpec.recipeFileNames.contains("context-network.sh"))
         let recipe = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -170,6 +178,25 @@ final class BotComputerGuestSpecTests: XCTestCase {
             "Playwright MCP attaches to the visible browser so viewer logins are the bot's session")
         XCTAssertTrue(browser.contains("--remote-debugging-address=127.0.0.1"),
             "CDP must stay on the guest loopback")
+    }
+
+    func test_contextualNetworkPolicyAddsPrivateEgressMarkersAndLeastPrivilegeOptions() throws {
+        let botID = BotID()
+        let support = URL(fileURLWithPath: "/tmp/rc-context-network")
+        let options = try BotComputerGuestSpec.containerCreateOptions(
+            botID: botID,
+            guestHome: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: botID).path,
+            appSupport: support,
+            viewerToken: String(repeating: "a", count: 32),
+            contextualNetworkPolicy: true
+        )
+        XCTAssertEqual(options.labels["remotecode.context.network"], "private-egress-v1")
+        XCTAssertEqual(options.environment["REMOTECODE_CONTEXT_NETWORK_POLICY"], "private-egress-v1")
+        XCTAssertEqual(options.capDrop, ["ALL"])
+        XCTAssertEqual(options.capAdd, ["NET_ADMIN"])
+        XCTAssertEqual(options.securityOptions, ["no-new-privileges:true"])
+        XCTAssertEqual(options.tmpfs, ["/run:rw,nosuid,nodev,noexec,mode=0755"])
+        XCTAssertEqual(options.image, "remotecode/computer:r6")
     }
 
     func test_createOptionsMountTheAgentKitReadOnlyAndRunAnInitWithTheHostAlias() throws {

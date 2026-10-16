@@ -112,6 +112,27 @@ final class BotComputerDockerClientTests: XCTestCase {
         XCTAssertEqual(args.last, BotComputerGuestSpec.imageTag, "the image stays the final argument")
     }
 
+    func test_createPassesContextNetworkSecurityFlagsOnceAsSeparateArguments() throws {
+        var calls: [[String]] = []
+        let cli = BotComputerDockerCLI { args in calls.append(args); return Data() }
+        let botID = BotID()
+        let support = URL(fileURLWithPath: "/tmp/rc-context-create-args")
+        let options = try BotComputerGuestSpec.containerCreateOptions(
+            botID: botID,
+            guestHome: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: botID).path,
+            appSupport: support,
+            viewerToken: String(repeating: "a", count: 32),
+            contextualNetworkPolicy: true
+        )
+        _ = try cli.create(options: options)
+        let args = try XCTUnwrap(calls.first)
+        for pair in [["--cap-drop", "ALL"], ["--cap-add", "NET_ADMIN"], ["--security-opt", "no-new-privileges:true"], ["--tmpfs", "/run:rw,nosuid,nodev,noexec,mode=0755"], ["--label", "remotecode.context.network=private-egress-v1"], ["--env", "REMOTECODE_CONTEXT_NETWORK_POLICY=private-egress-v1"]] {
+            XCTAssertEqual(zip(args, args.dropFirst()).filter { $0.0 == pair[0] && $0.1 == pair[1] }.count, 1, "\(pair) emitted once")
+        }
+        XCTAssertFalse(args.contains("--privileged"))
+        XCTAssertFalse(args.contains(where: { $0 == "--user" || $0 == "-u" }))
+    }
+
     func test_runProcessReturnsOutputLargerThanPipeCapacity() throws {
         // WHY: a real guest PNG is often larger than the OS pipe capacity, so
         // the runner must consume all bytes while the child is still writing.
