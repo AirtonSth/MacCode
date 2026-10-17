@@ -35,6 +35,14 @@ struct RemoteCodeMain {
         let inspectsDatabase = CommandLine.arguments.contains(inspectFlag)
         let createFlag = "--create-database-backup"
         let createsDatabase = CommandLine.arguments.contains(createFlag)
+        let repairsContextReceipts = CommandLine.arguments.contains("--repair-context-receipts")
+        if repairsContextReceipts {
+            guard CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--repair-context-receipts",
+                  ProcessInfo.processInfo.environment["RC2_SCHEDULED_TASK_AGENT"] != "1" else {
+                fputs("Context receipt repair accepts no arguments or mixed operations.\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+        }
 
         if restoresDatabase || inspectsDatabase || createsDatabase {
             let operationFlags = [restoreFlag, inspectFlag, createFlag].filter { CommandLine.arguments.contains($0) }
@@ -99,7 +107,7 @@ struct RemoteCodeMain {
             Logger(subsystem: "io.remotecode.app", category: "lifecycle")
                 .fault("app.second_instance_exit holder=\(holder, privacy: .public)")
             fputs("RemoteCode is already running for \(appSupportDirectory.path) (pid \(holder)); exiting.\n", stderr)
-            if restoresDatabase || inspectsDatabase || createsDatabase || rollingBack { exit(EXIT_FAILURE) }
+            if restoresDatabase || inspectsDatabase || createsDatabase || rollingBack || repairsContextReceipts { exit(EXIT_FAILURE) }
             if let holderPID, !LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
                 NSRunningApplication(processIdentifier: holderPID)?.activate()
             }
@@ -108,6 +116,28 @@ struct RemoteCodeMain {
             Logger(subsystem: "io.remotecode.app", category: "lifecycle")
                 .error("app.instance_lock_unavailable errno=\(code, privacy: .public)")
             instanceLock = nil
+        }
+
+        if repairsContextReceipts {
+            guard let instanceLock else {
+                fputs("Context receipt repair requires an exclusive host lock.\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+            withExtendedLifetime(instanceLock) {
+                do {
+                    let current = URL(fileURLWithPath: dbOverride ?? appSupportDirectory.appendingPathComponent("remotecode.sqlite").path)
+                    try HostScopedSessionBackup.recoverInterruptedRestore(currentURL: current, appSupport: appSupportDirectory)
+                    let report = try BotContextReceiptRepair.run(databaseURL: current, appSupport: appSupportDirectory)
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                    print(String(decoding: try encoder.encode(report), as: UTF8.self))
+                    if !report.failures.isEmpty { exit(EXIT_FAILURE) }
+                } catch {
+                    fputs("Context receipt repair failed; cleanup remains unconfirmed.\n", stderr)
+                    exit(EXIT_FAILURE)
+                }
+            }
+            return
         }
 
         if rollingBack {

@@ -33,3 +33,7 @@ Owned backup and file-tree fixtures were removed by their tests. After the test 
 ## Limits and pending work
 
 Full-plan acceptance, OAuth refresh, live provider execution, OS provider load, repair, rollout and measurements remain pending. UI/UX and the 21-skill ledger are unchanged; backend-only evidence does not open public gates or complete S-008.
+
+## Later cleanup receipt repair checkpoint
+
+The bounded explicit cleanup receipt repair path is now implemented and verified; see [CONTEXT-RECEIPT-REPAIR.md](CONTEXT-RECEIPT-REPAIR.md). Historical backup evidence above remains unchanged. Arbitrary unknown command outcomes still require evidence and are never replayed; broader lifecycle, provider, rollout and measurement limits remain open.

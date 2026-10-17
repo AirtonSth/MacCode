@@ -510,27 +510,24 @@ public final class BotComputerGuestService: @unchecked Sendable {
         try stop(botID: identity.storageBotID)
     }
 
-    public func stopForContextRecovery(identity: BotContextRuntimeIdentity) throws {
+    public func inspectForContextRecovery(identity: BotContextRuntimeIdentity) throws -> BotComputerContainerInspect? {
         let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
-        guard try docker.containerExists(name: name) else { return }
-
-        let before = try docker.inspect(name: name)
-        try validateGatewayRuntime(before, identity: identity)
+        guard try docker.containerExists(name: name) else { return nil }
+        let actual = try docker.inspect(name: name)
+        try validateGatewayRuntime(actual, identity: identity)
         let expectedHome = BotComputerGuestSpec.guestHomeURL(appSupport: appSupport, botID: identity.storageBotID)
             .resolvingSymlinksInPath().standardizedFileURL.path
-        func matchesHome(_ source: String?) -> Bool {
-            guard let source else { return false }
-            return URL(fileURLWithPath: source).resolvingSymlinksInPath().standardizedFileURL.path == expectedHome
-        }
-        guard matchesHome(before.homeSource) else {
+        guard let source = actual.homeSource,
+              URL(fileURLWithPath: source).resolvingSymlinksInPath().standardizedFileURL.path == expectedHome else {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
         }
-        guard before.running else { return }
+        return actual
+    }
 
-        try docker.stop(name: name)
-        let after = try docker.inspect(name: name)
-        try validateGatewayRuntime(after, identity: identity)
-        guard matchesHome(after.homeSource), !after.running else {
+    public func stopForContextRecovery(identity: BotContextRuntimeIdentity) throws {
+        guard let before = try inspectForContextRecovery(identity: identity), before.running else { return }
+        try docker.stop(name: BotComputerGuestSpec.containerName(botID: identity.storageBotID))
+        guard let after = try inspectForContextRecovery(identity: identity), !after.running else {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
         }
     }

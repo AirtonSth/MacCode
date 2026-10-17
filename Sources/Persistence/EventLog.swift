@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 // Reuses the module-level `iso` ISO8601DateFormatter declared in Repositories.swift
 // (hoisted; no per-append allocation).
@@ -81,6 +82,42 @@ public final class EventLogRepository {
             self.seq = seq
             self.kind = kind
             self.payloadJSON = payloadJSON
+        }
+    }
+
+    /// Persists one permanent cleanup proof and its replay event atomically.
+    public func recordContextCleanupRepair(runID: AgentRunID, payloadJSON: String) throws -> (payloadJSON: String, created: Bool) {
+        try db.performSync { db in
+            try db.transaction {
+                let key = "bot.context.cleanup.receipt." + runID.value.uuidString.lowercased()
+                let settings = SettingsRepository(db: db)
+                if let existing = try settings.get(key) { return (existing, false) }
+                let sequence = try db.prepare("SELECT MAX(last_seq, COALESCE((SELECT MAX(seq) FROM events), 0)) FROM event_sequence WHERE singleton=1;")
+                defer { sequence.reset() }
+                guard try sequence.step(), sequence.columnInt64(0) < Int64.max else {
+                    throw SQLiteError.execute("Durable cleanup receipt sequence is unavailable.")
+                }
+                let next = sequence.columnInt64(0) + 1
+                sequence.reset()
+                let event = try db.prepare("""
+                    INSERT INTO events(seq, kind, request_id, origin_client_id, payload_json, created_at)
+                    VALUES(?, 'bot.context.cleanup.repaired', ?, NULL, ?, ?);
+                    """)
+                defer { event.reset() }
+                try event.bind(1, next)
+                try event.bind(2, runID.value.uuidString.lowercased())
+                try event.bind(3, payloadJSON)
+                try event.bind(4, iso.string(from: Date()))
+                _ = try event.step()
+                let advance = try db.prepare("UPDATE event_sequence SET last_seq=? WHERE singleton=1;")
+                defer { advance.reset() }
+                try advance.bind(1, next)
+                _ = try advance.step()
+                try settings.set(key, payloadJSON)
+                db.noteEventRowsInserted(1)
+                try EventRetentionPolicy.prune(db: db)
+                return (payloadJSON, true)
+            }
         }
     }
 

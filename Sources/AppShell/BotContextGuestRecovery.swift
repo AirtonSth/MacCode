@@ -54,7 +54,8 @@ struct BotContextGuestRecovery {
         try directory.synchronize()
     }
 
-    static func reconcile(docker: (any BotComputerDockerClienting)?, appSupport: URL) -> Report {
+    static func reconcile(docker: (any BotComputerDockerClienting)?, appSupport: URL,
+                          selectedScopes: Set<String>? = nil) -> Report {
         var reconciled: [String] = []
         var failures: [String: String] = [:]
         let runsURL = DistillGuestEnvironment.runsDirectory(appSupport: appSupport)
@@ -69,6 +70,7 @@ struct BotContextGuestRecovery {
         do { scopes = try root.entriesChecked() }
         catch { return Report(reconciled: [], failures: ["guest-runs": String(describing: error)]) }
         for scopeName in scopes {
+            if let selectedScopes, !selectedScopes.contains(scopeName) { continue }
             guard let uuid = UUID(uuidString: scopeName), uuid.uuidString.lowercased() == scopeName else {
                 if !scopeName.hasSuffix(".env"), scopeName != ".DS_Store" {
                     failures[scopeName] = "Unrecognized contextual recovery entry."
@@ -107,9 +109,8 @@ struct BotContextGuestRecovery {
                     if entries.contains(env), !directory.remove(env) {
                         throw BotComputerGuestServiceError.contextualRuntimeUnavailable
                     }
-                    let homeURL = BotComputerGuestSpec.guestHomeURL(appSupport: appSupport, botID: identity.storageBotID)
                     do {
-                        let home = try PrivateDirectory(homeURL, create: false)
+                        let home = try nativeHome(identity: identity, appSupport: appSupport)
                         defer { home.close() }
                         if let conversationID = record.conversationID {
                             let generated = ".distill-context-session-\(conversationID.value.uuidString.lowercased())"
@@ -144,6 +145,16 @@ struct BotContextGuestRecovery {
             } catch { failures[scopeName] = String(describing: error) }
         }
         return Report(reconciled: reconciled, failures: failures)
+    }
+
+    private static func nativeHome(identity: BotContextRuntimeIdentity, appSupport: URL) throws -> PrivateDirectory {
+        let support = try PrivateDirectory(appSupport, create: false)
+        defer { support.close() }
+        let guests = try support.child("bot-guests", create: false)
+        defer { guests.close() }
+        let guest = try guests.child(identity.storageBotID.value.uuidString.lowercased(), create: false)
+        defer { guest.close() }
+        return try guest.child("home", create: false)
     }
 
     private static func scope(identity: BotContextRuntimeIdentity, appSupport: URL, create: Bool) throws -> PrivateDirectory {

@@ -304,3 +304,7 @@ Durable context-scoped resume now supersedes the earlier fresh-session-only ceil
 ### Scoped-session backup proof (bounded)
 
 Native CLI backup, inspect and restore preserve the paired SQLite database and `.scoped-sessions` archive. Exact package identity, test counts, review fixes and recovery-window details are documented in [CONTEXT-SCOPED-BACKUP.md](CONTEXT-SCOPED-BACKUP.md). Process-kill recovery is not host-power-loss or injected fsync-failure proof. Provider execution/authentication, OAuth refresh, OS provider load, repair, rollout and measurements remain pending; no UI/public gate change, and S-008 remains open.
+
+### Explicit cleanup receipt repair — bounded proof
+
+The host maintenance command `--repair-context-receipts` now reconciles canonical cleanup evidence without replaying unknown commands, changing revoked authority or sending queued work. At exact Sources/Tests tree `fc9c0e6c220bff211468fc81d30b76ccc2347719`, native packaging passed and 36 selected tests passed with zero failures/skips in 22.909 seconds. Actual CLI failure/restart/retry, stopped-container ownership refusal, preserved queue, interrupted imported state and same-thread history/current-run cases are documented in [CONTEXT-RECEIPT-REPAIR.md](CONTEXT-RECEIPT-REPAIR.md). iOS changes are documentation only; UI/UX and public gates remain unchanged. This does not complete S-007/S-008, resolve arbitrary unknown outcomes, or establish authenticated provider execution.
