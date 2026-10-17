@@ -485,3 +485,7 @@ A different path was tried: AppleScript through System Events against the isolat
 ### 21-skill ledger, final status
 
 No view layout changed in these checkpoints, so none of the 21 rows changed. The ledger in `CONTEXT-GROUPING-DESIGN.md` still records all 21 skills as read with recomputed hashes and the checker at 46/46 installed; rows needing people or hardware remain marked unverified.
+
+### Restore of a real backup with native history and active scoped sessions: not possible on this host
+
+The user's real host has no scoped sessions to back up: there is no `bot-context-sessions` directory under its application support, and its database is schema version 93 without `bot_conversation_contexts`, so no contextual conversation has ever been created there. A real backup with native history and active scoped sessions therefore does not exist, and one built by hand would be a synthetic fixture, not the real-fixture proof the plan asks for. The synthetic 12-session scoped fixtures in `HostScopedSessionBackupCLITests` (packaged binary, Docker live, passing) remain the only scoped-session restore proof. This item stays open until a host that has actually used contextual conversations exists; no production mutation was attempted to create one.
