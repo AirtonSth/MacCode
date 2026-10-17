@@ -147,8 +147,20 @@ final class BotContextExportTests: XCTestCase {
             XCTAssertEqual(writeOnly.error?.code, -32003)
             XCTAssertNil(writeOnly.result)
         }
+        func exportReceipts() throws -> [String] {
+            let st = try f.context.db.prepare("SELECT detail FROM audit_log WHERE action='bot.context.export' ORDER BY id;")
+            defer { st.reset() }
+            var rows: [String] = []
+            while try st.step() { rows.append(st.columnText(0) ?? "") }
+            return rows
+        }
+        XCTAssertEqual(try exportReceipts(), [], "preview, unauthenticated and write-only calls must not write an export receipt")
         let exported = try await post("bot.conversation.export", approved)
         XCTAssertNil(exported.error)
+        let receipts = try exportReceipts()
+        XCTAssertEqual(receipts.count, 1, "one confirmed export writes exactly one durable receipt")
+        XCTAssertTrue(receipts[0].contains(digest), "receipt binds the reviewed selection digest")
+        XCTAssertFalse(receipts[0].contains("approved-source-excerpt"), "receipt must never carry message text")
         XCTAssertEqual(exported.result?.objectValue?["exported"]?.boolValue, true)
         XCTAssertEqual(exported.result?.objectValue?["summary"], result["summary"])
         let encoded = String(decoding: try JSONEncoder().encode(exported), as: UTF8.self)
@@ -157,6 +169,7 @@ final class BotContextExportTests: XCTestCase {
         }
         _ = try f.context.botStore.revokeContext(hostID: f.host, botID: f.bot.id, context: .general, expectedRevision: 1)
         for _ in 0..<2 { assertDenied(try await post("bot.conversation.export", approved)) }
+        XCTAssertEqual(try exportReceipts().count, 1, "denied exports leave no receipt")
         _ = try f.context.botStore.grantContext(hostID: f.host, botID: f.bot.id, context: .general, actions: [.read, .send, .export], expectedRevision: 2)
         assertDenied(try await post("bot.conversation.export", approved))
         XCTAssertEqual(try count(f, "command_receipts"), beforeReceipts, "private export content must never enter mutation replay receipts")

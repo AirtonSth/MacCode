@@ -1065,6 +1065,17 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                       CFGetTypeID(approved) == CFBooleanGetTypeID(), approved.boolValue,
                       string(params, "selection_sha256") == digest else { throw denied }
             }
+            if confirmed {
+                // Receipt holds identifiers, counts and the digest only; never message text.
+                let receipt: [String: Any] = [
+                    "bot_id": botID.value.uuidString.lowercased(), "conversation_id": conversation.id.value.uuidString.lowercased(),
+                    "source_context_key": sourceContext.storageKey, "source_policy_revision": revision,
+                    "target_context_key": targetContext.storageKey, "target_policy_revision": targetRevision,
+                    "message_ids": ids.map { $0.uuidString.lowercased() }, "bytes": byteCount, "selection_sha256": digest,
+                ]
+                let detail = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys, .withoutEscapingSlashes])
+                try DeviceTrustRepository(db: db).audit(actor: "bot:\(hostID)", action: "bot.context.export", detail: String(decoding: detail, as: UTF8.self))
+            }
             result["selection_sha256"] = digest
             result["summary"] = excerpts.joined(separator: "\n\n")
             result["exported"] = confirmed

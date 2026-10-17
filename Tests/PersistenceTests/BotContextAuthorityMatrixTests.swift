@@ -125,12 +125,27 @@ final class BotContextAuthorityMatrixTests: XCTestCase {
         }
 
         // Entry points with no contextual contract must refuse a context instead of inferring a grant.
-        for method in ["bot.send", "bot.routine.run", "bot.routine.create", "bot.files.list", "bot.conversation.fork", "bot.queue.force_now", "bot.guest.start"] {
+        for method in ["bot.send", "bot.routine.run", "bot.routine.create", "bot.files.list", "bot.conversation.fork", "bot.queue.force_now", "bot.guest.start", "peer.ask", "peer.self_config", "bot.routine.update", "bot.routine.set_enabled"] {
             var p = params("bot.conversation.list", bot: botA, key: "general:v1", revision: 1, convo: generalA.id)
             p["client_request_id"] = UUID().uuidString
             p["text"] = "x"
             XCTAssertThrowsError(try authority.dispatch(method: method, params: p), "\(method) must not accept a contextual grant implicitly")
         }
+
+        // A retried contextual mutation replays its stored outcome instead of repeating the write.
+        let replayParams = params("bot.conversation.create", bot: botA, key: "general:v1", revision: 1, convo: generalA.id)
+        let first = try authority.dispatch(method: "bot.conversation.create", params: replayParams)
+        let conversationsBefore = try db.prepare("SELECT COUNT(*) FROM bot_conversations;")
+        XCTAssertTrue(try conversationsBefore.step())
+        let countBefore = conversationsBefore.columnInt64(0)
+        conversationsBefore.reset()
+        let replayed = try authority.dispatch(method: "bot.conversation.create", params: replayParams)
+        XCTAssertEqual((replayed["readback"] as? [String: Any])?["conversation_id"] as? String,
+                       (first["readback"] as? [String: Any])?["conversation_id"] as? String, "same request id must replay the same conversation")
+        let conversationsAfter = try db.prepare("SELECT COUNT(*) FROM bot_conversations;")
+        XCTAssertTrue(try conversationsAfter.step())
+        XCTAssertEqual(conversationsAfter.columnInt64(0), countBefore, "replay must not create a second conversation")
+        conversationsAfter.reset()
 
         // Revocation flips every previously allowed row to deny.
         let current = try XCTUnwrap(try store.getContextBinding(hostID: host, botID: BotID(UUID(uuidString: botA)!), context: .general))
