@@ -74,6 +74,47 @@ final class BotContextExportPresentationTests: XCTestCase {
         model.preview()
     }
 
+    /// Measures the shipped desk selection path (`selectDeskThread` through embedded history hydration)
+    /// between two contextual conversations: one cold first selection, then warmed alternations.
+    func testMeasureContextualDeskNavigationColdAndWarm() async throws {
+        guard ProcessInfo.processInfo.environment["RC_CONTEXT_NAV_PROBE"] == "1" else {
+            throw XCTSkip("set RC_CONTEXT_NAV_PROBE=1 to measure contextual desk navigation")
+        }
+        let f = try fixture("nav-perf")
+        var secondThread = AgentThread(title: "Second", provider: .distill, model: "unused")
+        secondThread.status = .completed
+        let second = BotConversation(botID: f.bot.id, title: "Second", linkedAgentThreadID: secondThread.id)
+        try f.context.botStore.createContextualConversation(second, newThread: secondThread,
+            hostID: f.context.liveActivityHostIdentity.serverId, context: .general, policyRevision: f.sourceRevision)
+        for index in 0..<40 {
+            try f.context.messageRepo.append(AgentMessage(threadId: secondThread.id, role: index.isMultiple(of: 2) ? .user : .assistant,
+                content: "excerpt \(index) " + String(repeating: "x", count: 400)))
+        }
+        func select(_ conversation: BotConversation, thread: AgentThread) async throws -> Double {
+            let start = DispatchTime.now().uptimeNanoseconds
+            f.vm.selectDeskThread(conversation.id)
+            let embedded = try XCTUnwrap(f.vm.deskAgentVM)
+            await embedded.waitForMessageHistoryLoad()
+            XCTAssertEqual(embedded.selectedThreadId, thread.id)
+            XCTAssertFalse(embedded.messages.isEmpty, "navigation must land on hydrated canonical history")
+            return Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        }
+        let cold = try await select(second, thread: secondThread)
+        var warm: [Double] = []
+        for index in 0..<10 {
+            warm.append(index.isMultiple(of: 2) ? try await select(f.source, thread: f.sourceThread) : try await select(second, thread: secondThread))
+        }
+        let sorted = warm.sorted()
+        let report: [String: Any] = ["workload": "contextual desk selection to hydrated embedded history; two conversations (2 and 40 messages); in-process",
+            "cold_ms": cold, "warm_ms": warm, "warm_median_ms": sorted[sorted.count / 2], "warm_max_ms": sorted.last ?? 0,
+            "physical_memory_bytes": ProcessInfo.processInfo.physicalMemory, "os": ProcessInfo.processInfo.operatingSystemVersionString]
+        let url = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"]), isDirectory: true)
+            .appendingPathComponent("context-navigation-\(UUID().uuidString).json")
+        try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys, .prettyPrinted]).write(to: url, options: .atomic)
+        print("CONTEXT_NAV_REPORT: " + url.lastPathComponent)
+        XCTAssertGreaterThanOrEqual(warm.count, 5)
+    }
+
     func testCanonicalDeskSelectionHydratesEmbeddedAgentHistory() async throws {
         let f = try fixture("history")
         let expected = try f.context.messageRepo.list(threadId: f.sourceThread.id)

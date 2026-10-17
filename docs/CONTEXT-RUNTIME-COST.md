@@ -70,3 +70,17 @@ Environment: Apple M5 Max, 18 processors, 128 GiB, macOS 27.0.1; Docker 29.4.0 w
 Reading: warm memory is linear at about 228 MiB per desktop. Warm readiness grows from about 2.0 s to about 4.0 s at 8, with a 6.7 s worst sample, and first creation at 8 is 4.4 times the single case. The earlier single-desktop median was 1.77 s, so the 2.0 s here includes the same fixed provisioning cost.
 
 Concurrency limit derived from these numbers: **4 simultaneous contextual desktops** on a machine like this one. At 4 the warm worst case stays under about 4.2 s and memory under about 0.9 GiB, while 8 raises first-creation latency to 8.9 s and the warm worst case to 6.7 s, with no failures observed. The host now enforces it: `BotContextGuestResources.prepare` refuses a fifth simultaneous contextual desktop for the same App Support scope with `contextualRuntimeCapacityReached(limit: 4)` before any ownership, delegation record or container work, and finishing or cancelling a runtime frees a slot. The default is `BotContextGuestResources.defaultMaximumLiveRuntimes`; a unit test with limit 2 proves refusal, no side effects and release. The value comes from one run on one machine, so it is a conservative default, not a validated production cap; the guest MCP gateway still has its separate 8 in-flight calls per run. Lower-memory hardware, authenticated provider workloads, sustained load, resource-exhaustion behavior and the first-creation tail beyond 8 desktops are not measured, so no production cap is claimed. The SQLite main-thread-wait warnings in the log come from the test's own schema migration on the test thread.
+
+## Contextual desk navigation measurement (macOS, in-process)
+
+`BotContextExportPresentationTests.testMeasureContextualDeskNavigationColdAndWarm` (opt-in with `RC_CONTEXT_NAV_PROBE=1`) drives the shipped `BotsViewModel.selectDeskThread` between two canonical contextual conversations (2 and 40 messages) on a real AppContext and waits for the embedded Agent App model to hydrate the stored history before stopping the clock. Each of three independent runs, each in a fresh test process, records one cold first selection (no prior desk selection in that process) and ten warmed alternating selections. Raw artifact: [evidence/context-navigation.json](evidence/context-navigation.json), SHA-256 `64e5dd15e6d28465822ab20a83757017f49c1a735fe350792acc6488578c9350`.
+
+| Run | Cold | Warm median (10) | Warm max |
+|---:|---:|---:|---:|
+| 1 | 16.1 ms | 9.1 ms | 11.5 ms |
+| 2 | 15.6 ms | 8.3 ms | 10.6 ms |
+| 3 | 16.1 ms | 8.9 ms | 11.5 ms |
+
+Environment: Apple M5 Max, 128 GiB, macOS 27.0.1. A first run that wrongly pre-warmed the "cold" sample (13.4 ms) was discarded and the test corrected before these runs.
+
+Limits: this is the model and persistence path only, not first rendered frame, SwiftUI layout or a real window, and it excludes iPhone navigation, networked hosts, large histories beyond 40 messages and busy/offline states. It does not replace the repository's first-useful-frame tolerance checks, and no concurrency or parity claim is derived from it.
