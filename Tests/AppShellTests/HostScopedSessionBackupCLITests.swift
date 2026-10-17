@@ -162,7 +162,9 @@ final class HostScopedSessionBackupCLITests: XCTestCase {
         func boundedText(_ url: URL) throws -> String {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
-            return String(decoding: try handle.read(upToCount: 64 * 1024) ?? Data(), as: UTF8.self)
+            let size = try handle.seekToEnd()
+            try handle.seek(toOffset: size > 64 * 1024 ? size - 64 * 1024 : 0)
+            return String(decoding: try handle.readToEnd() ?? Data(), as: UTF8.self)
         }
         let result = (process.terminationStatus, try boundedText(out), try boundedText(err))
         try? FileManager.default.removeItem(at: out)
@@ -424,6 +426,45 @@ final class HostScopedSessionBackupCLITests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: f.backup.path))
         XCTAssertEqual(Set(try FileManager.default.subpathsOfDirectory(atPath: f.support.path)), supportInventory)
         withExtendedLifetime(lock) {}
+    }
+
+    func testPackagedCLIScopedRestoreQuarantinesOrphansOnlyWhenAsked() throws {
+        try requireLiveDocker()
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        do {
+            let source = try SQLiteDB(path: f.database.path)
+            try source.execute("""
+                PRAGMA foreign_keys=OFF;
+                INSERT INTO agent_messages(id,thread_id,role,content,created_at) VALUES('m-orphan','22222222-2222-4222-8222-222222222222','user','lost parent','2026-01-01T00:00:00Z');
+                """)
+        }
+        let created = try run(["--create-database-backup", f.backup.path], fixture: f)
+        XCTAssertEqual(created.0, 0, created.2)
+        let review = try run(["--inspect-database-backup", f.backup.path], fixture: f)
+        XCTAssertEqual(review.0, 0, review.2)
+        let token = try reviewToken(review.1)
+        XCTAssertEqual(try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(review.1.data(using: .utf8))) as? [String: Any])["scoped_session_count"] as? Int, 12)
+        try mutateCurrentState(f)
+        let bytesBefore = try Data(contentsOf: f.database)
+        let nativeBefore = try scopedInventory(f)
+
+        let refused = try run(["--restore-database-backup", f.backup.path, "--restore-review", token], fixture: f)
+        XCTAssertNotEqual(refused.0, 0, "orphan rows must refuse a scoped restore by default")
+        XCTAssertTrue(refused.2.contains("foreign key check failed"), refused.2)
+        XCTAssertEqual(try Data(contentsOf: f.database), bytesBefore, "refused scoped restore must not alter the database")
+        XCTAssertEqual(try scopedInventory(f), nativeBefore, "refused scoped restore must not alter native history")
+
+        let restored = try run(["--restore-database-backup", f.backup.path, "--restore-review", token, "--quarantine-orphans"], fixture: f)
+        XCTAssertEqual(restored.0, 0, restored.2)
+        let line = try XCTUnwrap(restored.1.split(separator: "\n").first { $0.hasPrefix("Orphan rows were saved aside in: ") }.map(String.init), restored.1)
+        let quarantine = URL(fileURLWithPath: String(line.dropFirst("Orphan rows were saved aside in: ".count)))
+        let saved = try SQLiteDB(path: quarantine.path)
+        let statement = try saved.prepare("SELECT COUNT(*) FROM agent_messages WHERE id='m-orphan';")
+        defer { statement.reset() }
+        XCTAssertTrue(try statement.step())
+        XCTAssertEqual(statement.columnInt64(0), 1, "the orphan must be saved, not dropped")
+        try assertDatabaseState(f, revoked: true)
     }
 
     func testPackagedCLIRejectsTamperedBackupWithoutChangingDatabase() throws {

@@ -35,6 +35,10 @@ struct RemoteCodeMain {
         let inspectsDatabase = CommandLine.arguments.contains(inspectFlag)
         let createFlag = "--create-database-backup"
         let createsDatabase = CommandLine.arguments.contains(createFlag)
+        // Optional trailing opt-in; the strict argument checks below see the command without it.
+        let quarantineFlag = "--quarantine-orphans"
+        let quarantinesOrphans = restoresDatabase && CommandLine.arguments.count > 3 && CommandLine.arguments.last == quarantineFlag
+        let databaseArguments = quarantinesOrphans ? Array(CommandLine.arguments.dropLast()) : CommandLine.arguments
         let repairsContextReceipts = CommandLine.arguments.contains("--repair-context-receipts")
         if repairsContextReceipts {
             guard CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--repair-context-receipts",
@@ -52,15 +56,16 @@ struct RemoteCodeMain {
             if operationFlags.count != 1 || hasScheduledAgentFlag || rollingBack {
                 validArguments = false
             } else if inspectsDatabase || createsDatabase {
-                validArguments = CommandLine.arguments.count == 3 && CommandLine.arguments[1] == operationFlags[0]
-                    && !CommandLine.arguments.contains("--restore-review")
-            } else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == restoreFlag {
+                validArguments = databaseArguments.count == 3 && databaseArguments[1] == operationFlags[0]
+                    && !databaseArguments.contains("--restore-review") && !databaseArguments.contains(quarantineFlag)
+            } else if databaseArguments.count == 3 && databaseArguments[1] == restoreFlag && !databaseArguments.contains(quarantineFlag) {
                 validArguments = true
             } else {
-                validArguments = CommandLine.arguments.count == 5
-                    && CommandLine.arguments[1] == restoreFlag
-                    && CommandLine.arguments[3] == "--restore-review"
-                    && CommandLine.arguments.filter({ $0 == "--restore-review" }).count == 1
+                validArguments = databaseArguments.count == 5
+                    && databaseArguments[1] == restoreFlag
+                    && databaseArguments[3] == "--restore-review"
+                    && databaseArguments.filter({ $0 == "--restore-review" }).count == 1
+                    && !databaseArguments.contains(quarantineFlag)
             }
             guard validArguments else {
                 fputs("Database backup operation has mixed flags or invalid arguments.\n", stderr)
@@ -187,7 +192,7 @@ struct RemoteCodeMain {
                   !CommandLine.arguments.contains("--rollback-host"),
                   let index = CommandLine.arguments.firstIndex(of: operationFlag),
                   CommandLine.arguments.count >= index + 2,
-                  index + 2 == CommandLine.arguments.count || (restoresDatabase && index + 4 == CommandLine.arguments.count && CommandLine.arguments[index + 2] == "--restore-review"),
+                  index + 2 == databaseArguments.count || (restoresDatabase && index + 4 == databaseArguments.count && databaseArguments[index + 2] == "--restore-review"),
                   CommandLine.arguments.filter({ $0 == "--restore-review" }).count <= 1,
                   restoresDatabase || !CommandLine.arguments.contains("--restore-review") else {
                 fputs("Database backup operation requires exclusive host lock, one path, and no mixed flags.\n", stderr)
@@ -225,7 +230,11 @@ struct RemoteCodeMain {
                         }
                         token = CommandLine.arguments[reviewIndex + 1]
                     }
-                    let recovery = try HostScopedSessionBackup.restore(backupURL: backup, currentURL: current, appSupport: appSupportDirectory, reviewToken: token)
+                    let recovery = try HostScopedSessionBackup.restore(backupURL: backup, currentURL: current, appSupport: appSupportDirectory, reviewToken: token, quarantineOrphans: quarantinesOrphans)
+                    let quarantine = HostDatabaseRestore.quarantineURL(forRecovery: recovery)
+                    if quarantinesOrphans, FileManager.default.fileExists(atPath: quarantine.path) {
+                        print("Orphan rows were saved aside in: \(quarantine.path)")
+                    }
                     print("Database restored without starting execution. Recovery backup: \(recovery.path)")
                 } catch {
                     fputs("Database restore failed: \(error)\n", stderr)

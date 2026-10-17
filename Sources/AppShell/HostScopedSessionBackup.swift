@@ -132,7 +132,7 @@ enum HostScopedSessionBackup {
                       requiresConfirmation: true)
     }
 
-    static func restore(backupURL: URL, currentURL: URL, appSupport: URL, reviewToken: String?) throws -> URL {
+    static func restore(backupURL: URL, currentURL: URL, appSupport: URL, reviewToken: String?, quarantineOrphans: Bool = false) throws -> URL {
         let review = try inspect(backupURL: backupURL)
         if review.requiresConfirmation && reviewToken != review.fingerprint {
             throw failure("database restore requires the exact inspected review fingerprint")
@@ -145,6 +145,7 @@ enum HostScopedSessionBackup {
         let companion = HostScopedSessionArchive.companionURL(for: backupURL)
         if try !exists(companion.lastPathComponent, in: sourceParent) {
             return try HostDatabaseRestore.restore(backupURL: backupURL, currentURL: currentURL, reviewToken: reviewToken,
+                quarantineOrphans: quarantineOrphans,
                 beforeCommit: { _, recovery in
                     let manifest = try HostScopedSessionArchive.capture(databaseURL: recovery, appSupport: appSupport,
                         destination: HostScopedSessionArchive.companionURL(for: recovery))
@@ -171,7 +172,7 @@ enum HostScopedSessionBackup {
             }
             _ = try childAndClose("undo", in: stage)
             let recovery = try HostDatabaseRestore.restore(backupURL: incomingDB, currentURL: currentURL,
-                reviewToken: review.database.fingerprint, beforeCommit: { sanitized, recoveryURL in
+                reviewToken: review.database.fingerprint, quarantineOrphans: quarantineOrphans, beforeCommit: { sanitized, recoveryURL in
                     try HostScopedSessionArchive.validateBindings(incoming, databaseURL: sanitized)
                     try HostScopedSessionArchive.requireQuiescent(incoming, appSupport: appSupport)
                     let recoveryArchive = HostScopedSessionArchive.companionURL(for: recoveryURL)
