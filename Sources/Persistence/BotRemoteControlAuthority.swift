@@ -519,6 +519,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     ) -> (run: [String: Any], notification: [String: Any]?) {
         var run = routineRunRecord(routine, scheduledAt: scheduledAt, now: now)
         do {
+            if scheduledAt != nil {
+                guard settings.reload().isBotAutonomyActive else {
+                    routineSlotsNeedReseed = true
+                    throw Error(code: -32081, message: "Automatic bot tasks are paused.")
+                }
+                guard let current = try store.listEnabledRoutines().first(where: { $0.definition.id == routine.definition.id }),
+                      current.definition == routine.definition else {
+                    throw Error(code: -32079, message: "Scheduled task changed, was disabled or was removed before execution.")
+                }
+            }
             guard let onRoutineSend else {
                 throw Error(code: -32091, message: "Bot runtime is unavailable.")
             }
@@ -1829,6 +1839,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     }
 
     private func queueForceNow(params: [String: Any], requestID: String) throws -> [String: Any] {
+        try requireControlPlane()
         let bot = try requireBot(params)
         let itemID = string(params, "id") ?? ""
         var rows = try store.listQueuedFollowUps(botID: bot.id)
@@ -2089,6 +2100,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// iOS Run now: the phone's Test run. A real send in a new conversation;
     /// the receipt fails with the reason when the run could not start.
     private func routineRun(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
+        try requireControlPlane()
         let bot = try requireBot(params)
         guard let routineID = string(params, "routine_id"),
               let routineUUID = UUID(uuidString: routineID),
@@ -3655,7 +3667,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     // MARK: - Helpers
 
     private func requireControlPlane() throws {
-        guard settings.load().isBotControlPlaneActive else { throw Error.controlPlaneOff }
+        guard settings.reload().isBotControlPlaneActive else { throw Error.controlPlaneOff }
     }
 
     private func requireBot(_ params: [String: Any]) throws -> BotDefinition {

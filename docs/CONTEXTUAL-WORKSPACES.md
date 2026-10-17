@@ -318,3 +318,7 @@ The real legacy/contextual provisioning paths now have a reproducible cached-ima
 ### Native fork and replay authority — bounded S-002/S-007/S-008 proof
 
 Direct native router fork/side, the shared coordinator, durable prepare/graph commit and startup recovery now reject canonical contextual sources before provider capability or execution effects. Actual revocation and reopened SQLite/AppContext retain refusal and canonical identity; a pre-pin prepared intent remains diagnosable without replay or child commit. At Sources/Tests tree `7d1dfd16e8ab105a31d73f313d500a6a6bc69bb2`, 44 selected tests passed with zero failures/skips in 7.799 seconds after an isolated clean rebuild; native signed packaging passed from the same tree. Details and limits are in [CONTEXT-FORK-AUTHORITY.md](CONTEXT-FORK-AUTHORITY.md). Legacy unit regressions remain preserved; positive contextual export/fork, authenticated provider proof and the complete endpoint matrix remain pending. UI and public gates are unchanged; iOS documentation only.
+
+### Routine and queue authority — bounded proof
+
+Routine dispatch, queue admission/drain and current context authority checks are documented in [CONTEXT-QUEUE-ROUTINE-AUTHORITY.md](CONTEXT-QUEUE-ROUTINE-AUTHORITY.md). Exact-tree test evidence and limits are recorded there; provider execution, export completion and full S-002/S-007/S-008 acceptance remain open. iOS change is documentation only; UI/layout/public gates are unchanged.

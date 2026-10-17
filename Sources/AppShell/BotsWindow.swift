@@ -6544,14 +6544,17 @@ public final class BotsViewModel: ObservableObject {
         guard resolvedRouter() != nil, try currentRevision(for: bot) != nil else {
             throw BotStoreError.invalidRow("Bot runtime is unavailable")
         }
-        try admitDesktopSend(bot: bot)
-
-        if let conversationID {
-            guard let existing = try botStore.conversation(id: conversationID),
+        let existingConversation = try conversationID.map { id -> BotConversation in
+            guard let existing = try botStore.conversation(id: id),
                   existing.botID == bot.id, existing.groupID == nil else {
                 throw BotStoreError.notFound
             }
             try rejectContextualConversationSend(existing)
+            return existing
+        }
+        try admitDesktopSend(bot: bot)
+
+        if let existing = existingConversation {
             if existing.id == titioInboxConversationID {
                 // An LLM must never approve or answer for the user (§0.2):
                 // only the paired user's own text may reach the intercept,
@@ -11906,6 +11909,9 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         do {
+            guard let bot = try botStore.get(id: bot.id), bot.deletedAt == nil,
+                  conversation.botID == bot.id else { throw BotStoreError.notFound }
+            try rejectContextualConversationSend(conversation)
             guard queuedFollowUpMayDrain(next, botID: bot.id),
                   let record = try botStore.listQueuedFollowUps(botID: bot.id).first(where: { $0.id.lowercased() == next.id.uuidString.lowercased() }),
                   decodeQueuedFollowUp(record) == next else { return }
