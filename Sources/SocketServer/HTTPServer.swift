@@ -3902,7 +3902,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         status: 200,
                         contentType: "application/json",
                         body: respData,
-                        acceptEncoding: ae
+                        acceptEncoding: ae,
+                        additionalHeaders: ["Cache-Control": "no-store"]
                     )
                     self.requestPhaseMetrics.record(
                         .responseWrite,
@@ -4432,9 +4433,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
         ) else {
             return rpcErrorObject(Self.rpcCapabilityDenied(method: method), id: wireID)
         }
-        if method == "bot.conversation.enqueue", !principal.isAuthenticated {
+        if ["bot.conversation.enqueue", "bot.conversation.export.preview", "bot.conversation.export"].contains(method), !principal.isAuthenticated {
             return rpcErrorObject(JSONRPCError(code: -32098,
-                message: "Contextual enqueue requires an authenticated paired connection."), id: wireID)
+                message: "Contextual data operations require an authenticated paired connection."), id: wireID)
         }
         if method == AgentCheckpointListContract.method {
             // Explicit v1 transport gate before any repository work.

@@ -278,7 +278,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             guard try store.authorizes(hostID: hostID, botID: botID, context: context, action: action, policyRevision: revision) else {
                 throw Error(code: -32084, message: "Bot context authority is not active for this request.")
             }
-            if !["conversation.create", "conversation.list", "conversation.select", "conversation.enqueue"].contains(name) { throw Error(code: -32602, message: "Context resource unavailable.") }
+            if !["conversation.create", "conversation.list", "conversation.select", "conversation.enqueue", "conversation.export.preview", "conversation.export"].contains(name) { throw Error(code: -32602, message: "Context resource unavailable.") }
             if name == "conversation.create" {
                 guard Set(params.keys).isSubset(of: ["client_request_id", "bot_id", "title", "host_id", "context_key", "context_version", "policy_revision"]) else { throw Error.invalidParams }
             }
@@ -298,6 +298,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try queueList(params: params)
         case "conversation.list":
             return try conversationList(params: params)
+        case "conversation.export.preview", "conversation.export":
+            return try conversationExport(params: params, confirmed: name == "conversation.export")
         case "attachment.list":
             return try attachmentList(params: params)
         case "routine.list":
@@ -941,6 +943,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "get", "list", "settings.get", "queue.list", "conversation.list", "attachment.list", "routine.list", "files.list", "browser.state", "guest.state": return .read
         case "send", "queue.force_now", "conversation.create", "conversation.select", "conversation.clear_all", "conversation.fork", "conversation.enqueue": return .send
         case "attachment.stage", "attachment.import", "attachment.remove", "files.mutate", "files.open_tab", "files.split", "files.location.set", "browser.action", "link.open", "guest.input", "guest.start", "guest.stop", "guest.rebuild", "guest.revoke", "guest.control": return .files
+        case "conversation.export.preview", "conversation.export": return .export
         case "soul.set": return .memory
         case "settings.set", "save", "set_pinned", "set_hidden", "desktop.set", "avatar.set", "handle.set", "verbosity.set", "caveman.set", "routing.set": return .configure
         case "routine.create", "routine.update", "routine.enable", "routine.run", "routine.delete", "scheduler.tick": return .schedule
@@ -995,6 +998,79 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         let items = try store.listQueuedFollowUps(botID: BotID(uuid))
         return ["items": encodeQueue(items)]
+    }
+
+    private func conversationExport(params: [String: Any], confirmed: Bool) throws -> [String: Any] {
+        var fields: Set<String> = ["host_id", "bot_id", "context_key", "context_version", "policy_revision", "conversation_id", "target_context_key", "target_policy_revision", "message_ids"]
+        if confirmed { fields.formUnion(["approved", "selection_sha256"]) }
+        guard Set(params.keys) == fields else { throw Error.invalidParams }
+        return try db.transaction {
+            try requireControlPlane()
+            let denied = Error(code: -32084, message: "Contextual export is not authorized for this selection.")
+            var targetParams = params
+            targetParams["context_key"] = params["target_context_key"]
+            guard let sourceContext = parseContext(params), let targetContext = parseContext(targetParams),
+                  let (hostID, botID) = contextIdentity(params),
+                  let revision = integer(params["policy_revision"]), revision > 0,
+                  let targetRevision = integer(params["target_policy_revision"]), targetRevision > 0,
+                  try store.authorizes(hostID: hostID, botID: botID, context: sourceContext, action: .read, policyRevision: revision),
+                  try store.authorizes(hostID: hostID, botID: botID, context: sourceContext, action: .export, policyRevision: revision),
+                  try store.authorizes(hostID: hostID, botID: botID, context: targetContext, action: .send, policyRevision: targetRevision),
+                  let rawConversation = string(params, "conversation_id"), let conversationID = UUID(uuidString: rawConversation),
+                  let conversation = try store.conversation(id: BotConversationID(conversationID)),
+                  conversation.botID == botID, conversation.groupID == nil,
+                  let threadID = conversation.linkedAgentThreadID,
+                  let pin = try store.conversationContextPin(conversationID: conversation.id),
+                  pin.hostID == hostID, pin.botID == botID, pin.context == sourceContext,
+                  pin.contextVersion == BotContext.contractVersion, pin.policyRevision == revision,
+                  let thread = try AgentThreadRepository(db: db).get(id: threadID),
+                  thread.actor == .bot(botID), thread.actorLockedAt != nil,
+                  thread.provider == .distill, thread.executionTarget == .vm,
+                  let rawIDs = params["message_ids"] as? [String], !rawIDs.isEmpty, rawIDs.count <= 32 else { throw denied }
+            switch sourceContext {
+            case .general: guard thread.workspaceId == nil else { throw denied }
+            case .workspace(let workspace): guard thread.workspaceId == workspace else { throw denied }
+            }
+            let ids = rawIDs.compactMap(UUID.init(uuidString:))
+            guard ids.count == rawIDs.count, Set(ids).count == ids.count else { throw denied }
+            let repository = AgentMessageRepository(db: db)
+            var messages: [[String: Any]] = []
+            var excerpts: [String] = []
+            var byteCount: Int64 = 0
+            for id in ids {
+                let membership = try db.prepare("SELECT length(CAST(content AS BLOB)) FROM agent_messages WHERE id=? COLLATE NOCASE AND thread_id=? COLLATE NOCASE;")
+                defer { membership.reset() }
+                try membership.bind(1, id.uuidString)
+                try membership.bind(2, threadID.value.uuidString)
+                guard try membership.step(), membership.columnInt64(0) >= 0 else { throw denied }
+                byteCount += membership.columnInt64(0)
+                guard byteCount <= 65_536,
+                      let message = try repository.get(id: AgentMessageID(id)), message.threadId == threadID,
+                      message.role == .user || message.role == .assistant,
+                      !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw denied }
+                messages.append(["id": id.uuidString.lowercased(), "role": message.role.rawValue, "text": message.content])
+                excerpts.append("\(message.role.rawValue):\n\(message.content)")
+            }
+            var result: [String: Any] = [
+                "host_id": hostID, "bot_id": botID.value.uuidString.lowercased(),
+                "conversation_id": conversation.id.value.uuidString.lowercased(),
+                "context_key": sourceContext.storageKey, "context_version": BotContext.contractVersion,
+                "policy_revision": revision, "target_context_key": targetContext.storageKey,
+                "target_policy_revision": targetRevision, "messages": messages,
+            ]
+            let canonical = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .withoutEscapingSlashes])
+            let digest = SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
+            if confirmed {
+                guard let approved = params["approved"] as? NSNumber,
+                      CFGetTypeID(approved) == CFBooleanGetTypeID(), approved.boolValue,
+                      string(params, "selection_sha256") == digest else { throw denied }
+            }
+            result["selection_sha256"] = digest
+            result["summary"] = excerpts.joined(separator: "\n\n")
+            result["exported"] = confirmed
+            result["execution_available"] = false
+            return result
+        }
     }
 
     private func conversationList(params: [String: Any]) throws -> [String: Any] {
