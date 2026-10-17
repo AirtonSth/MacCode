@@ -105,7 +105,11 @@ final class BotContextCredentialResolverDockerProbeTests: XCTestCase {
       }
       for path in workspacePaths {
         try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        try Data((path.lastPathComponent + "-owned").utf8).write(
+          to: path.appendingPathComponent("marker.txt"))
       }
+      let hostOnlyMarker = root.appendingPathComponent("host-only-marker.txt")
+      try Data("host-only".utf8).write(to: hostOnlyMarker)
       let workspaceA = try router.createWorkspace(name: "Credential A", cwd: workspacePaths[0].path)
       let workspaceB = try router.createWorkspace(name: "Credential B", cwd: workspacePaths[1].path)
       let bot = try ctx.botStore.create(
@@ -217,8 +221,135 @@ final class BotContextCredentialResolverDockerProbeTests: XCTestCase {
         ])
         return try XCTUnwrap(JSONSerialization.jsonObject(with: output) as? [String: Any])
       }
+      let isolationScript = #"""
+        const fs = require('node:fs');
+        const net = require('node:net');
+        const http = require('node:http');
+        const os = require('node:os');
+        const timeout = 1000;
+
+        function tcp(host, port) {
+          return new Promise(resolve => {
+            const socket = net.createConnection({ host, port, timeout });
+            let done = false;
+            const finish = connected => {
+              if (done) return;
+              done = true;
+              socket.destroy();
+              resolve(connected);
+            };
+            socket.once('connect', () => finish(true));
+            socket.once('timeout', () => finish(false));
+            socket.once('error', () => finish(false));
+          });
+        }
+
+        function upgrade(token) {
+          return new Promise(resolve => {
+            let connected = false;
+            const request = http.request({
+              host: '127.0.0.1', port: 6080,
+              path: '/websockify?token=' + encodeURIComponent(token),
+              headers: {
+                Connection: 'Upgrade', Upgrade: 'websocket',
+                'Sec-WebSocket-Version': '13',
+                'Sec-WebSocket-Key': Buffer.from('0123456789abcdef').toString('base64'),
+              },
+            }, response => {
+              resolve({ connected, status: response.statusCode });
+              response.destroy();
+            });
+            request.once('socket', socket => {
+              connected = !socket.connecting;
+              socket.once('connect', () => { connected = true; });
+            });
+            request.setTimeout(2000, () => request.destroy(Object.assign(Error('viewer-timeout'), { code: 'ETIMEDOUT' })));
+            request.once('upgrade', (_response, socket) => {
+              socket.destroy();
+              resolve({ connected, status: 101 });
+            });
+            request.once('error', error => resolve({ connected, errorCode: error.code ?? 'unknown' }));
+            request.end();
+          });
+        }
+
+        (async () => {
+          const [peerIP, peerWorkspace, peerHostPortText, peerHome, peerEnv, hostMarker, ownMarker, ownContent] = process.argv.slice(1);
+          const peerHostPort = Number(peerHostPortText);
+          const files = [
+            { name: 'own-workspace', accessible: fs.existsSync(ownMarker), content: fs.readFileSync(ownMarker, 'utf8'), expected: true, expectedContent: ownContent },
+            { name: 'peer-workspace', accessible: fs.existsSync(peerWorkspace + '/marker.txt'), expected: false },
+            { name: 'peer-home', accessible: fs.existsSync(peerHome), expected: false },
+            { name: 'peer-private-env', accessible: fs.existsSync(peerEnv), expected: false },
+            { name: 'host-only', accessible: fs.existsSync(hostMarker), expected: false },
+          ];
+          const ownIPv4 = Object.values(os.networkInterfaces()).flat()
+            .find(value => value && value.family === 'IPv4' && !value.internal)?.address;
+          if (!ownIPv4 || !Number.isInteger(peerHostPort)) throw Error('missing-network-address');
+          const targets = [
+            { name: 'own-viewer', host: '127.0.0.1', port: 6080, expected: true },
+            ...[5900, 6080, 9222].map(port => ({ name: 'peer-' + port, host: peerIP, port, expected: false })),
+            { name: 'peer-published-viewer', host: 'host.docker.internal', port: peerHostPort, expected: false },
+          ];
+          const network = await Promise.all(targets.map(async target => ({
+            name: target.name, connected: await tcp(target.host, target.port), expected: target.expected,
+          })));
+          process.stdout.write(JSON.stringify({
+            files, network, ownIPv4,
+            valid: await upgrade(process.env.REMOTECODE_VIEWER_TOKEN),
+            invalid: await upgrade('invalid-context-probe'),
+          }));
+        })().catch(error => {
+          process.stderr.write(String(error));
+          process.exit(2);
+        });
+        """#
       for i in 0..<2 {
         let result = try probe(i)
+        let ownName = BotComputerGuestSpec.containerName(botID: identities[i].storageBotID)
+        let peerIndex = 1 - i
+        let peerName = BotComputerGuestSpec.containerName(botID: identities[peerIndex].storageBotID)
+        let peerIPData = try realDocker.run([
+          "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", peerName,
+        ])
+        let peerIP = String(decoding: peerIPData, as: UTF8.self)
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        let peerInspect = try realDocker.inspect(name: peerName)
+        let peerHome = try XCTUnwrap(peerInspect.homeSource)
+        let peerEnvPath = try envFile(peerIndex).path
+        XCTAssertTrue(FileManager.default.fileExists(atPath: peerHome), "Peer home source must exist")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: peerEnvPath), "Peer staged env file must exist")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: hostOnlyMarker.path))
+        let ownMarker = workspacePaths[i].appendingPathComponent("marker.txt").path
+        let ownContent = "workspace-\(i == 0 ? "a" : "b")-owned"
+        let guestOutput = try realDocker.run([
+          "exec", "--user", "1000", "--env-file", envFile(i).path, ownName, "node", "-e",
+          isolationScript, peerIP, workspacePaths[peerIndex].path, String(peerInspect.hostPort),
+          peerHome, peerEnvPath, hostOnlyMarker.path, ownMarker, ownContent,
+        ])
+        let isolation = try XCTUnwrap(JSONSerialization.jsonObject(with: guestOutput) as? [String: Any])
+        let fileResults = try XCTUnwrap(isolation["files"] as? [[String: Any]])
+        XCTAssertEqual(fileResults.count, 5)
+        for item in fileResults {
+          XCTAssertEqual(
+            item["accessible"] as? Bool, item["expected"] as? Bool,
+            "File isolation: \(item["name"] ?? "unknown")")
+          if item["name"] as? String == "own-workspace" {
+            XCTAssertEqual(item["content"] as? String, item["expectedContent"] as? String)
+          }
+        }
+        let networkResults = try XCTUnwrap(isolation["network"] as? [[String: Any]])
+        XCTAssertEqual(networkResults.count, 5)
+        for item in networkResults {
+          XCTAssertEqual(item["connected"] as? Bool, item["expected"] as? Bool, "Network isolation: \(item["name"] ?? "unknown")")
+        }
+        let validViewer = try XCTUnwrap(isolation["valid"] as? [String: Any])
+        XCTAssertEqual(validViewer["status"] as? Int, 101)
+        let invalidViewer = try XCTUnwrap(isolation["invalid"] as? [String: Any])
+        XCTAssertEqual(invalidViewer["connected"] as? Bool, true)
+        let rejectedStatus = (invalidViewer["status"] as? Int).map { (400..<500).contains($0) } ?? false
+        XCTAssertTrue(rejectedStatus || invalidViewer["errorCode"] as? String == "ECONNRESET",
+          "Invalid viewer token must be rejected after TCP connects")
         XCTAssertEqual(result["status"] as? Int, 200)
         XCTAssertEqual(
           (result["names"] as? [String])?.sorted(),
