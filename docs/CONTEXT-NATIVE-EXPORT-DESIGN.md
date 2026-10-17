@@ -115,3 +115,9 @@ The iOS export sheet now has the same **Continue in Destination** action as macO
 Verification on the iOS tree after this change, on an exclusive iPhone 17 / iOS 26.5 simulator removed afterwards: `ConnectionPhaseFourCatalogTests`, `ConnectionPhaseFourIdempotencyTests` and `ConnectionPhaseFourAuthorityTests` ran 62 tests, 0 failures, including `testContinueInDestinationCreatesPinnedConversationAndHoldsReviewedSummary` (inert before the copy, create pinned to the target with revision 3, queued text equal to the reviewed summary, no `bot.send`, no second create or enqueue on repeat) and `testContinueInDestinationRefusedWhenDestinationRevokedLeavesNothingQueued`. The existing `testBotContextExportNativeJourney` UI journey still passed (1 test, 0 failures, 102 s) on the same simulator type.
 
 Limits: the transport in these tests is a recording fake, not a live host; the new button is not driven by a UI test; no largest-text, VoiceOver or iPad pass was run for it.
+
+## Continue in Destination: largest text and iPad
+
+The `testBotContextExportNativeJourney` UI journey, which now taps **Continue in Destination**, also passed with the simulator content size set to `accessibility-extra-extra-extra-large` (read back with `simctl ui content_size` before the run) on an exclusive iPhone 17 / iOS 26.5 simulator (1 test, 0 failures, 159 s), and at default text on an exclusive iPad Pro 13-inch (M5) simulator (1 test, 0 failures, 111 s). Both simulators were removed afterwards.
+
+Accessibility limits: XCUITest reads the accessibility tree (identifiers, labels, values and hittability), so the new button and confirmation are reachable by assistive technology identifiers, but no actual VoiceOver session, Switch Control, hardware keyboard navigation or reduced-motion pass was run on iOS or macOS. The macOS sheet keeps its existing keyboard shortcuts (default action, cancel) and was only rendered offscreen. These remain unverified.

@@ -334,3 +334,18 @@ The existing historical queue regression now verifies revoke, newer-revision reg
 ### Manual contextual excerpt export
 
 Explicit paired preview/confirmation now exports only selected user/assistant text after current source read/export and intended-target send authorization. Digest-bound review, wrong-resource denial and fresh reads prevent revoked policy from replaying private content. The iOS finite read-only contract is integrated, without view changes. See [CONTEXT-MANUAL-EXPORT.md](CONTEXT-MANUAL-EXPORT.md) for exact-tree tests and limits. This is artifact export to the human client, not destination import, a new provider session, native review controls or complete S-002/S-003/S-006 acceptance.
+
+## Stage status summary (current evidence, not a completion claim)
+
+Stage-by-stage status against the verification plan. "Verified" means exercised by shipped-code tests recorded in the linked documents; every stage still has open items, and broad adoption is not validated.
+
+| Stage | Verified so far | Open |
+|---|---|---|
+| S-001 decisions and probes | Runtime cost (cold plus five warm, and 1/2/4/8 concurrent desktops) with an enforced default ceiling of 4; legacy and copied-data fixtures; scoped backup/restore. | Credential/network/filesystem probes with real provider credentials (`RC_CONTEXT_OPENROUTER_*` absent); usability trial contract and participants. |
+| S-002 authority | Bindings, immutable pins, guessed/revoked resources, export preview/confirm with selection digest, public enqueue, restore without revived grants. | Complete allow/deny matrix across every entry point; durable per-export audit receipt. |
+| S-003 canonical conversation | Same IDs through desk selection, history hydration, export, continue-in-destination (new pinned conversation, held unsent summary) on macOS and iOS. | Concurrent-window selection races end to end; activity/search/link entry points. |
+| S-004 navigation and native UI | Export sheet journey on iPhone (default and largest text) and iPad, picker at largest text, macOS sheet offscreen render. | Real macOS window drive, VoiceOver/keyboard, human usability trial. |
+| S-005 runtime isolation | Docker A/B resolver wiring, cleanup, capacity cap. | Restricted mode stays unavailable; real-provider isolation and browser/network policy. |
+| S-006 teams/delegation | Internal admission and cleanup tests. | Contextual peer entry blocked; real child execution and durable delegation. |
+| S-007 queue/replay | Offline durable intent, public enqueue with review hold, drain refusal after revocation, receipts. | Routines end to end, host switches, full matrix. |
+| S-008 migration/compat | Old/new client matrix on synthetic fixtures, restore CLI, rollback guard, pre-revocation backup cannot revive grants. | OAuth refresh/resume, raw older host unsupported, broad adoption, iPhone and first-frame navigation measurement. |
