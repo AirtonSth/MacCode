@@ -19,6 +19,8 @@ struct RemoteCodeMain {
         }
         let appSupportOverride = ProcessInfo.processInfo.environment["RC2_APP_SUPPORT"]
         let dbOverride = ProcessInfo.processInfo.environment["RC2_DB_PATH"]
+        let restoreFlag = "--restore-database-backup"
+        let restoresDatabase = CommandLine.arguments.contains(restoreFlag)
 
         if CommandLine.arguments.contains("--scheduled-task-agent-unregister") {
             do {
@@ -60,6 +62,7 @@ struct RemoteCodeMain {
             Logger(subsystem: "io.remotecode.app", category: "lifecycle")
                 .fault("app.second_instance_exit holder=\(holder, privacy: .public)")
             fputs("RemoteCode is already running for \(appSupportDirectory.path) (pid \(holder)); exiting.\n", stderr)
+            if restoresDatabase { exit(EXIT_FAILURE) }
             if let holderPID, !LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
                 NSRunningApplication(processIdentifier: holderPID)?.activate()
             }
@@ -68,6 +71,28 @@ struct RemoteCodeMain {
             Logger(subsystem: "io.remotecode.app", category: "lifecycle")
                 .error("app.instance_lock_unavailable errno=\(code, privacy: .public)")
             instanceLock = nil
+        }
+
+        if restoresDatabase {
+            guard let instanceLock,
+                  CommandLine.arguments.filter({ $0 == restoreFlag }).count == 1,
+                  let index = CommandLine.arguments.firstIndex(of: restoreFlag),
+                  CommandLine.arguments.indices.contains(index + 1) else {
+                fputs("Database restore requires an exclusive host lock and one backup path.\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+            withExtendedLifetime(instanceLock) {
+                do {
+                    let current = URL(fileURLWithPath: dbOverride ?? appSupportDirectory.appendingPathComponent("remotecode.sqlite").path)
+                    let backup = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+                    let recovery = try HostDatabaseRestore.restore(backupURL: backup, currentURL: current)
+                    print("Database restored without starting execution. Recovery backup: \(recovery.path)")
+                } catch {
+                    fputs("Database restore failed: \(error)\n", stderr)
+                    exit(EXIT_FAILURE)
+                }
+            }
+            return
         }
 
         if LocalAuthAdapter.isE2EPairingAutoApproveEnabled {

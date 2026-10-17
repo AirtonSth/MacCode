@@ -72,3 +72,7 @@ Baseline macOS `923df715f3e57295badba4290b211d3ee6a7cc00`; iOS baseline `a51ecd7
 Parent ran `scripts/isolated-sandbox.sh test --build-system native --filter 'BotContextRestoreCompatibilityTests|BotContextAuthorityTests|BotRoutineSchedulerTests|BotContextQueuedMessageTests'`: 11 tests, 0 failures, exit 0, 4.725 seconds, macOS tree `1eb0012ba51251745400ed7abebaab2640529d8e`. The existing legacy routine success/disabled/idempotency tests ran alongside the refusal and restore tests. Background Live Activity writes from existing AppContext teardown logged disk-I/O failures; the selected XCTest cases passed. This is not a whole-suite or background-service success claim.
 
 Limits: the snapshot is taken **after revocation**. This does not prove protection against restoring a pre-revocation backup, running an older binary, cross-version compatibility, contextual routine execution, private attachment-byte restoration, or full backup/rollback adoption. Those matrix entries remain pending; historical receipts are never evidence of current authorization.
+
+## Pre-revocation restore follow-up
+
+`CONTEXT-HOST-RESTORE.md` records the subsequent explicit offline host restore, current-authority overlay, real binary verification, and continued schema/rollout limits. It supersedes only the earlier statement that pre-revocation restore had no proof; it does not establish arbitrary file replacement or old-binary safety.
