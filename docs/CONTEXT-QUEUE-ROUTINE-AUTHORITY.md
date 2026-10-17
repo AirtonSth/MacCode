@@ -35,6 +35,8 @@ No positive contextual enqueue-to-revocation runtime was possible because public
 
 ## Historical queue: revoke and regrant
 
+The earlier no-public-enqueue ceiling is superseded by the explicit persistence-only [public contextual queue checkpoint](CONTEXT-PUBLIC-QUEUE.md). Execution remains unavailable. Historical evidence below keeps its original scope.
+
 No authorized public contextual enqueue exists: `router.sendAgentMessage` and host enqueue reject pinned sends. `startContextualRun` starts immediately; it does not queue. Therefore this test uses the existing real repository persist-only historical enqueue under a valid pin, not public admission proof. No new API or gates enabled for this test.
 
 The strengthened existing test verifies actual authorization for send at the pinned revision before repository enqueue; actual revocation at the exact revision; real drain, force, and launch recovery twice without effects; and unchanged full queue listing. Actual regrant at a newer revision leaves the old pin unauthorized while the new grant revision authorizes. Drain still rejects the old pin with `authority is inactive or invalid` (`-32602`). Reopen preserves the exact full rows, immutable pin, and queued dispatch with nil run, with zero messages and runs.

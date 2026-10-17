@@ -3932,7 +3932,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                failed["status"] as? String == BotRemoteControlAuthority.Status.failed.rawValue {
                 return JSONValue.from(failed)
             }
-            throw JSONRPCError(code: error.code, message: error.message)
+            let rejection = JSONRPCError(code: error.code, message: error.message)
+            if method == "bot.conversation.enqueue" {
+                // Domain errors precede enqueue or follow its transaction rollback.
+                throw DefiniteMutationRejection(rejection)
+            }
+            throw rejection
         }
     }
 

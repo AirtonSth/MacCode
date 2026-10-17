@@ -991,6 +991,7 @@ public final class JSONRPCDispatcher {
         "bot.queue.reorder",
         "bot.queue.force_now",
         "bot.conversation.create",
+        "bot.conversation.enqueue",
         "bot.conversation.select",
         "bot.conversation.clear_all",
         "bot.routine.create",
@@ -1592,6 +1593,7 @@ public final class JSONRPCDispatcher {
                 }
                 kind = .botRunStopRequested
                 botTerminalPayload = terminal
+            case "bot.conversation.enqueue": kind = .botQueueUpdated
             case "bot.queue.remove", "bot.queue.update", "bot.queue.reorder", "bot.queue.force_now":
                 kind = .botQueueUpdated
             case "bot.conversation.select": kind = .botConversationSelected
@@ -1762,6 +1764,9 @@ public final class JSONRPCDispatcher {
         let params = req.params ?? [:]
         if req.method == "bot.context.grant" || req.method == "bot.context.revoke" {
             return .init(id: req.id, error: JSONRPCError(code: -32098, message: "Bot context grants require an authenticated paired connection or native UI."))
+        }
+        if req.method == "bot.conversation.enqueue" {
+            return .init(id: req.id, error: JSONRPCError(code: -32098, message: "Contextual enqueue requires an authenticated paired connection or native UI."))
         }
         let peerReceiptMethod = params["method"]?.stringValue
         let isPeerReceiptStatus = req.method == "bot.peer.receipt.status"
@@ -2594,12 +2599,14 @@ public final class JSONRPCDispatcher {
             let hasScopedContext = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
             if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.context."), hasScopedContext {
                 let admitted = (req.method == "bot.conversation.list" && eventIdentity != nil)
-                    || ((req.method == "bot.conversation.create" || req.method == "bot.conversation.select") && Self.centralMutationExecution)
+                    || ((req.method == "bot.conversation.create" || req.method == "bot.conversation.select" || req.method == "bot.conversation.enqueue") && Self.centralMutationExecution)
                 guard admitted else {
                     throw JSONRPCError(code: -32602, message: "Context resource unavailable.")
                 }
             }
             if req.method == "bot.context.list", let eventIdentity {
+                params["host_id"] = .string(eventIdentity.hostId)
+            } else if req.method == "bot.conversation.enqueue", let eventIdentity {
                 params["host_id"] = .string(eventIdentity.hostId)
             } else if req.method == "bot.conversation.list", hasScopedContext, let eventIdentity {
                 params["host_id"] = .string(eventIdentity.hostId)

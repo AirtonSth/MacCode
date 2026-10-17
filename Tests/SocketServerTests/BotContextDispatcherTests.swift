@@ -170,6 +170,113 @@ final class BotContextDispatcherTests: XCTestCase {
         XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM agent_threads;"), 1)
     }
 
+    func test_conversationEnqueuePersistsOnlyAuthenticatedQueueIntent() async throws {
+        let parent = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"]), isDirectory: true)
+        let fixture = try Fixture(root: parent.appendingPathComponent("PublicQueueDispatcher-\(UUID().uuidString)", isDirectory: true))
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let bot = try fixture.authority.dispatch(method: "bot.create", params: ["client_request_id": "enqueue-bot", "name": "Queue test"])
+        let botID = try XCTUnwrap(bot["bot_id"] as? String)
+        _ = try fixture.authority.dispatch(method: "bot.routing.set", params: ["client_request_id": "enqueue-route", "bot_id": botID, "provider": "distill", "model": "test-main", "routing_mode": "explicit"])
+        let router = BotContextRouter(authority: fixture.authority, receiptRepository: fixture.receipts)
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let context = MutationRequestContext(ownerFingerprint: "owner-a", hostId: "host-a", bootEpoch: 1)
+        let grant = request("bot.context.grant", [
+            "client_request_id": .string("enqueue-grant"), "host_id": .string("host-b"),
+            "bot_id": .string(botID), "context_key": .string("general:v1"),
+            "context_version": .number(1), "policy_revision": .number(0),
+            "actions": .array([.string("read"), .string("send")]),
+        ])
+        let grantResponse = await dispatcher.dispatchHTTP(grant, mutationContext: context)
+        XCTAssertNil(grantResponse.error)
+        XCTAssertEqual(grantResponse.result?.objectValue?["status"]?.stringValue, "completed")
+        let create = await dispatcher.dispatchHTTP(request("bot.conversation.create", [
+            "client_request_id": .string("enqueue-conversation"), "bot_id": .string(botID),
+            "context_key": .string("general:v1"), "context_version": .number(1), "policy_revision": .number(1),
+        ]), mutationContext: context)
+        XCTAssertNil(create.error)
+        XCTAssertEqual(create.result?.objectValue?["status"]?.stringValue, "completed")
+        let created = try XCTUnwrap(create.result?.objectValue?["readback"]?.objectValue)
+        let conversationID = try XCTUnwrap(created["conversation_id"]?.stringValue)
+        let threadID = AgentThreadID(try XCTUnwrap(UUID(uuidString: created["thread_id"]?.stringValue ?? "")))
+        let params: [String: JSONValue] = [
+            "client_request_id": .string("enqueue-request"), "host_id": .string("host-b"), "bot_id": .string(botID),
+            "context_key": .string("general:v1"), "context_version": .number(1), "policy_revision": .number(1),
+            "conversation_id": .string(conversationID), "text": .string("Exact queued text"),
+        ]
+        var sendCallbacks = 0
+        fixture.authority.onSend = { _, _, _, _, _, _ in sendCallbacks += 1; return [:] }
+        let enqueue = request("bot.conversation.enqueue", params)
+        let first = await dispatcher.dispatchHTTP(enqueue, mutationContext: context)
+        XCTAssertNil(first.error)
+        let receipt = try XCTUnwrap(first.result?.objectValue)
+        XCTAssertEqual(receipt["status"]?.stringValue, "completed")
+        let readback = try XCTUnwrap(receipt["readback"]?.objectValue)
+        XCTAssertEqual(readback["enqueued"]?.boolValue, true)
+        XCTAssertEqual(readback["execution_available"]?.boolValue, false)
+        XCTAssertEqual(readback["requires_user_send"]?.boolValue, true)
+        XCTAssertEqual(Set(readback.keys), Set(["enqueued", "execution_available", "requires_user_send", "queue_id", "thread_id", "conversation_id", "host_id", "context_key", "context_version", "policy_revision"]))
+        let queueID = try XCTUnwrap(readback["queue_id"]?.stringValue)
+        XCTAssertEqual(readback["thread_id"]?.stringValue, threadID.value.uuidString.lowercased())
+        XCTAssertEqual(router.lastPairedParams?["host_id"]?.stringValue, "host-a")
+        let repository = AgentQueuedMessageRepository(db: fixture.db)
+        let rows = try repository.list(threadId: threadID)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].id.value.uuidString.lowercased(), queueID.lowercased())
+        XCTAssertEqual(rows[0].text, "Exact queued text")
+        XCTAssertTrue(try HostDatabaseRestore.requiresQueueReview(kind: .agent, id: queueID, db: fixture.db))
+        XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM agent_messages;"), 0)
+        XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM agent_runs;"), 0)
+        XCTAssertEqual(try fixture.rowCount("SELECT COUNT(*) FROM bot_queued_follow_ups;"), 0)
+        XCTAssertEqual(sendCallbacks, 0)
+        let replay = await dispatcher.dispatchHTTP(enqueue, mutationContext: context)
+        XCTAssertEqual(replay.result?.objectValue?["readback"]?.objectValue?["queue_id"]?.stringValue, queueID)
+        let reopened = try fixture.reopen()
+        let reopenedRouter = BotContextRouter(authority: reopened.authority, receiptRepository: reopened.receipts)
+        let reopenedReplay = await JSONRPCDispatcher(router: reopenedRouter).dispatchHTTP(enqueue, mutationContext: context)
+        XCTAssertEqual(reopenedReplay.result?.objectValue?["readback"]?.objectValue?["queue_id"]?.stringValue, queueID)
+        XCTAssertEqual(try AgentQueuedMessageRepository(db: reopened.db).list(threadId: threadID).count, 1)
+        var changed = params
+        changed["text"] = .string("Changed request")
+        let conflict = await dispatcher.dispatchHTTP(request("bot.conversation.enqueue", changed), mutationContext: context)
+        XCTAssertNotNil(conflict.error)
+        XCTAssertEqual(try repository.list(threadId: threadID).count, 1)
+
+        var invalids: [[String: JSONValue]] = []
+        for key in ["context_key", "context_version", "policy_revision", "conversation_id"] { var value = params; value.removeValue(forKey: key); value["client_request_id"] = .string("missing-\(key)"); invalids.append(value) }
+        var empty = params; empty["client_request_id"] = .string("empty-text"); empty["text"] = .string(" \n "); invalids.append(empty)
+        var fractional = params; fractional["client_request_id"] = .string("fractional-policy"); fractional["policy_revision"] = .number(1.5); invalids.append(fractional)
+        var wrongBot = params; wrongBot["client_request_id"] = .string("wrong-bot"); wrongBot["bot_id"] = .string(UUID().uuidString); invalids.append(wrongBot)
+        var wrongPin = params; wrongPin["client_request_id"] = .string("wrong-pin"); wrongPin["conversation_id"] = .string(UUID().uuidString); invalids.append(wrongPin)
+        for extra in ["workspace_id", "provider", "model", "routing_mode"] { var value = params; value["client_request_id"] = .string("extra-\(extra)"); value[extra] = .string("unexpected"); invalids.append(value) }
+        var attachments = params; attachments["client_request_id"] = .string("extra-attachments"); attachments["attachments"] = .array([]); invalids.append(attachments)
+        var stale = params; stale["client_request_id"] = .string("stale-policy"); stale["policy_revision"] = .number(0); invalids.append(stale)
+        for invalid in invalids {
+            let denied = await dispatcher.dispatchHTTP(request("bot.conversation.enqueue", invalid), mutationContext: context)
+            XCTAssertTrue(denied.error != nil || denied.result?.objectValue?["status"]?.stringValue == "failed")
+        }
+        XCTAssertEqual(try repository.list(threadId: threadID).count, 1)
+        SettingsStore(db: fixture.db).update { $0.botsControlPlaneEnabled = false }
+        var disabled = params; disabled["client_request_id"] = .string("disabled-enqueue")
+        let disabledResponse = await dispatcher.dispatchHTTP(request("bot.conversation.enqueue", disabled), mutationContext: context)
+        XCTAssertEqual(disabledResponse.error?.code, -32081)
+        XCTAssertEqual(try repository.list(threadId: threadID), rows)
+        SettingsStore(db: fixture.db).update { $0.botsControlPlaneEnabled = true }
+        let unauthenticated = await dispatcher.dispatchHTTP(enqueue, mutationContext: nil)
+        XCTAssertNotNil(unauthenticated.error)
+        let unix = await dispatcher.dispatchUnixSocket(enqueue)
+        XCTAssertNotNil(unix.error)
+        let revoke = await dispatcher.dispatchHTTP(request("bot.context.revoke", [
+            "client_request_id": .string("enqueue-revoke"), "bot_id": .string(botID), "context_key": .string("general:v1"),
+            "context_version": .number(1), "policy_revision": .number(1),
+        ]), mutationContext: context)
+        XCTAssertEqual(revoke.result?.objectValue?["status"]?.stringValue, "completed")
+        var revoked = params; revoked["client_request_id"] = .string("revoked-enqueue")
+        let revokedResponse = await dispatcher.dispatchHTTP(request("bot.conversation.enqueue", revoked), mutationContext: context)
+        XCTAssertTrue(revokedResponse.error != nil || revokedResponse.result?.objectValue?["status"]?.stringValue == "failed")
+        XCTAssertEqual(try repository.list(threadId: threadID).count, 1)
+        XCTAssertEqual(sendCallbacks, 0)
+    }
+
     func test_contextualCreationRevalidatesPolicyAndSeparatesWorkspacePairs() async throws {
         let fixture = try Fixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
@@ -379,8 +486,8 @@ private struct Fixture {
     let receipts: CommandReceiptRepository
     let db: SQLiteDB
 
-    init() throws {
-        directory = FileManager.default.temporaryDirectory.appendingPathComponent("bot-context-dispatch-\(UUID().uuidString)", isDirectory: true)
+    init(root: URL? = nil) throws {
+        directory = root ?? FileManager.default.temporaryDirectory.appendingPathComponent("bot-context-dispatch-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         dbPath = directory.appendingPathComponent("authority.sqlite").path
         let db = try SQLiteDB(path: dbPath)
@@ -430,7 +537,11 @@ private final class BotContextRouter: FakeRouter, CommandReceiptStateRouting {
                failed["status"] as? String == "failed" {
                 return try JSONValue.from(any: failed)
             }
-            throw JSONRPCError(code: error.code, message: error.message)
+            let rejection = JSONRPCError(code: error.code, message: error.message)
+            if method == "bot.conversation.enqueue" {
+                throw DefiniteMutationRejection(rejection)
+            }
+            throw rejection
         }
     }
 

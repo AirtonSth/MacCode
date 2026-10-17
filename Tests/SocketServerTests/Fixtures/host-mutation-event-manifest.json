@@ -186,6 +186,7 @@
     {"method": "bot.stop", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.run.stop_requested"], "readbackMethods": ["bot.receipt.status"]},
     {"method": "bot.force_stop", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.run.stop_requested"], "readbackMethods": ["bot.receipt.status"]},
     {"method": "bot.conversation.create", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.conversation.updated"], "readbackMethods": ["bot.conversation.list"]},
+    {"method": "bot.conversation.enqueue", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.queue.updated"], "readbackMethods": ["bot.receipt.status"]},
     {"method": "bot.conversation.select", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.conversation.selected"], "readbackMethods": ["bot.conversation.list"]},
     {"method": "bot.conversation.clear_all", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.conversation.updated"], "readbackMethods": ["bot.conversation.list"]},
     {"method": "bot.routine.create", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.routine.updated"], "readbackMethods": ["bot.routine.list"]},

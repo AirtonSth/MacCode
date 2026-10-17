@@ -1262,7 +1262,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         // 175 + bot.notice.act and bot.notice.read (Titio notice cards, hub spec §7)
         // + bot.notice.clear (clear a Titio notification, voice contract §3),
         // + explicit context grant/revoke and existing activity viewed/acknowledge.
-        XCTAssertEqual(canonical.count, 183)
+        XCTAssertEqual(canonical.count, 184)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }

@@ -3965,39 +3965,65 @@ public final class AgentQueuedMessageRepository {
         }
     }
 
+    internal func enqueueWithinTransaction(
+        threadId: AgentThreadID,
+        text: String,
+        attachments: [AgentAttachment],
+        interactionMode: AgentInteractionMode
+    ) throws -> AgentQueuedMessage {
+        let position = try nextPosition(threadId: threadId)
+        let queued = AgentQueuedMessage(
+            threadId: threadId,
+            text: text,
+            attachments: attachments,
+            interactionMode: interactionMode,
+            position: position
+        )
+        try upsertWithinTransaction(queued, routingConfiguration: nil, routingSnapshot: nil)
+        return queued
+    }
+
     public func upsert(
         _ message: AgentQueuedMessage,
         routingConfiguration: AgentRoutingConfiguration? = nil,
         routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) throws {
         try db.performSync { database in try database.transaction {
-                if try rowExists(message.id), try threadHasActiveLease(message.threadId) {
-                    throw AgentQueuedMessageMutationError.queueIsLeased
-                }
-                let st = try database.prepare("""
-                    INSERT INTO agent_queued_messages(id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET text=excluded.text, attachments_json=excluded.attachments_json, interaction_mode=excluded.interaction_mode, position=excluded.position, updated_at=excluded.updated_at;
-                """)
-                try st.bind(1, message.id.value.uuidString)
-                try st.bind(2, message.threadId.value.uuidString)
-                try st.bind(3, message.text)
-                try st.bind(4, attachmentsJSON(message.attachments))
-                try st.bind(5, message.interactionMode.rawValue)
-                try st.bind(6, Int64(message.position))
-                try st.bind(7, iso.string(from: message.createdAt))
-                try st.bind(8, iso.string(from: message.updatedAt))
-                _ = try st.step()
-                if let routingSnapshot = routingSnapshot ?? message.routingSnapshot {
-                    try persistRoutingSnapshot(routingSnapshot, queuedMessageId: message.id, database: database)
-                } else if let routingConfiguration {
-                    try persistRoutingSnapshot(
-                        AgentQueuedMessageRoutingSnapshot(configuration: routingConfiguration),
-                        queuedMessageId: message.id,
-                        database: database
-                    )
-                }
+            try upsertWithinTransaction(message, routingConfiguration: routingConfiguration, routingSnapshot: routingSnapshot)
         } }
+    }
+
+    private func upsertWithinTransaction(
+        _ message: AgentQueuedMessage,
+        routingConfiguration: AgentRoutingConfiguration?,
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot?
+    ) throws {
+        if try rowExists(message.id), try threadHasActiveLease(message.threadId) {
+            throw AgentQueuedMessageMutationError.queueIsLeased
+        }
+        let st = try db.prepare("""
+            INSERT INTO agent_queued_messages(id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET text=excluded.text, attachments_json=excluded.attachments_json, interaction_mode=excluded.interaction_mode, position=excluded.position, updated_at=excluded.updated_at;
+        """)
+        try st.bind(1, message.id.value.uuidString)
+        try st.bind(2, message.threadId.value.uuidString)
+        try st.bind(3, message.text)
+        try st.bind(4, attachmentsJSON(message.attachments))
+        try st.bind(5, message.interactionMode.rawValue)
+        try st.bind(6, Int64(message.position))
+        try st.bind(7, iso.string(from: message.createdAt))
+        try st.bind(8, iso.string(from: message.updatedAt))
+        _ = try st.step()
+        if let routingSnapshot = routingSnapshot ?? message.routingSnapshot {
+            try persistRoutingSnapshot(routingSnapshot, queuedMessageId: message.id, database: db)
+        } else if let routingConfiguration {
+            try persistRoutingSnapshot(
+                AgentQueuedMessageRoutingSnapshot(configuration: routingConfiguration),
+                queuedMessageId: message.id,
+                database: db
+            )
+        }
     }
 
     public func routingConfiguration(id: AgentQueuedMessageID) throws -> AgentRoutingConfiguration? {

@@ -142,6 +142,7 @@ public enum HostMutationContract {
     bot.stop
     bot.force_stop
     bot.conversation.create
+    bot.conversation.enqueue
     bot.conversation.select
     bot.conversation.clear_all
     bot.routine.create

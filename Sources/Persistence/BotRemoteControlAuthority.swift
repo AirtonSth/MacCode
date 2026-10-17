@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import CryptoKit
 import CoreModel
 import os
 
@@ -256,6 +257,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             throw Error.reserved
         }
         let contextMethods: Set<String> = ["context.list", "context.grant", "context.revoke"]
+        if name == "conversation.enqueue" {
+            let fields: Set<String> = ["client_request_id", "host_id", "bot_id", "context_key", "context_version", "policy_revision", "conversation_id", "text"]
+            guard Set(params.keys) == fields else { throw Error.invalidParams }
+        }
         if contextMethods.contains(name) {
             guard Set(params.keys).isSubset(of: ["host_id", "bot_id", "context_key", "context_version", "policy_revision", "actions", "client_request_id"]) else { throw Error.invalidParams }
         }
@@ -273,7 +278,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             guard try store.authorizes(hostID: hostID, botID: botID, context: context, action: action, policyRevision: revision) else {
                 throw Error(code: -32084, message: "Bot context authority is not active for this request.")
             }
-            if !["conversation.create", "conversation.list", "conversation.select"].contains(name) { throw Error(code: -32602, message: "Context resource unavailable.") }
+            if !["conversation.create", "conversation.list", "conversation.select", "conversation.enqueue"].contains(name) { throw Error(code: -32602, message: "Context resource unavailable.") }
             if name == "conversation.create" {
                 guard Set(params.keys).isSubset(of: ["client_request_id", "bot_id", "title", "host_id", "context_key", "context_version", "policy_revision"]) else { throw Error.invalidParams }
             }
@@ -934,7 +939,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func contextAction(for method: String) -> BotContextAction? {
         switch method {
         case "get", "list", "settings.get", "queue.list", "conversation.list", "attachment.list", "routine.list", "files.list", "browser.state", "guest.state": return .read
-        case "send", "queue.force_now", "conversation.create", "conversation.select", "conversation.clear_all", "conversation.fork": return .send
+        case "send", "queue.force_now", "conversation.create", "conversation.select", "conversation.clear_all", "conversation.fork", "conversation.enqueue": return .send
         case "attachment.stage", "attachment.import", "attachment.remove", "files.mutate", "files.open_tab", "files.split", "files.location.set", "browser.action", "link.open", "guest.input", "guest.start", "guest.stop", "guest.rebuild", "guest.revoke", "guest.control": return .files
         case "soul.set": return .memory
         case "settings.set", "save", "set_pinned", "set_hidden", "desktop.set", "avatar.set", "handle.set", "verbosity.set", "caveman.set", "routing.set": return .configure
@@ -1138,6 +1143,34 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             }
             return existing
         }
+        if name == "conversation.enqueue" {
+            let oldReceipts = receipts
+            let oldClaims = receiptClaims
+            let oldPersistedSidecarJSON = persistedSidecarJSON
+            do {
+                return try db.transaction {
+                    receipts = oldReceipts
+                    receiptClaims = oldClaims
+                    persistedSidecarJSON = oldPersistedSidecarJSON
+                    guard let context = parseContext(params),
+                          let (hostID, botID) = contextIdentity(params),
+                          let revision = integer(params["policy_revision"]), revision > 0,
+                          try store.authorizes(hostID: hostID, botID: botID, context: context, action: .send, policyRevision: revision) else {
+                        throw Error(code: -32084, message: "Bot context authority is not active for this request.")
+                    }
+                    let result = try perform(name: name, params: params, requestID: requestID, now: now)
+                    receipts[requestID] = result
+                    receiptClaims[requestID] = claim
+                    guard persistSidecar(withinTransaction: true).isEmpty else { throw Error.invalidParams }
+                    return result
+                }
+            } catch {
+                receipts = oldReceipts
+                receiptClaims = oldClaims
+                persistedSidecarJSON = oldPersistedSidecarJSON
+                throw error
+            }
+        }
         let result: [String: Any]
         do {
             result = try perform(name: name, params: params, requestID: requestID, now: now)
@@ -1170,6 +1203,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             withJSONObject: business,
             options: [.sortedKeys, .withoutEscapingSlashes]
         )
+        if name == "conversation.enqueue" {
+            return ["method": name, "params_sha256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()]
+        }
         guard let canonical = String(data: data, encoding: .utf8) else { throw Error.invalidParams }
         return ["method": name, "params": canonical]
     }
@@ -1226,6 +1262,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try stop(params: params, requestID: requestID, force: name == "force_stop", now: now)
         case "conversation.create":
             return try conversationCreate(params: params, requestID: requestID)
+        case "conversation.enqueue":
+            return try conversationEnqueue(params: params, requestID: requestID)
         case "conversation.select":
             return try conversationSelect(params: params, requestID: requestID)
         case "conversation.clear_all":
@@ -1996,6 +2034,48 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
             "conversation_id": conversation.id.value.uuidString.lowercased(),
             "title": conversation.title,
+        ])
+    }
+
+
+    private func conversationEnqueue(params: [String: Any], requestID: String) throws -> [String: Any] {
+        try requireControlPlane()
+        let bot = try requireBot(params)
+        guard let text = params["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let context = parseContext(params), let (hostID, botID) = contextIdentity(params),
+              let revision = integer(params["policy_revision"]), revision > 0,
+              let conversationRaw = params["conversation_id"] as? String,
+              let conversationUUID = UUID(uuidString: conversationRaw),
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
+              bot.id == botID, conversation.botID == botID, conversation.groupID == nil,
+              let threadID = conversation.linkedAgentThreadID,
+              let pin = try store.conversationContextPin(conversationID: conversation.id),
+              pin.hostID == hostID, pin.botID == botID, pin.context == context,
+              Int64(pin.contextVersion) == integer(params["context_version"]), pin.policyRevision == revision,
+              let thread = try AgentThreadRepository(db: db).get(id: threadID),
+              thread.actor == .bot(botID), thread.actorLockedAt != nil,
+              thread.executionTarget == .vm, thread.provider == .distill,
+              (context == .general ? thread.workspaceId == nil : { if case .workspace(let workspace) = context { return thread.workspaceId == workspace }; return false }()),
+              thread.parentThreadId == nil,
+              thread.isEphemeral == false,
+              try store.authorizes(hostID: hostID, botID: botID, context: context, action: .send, policyRevision: revision) else {
+            throw Error(code: -32084, message: "Bot context authority is not active for this request.")
+        }
+        let queued = try AgentQueuedMessageRepository(db: db).enqueueWithinTransaction(
+            threadId: threadID, text: text, attachments: [], interactionMode: .default
+        )
+        try HostDatabaseRestore.pauseQueue(kind: .agent, id: queued.id.value.uuidString, db: db)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "enqueued": true,
+            "queue_id": queued.id.value.uuidString.lowercased(),
+            "conversation_id": conversation.id.value.uuidString.lowercased(),
+            "thread_id": threadID.value.uuidString.lowercased(),
+            "host_id": hostID,
+            "context_key": context.storageKey,
+            "context_version": pin.contextVersion,
+            "policy_revision": pin.policyRevision,
+            "execution_available": false,
+            "requires_user_send": true,
         ])
     }
 
@@ -4512,7 +4592,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// instead of one per key. Returns the keys that were not written; those
     /// stay out of `persistedSidecarJSON`, so the next persist writes them again.
     @discardableResult
-    private func persistSidecar() -> [String] {
+    private func persistSidecar(withinTransaction: Bool = false) -> [String] {
         var failed: [String] = []
         var changed: [(key: String, json: Data)] = []
         func save(_ key: String, _ value: Any) {
@@ -4548,17 +4628,21 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard !changed.isEmpty else { return failed }
         var rejected: [String] = []
         do {
-            try db.transaction {
-                // The transaction helper runs this block again after a lock retry.
+            let writeRows = {
                 rejected = []
                 for row in changed {
                     do {
-                        try writeSidecarRow(row.key, String(decoding: row.json, as: UTF8.self), database: db)
+                        try self.writeSidecarRow(row.key, String(decoding: row.json, as: UTF8.self), database: self.db)
                     } catch {
-                        // Only this statement is undone; the other rows still commit.
                         rejected.append(row.key)
                     }
                 }
+            }
+            if withinTransaction {
+                writeRows()
+                guard rejected.isEmpty else { return failed + rejected }
+            } else {
+                try db.transaction(writeRows)
             }
         } catch {
             // What reached the database is unknown: write these rows again next time.
