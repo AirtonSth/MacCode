@@ -349,3 +349,18 @@ Stage-by-stage status against the verification plan. "Verified" means exercised 
 | S-006 teams/delegation | Internal admission and cleanup tests. | Contextual peer entry blocked; real child execution and durable delegation. |
 | S-007 queue/replay | Offline durable intent, public enqueue with review hold, drain refusal after revocation, receipts. | Routines end to end, host switches, full matrix. |
 | S-008 migration/compat | Old/new client matrix on synthetic fixtures, restore CLI, rollback guard, pre-revocation backup cannot revive grants. | OAuth refresh/resume, raw older host unsupported, broad adoption, iPhone and first-frame navigation measurement. |
+
+## Stage status update (evidence recorded after the summary above)
+
+Added since the earlier summary; same rule: verified means exercised by shipped-code tests recorded in the linked documents, not completion. Details and limits are in `CONTEXT-NATIVE-EXPORT-DESIGN.md`, `CONTEXT-RUNTIME-COST.md`.
+
+| Stage | Newly verified | Still open |
+|---|---|---|
+| S-001 | Concurrency of 1/2/4/8 contextual desktops measured on Docker (cold plus five warm each) and a default ceiling of 4 enforced in `BotContextGuestResources.prepare`. | Real-provider probes need `RC_CONTEXT_OPENROUTER_PARENT_TEST_KEY`, `RC_CONTEXT_OPENROUTER_CHILD_TEST_KEY`, `RC_CONTEXT_OPENROUTER_TEST_MODEL` and a dedicated OAuth account; usability-trial participants. |
+| S-002 | 17-row principal x context x action matrix through the real authority, mutation-validated (removing both export checks fails it); 13 existing authority suites re-run (147 tests). | Peer, routine execution and replay as live runs; durable per-export audit receipt. |
+| S-003 | Continue in destination on macOS and iOS: new conversation pinned to the reviewed destination, approved summary held unsent; iOS UI journey drives it. | Concurrent-window races end to end; activity/search/link entry points. |
+| S-004 | iOS export journey with the new action at the largest text size and on iPad; context picker at largest text; busy and offline export states; macOS sheet offscreen render. | Real macOS window drive, VoiceOver, hardware keyboard, human trial. |
+| S-005 | Contextual runtime admission refuses a fifth simultaneous desktop and frees the slot on finish. | Restricted mode stays unavailable; real-provider isolation, browser and network policy. |
+| S-006 | Unchanged this round. | Contextual peer entry, durable delegation, real child execution. |
+| S-007 | Unchanged this round beyond the authority matrix. | Routines end to end, host switches, full matrix. |
+| S-008 | Packaged signed CLI: backup/restore/interrupted rollback/tamper/lock (5 tests); pre-revocation and legacy schema-93 fixtures restored through the CLI and verified; held-queue claim refused after restore. Navigation cost: macOS model path (cold plus ten warm) and iPhone in-app receipt I-016 (three runs, cold plus five warm, about 100 ms warm median on a simulator). | Old/new iOS-client matrix server and two router/restart fixtures not re-run; OAuth refresh/resume; device and first-frame measurements; broad adoption not validated. |
