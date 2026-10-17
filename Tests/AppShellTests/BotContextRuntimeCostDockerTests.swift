@@ -185,4 +185,122 @@ final class BotContextRuntimeCostDockerTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: reportURL.path)
         print("CONTEXT_RUNTIME_COST_REPORT: " + reportURL.lastPathComponent)
     }
+    private struct ConcurrencySample: Codable {
+        let concurrent: Int
+        let phase: String
+        let index: Int
+        let wallMilliseconds: Double
+        let slowestMilliseconds: Double
+        let failures: Int
+        let totalMemoryMiB: Double
+        let maxCPUPercent: Double
+    }
+
+    private func memoryMiB(_ text: String) throws -> Double {
+        let used = try XCTUnwrap(text.split(separator: "/").first).trimmingCharacters(in: .whitespaces)
+        let units: [(String, Double)] = [("GiB", 1024), ("MiB", 1), ("KiB", 1.0 / 1024)]
+        for (unit, factor) in units where used.hasSuffix(unit) {
+            return try XCTUnwrap(Double(used.dropLast(unit.count))) * factor
+        }
+        throw CocoaError(.fileReadCorruptFile)
+    }
+
+    func testMeasureSimultaneousContextualDesktopsAtOneTwoFourEight() throws {
+        guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1",
+              ProcessInfo.processInfo.environment["RC_CONTEXT_RESOURCE_PROBE"] == "1" else {
+            throw XCTSkip("set RC_LIVE_DOCKER=1 RC_CONTEXT_RESOURCE_PROBE=1 for owned real-runtime concurrency measurement")
+        }
+        let docker = BotComputerDockerCLI()
+        _ = try docker.info()
+        guard try docker.imageExists(tag: BotComputerGuestSpec.imageTag) else {
+            throw XCTSkip("cached guest image required; resource measurement never builds or pulls it")
+        }
+        let root = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"]), isDirectory: true)
+            .appendingPathComponent("RuntimeConcurrency-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        var owned: [Runtime] = []
+        defer {
+            var clean = true
+            for runtime in owned {
+                do { try removeOwned(runtime, docker: docker) }
+                catch { clean = false; XCTFail("owned runtime cleanup failed; fixture retained: \(root.lastPathComponent)") }
+            }
+            if clean { XCTAssertNoThrow(try FileManager.default.removeItem(at: root)) }
+        }
+        let db = try SQLiteDB(path: root.appendingPathComponent("owned.sqlite").path)
+        try Schema.migrate(db)
+        let store = BotStore(db: db)
+        var samples: [ConcurrencySample] = []
+        for level in [1, 2, 4, 8] {
+            var group: [Runtime] = []
+            for n in 0..<level {
+                let bot = try store.create(name: "Conc \(level)-\(n)", title: "Conc", description: "", soul: "", provider: .distill, model: "desktop-only")
+                let binding = try store.grantContext(hostID: "owned-concurrency-probe", botID: bot.id, context: .general,
+                    actions: [.read, .send], expectedRevision: 0)
+                let storage = try BotContextRuntimeIdentity(binding: binding).storageBotID
+                let support = root.appendingPathComponent("l\(level)-\(n)", isDirectory: true)
+                try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                let runtime = Runtime(variant: "contextual", support: support, storageID: storage, binding: binding,
+                    service: BotComputerGuestService(appSupport: support, docker: docker, recipeContext: nil))
+                guard try !docker.containerExists(name: runtime.name), try !docker.networkExists(name: runtime.network) else {
+                    throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+                }
+                owned.append(runtime)
+                group.append(runtime)
+            }
+            for index in 0...5 {
+                if index > 0 {
+                    for runtime in group { try runtime.service.stopForContextRecovery(identity: BotContextRuntimeIdentity(binding: try XCTUnwrap(runtime.binding))) }
+                }
+                let lock = NSLock()
+                var durations = [Double](repeating: 0, count: level)
+                var failures = 0
+                let wallStart = DispatchTime.now().uptimeNanoseconds
+                DispatchQueue.concurrentPerform(iterations: level) { slot in
+                    let runtime = group[slot]
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    var failed = false
+                    do { _ = try runtime.service.provision(contextBinding: try XCTUnwrap(runtime.binding), workspace: nil, registeredWorkspaces: []) }
+                    catch { failed = true }
+                    let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                    lock.withLock { durations[slot] = elapsed; if failed { failures += 1 } }
+                }
+                let wall = Double(DispatchTime.now().uptimeNanoseconds - wallStart) / 1_000_000
+                var memory = 0.0
+                var cpu = 0.0
+                for runtime in group where failures == 0 {
+                    let raw = try docker.run(["stats", "--no-stream", "--format", "{{json .}}", runtime.name])
+                    let stats = try XCTUnwrap(JSONSerialization.jsonObject(with: raw) as? [String: Any])
+                    memory += try memoryMiB(try XCTUnwrap(stats["MemUsage"] as? String))
+                    cpu = max(cpu, try XCTUnwrap(Double(try XCTUnwrap(stats["CPUPerc"] as? String).replacingOccurrences(of: "%", with: ""))))
+                }
+                samples.append(ConcurrencySample(concurrent: level, phase: index == 0 ? "cold_cached_image" : "warm_resume", index: index,
+                    wallMilliseconds: wall, slowestMilliseconds: durations.max() ?? 0, failures: failures, totalMemoryMiB: memory, maxCPUPercent: cpu))
+                XCTAssertEqual(failures, 0, "level \(level) sample \(index) must provision every desktop")
+            }
+            for runtime in group {
+                try runtime.service.stopForContextRecovery(identity: BotContextRuntimeIdentity(binding: try XCTUnwrap(runtime.binding)))
+            }
+        }
+        let encoded = try JSONEncoder().encode(samples)
+        let rawInfo = try docker.run(["info", "--format", "{{json .}}"])
+        let info = try XCTUnwrap(JSONSerialization.jsonObject(with: rawInfo) as? [String: Any])
+        let report: [String: Any] = [
+            "schema_version": 1,
+            "workload": "post-readiness contextual desktop provisioning; no provider execution",
+            "os": ProcessInfo.processInfo.operatingSystemVersionString,
+            "physical_memory_bytes": ProcessInfo.processInfo.physicalMemory,
+            "processor_count": ProcessInfo.processInfo.processorCount,
+            "docker_cpus": try XCTUnwrap(info["NCPU"] as? Int),
+            "docker_memory_bytes": try XCTUnwrap(info["MemTotal"] as? Int64),
+            "docker_version": try XCTUnwrap(info["ServerVersion"] as? String),
+            "image_id": try docker.imageID(tag: BotComputerGuestSpec.imageTag),
+            "samples": try JSONSerialization.jsonObject(with: encoded)
+        ]
+        let json = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+        let reportURL = root.deletingLastPathComponent().appendingPathComponent("context-runtime-concurrency-\(UUID().uuidString).json")
+        try json.write(to: reportURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: reportURL.path)
+        print("CONTEXT_RUNTIME_CONCURRENCY_REPORT: " + reportURL.lastPathComponent)
+    }
 }

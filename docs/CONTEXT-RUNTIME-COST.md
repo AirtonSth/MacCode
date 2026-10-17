@@ -53,3 +53,20 @@ Independent source review `01a1495a-9929-7e30-811f-97a3da3616a8` found no materi
 The test prechecks generated container/network names, verifies exact ownership label and home mount before cleanup, removes the inspected immutable container ID and exact task network, and asserts both absent. Final task fixture-directory absence was separately verified; only the requested measurement JSON artifact remains. Existing user resources, Docker engine settings and credentials were preserved.
 
 Exactly two desktop environments were observed; this does not establish a safe production concurrency cap. U-003 remains open for authenticated workload, sustained/peak host and provider consumption, lower-memory supported hardware, resource-limit failure behavior and concurrency calibration. Public contextual execution stays closed. Dedicated `RC_CONTEXT_OPENROUTER_PARENT_TEST_KEY`, `RC_CONTEXT_OPENROUTER_CHILD_TEST_KEY` and `RC_CONTEXT_OPENROUTER_TEST_MODEL` were checked and absent; no fallback to personal accounts was used. OAuth refresh, authenticated child execution/session load, broader lifecycle and human usability acceptance remain pending. iOS receives mirrored documentation and raw evidence only, with no source or design change.
+
+## Simultaneous desktop measurement (1, 2, 4 and 8)
+
+Test `BotContextRuntimeCostDockerTests.testMeasureSimultaneousContextualDesktopsAtOneTwoFourEight` provisions N owned contextual desktops at the same time (N = 1, 2, 4, 8) through the real `BotComputerGuestService.provision(contextBinding:)`. For each N it records one first-creation sample (cached image) and five warm resumes of the stopped containers, plus per-container CPU and memory from `docker stats`. It never runs a provider. Raw artifact: [evidence/context-runtime-concurrency.json](evidence/context-runtime-concurrency.json), SHA-256 `fd294ca7cfd3ee20af892e0131a53607b0e9829d72dcbead75cfcf9a789f75f1`.
+
+Environment: Apple M5 Max, 18 processors, 128 GiB, macOS 27.0.1; Docker 29.4.0 with 18 CPUs and 16817168384 bytes; image `sha256:b3c068f7d076bbd8d87cac8a5e15955eda4730c5483c80b96f4a7987045299d2`. Single run, 311 s, 0 failures, all owned containers and networks removed (pre-existing `remotecode-bot-*` containers untouched).
+
+| Concurrent | First creation wall | Warm wall median (range, 5 samples) | Warm total memory median | Max container CPU (warm) |
+|---:|---:|---:|---:|---:|
+| 1 | 2002 ms | 2019 ms (1800–3000) | 227 MiB | 319% |
+| 2 | 2740 ms | 2767 ms (2376–3408) | 455 MiB | 277% |
+| 4 | 3256 ms | 2834 ms (2632–4153) | 911 MiB | 149% |
+| 8 | 8893 ms | 3970 ms (3542–6695) | 1807 MiB | 131% |
+
+Reading: warm memory is linear at about 228 MiB per desktop. Warm readiness grows from about 2.0 s to about 4.0 s at 8, with a 6.7 s worst sample, and first creation at 8 is 4.4 times the single case. The earlier single-desktop median was 1.77 s, so the 2.0 s here includes the same fixed provisioning cost.
+
+Concurrency limit derived from these numbers: **4 simultaneous contextual desktops** on a machine like this one. At 4 the warm worst case stays under about 4.2 s and memory under about 0.9 GiB, while 8 raises first-creation latency to 8.9 s and the warm worst case to 6.7 s, with no failures observed. This is a recommended ceiling for rollout, **not enforced by code**; the only existing cap is the guest MCP gateway limit of 8 in-flight tool calls per run. Lower-memory hardware, authenticated provider workloads, sustained load, resource-exhaustion behavior and the first-creation tail beyond 8 desktops are not measured, so no production cap is claimed. The SQLite main-thread-wait warnings in the log come from the test's own schema migration on the test thread.
