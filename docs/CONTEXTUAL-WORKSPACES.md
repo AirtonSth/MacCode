@@ -308,3 +308,8 @@ Native CLI backup, inspect and restore preserve the paired SQLite database and `
 ### Explicit cleanup receipt repair — bounded proof
 
 The host maintenance command `--repair-context-receipts` now reconciles canonical cleanup evidence without replaying unknown commands, changing revoked authority or sending queued work. At exact Sources/Tests tree `fc9c0e6c220bff211468fc81d30b76ccc2347719`, native packaging passed and 36 selected tests passed with zero failures/skips in 22.909 seconds. Actual CLI failure/restart/retry, stopped-container ownership refusal, preserved queue, interrupted imported state and same-thread history/current-run cases are documented in [CONTEXT-RECEIPT-REPAIR.md](CONTEXT-RECEIPT-REPAIR.md). iOS changes are documentation only; UI/UX and public gates remain unchanged. This does not complete S-007/S-008, resolve arbitrary unknown outcomes, or establish authenticated provider execution.
+
+
+### Desktop runtime resource samples — bounded U-003 evidence
+
+The real legacy/contextual provisioning paths now have a reproducible cached-image first-creation and five-paired-resume probe. At tree `05647df5c029863bc0b0a4f06c37fcea97b59071`, it passed in 34.109 seconds with zero failures/skips. On the measured M5 Max host, warm desktop-readiness medians were 799.897 ms legacy and 1769.864 ms contextual. This is observed overhead, not performance parity or a production concurrency calibration. Complete raw CPU/memory/PID/disk values and exact method limits are in [CONTEXT-RUNTIME-COST.md](CONTEXT-RUNTIME-COST.md). U-003, authenticated workload and rollout remain open; UI/public gates are unchanged.
