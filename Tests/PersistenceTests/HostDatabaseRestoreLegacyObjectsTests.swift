@@ -156,4 +156,32 @@ final class HostDatabaseRestoreLegacyObjectsTests: XCTestCase {
         let recovery = try HostDatabaseRestore.restore(backupURL: pair.backup, currentURL: pair.current, quarantineOrphans: true)
         XCTAssertFalse(FileManager.default.fileExists(atPath: HostDatabaseRestore.quarantineURL(forRecovery: recovery).path))
     }
+
+    /// A cleanup failure after the commit must not delete the only copy of the removed rows.
+    func testQuarantineSurvivesStagingCleanupFailureAfterCommit() throws {
+        let root = try makeRoot()
+        var stageToUnlock: URL?
+        defer {
+            if var url = stageToUnlock {
+                var values = URLResourceValues(); values.isUserImmutable = false
+                try? url.setResourceValues(values)
+            }
+            XCTAssertNoThrow(try FileManager.default.removeItem(at: root))
+        }
+        let pair = try makePair(root, withOrphans: true)
+        XCTAssertThrowsError(try HostDatabaseRestore.restore(backupURL: pair.backup, currentURL: pair.current, quarantineOrphans: true,
+            beforeCommit: { stage, _ in stageToUnlock = stage },
+            didCommit: {
+                guard var url = stageToUnlock else { return }
+                var values = URLResourceValues(); values.isUserImmutable = true
+                try? url.setResourceValues(values)
+            })) {
+            XCTAssertTrue(String(describing: $0).contains("staging cleanup failed"), "\($0)")
+        }
+        XCTAssertEqual(try count(SQLiteDB(path: pair.current.path), "agent_messages"), 1, "the restore did commit")
+        let quarantines = try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasPrefix(".restore-quarantine-") }
+        XCTAssertEqual(quarantines.count, 1, "the saved orphans must survive: \(quarantines)")
+        let saved = try SQLiteDB(path: root.appendingPathComponent(quarantines[0]).path, readonly: true)
+        XCTAssertEqual(try count(saved, "agent_messages"), 1)
+    }
 }

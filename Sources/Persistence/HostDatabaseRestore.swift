@@ -113,10 +113,12 @@ public enum HostDatabaseRestore {
         let stageURL = directory.appendingPathComponent(".restore-stage-\(token).sqlite")
         let recoveryURL = directory.appendingPathComponent(".restore-recovery-\(token).sqlite")
         var recoveryCreated = false
+        var committed = false
         do {
             try restore(backupURL: backupURL, currentURL: currentURL, stageURL: stageURL,
                         recoveryURL: recoveryURL, recoveryCreated: &recoveryCreated, reviewToken: reviewToken,
-                        quarantineOrphans: quarantineOrphans, beforeCommit: beforeCommit, didCommit: didCommit)
+                        quarantineOrphans: quarantineOrphans, beforeCommit: beforeCommit,
+                        didCommit: { committed = true; didCommit?() })
             do {
                 try removeStage(stageURL)
             } catch {
@@ -125,7 +127,8 @@ public enum HostDatabaseRestore {
             return recoveryURL
         } catch {
             try? removeStage(stageURL)
-            try? removeStage(quarantineURL(forRecovery: recoveryURL))
+            // After the commit the quarantine is the only copy of the removed rows: keep it.
+            if !committed { try? removeStage(quarantineURL(forRecovery: recoveryURL)) }
             if recoveryCreated {
                 throw SQLiteError.execute("\(error); pre-restore recovery database: \(recoveryURL.path)")
             }

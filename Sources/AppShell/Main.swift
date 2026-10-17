@@ -39,6 +39,10 @@ struct RemoteCodeMain {
         let quarantineFlag = "--quarantine-orphans"
         let quarantinesOrphans = restoresDatabase && CommandLine.arguments.count > 3 && CommandLine.arguments.last == quarantineFlag
         let databaseArguments = quarantinesOrphans ? Array(CommandLine.arguments.dropLast()) : CommandLine.arguments
+        if CommandLine.arguments.contains(quarantineFlag) && !quarantinesOrphans {
+            fputs("--quarantine-orphans is only valid as the last argument of --restore-database-backup.\n", stderr)
+            exit(EXIT_FAILURE)
+        }
         let repairsContextReceipts = CommandLine.arguments.contains("--repair-context-receipts")
         if repairsContextReceipts {
             guard CommandLine.arguments.count == 2, CommandLine.arguments[1] == "--repair-context-receipts",

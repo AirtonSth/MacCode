@@ -473,3 +473,15 @@ The ledger lives in `CONTEXT-GROUPING-DESIGN.md` and `CONTEXT-LEGACY-RESTORE-DES
 ### Open items, in one place
 
 Blocked by missing credentials or accounts: real-provider isolation, delegation, peer, OAuth refresh/resume and restricted-mode probes. Blocked by people or hardware: VoiceOver, hardware keyboard, reduced motion, usability trial, device and first-frame timing. Blocked by tooling: a macOS window row selection through the Accessibility drive. Product decisions: receipt query UI and retention. Contextual provider execution and restricted mode remain unavailable by design until the real probes pass.
+
+### Independent review of the restore delta (2026-10-17)
+
+A read-only review of the delta since `3e86770a9` found two defects, both fixed with tests. (1) A staging-cleanup failure after the restore had committed ran the failure path that deletes the quarantine database, which at that point is the only copy of the removed orphan rows; the quarantine is now kept once the commit happened (`testQuarantineSurvivesStagingCleanupFailureAfterCommit`, which makes the staging file immutable after commit and checks the saved row survives). (2) `--quarantine-orphans` outside a valid trailing restore opt-in could reach other operations such as `--scheduled-task-agent-unregister` or normal startup; it is now rejected before any dispatch, and the packaged-binary test covers the bare flag and the unregister combination. Re-run with the rebuilt packaged binary and Docker live: 23 tests, 0 failures, 2 skipped (the fixture-export tests that need their own environment), 17 `remotecode-bot-*` containers before and after. The reviewer could not run commands, so its findings rest on static reading; the fixes are proven by the new tests.
+
+### macOS window drive, second attempt (2026-10-17)
+
+A different path was tried: AppleScript through System Events against the isolated debug app. It reached only the direct children of the window (`entire contents` returned 0 elements, so the thread rows are not addressable), and the system refused to make the app frontmost (`frontmost` stayed false). A coordinate click without exact focus could land on another window, so no click was sent. Row selection and Continue in Destination in a real window therefore stay unproven; `testRealSheetRendersSelectionAndFrozenReviewFromRealModel`, `testContinueInDestinationCreatesNewConversationAndHoldsApprovedSummaryUnsent` and `testContinueInDestinationRefusedWhenDestinationSendIsRevoked` cover the shipped selection and continue state offscreen, and the iOS simulator journey covers the same flow in a real UI. The owned debug app was stopped; the personal production app was untouched.
+
+### 21-skill ledger, final status
+
+No view layout changed in these checkpoints, so none of the 21 rows changed. The ledger in `CONTEXT-GROUPING-DESIGN.md` still records all 21 skills as read with recomputed hashes and the checker at 46/46 installed; rows needing people or hardware remain marked unverified.

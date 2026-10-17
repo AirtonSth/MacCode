@@ -114,7 +114,9 @@ final class HostRestoreQuarantineCLITests: XCTestCase {
         for arguments in [["--inspect-database-backup", f.backup.path, "--quarantine-orphans"],
                           ["--create-database-backup", f.root.appendingPathComponent("new.sqlite").path, "--quarantine-orphans"],
                           ["--restore-database-backup", "--quarantine-orphans", f.backup.path],
-                          ["--restore-database-backup", f.backup.path, "--quarantine-orphans", "--quarantine-orphans"]] {
+                          ["--restore-database-backup", f.backup.path, "--quarantine-orphans", "--quarantine-orphans"],
+                          ["--quarantine-orphans"],
+                          ["--scheduled-task-agent-unregister", "--quarantine-orphans"]] {
             let result = try run(arguments, f)
             XCTAssertNotEqual(result.status, 0, "\(arguments)")
         }
