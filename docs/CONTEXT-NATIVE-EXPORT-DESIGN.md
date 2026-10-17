@@ -87,3 +87,13 @@ Findings from the accessibility-extra-extra-extra-large run:
 Results: 105 iOS unit tests with 0 failures; `testBotContextExportNativeJourney` passed on an iPhone 17 simulator at the largest accessibility text size and on an iPad Pro 13-inch simulator at default size. A red check with the old rebinder fails the preservation assertion as expected. macOS: 20 selected tests with 0 failures, including one that loads the canonical stored excerpts (IDs and bodies) into the embedded Agent App model without provider execution.
 
 Limits: the macOS native export sheet was not driven through the GUI (automation focus and menu limitations), so macOS rendering of the hydrated timeline is not proven; the iOS largest-text Legacy-to-General roster detour failure was a test selector defect (the Bot row sat below the viewport) and is fixed on the iOS side; keyboard, VoiceOver and human usability checks are still pending.
+
+## macOS sheet render and pre-revocation restore re-run
+
+`BotContextExportPresentationTests.testRealSheetRendersSelectionAndFrozenReviewFromRealModel` hosts the shipped `BotContextExportSheet` in an `NSHostingView` bound to the real `BotContextExportModel` created by `BotsViewModel.makeContextExportModel` over a real AppContext fixture, renders the selecting state, then selects one excerpt and a destination, runs the real preview and renders again. It asserts that both states paint content and that the images differ. Five tests in the class passed with 0 failures on macOS tree `8eb11de816ace5fa50febf82a9990ab7546f977b` plus this test. I inspected the PNGs: the selection state lists both stored excerpts with the "Destination" row; the review state shows Destination "Export target" and only the first selected excerpt, with Back and Confirm and Copy controls.
+
+A first run rendered "Source access is unavailable or has changed." because the test dropped its offscreen window, which made the model's `onDisappear` cancel it. The test now keeps its windows alive; no production code changed.
+
+Limits: this is an offscreen render, not a drive of the real app window. Control labels are not drawn by `cacheDisplay` (buttons appear as blank rounded shapes), so button text, the destination menu, keyboard focus, VoiceOver and the NSMenu entry point are still unverified. The earlier mac-use attempt could not open the menu item.
+
+The pre-revocation restore suite `HostDatabaseRestoreTests|BotContextRestoreCompatibilityTests` was re-run on `8eb11de816ace5fa50febf82a9990ab7546f977b`: 8 tests, 2 skipped (export/verify fixtures that need their own environment), 0 failures, including `testPreRevocationBackupCannotReplaceCurrentAuthorityOrReviveRuns` and `testMissingCurrentBindingNeverAdoptsBackupGrant`. No new restore code was needed.

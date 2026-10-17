@@ -1,8 +1,10 @@
 import AgentRuntime
+import AppKit
 import CoreModel
 import Foundation
 import Persistence
 import SocketServer
+import SwiftUI
 import XCTest
 @testable import AppShell
 @testable import Surfaces
@@ -81,6 +83,57 @@ final class BotContextExportPresentationTests: XCTestCase {
         XCTAssertEqual(embedded.selectedThreadId, f.sourceThread.id)
         XCTAssertEqual(embedded.messages.map(\.id), expected.map(\.id), "Opening a contextual conversation must hydrate its canonical stored excerpts without provider execution")
         XCTAssertEqual(embedded.messages.map(\.content), expected.map(\.content), "Hydrated history must include the stored excerpt bodies, not only message shells")
+    }
+
+    private var openWindows: [NSWindow] = []
+
+    override func tearDown() async throws {
+        openWindows.removeAll()
+        try await super.tearDown()
+    }
+
+    private func render(_ model: BotContextExportModel, name: String) throws -> NSBitmapImageRep {
+        let size = CGSize(width: 640, height: 720)
+        let hosting = NSHostingView(rootView: BotContextExportSheet(model: model).frame(width: size.width, height: size.height))
+        hosting.frame = NSRect(origin: .zero, size: size)
+        hosting.appearance = NSAppearance(named: .darkAqua)
+        let window = NSWindow(contentRect: hosting.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = hosting
+        openWindows.append(window)
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        if let directory = ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"] {
+            let url = URL(fileURLWithPath: directory, isDirectory: true).appendingPathComponent("macos-export-\(name).png")
+            try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url, options: .atomic)
+        }
+        return bitmap
+    }
+
+    private func inkSamples(_ bitmap: NSBitmapImageRep) -> Int {
+        var count = 0
+        for y in stride(from: 0, to: bitmap.pixelsHigh, by: max(bitmap.pixelsHigh / 240, 1)) {
+            for x in stride(from: 0, to: bitmap.pixelsWide, by: max(bitmap.pixelsWide / 240, 1)) {
+                guard let c = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { continue }
+                if c.redComponent + c.greenComponent + c.blueComponent > 1.2 { count += 1 }
+            }
+        }
+        return count
+    }
+
+    func testRealSheetRendersSelectionAndFrozenReviewFromRealModel() async throws {
+        let f = try fixture("render")
+        let model = try f.vm.makeContextExportModel { _ in }
+        let selecting = try render(model, name: "selecting")
+        try prepare(model, target: f.targetContext)
+        await waitUntil { model.review != nil || model.errorMessage != nil }
+        XCTAssertNotNil(model.review)
+        let reviewed = try render(model, name: "review")
+        XCTAssertGreaterThan(inkSamples(selecting), 50, "selection sheet must paint its excerpt rows")
+        XCTAssertGreaterThan(inkSamples(reviewed), inkSamples(selecting) / 2, "review state must still paint content")
+        XCTAssertNotEqual(selecting.representation(using: .png, properties: [:]), reviewed.representation(using: .png, properties: [:]),
+                          "choosing an excerpt and target and previewing must visibly change the sheet")
     }
 
     func testRealPresentationReviewAndRevocationCannotCopyOrMutateConversations() async throws {
