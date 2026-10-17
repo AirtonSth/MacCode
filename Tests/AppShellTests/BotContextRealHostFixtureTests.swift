@@ -119,6 +119,88 @@ final class BotContextRealHostFixtureTests: XCTestCase {
         try JSONEncoder().encode(navigation).write(to: root.appendingPathComponent("navigation.json"), options: .atomic)
     }
 
+    func test_verifyOfflineQueueRevocationAfterHostRestart() throws {
+        guard ProcessInfo.processInfo.environment[Self.verifyKey] == "1" else {
+            throw XCTSkip("set RC_CONTEXT_REAL_HOST_VERIFY=1 to verify the exported fixture")
+        }
+        guard let rootPath = ProcessInfo.processInfo.environment[Self.rootKey] else {
+            throw XCTSkip("set RC_CONTEXT_REAL_HOST_FIXTURE_ROOT to locate the exported fixture")
+        }
+        let root = try Self.validatedRoot(rootPath)
+        let supportDB = root.appendingPathComponent("app-support/remotecode.sqlite")
+        guard FileManager.default.fileExists(atPath: supportDB.path) else {
+            XCTFail("exported fixture database missing")
+            return
+        }
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: root.appendingPathComponent("fixture.json")))
+        let navigation = try JSONDecoder().decode([String: String].self, from: Data(contentsOf: root.appendingPathComponent("navigation.json")))
+        func uuid(_ key: String) throws -> UUID {
+            try XCTUnwrap(navigation[key].flatMap(UUID.init(uuidString:)), "missing or invalid navigation UUID: \(key)")
+        }
+        let generalConversationID = BotConversationID(try uuid("generalConversationID"))
+        let generalThreadID = AgentThreadID(try uuid("generalThreadID"))
+        let workspaceConversationID = BotConversationID(try uuid("workspaceConversationID"))
+        let workspaceThreadID = AgentThreadID(try uuid("workspaceThreadID"))
+        XCTAssertNotEqual(generalConversationID, workspaceConversationID)
+        XCTAssertNotEqual(generalThreadID, workspaceThreadID)
+        XCTAssertEqual(try uuid("botID"), fixture.botID.value)
+        XCTAssertEqual(try uuid("workspaceID"), fixture.workspaceID.value)
+
+        let db = try SQLiteDB(path: supportDB.path, readonly: true)
+        let store = BotStore(db: db)
+        let bindingA = try XCTUnwrap(store.getContextBinding(hostID: fixture.hostID, botID: fixture.botID, context: .general))
+        let bindingB = try XCTUnwrap(store.getContextBinding(hostID: fixture.hostID, botID: fixture.bBotID, context: .general))
+        XCTAssertEqual(bindingA.policyRevision, 2)
+        XCTAssertEqual(bindingA.state, .revoked)
+        XCTAssertEqual(bindingB.policyRevision, fixture.expectedBRevision)
+        XCTAssertEqual(bindingB.policyRevision, 1)
+        XCTAssertEqual(bindingB.state, .active)
+        let workspaceBinding = try XCTUnwrap(store.getContextBinding(hostID: fixture.hostID, botID: fixture.botID, context: .workspace(fixture.workspaceID)))
+        XCTAssertEqual(workspaceBinding.policyRevision, 1)
+        XCTAssertEqual(workspaceBinding.state, .active)
+        XCTAssertTrue(try store.authorizes(hostID: fixture.hostID, botID: fixture.bBotID, context: .general, action: .read, policyRevision: bindingB.policyRevision))
+        XCTAssertTrue(try store.authorizes(hostID: fixture.hostID, botID: fixture.bBotID, context: .general, action: .send, policyRevision: bindingB.policyRevision))
+
+        let general = try XCTUnwrap(store.listConversations(botID: fixture.botID).first { $0.id == generalConversationID })
+        let workspace = try XCTUnwrap(store.listConversations(botID: fixture.botID).first { $0.id == workspaceConversationID })
+        XCTAssertEqual(general.linkedAgentThreadID, generalThreadID)
+        XCTAssertEqual(workspace.linkedAgentThreadID, workspaceThreadID)
+        let generalPin = try XCTUnwrap(store.conversationContextPin(conversationID: generalConversationID))
+        let workspacePin = try XCTUnwrap(store.conversationContextPin(conversationID: workspaceConversationID))
+        XCTAssertEqual(generalPin.hostID, fixture.hostID)
+        XCTAssertEqual(generalPin.botID, fixture.botID)
+        XCTAssertEqual(generalPin.context, .general)
+        XCTAssertEqual(generalPin.policyRevision, 1)
+        XCTAssertEqual(workspacePin.context, .workspace(fixture.workspaceID))
+        XCTAssertEqual(workspacePin.policyRevision, 1)
+
+        let threads = AgentThreadRepository(db: db)
+        let generalThread = try XCTUnwrap(threads.get(id: generalThreadID))
+        let workspaceThread = try XCTUnwrap(threads.get(id: workspaceThreadID))
+        XCTAssertNil(generalThread.workspaceId)
+        XCTAssertEqual(generalThread.actor, .bot(fixture.botID))
+        XCTAssertEqual(workspaceThread.workspaceId, fixture.workspaceID)
+        XCTAssertEqual(workspaceThread.actor, .bot(fixture.botID))
+        for threadID in [generalThreadID, workspaceThreadID] {
+            let runs = try db.prepare("SELECT COUNT(*) FROM agent_runs WHERE lower(thread_id)=?;")
+            try runs.bind(1, threadID.value.uuidString.lowercased())
+            XCTAssertTrue(try runs.step())
+            XCTAssertEqual(runs.columnInt64(0), 1)
+            let userMessages = try db.prepare("SELECT COUNT(*) FROM agent_messages WHERE lower(thread_id)=? AND role='user';")
+            try userMessages.bind(1, threadID.value.uuidString.lowercased())
+            XCTAssertTrue(try userMessages.step())
+            XCTAssertEqual(userMessages.columnInt64(0), 0)
+        }
+        XCTAssertTrue(try AgentQueuedMessageRepository(db: db).list(threadId: generalThreadID).isEmpty)
+
+        let reopenedDB = try SQLiteDB(path: supportDB.path, readonly: true)
+        let reopenedStore = BotStore(db: reopenedDB)
+        XCTAssertEqual(try reopenedStore.getContextBinding(hostID: fixture.hostID, botID: fixture.botID, context: .general)?.policyRevision, 2)
+        XCTAssertEqual(try reopenedStore.getContextBinding(hostID: fixture.hostID, botID: fixture.botID, context: .general)?.state, .revoked)
+        XCTAssertEqual(try reopenedStore.conversationContextPin(conversationID: generalConversationID)?.policyRevision, 1)
+        XCTAssertEqual(try reopenedStore.conversationContextPin(conversationID: workspaceConversationID)?.context, .workspace(fixture.workspaceID))
+    }
+
     func test_verifyRealHostFixtureAfterRevoke() throws {
         guard ProcessInfo.processInfo.environment[Self.verifyKey] == "1" else {
             throw XCTSkip("set RC_CONTEXT_REAL_HOST_VERIFY=1 to verify the exported fixture")

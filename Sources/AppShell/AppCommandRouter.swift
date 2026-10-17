@@ -2981,6 +2981,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// In-process schedule owner (main app). Run Now / ticks call this instead of XPC.
     public weak var scheduledTaskScheduler: ScheduledTaskScheduler?
 
+    private static func refuseContextPinnedGenericExecution(_ threadID: AgentThreadID, context ctx: AppContext) throws {
+        guard let pin = try ctx.botStore.conversationContextPin(linkedTo: threadID) else { return }
+        let authorized: Bool
+        if let conversation = try ctx.botStore.conversation(id: pin.conversationID) {
+            authorized = try ctx.botStore.authorizesConversation(conversation, hostID: ctx.liveActivityHostIdentity.serverId, action: .send)
+        } else {
+            authorized = false
+        }
+        throw JSONRPCError(code: -32602, message: authorized
+                           ? "Contextual execution is unavailable until isolation is verified."
+                           : "Contextual send authority is inactive or invalid.")
+    }
+
     /// Resolve authorization for a context-pinned thread without applying legacy routing.
     static func contextPinnedThreadDestination(
         _ threadID: AgentThreadID,
@@ -5692,6 +5705,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
               let thread = try ctx.threadRepo.get(id: queued.threadId) else {
             throw JSONRPCError.invalidParams
         }
+        try Self.refuseContextPinnedGenericExecution(queued.threadId, context: ctx)
         if let dispatch = try ctx.queuedMessageRepo.dispatch(id: queued.id),
            let runId = dispatch.runId {
             if dispatch.state == .dispatched {
@@ -6107,6 +6121,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true, compilesBotPrompt: Bool = false) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        do {
+            try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
+        } catch {
+            if preflightRejectionIsDefinite { throw DefiniteMutationRejection(error) }
+            throw error
+        }
         // Status + permission + provider identity only. A leftover 26-column
         // + routing `get` hitchs every send before configureAgentThread loads
         // the row again for mutate.
@@ -6443,6 +6463,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         recoverPreparedFromPriorProcess: Bool = false,
         botVMHandOff: Bool = false
     ) async throws {
+        if let ctx = context {
+            try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
+        }
         // This gate only needs durable run-state. A full 26-column + routing
         // `get` hitchs MainActor before the next queued follow-up can start.
         // A D12 hand-off also drains a thread that never ran (still `.pending`
@@ -6860,6 +6883,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, modelSelection: AgentModelSelection? = nil) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID) {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let source = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
         let storedMarkdown: String?
         if let planMarkdown {
             storedMarkdown = planMarkdown
