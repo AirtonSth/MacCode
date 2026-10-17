@@ -322,3 +322,7 @@ Direct native router fork/side, the shared coordinator, durable prepare/graph co
 ### Routine and queue authority — bounded proof
 
 Routine dispatch, queue admission/drain and current context authority checks are documented in [CONTEXT-QUEUE-ROUTINE-AUTHORITY.md](CONTEXT-QUEUE-ROUTINE-AUTHORITY.md). Exact-tree test evidence and limits are recorded there; provider execution, export completion and full S-002/S-007/S-008 acceptance remain open. iOS change is documentation only; UI/layout/public gates are unchanged.
+
+### Historical queue: revoke and regrant
+
+The existing historical queue regression now verifies revoke, newer-revision regrant and reopen without consuming or duplicating persisted intent. At tree `e2875cf81c811516312db0ca955aec7e96ba97bf`, 18 selected tests passed with zero failures/skips; product Sources are unchanged. This is repository persistence and real router refusal proof, not authorized public contextual enqueue. Full public queue admission remains unavailable. See [CONTEXT-QUEUE-ROUTINE-AUTHORITY.md](CONTEXT-QUEUE-ROUTINE-AUTHORITY.md). iOS changes are documentation only; public gates and layout remain unchanged.

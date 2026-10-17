@@ -16,8 +16,8 @@ final class BotContextQueuedMessageTests: XCTestCase {
         let conversation: BotConversation
     }
 
-    private func fixture(_ label: String) throws -> Fixture {
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("BotContextQueuedMessageTests-\(label)-\(UUID())", isDirectory: true)
+    private func fixture(_ label: String, parent: URL = FileManager.default.temporaryDirectory) throws -> Fixture {
+        let root = parent.appendingPathComponent("BotContextQueuedMessageTests-\(label)-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let context = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path, performLaunchRunReconciliation: false)
         let router = AppCommandRouter(context: context)
@@ -100,12 +100,17 @@ final class BotContextQueuedMessageTests: XCTestCase {
     }
 
     func test_revokedHistoricalQueueRemainsUntouchedAcrossDrainForceRecoveryAndReopen() async throws {
-        let f = try fixture("revoked-queue")
+        let parent = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"]), isDirectory: true)
+        let f = try fixture("revoked-queue", parent: parent)
         defer { try? FileManager.default.removeItem(at: f.root) }
-        let attachment = AgentAttachment(path: "/nonexistent/pinned.txt", displayName: "pinned.txt", kind: .file)
-        let queued = try f.context.queuedMessageRepo.enqueue(threadId: f.thread.id, text: "historical intent", attachments: [attachment], interactionMode: .default)
         let host = f.context.liveActivityHostIdentity.serverId
-        _ = try f.context.botStore.revokeContext(hostID: host, botID: f.botID, context: .general, expectedRevision: 1)
+        let pin = try XCTUnwrap(f.context.botStore.conversationContextPin(conversationID: f.conversation.id))
+        XCTAssertTrue(try f.context.botStore.authorizes(hostID: host, botID: f.botID, context: .general, action: .send, policyRevision: pin.policyRevision))
+        let attachment = AgentAttachment(path: "/nonexistent/pinned.txt", displayName: "pinned.txt", kind: .file)
+        // Historical persistence is not public contextual send admission.
+        let queued = try f.context.queuedMessageRepo.enqueue(threadId: f.thread.id, text: "historical intent", attachments: [attachment], interactionMode: .default)
+        let queuedSnapshot = try f.context.queuedMessageRepo.list(threadId: f.thread.id)
+        let revoked = try f.context.botStore.revokeContext(hostID: host, botID: f.botID, context: .general, expectedRevision: pin.policyRevision)
         var resolved: [[AgentAttachment]] = []
         f.router.sendAgentMessageResolvedAttachmentsProbeForTesting = { resolved.append($0) }
 
@@ -136,6 +141,20 @@ final class BotContextQueuedMessageTests: XCTestCase {
         XCTAssertFalse(f.router.preflightListedProviderSnapshotsForTesting)
         XCTAssertEqual(try f.context.messageRepo.list(threadId: f.thread.id).count, 0)
         XCTAssertEqual(try runCount(f.context, threadID: f.thread.id), 0)
+        XCTAssertEqual(try f.context.queuedMessageRepo.list(threadId: f.thread.id), queuedSnapshot)
+
+        let regranted = try f.context.botStore.grantContext(hostID: host, botID: f.botID, context: .general, actions: [.read, .send], expectedRevision: revoked.policyRevision)
+        XCTAssertFalse(try f.context.botStore.authorizes(hostID: host, botID: f.botID, context: .general, action: .send, policyRevision: pin.policyRevision))
+        XCTAssertTrue(try f.context.botStore.authorizes(hostID: host, botID: f.botID, context: .general, action: .send, policyRevision: regranted.policyRevision))
+        do {
+            try await f.router.drainNextQueuedAgentMessage(thread: f.thread.id, recoverPreparedFromPriorProcess: true)
+            XCTFail("regrant must not authorize the historical pin")
+        } catch let error as JSONRPCError {
+            XCTAssertEqual(error.code, -32602)
+            XCTAssertTrue(error.message.contains("authority is inactive or invalid"))
+        }
+        XCTAssertEqual(try f.context.queuedMessageRepo.list(threadId: f.thread.id), queuedSnapshot)
+        XCTAssertEqual(try f.context.botStore.conversationContextPin(conversationID: f.conversation.id), pin)
 
         let reopened = try AppContext(channel: .debug, dbPathOverride: f.context.db.path, appSupportOverride: f.root.appendingPathComponent("support").path, performLaunchRunReconciliation: false)
         let reopenedRouter = AppCommandRouter(context: reopened)
@@ -152,6 +171,8 @@ final class BotContextQueuedMessageTests: XCTestCase {
         let reopenedQueued = try XCTUnwrap(reopened.queuedMessageRepo.get(id: queued.id))
         XCTAssertEqual(reopenedQueued.text, "historical intent")
         XCTAssertEqual(reopenedQueued.attachments, [attachment])
+        XCTAssertEqual(try reopened.queuedMessageRepo.list(threadId: f.thread.id), queuedSnapshot)
+        XCTAssertEqual(try reopened.botStore.conversationContextPin(conversationID: f.conversation.id), pin)
         XCTAssertEqual(try reopened.messageRepo.list(threadId: f.thread.id).count, 0)
         XCTAssertEqual(try runCount(reopened, threadID: f.thread.id), 0)
     }
