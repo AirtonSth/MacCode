@@ -215,3 +215,45 @@ final class BotContextEnqueueReplayTests: XCTestCase {
         XCTAssertEqual(st.columnInt64(0), 1, "replay after reopen must not queue a second item")
     }
 }
+
+final class BotContextRoutinePeerReplayTests: XCTestCase {
+    func testRoutineRunReplayAfterReopenDoesNotSendTwiceAndPeerRefusesRevokedContext() throws {
+        let root = try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"])
+        let dir = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("RoutineReplay-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("routine.sqlite").path
+        var sends = 0
+        func open() throws -> BotRemoteControlAuthority {
+            let db = try SQLiteDB(path: path)
+            try Schema.migrate(db)
+            let settings = SettingsStore(db: db)
+            settings.update { $0.botsControlPlaneEnabled = true }
+            let authority = BotRemoteControlAuthority(db: db, store: BotStore(db: db), settings: settings, appSupportDirectory: dir)
+            authority.onRoutineSend = { _ in sends += 1; return [:] }
+            return authority
+        }
+        let authority = try open()
+        let host = "host"
+        let bot = try XCTUnwrap(try authority.dispatch(method: "bot.create", params: ["client_request_id": "c", "name": "Routine"])["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.routing.set", params: ["client_request_id": "r", "bot_id": bot, "host_id": host, "provider": "distill", "provider_instance_id": "distill", "model": "m", "routing_mode": "explicit"])
+        let created = try authority.dispatch(method: "bot.routine.create", params: ["client_request_id": "rc", "bot_id": bot, "name": "R", "prompt": "p", "schedule_spec_json": "{}"])
+        let routine = try XCTUnwrap((created["readback"] as? [String: Any])?["routine_id"] as? String)
+        let run: [String: Any] = ["client_request_id": "run-1", "bot_id": bot, "routine_id": routine, "host_id": host]
+        _ = try authority.dispatch(method: "bot.routine.run", params: run)
+        XCTAssertEqual(sends, 1, "the first run sends once")
+        let reopened = try open()
+        _ = try reopened.dispatch(method: "bot.routine.run", params: run)
+        XCTAssertEqual(sends, 1, "a replayed run request after reopen must not send again")
+
+        // A contextual grant, once revoked, cannot be used to reach peer or routine entry points.
+        _ = try reopened.dispatch(method: "bot.context.grant", params: ["client_request_id": "g", "host_id": host, "bot_id": bot, "context_key": "general:v1", "context_version": 1, "policy_revision": 0, "actions": ["read", "send", "delegate", "schedule"]])
+        _ = try reopened.dispatch(method: "bot.context.revoke", params: ["client_request_id": "rv", "host_id": host, "bot_id": bot, "context_key": "general:v1", "context_version": 1, "policy_revision": 1])
+        for method in ["peer.ask", "bot.routine.run"] {
+            var p: [String: Any] = ["client_request_id": UUID().uuidString, "bot_id": bot, "host_id": host, "context_key": "general:v1", "context_version": 1, "policy_revision": 1, "routine_id": routine, "handle": "x", "text": "x"]
+            if method == "peer.ask" { p["client_request_id"] = "peer-\(UUID().uuidString)" }
+            XCTAssertThrowsError(try reopened.dispatch(method: method, params: p), "\(method) must refuse a revoked contextual grant")
+        }
+        XCTAssertEqual(sends, 1, "no refused call may reach the host send")
+    }
+}
