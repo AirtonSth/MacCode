@@ -90,7 +90,17 @@ public enum HostDatabaseRestore {
         return AgentRunID(uuid)
     }
 
+    /// Sibling of the pre-restore recovery database that receives quarantined orphan rows.
+    public static func quarantineURL(forRecovery recoveryURL: URL) -> URL {
+        recoveryURL.deletingLastPathComponent().appendingPathComponent(
+            recoveryURL.lastPathComponent.replacingOccurrences(of: ".restore-recovery-", with: ".restore-quarantine-"))
+    }
+
+    /// `quarantineOrphans` opts in to moving rows whose parent no longer exists out of the restored
+    /// database into `quarantineURL(forRecovery:)` instead of refusing the restore. Nothing is dropped
+    /// without being saved there.
     public static func restore(backupURL: URL, currentURL: URL, reviewToken: String? = nil,
+                               quarantineOrphans: Bool = false,
                                beforeCommit: ((URL, URL) throws -> Void)? = nil,
                                didCommit: (() -> Void)? = nil) throws -> URL {
         let sourceInfo = try regularFile(backupURL)
@@ -106,7 +116,7 @@ public enum HostDatabaseRestore {
         do {
             try restore(backupURL: backupURL, currentURL: currentURL, stageURL: stageURL,
                         recoveryURL: recoveryURL, recoveryCreated: &recoveryCreated, reviewToken: reviewToken,
-                        beforeCommit: beforeCommit, didCommit: didCommit)
+                        quarantineOrphans: quarantineOrphans, beforeCommit: beforeCommit, didCommit: didCommit)
             do {
                 try removeStage(stageURL)
             } catch {
@@ -115,6 +125,7 @@ public enum HostDatabaseRestore {
             return recoveryURL
         } catch {
             try? removeStage(stageURL)
+            try? removeStage(quarantineURL(forRecovery: recoveryURL))
             if recoveryCreated {
                 throw SQLiteError.execute("\(error); pre-restore recovery database: \(recoveryURL.path)")
             }
@@ -125,6 +136,7 @@ public enum HostDatabaseRestore {
 
     private static func restore(backupURL: URL, currentURL: URL, stageURL: URL,
                                 recoveryURL: URL, recoveryCreated: inout Bool, reviewToken: String?,
+                                quarantineOrphans: Bool,
                                 beforeCommit: ((URL, URL) throws -> Void)?,
                                 didCommit: (() -> Void)?) throws {
         let source = try SQLiteDB(path: backupURL.path, readonly: true)
@@ -142,6 +154,14 @@ public enum HostDatabaseRestore {
                 throw SQLiteError.execute("backup contains queued work or schedules requiring explicit review")
             }
             try Schema.migrate(stage)
+            let orphans = try orphanRows(stage)
+            if !orphans.isEmpty {
+                guard quarantineOrphans else {
+                    let summary = Dictionary(grouping: orphans, by: \.table).map { "\($0.key)=\($0.value.count)" }.sorted().joined(separator: ", ")
+                    throw SQLiteError.execute("restore foreign key check failed: rows without a parent (\(summary)); restore with orphan quarantine to keep them aside")
+                }
+                try quarantine(orphansIn: stage, at: quarantineURL(forRecovery: recoveryURL))
+            }
             try stage.enableFullDurability()
         }
 
@@ -333,15 +353,102 @@ public enum HostDatabaseRestore {
                 throw SQLiteError.execute("restore integrity check failed")
             }
         }
-        do {
-            let check = try stage.prepare("PRAGMA foreign_key_check;")
-            defer { check.reset() }
-            guard try !check.step() else { throw SQLiteError.execute("restore foreign key check failed") }
-        }
+        guard try orphanRows(stage).isEmpty else { throw SQLiteError.execute("restore foreign key check failed") }
         try beforeCommit?(stageURL, recoveryURL)
         try stage.backup(to: current)
         didCommit?()
     }
+
+    private static func orphanRows(_ db: SQLiteDB) throws -> [(table: String, rowid: Int64)] {
+        let check = try db.prepare("PRAGMA foreign_key_check;")
+        defer { check.reset() }
+        var rows: [(table: String, rowid: Int64)] = []
+        while try check.step() {
+            guard let table = check.columnText(0), !check.columnIsNull(1) else {
+                throw SQLiteError.execute("restore foreign key check failed on a table without rowid")
+            }
+            rows.append((table, check.columnInt64(1)))
+        }
+        return rows
+    }
+
+    /// Moves orphan rows, and rows orphaned by their removal, into a private quarantine database.
+    private static func quarantine(orphansIn stage: SQLiteDB, at url: URL) throws {
+        try createPrivateFile(url)
+        try stage.execute("PRAGMA foreign_keys=OFF;")
+        defer { try? stage.execute("PRAGMA foreign_keys=ON;") }
+        let attach = try stage.prepare("ATTACH DATABASE ? AS quarantine;")
+        try attach.bind(1, url.path)
+        _ = try attach.step()
+        attach.reset()
+        do {
+            var settled = false
+            for _ in 0..<16 {
+                let orphans = try orphanRows(stage)
+                if orphans.isEmpty { settled = true; break }
+                var byTable: [String: Set<Int64>] = [:]
+                for orphan in orphans { byTable[orphan.table, default: []].insert(orphan.rowid) }
+                for (table, rowids) in byTable {
+                    let name = "\"" + table.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+                    try stage.execute("CREATE TABLE IF NOT EXISTS quarantine.\(name) AS SELECT * FROM main.\(name) WHERE 0;")
+                    let sorted = rowids.sorted()
+                    for start in stride(from: 0, to: sorted.count, by: 500) {
+                        let list = sorted[start..<min(start + 500, sorted.count)].map(String.init).joined(separator: ",")
+                        try stage.execute("INSERT INTO quarantine.\(name) SELECT * FROM main.\(name) WHERE rowid IN (\(list)); DELETE FROM main.\(name) WHERE rowid IN (\(list));")
+                    }
+                }
+            }
+            guard settled else { throw SQLiteError.execute("restore foreign key check failed: orphan quarantine did not settle") }
+        } catch {
+            try? stage.execute("DETACH DATABASE quarantine;")
+            throw error
+        }
+        try stage.execute("DETACH DATABASE quarantine;")
+    }
+
+    /// Objects older builds created that this schema no longer lists. They only cache display data,
+    /// are accepted when their SQL is exactly as shipped, and are carried over unchanged.
+    private static let legacyOptionalObjects: [String: String] = [
+        "table/agent_message_outbound_payloads": [
+            "CREATE TABLE agent_message_outbound_payloads (",
+            "    message_id TEXT PRIMARY KEY NOT NULL,",
+            "    thread_id TEXT NOT NULL,",
+            "    outbound_text TEXT NOT NULL,",
+            "    created_at TEXT NOT NULL,",
+            "    FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE CASCADE,",
+            "    FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE",
+            ")"].joined(separator: "\n"),
+        "index/idx_agent_message_outbound_payloads_thread": [
+            "CREATE INDEX idx_agent_message_outbound_payloads_thread",
+            "    ON agent_message_outbound_payloads(thread_id, created_at)"].joined(separator: "\n"),
+        "table/agent_message_display_translations": [
+            "CREATE TABLE agent_message_display_translations (",
+            "    message_id TEXT PRIMARY KEY NOT NULL,",
+            "    thread_id TEXT NOT NULL,",
+            "    wire_sha256 TEXT NOT NULL,",
+            "    display_text TEXT NOT NULL,",
+            "    created_at TEXT NOT NULL,",
+            "    FOREIGN KEY(message_id) REFERENCES agent_messages(id) ON DELETE CASCADE,",
+            "    FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE",
+            ")"].joined(separator: "\n"),
+        "index/idx_agent_message_display_translations_thread": [
+            "CREATE INDEX idx_agent_message_display_translations_thread",
+            "    ON agent_message_display_translations(thread_id, created_at)"].joined(separator: "\n"),
+        "table/agent_timeline_display_translations": [
+            "CREATE TABLE agent_timeline_display_translations (",
+            "    owner_kind TEXT NOT NULL,",
+            "    owner_id TEXT NOT NULL,",
+            "    thread_id TEXT NOT NULL,",
+            "    wire_sha256 TEXT NOT NULL,",
+            "    display_text TEXT NOT NULL,",
+            "    created_at TEXT NOT NULL,",
+            "    PRIMARY KEY(thread_id, owner_kind, owner_id),",
+            "    FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE",
+            ")"].joined(separator: "\n"),
+        "index/idx_agent_timeline_display_translations_thread": [
+            "CREATE INDEX idx_agent_timeline_display_translations_thread",
+            "    ON agent_timeline_display_translations(thread_id, created_at)"].joined(separator: "\n"),
+    ]
 
     private static func validateBackupSchema(_ db: SQLiteDB) throws -> Int {
         func schema(_ database: SQLiteDB) throws -> [String: String] {
@@ -356,7 +463,8 @@ public enum HostDatabaseRestore {
             }
             return result
         }
-        let actual = try schema(db)
+        var actual = try schema(db)
+        for (key, sql) in legacyOptionalObjects where actual[key] == sql { actual[key] = nil }
         for version in [93, 96, Schema.currentVersion] {
             let trusted = try Schema.trustedRestoreSchema(version: version)
             if try actual == schema(trusted) {
