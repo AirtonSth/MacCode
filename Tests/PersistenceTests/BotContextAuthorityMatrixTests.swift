@@ -132,6 +132,25 @@ final class BotContextAuthorityMatrixTests: XCTestCase {
             XCTAssertThrowsError(try authority.dispatch(method: method, params: p), "\(method) must not accept a contextual grant implicitly")
         }
 
+        // Restricted/isolated execution is not offered: the contract has no such option, so a client that
+        // asks for one is refused instead of silently getting broader or different access.
+        func bindingCount() throws -> Int64 {
+            let st = try db.prepare("SELECT COUNT(*) FROM bot_context_bindings;")
+            defer { st.reset() }
+            XCTAssertTrue(try st.step())
+            return st.columnInt64(0)
+        }
+        let bindingsBeforeRestricted = try bindingCount()
+        for field in ["access_mode", "isolation", "restricted", "network_policy", "filesystem_mode"] {
+            for method in ["bot.context.grant", "bot.conversation.create", "bot.conversation.enqueue"] {
+                var p = params(method, bot: botA, key: "general:v1", revision: 1, convo: generalA.id)
+                if method == "bot.context.grant" { p["actions"] = ["read"]; p["policy_revision"] = 0; p["client_request_id"] = UUID().uuidString }
+                p[field] = "restricted"
+                XCTAssertThrowsError(try authority.dispatch(method: method, params: p), "\(method) must refuse unknown \(field)")
+            }
+        }
+        XCTAssertEqual(try bindingCount(), bindingsBeforeRestricted, "refused restricted requests must not change any binding")
+
         // A retried contextual mutation replays its stored outcome instead of repeating the write.
         let replayParams = params("bot.conversation.create", bot: botA, key: "general:v1", revision: 1, convo: generalA.id)
         let first = try authority.dispatch(method: "bot.conversation.create", params: replayParams)

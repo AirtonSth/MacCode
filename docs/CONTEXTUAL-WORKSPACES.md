@@ -364,3 +364,22 @@ Added since the earlier summary; same rule: verified means exercised by shipped-
 | S-006 | Unchanged this round. | Contextual peer entry, durable delegation, real child execution. |
 | S-007 | Unchanged this round beyond the authority matrix. | Routines end to end, host switches, full matrix. |
 | S-008 | Packaged signed CLI: backup/restore/interrupted rollback/tamper/lock (5 tests); pre-revocation and legacy schema-93 fixtures restored through the CLI and verified; held-queue claim refused after restore. Navigation cost: macOS model path (cold plus ten warm) and iPhone in-app receipt I-016 (three runs, cold plus five warm, about 100 ms warm median on a simulator). | Old/new iOS-client matrix server and two router/restart fixtures not re-run; OAuth refresh/resume; device and first-frame measurements; broad adoption not validated. |
+
+## Final eight-stage mapping (2026-10-17)
+
+Each row names the shipped change and the strongest evidence actually obtained. "Verified" means a shipped-code test or packaged-binary run recorded in the linked documents. Nothing here is a completion claim for the plan: items under "Not proven" are open, and the ones marked "blocked" cannot be closed without credentials or people that this environment does not have.
+
+| Stage | Shipped change | Verified | Not proven |
+|---|---|---|---|
+| S-001 stable Bot identity | Bot identity separate from workspace hint; legacy `workspaceID` never becomes a grant. | Authority matrix (18 refusal/allow rows plus replay) and 13 authority suites. | Shared-identity approval from the owner (decision, not code). |
+| S-002 host authority | Host-owned bindings with policy revision, per-action grants, canonical pinned conversations, export receipt in `audit_log`. | Matrix through real SQLite; receipt written once per confirmed export and never on preview or denial, over real HTTP; unknown access-mode fields (`restricted`, `isolation`, `network_policy`, `filesystem_mode`) refused without changing bindings. | Peer, routine execution and replay as live provider runs (blocked: no provider credentials). No UI to read the receipt and no retention policy. |
+| S-003 destinations | Export preview/confirm and Continue in Destination on macOS and iOS. | Unit and offscreen proofs on both platforms; iOS UI journey at default and largest text and on iPad. | Concurrent-window races; activity, search and link entry points; a real macOS window drive. |
+| S-004 native UX | Context picker, export sheet, busy/offline states in the existing visual language. | iOS UI tests (default, largest text, iPad), busy/offline contract test, macOS sheet render. | VoiceOver, hardware keyboard, reduced motion, human usability trial (blocked: needs people). |
+| S-005 runtime isolation | Four-runtime admission ceiling; restricted mode not offered (no contract field accepts it). | Docker measurement at 1/2/4/8 with cold and five warm samples; ceiling enforced and slot released. | Real-provider isolation, browser/network/filesystem probes. Restricted mode stays unavailable until those probes pass (blocked: no keys). |
+| S-006 delegation | Contextual peer entry refused unless a running parent exists. | Existing admission tests. | Durable delegation and real child execution (blocked: credentials). |
+| S-007 routines and queues | Held queues stay held until exact explicit force. | Legacy router and restart fixtures through the packaged CLI. | Routines end to end, host switches, OAuth refresh/resume (blocked: dedicated account). |
+| S-008 compatibility | Additive schema 97, scoped backup/restore CLI, rollback command. | Old/new iOS client against old (schema 93) and current (schema 97) real hosts, 2/2 each; restore and rollback through the packaged binary; I-016 and macOS navigation timings. | Real personal database, device and first-frame timing, raw older host on a modern database (unsupported). |
+
+Not attempted this round: a real macOS window drive. Earlier attempts returned `stale_state_token` and `focus_required` from the accessibility tooling and never showed the export sheet, so no GUI launch readback is claimed beyond the offscreen render.
+
+The 21-row design-skill ledger lives in `CONTEXT-GROUPING-DESIGN.md` and `CONTEXT-LEGACY-RESTORE-DESIGN.md`; this round changed no view layout, so its rows (applied or not-applicable) are unchanged and no new visual proof is added to them.
