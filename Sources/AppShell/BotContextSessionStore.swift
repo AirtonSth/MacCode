@@ -4,7 +4,7 @@ import CoreModel
 
 /// Host-owned binding between a contextual conversation and native Distill history.
 enum BotContextSessionStore {
-    private struct Binding: Codable {
+    struct Binding: Codable, Equatable {
         let version: Int
         let pin: BotConversationContextPin
         let threadID: AgentThreadID

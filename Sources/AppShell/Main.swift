@@ -23,7 +23,7 @@ struct RemoteCodeMain {
         }
         let rollbackFlag = "--rollback-host"
         let rollingBack = CommandLine.arguments.contains(rollbackFlag)
-        if rollingBack && (CommandLine.arguments.contains("--inspect-database-backup") || CommandLine.arguments.contains("--restore-database-backup")) {
+        if rollingBack && (CommandLine.arguments.contains("--inspect-database-backup") || CommandLine.arguments.contains("--restore-database-backup") || CommandLine.arguments.contains("--create-database-backup")) {
             fputs("Host rollback cannot combine with database inspect or restore.\n", stderr)
             exit(EXIT_FAILURE)
         }
@@ -33,7 +33,32 @@ struct RemoteCodeMain {
         let restoresDatabase = CommandLine.arguments.contains(restoreFlag)
         let inspectFlag = "--inspect-database-backup"
         let inspectsDatabase = CommandLine.arguments.contains(inspectFlag)
+        let createFlag = "--create-database-backup"
+        let createsDatabase = CommandLine.arguments.contains(createFlag)
 
+        if restoresDatabase || inspectsDatabase || createsDatabase {
+            let operationFlags = [restoreFlag, inspectFlag, createFlag].filter { CommandLine.arguments.contains($0) }
+            let hasScheduledAgentFlag = CommandLine.arguments.contains(where: { $0 == "--scheduled-task-agent" || $0 == "--scheduled-task-agent-unregister" })
+                || ProcessInfo.processInfo.environment["RC2_SCHEDULED_TASK_AGENT"] == "1"
+            let validArguments: Bool
+            if operationFlags.count != 1 || hasScheduledAgentFlag || rollingBack {
+                validArguments = false
+            } else if inspectsDatabase || createsDatabase {
+                validArguments = CommandLine.arguments.count == 3 && CommandLine.arguments[1] == operationFlags[0]
+                    && !CommandLine.arguments.contains("--restore-review")
+            } else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == restoreFlag {
+                validArguments = true
+            } else {
+                validArguments = CommandLine.arguments.count == 5
+                    && CommandLine.arguments[1] == restoreFlag
+                    && CommandLine.arguments[3] == "--restore-review"
+                    && CommandLine.arguments.filter({ $0 == "--restore-review" }).count == 1
+            }
+            guard validArguments else {
+                fputs("Database backup operation has mixed flags or invalid arguments.\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+        }
         if !rollingBack && CommandLine.arguments.contains("--scheduled-task-agent-unregister") {
             do {
                 try ScheduledTaskAgentServiceManager().unregister()
@@ -74,7 +99,7 @@ struct RemoteCodeMain {
             Logger(subsystem: "io.remotecode.app", category: "lifecycle")
                 .fault("app.second_instance_exit holder=\(holder, privacy: .public)")
             fputs("RemoteCode is already running for \(appSupportDirectory.path) (pid \(holder)); exiting.\n", stderr)
-            if restoresDatabase || inspectsDatabase || rollingBack { exit(EXIT_FAILURE) }
+            if restoresDatabase || inspectsDatabase || createsDatabase || rollingBack { exit(EXIT_FAILURE) }
             if let holderPID, !LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
                 NSRunningApplication(processIdentifier: holderPID)?.activate()
             }
@@ -122,26 +147,40 @@ struct RemoteCodeMain {
             exit(EXIT_FAILURE)
         }
 
-        if restoresDatabase || inspectsDatabase {
-            let operationFlag = restoresDatabase ? restoreFlag : inspectFlag
-            guard let instanceLock, !(restoresDatabase && inspectsDatabase),
+        if restoresDatabase || inspectsDatabase || createsDatabase {
+            let operations = [restoreFlag, inspectFlag, createFlag].filter { CommandLine.arguments.contains($0) }
+            let operationFlag = operations.first ?? ""
+            guard let instanceLock, operations.count == 1,
                   CommandLine.arguments.filter({ $0 == operationFlag }).count == 1,
+                  !CommandLine.arguments.contains("--scheduled-task-agent"),
+                  !CommandLine.arguments.contains("--scheduled-task-agent-unregister"),
+                  !CommandLine.arguments.contains("--rollback-host"),
                   let index = CommandLine.arguments.firstIndex(of: operationFlag),
-                  CommandLine.arguments.indices.contains(index + 1) else {
-                fputs("Database restore requires an exclusive host lock and one backup path.\n", stderr)
+                  CommandLine.arguments.count >= index + 2,
+                  index + 2 == CommandLine.arguments.count || (restoresDatabase && index + 4 == CommandLine.arguments.count && CommandLine.arguments[index + 2] == "--restore-review"),
+                  CommandLine.arguments.filter({ $0 == "--restore-review" }).count <= 1,
+                  restoresDatabase || !CommandLine.arguments.contains("--restore-review") else {
+                fputs("Database backup operation requires exclusive host lock, one path, and no mixed flags.\n", stderr)
                 exit(EXIT_FAILURE)
             }
             withExtendedLifetime(instanceLock) {
                 do {
                     let current = URL(fileURLWithPath: dbOverride ?? appSupportDirectory.appendingPathComponent("remotecode.sqlite").path)
+                    try HostScopedSessionBackup.recoverInterruptedRestore(currentURL: current, appSupport: appSupportDirectory)
                     let backup = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+                    if createsDatabase {
+                        try HostScopedSessionBackup.create(backupURL: backup, currentURL: current, appSupport: appSupportDirectory)
+                        print("Database backup created: \(backup.path)")
+                        return
+                    }
                     if inspectsDatabase {
-                        let review = try HostDatabaseRestore.inspect(backupURL: backup)
+                        let review = try HostScopedSessionBackup.inspect(backupURL: backup)
                         let output: [String: Any] = [
-                            "schema_version": review.schemaVersion, "review_fingerprint": review.fingerprint,
-                            "agent_queue_ids": review.agentQueueIDs, "bot_queue_ids": review.botQueueIDs,
-                            "routine_ids": review.routineIDs, "scheduled_task_ids": review.scheduledTaskIDs,
+                            "schema_version": review.database.schemaVersion, "review_fingerprint": review.fingerprint,
+                            "agent_queue_ids": review.database.agentQueueIDs, "bot_queue_ids": review.database.botQueueIDs,
+                            "routine_ids": review.database.routineIDs, "scheduled_task_ids": review.database.scheduledTaskIDs,
                             "requires_confirmation": review.requiresConfirmation,
+                            "scoped_session_count": review.scopedSessionCount,
                             "adoption_policy": "Queues require an explicit force-send action. Schedules remain disabled until explicitly enabled."
                         ]
                         let data = try JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys])
@@ -156,7 +195,7 @@ struct RemoteCodeMain {
                         }
                         token = CommandLine.arguments[reviewIndex + 1]
                     }
-                    let recovery = try HostDatabaseRestore.restore(backupURL: backup, currentURL: current, reviewToken: token)
+                    let recovery = try HostScopedSessionBackup.restore(backupURL: backup, currentURL: current, appSupport: appSupportDirectory, reviewToken: token)
                     print("Database restored without starting execution. Recovery backup: \(recovery.path)")
                 } catch {
                     fputs("Database restore failed: \(error)\n", stderr)
@@ -164,6 +203,18 @@ struct RemoteCodeMain {
                 }
             }
             return
+        }
+
+        guard let instanceLock else {
+            fputs("RemoteCode cannot start without exclusive host lock.\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+        do {
+            let current = URL(fileURLWithPath: dbOverride ?? appSupportDirectory.appendingPathComponent("remotecode.sqlite").path)
+            try HostScopedSessionBackup.recoverInterruptedRestore(currentURL: current, appSupport: appSupportDirectory)
+        } catch {
+            fputs("Interrupted database restore recovery failed: \(error)\n", stderr)
+            exit(EXIT_FAILURE)
         }
 
         if LocalAuthAdapter.isE2EPairingAutoApproveEnabled {

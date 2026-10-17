@@ -90,7 +90,9 @@ public enum HostDatabaseRestore {
         return AgentRunID(uuid)
     }
 
-    public static func restore(backupURL: URL, currentURL: URL, reviewToken: String? = nil) throws -> URL {
+    public static func restore(backupURL: URL, currentURL: URL, reviewToken: String? = nil,
+                               beforeCommit: ((URL, URL) throws -> Void)? = nil,
+                               didCommit: (() -> Void)? = nil) throws -> URL {
         let sourceInfo = try regularFile(backupURL)
         let currentInfo = try regularFile(currentURL)
         guard sourceInfo.st_dev != currentInfo.st_dev || sourceInfo.st_ino != currentInfo.st_ino else {
@@ -103,7 +105,8 @@ public enum HostDatabaseRestore {
         var recoveryCreated = false
         do {
             try restore(backupURL: backupURL, currentURL: currentURL, stageURL: stageURL,
-                        recoveryURL: recoveryURL, recoveryCreated: &recoveryCreated, reviewToken: reviewToken)
+                        recoveryURL: recoveryURL, recoveryCreated: &recoveryCreated, reviewToken: reviewToken,
+                        beforeCommit: beforeCommit, didCommit: didCommit)
             do {
                 try removeStage(stageURL)
             } catch {
@@ -121,7 +124,9 @@ public enum HostDatabaseRestore {
     }
 
     private static func restore(backupURL: URL, currentURL: URL, stageURL: URL,
-                                recoveryURL: URL, recoveryCreated: inout Bool, reviewToken: String?) throws {
+                                recoveryURL: URL, recoveryCreated: inout Bool, reviewToken: String?,
+                                beforeCommit: ((URL, URL) throws -> Void)?,
+                                didCommit: (() -> Void)?) throws {
         let source = try SQLiteDB(path: backupURL.path, readonly: true)
         try createPrivateFile(stageURL)
         do {
@@ -151,6 +156,8 @@ public enum HostDatabaseRestore {
         let recovery = try SQLiteDB(path: recoveryURL.path)
         try recovery.enableFullDurability()
         try current.backup(to: recovery)
+        try recovery.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        try recovery.execute("PRAGMA journal_mode=DELETE;")
         recoveryCreated = true
 
         do {
@@ -271,6 +278,54 @@ public enum HostDatabaseRestore {
         for run in try schedules.listActiveRuns() {
             try schedules.finish(runID: run.id, status: .cancelled, errorCode: "database_restore_review", errorSummary: "Imported run stopped pending restore review.")
         }
+        let terminalStatuses = try current.prepare("""
+            SELECT thread_id, status FROM provider_session_runtime
+            WHERE status NOT IN ('running', 'pending');
+            """)
+        defer { terminalStatuses.reset() }
+        var terminalByThread: [String: String] = [:]
+        while try terminalStatuses.step() {
+            guard let threadID = terminalStatuses.columnText(0), let status = terminalStatuses.columnText(1) else {
+                throw SQLiteError.execute("current provider session has invalid terminal status")
+            }
+            terminalByThread[threadID.lowercased()] = status
+        }
+        let importedProviderThreads = try stage.prepare("SELECT thread_id, status FROM provider_session_runtime;")
+        defer { importedProviderThreads.reset() }
+        let providerSessions = ProviderSessionRuntimeRepository(db: stage)
+        while try importedProviderThreads.step() {
+            guard let rawID = importedProviderThreads.columnText(0), let id = UUID(uuidString: rawID) else {
+                throw SQLiteError.execute("restored provider session has an invalid thread identity")
+            }
+            let threadID = AgentThreadID(id)
+            let importedStatus = AgentRunStatus(rawValue: importedProviderThreads.columnText(1) ?? "")
+            if let terminalStatus = terminalByThread[rawID.lowercased()] {
+                let update = try stage.prepare("UPDATE provider_session_runtime SET status=? WHERE thread_id=? COLLATE NOCASE;")
+                try update.bind(1, terminalStatus)
+                try update.bind(2, rawID)
+                _ = try update.step()
+                update.reset()
+            } else if importedStatus == .running || importedStatus == .pending {
+                try providerSessions.markStopped(threadId: threadID, status: .interrupted)
+                let normalize = try stage.prepare("UPDATE provider_session_runtime SET status='interrupted' WHERE thread_id=? COLLATE NOCASE;")
+                try normalize.bind(1, rawID)
+                _ = try normalize.step()
+                normalize.reset()
+            }
+        }
+        let delegationRoots = try stage.prepare("SELECT parent_run_id FROM bot_context_delegations UNION SELECT child_run_id FROM bot_context_delegations;")
+        defer { delegationRoots.reset() }
+        let botStore = BotStore(db: stage)
+        var delegationRunIDs: [AgentRunID] = []
+        while try delegationRoots.step() {
+            guard let rawID = delegationRoots.columnText(0), let id = UUID(uuidString: rawID) else {
+                throw SQLiteError.execute("restored context delegation has an invalid run identity")
+            }
+            delegationRunIDs.append(AgentRunID(id))
+        }
+        for runID in delegationRunIDs {
+            _ = try botStore.closeContextDelegationTree(runID: runID)
+        }
         do {
             let check = try stage.prepare("PRAGMA integrity_check;")
             defer { check.reset() }
@@ -283,7 +338,9 @@ public enum HostDatabaseRestore {
             defer { check.reset() }
             guard try !check.step() else { throw SQLiteError.execute("restore foreign key check failed") }
         }
+        try beforeCommit?(stageURL, recoveryURL)
         try stage.backup(to: current)
+        didCommit?()
     }
 
     private static func validateBackupSchema(_ db: SQLiteDB) throws -> Int {
