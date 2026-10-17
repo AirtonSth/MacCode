@@ -267,3 +267,21 @@ final class BotContextRoutinePeerReplayTests: XCTestCase {
         XCTAssertEqual(sends, 1, "no refused call may reach the host send")
     }
 }
+
+final class SocketPathOverrideGuardTests: XCTestCase {
+    func testRegularFileIsRefusedAndSurvivesWhileAbsentPathIsHonored() throws {
+        let root = try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"])
+        let dir = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("SockGuard-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { unsetenv("RC2_SOCKET_PATH"); try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("precious.txt")
+        try Data("keep".utf8).write(to: file)
+        setenv("RC2_SOCKET_PATH", file.path, 1)
+        let fallback = AppPaths.socketPath(for: .debug)
+        XCTAssertNotEqual(fallback, file.path, "a regular file must never become the socket path")
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "keep")
+        let absent = dir.appendingPathComponent("new.sock").path
+        setenv("RC2_SOCKET_PATH", absent, 1)
+        XCTAssertEqual(AppPaths.socketPath(for: .debug), absent)
+    }
+}
