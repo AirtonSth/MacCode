@@ -136,6 +136,7 @@ public final class AppContext {
     public let workspaceListGateway: WorkspaceListGateway
     public let botStore: BotStore
     let contextualSecretStore: any BotSecretStore
+    let contextualRunAdmissions = BotContextRunAdmissions()
     /// Host MCP servers for bot agents running inside their Linux guest. Binds
     /// 127.0.0.1 on the first issued run bearer; stopped at app termination.
     public let botGuestMCPGateway = BotGuestMCPGateway()
@@ -750,6 +751,10 @@ public final class AppContext {
             },
             providerAdapters: [.codex: codex, .claude: claude, .grok: grok, .distill: distill]
         )
+        let contextualBotStore = self.botStore
+        self.coordinator.botContextPinForThread = { [contextualBotStore] threadID in
+            try contextualBotStore.conversationContextPin(linkedTo: threadID)
+        }
         self.coordinator.onRecoveredForkPrunedThreadIDs = { [weak contextReference] ids in
             await MainActor.run {
                 contextReference?.value?.enqueueRecoveredForkPrunedThreadIDs(ids)

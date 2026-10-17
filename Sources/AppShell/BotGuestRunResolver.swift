@@ -63,7 +63,9 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         var dockerExecutable: @Sendable () throws -> String
         /// Registered workspace roots by id (MainActor state in the app).
         var workspaces: @Sendable () async -> [WorkspaceID: String]
-        var prepareContextRuntime: (@Sendable (AgentRunRequest) async throws -> BotContextGuestResources)? = nil
+        var prepareContextRuntime: (@Sendable (AgentRunRequest, AgentRunID?, String) async throws -> BotContextGuestResources)? = nil
+        var contextualAdmissions: BotContextRunAdmissions? = nil
+        var contextDockerArchitecture: (@Sendable () throws -> String)? = nil
         /// The Mac distill binary, for its version (nil: not installed).
         var hostBinary: @Sendable (_ request: AgentRunRequest) -> String?
         /// Reads the Mac distill binary's version ahead of `binaryGuestPath`,
@@ -143,7 +145,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     private func preparePinnedContextRuntime(
         _ request: AgentRunRequest,
         progress: @escaping @Sendable (DistillGuestStage) -> Void
-    ) async throws -> Never {
+    ) async throws -> DistillGuestLaunchPlan {
         let unavailable = DistillGuestLaunchError.unavailable(
             "Contextual execution is unavailable until runtime isolation is verified."
         )
@@ -151,14 +153,76 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         try await deps.barrier.wait()
         try Task.checkCancellation()
         guard let prepareContextRuntime = deps.prepareContextRuntime else { throw unavailable }
-        let resources: BotContextGuestResources
-        do { resources = try await prepareContextRuntime(request) }
-        catch { throw Self.launchError(error) }
-        if resources.hasCredentialMaterial { progress(.preparingAgent) }
-        do { try await Self.blocking { try resources.cancel() } }
-        catch { throw Self.launchError(error) }
-        try Task.checkCancellation()
-        throw unavailable
+        guard let admissions = deps.contextualAdmissions else {
+            let resources = try await prepareContextRuntime(request, nil, "")
+            if resources.hasCredentialMaterial { progress(.preparingAgent) }
+            try await Self.blocking { try resources.cancel() }
+            throw unavailable
+        }
+        guard let admission = try admissions.consume(request) else {
+            let resources = try await prepareContextRuntime(request, nil, "")
+            if resources.hasCredentialMaterial { progress(.preparingAgent) }
+            try await Self.blocking { try resources.cancel() }
+            throw unavailable
+        }
+        var resources: BotContextGuestResources?
+        var heartbeat: BotGuestLeaseHeartbeat?
+        do {
+            func validate() throws {
+                try Task.checkCancellation()
+                guard admission.validates() else { throw unavailable }
+            }
+            try validate()
+            guard request.providerBinary == nil,
+                  request.extraArgs.isEmpty, request.providerThreadId == nil,
+                  !admission.model.isEmpty, request.model == admission.model,
+                  let architecture = deps.contextDockerArchitecture else { throw unavailable }
+            progress(.preparingAgent)
+            let hostBinary = deps.hostBinary(request)
+            await deps.probeHostVersion(hostBinary)
+            try validate()
+            let dockerArch = try architecture()
+            let binaryPath = try await deps.binaryGuestPath(hostBinary, dockerArch)
+            try validate()
+            let dockerExecutable = try deps.dockerExecutable()
+            progress(.startingVM)
+            let prepared = try await prepareContextRuntime(request, admission.parentRunID, admission.providerConfiguration)
+            resources = prepared
+            try validate()
+            guard let envFile = prepared.envFileURL else { throw unavailable }
+            let runID = request.runId.value.uuidString.lowercased()
+            let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: prepared.identity.storageBotID)
+            let leaseHeartbeat = try BotGuestLeaseHeartbeat(guestHome: guestHome, runID: runID, interval: deps.heartbeatInterval)
+            heartbeat = leaseHeartbeat
+            let guestCwd: String
+            switch admission.pin.context {
+            case .general: guestCwd = BotComputerGuestSpec.guestUserHome
+            case .workspace: guestCwd = request.cwd
+            }
+            let guestCommand = try DistillGuestLaunchPlan.guestCommand(binaryPath: binaryPath, for: request)
+            try validate()
+            progress(.launching)
+            try validate()
+            let plan = DistillGuestLaunchPlan(
+                runID: runID, dockerExecutable: dockerExecutable, container: prepared.container,
+                guestCwd: guestCwd, guestCommand: guestCommand, envFileURL: envFile, lease: nil,
+                teardown: { [weak self] _ in
+                    leaseHeartbeat.stop()
+                    do { try await Self.blocking { try prepared.cancel() } }
+                    catch { guestResolverLog.error("bot.context.finish_failed run=\(runID, privacy: .public)") }
+                    self?.forgetPlan(runID: runID)
+                }
+            )
+            lock.withLock { livePlans[runID] = plan }
+            return plan
+        } catch {
+            heartbeat?.stop()
+            if let resources {
+                do { try await Self.blocking { try resources.cancel() } }
+                catch { guestResolverLog.error("bot.context.prepare_cleanup_failed run=\(request.runId.value.uuidString.lowercased(), privacy: .public)") }
+            }
+            throw Self.launchError(error)
+        }
     }
 
     private func prepareGuestRun(
@@ -790,7 +854,7 @@ extension AppContext {
                     self?.state.workspaces.mapValues(\.cwd) ?? [:]
                 }
             },
-            prepareContextRuntime: { [weak self] request in
+            prepareContextRuntime: { [weak self] request, parentRunID, providerConfiguration in
                 guard let context = self else {
                     throw DistillGuestLaunchError.unavailable(
                         "Contextual execution is unavailable until runtime isolation is verified."
@@ -819,9 +883,19 @@ extension AppContext {
                         appSupport: appSupport,
                         workspace: workspace,
                         registeredWorkspaces: registeredWorkspaces,
-                        secretStore: context.contextualSecretStore
+                        secretStore: context.contextualSecretStore,
+                        parentRunID: parentRunID,
+                        providerConfiguration: providerConfiguration
                     )
                 }
+            },
+            contextualAdmissions: contextualRunAdmissions,
+            contextDockerArchitecture: {
+                let info = try docker.info()
+                guard let architecture = DistillGuestBinaryProvisioner.dockerArchitecture(fromInfo: info) else {
+                    throw DistillGuestLaunchError.unavailable("Docker did not report its CPU architecture.")
+                }
+                return architecture
             },
             hostBinary: { request in
                 DistillProvisioner.resolveInstalledBinary(override: request.providerBinary ?? distillOverride)

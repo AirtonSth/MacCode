@@ -1,5 +1,7 @@
 # Context resolver integration checkpoint
 
+The preparation-only descriptions below are historical and tied to their recorded trees. Current host-only internal admission can return a scoped guest launch plan after explicit authority and credential checks; public entry points remain closed. See [current contextual admission](CONTEXT-DELEGATION-ADMISSION.md). Its positive live provider/child probe is compiled but skipped without dedicated provider fixtures.
+
 This checkpoint proves the macOS contextual resolver's actual provider-start path reaches scoped runtime preparation, then refuses model launch and cleans up. It does not enable contextual provider execution. Public router and Bots window gates are unchanged; restricted mode and public contextual provider admission remain unavailable. There is no Mac fallback, and the resolver never returns a guest launch plan for a pinned thread.
 
 ## Actual path

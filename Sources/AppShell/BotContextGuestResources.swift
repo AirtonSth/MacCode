@@ -55,7 +55,8 @@ final class BotContextGuestResources {
         workspace: Workspace?,
         registeredWorkspaces: Set<String>,
         secretStore: (any BotSecretStore)?,
-        parentRunID: AgentRunID? = nil
+        parentRunID: AgentRunID? = nil,
+        providerConfiguration: String = ""
     ) throws -> BotContextGuestResources {
         do {
             guard request.runAsUser == nil || request.runAsUser?.uid == getuid() else {
@@ -135,9 +136,12 @@ final class BotContextGuestResources {
                         throw DistillGuestCredentialError.writeFailed(path: directory.path, errno: errno)
                     }
                     resources.configDirectory = directory
-                    let rendered = DistillGuestConfig.render(hostConfig: "", gatewayPort: issued.port, servers: [
+                    let rendered = DistillGuestConfig.render(hostConfig: providerConfiguration, gatewayPort: issued.port, servers: [
                         .init(name: BotSelfConfigCatalog.serverName, toolTimeoutSeconds: 900),
                     ], hostEnvironment: [:])
+                    guard rendered.droppedModels[request.model] == nil else {
+                        throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+                    }
                     resources.envFileURL = try DistillGuestEnvironment.writeRunFiles(
                         rendered: rendered, configDirectory: directory,
                         guestDistillHome: BotComputerGuestSpec.guestUserHome + "/" + resources.directoryName,

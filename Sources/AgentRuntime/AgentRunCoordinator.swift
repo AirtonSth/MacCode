@@ -460,6 +460,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private let orchestrationRuntime: AgentOrchestrationRuntime?
     private let providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])?
     private let botSecretStore: any BotSecretStore
+    public var botContextPinForThread: (@Sendable (AgentThreadID) throws -> BotConversationContextPin?)?
     private var providers: [AgentProvider: AgentProviderAdapter]
     private var active: [AgentRunID: AgentRunHandle] = [:]
     private var activeThreads: [AgentThreadID: AgentRunID] = [:]
@@ -1450,10 +1451,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Secret loading is part of run admission, not desktop-environment
         // shaping. Reload it for every turn so resident provider processes see
         // the exact current Bot values before scope comparison or provider start.
-        effectiveEnvironment = try BotSecretEnvironment.applying(
-            to: effectiveEnvironment,
-            store: botSecretStore
-        )
+        if try botContextPinForThread?(request.threadId) != nil {
+            effectiveEnvironment = BotSecretEnvironment.scrubbingInherited(from: effectiveEnvironment)
+        } else {
+            effectiveEnvironment = try BotSecretEnvironment.applying(
+                to: effectiveEnvironment,
+                store: botSecretStore
+            )
+        }
         let effectiveReasoningEffort = Self.normalizedProviderReasoningEffort(
             provider: request.provider,
             model: request.model,
