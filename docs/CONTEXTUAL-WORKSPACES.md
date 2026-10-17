@@ -408,3 +408,11 @@ An independent review of the delta found three real defects, all fixed: (1) `RC2
 ### Credential-free Docker isolation run (2026-10-17, macOS 3fb9045d4)
 
 With `RC_LIVE_DOCKER=1`, `test_liveRestartReconcilesAWithoutRevivingGrantsOrRuns` (8.2 s) and `test_liveResolverProvisionsScopedRuntimesBeforeProviderGate` (14.3 s) passed against real Docker; 17 `remotecode-bot-*` containers before and after. Two tests skipped and are not passes: `test_childPrepareAndExit` (child-process helper, only meaningful when the parent test launches it) and `testDedicatedProviderCreatesRealChildAndRevokesItsGuest` (needs the OpenRouter test keys). Real-provider child execution and revocation of its guest therefore remain unproven. No A/B marker probe beyond these existing tests was added.
+
+### Docker A/B marker probe (credential-free)
+
+`BotContextABMarkerDockerTests.test_liveTwoContextsShareNoFilesCookiesMemoryOrEnvironment` (guarded by `RC_LIVE_DOCKER=1`, skips when the matching guest image is missing, never builds or pulls) provisions two workspace-scoped runtimes of one bot through the shipped `BotComputerGuestService.provision(contextBinding:...)`. In each runtime it seeds a unique file, a Chromium-profile cookie file, a `/tmp` file, a long-lived process whose argv carries a memory marker, and a process environment variable marker.
+
+Result at this revision: 1 test, 0 failures. Controls confirm each runtime reads its own file, cookie and tmp markers and sees its own process argv and environment markers. Neither runtime observed any of the peer's five markers (file contents, cookie contents, tmp, `/proc/*/cmdline` and `environ`, directory listings), the peer workspace path was absent, home mounts and networks were distinct, and the peer's file and cookie markers did not appear in the host-side scoped home. The runtime count of `remotecode-bot-*` containers was 17 before and after.
+
+Limits: this proves container-level separation with the guest image only. Real provider credentials, OAuth refresh and delegated child isolation remain unproven and contextual provider execution stays blocked.
