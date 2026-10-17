@@ -26,6 +26,7 @@ final class BotContextGuestResources {
     private var homeDirectory: PrivateDirectory?
     private let operationLock = NSLock()
     private var finished = false
+    private var stopRequired = false
 
     var hasCredentialMaterial: Bool {
         operationLock.lock()
@@ -241,8 +242,9 @@ final class BotContextGuestResources {
     }
 
     private func finishLocked(stopRuntime: Bool) throws {
+        stopRequired = stopRequired || stopRuntime
         if finished {
-            guard stopRuntime else { return }
+            guard stopRequired else { return }
             let ownsScope = Self.lock.withLock {
                 guard Self.live[identity.storageBotID] == nil || Self.live[identity.storageBotID] === self else { return false }
                 Self.live[identity.storageBotID] = self
@@ -281,7 +283,7 @@ final class BotContextGuestResources {
             catch { if descendantError == nil { descendantError = error } }
         }
         if let descendantError { throw descendantError }
-        if stopRuntime { try service.stopForContextRecovery(identity: identity) }
+        if stopRequired { try service.stopForContextRecovery(identity: identity) }
         if let networkLease {
             try service.revokeGatewayLease(networkLease)
         } else if installationAttempted {

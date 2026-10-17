@@ -719,7 +719,7 @@ extension AppContext {
     /// wait on; elsewhere guest threads fail.
     func makeBotGuestRunResolver(hostsGuestRuns: Bool) -> BotGuestRunResolver {
         let appSupport = appSupportDirectory
-        let docker = BotComputerDockerCLI()
+        let docker = guestDocker
         let guestService = BotComputerGuestService(
             appSupport: appSupport,
             docker: docker,

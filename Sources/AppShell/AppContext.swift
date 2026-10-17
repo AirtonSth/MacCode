@@ -170,6 +170,7 @@ public final class AppContext {
     }()
     /// Opens once launch cleanup of bot guests is done; guest runs wait on it.
     public let botGuestLaunchBarrier = DistillGuestLaunchBarrier()
+    let guestDocker: any BotComputerDockerClienting
     /// Decides and prepares in-guest Distill runs; quit ends the ones it owns.
     private(set) var botGuestRunResolver: BotGuestRunResolver?
     /// The Distill update schedule (`startDistillAutoUpdates`); nil in a
@@ -585,9 +586,11 @@ public final class AppContext {
         /// Background helpers that share the same SQLite (Scheduled Task Agent)
         /// must NOT flip every live interactive run to `interrupted`.
         performLaunchRunReconciliation: Bool = true,
-        contextualSecretStore: any BotSecretStore = BotKeychainSecretStore()
+        contextualSecretStore: any BotSecretStore = BotKeychainSecretStore(),
+        guestDocker: any BotComputerDockerClienting = BotComputerDockerCLI()
     ) throws {
         self.channel = channel
+        self.guestDocker = guestDocker
         self.contextualSecretStore = contextualSecretStore
         self.hostsBotGroupConversations = performLaunchRunReconciliation
         self.accountUsageRefresher = accountUsageRefresher

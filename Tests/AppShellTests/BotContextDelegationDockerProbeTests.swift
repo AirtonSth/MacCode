@@ -9,14 +9,23 @@ import Persistence
 @MainActor
 final class BotContextDelegationDockerProbeTests: XCTestCase {
     func test_sameContextResourceDelegationThroughRealDocker() async throws {
+        try await run_sameContextResourceDelegationThroughRealDocker(injectChildStopFailure: false)
+    }
+
+    func test_sameContextResourceDelegationStopFailureThroughRealDocker() async throws {
+        try await run_sameContextResourceDelegationThroughRealDocker(injectChildStopFailure: true)
+    }
+
+    private func run_sameContextResourceDelegationThroughRealDocker(injectChildStopFailure: Bool) async throws {
         guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {
             throw XCTSkip("set RC_LIVE_DOCKER=1 for the real Docker delegation probe")
         }
-        let docker = BotComputerDockerCLI()
-        _ = try docker.info()
-        XCTAssertTrue(try docker.imageExists(tag: BotComputerGuestSpec.imageTag))
-        XCTAssertEqual(try docker.imageLabel(tag: BotComputerGuestSpec.imageTag, key: BotComputerGuestSpec.recipeLabelKey), BotComputerGuestSpec.recipeRevision)
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent("delegation-probe-\(UUID().uuidString)", isDirectory: true)
+        let realDocker = BotComputerDockerCLI()
+        _ = try realDocker.info()
+        XCTAssertTrue(try realDocker.imageExists(tag: BotComputerGuestSpec.imageTag))
+        XCTAssertEqual(try realDocker.imageLabel(tag: BotComputerGuestSpec.imageTag, key: BotComputerGuestSpec.recipeLabelKey), BotComputerGuestSpec.recipeRevision)
+        let probeRoot = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"]), isDirectory: true)
+        let root = probeRoot.appendingPathComponent("delegation-probe-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         var cleanupConfirmed = true
         defer {
@@ -48,10 +57,12 @@ final class BotContextDelegationDockerProbeTests: XCTestCase {
             try secrets.save(botID: identities[index].storageBotID, name: "CONTEXT_MARKER", value: markers[index])
             try secrets.save(botID: identities[index].storageBotID, name: names[index], value: "synthetic")
         }
+        let docker = DescendantCleanupDocker(real: realDocker)
         let service = BotComputerGuestService(appSupport: support, docker: docker, recipeContext: nil)
         var resources: [BotContextGuestResources] = []
         var heartbeats: [BotGuestLeaseHeartbeat] = []
         defer {
+            docker.failChildStop = false
             for heartbeat in heartbeats { heartbeat.stop() }
             for resource in resources {
                 do { try resource.finish() } catch { cleanupConfirmed = false; XCTFail("Resource cleanup failed: \(error)") }
@@ -104,7 +115,7 @@ final class BotContextDelegationDockerProbeTests: XCTestCase {
         });req.setTimeout(5000,()=>req.destroy(Error('timeout')));req.on('error',()=>process.exit(2));req.end(body);
         """#
         func invoke(_ index: Int) throws -> [String: Any] {
-            let data = try docker.run(["exec", "--env-file", envFiles[index].path, resources[index].container, "node", "-e", client])
+            let data = try realDocker.run(["exec", "--env-file", envFiles[index].path, resources[index].container, "node", "-e", client])
             return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         }
         for index in [1, 2] {
@@ -134,9 +145,10 @@ final class BotContextDelegationDockerProbeTests: XCTestCase {
         let sentinel = #"const fs=require('fs');fs.writeFileSync('/home/remotecode/.delegation-probe.pid',String(process.pid));setInterval(()=>fs.writeFileSync('/home/remotecode/.delegation-probe-pulse',String(Date.now())),100);"#
         for index in [1, 2] {
             let resource = resources[index]
+            if injectChildStopFailure, index == 1 { docker.childName = resource.container; docker.failChildStop = true }
             heartbeats.append(try BotGuestLeaseHeartbeat(guestHome: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: resource.identity.storageBotID), runID: resource.runID.value.uuidString.lowercased()))
-            _ = try docker.run(["exec", "--env-file", envFiles[index].path, "-d", resource.container, BotComputerGuestSpec.runAgentPath, resource.runID.value.uuidString.lowercased(), "--", "node", "-e", sentinel])
-            _ = try docker.run(["exec", resource.container, "sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10; do if test -f /home/remotecode/.delegation-probe.pid && kill -0 $(cat /home/remotecode/.delegation-probe.pid); then exit 0; fi; sleep 0.1; done; exit 1"])
+            _ = try realDocker.run(["exec", "--env-file", envFiles[index].path, "-d", resource.container, BotComputerGuestSpec.runAgentPath, resource.runID.value.uuidString.lowercased(), "--", "node", "-e", sentinel])
+            _ = try realDocker.run(["exec", resource.container, "sh", "-c", "for i in 1 2 3 4 5 6 7 8 9 10; do if test -f /home/remotecode/.delegation-probe.pid && kill -0 $(cat /home/remotecode/.delegation-probe.pid); then exit 0; fi; sleep 0.1; done; exit 1"])
         }
         let authority = try XCTUnwrap(ctx.router?.botRoutineAuthority)
         let result = try authority.dispatch(method: "bot.context.revoke", params: [
@@ -157,9 +169,24 @@ final class BotContextDelegationDockerProbeTests: XCTestCase {
             .appendingPathComponent(childRequest.runId.value.uuidString.lowercased() + ".context.json")
         let deadline = Date().addingTimeInterval(15)
         var childEnded = false
+        if injectChildStopFailure {
+            while Date() < deadline && (docker.failures == 0 || (try? JSONDecoder().decode(BotContextGuestRecovery.Record.self, from: Data(contentsOf: journal)).state) != .pending) {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            XCTAssertGreaterThan(docker.failures, 0)
+            XCTAssertEqual(try JSONDecoder().decode(BotContextGuestRecovery.Record.self, from: Data(contentsOf: journal)).state, .pending)
+            XCTAssertTrue(try realDocker.inspect(name: resources[1].container).running)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: envFiles[1].path))
+            XCTAssertFalse(try store.authorizesContextDelegation(hostID: host, runID: childRequest.runId, threadID: childRequest.threadId))
+            XCTAssertTrue(try XCTUnwrap(store.contextDelegation(childRunID: childRequest.runId)).closed)
+            XCTAssertTrue(try realDocker.inspect(name: resources[2].container).running)
+            XCTAssertEqual(try invoke(2)["status"] as? Int, 200)
+            docker.failChildStop = false
+            try resources[0].cancel()
+        }
         while Date() < deadline {
             let record = try JSONDecoder().decode(BotContextGuestRecovery.Record.self, from: Data(contentsOf: journal))
-            let childRunning = try docker.inspect(name: resources[1].container).running
+            let childRunning = try realDocker.inspect(name: resources[1].container).running
             if record.state == .ended && !childRunning {
                 childEnded = true
                 break
@@ -169,11 +196,11 @@ final class BotContextDelegationDockerProbeTests: XCTestCase {
         XCTAssertTrue(childEnded, "Ancestor revocation must stop and finish the child, not only close its authority")
         XCTAssertFalse(FileManager.default.fileExists(atPath: envFiles[1].path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(resources[1].configDirectory).path))
-        XCTAssertTrue(try docker.inspect(name: resources[2].container).running)
-        _ = try docker.run(["exec", resources[2].container, "sh", "-c", "kill -0 $(cat /home/remotecode/.delegation-probe.pid)"])
-        let pulseBefore = try docker.run(["exec", resources[2].container, "cat", "/home/remotecode/.delegation-probe-pulse"])
+        XCTAssertTrue(try realDocker.inspect(name: resources[2].container).running)
+        _ = try realDocker.run(["exec", resources[2].container, "sh", "-c", "kill -0 $(cat /home/remotecode/.delegation-probe.pid)"])
+        let pulseBefore = try realDocker.run(["exec", resources[2].container, "cat", "/home/remotecode/.delegation-probe-pulse"])
         try await Task.sleep(nanoseconds: 250_000_000)
-        let pulseAfter = try docker.run(["exec", resources[2].container, "cat", "/home/remotecode/.delegation-probe-pulse"])
+        let pulseAfter = try realDocker.run(["exec", resources[2].container, "cat", "/home/remotecode/.delegation-probe-pulse"])
         XCTAssertNotEqual(pulseBefore, pulseAfter, "B must keep executing after ancestor A is revoked")
         XCTAssertTrue(FileManager.default.fileExists(atPath: envFiles[2].path))
         XCTAssertEqual(try invoke(2)["status"] as? Int, 200)
