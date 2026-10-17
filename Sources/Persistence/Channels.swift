@@ -48,9 +48,16 @@ public enum AppPaths {
 
     public static func socketPath(for channel: ReleaseChannel, override: String? = nil) -> String {
         if let override { return override }
-        if let env = ProcessInfo.processInfo.environment["RC2_SOCKET_PATH"], env.hasPrefix("/") { return env }
+        if let env = ProcessInfo.processInfo.environment["RC2_SOCKET_PATH"], env.hasPrefix("/"), isSocketOrAbsent(env) { return env }
         // Use a short path under /tmp because Unix socket path is limited (~104 bytes).
         return "/tmp/\(channel.displayName).sock"
+    }
+
+    /// The server unlinks its path before binding, so the override may only name a socket or nothing.
+    private static func isSocketOrAbsent(_ path: String) -> Bool {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return true }
+        return (info.st_mode & S_IFMT) == S_IFSOCK
     }
 
     public static func databasePath(for channel: ReleaseChannel, override: String? = nil) -> String {

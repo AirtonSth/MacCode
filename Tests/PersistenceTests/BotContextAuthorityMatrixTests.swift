@@ -125,7 +125,7 @@ final class BotContextAuthorityMatrixTests: XCTestCase {
         }
 
         // Entry points with no contextual contract must refuse a context instead of inferring a grant.
-        for method in ["bot.send", "bot.routine.run", "bot.routine.create", "bot.files.list", "bot.conversation.fork", "bot.queue.force_now", "bot.guest.start", "peer.ask", "peer.self_config", "bot.routine.update", "bot.routine.set_enabled"] {
+        for method in ["bot.send", "bot.routine.run", "bot.routine.create", "bot.files.list", "bot.conversation.fork", "bot.queue.force_now", "bot.guest.start", "bot.routine.update", "bot.routine.set_enabled"] {
             var p = params("bot.conversation.list", bot: botA, key: "general:v1", revision: 1, convo: generalA.id)
             p["client_request_id"] = UUID().uuidString
             p["text"] = "x"
@@ -141,15 +141,23 @@ final class BotContextAuthorityMatrixTests: XCTestCase {
             return st.columnInt64(0)
         }
         let bindingsBeforeRestricted = try bindingCount()
+        func restrictedGrant(_ extra: [String: Any]) -> [String: Any] {
+            var p: [String: Any] = ["client_request_id": UUID().uuidString, "host_id": host, "bot_id": botB, "context_key": workspaceKey, "context_version": 1, "policy_revision": 0, "actions": ["read"]]
+            p.merge(extra) { _, new in new }
+            return p
+        }
         for field in ["access_mode", "isolation", "restricted", "network_policy", "filesystem_mode"] {
-            for method in ["bot.context.grant", "bot.conversation.create", "bot.conversation.enqueue"] {
+            XCTAssertThrowsError(try authority.dispatch(method: "bot.context.grant", params: restrictedGrant([field: "restricted"])), "grant must refuse unknown \(field)")
+            for method in ["bot.conversation.create", "bot.conversation.enqueue"] {
                 var p = params(method, bot: botA, key: "general:v1", revision: 1, convo: generalA.id)
-                if method == "bot.context.grant" { p["actions"] = ["read"]; p["policy_revision"] = 0; p["client_request_id"] = UUID().uuidString }
                 p[field] = "restricted"
                 XCTAssertThrowsError(try authority.dispatch(method: method, params: p), "\(method) must refuse unknown \(field)")
             }
         }
         XCTAssertEqual(try bindingCount(), bindingsBeforeRestricted, "refused restricted requests must not change any binding")
+        // Control: the same grant without the extra field is valid, so the field alone caused each refusal.
+        _ = try authority.dispatch(method: "bot.context.grant", params: restrictedGrant([:]))
+        XCTAssertEqual(try bindingCount(), bindingsBeforeRestricted + 1)
 
         // A retried contextual mutation replays its stored outcome instead of repeating the write.
         let replayParams = params("bot.conversation.create", bot: botA, key: "general:v1", revision: 1, convo: generalA.id)
@@ -249,9 +257,11 @@ final class BotContextRoutinePeerReplayTests: XCTestCase {
         // A contextual grant, once revoked, cannot be used to reach peer or routine entry points.
         _ = try reopened.dispatch(method: "bot.context.grant", params: ["client_request_id": "g", "host_id": host, "bot_id": bot, "context_key": "general:v1", "context_version": 1, "policy_revision": 0, "actions": ["read", "send", "delegate", "schedule"]])
         _ = try reopened.dispatch(method: "bot.context.revoke", params: ["client_request_id": "rv", "host_id": host, "bot_id": bot, "context_key": "general:v1", "context_version": 1, "policy_revision": 1])
-        for method in ["peer.ask", "bot.routine.run"] {
+        // Control: the peer entry point answers when no revoked context is attached.
+        _ = try reopened.dispatch(method: "bot.peer.ask", params: ["client_request_id": "peer-ok", "bot_id": bot, "handle": "x"])
+        for method in ["bot.peer.ask", "bot.routine.run"] {
             var p: [String: Any] = ["client_request_id": UUID().uuidString, "bot_id": bot, "host_id": host, "context_key": "general:v1", "context_version": 1, "policy_revision": 1, "routine_id": routine, "handle": "x", "text": "x"]
-            if method == "peer.ask" { p["client_request_id"] = "peer-\(UUID().uuidString)" }
+            if method == "bot.peer.ask" { p["client_request_id"] = "peer-\(UUID().uuidString)" }
             XCTAssertThrowsError(try reopened.dispatch(method: method, params: p), "\(method) must refuse a revoked contextual grant")
         }
         XCTAssertEqual(sends, 1, "no refused call may reach the host send")
