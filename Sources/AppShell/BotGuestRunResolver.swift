@@ -110,7 +110,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     ) async throws -> DistillGuestLaunchPlan? {
         if try deps.botStore.conversationContextPin(linkedTo: request.threadId) != nil {
             let work = Task {
-                try await self.preparePinnedContextRuntime(request)
+                try await self.preparePinnedContextRuntime(request, progress: progress)
             }
             request.acceptancePermit?.onInvalidate { work.cancel() }
             return try await withTaskCancellationHandler {
@@ -140,7 +140,10 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         }
     }
 
-    private func preparePinnedContextRuntime(_ request: AgentRunRequest) async throws -> Never {
+    private func preparePinnedContextRuntime(
+        _ request: AgentRunRequest,
+        progress: @escaping @Sendable (DistillGuestStage) -> Void
+    ) async throws -> Never {
         let unavailable = DistillGuestLaunchError.unavailable(
             "Contextual execution is unavailable until runtime isolation is verified."
         )
@@ -148,12 +151,12 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         try await deps.barrier.wait()
         try Task.checkCancellation()
         guard let prepareContextRuntime = deps.prepareContextRuntime else { throw unavailable }
-        let resources = try await prepareContextRuntime(request)
-        do {
-            try await Self.blocking { try resources.cancel() }
-        } catch {
-            throw Self.launchError(error)
-        }
+        let resources: BotContextGuestResources
+        do { resources = try await prepareContextRuntime(request) }
+        catch { throw Self.launchError(error) }
+        if resources.hasCredentialMaterial { progress(.preparingAgent) }
+        do { try await Self.blocking { try resources.cancel() } }
+        catch { throw Self.launchError(error) }
         try Task.checkCancellation()
         throw unavailable
     }
@@ -816,7 +819,7 @@ extension AppContext {
                         appSupport: appSupport,
                         workspace: workspace,
                         registeredWorkspaces: registeredWorkspaces,
-                        secretStore: nil
+                        secretStore: context.contextualSecretStore
                     )
                 }
             },

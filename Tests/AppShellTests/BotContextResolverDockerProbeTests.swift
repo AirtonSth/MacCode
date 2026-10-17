@@ -25,7 +25,7 @@ final class BotContextResolverDockerProbeTests: XCTestCase {
         }
         let support = root.appendingPathComponent("support", isDirectory: true)
         let database = root.appendingPathComponent("probe.sqlite")
-        let ctx = try AppContext(channel: .debug, dbPathOverride: database.path, appSupportOverride: support.path, privateAccountAPI: SilentWakeRecordingAPI(), performLaunchRunReconciliation: true)
+        let ctx = try AppContext(channel: .debug, dbPathOverride: database.path, appSupportOverride: support.path, privateAccountAPI: SilentWakeRecordingAPI(), performLaunchRunReconciliation: true, contextualSecretStore: InMemoryBotSecretStore())
         ctx.router = AppCommandRouter(context: ctx)
         let router = try XCTUnwrap(ctx.router)
         let host = ctx.liveActivityHostIdentity.serverId

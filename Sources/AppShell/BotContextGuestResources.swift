@@ -26,6 +26,12 @@ final class BotContextGuestResources {
     private var homeDirectory: PrivateDirectory?
     private let operationLock = NSLock()
     private var finished = false
+
+    var hasCredentialMaterial: Bool {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        return !finished && envFileURL != nil && configDirectory != nil
+    }
     private var directoryName: String { ".distill-context-\(runID.value.uuidString.lowercased())" }
 
     private init(identity: BotContextRuntimeIdentity, runID: AgentRunID, threadID: AgentThreadID, store: BotStore, service: BotComputerGuestService, gateway: BotGuestMCPGateway?, appSupport: URL) {
@@ -89,7 +95,6 @@ final class BotContextGuestResources {
                 }
             }
             let context = BotGuestMCPGateway.ContextBinding(pin: pin, threadID: request.threadId)
-            // ponytail: runtime-only omits credentials; enable them only after isolation probes pass.
             let gateway = secretStore.map { BotGuestMCPGateway(context: context, contextStore: store, secretStore: $0) }
             let resources = BotContextGuestResources(identity: identity, runID: request.runId, threadID: request.threadId, store: store, service: service, gateway: gateway, appSupport: appSupport)
             resources.operationLock.lock()

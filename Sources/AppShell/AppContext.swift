@@ -135,6 +135,7 @@ public final class AppContext {
     /// Off-MainActor owner for the authoritative HTTP workspace list read.
     public let workspaceListGateway: WorkspaceListGateway
     public let botStore: BotStore
+    let contextualSecretStore: any BotSecretStore
     /// Host MCP servers for bot agents running inside their Linux guest. Binds
     /// 127.0.0.1 on the first issued run bearer; stopped at app termination.
     public let botGuestMCPGateway = BotGuestMCPGateway()
@@ -583,9 +584,11 @@ public final class AppContext {
         /// Interactive RemoteCode must reconcile abandoned runs on launch.
         /// Background helpers that share the same SQLite (Scheduled Task Agent)
         /// must NOT flip every live interactive run to `interrupted`.
-        performLaunchRunReconciliation: Bool = true
+        performLaunchRunReconciliation: Bool = true,
+        contextualSecretStore: any BotSecretStore = BotKeychainSecretStore()
     ) throws {
         self.channel = channel
+        self.contextualSecretStore = contextualSecretStore
         self.hostsBotGroupConversations = performLaunchRunReconciliation
         self.accountUsageRefresher = accountUsageRefresher
         self.agentSkillsHomeOverrideForTesting = agentSkillsHomeOverrideForTesting
