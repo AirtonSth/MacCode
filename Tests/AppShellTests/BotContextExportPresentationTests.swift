@@ -5,6 +5,7 @@ import Persistence
 import SocketServer
 import XCTest
 @testable import AppShell
+@testable import Surfaces
 
 @MainActor
 final class BotContextExportPresentationTests: XCTestCase {
@@ -37,7 +38,8 @@ final class BotContextExportPresentationTests: XCTestCase {
         let host = context.liveActivityHostIdentity.serverId
         let sourceGrant = try context.botStore.grantContext(hostID: host, botID: bot.id, context: .general, actions: [.read, .send, .export], expectedRevision: 0)
         let targetGrant = try context.botStore.grantContext(hostID: host, botID: bot.id, context: targetContext, actions: [.read, .send], expectedRevision: 0)
-        let sourceThread = AgentThread(title: "Source", provider: .distill, model: "unused")
+        var sourceThread = AgentThread(title: "Source", provider: .distill, model: "unused")
+        sourceThread.status = .completed
         let source = BotConversation(botID: bot.id, title: "Source", linkedAgentThreadID: sourceThread.id)
         try context.botStore.createContextualConversation(source, newThread: sourceThread, hostID: host, context: .general, policyRevision: sourceGrant.policyRevision)
         for text in ["first approved excerpt", "second approved excerpt"] {
@@ -68,6 +70,17 @@ final class BotContextExportPresentationTests: XCTestCase {
         model.chooseTarget(target.storageKey)
         XCTAssertEqual(model.targetKey, target.storageKey)
         model.preview()
+    }
+
+    func testCanonicalDeskSelectionHydratesEmbeddedAgentHistory() async throws {
+        let f = try fixture("history")
+        let expected = try f.context.messageRepo.list(threadId: f.sourceThread.id)
+        XCTAssertEqual(expected.count, 2)
+        let embedded = try XCTUnwrap(f.vm.deskAgentVM, "Canonical desk selection must mount its embedded Agent App model")
+        await embedded.waitForMessageHistoryLoad()
+        XCTAssertEqual(embedded.selectedThreadId, f.sourceThread.id)
+        XCTAssertEqual(embedded.messages.map(\.id), expected.map(\.id), "Opening a contextual conversation must hydrate its canonical stored excerpts without provider execution")
+        XCTAssertEqual(embedded.messages.map(\.content), expected.map(\.content), "Hydrated history must include the stored excerpt bodies, not only message shells")
     }
 
     func testRealPresentationReviewAndRevocationCannotCopyOrMutateConversations() async throws {

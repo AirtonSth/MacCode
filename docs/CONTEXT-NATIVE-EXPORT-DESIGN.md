@@ -73,3 +73,17 @@ Statuses describe design guidance reflected in implementation, not verification 
 ## Remaining verification
 
 Run the planned native tests and GUI/device checks. Exercise empty, one, many, unavailable-destination, and long-preview cases; confirm the preview, frozen request, selected destination, and copied text match. Verify dismissal, host/source/conversation changes, keyboard/focus, VoiceOver, and platform layouts. Record results after runs; none are asserted here.
+
+## Verification update: stable rows, binding rebinding and maximum text size
+
+Roots and baselines: iOS `ios-app/.sandbox-worktrees/contextual-workspaces-20261015` at `5e24d1ec1ae78c800dc18695937d265b356f065f`; macOS `macos-app/.sandbox-worktrees/20261016T013608Z` at `862ae1a64dd5ff3555104044c877f32c2e578443`.
+
+Findings from the accessibility-extra-extra-extra-large run:
+- The debug fixture rebound only the General binding when the host alias rotated, so the target workspace read failed with -32602. The rebinder now moves every existing binding for the previous host without creating grants or reviving revoked state. Default binding state (active, read/send) is unchanged; the export fixture grants General export explicitly.
+- The sheet showed an empty "Selected excerpts" section because rows lived in separate state from the presentation. The presentation now owns an immutable row snapshot taken when the sheet opens.
+- UI test selection now freezes a concrete row identifier before scrolling, because `firstMatch` resolved a different lazy row afterwards. The confirmation control is revealed by a drag in the outer form gutter, since the nested summary consumes centered swipes.
+- The preview target is a full-width wrapping read-only text instead of a truncated disabled picker; the selection screen keeps the native picker.
+
+Results: 105 iOS unit tests with 0 failures; `testBotContextExportNativeJourney` passed on an iPhone 17 simulator at the largest accessibility text size and on an iPad Pro 13-inch simulator at default size. A red check with the old rebinder fails the preservation assertion as expected. macOS: 20 selected tests with 0 failures, including one that loads the canonical stored excerpts (IDs and bodies) into the embedded Agent App model without provider execution.
+
+Limits: the macOS native export sheet was not driven through the GUI (automation focus and menu limitations), so macOS rendering of the hydrated timeline is not proven; the largest-text route through the Legacy-to-General roster detour intermittently hangs and remains unresolved; keyboard, VoiceOver and human usability checks are still pending.
