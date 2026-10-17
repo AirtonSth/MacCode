@@ -61,6 +61,58 @@ final class BotContextGuestResourcesTests: XCTestCase {
         assertRejected(root: root, store: store, repo: repo, workspace: workspace, thread: thread, host: "wrong-host", secrets: secrets)
     }
 
+    func testLateCancelOfFinishedRuntimeCannotStopNewOwner() throws {
+        guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {
+            throw XCTSkip("set RC_LIVE_DOCKER=1 for the real Docker runtime ownership probe")
+        }
+        let docker = BotComputerDockerCLI()
+        _ = try docker.info()
+        guard try docker.imageExists(tag: BotComputerGuestSpec.imageTag),
+              try docker.imageLabel(tag: BotComputerGuestSpec.imageTag, key: BotComputerGuestSpec.recipeLabelKey) == BotComputerGuestSpec.recipeRevision else {
+            throw XCTSkip("matching existing Docker r7 image required; probe never builds an image")
+        }
+
+        let (root, store, repo, workspace, thread, _, host, _) = try fixture()
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let service = BotComputerGuestService(appSupport: support, docker: docker, recipeContext: nil)
+        let botID: BotID
+        guard case .bot(let id) = thread.actor else { throw XCTSkip("fixture thread must belong to a bot") }
+        botID = id
+        let binding = try XCTUnwrap(store.getContextBinding(hostID: host, botID: botID, context: .workspace(workspace.id)))
+        let identity = try BotContextRuntimeIdentity(binding: binding)
+        let container = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+        defer {
+            do {
+                try service.wipe(identity: identity)
+                XCTAssertFalse(try docker.containerExists(name: container))
+                XCTAssertFalse(try docker.networkExists(name: BotComputerGuestSpec.networkName(botID: identity.storageBotID)))
+                try FileManager.default.removeItem(at: root)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+            } catch {
+                XCTFail("fixture cleanup failed: \(error)")
+            }
+        }
+
+        let firstRequest = AgentRunRequest(runId: AgentRunID(), threadId: thread.id, provider: .distill, model: "distill", cwd: workspace.cwd, prompt: "test")
+        let first = try BotContextGuestResources.prepare(request: firstRequest, hostID: host, store: store, threadRepo: repo, service: service, appSupport: support, workspace: workspace, registeredWorkspaces: [workspace.cwd], secretStore: nil)
+        XCTAssertNil(first.envFileURL)
+        XCTAssertNil(first.configDirectory)
+        XCTAssertEqual(first.identity, identity)
+        try first.finish()
+
+        let secondRequest = AgentRunRequest(runId: AgentRunID(), threadId: thread.id, provider: .distill, model: "distill", cwd: workspace.cwd, prompt: "test")
+        let second = try BotContextGuestResources.prepare(request: secondRequest, hostID: host, store: store, threadRepo: repo, service: service, appSupport: support, workspace: workspace, registeredWorkspaces: [workspace.cwd], secretStore: nil)
+        XCTAssertEqual(second.identity, first.identity)
+        XCTAssertEqual(second.container, first.container)
+        XCTAssertNotEqual(second.runID, first.runID)
+        XCTAssertTrue(try docker.inspect(name: second.container).running)
+        try first.cancel()
+        XCTAssertTrue(try docker.containerExists(name: second.container), "late cancel must not remove newer owner's container")
+        XCTAssertTrue(try docker.inspect(name: second.container).running, "late cancel must not stop newer owner's runtime")
+        try second.cancel()
+        XCTAssertFalse(try docker.inspect(name: second.container).running)
+    }
+
     func testPersistedRunAsUserRejectedWhenRequestOmitsIt() throws {
         let (root, store, repo, workspace, original, _, host, _) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }

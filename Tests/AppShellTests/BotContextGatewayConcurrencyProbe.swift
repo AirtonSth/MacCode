@@ -6,7 +6,7 @@ import Persistence
 import SocketServer
 @testable import AppShell
 
-private final class BlockingImageDocker: BotComputerDockerClienting, @unchecked Sendable {
+final class BlockingImageDocker: BotComputerDockerClienting, @unchecked Sendable {
     private let docker = BotComputerDockerCLI()
     private let entered: DispatchSemaphore
     private let release: DispatchSemaphore

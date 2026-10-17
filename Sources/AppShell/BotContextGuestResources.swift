@@ -17,7 +17,7 @@ final class BotContextGuestResources {
     private(set) var configDirectory: URL?
     private let appSupport: URL
     private let service: BotComputerGuestService
-    private let gateway: BotGuestMCPGateway
+    private let gateway: BotGuestMCPGateway?
     private let store: BotStore
     let threadID: AgentThreadID
     private var networkLease: BotContextGatewayLease?
@@ -28,7 +28,7 @@ final class BotContextGuestResources {
     private var finished = false
     private var directoryName: String { ".distill-context-\(runID.value.uuidString.lowercased())" }
 
-    private init(identity: BotContextRuntimeIdentity, runID: AgentRunID, threadID: AgentThreadID, store: BotStore, service: BotComputerGuestService, gateway: BotGuestMCPGateway, appSupport: URL) {
+    private init(identity: BotContextRuntimeIdentity, runID: AgentRunID, threadID: AgentThreadID, store: BotStore, service: BotComputerGuestService, gateway: BotGuestMCPGateway?, appSupport: URL) {
         self.appSupport = appSupport
         self.identity = identity
         self.runID = runID
@@ -47,7 +47,7 @@ final class BotContextGuestResources {
         appSupport: URL,
         workspace: Workspace?,
         registeredWorkspaces: Set<String>,
-        secretStore: any BotSecretStore,
+        secretStore: (any BotSecretStore)?,
         parentRunID: AgentRunID? = nil
     ) throws -> BotContextGuestResources {
         do {
@@ -89,56 +89,68 @@ final class BotContextGuestResources {
                 }
             }
             let context = BotGuestMCPGateway.ContextBinding(pin: pin, threadID: request.threadId)
-            let gateway = BotGuestMCPGateway(context: context, contextStore: store, secretStore: secretStore)
+            // ponytail: runtime-only omits credentials; enable them only after isolation probes pass.
+            let gateway = secretStore.map { BotGuestMCPGateway(context: context, contextStore: store, secretStore: $0) }
             let resources = BotContextGuestResources(identity: identity, runID: request.runId, threadID: request.threadId, store: store, service: service, gateway: gateway, appSupport: appSupport)
-            let claimed = lock.withLock {
-                guard live[identity.storageBotID] == nil,
-                      !live.values.contains(where: { $0.appSupport.resolvingSymlinksInPath().standardizedFileURL == appSupport.resolvingSymlinksInPath().standardizedFileURL && $0.runID == request.runId }) else { return false }
-                live[identity.storageBotID] = resources
-                return true
-            }
-            guard claimed else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+            resources.operationLock.lock()
+            var claimed = false
             do {
+                defer { resources.operationLock.unlock() }
+                let didClaim = lock.withLock {
+                    guard live[identity.storageBotID] == nil,
+                          !live.values.contains(where: { $0.appSupport.resolvingSymlinksInPath().standardizedFileURL == appSupport.resolvingSymlinksInPath().standardizedFileURL && $0.runID == request.runId }) else { return false }
+                    live[identity.storageBotID] = resources
+                    return true
+                }
+                guard didClaim else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+                claimed = true
                 if let parentRunID {
                     _ = try store.recordContextDelegation(hostID: hostID, parentRunID: parentRunID, childRunID: request.runId, childThreadID: request.threadId)
                 }
                 guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                 try BotContextGuestRecovery.begin(identity: identity, runID: request.runId, appSupport: appSupport)
                 resources.recordStarted = true
-                let adapter = BotContextSecretStore(identity: identity, store: secretStore, authorizes: authorize)
-                let trustedEnvironment = try BotSecretEnvironment.applying(to: [
-                    BotSecretEnvironment.botIDEnvironmentKey: pin.botID.value.uuidString,
-                    BotPeerDelegation.threadEnvironmentKey: thread.id.value.uuidString,
-                ], store: adapter)
-                resources.container = try service.provision(contextBinding: binding, workspace: workspace, registeredWorkspaces: registeredWorkspaces, requestingThreadID: request.threadId).containerID
-                guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
-                let run = request.runId.value.uuidString.lowercased()
-                let issued = try gateway.issue(.init(runID: run, hostEnvironment: [:], context: context))
-                resources.installationAttempted = true
-                resources.networkLease = try service.installGatewayLease(identity: identity, runID: request.runId, port: issued.port)
-                let parent = try PrivateDirectory(home, create: false)
-                resources.homeDirectory = parent
-                let directory = home.appendingPathComponent(resources.directoryName, isDirectory: true)
-                guard mkdir(directory.path, 0o700) == 0 else {
-                    throw DistillGuestCredentialError.writeFailed(path: directory.path, errno: errno)
+                if let secretStore, let gateway {
+                    let adapter = BotContextSecretStore(identity: identity, store: secretStore, authorizes: authorize)
+                    let trustedEnvironment = try BotSecretEnvironment.applying(to: [
+                        BotSecretEnvironment.botIDEnvironmentKey: pin.botID.value.uuidString,
+                        BotPeerDelegation.threadEnvironmentKey: thread.id.value.uuidString,
+                    ], store: adapter)
+                    resources.container = try service.provision(contextBinding: binding, workspace: workspace, registeredWorkspaces: registeredWorkspaces, requestingThreadID: request.threadId).containerID
+                    guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+                    let run = request.runId.value.uuidString.lowercased()
+                    let issued = try gateway.issue(.init(runID: run, hostEnvironment: [:], context: context))
+                    resources.installationAttempted = true
+                    resources.networkLease = try service.installGatewayLease(identity: identity, runID: request.runId, port: issued.port)
+                    let parent = try PrivateDirectory(home, create: false)
+                    resources.homeDirectory = parent
+                    let directory = home.appendingPathComponent(resources.directoryName, isDirectory: true)
+                    guard mkdir(directory.path, 0o700) == 0 else {
+                        throw DistillGuestCredentialError.writeFailed(path: directory.path, errno: errno)
+                    }
+                    resources.configDirectory = directory
+                    let rendered = DistillGuestConfig.render(hostConfig: "", gatewayPort: issued.port, servers: [
+                        .init(name: BotSelfConfigCatalog.serverName, toolTimeoutSeconds: 900),
+                    ], hostEnvironment: [:])
+                    resources.envFileURL = try DistillGuestEnvironment.writeRunFiles(
+                        rendered: rendered, configDirectory: directory,
+                        guestDistillHome: BotComputerGuestSpec.guestUserHome + "/" + resources.directoryName,
+                        providerEnvironment: trustedEnvironment, runID: run, gatewayToken: issued.token,
+                        gitIdentity: nil, codexClientVersion: nil,
+                        runsDirectory: DistillGuestEnvironment.runsDirectory(appSupport: appSupport)
+                            .appendingPathComponent(identity.storageBotID.value.uuidString.lowercased(), isDirectory: true)
+                    )
+                    guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+                } else {
+                    resources.container = try service.provision(contextBinding: binding, workspace: workspace, registeredWorkspaces: registeredWorkspaces, requestingThreadID: request.threadId).containerID
+                    guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                 }
-                resources.configDirectory = directory
-                let rendered = DistillGuestConfig.render(hostConfig: "", gatewayPort: issued.port, servers: [
-                    .init(name: BotSelfConfigCatalog.serverName, toolTimeoutSeconds: 900),
-                ], hostEnvironment: [:])
-                resources.envFileURL = try DistillGuestEnvironment.writeRunFiles(
-                    rendered: rendered, configDirectory: directory,
-                    guestDistillHome: BotComputerGuestSpec.guestUserHome + "/" + resources.directoryName,
-                    providerEnvironment: trustedEnvironment, runID: run, gatewayToken: issued.token,
-                    gitIdentity: nil, codexClientVersion: nil,
-                    runsDirectory: DistillGuestEnvironment.runsDirectory(appSupport: appSupport)
-                        .appendingPathComponent(identity.storageBotID.value.uuidString.lowercased(), isDirectory: true)
-                )
-                guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                 return resources
             } catch {
-                do { try resources.finish() }
-                catch { NSLog("Bot context preparation cleanup unconfirmed run=%@ error=%@", request.runId.value.uuidString.lowercased(), String(describing: error)) }
+                if claimed {
+                    do { try resources.cancel() }
+                    catch { NSLog("Bot context preparation cleanup unconfirmed run=%@ error=%@", request.runId.value.uuidString.lowercased(), String(describing: error)) }
+                }
                 throw error
             }
         }
@@ -148,7 +160,7 @@ final class BotContextGuestResources {
         try operationLock.withLock { try finishLocked(stopRuntime: false) }
     }
 
-    private func cancelDescendant() throws {
+    func cancel() throws {
         try operationLock.withLock { try finishLocked(stopRuntime: true) }
     }
 
@@ -169,7 +181,7 @@ final class BotContextGuestResources {
                 for resource in matches {
                     do {
                         if resource.runID == runID && resource.threadID == threadID { try resource.finish() }
-                        else { try resource.cancelDescendant() }
+                        else { try resource.cancel() }
                     } catch {
                         NSLog("Bot context finish failed run=%@ error=%@", resource.runID.value.uuidString.lowercased(), String(describing: error))
                     }
@@ -217,15 +229,28 @@ final class BotContextGuestResources {
                 }
             }
             for resource in captured {
-                do { try resource.cancelDescendant() }
+                do { try resource.cancel() }
                 catch { NSLog("Bot context revocation failed run=%@ error=%@", resource.runID.value.uuidString.lowercased(), String(describing: error)) }
             }
         }
     }
 
     private func finishLocked(stopRuntime: Bool) throws {
-        guard !finished else { return }
-        gateway.revoke(runID: runID.value.uuidString.lowercased())
+        if finished {
+            guard stopRuntime else { return }
+            let ownsScope = Self.lock.withLock {
+                guard Self.live[identity.storageBotID] == nil || Self.live[identity.storageBotID] === self else { return false }
+                Self.live[identity.storageBotID] = self
+                return true
+            }
+            guard ownsScope else { return }
+            try service.stopForContextRecovery(identity: identity)
+            Self.lock.withLock {
+                if Self.live[identity.storageBotID] === self { Self.live[identity.storageBotID] = nil }
+            }
+            return
+        }
+        gateway?.revoke(runID: runID.value.uuidString.lowercased())
         // Remove distributed credentials even if the network cannot be reconciled.
         if let envFileURL {
             guard unlink(envFileURL.path) == 0 || errno == ENOENT else {
@@ -247,7 +272,7 @@ final class BotContextGuestResources {
         }
         var descendantError: Error?
         for child in descendants {
-            do { try child.cancelDescendant() }
+            do { try child.cancel() }
             catch { if descendantError == nil { descendantError = error } }
         }
         if let descendantError { throw descendantError }
@@ -257,7 +282,7 @@ final class BotContextGuestResources {
         } else if installationAttempted {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
         }
-        gateway.stop()
+        gateway?.stop()
         if let homeDirectory {
             if configDirectory != nil {
                 homeDirectory.removeTree(directoryName)
