@@ -63,7 +63,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         var dockerExecutable: @Sendable () throws -> String
         /// Registered workspace roots by id (MainActor state in the app).
         var workspaces: @Sendable () async -> [WorkspaceID: String]
-        var prepareContextRuntime: (@Sendable (AgentRunRequest, AgentRunID?, String) async throws -> BotContextGuestResources)? = nil
+        var prepareContextRuntime: (@Sendable (AgentRunRequest, AgentRunID?, String, Bool) async throws -> BotContextGuestResources)? = nil
         var contextualAdmissions: BotContextRunAdmissions? = nil
         var contextDockerArchitecture: (@Sendable () throws -> String)? = nil
         /// The Mac distill binary, for its version (nil: not installed).
@@ -104,6 +104,11 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
 
     func isGuestThread(_ threadId: AgentThreadID) -> Bool {
         (try? deps.threadRepo.guestPlacement(of: threadId))??.runsInGuest == true
+    }
+
+    func preservesSessionIdentity(_ threadId: AgentThreadID) -> Bool {
+        do { return try deps.botStore.conversationContextPin(linkedTo: threadId) != nil }
+        catch { return true }
     }
 
     func prepare(
@@ -154,13 +159,13 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         try Task.checkCancellation()
         guard let prepareContextRuntime = deps.prepareContextRuntime else { throw unavailable }
         guard let admissions = deps.contextualAdmissions else {
-            let resources = try await prepareContextRuntime(request, nil, "")
+            let resources = try await prepareContextRuntime(request, nil, "", false)
             if resources.hasCredentialMaterial { progress(.preparingAgent) }
             try await Self.blocking { try resources.cancel() }
             throw unavailable
         }
         guard let admission = try admissions.consume(request) else {
-            let resources = try await prepareContextRuntime(request, nil, "")
+            let resources = try await prepareContextRuntime(request, nil, "", false)
             if resources.hasCredentialMaterial { progress(.preparingAgent) }
             try await Self.blocking { try resources.cancel() }
             throw unavailable
@@ -174,7 +179,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             }
             try validate()
             guard request.providerBinary == nil,
-                  request.extraArgs.isEmpty, request.providerThreadId == nil,
+                  request.extraArgs.isEmpty, request.providerThreadId == admission.resumeCursor,
                   !admission.model.isEmpty, request.model == admission.model,
                   let architecture = deps.contextDockerArchitecture else { throw unavailable }
             progress(.preparingAgent)
@@ -186,7 +191,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             try validate()
             let dockerExecutable = try deps.dockerExecutable()
             progress(.startingVM)
-            let prepared = try await prepareContextRuntime(request, admission.parentRunID, admission.providerConfiguration)
+            let prepared = try await prepareContextRuntime(request, admission.parentRunID, admission.providerConfiguration, true)
             resources = prepared
             try validate()
             guard let envFile = prepared.envFileURL else { throw unavailable }
@@ -211,7 +216,8 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                     do { try await Self.blocking { try prepared.cancel() } }
                     catch { guestResolverLog.error("bot.context.finish_failed run=\(runID, privacy: .public)") }
                     self?.forgetPlan(runID: runID)
-                }
+                },
+                onSessionOpened: admission.recordOpened
             )
             lock.withLock { livePlans[runID] = plan }
             return plan
@@ -854,7 +860,7 @@ extension AppContext {
                     self?.state.workspaces.mapValues(\.cwd) ?? [:]
                 }
             },
-            prepareContextRuntime: { [weak self] request, parentRunID, providerConfiguration in
+            prepareContextRuntime: { [weak self] request, parentRunID, providerConfiguration, persistentSession in
                 guard let context = self else {
                     throw DistillGuestLaunchError.unavailable(
                         "Contextual execution is unavailable until runtime isolation is verified."
@@ -885,7 +891,8 @@ extension AppContext {
                         registeredWorkspaces: registeredWorkspaces,
                         secretStore: context.contextualSecretStore,
                         parentRunID: parentRunID,
-                        providerConfiguration: providerConfiguration
+                        providerConfiguration: providerConfiguration,
+                        persistentSession: persistentSession
                     )
                 }
             },

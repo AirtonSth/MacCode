@@ -27,13 +27,18 @@ final class BotContextGuestResources {
     private let operationLock = NSLock()
     private var finished = false
     private var stopRequired = false
+    private var persistentSession = false
+    private var sessionPin: BotConversationContextPin?
 
     var hasCredentialMaterial: Bool {
         operationLock.lock()
         defer { operationLock.unlock() }
         return !finished && envFileURL != nil && configDirectory != nil
     }
-    private var directoryName: String { ".distill-context-\(runID.value.uuidString.lowercased())" }
+    private var directoryName: String {
+        if persistentSession, let sessionPin { return BotContextSessionStore.directoryName(pin: sessionPin) }
+        return ".distill-context-\(runID.value.uuidString.lowercased())"
+    }
 
     private init(identity: BotContextRuntimeIdentity, runID: AgentRunID, threadID: AgentThreadID, store: BotStore, service: BotComputerGuestService, gateway: BotGuestMCPGateway?, appSupport: URL) {
         self.appSupport = appSupport
@@ -56,7 +61,8 @@ final class BotContextGuestResources {
         registeredWorkspaces: Set<String>,
         secretStore: (any BotSecretStore)?,
         parentRunID: AgentRunID? = nil,
-        providerConfiguration: String = ""
+        providerConfiguration: String = "",
+        persistentSession: Bool = false
     ) throws -> BotContextGuestResources {
         do {
             guard request.runAsUser == nil || request.runAsUser?.uid == getuid() else {
@@ -96,9 +102,16 @@ final class BotContextGuestResources {
                     throw BotComputerGuestServiceError.contextualRuntimeUnavailable
                 }
             }
+            if persistentSession {
+                try BotContextSessionStore.validate(pin: pin, threadID: request.threadId,
+                    parentRunID: parentRunID, cwd: request.cwd, resumeCursor: request.providerThreadId,
+                    appSupport: appSupport, authorizes: authorize)
+            }
             let context = BotGuestMCPGateway.ContextBinding(pin: pin, threadID: request.threadId)
             let gateway = secretStore.map { BotGuestMCPGateway(context: context, contextStore: store, secretStore: $0) }
             let resources = BotContextGuestResources(identity: identity, runID: request.runId, threadID: request.threadId, store: store, service: service, gateway: gateway, appSupport: appSupport)
+            resources.persistentSession = persistentSession
+            resources.sessionPin = persistentSession ? pin : nil
             resources.operationLock.lock()
             var claimed = false
             do {
@@ -115,7 +128,7 @@ final class BotContextGuestResources {
                     _ = try store.recordContextDelegation(hostID: hostID, parentRunID: parentRunID, childRunID: request.runId, childThreadID: request.threadId)
                 }
                 guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
-                try BotContextGuestRecovery.begin(identity: identity, runID: request.runId, appSupport: appSupport)
+                try BotContextGuestRecovery.begin(identity: identity, runID: request.runId, conversationID: persistentSession ? pin.conversationID : nil, appSupport: appSupport)
                 resources.recordStarted = true
                 if let secretStore, let gateway {
                     let adapter = BotContextSecretStore(identity: identity, store: secretStore, authorizes: authorize)
@@ -131,9 +144,18 @@ final class BotContextGuestResources {
                     resources.networkLease = try service.installGatewayLease(identity: identity, runID: request.runId, port: issued.port)
                     let parent = try PrivateDirectory(home, create: false)
                     resources.homeDirectory = parent
-                    let directory = home.appendingPathComponent(resources.directoryName, isDirectory: true)
-                    guard mkdir(directory.path, 0o700) == 0 else {
-                        throw DistillGuestCredentialError.writeFailed(path: directory.path, errno: errno)
+                    let directory: URL
+                    if persistentSession {
+                        directory = try BotContextSessionStore.prepare(
+                            pin: pin, threadID: request.threadId, parentRunID: parentRunID,
+                            cwd: request.cwd, resumeCursor: request.providerThreadId,
+                            appSupport: appSupport, authorizes: authorize
+                        )
+                    } else {
+                        directory = home.appendingPathComponent(resources.directoryName, isDirectory: true)
+                        guard mkdir(directory.path, 0o700) == 0 else {
+                            throw DistillGuestCredentialError.writeFailed(path: directory.path, errno: errno)
+                        }
                     }
                     resources.configDirectory = directory
                     let rendered = DistillGuestConfig.render(hostConfig: providerConfiguration, gatewayPort: issued.port, servers: [
@@ -295,7 +317,17 @@ final class BotContextGuestResources {
         }
         gateway?.stop()
         if let homeDirectory {
-            if configDirectory != nil {
+            if persistentSession {
+                if let configDirectory {
+                    let directory = try PrivateDirectory(configDirectory, create: false)
+                    defer { directory.close() }
+                    if (try directory.entriesChecked()).contains("config.toml") {
+                        guard directory.remove("config.toml") else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+                        try directory.synchronize()
+                        guard !(try directory.entriesChecked()).contains("config.toml") else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+                    }
+                }
+            } else if configDirectory != nil {
                 homeDirectory.removeTree(directoryName)
                 guard try !homeDirectory.entriesChecked().contains(directoryName) else {
                     throw BotComputerGuestServiceError.contextualRuntimeUnavailable

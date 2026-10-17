@@ -70,9 +70,9 @@ final class BotContextInternalAdmissionTests: XCTestCase {
         storedSession.providerThreadId = "existing-session"
         try context.threadRepo.upsert(storedSession)
         let existingSession = AgentRunRequest(threadId: missingThread.id, provider: .distill, model: fixtureModel, cwd: workspace.cwd, prompt: "must refuse")
-        do { _ = try await context.startContextualRun(existingSession); XCTFail("Contextual runs must start with a fresh provider session") }
+        do { _ = try await context.startContextualRun(existingSession); XCTFail("An unbound stored provider cursor must refuse before admission") }
         catch let error as DistillGuestLaunchError {
-            XCTAssertEqual(error, .unavailable("Internal contextual admission requires a fresh provider session."))
+            XCTAssertEqual(error, .unavailable("The contextual provider session cannot be resumed safely."))
         }
         XCTAssertNil(try context.runRepo.get(id: existingSession.runId))
         XCTAssertFalse(FileManager.default.fileExists(atPath: BotComputerGuestSpec.guestHomeRoot(appSupport: root.appendingPathComponent("support", isDirectory: true)).path))

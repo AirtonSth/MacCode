@@ -764,6 +764,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         reason: FreshSessionReason,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws -> AgentRunHandle {
+        guard synchronized({ guestLaunchResolver })?.preservesSessionIdentity(request.threadId) != true else {
+            throw DistillGuestLaunchError.unavailable("Scoped Distill sessions cannot be replaced with a fresh session.")
+        }
         let reasonLabel: String
         let notice: String
         switch reason {
@@ -1284,6 +1287,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     rules: BotRunMCPAdmission.distillSessionRules(environment: request.environment)
                 )
             }
+            try guestPlan?.recordSessionOpened(opened.sessionId)
             // The guest agent is up with its MCP servers: the strip goes back to the turn's own status.
             if guestPlan != nil { onEvent(.event(DistillGuestStage.ready.runtimeEvent)) }
             let mapper = DistillACPEventMapper(sessionId: opened.sessionId)

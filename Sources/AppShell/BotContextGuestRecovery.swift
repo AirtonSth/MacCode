@@ -11,12 +11,13 @@ struct BotContextGuestRecovery {
         let context: BotContext
         let policyRevision: Int64
         let runID: AgentRunID
+        var conversationID: BotConversationID? = nil
         var state: State
         enum State: String, Codable { case pending, ended }
     }
     struct Report { let reconciled: [String]; let failures: [String: String] }
 
-    static func begin(identity: BotContextRuntimeIdentity, runID: AgentRunID, appSupport: URL) throws {
+    static func begin(identity: BotContextRuntimeIdentity, runID: AgentRunID, conversationID: BotConversationID? = nil, appSupport: URL) throws {
         let directory = try scope(identity: identity, appSupport: appSupport, create: true)
         defer { directory.close() }
         let name = filename(runID)
@@ -33,7 +34,7 @@ struct BotContextGuestRecovery {
         guard !entries.contains(where: { $0.hasSuffix(".env") }) else {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
         }
-        let record = Record(version: 1, hostID: identity.hostID, botID: identity.botID, context: identity.context, policyRevision: identity.policyRevision, runID: runID, state: .pending)
+        let record = Record(version: 1, hostID: identity.hostID, botID: identity.botID, context: identity.context, policyRevision: identity.policyRevision, runID: runID, conversationID: conversationID, state: .pending)
         try directory.writeAtomically(JSONEncoder().encode(record), to: name)
         try directory.synchronize()
     }
@@ -110,10 +111,23 @@ struct BotContextGuestRecovery {
                     do {
                         let home = try PrivateDirectory(homeURL, create: false)
                         defer { home.close() }
-                        let generated = ".distill-context-\(record.runID.value.uuidString.lowercased())"
-                        home.removeTree(generated)
-                        guard !(try home.entriesChecked()).contains(generated) else {
-                            throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+                        if let conversationID = record.conversationID {
+                            let generated = ".distill-context-session-\(conversationID.value.uuidString.lowercased())"
+                            let entries = try home.entriesChecked()
+                            if entries.contains(generated) {
+                                let sessionHome = try home.child(generated, create: false)
+                                defer { sessionHome.close() }
+                                if (try sessionHome.entriesChecked()).contains("config.toml") {
+                                    guard sessionHome.remove("config.toml") else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+                                    try sessionHome.synchronize()
+                                }
+                            }
+                        } else {
+                            let generated = ".distill-context-\(record.runID.value.uuidString.lowercased())"
+                            home.removeTree(generated)
+                            guard !(try home.entriesChecked()).contains(generated) else {
+                                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+                            }
                         }
                         try home.synchronize()
                     } catch let error as DistillGuestCredentialError {

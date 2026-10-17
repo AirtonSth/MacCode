@@ -11,9 +11,29 @@ final class BotContextRunAdmissions: @unchecked Sendable {
         let parentRunID: AgentRunID?
         let model: String
         let cwd: String
+        let resumeCursor: String?
         let permit: AgentRunAcceptancePermit
         let providerConfiguration: String
         let validates: @Sendable () -> Bool
+        let recordOpened: @Sendable (String) throws -> Void
+
+        init(runID: AgentRunID, threadID: AgentThreadID, pin: BotConversationContextPin,
+             parentRunID: AgentRunID?, model: String, cwd: String, resumeCursor: String? = nil,
+             permit: AgentRunAcceptancePermit, providerConfiguration: String,
+             validates: @escaping @Sendable () -> Bool,
+             recordOpened: @escaping @Sendable (String) throws -> Void = { _ in }) {
+            self.runID = runID
+            self.threadID = threadID
+            self.pin = pin
+            self.parentRunID = parentRunID
+            self.model = model
+            self.cwd = cwd
+            self.resumeCursor = resumeCursor
+            self.permit = permit
+            self.providerConfiguration = providerConfiguration
+            self.validates = validates
+            self.recordOpened = recordOpened
+        }
     }
 
     private let lock = NSLock()
@@ -35,7 +55,7 @@ final class BotContextRunAdmissions: @unchecked Sendable {
                   request.model == admission.model, request.cwd == admission.cwd,
                   let permit = request.acceptancePermit, permit === admission.permit,
                   request.providerBinary == nil, request.extraArgs.isEmpty,
-                  request.providerThreadId == nil else { throw BotStoreError.notFound }
+                  request.providerThreadId == admission.resumeCursor else { throw BotStoreError.notFound }
             admissions.removeValue(forKey: admission.runID)
             return admission
         }
@@ -114,10 +134,6 @@ extension AppContext {
               let pin = try botStore.conversationContextPin(linkedTo: request.threadId),
               let thread = try threadRepo.get(id: request.threadId), thread.model == request.model,
               thread.permissionMode == request.permissionMode else { throw BotStoreError.notFound }
-        // ponytail: fresh scoped sessions only; add durable scoped session storage before resuming.
-        guard thread.providerThreadId == nil, thread.status == .pending else {
-            throw DistillGuestLaunchError.unavailable("Internal contextual admission requires a fresh provider session.")
-        }
         switch pin.context {
         case .general:
             guard thread.workspaceId == nil, request.cwd == BotComputerGuestSpec.guestUserHome else { throw BotStoreError.notFound }
@@ -138,17 +154,59 @@ extension AppContext {
                 parentRunID: parentRunID, hostID: hostID, store: store, threadRepo: threads, runRepo: runs)
         }
         let scopedSecrets = BotContextSecretStore(identity: identity, store: secretStore, authorizes: authorizes)
+        let support = appSupportDirectory
+        guard authorizes(), let key = try scopedSecrets.load(botID: pin.botID, name: "OPENROUTER_API_KEY"),
+              !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !key.contains("\n"), !key.contains("\r") else { throw BotStoreError.notFound }
+        let resumeCursor: String?
+        do { resumeCursor = try coordinator.resumeCursorForRun(request) }
+        catch { throw DistillGuestLaunchError.unavailable("The contextual provider session cannot be resumed safely.") }
+        let storedCursor = try threadRepo.providerThreadId(of: request.threadId)
+        if let storedCursor, !storedCursor.isEmpty {
+            guard resumeCursor == storedCursor else {
+                throw DistillGuestLaunchError.unavailable("The contextual provider session cannot be resumed safely.")
+            }
+        } else if resumeCursor != nil {
+            throw DistillGuestLaunchError.unavailable("The contextual provider session cannot be resumed safely.")
+        }
         let validates: @Sendable () -> Bool = {
-            guard authorizes(), let key = try? scopedSecrets.load(botID: pin.botID, name: "OPENROUTER_API_KEY") else { return false }
-            return !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !key.contains("\n") && !key.contains("\r")
+            guard authorizes(), let key = try? scopedSecrets.load(botID: pin.botID, name: "OPENROUTER_API_KEY"),
+                  !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !key.contains("\n"), !key.contains("\r") else { return false }
+            return (try? BotContextSessionStore.validate(pin: pin, threadID: request.threadId,
+                parentRunID: parentRunID, cwd: request.cwd, resumeCursor: resumeCursor,
+                appSupport: support, authorizes: authorizes)) != nil
+        }
+        let recordOpened: @Sendable (String) throws -> Void = { sessionID in
+            guard validates() else { throw BotStoreError.notFound }
+            try BotContextSessionStore.recordOpened(sessionID: sessionID, pin: pin,
+                threadID: request.threadId, parentRunID: parentRunID, cwd: request.cwd,
+                expectedResumeCursor: resumeCursor, appSupport: support, authorizes: authorizes)
         }
         guard validates() else { throw BotStoreError.notFound }
-        var admitted = request
         let permit = AgentRunAcceptancePermit()
-        admitted.acceptancePermit = permit
+        var admitted = AgentRunRequest(
+            runId: request.runId, threadId: request.threadId, provider: request.provider,
+            providerInstanceId: request.providerInstanceId, model: request.model, cwd: request.cwd,
+            prompt: request.prompt, userMessageContent: request.userMessageContent,
+            attachments: request.attachments, providerThreadId: resumeCursor,
+            permissionMode: request.permissionMode, reasoningEffort: request.reasoningEffort,
+            reasoningModel: request.reasoningModel,
+            distillMainEffortSelection: request.distillMainEffortSelection,
+            distillReasoningEffortSelection: request.distillReasoningEffortSelection,
+            distillUltracode: request.distillUltracode, serviceTier: request.serviceTier,
+            interactionMode: request.interactionMode, providerBinary: request.providerBinary,
+            environment: request.environment, extraArgs: request.extraArgs,
+            runAsUser: request.runAsUser, acceptancePermit: permit,
+            contextSnapshot: request.contextSnapshot, preparedContextSeed: request.preparedContextSeed
+        )
+        admitted.priorProviderSessionModel = request.priorProviderSessionModel
+        admitted.priorProviderSessionRetired = request.priorProviderSessionRetired
+        admitted.priorConversationTail = request.priorConversationTail
         try contextualRunAdmissions.register(.init(runID: request.runId, threadID: request.threadId,
-            pin: pin, parentRunID: parentRunID, model: request.model, cwd: request.cwd, permit: permit,
-            providerConfiguration: configuration, validates: validates))
+            pin: pin, parentRunID: parentRunID, model: request.model, cwd: request.cwd,
+            resumeCursor: resumeCursor, permit: permit,
+            providerConfiguration: configuration, validates: validates, recordOpened: recordOpened))
         defer { contextualRunAdmissions.discard(runID: request.runId) }
         return try await coordinator.startRun(admitted)
     }

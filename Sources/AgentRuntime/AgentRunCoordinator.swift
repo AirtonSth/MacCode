@@ -5008,6 +5008,25 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return adapter
     }
 
+    public func resumeCursorForRun(_ request: AgentRunRequest) throws -> String? {
+        let cursor = try recoverableResumeContext(for: request)?.resumeCursor
+        if request.provider == .distill, let cursor {
+            guard let providerSessionRepo else {
+                throw AgentProviderAdapterError.unsupported("Scoped provider recovery metadata is unavailable.")
+            }
+            let payload = ProviderSessionRuntimePayload.decode(try providerSessionRepo.runtimePayloadJSON(of: request.threadId) ?? nil)
+            guard payload.distillRetiredSessionIds?.contains(cursor) != true else {
+                throw AgentProviderAdapterError.unsupported("Scoped provider history was retired; explicit repair is required.")
+            }
+            let previousModel = payload.distillSessionId == cursor ? payload.distillSessionModel
+                : try providerSessionRepo.sessionModel(of: request.threadId, resumeCursor: cursor)
+            guard !DistillACPAdapter.isCrossModelFamilySwitch(from: previousModel, to: request.model) else {
+                throw AgentProviderAdapterError.unsupported("Scoped provider history cannot change model family implicitly.")
+            }
+        }
+        return cursor
+    }
+
     private func recoverableResumeContext(for request: AgentRunRequest) throws -> ProviderRecoveryContext? {
         if let liveSession = liveAdapterSession(for: request) {
             return ProviderRecoveryContext(resumeCursor: liveSession.providerThreadId)
