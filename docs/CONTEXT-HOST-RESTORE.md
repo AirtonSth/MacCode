@@ -1,5 +1,7 @@
 # Host database restore without authority rollback
 
+For the bounded old/new client and host compatibility matrix, including the unsafe raw-older-host result, see [`CONTEXT-VERSION-MATRIX.md`](CONTEXT-VERSION-MATRIX.md).
+
 ## Scope and baselines
 
 The checkpoint implements the pre-revocation backup case from plan stages 7–8. The repository previously had relational thread undo and corruption quarantine, but no complete database-import entry. The new entry is an explicit offline host command, not a replacement UI or an automatic startup migration.
