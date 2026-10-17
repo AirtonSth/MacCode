@@ -164,6 +164,18 @@ final class BotContextResolverCleanupFailureDockerTests: XCTestCase {
                 let before = try await status(index)
                 XCTAssertEqual(before, 200)
             }
+            let childConversationIDs = try context.botStore.listConversations(botID: child.id).map(\.id)
+            var admission = gatewayRequests[0]
+            admission.httpBody = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": ["name": "bot_ask_peer", "arguments": ["handle": child.handle, "prompt": "owned", "reply_mode": "consult"]]])
+            let (admissionData, admissionResponse) = try await session.data(for: admission)
+            XCTAssertEqual(try XCTUnwrap(admissionResponse as? HTTPURLResponse).statusCode, 200)
+            let admissionJSON = try XCTUnwrap(try JSONSerialization.jsonObject(with: admissionData) as? [String: Any])
+            let admissionError = try XCTUnwrap(admissionJSON["error"] as? [String: Any])
+            XCTAssertEqual(admissionError["code"] as? Int, -32602)
+            XCTAssertTrue(try XCTUnwrap(admissionError["message"] as? String).contains("not available"))
+            XCTAssertEqual(try context.botStore.listConversations(botID: child.id).map(\.id), childConversationIDs)
+            XCTAssertNil(try context.botStore.contextDelegation(childRunID: requests[1].runId))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("provider-ran").path))
             dockerGate.failChildStop = true
             context.coordinator.stopRun(requests[0].runId)
             observerInstance.release(run: requests[0].runId)
