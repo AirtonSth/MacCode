@@ -383,3 +383,20 @@ Each row names the shipped change and the strongest evidence actually obtained. 
 Not attempted this round: a real macOS window drive. Earlier attempts returned `stale_state_token` and `focus_required` from the accessibility tooling and never showed the export sheet, so no GUI launch readback is claimed beyond the offscreen render.
 
 The 21-row design-skill ledger lives in `CONTEXT-GROUPING-DESIGN.md` and `CONTEXT-LEGACY-RESTORE-DESIGN.md`; this round changed no view layout, so its rows (applied or not-applicable) are unchanged and no new visual proof is added to them.
+
+## Mapping addendum and proof status (2026-10-17, macOS 9ba410e2f, iOS 31a313f56)
+
+Proofs added after the mapping above, all on shipped code in the isolated runner:
+
+| Stage | Added proof | Status |
+|---|---|---|
+| S-002 | Confirmed export writes one `audit_log` receipt (no text), none on preview or denial, over real HTTP; `bot.conversation.enqueue` replay after DB reopen returns the same queue item without a duplicate. | passed |
+| S-005 | Restricted/isolation/network/filesystem fields refused by grant, create and enqueue; bindings unchanged. | passed (contract only; real probes unavailable: no credentials) |
+| S-006 | `peer.ask` refused after a revoked context; real consultation with a provider. | refusal passed; provider path unavailable |
+| S-007 | `bot.routine.run` replay after reopen sends once; scheduler tick after revocation runs legacy with no pin or grant change. | passed (non-interference only) |
+| S-008 | Old/new iOS client against schema 93/97 hosts 2/2 each; router and bot restart fixtures; legacy restore via packaged CLI. | passed (synthetic fixtures) |
+| S-004 | iOS export journey at largest text, iPad, offline/busy: `testBotContextExportNativeJourney` passed again at 31a313f56. macOS window: the sheet opened with the correct Host, Bot and Source; row selection and Continue in Destination were not completed in the window. | iOS passed; macOS window partial |
+
+Unavailable proofs, stated plainly: real-provider isolation, delegation, peer, OAuth refresh/resume and restricted-mode probes (no OpenRouter test keys, no dedicated OAuth account); VoiceOver, hardware keyboard, reduced motion and the human usability trial (need people); device and first-frame timing (no device pass); a macOS window drive through row selection (automation clicks failed); any run on a real personal database. The plan is not complete.
+
+Design ledger: the 21-skill table lives in `CONTEXT-GROUPING-DESIGN.md` (and `CONTEXT-LEGACY-RESTORE-DESIGN.md`). This round changed no view layout on either platform, so every row keeps its recorded status (applied or not-applicable) and no new visual proof is claimed. The installed-skill checker reports 46/46 installed.
