@@ -426,3 +426,7 @@ Re-run at this revision on shipped code with fake provider runners:
 - `BotContextDelegationTests` (7 tests): self and cycle edges, foreign host, mismatched or revoked delegate, depth 64 accepted and 65 rejected, tree close including a closed intermediate, and immutability of edges.
 
 Limit: these use fake runners. Real-provider delegation and peer behaviour stay unproven.
+
+### macOS window drive attempt (2026-10-17): environmental failure
+
+The isolated debug app was launched with the sandbox runner and its Bots window was read through the Accessibility tree (roster, `Conversation context: Goal context A. Contextual execution unavailable.` menu and the `bots.desk.thread.row.*` rows were present). Pressing a thread row (`ax_40`) with a freshly observed state token failed with `semantic_action_failed`; attempts that reused a token returned `stale_state_token` because every observation changes the token while the window updates. Pressing the context menu button failed with `stale_state_token` as well. No row selection, export sheet or Continue in Destination was driven through the real window, so the macOS window interaction remains proven by offscreen model and render tests only. The debug app was stopped afterwards; the personal production app was untouched.
