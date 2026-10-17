@@ -55,6 +55,7 @@ final class BotContextExportModel: ObservableObject, Identifiable {
     @Published private(set) var review: Review?
     @Published private(set) var isBusy = false
     @Published private(set) var copied = false
+    @Published private(set) var continuedConversationID: String?
     @Published private(set) var invalidated = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var unavailableMessage: String?
@@ -139,6 +140,7 @@ final class BotContextExportModel: ObservableObject, Identifiable {
         generation &+= 1
         review = nil
         copied = false
+        continuedConversationID = nil
         errorMessage = nil
     }
 
@@ -162,6 +164,48 @@ final class BotContextExportModel: ObservableObject, Identifiable {
             }
             self.copy(review.summary)
             self.copied = true
+        }
+    }
+
+    /// Starts a new canonical conversation in the reviewed destination and holds the
+    /// approved summary there as an unsent queued message. Nothing is executed.
+    func continueInDestination() {
+        guard !isBusy, copied, continuedConversationID == nil, let review, validateSource(),
+              let target = targets.first(where: { $0.key == review.request["target_context_key"]?.stringValue }) else { return }
+        let create: [String: JSONValue] = [
+            "client_request_id": .string(UUID().uuidString.lowercased()),
+            "host_id": origin.parameters["host_id"] ?? .string(origin.hostID),
+            "bot_id": .string(origin.botID),
+            "title": .string("Continued from \(origin.sourceLabel)"),
+            "context_key": .string(target.key),
+            "context_version": .number(Double(origin.contextVersion)),
+            "policy_revision": .number(Double(target.revision)),
+        ]
+        run(method: "bot.conversation.create", params: create) { [weak self] response, owner in
+            guard let self, self.owns(owner), self.validateSource() else { return }
+            guard let readback = response["readback"]?.objectValue,
+                  let conversationID = readback["conversation_id"]?.stringValue,
+                  readback["context_key"] == .string(target.key),
+                  readback["policy_revision"] == .number(Double(target.revision)) else {
+                self.errorMessage = "The destination conversation could not be confirmed. Nothing was queued."
+                return
+            }
+            var queue = create
+            queue["client_request_id"] = .string(UUID().uuidString.lowercased())
+            queue["conversation_id"] = .string(conversationID)
+            queue["text"] = .string(review.summary)
+            queue.removeValue(forKey: "title")
+            self.run(method: "bot.conversation.enqueue", params: queue) { [weak self] response, owner in
+                guard let self, self.owns(owner), self.validateSource() else { return }
+                guard let readback = response["readback"]?.objectValue,
+                      readback["enqueued"]?.boolValue == true,
+                      readback["requires_user_send"]?.boolValue == true,
+                      readback["conversation_id"] == .string(conversationID) else {
+                    self.errorMessage = "The approved summary was not queued in the destination."
+                    return
+                }
+                self.continuedConversationID = conversationID
+            }
         }
     }
 
@@ -317,6 +361,17 @@ struct BotContextExportSheet: View {
             if model.isBusy { ProgressView("Preparing export…") }
             if let error = model.errorMessage { Text(error).foregroundStyle(DS.Palette.danger).accessibilityIdentifier("bots.desk.export.error") }
             if model.copied { Text("Copied.").foregroundStyle(.secondary) }
+            if model.copied, model.review != nil {
+                if model.continuedConversationID != nil {
+                    Text("Summary held in the destination. Review and send it there.")
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("bots.desk.export.continued")
+                } else {
+                    Button("Continue in Destination") { model.continueInDestination() }
+                        .accessibilityIdentifier("bots.desk.export.continue")
+                        .disabled(model.isBusy || !model.sourceIsCurrent)
+                }
+            }
             HStack {
                 Spacer()
                 Button("Close") { model.cancel(); dismiss() }

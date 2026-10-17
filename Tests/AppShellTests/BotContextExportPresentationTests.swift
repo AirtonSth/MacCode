@@ -184,6 +184,74 @@ final class BotContextExportPresentationTests: XCTestCase {
         XCTAssertEqual(copies, [review.summary])
     }
 
+    private func routeToDistill(_ f: Fixture) async throws {
+        SettingsStore(db: f.context.db).update { $0.botsControlPlaneEnabled = true }
+        _ = try await f.router.dispatchPairedBotRemote(method: "bot.routing.set", params: [
+            "client_request_id": .string(UUID().uuidString.lowercased()),
+            "bot_id": .string(f.bot.id.value.uuidString.lowercased()),
+            "host_id": .string(f.context.liveActivityHostIdentity.serverId),
+            "provider": .string("distill"), "provider_instance_id": .string("distill"),
+            "model": .string("main-a"), "routing_mode": .string("explicit"),
+        ])
+    }
+
+    func testContinueInDestinationCreatesNewConversationAndHoldsApprovedSummaryUnsent() async throws {
+        let f = try fixture("continue")
+        try await routeToDistill(f)
+        let model = try f.vm.makeContextExportModel { _ in }
+        try prepare(model, target: f.targetContext)
+        await waitUntil { model.review != nil || model.errorMessage != nil }
+        let review = try XCTUnwrap(model.review)
+        model.continueInDestination()
+        XCTAssertNil(model.continuedConversationID, "continuing must wait for the confirmed copy")
+        model.confirmAndCopy()
+        await waitUntil { model.copied || model.errorMessage != nil }
+        XCTAssertTrue(model.copied, model.errorMessage ?? "export must confirm first")
+        let before = try f.context.botStore.listConversations(botID: f.bot.id).map(\.id)
+        model.continueInDestination()
+        await waitUntil { model.continuedConversationID != nil || model.errorMessage != nil }
+        let newID = try XCTUnwrap(model.continuedConversationID, model.errorMessage ?? "expected destination conversation")
+        let conversations = try f.context.botStore.listConversations(botID: f.bot.id)
+        XCTAssertEqual(conversations.count, before.count + 1, "exactly one new canonical conversation")
+        let created = try XCTUnwrap(conversations.first { $0.id.value.uuidString.lowercased() == newID })
+        XCTAssertNotEqual(created.id, f.source.id)
+        let pin = try XCTUnwrap(try f.context.botStore.conversationContextPin(conversationID: created.id))
+        XCTAssertEqual(pin.context, f.targetContext, "the new conversation is pinned to the reviewed destination")
+        XCTAssertEqual(pin.policyRevision, f.targetRevision)
+        let thread = try XCTUnwrap(created.linkedAgentThreadID)
+        let queued = try f.context.queuedMessageRepo.list(threadId: thread)
+        XCTAssertEqual(queued.count, 1)
+        XCTAssertEqual(queued[0].text, review.summary, "the held text is exactly the reviewed summary")
+        XCTAssertTrue(try HostDatabaseRestore.requiresQueueReview(kind: .agent, id: queued[0].id.value.uuidString, db: f.context.db),
+                      "the summary must stay held until the human sends it")
+        XCTAssertTrue(try f.context.messageRepo.list(threadId: thread).isEmpty, "nothing is delivered or run")
+        XCTAssertEqual(try f.context.messageRepo.list(threadId: f.sourceThread.id).count, 2, "source history is untouched")
+        model.continueInDestination()
+        await waitUntil { !model.isBusy }
+        XCTAssertEqual(try f.context.botStore.listConversations(botID: f.bot.id).count, conversations.count, "no second conversation")
+        XCTAssertEqual(try f.context.queuedMessageRepo.list(threadId: thread).count, 1, "no second queued copy")
+    }
+
+    func testContinueInDestinationRefusedWhenDestinationSendIsRevoked() async throws {
+        let f = try fixture("continue-revoked")
+        try await routeToDistill(f)
+        let model = try f.vm.makeContextExportModel { _ in }
+        try prepare(model, target: f.targetContext)
+        await waitUntil { model.review != nil || model.errorMessage != nil }
+        model.confirmAndCopy()
+        await waitUntil { model.copied || model.errorMessage != nil }
+        XCTAssertTrue(model.copied)
+        _ = try f.context.botStore.revokeContext(hostID: f.context.liveActivityHostIdentity.serverId, botID: f.bot.id,
+            context: f.targetContext, expectedRevision: f.targetRevision)
+        let before = try f.context.botStore.listConversations(botID: f.bot.id).map(\.id)
+        model.continueInDestination()
+        await waitUntil { !model.isBusy && (model.errorMessage != nil || model.continuedConversationID != nil) }
+        XCTAssertNil(model.continuedConversationID)
+        XCTAssertNotNil(model.errorMessage)
+        XCTAssertEqual(try f.context.botStore.listConversations(botID: f.bot.id).map(\.id), before,
+                       "a revoked destination must not gain a conversation or queued text")
+    }
+
     func testChangedSourceInvalidatesReviewWithoutCopy() async throws {
         let f = try fixture("source-change")
         var copies: [String] = []
