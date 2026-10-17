@@ -31,6 +31,7 @@ public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStri
     case screenshotResultTooLarge(actualBytes: Int, maximumBytes: Int)
     case rebuildWhileRunActive(threadTitle: String)
     case contextualRuntimeUnavailable
+    case contextualRuntimeCapacityReached(limit: Int)
 
     public var description: String {
         switch self {
@@ -43,6 +44,8 @@ public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStri
                 + "Rebuild after that run finishes."
         case .contextualRuntimeUnavailable:
             return "Contextual guest runtime is unavailable."
+        case .contextualRuntimeCapacityReached(let limit):
+            return "At most \(limit) contextual desktops can run at once. Retry after one finishes."
         }
     }
 }

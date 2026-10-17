@@ -9,6 +9,8 @@ final class BotContextGuestResources {
     private static let lock = NSLock()
     // Retain listeners until network cleanup is proven, including failed preparation.
     private static var live: [BotID: BotContextGuestResources] = [:]
+    /// Measured ceiling (docs/CONTEXT-RUNTIME-COST.md): 4 simultaneous desktops.
+    static let defaultMaximumLiveRuntimes = 4
 
     let identity: BotContextRuntimeIdentity
     let runID: AgentRunID
@@ -62,7 +64,8 @@ final class BotContextGuestResources {
         secretStore: (any BotSecretStore)?,
         parentRunID: AgentRunID? = nil,
         providerConfiguration: String = "",
-        persistentSession: Bool = false
+        persistentSession: Bool = false,
+        maximumLiveRuntimes: Int = BotContextGuestResources.defaultMaximumLiveRuntimes
     ) throws -> BotContextGuestResources {
         do {
             guard request.runAsUser == nil || request.runAsUser?.uid == getuid() else {
@@ -116,13 +119,24 @@ final class BotContextGuestResources {
             var claimed = false
             do {
                 defer { resources.operationLock.unlock() }
+                var atCapacity = false
                 let didClaim = lock.withLock {
+                    let scope = appSupport.resolvingSymlinksInPath().standardizedFileURL
+                    if live[identity.storageBotID] == nil,
+                       live.values.filter({ $0.appSupport.resolvingSymlinksInPath().standardizedFileURL == scope }).count >= maximumLiveRuntimes {
+                        atCapacity = true
+                        return false
+                    }
                     guard live[identity.storageBotID] == nil,
                           !live.values.contains(where: { $0.appSupport.resolvingSymlinksInPath().standardizedFileURL == appSupport.resolvingSymlinksInPath().standardizedFileURL && $0.runID == request.runId }) else { return false }
                     live[identity.storageBotID] = resources
                     return true
                 }
-                guard didClaim else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+                guard didClaim else {
+                    throw atCapacity
+                        ? BotComputerGuestServiceError.contextualRuntimeCapacityReached(limit: maximumLiveRuntimes)
+                        : BotComputerGuestServiceError.contextualRuntimeUnavailable
+                }
                 claimed = true
                 if let parentRunID {
                     _ = try store.recordContextDelegation(hostID: hostID, parentRunID: parentRunID, childRunID: request.runId, childThreadID: request.threadId)

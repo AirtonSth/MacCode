@@ -2188,6 +2188,61 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertEqual(fake.removed, [name])
     }
 
+    func test_contextualPrepareRefusesBeyondLiveRuntimeLimitUntilOneFinishes() throws {
+        let support = makeSupport("rc-context-capacity")
+        defer { try? FileManager.default.removeItem(at: support) }
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let db = try SQLiteDB(path: support.appendingPathComponent("contexts.sqlite").path)
+        try Schema.migrate(db)
+        let store = BotStore(db: db)
+        let hostID = "context-capacity-host"
+        let fake = FakeDocker()
+        fake.execOutput = { command in
+            if command == ["/bin/cat", "/etc/hosts"] { return Data("10.250.250.254 host.docker.internal\n".utf8) }
+            if command.contains("--allow-gateway") { return Data("context-gateway-lease-v1\n".utf8) }
+            if command.contains("--revoke-gateway") { return Data("context-gateway-revoked-v1\n".utf8) }
+            return nil
+        }
+        let service = BotComputerGuestService(appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0)
+        let threadRepo = AgentThreadRepository(db: db)
+        let secrets = InMemoryBotSecretStore()
+        var requests: [AgentRunRequest] = []
+        for index in 0..<3 {
+            let bot = try store.create(name: "Cap \(index)", title: "Cap", description: "", handle: "context-cap-\(index)", soul: "", provider: .distill, model: "distill")
+            let grant = try store.grantContext(hostID: hostID, botID: bot.id, context: .general, actions: [.read, .send, .configure], expectedRevision: 0)
+            let identity = try BotContextRuntimeIdentity(binding: grant)
+            let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+            let network = BotComputerGuestSpec.networkName(botID: identity.storageBotID)
+            fake.networkSet.insert(network)
+            fake.containers[name] = BotComputerContainerInspect(
+                running: true, imageID: "img", hostPort: 49152, networkNames: [network],
+                labels: [BotComputerGuestSpec.botIDLabelKey: identity.storageBotID.value.uuidString.lowercased(),
+                         "remotecode.context.network": "private-egress-v1",
+                         BotComputerGuestSpec.runtimeLabelKey: BotComputerGuestSpec.runtimeRevision,
+                         BotComputerGuestSpec.workspacesLabelKey: BotComputerGuestSpec.workspacesLabel([])],
+                homeSource: BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: identity.storageBotID).standardizedFileURL.path
+            )
+            let thread = AgentThread(workspaceId: nil, title: "Cap", provider: .distill, model: "distill")
+            _ = try store.createContextualConversation(BotConversation(botID: bot.id, title: "Cap", linkedAgentThreadID: thread.id), newThread: thread, hostID: hostID, context: .general, policyRevision: grant.policyRevision)
+            requests.append(AgentRunRequest(threadId: thread.id, provider: .distill, model: "distill", cwd: "", prompt: "cap"))
+        }
+        var live: [BotContextGuestResources] = []
+        defer { for resource in live { try? resource.finish() } }
+        func prepare(_ request: AgentRunRequest) throws -> BotContextGuestResources {
+            try BotContextGuestResources.prepare(request: request, hostID: hostID, store: store, threadRepo: threadRepo, service: service, appSupport: support, workspace: nil, registeredWorkspaces: [], secretStore: secrets, maximumLiveRuntimes: 2)
+        }
+        live.append(try prepare(requests[0]))
+        live.append(try prepare(requests[1]))
+        XCTAssertThrowsError(try prepare(requests[2])) {
+            XCTAssertEqual($0 as? BotComputerGuestServiceError, .contextualRuntimeCapacityReached(limit: 2),
+                           "a third simultaneous contextual desktop must be refused, not silently queued or started")
+        }
+        XCTAssertNil(try store.contextDelegation(childRunID: requests[2].runId), "a refused run must not record any ownership")
+        try live.removeFirst().finish()
+        live.append(try prepare(requests[2]))
+        XCTAssertEqual(live.count, 2, "finishing one runtime must free capacity for the refused run")
+    }
+
     func test_parentFinishThrowsUntilDelegatedChildStopSucceeds() throws {
         let support = makeSupport("rc-context-delegation-finish")
         defer { try? FileManager.default.removeItem(at: support) }
