@@ -5091,6 +5091,47 @@ public final class BotsViewModel: ObservableObject {
         } catch { selectedPinnedContextLabel = "Context unavailable" }
     }
 
+    func makeContextExportModel(copy: @escaping (String) -> Void = { text in
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }) throws -> BotContextExportModel {
+        guard let botID = selectedBotID, let bot = try botStore.get(id: botID),
+              let conversation = selectedConversation, conversation.botID == botID,
+              let threadID = conversation.linkedAgentThreadID,
+              let pin = try botStore.conversationContextPin(conversationID: conversation.id),
+              pin.hostID == context.liveActivityHostIdentity.serverId,
+              try botStore.authorizes(hostID: pin.hostID, botID: botID, context: pin.context, action: .read, policyRevision: pin.policyRevision),
+              try botStore.authorizes(hostID: pin.hostID, botID: botID, context: pin.context, action: .export, policyRevision: pin.policyRevision),
+              let router = router ?? context.router else {
+            throw NSError(domain: "BotContextExport", code: 1, userInfo: [NSLocalizedDescriptionKey: "This conversation needs current read and export permission. Policy changes require a new conversation."])
+        }
+        let rows = try context.messageRepo.list(threadId: threadID)
+            .filter { $0.role == .user || $0.role == .assistant }
+            .map { BotContextExportModel.Row(id: $0.id.value.uuidString.lowercased(), role: $0.role.rawValue, text: $0.content) }
+        let targets = try botStore.listContextBindings(hostID: pin.hostID, botID: botID)
+            .filter { $0.state == .active && $0.actions.contains(.send) }
+            .compactMap { binding -> BotContextExportModel.Target? in
+                let label: String
+                switch binding.context {
+                case .general: label = "General"
+                case .workspace(let id):
+                    guard let workspace = context.state.workspaces[id] else { return nil }
+                    label = workspace.name
+                }
+                return .init(key: binding.context.storageKey, revision: binding.policyRevision, label: label)
+            }
+        let origin = BotContextExportModel.Origin(hostID: pin.hostID, botID: botID.value.uuidString.lowercased(),
+            contextKey: pin.context.storageKey, contextVersion: pin.contextVersion, policyRevision: pin.policyRevision,
+            conversationID: conversation.id.value.uuidString.lowercased(), hostLabel: pin.hostID,
+            botLabel: Self.displayName(bot.name), sourceLabel: selectedPinnedContextLabel)
+        return BotContextExportModel(origin: origin, rows: rows, targets: targets,
+            request: { method, params in try await router.dispatchPairedBotRemote(method: method, params: params) },
+            currentSource: { [weak self] in
+                self?.selectedBotID == botID && self?.selectedConversation?.id == conversation.id
+                    && self?.context.liveActivityHostIdentity.serverId == pin.hostID
+            }, copy: copy)
+    }
+
     @discardableResult
     public func allowReadAndSend(botID: BotID, context: BotContext) -> Bool {
         guard selectedBotID == botID else { return false }
@@ -13123,6 +13164,7 @@ public struct BotsRootView: View {
     @State private var pendingDockerDataClear: BotID?
     @State private var isConfirmingTitioFactoryReset = false
     @State private var pendingContextGrant: (botID: BotID, context: BotContext, contextName: String)?
+    @State private var contextExportModel: BotContextExportModel?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
@@ -14043,6 +14085,13 @@ public struct BotsRootView: View {
                 Text(vm.selectedPinnedContextLabel)
                 Text("Contextual execution unavailable")
                 Divider()
+                Button("Export selected excerpts…") {
+                    do { contextExportModel = try vm.makeContextExportModel() }
+                    catch { vm.errorMessage = error.localizedDescription }
+                }
+                .disabled(vm.selectedPinnedContextLabel == "Legacy")
+                .accessibilityIdentifier("bots.desk.export.open")
+                Divider()
                 Button("New conversation in General") { vm.createDeskThread(in: .general) }
                 ForEach(vm.existingWorkspaceContexts, id: \.id) { workspace in
                     Button("New conversation in \(workspace.name)") { vm.createDeskThread(in: .workspace(workspace.id)) }
@@ -14100,6 +14149,11 @@ public struct BotsRootView: View {
         .padding(.trailing, DS.Space.xl)
         .frame(height: 44)
         .dsBar(edge: .bottom)
+        .sheet(item: $contextExportModel, onDismiss: { contextExportModel?.cancel(); contextExportModel = nil }) { model in
+            BotContextExportSheet(model: model)
+        }
+        .onChange(of: vm.selectedBotID) { _, _ in contextExportModel?.invalidate() }
+        .onChange(of: vm.selectedConversation?.id) { _, _ in contextExportModel?.invalidate() }
         .confirmationDialog("Allow read and send in \(pendingContextGrant?.contextName ?? "context") for \(pendingContextGrant?.botID.description ?? "Bot")?", isPresented: Binding(get: { pendingContextGrant != nil }, set: { if !$0 { pendingContextGrant = nil } }), titleVisibility: .visible) {
             Button("Allow read and send") {
                 if let target = pendingContextGrant { _ = vm.allowReadAndSend(botID: target.botID, context: target.context) }
