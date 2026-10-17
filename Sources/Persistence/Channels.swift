@@ -48,6 +48,7 @@ public enum AppPaths {
 
     public static func socketPath(for channel: ReleaseChannel, override: String? = nil) -> String {
         if let override { return override }
+        if let env = ProcessInfo.processInfo.environment["RC2_SOCKET_PATH"], env.hasPrefix("/") { return env }
         // Use a short path under /tmp because Unix socket path is limited (~104 bytes).
         return "/tmp/\(channel.displayName).sock"
     }
