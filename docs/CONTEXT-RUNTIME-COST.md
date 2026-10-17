@@ -90,3 +90,15 @@ Limits: this is the model and persistence path only, not first rendered frame, S
 `FlowUITests.testMeasureBotContextSwitchColdAndWarm` (opt-in with `RC2_MEASURE_CELLS=context-nav`, the harness's existing gate) taps the real General and Legacy rows in the context picker on an exclusive iPhone 17 / iOS 26.5 simulator against the in-process fake host, and stops when the chat header identity names the new context. Each run has one cold first switch and five warmed alternating switches. Three runs: cold 1938, 1901 and 1999 ms; warm medians 1910, 1916 and 1909 ms (warm ranges 1865–1982 ms).
 
 Interpretation limit: cold and warm are indistinguishable and the spread is about ±4%, which points to a fixed XCUITest cost (the tap waits for the app to go idle and the label is polled) rather than the app's navigation latency. These numbers are an upper bound of the user-visible switch as seen through XCUITest on a simulator; they are not a first-useful-frame measurement, not comparable with the macOS in-process figures above, and not a performance-parity claim. A trustworthy iPhone figure needs in-app signposts (the existing perf ring) on a device. No concurrency or limit was derived from them.
+
+## iPhone contextual switch: in-app receipts (supersedes the XCUITest figure above)
+
+The app now records a perceived-performance interaction **I-016 `bot_context_switch`** in the existing `PerfInteractions` ring: it begins when a context row is chosen in `BotChatView.selectConversationContext`, marks `feedback` at the first frame after the context is adopted and the sheet closes, and ends `settled` at the first frame after `refreshChatCritical` completes (`failed` if the model refuses the switch). Stage times are display-link frame-bounded like the other interactions; receipts carry only ids, outcome and timings. `FlowUITests.testMeasureBotContextSwitchColdAndWarm` (`RC2_MEASURE_CELLS=context-nav`) drives six real picker switches on an exclusive iPhone 17 / iOS 26.5 simulator against the in-process fake host and reads the I-016 receipts from the app's ring (the XCUITest wall clock now only proves each switch completed). Three independent runs, each with one cold first switch and five warm switches:
+
+| Run | Cold settled | Warm settled median (5) | Warm range |
+|---:|---:|---:|---:|
+| 1 | 135.5 ms | 98.6 ms | 96.9–100.2 ms |
+| 2 | 164.9 ms | 117.7 ms | 112.5–120.5 ms |
+| 3 | 114.9 ms | 97.8 ms | 85.1–122.7 ms |
+
+This replaces the earlier ~1.9 s XCUITest-dominated figure, which measured the automation, not the app. Limits: simulator and fake host (no network), frame-bounded display-link timing rather than a device trace, the `feedback` stage varied widely between 1 and 115 ms across switches and is not summarized, and no concurrency or parity claim is derived. The first draft of the test filtered the ring for the wrong record kind and failed; the ring contents were dumped to correct it. Existing perf unit tests (`PerfInstrumentationTests`, 45 tests across it and `ConnectionPhaseFourCatalogTests`, 0 failures) and the context picker UI journey passed after the change.
