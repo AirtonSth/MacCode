@@ -17,6 +17,16 @@ struct RemoteCodeMain {
             let bundleID = Bundle.main.bundleIdentifier ?? ""
             channel = ReleaseChannel.channelFromBundleID(bundleID)
         }
+        if CommandLine.arguments == [CommandLine.arguments[0], "--database-schema-version"] {
+            print(Persistence.Schema.currentVersion)
+            return
+        }
+        let rollbackFlag = "--rollback-host"
+        let rollingBack = CommandLine.arguments.contains(rollbackFlag)
+        if rollingBack && (CommandLine.arguments.contains("--inspect-database-backup") || CommandLine.arguments.contains("--restore-database-backup")) {
+            fputs("Host rollback cannot combine with database inspect or restore.\n", stderr)
+            exit(EXIT_FAILURE)
+        }
         let appSupportOverride = ProcessInfo.processInfo.environment["RC2_APP_SUPPORT"]
         let dbOverride = ProcessInfo.processInfo.environment["RC2_DB_PATH"]
         let restoreFlag = "--restore-database-backup"
@@ -24,7 +34,7 @@ struct RemoteCodeMain {
         let inspectFlag = "--inspect-database-backup"
         let inspectsDatabase = CommandLine.arguments.contains(inspectFlag)
 
-        if CommandLine.arguments.contains("--scheduled-task-agent-unregister") {
+        if !rollingBack && CommandLine.arguments.contains("--scheduled-task-agent-unregister") {
             do {
                 try ScheduledTaskAgentServiceManager().unregister()
                 print("Scheduled Tasks background agent unregistered.")
@@ -38,7 +48,7 @@ struct RemoteCodeMain {
         RemoteCodeAppearance.apply(to: app)
         let isScheduledTaskAgent = CommandLine.arguments.contains("--scheduled-task-agent")
             || ProcessInfo.processInfo.environment["RC2_SCHEDULED_TASK_AGENT"] == "1"
-        if isScheduledTaskAgent {
+        if isScheduledTaskAgent && !rollingBack {
             // Schedules run in-process in the interactive app. A leftover LaunchAgent
             // install must not dual-claim: unregister and exit immediately.
             do {
@@ -64,7 +74,7 @@ struct RemoteCodeMain {
             Logger(subsystem: "io.remotecode.app", category: "lifecycle")
                 .fault("app.second_instance_exit holder=\(holder, privacy: .public)")
             fputs("RemoteCode is already running for \(appSupportDirectory.path) (pid \(holder)); exiting.\n", stderr)
-            if restoresDatabase || inspectsDatabase { exit(EXIT_FAILURE) }
+            if restoresDatabase || inspectsDatabase || rollingBack { exit(EXIT_FAILURE) }
             if let holderPID, !LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
                 NSRunningApplication(processIdentifier: holderPID)?.activate()
             }
@@ -73,6 +83,43 @@ struct RemoteCodeMain {
             Logger(subsystem: "io.remotecode.app", category: "lifecycle")
                 .error("app.instance_lock_unavailable errno=\(code, privacy: .public)")
             instanceLock = nil
+        }
+
+        if rollingBack {
+            guard let instanceLock, CommandLine.arguments.count >= 3,
+                  CommandLine.arguments[1] == rollbackFlag,
+                  !CommandLine.arguments.dropFirst(2).contains(rollbackFlag),
+                  !CommandLine.arguments.dropFirst(2).contains("--restore-database-backup"),
+                  !CommandLine.arguments.dropFirst(2).contains("--inspect-database-backup") else {
+                fputs("Host rollback requires an exclusive host lock, one target app path, and no mixed database operation.\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+            let separator: Int?
+            if CommandLine.arguments.count == 3 {
+                separator = nil
+            } else if CommandLine.arguments[3] == "--" {
+                separator = 3
+            } else {
+                fputs("Host rollback accepts only explicit -- before forwarded arguments.\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+            withExtendedLifetime(instanceLock) {
+                do {
+                    let target = URL(fileURLWithPath: CommandLine.arguments[2])
+                    let database = URL(fileURLWithPath: dbOverride ?? appSupportDirectory.appendingPathComponent("remotecode.sqlite").path)
+                    let executable = try HostDatabaseRollback.validate(databaseURL: database, targetURL: target, currentBundleURL: Bundle.main.bundleURL, currentBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+                    let forwarded = separator.map { Array(CommandLine.arguments[($0 + 1)...]) } ?? []
+                    let args = [executable.path] + forwarded
+                    let cargs = args.map { strdup($0) } + [nil]
+                    cargs.withUnsafeBufferPointer { buffer in _ = execv(executable.path, buffer.baseAddress!) }
+                    fputs("Unable to execute rollback target.\n", stderr)
+                    exit(EXIT_FAILURE)
+                } catch {
+                    fputs("Host rollback refused: \(error)\n", stderr)
+                    exit(EXIT_FAILURE)
+                }
+            }
+            exit(EXIT_FAILURE)
         }
 
         if restoresDatabase || inspectsDatabase {

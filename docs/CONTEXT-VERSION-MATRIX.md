@@ -27,6 +27,10 @@ Current host refused the claim after checking queued state, no initial lease, an
 
 The tested rollback scope is the historical client transport against the new host, or the recovery CLI under the new host; this is not a claim of complete historical-app compatibility. Running a raw older host against a modern database is unsupported and unsafe. CLI test evidence does not establish broader compatibility or complete S-008. Earlier failed parser/history tests were not passes. No UI changes or new visual/accessibility proof are claimed; prior ledgers remain unchanged. No scratch paths or tokens were persisted. Cleanup results are recorded below.
 
+## Host executable rollback — superseding checkpoint
+
+The newer supported rollback command and its limits supersede any broader reading of the historical restore/rollback evidence above. It does not restore the database, prove the full native lifecycle, or make direct arbitrary older-binary launches safe; S-008 remains incomplete. See [CONTEXT-HOST-ROLLBACK.md](CONTEXT-HOST-ROLLBACK.md) for exact tested-tree evidence and guard conditions.
+
 ## Reproduction and limits
 
 `HostVersionMatrixServerTests.test_serveHostVersionMatrixFixture` requires fresh `RC_HOST_VERSION_MATRIX_ROOT` and a non-primary loopback `RC_HOST_VERSION_MATRIX_PORT`. It writes the generated synthetic pairing token and stable IDs to a local manifest. Run the same test source with each historical/current host revision. Supply those two manifest JSON objects as `RC_MATRIX_OLD_HOST_JSON` and `RC_MATRIX_NEW_HOST_JSON` in each iOS test target environment; run `HostVersionMatrixContractTests` with `RC2_REAL_HOST_TEST` enabled. The transport matrix does not exercise the entire HostSession lifecycle, provider execution, native UI, or automatic launch reconciliation.
