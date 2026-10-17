@@ -176,3 +176,42 @@ final class BotContextAuthorityMatrixTests: XCTestCase {
         XCTAssertTrue(workspaceStillAllowed.allowed, "revoking general must not revoke the independent workspace binding")
     }
 }
+
+final class BotContextEnqueueReplayTests: XCTestCase {
+    func testEnqueueReplayAfterReopenReturnsSameItemWithoutDuplicate() throws {
+        let root = try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"])
+        let dir = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("EnqueueReplay-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("replay.sqlite").path
+        func open() throws -> (SQLiteDB, BotRemoteControlAuthority) {
+            let db = try SQLiteDB(path: path)
+            try Schema.migrate(db)
+            let settings = SettingsStore(db: db)
+            settings.update { $0.botsControlPlaneEnabled = true }
+            return (db, BotRemoteControlAuthority(db: db, store: BotStore(db: db), settings: settings, appSupportDirectory: dir))
+        }
+        let (db, authority) = try open()
+        let host = "host"
+        let bot = try XCTUnwrap(try authority.dispatch(method: "bot.create", params: ["client_request_id": "c", "name": "Replay"])["bot_id"] as? String)
+        _ = try authority.dispatch(method: "bot.routing.set", params: ["client_request_id": "r", "bot_id": bot, "host_id": host, "provider": "distill", "provider_instance_id": "distill", "model": "m", "routing_mode": "explicit"])
+        _ = try authority.dispatch(method: "bot.context.grant", params: ["client_request_id": "g", "host_id": host, "bot_id": bot, "context_key": "general:v1", "context_version": 1, "policy_revision": 0, "actions": ["read", "send"]])
+        let made = try authority.dispatch(method: "bot.conversation.create", params: ["client_request_id": "mk", "bot_id": bot, "title": "T", "host_id": host, "context_key": "general:v1", "context_version": 1, "policy_revision": 1])
+        let convo = try XCTUnwrap((made["readback"] as? [String: Any])?["conversation_id"] as? String)
+        let params: [String: Any] = ["client_request_id": "enq-1", "bot_id": bot, "host_id": host, "context_key": "general:v1", "context_version": 1, "policy_revision": 1, "conversation_id": convo, "text": "hold me"]
+        let first = try authority.dispatch(method: "bot.conversation.enqueue", params: params)
+        func queued() throws -> Int64 {
+            let st = try db.prepare("SELECT COUNT(*) FROM agent_queued_messages;")
+            defer { st.reset() }
+            XCTAssertTrue(try st.step())
+            return st.columnInt64(0)
+        }
+        XCTAssertEqual(try queued(), 1)
+        let (db2, reopened) = try open()
+        let replay = try reopened.dispatch(method: "bot.conversation.enqueue", params: params)
+        XCTAssertEqual((replay["readback"] as? [String: Any])?["queue_id"] as? String, (first["readback"] as? [String: Any])?["queue_id"] as? String)
+        let st = try db2.prepare("SELECT COUNT(*) FROM agent_queued_messages;")
+        XCTAssertTrue(try st.step())
+        XCTAssertEqual(st.columnInt64(0), 1, "replay after reopen must not queue a second item")
+    }
+}
