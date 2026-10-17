@@ -203,3 +203,7 @@ New deterministic check: `BotContextEnqueueReplayTests.testEnqueueReplayAfterReo
 ### Routine replay and peer refusal (2026-10-17)
 
 `BotContextRoutinePeerReplayTests` drives the shipped `BotRemoteControlAuthority` on a real SQLite file with a counting `onRoutineSend` host callback. A `bot.routine.run` sends once; after reopening the database with a new authority, the same `client_request_id` returns without a second send. After a contextual grant is revoked, `peer.ask` and `bot.routine.run` carrying that context are refused and no further send happens. Passed (1 test, 0 failures). Limits: the refusal assertion is not isolated to revocation, because these entry points also reject any context fields (already covered by the matrix), and the peer path has no provider, so a real consultation and a scheduled-slot drain after revocation remain unproven.
+
+### Scheduled slot after context revocation (2026-10-17)
+
+`BotRoutineSchedulerTests.test_dueSlotAfterContextRevocationRunsLegacyAndNeverCreatesAPinOrGrant` drives the shipped `BotRoutineScheduler.tick` into a real provider request (controlled runner). A Bot whose General grant was revoked still runs its due routine as an ordinary conversation; that conversation has no contextual pin and the Bot's binding keeps its revoked state and revision, so the scheduler neither blocks on nor widens contextual authority. Suite: 5 tests, 0 failures. Limit: routines have no contextual contract at all, so this proves non-interference, not that a routine can run inside a context; that stays unavailable by design.
