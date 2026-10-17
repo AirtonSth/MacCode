@@ -696,6 +696,73 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(runner.finish(runID: second.runId, status: .completed, reply: "second done"))
     }
 
+    func test_hostCatalogFollowUpDoesNotDrainAfterMasterControlPlaneDisabled() async throws {
+        // WHY: disabling master control plane before completion must preserve accepted work without starting it.
+        directory = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"]))
+            .appendingPathComponent("QueuePolicy-\(UUID().uuidString)").path
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true", authenticated: true, id: "claude"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let created = try router.createHostBot(
+            name: "Oliver", title: "Critical QA", description: "", handle: "oliver-revoke",
+            soul: "Be exact.", callerRun: AgentRunID()
+        )
+        let botID = BotID(try XCTUnwrap(created.objectValue?["id"]?.stringValue.flatMap(UUID.init)))
+        let other = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude, model: "opus")
+        let caller = try seedBotCaller(context: context, provider: .claude, model: "opus", permissionMode: .fullAccess)
+        let first = try await router.sendHostBot(botID: botID, text: "first host task", conversationID: nil,
+                                                 callerThread: caller.thread.id, callerRun: caller.run.id)
+        let firstStarted = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+        XCTAssertTrue(firstStarted)
+        let firstRequest = try XCTUnwrap(runner.requests.first)
+        let conversationID = BotConversationID(try XCTUnwrap(first.objectValue?["conversation_id"]?.stringValue.flatMap(UUID.init)))
+        vm.openDesk(other)
+        let accepted = try await router.sendHostBot(botID: botID, text: "second exact follow-up", conversationID: conversationID,
+                                                    callerThread: caller.thread.id, callerRun: caller.run.id)
+        XCTAssertEqual(accepted.objectValue?["queued_follow_up"]?.boolValue, true)
+        let queuedBefore = vm.queuedFollowUpsForTesting(botID: botID)
+        XCTAssertEqual(queuedBefore.map(\.text), ["second exact follow-up"])
+
+        SettingsStore(db: context.db).update { $0.botsControlPlaneEnabled = false }
+        let queuedRowsBefore = try context.botStore.listQueuedFollowUps(botID: botID)
+        let callerRunBefore = try XCTUnwrap(context.runRepo.get(id: caller.run.id))
+        let conversation = try XCTUnwrap(context.botStore.conversation(id: conversationID))
+        let botThreadID = try XCTUnwrap(conversation.linkedAgentThreadID)
+        let botMessagesBefore = try context.messageRepo.list(threadId: botThreadID)
+        let followThroughBefore = vm.followThroughApplyCountForTesting
+        XCTAssertTrue(runner.finish(runID: firstRequest.runId, status: .completed, reply: "first done"))
+        let followThroughSettled = await waitUntil(timeout: 5) { vm.followThroughApplyCountForTesting > followThroughBefore }
+        XCTAssertTrue(followThroughSettled)
+        XCTAssertEqual(runner.requests.count, 1)
+        XCTAssertEqual(vm.queuedFollowUpsForTesting(botID: botID).map(\.id), queuedBefore.map(\.id))
+        XCTAssertEqual(vm.queuedFollowUpsForTesting(botID: botID).map(\.text), ["second exact follow-up"])
+        XCTAssertEqual(try context.botStore.listQueuedFollowUps(botID: botID), queuedRowsBefore)
+        XCTAssertEqual(try context.runRepo.get(id: caller.run.id), callerRunBefore)
+        XCTAssertEqual(
+            try context.runRepo.listRecentFinished(limit: 50).filter { $0.threadId == botThreadID }.map(\.id),
+            [firstRequest.runId]
+        )
+        XCTAssertEqual(
+            try context.messageRepo.list(threadId: botThreadID).filter { $0.content.contains("second exact follow-up") },
+            botMessagesBefore.filter { $0.content.contains("second exact follow-up") }
+        )
+        XCTAssertEqual(vm.selectedBotID, other.id)
+        let botMessages = try context.messageRepo.list(threadId: botThreadID)
+        XCTAssertEqual(botMessages.filter { $0.role == .user }.count, 1)
+        XCTAssertFalse(botMessages.contains { $0.content.contains("second exact follow-up") && $0.role == .user })
+    }
+
     func test_hostSendToAnotherBotCompilesThatBotsBrowserPage_becauseOneBotsPageMustNeverReachAnothersPrompt() async throws {
         // WHY: the run prompt names the last page the Bot's browser had open.
         // It was read from the Bot selected on the Mac, so a paired send to

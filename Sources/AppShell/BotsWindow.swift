@@ -12206,6 +12206,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func admitDesktopSend(bot: BotDefinition) throws {
+        guard settingsStore.reload().isBotControlPlaneActive else { throw BotPublishError.controlPlaneDisabled }
         let revision = try currentRevision(for: bot)
         let kind = desktopKindOverrideForTesting
             ?? resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace)
