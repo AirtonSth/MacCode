@@ -5706,6 +5706,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw JSONRPCError.invalidParams
         }
         try Self.refuseContextPinnedGenericExecution(queued.threadId, context: ctx)
+        if try HostDatabaseRestore.requiresQueueReview(kind: .agent, id: id.value.uuidString, db: ctx.db) {
+            let dispatch = try ctx.queuedMessageRepo.dispatch(id: id)
+            guard dispatch?.state == .queued, dispatch?.runId == nil,
+                  try ctx.runRepo.get(id: AgentRunID(id.value)) == nil else {
+                throw JSONRPCError(code: -32602, message: "Restored queued outcome requires reconciliation before another send.")
+            }
+            try HostDatabaseRestore.approveQueue(kind: .agent, id: id.value.uuidString, db: ctx.db)
+        }
         if let dispatch = try ctx.queuedMessageRepo.dispatch(id: queued.id),
            let runId = dispatch.runId {
             if dispatch.state == .dispatched {
@@ -5792,6 +5800,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw JSONRPCError(code: -32000, message: "Queued message is already processing.")
         }
         let dispatchRunId = AgentRunID(queued.id.value)
+        try HostDatabaseRestore.recordQueueAttempt(kind: .agent, id: queued.id.value.uuidString, runID: dispatchRunId, db: ctx.db)
         guard try ctx.queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId) else {
             _ = try? ctx.queuedMessageRepo.release(lease)
             throw JSONRPCError(code: -32000, message: "Queued message dispatch could not be prepared.")
@@ -6465,6 +6474,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ) async throws {
         if let ctx = context {
             try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
+            if let head = try ctx.queuedMessageRepo.first(threadId: thread),
+               try HostDatabaseRestore.requiresQueueReview(kind: .agent, id: head.id.value.uuidString, db: ctx.db) {
+                return
+            }
         }
         // This gate only needs durable run-state. A full 26-column + routing
         // `get` hitchs MainActor before the next queued follow-up can start.

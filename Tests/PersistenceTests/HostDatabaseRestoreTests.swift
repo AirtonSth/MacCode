@@ -110,7 +110,7 @@ final class HostDatabaseRestoreTests: XCTestCase {
         defer { XCTAssertNoThrow(try FileManager.default.removeItem(at: root)) }
         let fixture = try makeFixture(root)
         let before = try Data(contentsOf: root.appendingPathComponent("before-revoke.sqlite"))
-        let recovery = try HostDatabaseRestore.restore(backupURL: root.appendingPathComponent("before-revoke.sqlite"), currentURL: root.appendingPathComponent("current.sqlite"))
+        let recovery = try HostDatabaseRestore.restore(backupURL: root.appendingPathComponent("before-revoke.sqlite"), currentURL: root.appendingPathComponent("current.sqlite"), reviewToken: HostDatabaseRestore.inspect(backupURL: root.appendingPathComponent("before-revoke.sqlite")).fingerprint)
         try assertRestored(root, fixture: fixture)
         let exactEpochDB = try SQLiteDB(path: root.appendingPathComponent("current.sqlite").path, readonly: true)
         XCTAssertEqual(try SettingsRepository(db: exactEpochDB).get("live_activity.boot_epoch"), "9")
@@ -170,7 +170,7 @@ final class HostDatabaseRestoreTests: XCTestCase {
                 """)
         }
         XCTAssertThrowsError(try HostDatabaseRestore.restore(backupURL: root.appendingPathComponent("before-revoke.sqlite"), currentURL: root.appendingPathComponent("current.sqlite"))) {
-            XCTAssertTrue(String(describing: $0).contains("exact trusted current database schema"))
+            XCTAssertTrue(String(describing: $0).contains("exact trusted database schema"))
         }
         let current = try SQLiteDB(path: root.appendingPathComponent("current.sqlite").path, readonly: true)
         XCTAssertEqual(try BotStore(db: current).getContextBinding(hostID: "host", botID: fixture.botA, context: .general)?.state, .revoked)
@@ -188,7 +188,7 @@ final class HostDatabaseRestoreTests: XCTestCase {
             try remove.bind(1, fixture.botB.value.uuidString.lowercased())
             _ = try remove.step()
         }
-        _ = try HostDatabaseRestore.restore(backupURL: root.appendingPathComponent("before-revoke.sqlite"), currentURL: root.appendingPathComponent("current.sqlite"))
+        _ = try HostDatabaseRestore.restore(backupURL: root.appendingPathComponent("before-revoke.sqlite"), currentURL: root.appendingPathComponent("current.sqlite"), reviewToken: HostDatabaseRestore.inspect(backupURL: root.appendingPathComponent("before-revoke.sqlite")).fingerprint)
         let current = try SQLiteDB(path: root.appendingPathComponent("current.sqlite").path, readonly: true)
         let store = BotStore(db: current)
         XCTAssertNil(try store.getContextBinding(hostID: "host", botID: fixture.botB, context: .general))

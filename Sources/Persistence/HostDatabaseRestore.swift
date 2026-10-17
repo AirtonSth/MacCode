@@ -1,10 +1,96 @@
 import Foundation
 import Darwin
 import CoreModel
+import CryptoKit
+import SQLite3
 
 /// Offline restore only: caller must own the host instance lock, with no live AppContext.
 public enum HostDatabaseRestore {
-    public static func restore(backupURL: URL, currentURL: URL) throws -> URL {
+    public enum QueueKind: String { case agent, bot }
+
+    public struct Review {
+        public let schemaVersion: Int
+        public let fingerprint: String
+        public let agentQueueIDs: [String]
+        public let botQueueIDs: [String]
+        public let routineIDs: [String]
+        public let scheduledTaskIDs: [String]
+        public var requiresConfirmation: Bool {
+            !agentQueueIDs.isEmpty || !botQueueIDs.isEmpty || !routineIDs.isEmpty || !scheduledTaskIDs.isEmpty
+        }
+    }
+
+    public static func inspect(backupURL: URL) throws -> Review {
+        _ = try regularFile(backupURL)
+        let db = try SQLiteDB(path: backupURL.path, readonly: true)
+        try db.execute("BEGIN;")
+        defer { try? db.execute("ROLLBACK;") }
+        let version = try validateBackupSchema(db)
+        let review = try reviewSnapshot(db, version: version)
+        try db.execute("COMMIT;")
+        return review
+    }
+
+    public static func requiresQueueReview(kind: QueueKind, id: String, db: SQLiteDB) throws -> Bool {
+        let statement = try db.prepare("SELECT 1 FROM host_restore_queue_holds WHERE kind=? AND queue_id=? AND approved=0;")
+        defer { statement.reset() }
+        try statement.bind(1, kind.rawValue)
+        try statement.bind(2, id)
+        return try statement.step()
+    }
+
+    /// Only an explicit force-send action may release this exact restored intent.
+    public static func approveQueue(kind: QueueKind, id: String, db: SQLiteDB) throws {
+        let statement = try db.prepare("UPDATE host_restore_queue_holds SET approved=1 WHERE kind=? AND queue_id=?;")
+        defer { statement.reset() }
+        try statement.bind(1, kind.rawValue)
+        try statement.bind(2, id)
+        _ = try statement.step()
+    }
+
+    public static func recoverQueueApprovals(db: SQLiteDB) throws {
+        try db.execute("UPDATE host_restore_queue_holds SET approved=0 WHERE approved<>0;")
+    }
+
+    public static func pauseQueue(kind: QueueKind, id: String, db: SQLiteDB) throws {
+        let statement = try db.prepare("INSERT INTO host_restore_queue_holds(kind,queue_id,approved) VALUES(?,?,0) ON CONFLICT(kind,queue_id) DO UPDATE SET approved=0;")
+        defer { statement.reset() }
+        try statement.bind(1, kind.rawValue)
+        try statement.bind(2, id)
+        _ = try statement.step()
+    }
+
+    public static func recordQueueAttempt(kind: QueueKind, id: String, runID: AgentRunID, db: SQLiteDB) throws {
+        let sql = kind == .agent
+            ? "UPDATE host_restore_queue_holds SET attempt_run_id=? WHERE kind=? AND queue_id=?;"
+            : "INSERT INTO host_restore_queue_holds(kind,queue_id,approved,attempt_run_id) VALUES(?,?,1,?) ON CONFLICT(kind,queue_id) DO UPDATE SET attempt_run_id=excluded.attempt_run_id;"
+        let statement = try db.prepare(sql)
+        defer { statement.reset() }
+        if kind == .agent {
+            try statement.bind(1, runID.value.uuidString)
+            try statement.bind(2, kind.rawValue)
+            try statement.bind(3, id)
+        } else {
+            try statement.bind(1, kind.rawValue)
+            try statement.bind(2, id)
+            try statement.bind(3, runID.value.uuidString)
+        }
+        _ = try statement.step()
+    }
+
+    public static func queueAttempt(kind: QueueKind, id: String, db: SQLiteDB) throws -> AgentRunID? {
+        let statement = try db.prepare("SELECT attempt_run_id FROM host_restore_queue_holds WHERE kind=? AND queue_id=?;")
+        defer { statement.reset() }
+        try statement.bind(1, kind.rawValue)
+        try statement.bind(2, id)
+        guard try statement.step(), let raw = statement.columnText(0) else { return nil }
+        guard let uuid = UUID(uuidString: raw), uuid.uuidString.lowercased() == raw.lowercased() else {
+            throw SQLiteError.execute("restored queue has an invalid attempt identity")
+        }
+        return AgentRunID(uuid)
+    }
+
+    public static func restore(backupURL: URL, currentURL: URL, reviewToken: String? = nil) throws -> URL {
         let sourceInfo = try regularFile(backupURL)
         let currentInfo = try regularFile(currentURL)
         guard sourceInfo.st_dev != currentInfo.st_dev || sourceInfo.st_ino != currentInfo.st_ino else {
@@ -17,7 +103,7 @@ public enum HostDatabaseRestore {
         var recoveryCreated = false
         do {
             try restore(backupURL: backupURL, currentURL: currentURL, stageURL: stageURL,
-                        recoveryURL: recoveryURL, recoveryCreated: &recoveryCreated)
+                        recoveryURL: recoveryURL, recoveryCreated: &recoveryCreated, reviewToken: reviewToken)
             do {
                 try removeStage(stageURL)
             } catch {
@@ -35,16 +121,23 @@ public enum HostDatabaseRestore {
     }
 
     private static func restore(backupURL: URL, currentURL: URL, stageURL: URL,
-                                recoveryURL: URL, recoveryCreated: inout Bool) throws {
+                                recoveryURL: URL, recoveryCreated: inout Bool, reviewToken: String?) throws {
         let source = try SQLiteDB(path: backupURL.path, readonly: true)
-        try validateBackupSchema(source)
         try createPrivateFile(stageURL)
         do {
             let stage = try SQLiteDB(path: stageURL.path)
             try source.backup(to: stage)
+            let version = try validateBackupSchema(stage)
+            let review = try reviewSnapshot(stage, version: version)
+            if let reviewToken {
+                guard reviewToken == review.fingerprint else {
+                    throw SQLiteError.execute("restore review fingerprint changed; inspect the backup again")
+                }
+            } else if review.requiresConfirmation {
+                throw SQLiteError.execute("backup contains queued work or schedules requiring explicit review")
+            }
             try Schema.migrate(stage)
             try stage.enableFullDurability()
-            try validateRestorableWork(stage)
         }
 
         let current = try SQLiteDB(path: currentURL.path)
@@ -79,6 +172,48 @@ public enum HostDatabaseRestore {
         let botUpdates = columns.map { "\"\($0)\"=latest.\"\($0)\"" }.joined(separator: ",")
         do {
             try current.transaction {
+                let conflicts = try current.prepare("""
+                    SELECT 1 WHERE EXISTS (
+                        SELECT 1 FROM main.agent_queued_messages c LEFT JOIN restored.agent_queued_messages r ON r.id=c.id COLLATE NOCASE
+                        WHERE r.id IS NULL OR r.thread_id<>c.thread_id COLLATE NOCASE OR r.text<>c.text OR r.attachments_json<>c.attachments_json OR r.interaction_mode IS NOT c.interaction_mode)
+                    OR EXISTS (
+                        SELECT r.* FROM main.agent_queued_message_routing r WHERE queued_message_id COLLATE NOCASE IN (SELECT id FROM main.agent_queued_messages)
+                        EXCEPT SELECT r.* FROM restored.agent_queued_message_routing r WHERE queued_message_id COLLATE NOCASE IN (SELECT id FROM main.agent_queued_messages))
+                    OR EXISTS (
+                        SELECT r.* FROM restored.agent_queued_message_routing r WHERE queued_message_id COLLATE NOCASE IN (SELECT id FROM main.agent_queued_messages)
+                        EXCEPT SELECT r.* FROM main.agent_queued_message_routing r WHERE queued_message_id COLLATE NOCASE IN (SELECT id FROM main.agent_queued_messages))
+                    OR EXISTS (
+                        SELECT 1 FROM main.agent_queued_messages q
+                        JOIN restored.agent_threads source_thread ON source_thread.id=q.thread_id COLLATE NOCASE
+                        LEFT JOIN main.agent_threads current_thread ON current_thread.id=q.thread_id COLLATE NOCASE
+                        WHERE NOT EXISTS (SELECT 1 FROM restored.agent_queued_message_routing qr WHERE qr.queued_message_id=q.id COLLATE NOCASE)
+                          AND (current_thread.id IS NULL
+                            OR source_thread.provider IS NOT current_thread.provider
+                            OR source_thread.provider_instance_id IS NOT current_thread.provider_instance_id
+                            OR source_thread.model IS NOT current_thread.model
+                            OR source_thread.permission_mode IS NOT current_thread.permission_mode
+                            OR source_thread.reasoning_effort IS NOT current_thread.reasoning_effort
+                            OR source_thread.service_tier IS NOT current_thread.service_tier
+                            OR source_thread.model_selection_json IS NOT current_thread.model_selection_json
+                            OR source_thread.reasoning_model IS NOT current_thread.reasoning_model
+                            OR EXISTS (
+                                SELECT sr.* FROM restored.agent_thread_routing sr
+                                WHERE sr.thread_id=source_thread.id
+                                EXCEPT SELECT cr.* FROM main.agent_thread_routing cr WHERE cr.thread_id=current_thread.id)
+                            OR EXISTS (
+                                SELECT cr.* FROM main.agent_thread_routing cr
+                                WHERE cr.thread_id=current_thread.id
+                                EXCEPT SELECT sr.* FROM restored.agent_thread_routing sr WHERE sr.thread_id=source_thread.id))
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM main.bot_queued_follow_ups c LEFT JOIN restored.bot_queued_follow_ups r ON r.id=c.id COLLATE NOCASE
+                        WHERE r.id IS NULL OR r.bot_id<>c.bot_id OR r.conversation_id IS NOT c.conversation_id OR r.text<>c.text OR r.payload_json<>c.payload_json);
+                    """)
+                defer { conflicts.reset() }
+                guard try !conflicts.step() else {
+                    throw SQLiteError.execute("restore would lose or change a current queued intent")
+                }
+                conflicts.reset()
                 try current.execute("""
                     INSERT INTO restored.bots SELECT b.* FROM main.bots AS b
                     WHERE b.id IN (SELECT bot_id FROM main.bot_context_bindings)
@@ -99,6 +234,22 @@ public enum HostDatabaseRestore {
                     INSERT INTO restored.settings SELECT * FROM main.settings;
                     DELETE FROM restored.command_receipts;
                     INSERT INTO restored.command_receipts SELECT * FROM main.command_receipts;
+                    INSERT INTO restored.host_restore_queue_holds(kind,queue_id)
+                    SELECT 'agent',id FROM restored.agent_queued_messages WHERE true ON CONFLICT(kind,queue_id) DO UPDATE SET approved=0;
+                    INSERT INTO restored.host_restore_queue_holds(kind,queue_id)
+                    SELECT 'bot',id FROM restored.bot_queued_follow_ups WHERE true ON CONFLICT(kind,queue_id) DO UPDATE SET approved=0;
+                    UPDATE restored.host_restore_queue_holds AS old SET attempt_run_id=latest.attempt_run_id
+                    FROM main.host_restore_queue_holds AS latest WHERE old.kind=latest.kind AND old.queue_id=latest.queue_id COLLATE NOCASE;
+                    UPDATE restored.agent_queued_messages SET lease_id=NULL,lease_started_at=NULL;
+                    UPDATE restored.bot_routine_activations SET is_enabled=0;
+                    UPDATE restored.scheduled_tasks SET enabled=0,lease_owner=NULL,lease_expires_at=NULL;
+                    UPDATE restored.scheduled_task_runs AS old
+                    SET status=latest.status,finished_at=latest.finished_at,error_code=latest.error_code,error_summary=latest.error_summary
+                    FROM main.scheduled_task_runs AS latest WHERE old.id=latest.id AND latest.status NOT IN ('queued','running');
+                    INSERT INTO restored.agent_runs SELECT run.* FROM main.agent_runs AS run
+                    WHERE (EXISTS (SELECT 1 FROM restored.agent_queued_messages q WHERE q.id=run.id COLLATE NOCASE AND q.thread_id=run.thread_id COLLATE NOCASE)
+                        OR EXISTS (SELECT 1 FROM restored.host_restore_queue_holds h WHERE h.attempt_run_id=run.id COLLATE NOCASE))
+                      AND NOT EXISTS (SELECT 1 FROM restored.agent_runs WHERE id=run.id);
                     UPDATE restored.agent_runs AS old
                     SET status=latest.status, finished_at=latest.finished_at,
                         error_message=latest.error_message, terminal_reason=latest.terminal_reason
@@ -116,6 +267,10 @@ public enum HostDatabaseRestore {
         try CommandReceiptRepository(db: stage).recoverInterruptedClaims()
         _ = try AgentRunRepository(db: stage).reconcileRunningOnLaunch()
         try AgentThreadRepository(db: stage).reconcileRunningOnLaunch()
+        let schedules = ScheduledTaskStore(db: stage)
+        for run in try schedules.listActiveRuns() {
+            try schedules.finish(runID: run.id, status: .cancelled, errorCode: "database_restore_review", errorSummary: "Imported run stopped pending restore review.")
+        }
         do {
             let check = try stage.prepare("PRAGMA integrity_check;")
             defer { check.reset() }
@@ -131,10 +286,7 @@ public enum HostDatabaseRestore {
         try stage.backup(to: current)
     }
 
-    private static func validateBackupSchema(_ db: SQLiteDB) throws {
-        // ponytail: accept the exact current schema; older schema imports need a validated data-only migration.
-        let trusted = try SQLiteDB(path: ":memory:")
-        try Schema.migrate(trusted)
+    private static func validateBackupSchema(_ db: SQLiteDB) throws -> Int {
         func schema(_ database: SQLiteDB) throws -> [String: String] {
             let statement = try database.prepare("SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name;")
             defer { statement.reset() }
@@ -147,10 +299,79 @@ public enum HostDatabaseRestore {
             }
             return result
         }
-        guard try schema(db) == schema(trusted) else {
-            throw SQLiteError.execute("restore requires the exact trusted current database schema")
+        let actual = try schema(db)
+        for version in [93, 96, Schema.currentVersion] {
+            let trusted = try Schema.trustedRestoreSchema(version: version)
+            if try actual == schema(trusted) {
+                let meta = try db.prepare("SELECT MAX(version),typeof(MAX(version)) FROM schema_meta;")
+                defer { meta.reset() }
+                guard try meta.step(), meta.columnText(1) == "integer", meta.columnInt64(0) == Int64(version) else {
+                    throw SQLiteError.execute("restore schema version does not match its trusted structure")
+                }
+                return version
+            }
         }
-        try validateVersion(db)
+        throw SQLiteError.execute("restore requires an exact trusted database schema")
+    }
+
+    private static func reviewSnapshot(_ db: SQLiteDB, version: Int) throws -> Review {
+        var hash = SHA256()
+        hash.update(data: Data("host-restore-review-v1".utf8))
+        func bytes(_ data: Data) {
+            var length = UInt64(data.count).bigEndian
+            withUnsafeBytes(of: &length) { hash.update(data: Data($0)) }
+            hash.update(data: data)
+        }
+        func ids(_ table: String, _ column: String = "id") throws -> [String] {
+            let statement = try db.prepare("SELECT \(column) FROM \(table) ORDER BY \(column);")
+            defer { statement.reset() }
+            var result: [String] = []
+            while try statement.step() {
+                guard let id = statement.columnText(0), UUID(uuidString: id)?.uuidString.lowercased() == id.lowercased() else {
+                    throw SQLiteError.execute("restore work has a noncanonical identifier")
+                }
+                result.append(id)
+            }
+            return result
+        }
+        let agentIDs = try ids("agent_queued_messages")
+        let botIDs = try ids("bot_queued_follow_ups")
+        let routineIDs = try ids("bot_routine_definitions")
+        let taskIDs = try ids("scheduled_tasks")
+        let tables = try db.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name;")
+        defer { tables.reset() }
+        while try tables.step() {
+            guard let table = tables.columnText(0) else { throw SQLiteError.execute("restore table has no name") }
+            bytes(Data(table.utf8))
+            let escaped = table.replacingOccurrences(of: "\"", with: "\"\"")
+            let rows = try db.prepare("SELECT * FROM \"\(escaped)\" ORDER BY rowid;")
+            defer { rows.reset() }
+            while try rows.step() {
+                bytes(Data("row".utf8))
+                for index in 0..<sqlite3_column_count(rows.handle) {
+                    let type = sqlite3_column_type(rows.handle, index)
+                    bytes(Data([UInt8(type)]))
+                    switch type {
+                    case SQLITE_INTEGER:
+                        var value = sqlite3_column_int64(rows.handle, index).bigEndian
+                        withUnsafeBytes(of: &value) { bytes(Data($0)) }
+                    case SQLITE_FLOAT:
+                        var value = sqlite3_column_double(rows.handle, index).bitPattern.bigEndian
+                        withUnsafeBytes(of: &value) { bytes(Data($0)) }
+                    case SQLITE_TEXT, SQLITE_BLOB:
+                        let count = Int(sqlite3_column_bytes(rows.handle, index))
+                        if count > 0, let pointer = sqlite3_column_blob(rows.handle, index) {
+                            bytes(Data(bytes: pointer, count: count))
+                        } else { bytes(Data()) }
+                    default: bytes(Data())
+                    }
+                }
+            }
+        }
+        let fingerprint = hash.finalize().map { String(format: "%02x", $0) }.joined()
+        return Review(schemaVersion: version, fingerprint: fingerprint,
+                      agentQueueIDs: agentIDs, botQueueIDs: botIDs,
+                      routineIDs: routineIDs, scheduledTaskIDs: taskIDs)
     }
 
     private static func validateVersion(_ db: SQLiteDB) throws {
@@ -159,23 +380,6 @@ public enum HostDatabaseRestore {
         guard try statement.step(), statement.columnText(1) == "integer",
               statement.columnInt64(0) > 0, statement.columnInt64(0) <= Int64(Schema.currentVersion) else {
             throw SQLiteError.execute("restore requires a supported RemoteCode database schema")
-        }
-    }
-
-    private static func validateRestorableWork(_ db: SQLiteDB) throws {
-        // ponytail: legacy queued work and enabled schedules require a future explicit-review restore path.
-        let statement = try db.prepare("""
-            SELECT 1 WHERE EXISTS (
-                SELECT 1 FROM agent_queued_messages q WHERE NOT EXISTS (
-                    SELECT 1 FROM bot_conversation_contexts c WHERE c.thread_id=q.thread_id))
-            OR EXISTS (SELECT 1 FROM bot_queued_follow_ups q WHERE NOT EXISTS (
-                SELECT 1 FROM bot_conversation_contexts c WHERE c.conversation_id=q.conversation_id))
-            OR EXISTS (SELECT 1 FROM bot_routine_activations WHERE is_enabled<>0)
-            OR EXISTS (SELECT 1 FROM scheduled_tasks WHERE enabled<>0);
-            """)
-        defer { statement.reset() }
-        guard try !statement.step() else {
-            throw SQLiteError.execute("backup contains legacy queued work or enabled schedules requiring explicit review")
         }
     }
 

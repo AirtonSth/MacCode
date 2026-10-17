@@ -242,6 +242,7 @@ public final class Bootstrap {
         try db.enableFullDurability()
         try beforeSchemaMigrationForTesting?(db)
         try Schema.migrate(db)
+        try HostDatabaseRestore.recoverQueueApprovals(db: db)
         try CommandReceiptRepository(db: db).recoverInterruptedClaims()
         try initDefaults(db: db)
         let maintenance = ForkIntentMaintenanceLoop(

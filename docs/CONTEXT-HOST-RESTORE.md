@@ -52,3 +52,23 @@ Independent review identified imported-schema triggers, incomplete merged Bot id
 ## Design and cleanup
 
 No native view or interaction layout changed. Existing design ledgers remain in `CONTEXT-OFFLINE-INTENT.md` and `CONTEXT-GROUPING-DESIGN.md`; this backend-only command does not claim new browser, keyboard, VoiceOver, simulator, or human-trial evidence. Verification used synthetic databases and dedicated paths; no personal database, credential store, running host, or shared tool installation was modified. Task fixture cleanup is recorded separately before publication; retained recovery files in a real user restore are intentional deliverables, not temporary files to delete automatically.
+
+
+## Superseding legacy RESTORE adoption update
+
+This section supersedes the earlier legacy queue/schedule refusal ceiling for the implemented adoption path; preceding host-restore evidence remains historical evidence for its original scope. Legacy adoption requires fingerprint review and explicit confirmation. Current authority remains authoritative. Exact held queue items require explicit approval only after the context guard passes; neither automatic drain nor force action bypasses that guard. Bot receipts are processed asynchronously and stay queued until acceptance. Rejected held items remain queued. Adopted schedules stay disabled until explicit user re-enable. No automatic execution occurs.
+
+The earlier schema run at `f249b93dc480c02d5481e8a41d353635517f67ac` reported 7 executed, 1 skipped, 0 failed in 3.565 seconds; it remains historical evidence only. The final bounded evidence below supersedes the prior open-findings status, without claiming full adoption correctness.
+
+
+## Final legacy RESTORE adoption evidence
+
+The exact Sources/Tests tree is `77247c43d481a84c192aff83572c6c89cd2d4faa`. Packaged CLI Sources match build tree `64a5567214ac18201f98f76584b398ca31e75c6e` (`git diff Sources` exit 0); packaged binary SHA-256 is `fa92966d2372b56227e035d46ba19fc1f4808b96d2a62330decd0bf9448cd730`.
+
+The actual CLI refused while the instance lock was held (exit 1). ID-only preview reported 93 (exit 0). Missing/wrong review refused (exit 1) and left current state unchanged. Correct review adopted 93→97 (exit 0): 3 held items, schedules disabled, no revived grants or active runs, IDs/history intact, source unchanged, recovery mode 0600 and no staging files. The read-only verifier ran before mutations: 1 passed in 0.015 seconds.
+
+On that same Sources/Tests tree, combined filter `HostRestoreLegacySchemaTests.test[A-Z]|HostRestoreLegacyRouterTests|HostRestoreAgentFailureTests|HostRestoreBotRestartTests.testReopenHoldsFailedBotAttemptAndForceDoesNotStartProvider` ran 10 tests, 0 skips, 0 failures, 5.849 seconds. Bot Force retained the row synchronously and queued one receipt; acceptance occurred once with an ID-only async event. Admission refusal and Stop-before-dispatch retained the row; definite Agent failure re-paused it. Child-process exit/reopen preserved the Bot failed attempt and refused duplicate Force. Reviewer follow-up `01a147cf-bd2d-7a42-bc68-d8ab3628b7e2` closed all source objections; no new material defect was reported.
+
+Limits: no live provider credential/isolation proof. UI unchanged. iOS docs-only, with no new simulator proof. Earlier failed runs remain historical and are not counted as passes. This evidence supersedes the preceding statement that three material bugs remained under repair.
+
+Adjacent regressions on the same tree ran 38 tests, with 2 optional export/verification skips and 0 failures, in 16.974 seconds. Coverage includes ordinary Agent definite-failure retry, prepared recovery, Bot queue ownership/relaunch, SQLite backup, restore, and queue leases. The focused legacy combined run above had no skips. Restart proof uses a real process boundary and database Bootstrap; it disables the separate asynchronous launch-run reconciliation job and does not claim full startup reconciliation coverage.

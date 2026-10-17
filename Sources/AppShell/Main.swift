@@ -21,6 +21,8 @@ struct RemoteCodeMain {
         let dbOverride = ProcessInfo.processInfo.environment["RC2_DB_PATH"]
         let restoreFlag = "--restore-database-backup"
         let restoresDatabase = CommandLine.arguments.contains(restoreFlag)
+        let inspectFlag = "--inspect-database-backup"
+        let inspectsDatabase = CommandLine.arguments.contains(inspectFlag)
 
         if CommandLine.arguments.contains("--scheduled-task-agent-unregister") {
             do {
@@ -62,7 +64,7 @@ struct RemoteCodeMain {
             Logger(subsystem: "io.remotecode.app", category: "lifecycle")
                 .fault("app.second_instance_exit holder=\(holder, privacy: .public)")
             fputs("RemoteCode is already running for \(appSupportDirectory.path) (pid \(holder)); exiting.\n", stderr)
-            if restoresDatabase { exit(EXIT_FAILURE) }
+            if restoresDatabase || inspectsDatabase { exit(EXIT_FAILURE) }
             if let holderPID, !LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
                 NSRunningApplication(processIdentifier: holderPID)?.activate()
             }
@@ -73,10 +75,11 @@ struct RemoteCodeMain {
             instanceLock = nil
         }
 
-        if restoresDatabase {
-            guard let instanceLock,
-                  CommandLine.arguments.filter({ $0 == restoreFlag }).count == 1,
-                  let index = CommandLine.arguments.firstIndex(of: restoreFlag),
+        if restoresDatabase || inspectsDatabase {
+            let operationFlag = restoresDatabase ? restoreFlag : inspectFlag
+            guard let instanceLock, !(restoresDatabase && inspectsDatabase),
+                  CommandLine.arguments.filter({ $0 == operationFlag }).count == 1,
+                  let index = CommandLine.arguments.firstIndex(of: operationFlag),
                   CommandLine.arguments.indices.contains(index + 1) else {
                 fputs("Database restore requires an exclusive host lock and one backup path.\n", stderr)
                 exit(EXIT_FAILURE)
@@ -85,7 +88,28 @@ struct RemoteCodeMain {
                 do {
                     let current = URL(fileURLWithPath: dbOverride ?? appSupportDirectory.appendingPathComponent("remotecode.sqlite").path)
                     let backup = URL(fileURLWithPath: CommandLine.arguments[index + 1])
-                    let recovery = try HostDatabaseRestore.restore(backupURL: backup, currentURL: current)
+                    if inspectsDatabase {
+                        let review = try HostDatabaseRestore.inspect(backupURL: backup)
+                        let output: [String: Any] = [
+                            "schema_version": review.schemaVersion, "review_fingerprint": review.fingerprint,
+                            "agent_queue_ids": review.agentQueueIDs, "bot_queue_ids": review.botQueueIDs,
+                            "routine_ids": review.routineIDs, "scheduled_task_ids": review.scheduledTaskIDs,
+                            "requires_confirmation": review.requiresConfirmation,
+                            "adoption_policy": "Queues require an explicit force-send action. Schedules remain disabled until explicitly enabled."
+                        ]
+                        let data = try JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys])
+                        print(String(decoding: data, as: UTF8.self))
+                        return
+                    }
+                    var token: String?
+                    if let reviewIndex = CommandLine.arguments.firstIndex(of: "--restore-review") {
+                        guard CommandLine.arguments.filter({ $0 == "--restore-review" }).count == 1,
+                              CommandLine.arguments.indices.contains(reviewIndex + 1) else {
+                            throw SQLiteError.open("restore review requires one fingerprint")
+                        }
+                        token = CommandLine.arguments[reviewIndex + 1]
+                    }
+                    let recovery = try HostDatabaseRestore.restore(backupURL: backup, currentURL: current, reviewToken: token)
                     print("Database restored without starting execution. Recovery backup: \(recovery.path)")
                 } catch {
                     fputs("Database restore failed: \(error)\n", stderr)

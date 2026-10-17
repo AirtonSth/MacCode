@@ -4131,6 +4131,7 @@ public final class AgentQueuedMessageRepository {
             try select.bind(1, threadId.value.uuidString)
             guard try select.step() else { return }
             let message = decodeRow(select)
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: message.id.value.uuidString, db: database) else { return }
             let state = AgentQueuedMessageDispatchState(rawValue: select.columnText(10) ?? "") ?? .queued
             guard state == .queued else { return }
             if select.columnText(8) != nil,
@@ -4173,6 +4174,7 @@ public final class AgentQueuedMessageRepository {
             try select.bind(1, id.value.uuidString)
             guard try select.step() else { return }
             let message = decodeRow(select)
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: message.id.value.uuidString, db: database) else { return }
             let state = AgentQueuedMessageDispatchState(rawValue: select.columnText(10) ?? "") ?? .queued
             guard state == .queued else { return }
             if select.columnText(8) != nil,
@@ -4204,6 +4206,9 @@ public final class AgentQueuedMessageRepository {
             try st.bind(2, lease.leaseId)
             _ = try st.step()
             guard try changedRowCount() == 1 else { return false }
+            if try HostDatabaseRestore.queueAttempt(kind: .agent, id: lease.message.id.value.uuidString, db: database) != nil {
+                try HostDatabaseRestore.pauseQueue(kind: .agent, id: lease.message.id.value.uuidString, db: database)
+            }
             try normalizePositions(threadId: lease.message.threadId)
             return true
         } }
@@ -4261,6 +4266,9 @@ public final class AgentQueuedMessageRepository {
             try st.bind(3, runId.value.uuidString)
             _ = try st.step()
             guard try changedRowCount() == 1 else { return false }
+            if try HostDatabaseRestore.queueAttempt(kind: .agent, id: lease.message.id.value.uuidString, db: database) != nil {
+                try HostDatabaseRestore.pauseQueue(kind: .agent, id: lease.message.id.value.uuidString, db: database)
+            }
             if let promotedId,
                let target = try get(id: promotedId),
                target.threadId == lease.message.threadId,
@@ -4337,6 +4345,7 @@ public final class AgentQueuedMessageRepository {
         runId: AgentRunID
     ) throws -> AgentQueuedMessage? {
         try db.performSync { database in try database.transaction {
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: id.value.uuidString, db: database) else { return nil }
             let select = try database.prepare("""
                 SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at,
                        lease_id
@@ -4359,6 +4368,9 @@ public final class AgentQueuedMessageRepository {
             try update.bind(3, runId.value.uuidString)
             _ = try update.step()
             guard try changedRowCount() == 1 else { return nil }
+            if try HostDatabaseRestore.queueAttempt(kind: .agent, id: id.value.uuidString, db: database) != nil {
+                try HostDatabaseRestore.pauseQueue(kind: .agent, id: id.value.uuidString, db: database)
+            }
             return message
         } }
     }
@@ -4371,6 +4383,7 @@ public final class AgentQueuedMessageRepository {
         runId: AgentRunID
     ) throws -> AgentQueuedMessage? {
         try db.performSync { database in try database.transaction {
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: id.value.uuidString, db: database) else { return nil }
             let select = try database.prepare("""
                 SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at,
                        lease_id
@@ -4401,6 +4414,7 @@ public final class AgentQueuedMessageRepository {
     /// delete predicate. Concurrent recovery yields the row to exactly one caller.
     public func acknowledgeDispatched(id: AgentQueuedMessageID, runId: AgentRunID) throws -> AgentQueuedMessage? {
         try db.performSync { database in try database.transaction {
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: id.value.uuidString, db: database) else { return nil }
             let select = try database.prepare("""
                 SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
                 FROM agent_queued_messages
@@ -4437,6 +4451,7 @@ public final class AgentQueuedMessageRepository {
             guard try select.step(), select.columnText(9) == AgentQueuedMessageDispatchState.dispatched.rawValue,
                   let runId = select.columnText(8) else { return nil }
             let message = decodeRow(select)
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: message.id.value.uuidString, db: database) else { return nil }
             let delete = try database.prepare("""
                 DELETE FROM agent_queued_messages
                 WHERE id = ? AND dispatch_state = 'dispatched' AND dispatch_run_id = ?;

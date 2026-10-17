@@ -2923,6 +2923,8 @@ private final class DeskSendWork {
     var task: Task<Void, Never>!
     var threadID: AgentThreadID?
     var runID: AgentRunID?
+    var queuedRecord: BotQueuedFollowUpRecord?
+    var providerAccepted = false
 }
 
 /// One in-flight stop join per bot so concurrent stops share the same await.
@@ -6284,6 +6286,7 @@ public final class BotsViewModel: ObservableObject {
         let next: [BotQueuedFollowUp]? = items.isEmpty ? nil : items
         guard queuedFollowUpsByBot[botID] != next else { return }
         queuedFollowUpsByBot[botID] = next
+        cancelChangedQueuedStarts(botID: botID)
         syncQueuedFollowUps()
     }
 
@@ -6309,6 +6312,28 @@ public final class BotsViewModel: ObservableObject {
               let threadID = conversation.linkedAgentThreadID else {
             throw BotStoreError.invalidRow("queued follow-up authority is stale")
         }
+        guard try botStore.conversationContextPin(conversationID: conversationID) == nil else {
+            throw BotStoreError.invalidInput("Contextual execution is unavailable until isolation is verified.")
+        }
+        func ownsQueuedDeskSendReservation() -> Bool {
+            (deskSendTasks[botID] ?? []).contains {
+                $0.threadID == threadID && $0.queuedRecord?.id.caseInsensitiveCompare(id) == .orderedSame
+            }
+        }
+        if context.coordinator.hasPendingProviderStart(threadId: threadID) || ownsQueuedDeskSendReservation() {
+            return ["force_status": "queued", "conversation_id": conversationID.value.uuidString.lowercased(), "thread_id": threadID.value.uuidString.lowercased()]
+        }
+        if let attempt = try HostDatabaseRestore.queueAttempt(kind: .bot, id: id, db: context.db),
+           try context.runRepo.get(id: attempt) != nil {
+            if context.coordinator.activeRunId(threadId: threadID) == attempt {
+                return ["force_status": "started", "run_id": attempt.value.uuidString.lowercased(), "conversation_id": conversationID.value.uuidString.lowercased(), "thread_id": threadID.value.uuidString.lowercased()]
+            }
+            throw BotStoreError.invalidInput("Restored queued outcome requires reconciliation before another send.")
+        }
+        if try HostDatabaseRestore.requiresQueueReview(kind: .bot, id: id, db: context.db) {
+            try admitDesktopSend(bot: bot)
+            try HostDatabaseRestore.approveQueue(kind: .bot, id: id, db: context.db)
+        }
         if try liveThreadIDs(for: botID).contains(threadID) {
             stopDeskThread(conversationID)
             return [
@@ -6318,6 +6343,9 @@ public final class BotsViewModel: ObservableObject {
             ]
         }
         drainHostQueuedFollowUp(bot: bot, conversation: conversation)
+        if context.coordinator.hasPendingProviderStart(threadId: threadID) || ownsQueuedDeskSendReservation() {
+            return ["force_status": "queued", "conversation_id": conversationID.value.uuidString.lowercased(), "thread_id": threadID.value.uuidString.lowercased()]
+        }
         guard queuedFollowUpsByBot[botID]?.contains(where: { $0.id == itemID }) != true,
               let runID = context.coordinator.activeRunId(threadId: threadID) else {
             throw BotStoreError.invalidRow("queued follow-up did not start")
@@ -8076,7 +8104,18 @@ public final class BotsViewModel: ObservableObject {
         brainPane = pane
     }
 
+    private func cancelChangedQueuedStarts(botID: BotID) {
+        let items = queuedFollowUpsByBot[botID] ?? []
+        for work in deskSendTasks[botID] ?? [] where !work.providerAccepted {
+            if let record = work.queuedRecord,
+               items.first(where: { $0.id.uuidString.lowercased() == record.id.lowercased() }) != decodeQueuedFollowUp(record) {
+                work.task.cancel()
+            }
+        }
+    }
+
     private func persistQueuedFollowUps() {
+        for botID in Array(deskSendTasks.keys) { cancelChangedQueuedStarts(botID: botID) }
         let liveIDs = Set(queuedFollowUpsByBot.keys)
         let stored = try? botStore.listAllQueuedFollowUps()
         if let stored {
@@ -11381,7 +11420,8 @@ public final class BotsViewModel: ObservableObject {
         conversation: BotConversation,
         userText: String,
         attachments: [AgentAttachment],
-        routingOverride: BotDeskRouting? = nil
+        routingOverride: BotDeskRouting? = nil,
+        queuedRecord: BotQueuedFollowUpRecord? = nil
     ) throws -> BotStartedRun? {
         // Dest first. Send used to listMemory/listSkillBindings after the
         // bubble painted. Both Desk and host-catalog sends snapshot the same
@@ -11407,16 +11447,24 @@ public final class BotsViewModel: ObservableObject {
             routing: routing,
             router: router
         )
+        if let queuedRecord {
+            try HostDatabaseRestore.recordQueueAttempt(kind: .bot, id: queuedRecord.id, runID: prepared.runID, db: context.db)
+        }
         beginDeskSendInFlight(for: bot.id)
         let epoch = deskStopEpoch[bot.id] ?? 0
         let work = DeskSendWork()
         work.threadID = prepared.thread.id
         work.runID = prepared.runID
+        work.queuedRecord = queuedRecord
         context.coordinator.reserveProviderStart(threadId: prepared.thread.id, runId: prepared.runID)
         work.task = EventBus.outsideMutationCapture {
             Task { [weak self] in
                 guard let self else { return }
                 defer {
+                    if !work.providerAccepted, let record = work.queuedRecord {
+                        do { try HostDatabaseRestore.pauseQueue(kind: .bot, id: record.id, db: self.context.db) }
+                        catch { self.errorMessage = "Queued message review state could not be saved: \(error)" }
+                    }
                     if let threadID = work.threadID, let runID = work.runID {
                         self.context.coordinator.discardProviderStartReservation(
                             threadId: threadID,
@@ -11452,6 +11500,15 @@ public final class BotsViewModel: ObservableObject {
                 // provider has accepted the turn or the start has failed.
                 let signposter = PerfSwitchMetrics.signposter
                 let startInterval = signposter.beginInterval("bot_send_start", id: signposter.makeSignpostID())
+                if let expected = queuedRecord {
+                    guard let current = try? self.botStore.listQueuedFollowUps(botID: bot.id).first(where: { $0.id == expected.id }),
+                          current.text == expected.text, current.payloadJSON == expected.payloadJSON,
+                          current.conversationID == expected.conversationID else {
+                        self.forgetDeskSend(work, botID: bot.id)
+                        self.clearDeskSendInFlight(for: bot.id)
+                        return
+                    }
+                }
                 let brain = self.destBrainInputs(for: bot, deskCache: deskBrain)
                 let started = await self.startSupervisedRun(
                     bot: bot,
@@ -11466,15 +11523,36 @@ public final class BotsViewModel: ObservableObject {
                     expectedEpoch: epoch
                 )
                 signposter.endInterval("bot_send_start", startInterval)
-                self.forgetDeskSend(work, botID: bot.id)
-                self.clearDeskSendInFlight(for: bot.id)
                 if let started {
+                    work.providerAccepted = true
+                    if let record = queuedRecord {
+                        do {
+                            if try self.botStore.acknowledgeQueuedFollowUp(record) {
+                                self.queuedFollowUpsByBot[bot.id]?.removeAll { $0.id.uuidString.lowercased() == record.id.lowercased() }
+                                if self.queuedFollowUpsByBot[bot.id]?.isEmpty == true { self.queuedFollowUpsByBot[bot.id] = nil }
+                                self.syncQueuedFollowUps()
+                                EventBus.shared.publish(kind: .botQueueUpdated, payload: .object([
+                                    "bot_id": .string(bot.id.value.uuidString.lowercased()),
+                                ]))
+                            } else {
+                                try HostDatabaseRestore.pauseQueue(kind: .bot, id: record.id, db: self.context.db)
+                                self.reloadQueuedFollowUpsFromStore(botID: bot.id)
+                                self.errorMessage = "Queued message changed during admission; review delivery before retrying."
+                            }
+                        } catch {
+                            self.errorMessage = "Queued message acknowledgement could not be saved: \(error)"
+                        }
+                    }
+                    self.forgetDeskSend(work, botID: bot.id)
+                    self.clearDeskSendInFlight(for: bot.id)
                     self.lastSendStartedProviderRun = true
                     self.lastLinkedRunIDByBot[bot.id] = started.runID
                     self.restoreDeskWorkLog(botID: bot.id)
                     self.restoreDeskLiveTurn(botID: bot.id)
                     _ = await self.followLinkedRun(bot: bot, started: started)
                 } else {
+                    self.forgetDeskSend(work, botID: bot.id)
+                    self.clearDeskSendInFlight(for: bot.id)
                     self.deskSendInFlightStartedAt = nil
                     self.recordNeedsAttention(bot: bot, conversation: prepared.conversation, userText: userText)
                 }
@@ -11771,11 +11849,35 @@ public final class BotsViewModel: ObservableObject {
         queuedFollowUps = selectedBotID.flatMap { queuedFollowUpsByBot[$0] } ?? []
     }
 
+    private func queuedFollowUpMayDrain(_ item: BotQueuedFollowUp, botID: BotID) -> Bool {
+        guard (deskSendTasks[botID] ?? []).isEmpty else { return false }
+        do {
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .bot, id: item.id.uuidString, db: context.db) else { return false }
+            if let attempt = try HostDatabaseRestore.queueAttempt(kind: .bot, id: item.id.uuidString, db: context.db),
+               try context.runRepo.get(id: attempt) != nil {
+                try HostDatabaseRestore.pauseQueue(kind: .bot, id: item.id.uuidString, db: context.db)
+                return false
+            }
+            return true
+        } catch {
+            errorMessage = String(describing: error)
+            return false
+        }
+    }
+
     private func drainQueuedFollowUp() {
         guard let bot = selectedBot else { return }
         guard !deskRunIsLive else { return }
         guard let next = queuedFollowUpsByBot[bot.id]?.first else {
             syncQueuedFollowUps()
+            return
+        }
+        guard queuedFollowUpMayDrain(next, botID: bot.id) else { return }
+        if let id = next.conversationID {
+            do {
+                guard let conversation = try botStore.conversation(id: id) else { return }
+                drainHostQueuedFollowUp(bot: bot, conversation: conversation)
+            } catch { errorMessage = String(describing: error) }
             return
         }
         composerText = next.text
@@ -11800,10 +11902,13 @@ public final class BotsViewModel: ObservableObject {
             $0.conversationID == conversation.id
         }), let next = queuedFollowUpsByBot[bot.id]?[index] else { return }
         if let threadID = conversation.linkedAgentThreadID,
-           context.coordinator.activeRunId(threadId: threadID) != nil {
+           (context.coordinator.activeRunId(threadId: threadID) != nil || context.coordinator.hasPendingProviderStart(threadId: threadID)) {
             return
         }
         do {
+            guard queuedFollowUpMayDrain(next, botID: bot.id),
+                  let record = try botStore.listQueuedFollowUps(botID: bot.id).first(where: { $0.id.lowercased() == next.id.uuidString.lowercased() }),
+                  decodeQueuedFollowUp(record) == next else { return }
             try admitDesktopSend(bot: bot)
             let display = AgentChatTranscriptChrome.displayUserLine(
                 text: next.text,
@@ -11825,20 +11930,17 @@ public final class BotsViewModel: ObservableObject {
                 conversation: target,
                 userText: next.text,
                 attachments: next.attachments,
-                routingOverride: next.routing
+                routingOverride: next.routing,
+                queuedRecord: record
             ) {
                 stampDeskUserMessageIdentity(runID: started.runID, botID: bot.id)
+            } else {
+                try HostDatabaseRestore.pauseQueue(kind: .bot, id: next.id.uuidString, db: context.db)
             }
         } catch {
             errorMessage = String(describing: error)
             return
         }
-        queuedFollowUpsByBot[bot.id]?.removeAll { $0.id == next.id }
-        if queuedFollowUpsByBot[bot.id]?.isEmpty == true {
-            queuedFollowUpsByBot[bot.id] = nil
-        }
-        persistQueuedFollowUps()
-        syncQueuedFollowUps()
     }
 
     private func applyFollowThrough(

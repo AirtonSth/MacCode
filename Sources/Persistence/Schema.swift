@@ -68,7 +68,8 @@ public enum Schema {
     static let botContextsSchemaVersion = 94
     static let botConversationContextsSchemaVersion = 95
     static let botContextDelegationsSchemaVersion = 96
-    public static let currentVersion: Int = botContextDelegationsSchemaVersion
+    static let hostRestoreQueueHoldsSchemaVersion = 97
+    public static let currentVersion: Int = hostRestoreQueueHoldsSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1936,6 +1937,15 @@ public enum Schema {
         BEFORE DELETE ON bot_context_delegations
         BEGIN SELECT RAISE(ABORT, 'bot context delegation cannot be deleted'); END;
         """),
+        SchemaStep(hostRestoreQueueHoldsSchemaVersion, """
+        CREATE TABLE IF NOT EXISTS host_restore_queue_holds (
+            kind TEXT NOT NULL CHECK(kind IN ('agent','bot')),
+            queue_id TEXT NOT NULL COLLATE NOCASE,
+            approved INTEGER NOT NULL DEFAULT 0 CHECK(approved IN (0,1)),
+            attempt_run_id TEXT,
+            PRIMARY KEY(kind, queue_id)
+        );
+        """),
     ]
 
     /// Additive and idempotent. `key` reuses today's banner identifiers, so a
@@ -2135,6 +2145,17 @@ public enum Schema {
     // PERF: ISO8601DateFormatter is expensive; reuse one for migration timestamps.
     private static let migrationAppliedAtLock = NSLock()
     private static let migrationAppliedAtFormatter = ISO8601DateFormatter()
+
+    static func trustedRestoreSchema(version: Int) throws -> SQLiteDB {
+        guard [93, 96, currentVersion].contains(version) else {
+            throw SQLiteError.execute("unsupported restore schema version")
+        }
+        let db = try SQLiteDB(path: ":memory:")
+        try migrateSteps(db, steps.filter { $0.version <= version })
+        try healBotTeamsGroupsSchema(db)
+        try db.execute(botConversationRoutingMigrationSQL)
+        return db
+    }
 
     public static func migrate(_ db: SQLiteDB) throws {
         try migrateSteps(db, steps)
