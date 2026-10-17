@@ -206,6 +206,15 @@ final class AgentAppBotMentionTests: XCTestCase {
             XCTAssertTrue(started, "Expected provider request for \(thread.title)")
             return try XCTUnwrap(runner.requests.first { $0.threadId == thread.id }?.runId)
         }
+        func startContextualRoot(_ thread: AgentThread, expectedRequests: Int) async throws -> AgentRunID {
+            let id = try await ctx.coordinator.startRun(AgentRunRequest(
+                threadId: thread.id, provider: .distill, model: "fake-model",
+                cwd: BotHome(appSupportDirectory: ctx.appSupportDirectory, bot: bot).root.path, prompt: "existing \(thread.title)"
+            ))
+            let started = await waitUntil(timeout: 5) { runner.requests.count >= expectedRequests }
+            XCTAssertTrue(started, "Expected provider request for \(thread.title)")
+            return id
+        }
         func legacyChain(_ parent: AgentRunID, title: String, expected: Int) async throws -> (AgentThread, AgentRunID, AgentThread, AgentRunID) {
             let child = try makeThread("\(title) child")
             let childRun = try await start(child, expectedRequests: expected)
@@ -218,7 +227,7 @@ final class AgentAppBotMentionTests: XCTestCase {
 
         let rootA = try makeThread("Context A root", contextual: contextA, revision: bindingA.policyRevision)
         let rootB = try makeThread("Context B root", contextual: contextB, revision: bindingB.policyRevision)
-        let runA = try await start(rootA, expectedRequests: 1)
+        let runA = try await startContextualRoot(rootA, expectedRequests: 1)
         // Seed pre-existing coordinator work; public contextual provider admission remains closed.
         let runB = try await ctx.coordinator.startRun(AgentRunRequest(
             threadId: rootB.id, provider: .distill, model: "fake-model",
@@ -235,7 +244,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(ctx.coordinator.activeRunId(threadId: rootB.id), runB)
 
         let rootA2 = try makeThread("Context A replacement", contextual: contextA, revision: bindingA.policyRevision)
-        let runA2 = try await start(rootA2, expectedRequests: 5)
+        let runA2 = try await startContextualRoot(rootA2, expectedRequests: 5)
         let chainA2 = try await legacyChain(runA2, title: "A replacement", expected: 6)
         XCTAssertTrue(runner.finish(runID: runA2, status: .completed, reply: "parent done"))
         let completedParent = await waitUntil(timeout: 5) {
@@ -246,7 +255,7 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(try ctx.runRepo.get(id: chainA2.1)?.status, .running)
         XCTAssertEqual(try ctx.runRepo.get(id: chainA2.3)?.status, .running)
         let rootA3 = try makeThread("Context A active revoke", contextual: contextA, revision: bindingA.policyRevision)
-        let runA3 = try await start(rootA3, expectedRequests: 8)
+        let runA3 = try await startContextualRoot(rootA3, expectedRequests: 8)
         let chainA3 = try await legacyChain(runA3, title: "A active revoke", expected: 9)
         let authority = try XCTUnwrap(ctx.router!.botRoutineAuthority)
         let result = try authority.dispatch(method: "bot.context.revoke", params: [

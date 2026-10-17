@@ -416,3 +416,13 @@ With `RC_LIVE_DOCKER=1`, `test_liveRestartReconcilesAWithoutRevivingGrantsOrRuns
 Result at this revision: 1 test, 0 failures. Controls confirm each runtime reads its own file, cookie and tmp markers and sees its own process argv and environment markers. Neither runtime observed any of the peer's five markers (file contents, cookie contents, tmp, `/proc/*/cmdline` and `environ`, directory listings), the peer workspace path was absent, home mounts and networks were distinct, and the peer's file and cookie markers did not appear in the host-side scoped home. The runtime count of `remotecode-bot-*` containers was 17 before and after.
 
 Limits: this proves container-level separation with the guest image only. Real provider credentials, OAuth refresh and delegated child isolation remain unproven and contextual provider execution stays blocked.
+
+### Stop, revocation and delegation fences (credential-free)
+
+Re-run at this revision on shipped code with fake provider runners:
+
+- `AgentAppBotMentionTests.test_stopAndContextRevokeCancelLegacyDescendantsButNotOtherContext`: Stop and `bot.context.revoke` durably cancel preregistered child and grandchild runs of the revoked context, leave a completed parent's result intact, and never cancel the run of another context. The test had been failing because it started contextual roots through the public send path, which the contextual provider gate correctly refuses; the roots are now seeded through `coordinator.startRun`, as the other-context root already was. No production code changed.
+- `AgentAppBotMentionTests.test_peerPreStartDeadlineSettlesReceiptAndPreventsLateProviderExecution`: a peer that misses its start deadline settles its receipt and the provider never runs late.
+- `BotContextDelegationTests` (7 tests): self and cycle edges, foreign host, mismatched or revoked delegate, depth 64 accepted and 65 rejected, tree close including a closed intermediate, and immutability of edges.
+
+Limit: these use fake runners. Real-provider delegation and peer behaviour stay unproven.
