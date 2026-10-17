@@ -24,7 +24,7 @@ Typed domain refusals for this atomic enqueue operation remain definite refusals
 
 ## Verification boundaries
 
-The macOS journey uses the actual `AppContext`, `AppCommandRouter`, authority, SQLite repositories and `JSONRPCDispatcher.dispatchHTTP`. It is not a fake enqueue and does not replace the unit under test. It calls the dispatcher directly with a mutation principal; it does not establish a new live HTTP-listener/bearer or physical-device pairing proof.
+The original macOS checkpoint used the actual `AppContext`, `AppCommandRouter`, authority, SQLite repositories and a direct `JSONRPCDispatcher.dispatchHTTP` call with a mutation principal. The follow-up below adds a real loopback listener and bearer admission; physical-device pairing remains unverified.
 
 The iOS test uses the actual session and durable mutation ledger with a recording transport. It verifies the exact request fields, ledger-generated request identity and nested persistence receipt shape, not a real host connection or provider execution. The full iOS mutation catalog is checked against its vendored contract fixture.
 
@@ -45,3 +45,21 @@ At exact iOS App/Tests tree `c42dbbb5eaadb7299ea1bae7671be44c6459975b`, `xcodebu
 Earlier attempts are not passing evidence: initial test API assumptions did not compile; the iOS catalog initially lacked the new fixture entry; and the public master-off check exposed an incorrect unknown-outcome classification. The final checks above include those corrections. Independent source reviews `01a149dc-adcd-7a12-b257-c82acba4a205` and `01a149f5-751c-7df2-bfba-70b7435b5b57` found no concrete defect within their inspected scopes. They did not run the checks, prove live listener authentication or verify arbitrary commit/power-loss failures.
 
 Native macOS packaging from the same tested source completed with exit 0 using `RC2_SWIFT_BUILD_SYSTEM=native scripts/isolated-sandbox.sh build`; codesign reported the bundle valid. Executable SHA-256: `80932d9ef2ccc16af48c64d2aab129a62f80c25555acf3ff12260987423a6a28`. No debug-host launch, production-host change, merge or release is claimed for this checkpoint.
+
+## Real listener and authenticated-principal follow-up
+
+The actual loopback HTTP entry initially inherited the existing trusted-local full-access fallback for the new mutation. Missing or invalid bearer could therefore enqueue contextual text despite the paired-only contract. The fix retains authentication provenance on `DirectRPCPrincipal`: verified credential resolvers produce authenticated principals, while both loopback fallback and the owner-fingerprint-only dispatch seam are unauthenticated. Only `bot.conversation.enqueue` requires the authenticated principal at the decoded RPC-item boundary, before dispatcher, ledger or repository work. Existing trusted-loopback behavior for other methods is unchanged.
+
+The strengthened existing journey posts through `URLSession` to a real `DirectHTTPServer` listener. Missing and invalid fixture bearers are refused with no queued row or run; a valid fixture bearer creates the exact canonical queued intent and host-bound receipt. Existing replay, master-off, revocation, force/recovery and reopened-state checks then continue through the actual router. The listener binds only to loopback, retries only an occupied port before effects, and the test stops it and invalidates its ephemeral session. The synthetic auth adapter is kept alive because the server holds a weak auth reference; an intermediate fixture-lifetime failure is not counted as passing proof.
+
+At exact Sources/Tests tree `f518e3e4a7345d3af35884791ff09b7e7cb5951b`, the isolated native run passed 80 tests, zero skips/failures, in 6.064 seconds (exit 0):
+
+```sh
+RC2_DISABLE_MANAGED_DISTILL_RECONCILE=1 RC_CONTEXT_PROBE_ROOT=<caller-owned> scripts/isolated-sandbox.sh test --build-system native --filter 'BotContextPublicQueueTests|HTTPServerTests|BotContextDispatcherTests|HybridHTTPWebSocketContractTests'
+```
+
+Read-only source review `01a14a01-f28a-7440-90b3-a5d7ec7073d5` found no concrete defect in the new provenance guard and listener regression. It did not run the tests. The test uses a synthetic bearer resolver, not a production trusted-device pairing database or personal credentials; it does not establish a LAN/TLS, physical-device pairing, provider execution or runtime-isolation proof. iOS product code is unchanged in this follow-up, so the earlier 20-test contract proof is reused rather than presented as rerun. Layout and execution gates remain unchanged.
+
+At this invocation, `RC_CONTEXT_OPENROUTER_PARENT_TEST_KEY`, `RC_CONTEXT_OPENROUTER_CHILD_TEST_KEY` and `RC_CONTEXT_OPENROUTER_TEST_MODEL` were absent (presence checked without printing values). Positive dedicated-provider delegation/revocation therefore remains blocked. Other implementation and acceptance gaps in the eight-stage matrix remain open independently of these inputs.
+
+The follow-up native package build completed with exit 0 from the tested source; codesign reported the bundle valid. Executable SHA-256: `e66a13aaed6ad8b364a248016b871214c765ee8f0e4c59c18ab1a726176aafec`. Invocation-owned fixture remnants were inspected and removed; the test listener/session ended with the test process. The personal host and pre-existing simulator were not changed by this follow-up.

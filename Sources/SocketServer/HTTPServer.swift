@@ -13,10 +13,12 @@ import RemoteCodeTreaty
 public struct DirectRPCPrincipal: Sendable, Equatable {
     public let ownerFingerprint: String
     public let grantedCapabilities: String
+    public let isAuthenticated: Bool
 
-    public init(ownerFingerprint: String, grantedCapabilities: String) {
+    public init(ownerFingerprint: String, grantedCapabilities: String, isAuthenticated: Bool = true) {
         self.ownerFingerprint = ownerFingerprint
         self.grantedCapabilities = grantedCapabilities
+        self.isAuthenticated = isAuthenticated
     }
 }
 
@@ -3679,7 +3681,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let effectiveRPCPrincipal = requestRPCPrincipal
             ?? DirectRPCPrincipal(
                 ownerFingerprint: requestOwnerFingerprint,
-                grantedCapabilities: "*"
+                grantedCapabilities: "*",
+                isAuthenticated: false
             )
         // POST body for pair endpoints; honor Content-Length read above.
         var bodyData = buffer.subdata(in: bodyStartAbsolute..<min(bodyStartAbsolute + contentLength, buffer.endIndex))
@@ -4216,7 +4219,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         let principal = DirectRPCPrincipal(
             ownerFingerprint: ownerFingerprint
                 ?? Self.connectionOwnerFingerprint(token: nil),
-            grantedCapabilities: "*"
+            grantedCapabilities: "*",
+            isAuthenticated: false
         )
         return await dispatchRPC(
             bodyData: bodyData,
@@ -4427,6 +4431,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             grantedCapabilities: principal.grantedCapabilities
         ) else {
             return rpcErrorObject(Self.rpcCapabilityDenied(method: method), id: wireID)
+        }
+        if method == "bot.conversation.enqueue", !principal.isAuthenticated {
+            return rpcErrorObject(JSONRPCError(code: -32098,
+                message: "Contextual enqueue requires an authenticated paired connection."), id: wireID)
         }
         if method == AgentCheckpointListContract.method {
             // Explicit v1 transport gate before any repository work.

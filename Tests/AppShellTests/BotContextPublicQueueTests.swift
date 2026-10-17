@@ -48,7 +48,48 @@ final class BotContextPublicQueueTests: XCTestCase {
         ]
         let requestData = try JSONEncoder().encode(JSONValue.object(["jsonrpc": .string("2.0"), "id": .number(1), "method": .string("bot.conversation.enqueue"), "params": .object(params)]))
         let request = try JSONDecoder().decode(JSONRPCRequest.self, from: requestData)
-        let first = await dispatcher.dispatchHTTP(request, mutationContext: mutation)
+        let auth = PublicQueueAuth()
+        defer { withExtendedLifetime(auth) {} }
+        var listener: DirectHTTPServer?
+        var port: UInt16 = 0
+        for _ in 0..<10 where listener == nil {
+            port = UInt16.random(in: 33000...44000)
+            let candidate = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher,
+                auth: auth, serverId: host, bootEpoch: 1)
+            do {
+                try candidate.start()
+                listener = candidate
+            } catch let error as POSIXError where error.code == .EADDRINUSE {
+                candidate.stop()
+            }
+        }
+        let server = try XCTUnwrap(listener)
+        defer { server.stop() }
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let endpoint = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/v1/rpc"))
+        func post(bearer: String?) async throws -> (Data, HTTPURLResponse) {
+            var http = URLRequest(url: endpoint)
+            http.httpMethod = "POST"
+            http.httpBody = requestData
+            http.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            if let bearer { http.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
+            let (data, response) = try await session.data(for: http)
+            return (data, try XCTUnwrap(response as? HTTPURLResponse))
+        }
+        for bearer: String? in [nil, "invalid-owned-bearer"] {
+            let (data, response) = try await post(bearer: bearer)
+            if response.statusCode == 200 {
+                XCTAssertEqual(try JSONDecoder().decode(JSONRPCResponse.self, from: data).error?.code, -32098)
+            } else {
+                XCTAssertTrue([401, 403].contains(response.statusCode))
+            }
+            XCTAssertTrue(try context.queuedMessageRepo.list(threadId: thread.id).isEmpty)
+            XCTAssertEqual(try runCount(context, threadID: thread.id), 0)
+        }
+        let (acceptedData, acceptedHTTP) = try await post(bearer: "owned-queue-bearer")
+        XCTAssertEqual(acceptedHTTP.statusCode, 200)
+        let first = try JSONDecoder().decode(JSONRPCResponse.self, from: acceptedData)
         XCTAssertNil(first.error)
         let receipt = try XCTUnwrap(first.result?.objectValue)
         XCTAssertEqual(receipt["status"]?.stringValue, "completed")
@@ -162,4 +203,16 @@ final class BotContextPublicQueueTests: XCTestCase {
         XCTAssertTrue(try HostDatabaseRestore.requiresQueueReview(kind: .agent, id: queueID, db: context.db))
         XCTAssertEqual(try context.botStore.conversationContextPin(conversationID: conversationID), pin)
     }
+}
+
+private final class PublicQueueAuth: DirectAuthProvider {
+    func verify(token: String) -> Bool { token == "owned-queue-bearer" }
+    func authorizedRPCPrincipal(token: String) -> DirectRPCPrincipal? {
+        guard verify(token: token) else { return nil }
+        return DirectRPCPrincipal(ownerFingerprint: "public-queue-owner", grantedCapabilities: "*")
+    }
+    func createPairingCode() -> String? { nil }
+    func redeemPairingCode(_ code: String, deviceName: String) -> (deviceId: String, token: String)? { nil }
+    func listDevices() -> [[String: Any]] { [] }
+    func revokeDevice(_ id: String) {}
 }
