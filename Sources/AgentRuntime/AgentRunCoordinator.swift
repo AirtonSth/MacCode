@@ -4246,6 +4246,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         sourceThreadId: AgentThreadID,
         childThread: AgentThread
     ) async throws -> AgentThreadForkResult {
+        try threadRepo.requireUnscopedForkSource(sourceThreadId)
         guard sourceThreadId != childThread.id else {
             throw AgentProviderAdapterError.unsupported("fork child must have a distinct local thread identity")
         }
@@ -4301,6 +4302,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return
         }
         for intent in intents {
+            do { try threadRepo.requireUnscopedForkSource(intent.sourceThreadId) }
+            catch {
+                recordForkLaunchRecoveryError(childThreadId: intent.childThread.id, error: String(describing: error))
+                continue
+            }
             let adapter = providerAdapterSnapshot(for: intent.provider)
             guard let adapter, (await ProviderCLIProbe.runOffCooperativePool { adapter.forkSafety(threadId: intent.sourceThreadId) }).supportsDurableFork else {
                 recordForkLaunchRecoveryError(
@@ -4460,6 +4466,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         _ initialIntent: AgentThreadForkIntent,
         adapter: AgentProviderAdapter
     ) async throws -> AgentThreadForkResult {
+        try threadRepo.requireUnscopedForkSource(initialIntent.sourceThreadId)
         var intent = try threadRepo.getForkIntent(childThreadId: initialIntent.childThread.id) ?? initialIntent
         // Cheap existence + cursor. First-time fork misses the child; a 26-column
         // + routing get would only compile nil. Load the full row only to return

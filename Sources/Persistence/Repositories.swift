@@ -1887,6 +1887,7 @@ public final class AgentThreadRepository {
                 guard try get(id: sourceThreadId) != nil else {
                     throw AgentThreadForkPersistenceError.sourceThreadNotFound
                 }
+                try requireUnscopedForkSource(sourceThreadId)
                 let sourceMessages: [AgentMessage]
                 if let forkIntentChildThreadId {
                     guard forkIntentChildThreadId == childThread.id,
@@ -1952,6 +1953,13 @@ public final class AgentThreadRepository {
         }
     }
 
+    /// Generic provider forks cannot export a pinned conversation's native history.
+    public func requireUnscopedForkSource(_ threadID: AgentThreadID) throws {
+        guard try BotStore(db: db).conversationContextPin(linkedTo: threadID) == nil else {
+            throw AgentThreadForkPersistenceError.contextualSourceUnsupported
+        }
+    }
+
     /// Creates the durable local identity before any provider mutation. The
     /// idempotency key is stable for the child identity, so a crash before the
     /// provider result is recorded can safely replay only on adapters that
@@ -1971,6 +1979,7 @@ public final class AgentThreadRepository {
                 guard try get(id: sourceThreadId) != nil else {
                     throw AgentThreadForkPersistenceError.sourceThreadNotFound
                 }
+                try requireUnscopedForkSource(sourceThreadId)
 
                 // Same durable child/key is a retry, not a second snapshot. Any
                 // mismatch is a conflict rather than an unsafe best-effort merge.
@@ -2716,6 +2725,7 @@ public enum AgentThreadForkPersistenceError: Error, Equatable {
     case childThreadConflict
     case invalidIntentState(AgentThreadForkIntentState)
     case corruptIntent
+    case contextualSourceUnsupported
 }
 
 public struct AgentMessageBodyBudgetResult: Sendable, Equatable {

@@ -5029,6 +5029,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Durable provider fork of a thread into a persisted child (`agent.thread.fork`).
     public func forkAgentThread(sourceThreadId: AgentThreadID, messageID: String?) async throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try Self.refuseContextPinnedGenericExecution(sourceThreadId, context: ctx)
         guard let source = try ctx.threadRepo.get(id: sourceThreadId) else {
             throw LayoutError.workspaceNotFound
         }
@@ -5053,6 +5054,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Ephemeral fork of a thread (`agent.thread.side`). Hidden from the rail and swept at launch.
     public func sideAgentThread(sourceThreadId: AgentThreadID, text: String?) async throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try Self.refuseContextPinnedGenericExecution(sourceThreadId, context: ctx)
         guard let source = try ctx.threadRepo.get(id: sourceThreadId) else {
             throw LayoutError.workspaceNotFound
         }
