@@ -84,3 +84,9 @@ Concurrency limit derived from these numbers: **4 simultaneous contextual deskto
 Environment: Apple M5 Max, 128 GiB, macOS 27.0.1. A first run that wrongly pre-warmed the "cold" sample (13.4 ms) was discarded and the test corrected before these runs.
 
 Limits: this is the model and persistence path only, not first rendered frame, SwiftUI layout or a real window, and it excludes iPhone navigation, networked hosts, large histories beyond 40 messages and busy/offline states. It does not replace the repository's first-useful-frame tolerance checks, and no concurrency or parity claim is derived from it.
+
+## iPhone contextual switch measurement (XCUITest, simulator)
+
+`FlowUITests.testMeasureBotContextSwitchColdAndWarm` (opt-in with `RC2_MEASURE_CELLS=context-nav`, the harness's existing gate) taps the real General and Legacy rows in the context picker on an exclusive iPhone 17 / iOS 26.5 simulator against the in-process fake host, and stops when the chat header identity names the new context. Each run has one cold first switch and five warmed alternating switches. Three runs: cold 1938, 1901 and 1999 ms; warm medians 1910, 1916 and 1909 ms (warm ranges 1865–1982 ms).
+
+Interpretation limit: cold and warm are indistinguishable and the spread is about ±4%, which points to a fixed XCUITest cost (the tap waits for the app to go idle and the label is polled) rather than the app's navigation latency. These numbers are an upper bound of the user-visible switch as seen through XCUITest on a simulator; they are not a first-useful-frame measurement, not comparable with the macOS in-process figures above, and not a performance-parity claim. A trustworthy iPhone figure needs in-app signposts (the existing perf ring) on a device. No concurrency or limit was derived from them.
