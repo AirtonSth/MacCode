@@ -71,6 +71,11 @@ public protocol DirectAuthProvider: AnyObject {
     func cancelPairingRequest(requestId: String) -> Bool
     func listDevices() -> [[String: Any]]
     func revokeDevice(_ id: String)
+    /// Mac relay static public key (X25519), nil while relay keys are unavailable.
+    func relayHostPublicKey() -> Data?
+    /// Stores the relay key of the device that owns this verified bearer.
+    func setRelayPublicKey(forBearer token: String, key: Data) -> Bool
+    func setRelayPublicKey(deviceId: String, key: Data)
 }
 
 /// Exact `agent.checkpoint_list` capability marker shared by public HTTP
@@ -223,6 +228,10 @@ public struct AgentAttachmentUploadCapabilityAdvertisement: Sendable, Equatable 
 /// Defaulted so existing conformers (e.g. test doubles) need no change
 /// until they opt into the request/approve flow.
 public extension DirectAuthProvider {
+    func relayHostPublicKey() -> Data? { nil }
+    func setRelayPublicKey(forBearer token: String, key: Data) -> Bool { false }
+    func setRelayPublicKey(deviceId: String, key: Data) {}
+
     /// Existing providers and test doubles remain full-access until they opt
     /// into persisted scopes. Production LocalAuthAdapter overrides this and
     /// derives both values from one DeviceTrustRepository.verify call.
@@ -1219,7 +1228,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     ) -> Bool {
         guard hasAuthProvider, path.hasPrefix("/v1") else { return false }
         // Always-gated: identity proof for cold connect; not loopback-trusted.
-        if path == "/v1/capabilities/authenticated" { return true }
+        if path == "/v1/capabilities/authenticated" || path == "/v1/relay/keys" { return true }
         return (!loopbackOnly || remoteAuthenticated) && !authExemptV1Paths.contains(path)
     }
 
@@ -1588,6 +1597,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// fail-closed until then).
     public let serverId: String
     public let bootEpoch: UInt64
+
+    /// True while the Mac relay host socket is open (`/v1/discovery` `relay`).
+    public var relayAvailable: @Sendable () -> Bool = { false }
+    /// Relay base URL advertised by `POST /v1/relay/keys`.
+    public var relayURLString = "wss://relay.remotecode.io"
+
+    /// Decodes a base64 X25519 public key; nil when malformed.
+    static func decodeRelayPublicKey(_ value: Any?) -> Data? {
+        guard let text = value as? String, let data = Data(base64Encoded: text), data.count == 32,
+              (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: data)) != nil else { return nil }
+        return data
+    }
 
     /// Per-peer brute-force brake for the LAN pairing endpoints. The 6-digit
     /// code is brute-forceable over LAN without this throttle.
@@ -3987,7 +4008,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             var resp: [String: Any] = ["status": s.status]
             if let d = s.deviceId { resp["device_id"] = d }
-            if let t = s.token { resp["token"] = t }
+            if let t = s.token {
+                resp["token"] = t
+                if let d = s.deviceId, let key = Self.decodeRelayPublicKey(obj["relay_public_key"]) {
+                    auth.setRelayPublicKey(deviceId: d, key: key)
+                }
+                if let mac = auth.relayHostPublicKey() { resp["relay_public_key"] = mac.base64EncodedString() }
+            }
             sendJSON(fd: fd, status: 200, body: resp, acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/pair/cancel"):
             // Device-initiated cancel of its own outstanding request. Moves
@@ -4035,7 +4062,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 // No releaseOutstanding here: the QR/redeem flow never reserves
                 // a slot (/v1/pair does), and the count-based release could free
                 // a slot still bound to this peer's live pairing request.
-                sendJSON(fd: fd, status: 200, body: ["device_id": deviceId, "token": token], acceptEncoding: headers["accept-encoding"])
+                var resp: [String: Any] = ["device_id": deviceId, "token": token]
+                if let key = Self.decodeRelayPublicKey(obj["relay_public_key"]) {
+                    auth.setRelayPublicKey(deviceId: deviceId, key: key)
+                }
+                if let mac = auth.relayHostPublicKey() { resp["relay_public_key"] = mac.base64EncodedString() }
+                sendJSON(fd: fd, status: 200, body: resp, acceptEncoding: headers["accept-encoding"])
             } else {
                 pairingThrottle.recordFailure(peer: peer)
                 // CONTRACT (:23): "code_expired" covers both expired and already-redeemed
@@ -4105,7 +4137,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "port": port,
                 "boot_epoch": Int64(bootEpoch),
                 "vpn_required": !bindLoopbackOnly,
+                // `relay` stays false: shipped iOS builds refuse a host that sets it
+                // (no-relay policy for app-level relays). The byte relay is end-to-end
+                // encrypted, so it is announced under its own key.
                 "relay": false,
+                "relay_ws_v1": relayAvailable(),
                 // Optional stream control negotiated on welcome, not here.
                 "stream_interest_v1": Self.supportsStreamInterestControl,
                 // Paired iOS cold connect: one-shot authenticated capabilities
@@ -4130,6 +4166,38 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 ),
                 acceptEncoding: headers["accept-encoding"]
             )
+        case ("POST", "/v1/relay/keys"):
+            guard requestBearerVerified, let auth = auth, let token = presentedBearerToken else {
+                send(fd: fd, status: 401, contentType: "text/plain",
+                     body: Self.unauthorizedBody,
+                     additionalHeaders: [
+                        "WWW-Authenticate":
+                            wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2"),
+                        "Cache-Control": "no-store",
+                     ])
+                return
+            }
+            guard let mac = auth.relayHostPublicKey() else {
+                sendJSON(fd: fd, status: 503, body: ["error": "relay_unavailable"],
+                         acceptEncoding: headers["accept-encoding"])
+                return
+            }
+            guard let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
+                  let key = Self.decodeRelayPublicKey(obj["relay_public_key"]) else {
+                sendJSON(fd: fd, status: 400, body: ["error": "invalid_relay_key"],
+                         acceptEncoding: headers["accept-encoding"])
+                return
+            }
+            guard auth.setRelayPublicKey(forBearer: token, key: key) else {
+                sendJSON(fd: fd, status: 400, body: ["error": "invalid_relay_key"],
+                         acceptEncoding: headers["accept-encoding"])
+                return
+            }
+            sendJSON(fd: fd, status: 200,
+                     body: ["relay_public_key": mac.base64EncodedString(),
+                            "relay_url": relayURLString, "server_id": serverId],
+                     acceptEncoding: headers["accept-encoding"],
+                     additionalHeaders: ["Cache-Control": "no-store"])
         case ("GET", "/v1/capabilities/authenticated"):
             // Always require a verified bearer (including loopback-only). The
             // shared HTTP gate records that proof once. Requiring the recorded

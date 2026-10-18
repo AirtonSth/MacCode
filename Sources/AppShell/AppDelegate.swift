@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import AppKit
 import CoreModel
 import Persistence
@@ -102,6 +103,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         authenticator: tailcatAuthenticator
     )
     var tailcatSupervisor: TailcatRuntimeSupervisor?
+    private var relayHostClient: RelayHostClient?
+    private let relayHostKeyStore: RelayHostKeyStoring = KeychainRelayHostKeyStore()
     private var tailcatPathObserver: TailcatNetworkPathObserver?
     private var tailcatSettingTask: Task<Void, Never>?
     lazy var tailcatAccessSettingAuthority = TailcatAccessSettingAuthority { [weak self] requested in
@@ -359,6 +362,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                                                name: .rc2RemoteAccessSettingChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(tailcatAccountChanged),
                                                name: .rc2PrivateAccountChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(relaySettingChanged),
+                                               name: .rc2RelaySettingChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keybindingsReloaded),
                                                name: .rc2KeybindingsReloaded, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -718,6 +723,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         tailcatPathObserver = nil
         let tailcat = tailcatSupervisor
         tailcatSupervisor = nil
+        relayHostClient?.stop()
+        relayHostClient = nil
         Task { await tailcat?.shutdown() }
         providerSessionReaperTimer?.invalidate()
         ccrRetentionTimer?.invalidate()
@@ -1182,6 +1189,47 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     @objc private func tailcatAccountChanged() {
         Task { await tailcatSupervisor?.accountChanged() }
+        relayHostClient?.accountChanged()
+    }
+
+    @objc private func relaySettingChanged() {
+        configureRelay()
+    }
+
+    /// Starts or stops the relay host client from `relay_enabled` and the HTTP server state.
+    private func configureRelay() {
+        guard let context else { return }
+        relayHostClient?.stop()
+        relayHostClient = nil
+        httpServer?.relayAvailable = { false }
+        let requested = ((try? context.settingsRepo.get("relay_enabled")) ?? "0") == "1"
+        // Lazy: the Keychain key is only created when pairing or the relay first needs it.
+        let keyStore = relayHostKeyStore
+        localAuth?.relayHostPublicKeyProvider = {
+            (try? keyStore.loadOrCreate())?.publicKey.rawRepresentation
+        }
+        guard requested, let http = httpServer else { return }
+        let hostKey: Curve25519.KeyAgreement.PrivateKey
+        do { hostKey = try keyStore.loadOrCreate() } catch {
+            NSLog("Relay host key unavailable")
+            return
+        }
+        let base = ProcessInfo.processInfo.environment["RC_RELAY_URL"].flatMap(URL.init(string:))
+            ?? URL(string: "wss://relay.remotecode.io")!
+        http.relayURLString = base.absoluteString
+        let accountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
+        let trust = DeviceTrustRepository(db: context.db)
+        let client = RelayHostClient(
+            server: http,
+            relayBase: base,
+            serverId: context.liveActivityHostIdentity.serverId,
+            hostStatic: hostKey,
+            accessToken: { accountStore.load()?.accessToken },
+            trustedDeviceForRelayKey: { (try? trust.deviceIdForRelayKey($0)) ?? nil }
+        )
+        http.relayAvailable = { [weak client] in client?.isConnected ?? false }
+        relayHostClient = client
+        client.start()
     }
 
     @objc private func workspaceWillSleep() {
@@ -1330,6 +1378,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                     try self?.startDirectHTTPServer(remoteEnabled: enabled, serverId: serverId, port: port)
                 },
                 stopServer: { [weak self] in
+                    self?.relayHostClient?.stop()
+                    self?.relayHostClient = nil
                     self?.tailcatLoopbackListener.setHTTPServer(nil)
                     self?.httpServer?.stop()
                     self?.httpServer = nil
@@ -1426,6 +1476,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         tailcatLoopbackListener.setHTTPServer(http)
         httpServer = http
         configureTailcatAccess()
+        configureRelay()
         try? Self.resolvePetServerFailure(
             server: "HTTP server",
             repository: NotificationRepository(db: context.db)

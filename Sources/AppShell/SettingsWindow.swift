@@ -16,6 +16,7 @@ extension Notification.Name {
     static let rc2RemoteAccessSettingChanged = Notification.Name("rc2RemoteAccessSettingChanged")
     static let rc2PrivateAccountChanged = Notification.Name("rc2PrivateAccountChanged")
     static let rc2TailcatSettingChanged = Notification.Name("rc2TailcatSettingChanged")
+    static let rc2RelaySettingChanged = Notification.Name("rc2RelaySettingChanged")
     static let rc2TailcatRuntimeStatusChanged = Notification.Name("rc2TailcatRuntimeStatusChanged")
 }
 
@@ -283,6 +284,7 @@ public final class SettingsViewModel: ObservableObject {
 
     @Published public var remoteAccessEnabled: Bool = false
     @Published public var tailcatAccessEnabled: Bool = false
+    @Published public var relayEnabled: Bool = false
     @Published public var tailcatAccessStatus: String = TailcatRuntimeStatus.off.displayText
     /// Non-nil when the HTTP listener failed to bind after the last remote-access
     /// toggle-on. The toggle is reverted to off and the preference rolled back so
@@ -614,6 +616,7 @@ public final class SettingsViewModel: ObservableObject {
         #endif
         remoteAccessEnabled = (try? settingsRepo.get("remote_access_enabled")) == "1"
         tailcatAccessEnabled = TailcatAccessDefaults.isEnabled(try? settingsRepo.get("tailcat_access_enabled"))
+        relayEnabled = (try? settingsRepo.get("relay_enabled")) == "1"
         tailcatAccessStatus = tailcatAccessEnabled
             ? tailcatAccessSettingAuthority.currentStatus.displayText
             : TailcatRuntimeStatus.off.displayText
@@ -697,6 +700,16 @@ public final class SettingsViewModel: ObservableObject {
             }
         } else {
             _pendingRemoteAccessToggle = false
+        }
+    }
+
+    public func setRelayEnabled(_ on: Bool) {
+        do {
+            try settingsRepo.set("relay_enabled", on ? "1" : "0")
+            relayEnabled = on
+            NotificationCenter.default.post(name: .rc2RelaySettingChanged, object: nil)
+        } catch {
+            recordSettingsWriteError(error)
         }
     }
 
@@ -1621,6 +1634,15 @@ public struct SettingsView: View {
                 .labelsHidden()
                 .disabled(vm.privateAccountUser?.subscribed != true)
                 .accessibilityIdentifier("settings.tailcatAccess.toggle")
+            }
+            settingRow("Relay (beta)") {
+                Toggle("", isOn: Binding(
+                    get: { vm.relayEnabled },
+                    set: { vm.setRelayEnabled($0) }
+                ))
+                .labelsHidden()
+                .disabled(vm.privateAccountUser?.subscribed != true)
+                .accessibilityIdentifier("settings.relay.toggle")
             }
             Text(vm.tailcatAccessStatus)
                 .font(DS.Font.caption)

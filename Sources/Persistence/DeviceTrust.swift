@@ -740,10 +740,30 @@ public final class DeviceTrustRepository {
     }
 
     public func revoke(id: String) throws {
-        let st = try db.prepare("UPDATE device_trust SET revoked_at = ? WHERE id = ?;")
+        let st = try db.prepare("UPDATE device_trust SET revoked_at = ?, relay_public_key = NULL WHERE id = ?;")
         try st.bind(1, iso.string(from: Date())); try st.bind(2, id)
         _ = try st.step()
         Self.bumpTrustGeneration()
+        NotificationCenter.default.post(name: Self.deviceRevokedNotification, object: nil, userInfo: ["deviceId": id])
+    }
+
+    /// Posted after every committed revoke; `userInfo["deviceId"]` is the device id.
+    public static let deviceRevokedNotification = Notification.Name("io.remotecode.device-trust.revoked")
+
+    /// Stores (or clears) the relay key of a non-revoked device.
+    public func setRelayPublicKey(deviceId: String, key: Data?) throws {
+        let st = try db.prepare("UPDATE device_trust SET relay_public_key = ? WHERE id = ? AND revoked_at IS NULL;")
+        try st.bind(1, key); try st.bind(2, deviceId)
+        _ = try st.step()
+    }
+
+    /// Device id owning this relay key; revoked devices never match.
+    public func deviceIdForRelayKey(_ key: Data) throws -> String? {
+        let st = try db.prepare("SELECT id FROM device_trust WHERE relay_public_key = ? AND revoked_at IS NULL LIMIT 1;")
+        defer { st.reset() }
+        try st.bind(1, key)
+        guard try st.step() else { return nil }
+        return st.columnText(0)
     }
 
     /// Delete all device_trust rows that have been revoked (revoked_at IS NOT NULL).
