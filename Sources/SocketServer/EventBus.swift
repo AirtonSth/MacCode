@@ -304,7 +304,7 @@ public final class EventBus: @unchecked Sendable {
     /// a busy session; memory stays bounded by `defaultRecentByteLimit`.
     public static let defaultRecentLimit = 4_096
     /// Peak payload bytes retained alongside `defaultRecentLimit`.
-    /// Must cover several client replay pages: a DERP/cellular round trip can
+    /// Must cover several client replay pages: a cellular/relay round trip can
     /// otherwise evict the required prefix between baselineRequired and
     /// events.recent, forcing an endless full-snapshot loop under host churn.
     public static let defaultRecentByteLimit = 2 * 1_024 * 1_024

@@ -15,7 +15,7 @@ final class ResumeHeadContractTests: XCTestCase {
         "serverTimeEpochMs", "heartbeatIntervalMs", "heartbeatTimeoutMs",
         "snapshotTimeoutMs", "currentSequence", "oldestReplaySequence", "capabilities",
     ]
-    private static let rotationNotice = "tailcat.rotation_notice.v1"
+    private static let rotationNotice = "other.feature.v1"
 
     func test_featureHeader_matchesOnlyTheExactResumeHeadToken() {
         // A looser match sends a welcome key the client cannot parse, which is
@@ -37,8 +37,6 @@ final class ResumeHeadContractTests: XCTestCase {
         XCTAssertFalse(ConnectionClientFeatures.requestsResumeHead(header: "resume.v1"))
         XCTAssertFalse(ConnectionClientFeatures.requestsResumeHead(header: "identity.v1"))
         XCTAssertFalse(ConnectionClientFeatures.requestsResumeHead(header: Self.rotationNotice))
-        XCTAssertFalse(ConnectionClientFeatures.requestsTailcatRotationNotice(header: "resume.head.v1"),
-                       "the head token must not bring the Tailcat digest with it")
     }
 
     func test_welcomeHead_isOmittedByDefault_andStrictWhenPresent() throws {

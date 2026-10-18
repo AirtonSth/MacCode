@@ -3,21 +3,16 @@ import CoreModel
 import Persistence
 @testable import AppShell
 
-/// F5: the push bridge's hourly silent-wake budget, its two Live Activity
-/// rules and the Tailcat rotation announce with its durable baseline.
+/// F5: the push bridge's hourly silent-wake budget and its two Live Activity rules.
 ///
 /// The bridge has no clock seam, so every test runs inside one instant: budget
 /// sends are forced (the 30 s bucket is not what is measured), the rolling
 /// window is exercised by writing the stored budget value, and the 30 s bucket
-/// key is removed before each announce that stands for a later renewal.
+/// key is removed before each send that stands for a later wake.
 final class SilentWakeBudgetBridgeTests: XCTestCase {
     private static let legacyBucketKey = "private.silentCatchUp.lastBucket"
     private static let bucketsKey = "private.silentCatchUp.lastBuckets"
     private static let budgetKey = "private.silentWake.budget.v1"
-    private static let announcedDigestKey = "private.tailcat.announcedDigest.v1"
-    private static let digest1 = String(repeating: "1", count: 64)
-    private static let digest2 = String(repeating: "2", count: 64)
-    private static let digest3 = String(repeating: "3", count: 64)
 
     private var wakeOutboxFlagBefore: Bool?
 
@@ -412,294 +407,6 @@ final class SilentWakeBudgetBridgeTests: XCTestCase {
         XCTAssertEqual(legacy.api.requests.first?.silent, true)
     }
 
-    // MARK: - Tailcat rotation announce (table P2)
-
-    func testTailcatAnnounceSendsOnePushPerDigestChange() async throws {
-        // WHY: a rotation is announced once, not once per 5-minute renewal,
-        // and the first publish of this build pushes nothing. The 30 s bucket
-        // is cleared before each announce so that the baseline, not the
-        // bucket, is what refuses the repeats.
-        let fixture = try makeFixture()
-        let bridge = fixture.makeBridge()
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-
-        await bridge.announceTailcatEndpointIfChanged()
-        clearCoalesceBuckets()
-        await bridge.announceTailcatEndpointIfChanged()
-        XCTAssertTrue(fixture.api.requests.isEmpty, "the first digest is the baseline, not a change")
-        XCTAssertEqual(try fixture.settings.get(Self.announcedDigestKey), Self.digest1)
-
-        fixture.hints.set(Self.hint(digest: Self.digest2))
-        for _ in 0..<3 {
-            clearCoalesceBuckets()
-            await bridge.announceTailcatEndpointIfChanged()
-        }
-
-        XCTAssertEqual(fixture.api.requests.count, 1, "one push for one digest change")
-        let push = try XCTUnwrap(fixture.api.requests.first)
-        XCTAssertTrue(push.silent)
-        XCTAssertEqual(push.data["rc2_reason"], "tailcat_endpoint_changed")
-        XCTAssertEqual(push.data["rc2_tc_dig"], Self.digest2)
-    }
-
-    func testTailcatAnnounceSurvivesBridgeRestart() async throws {
-        // WHY: a relaunch with the same keys must not wake the phone, and a
-        // relaunch that publishes another digest must. A baseline kept in
-        // memory would be seeded again by the third bridge and send nothing.
-        let fixture = try makeFixture()
-        let first = fixture.makeBridge()
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-        await first.announceTailcatEndpointIfChanged()
-        fixture.hints.set(Self.hint(digest: Self.digest2))
-        await first.announceTailcatEndpointIfChanged()
-        XCTAssertEqual(fixture.api.requests.count, 1, "fixture: the second digest was delivered by the first bridge")
-
-        let sameDigest = fixture.makeBridge()
-        clearCoalesceBuckets()
-        await sameDigest.announceTailcatEndpointIfChanged()
-        XCTAssertEqual(fixture.api.requests.count, 1, "a relaunch that publishes the announced digest sends nothing")
-
-        fixture.hints.set(Self.hint(digest: Self.digest3))
-        let newDigest = fixture.makeBridge()
-        clearCoalesceBuckets()
-        await newDigest.announceTailcatEndpointIfChanged()
-        XCTAssertEqual(fixture.api.requests.count, 2, "a relaunch that publishes another digest announces it at once")
-        XCTAssertEqual(fixture.api.requests.last?.data["rc2_tc_dig"], Self.digest3)
-    }
-
-    func testAnOlderDigestDeliveredLateDoesNotMoveTheBaselineBack() async throws {
-        // WHY: a push built before a rotation and answered after it carried the
-        // old digest. Writing that back would make the next renewal send a
-        // second rotation push for a digest the phone already has.
-        let fixture = try makeFixture()
-        let bridge = fixture.makeBridge()
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-        await bridge.announceTailcatEndpointIfChanged()
-
-        fixture.api.script([.hold])
-        let heldWake = Task {
-            await bridge.deliverSilentCatchUp(
-                hostHint: "h",
-                force: true,
-                payload: SilentCatchUpV1(reason: "attention"),
-                coalesceClass: .attention
-            )
-        }
-        await fixture.api.waitUntilHeld()
-
-        fixture.hints.set(Self.hint(digest: Self.digest2))
-        await bridge.announceTailcatEndpointIfChanged()
-        XCTAssertEqual(try fixture.settings.get(Self.announcedDigestKey), Self.digest2)
-
-        fixture.api.releaseHeld()
-        await heldWake.value
-        XCTAssertEqual(
-            fixture.api.requests.map { $0.data["rc2_tc_dig"] },
-            [Self.digest1, Self.digest2],
-            "fixture: the held wake carried the old digest and was answered after the rotation push"
-        )
-        XCTAssertEqual(
-            try fixture.settings.get(Self.announcedDigestKey),
-            Self.digest2,
-            "a delivered push with an older digest never moves the baseline back"
-        )
-
-        // An empty hour and a new 30 s bucket: only the baseline can explain
-        // why the next renewal sends nothing.
-        try fixture.settings.set(Self.budgetKey, "")
-        clearCoalesceBuckets()
-        await bridge.announceTailcatEndpointIfChanged()
-        XCTAssertEqual(fixture.api.requests.count, 2, "no second rotation push for the same digest")
-    }
-
-    func testTailcatAnnounceIsAskedAgainAfterAFailedSend() async throws {
-        // WHY: a failed announce is not recorded as done. The renewal is its
-        // retry, so the baseline moves only when a push was delivered.
-        let fixture = try makeFixture()
-        let bridge = fixture.makeBridge()
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-        await bridge.announceTailcatEndpointIfChanged()
-        fixture.hints.set(Self.hint(digest: Self.digest2))
-
-        fixture.api.script([.fail])
-        await bridge.announceTailcatEndpointIfChanged()
-        XCTAssertEqual(fixture.api.requests.count, 1)
-        XCTAssertEqual(
-            try fixture.settings.get(Self.announcedDigestKey),
-            Self.digest1,
-            "a send that threw announced nothing"
-        )
-
-        clearCoalesceBuckets()
-        await bridge.announceTailcatEndpointIfChanged()
-        XCTAssertEqual(fixture.api.requests.count, 2, "the next renewal asks again")
-        XCTAssertEqual(fixture.api.requests.last?.data["rc2_tc_dig"], Self.digest2)
-        XCTAssertEqual(try fixture.settings.get(Self.announcedDigestKey), Self.digest2)
-    }
-
-    func testTailcatPushCarriesOnlyPublicKeys() async throws {
-        // WHY: a push transits Apple. The rotation push carries a digest and
-        // the public catalog facts, never a ConnBlob, a key, an address or a
-        // token (gate G9 stays closed). The exact map pins every value.
-        let fixture = try makeFixture()
-        let bridge = fixture.makeBridge()
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-        await bridge.announceTailcatEndpointIfChanged()
-        fixture.hints.set(Self.hint(digest: Self.digest2))
-        await bridge.announceTailcatEndpointIfChanged()
-
-        let push = try XCTUnwrap(fixture.api.requests.first)
-        XCTAssertTrue(push.silent)
-        XCTAssertEqual(push.title, "")
-        XCTAssertEqual(push.data, [
-            "rc2_catch_up": "1",
-            "rc2_schema": "silent_catchup.v1",
-            "rc2_reason": "tailcat_endpoint_changed",
-            "rc2_wm": "42",
-            "rc2_boot_epoch": "7",
-            "rc2_tc_sid": "server-1",
-            "rc2_tc_ver": "2",
-            "rc2_tc_exp": "2099-01-01T00:00:00Z",
-            "rc2_tc_build": "build-1",
-            "rc2_tc_dig": Self.digest2,
-        ])
-        for secret in ["blob", "access-token", "refresh-token", "apns-token", "nodekey"] {
-            XCTAssertFalse(push.data.values.contains { $0.contains(secret) }, secret)
-        }
-    }
-
-    func testTailcatPushIdempotencyKeyNamesTheDigestItCarries() async throws {
-        // WHY: two Macs of one account rotate together (admission is account
-        // wide) and send to the same phone. On a key built only from the
-        // class and the 30 s bucket the backend answers the second Mac from
-        // its cache without sending, and that Mac records its digest as told.
-        let fixture = try makeFixture()
-        let bridge = fixture.makeBridge()
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-        await bridge.announceTailcatEndpointIfChanged()
-        fixture.hints.set(Self.hint(digest: Self.digest2))
-        await bridge.announceTailcatEndpointIfChanged()
-
-        let push = try XCTUnwrap(fixture.api.requests.first)
-        let carried = try XCTUnwrap(push.data["rc2_tc_dig"])
-        XCTAssertTrue(push.idempotencyKey.hasPrefix("catchup.tailcat.\(carried)."), push.idempotencyKey)
-    }
-
-    func testFailedTailcatPushIsNeverQueuedForReplay() async throws {
-        // WHY: the next renewal is the retry of a rotation push. A queued copy
-        // would be a second push for the same rotation.
-        ConnectionFeatureFlags.wakeOutboxEnabled = true
-        let fixture = try makeFixture()
-        let store = SilentWakeOutboxStore(settings: fixture.settings)
-        // The replay always fails and is never rescheduled, so a queued record stays countable.
-        let outbox = SilentWakeOutbox(
-            store: store,
-            retryDelay: { _ in 3_600 },
-            schedule: { _, _ in },
-            isEnabled: { true },
-            send: { _ in throw SilentWakeOutboxError.bridgeUnavailable }
-        )
-        let bridge = fixture.makeBridge(silentWakeOutbox: outbox)
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-        await bridge.announceTailcatEndpointIfChanged()
-        fixture.hints.set(Self.hint(digest: Self.digest2))
-        fixture.api.script([.fail, .fail])
-
-        await bridge.announceTailcatEndpointIfChanged()
-        await outbox.flush()
-        XCTAssertEqual(
-            fixture.api.requests.map { $0.data["rc2_reason"] },
-            ["tailcat_endpoint_changed"],
-            "fixture: the rotation push was tried and threw"
-        )
-        XCTAssertTrue(try store.pending().isEmpty, "a failed rotation push is not queued")
-
-        // The outbox is live: a failed wake of another class is queued.
-        await send(.attention, on: bridge)
-        await outbox.flush()
-        XCTAssertEqual(try store.pending().map(\.coalesceClass), ["attention"])
-    }
-
-    func testTailcatPushIsNotSentWithoutADigestInThePayload() async throws {
-        // WHY: the rotation push is about the address only. Without a digest
-        // to carry it would be a bare wake that makes the phone catch up for
-        // nothing.
-        let fixture = try makeFixture()
-        let bridge = fixture.makeBridge()
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-        await bridge.announceTailcatEndpointIfChanged()
-
-        fixture.hints.set(Self.hint(digest: Self.digest2, leaseExpiresAt: "2020-01-01T00:00:00Z"))
-        await bridge.announceTailcatEndpointIfChanged()
-        fixture.hints.set(Self.hint(digest: nil))
-        clearCoalesceBuckets()
-        await bridge.announceTailcatEndpointIfChanged()
-        XCTAssertTrue(fixture.api.requests.isEmpty, "an expired lease or a hint without a digest announces nothing")
-        XCTAssertEqual(try fixture.settings.get(Self.announcedDigestKey), Self.digest1)
-
-        // The funnel refuses it too (the hint can change between the compare
-        // and the send), and gives the slot back: `other` is admitted only
-        // while nothing is used or in flight.
-        await bridge.deliverSilentCatchUp(
-            hostHint: "tailcat",
-            force: true,
-            payload: SilentCatchUpV1(reason: "tailcat_endpoint_changed"),
-            coalesceClass: .tailcat
-        )
-        XCTAssertTrue(fixture.api.requests.isEmpty, "never a tailcat wake without the digest")
-        await send(.other, on: bridge)
-        XCTAssertEqual(fixture.api.requests.map { $0.data["rc2_reason"] }, ["other"])
-    }
-
-    func testAnnounceWithoutAPushTargetSendsNothingAndAnnouncesOnceATargetExists() async throws {
-        // WHY: a phone whose token was dropped and registered again must still
-        // be told, so nothing is recorded as announced while there is nobody
-        // to tell; and a Mac with nobody to tell logs nothing every 5 minutes.
-        let fixture = try makeFixture()
-        let bridge = fixture.makeBridge()
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-        await bridge.announceTailcatEndpointIfChanged()
-        fixture.hints.set(Self.hint(digest: Self.digest2))
-        fixture.targetStore.clear()
-        let notSentBefore = HostWakeMetrics.shared.count(.wakeNotSent)
-
-        await bridge.announceTailcatEndpointIfChanged()
-        XCTAssertTrue(fixture.api.requests.isEmpty)
-        XCTAssertEqual(try fixture.settings.get(Self.announcedDigestKey), Self.digest1)
-        XCTAssertEqual(HostWakeMetrics.shared.count(.wakeNotSent), notSentBefore, "no wake_not_sent line per renewal")
-
-        try fixture.targetStore.save(
-            pushToken: "apns-token",
-            pushTokenType: "apns",
-            liveActivityToken: nil,
-            deviceId: "device-1"
-        )
-        for _ in 0..<2 {
-            clearCoalesceBuckets()
-            await bridge.announceTailcatEndpointIfChanged()
-        }
-        XCTAssertEqual(fixture.api.requests.count, 1, "the first renewal after the phone registered announces once")
-        XCTAssertEqual(fixture.api.requests.first?.data["rc2_tc_dig"], Self.digest2)
-    }
-
-    func testADeliveredWakeOfAnotherClassCarryingTheDigestCountsAsAnnounced() async throws {
-        // WHY: every push carries the digest. Two pushes for one fact waste a
-        // slot of the hour.
-        let fixture = try makeFixture()
-        let bridge = fixture.makeBridge()
-        fixture.hints.set(Self.hint(digest: Self.digest1))
-        await bridge.announceTailcatEndpointIfChanged()
-        fixture.hints.set(Self.hint(digest: Self.digest2))
-
-        await send(.attention, on: bridge)
-        XCTAssertEqual(fixture.api.requests.first?.data["rc2_tc_dig"], Self.digest2)
-
-        clearCoalesceBuckets()
-        await bridge.announceTailcatEndpointIfChanged()
-        XCTAssertEqual(fixture.api.requests.count, 1, "the attention wake already told the phone")
-        XCTAssertEqual(try fixture.settings.get(Self.announcedDigestKey), Self.digest2)
-    }
-
     // MARK: - Helpers
 
     private struct Fixture {
@@ -707,7 +414,6 @@ final class SilentWakeBudgetBridgeTests: XCTestCase {
         let accountStore: PrivateAccountSessionStore
         let targetStore: PrivatePushTargetStore
         let api: SilentWakeRecordingAPI
-        let hints: SilentWakeHintBox
 
         /// A bridge over this fixture's stores. A second one stands for a relaunch.
         func makeBridge(silentWakeOutbox: SilentWakeOutbox? = nil) -> PrivateNotificationBridge {
@@ -718,9 +424,7 @@ final class SilentWakeBudgetBridgeTests: XCTestCase {
                 settings: settings,
                 silentWakeOutbox: silentWakeOutbox
             )
-            let hints = self.hints
             bridge.setConnectionHintSources(
-                tailcat: { hints.get() },
                 watermark: { "42" },
                 bootEpoch: { "7" }
             )
@@ -748,8 +452,7 @@ final class SilentWakeBudgetBridgeTests: XCTestCase {
             settings: settings,
             accountStore: accountStore,
             targetStore: targetStore,
-            api: api,
-            hints: SilentWakeHintBox()
+            api: api
         )
     }
 
@@ -766,19 +469,6 @@ final class SilentWakeBudgetBridgeTests: XCTestCase {
     /// A real renewal is 300 s later, in another 30 s bucket.
     private func clearCoalesceBuckets() {
         UserDefaults.standard.removeObject(forKey: Self.bucketsKey)
-    }
-
-    private static func hint(
-        digest: String?,
-        leaseExpiresAt: String = "2099-01-01T00:00:00Z"
-    ) -> TailcatPushHint {
-        TailcatPushHint(
-            serverId: "server-1",
-            version: 2,
-            leaseExpiresAt: leaseExpiresAt,
-            transportBuildId: "build-1",
-            endpointDigest: digest
-        )
     }
 
     /// The stored budget value with three delivered wakes of the same age.
@@ -807,17 +497,8 @@ final class SilentWakeBudgetBridgeTests: XCTestCase {
 
 // MARK: - Test doubles
 
-/// The Tailcat hint source of a bridge, settable from the test.
-private final class SilentWakeHintBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var hint: TailcatPushHint?
-
-    func set(_ hint: TailcatPushHint?) { lock.withLock { self.hint = hint } }
-    func get() -> TailcatPushHint? { lock.withLock { hint } }
-}
-
 /// Records every `deliverAlert` call and answers it from a script. Internal
-/// (not file-private) because the rotation push composition tests reuse it.
+/// (not file-private) because other test files reuse it.
 final class SilentWakeRecordingAPI: PrivateAccountAPI, @unchecked Sendable {
     struct Request: Equatable, Sendable {
         let title: String

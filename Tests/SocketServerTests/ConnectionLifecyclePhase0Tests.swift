@@ -215,17 +215,17 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
         XCTAssertEqual(registry.count, 0)
     }
 
-    func test_acceptedSocketRegistryCapsTailcatToReserveOrdinarySlots() throws {
+    func test_acceptedSocketRegistryCapsRelayToReserveOrdinarySlots() throws {
         // WHY: the shared 64-descriptor budget must still leave LAN room.
-        // Tailcat stops at 48 so at least 16 ordinary slots remain. The 8/6
+        // Relay stops at 48 so at least 16 ordinary slots remain. The 8/6
         // fixture is the same policy (reserve 2 of 8, as 16 of 64).
         XCTAssertEqual(AcceptedSocketRegistry.defaultMaximumDescriptors, 64)
-        XCTAssertEqual(AcceptedSocketRegistry.defaultTailcatMaximumDescriptors, 48)
+        XCTAssertEqual(AcceptedSocketRegistry.defaultRelayMaximumDescriptors, 48)
         XCTAssertEqual(AcceptedSocketRegistry.defaultOrdinaryReserveDescriptors, 16)
         XCTAssertEqual(
             AcceptedSocketRegistry.defaultMaximumDescriptors
                 - AcceptedSocketRegistry.defaultOrdinaryReserveDescriptors,
-            AcceptedSocketRegistry.defaultTailcatMaximumDescriptors
+            AcceptedSocketRegistry.defaultRelayMaximumDescriptors
         )
 
         var pairs: [[Int32]] = []
@@ -240,7 +240,7 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
 
         let registry = AcceptedSocketRegistry(
             maximumDescriptors: 8,
-            tailcatMaximumDescriptors: 6
+            relayMaximumDescriptors: 6
         )
         let generation = registry.activate()
 
@@ -248,43 +248,43 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
             guard case .accepted = registry.register(
                 pairs[index][0],
                 generation: generation,
-                scope: .tailcat
+                scope: .relay
             ) else {
-                XCTFail("Tailcat must be admitted until its reserved cap")
+                XCTFail("Relay must be admitted until its reserved cap")
                 return
             }
         }
         XCTAssertEqual(registry.count, 6)
 
-        guard case let .atCapacity(tailcatActive, tailcatLimit, firstTailcatDiagnostic) = registry.register(
+        guard case let .atCapacity(relayActive, relayLimit, firstRelayDiagnostic) = registry.register(
             pairs[6][0],
             generation: generation,
-            scope: .tailcat
+            scope: .relay
         ) else {
-            XCTFail("the first Tailcat beyond the Tailcat cap must be rejected while global room remains")
+            XCTFail("the first Relay beyond the Relay cap must be rejected while global room remains")
             return
         }
-        XCTAssertEqual(tailcatActive, 6)
-        XCTAssertEqual(tailcatLimit, 6)
-        XCTAssertTrue(firstTailcatDiagnostic)
+        XCTAssertEqual(relayActive, 6)
+        XCTAssertEqual(relayLimit, 6)
+        XCTAssertTrue(firstRelayDiagnostic)
         XCTAssertEqual(registry.count, 6)
         XCTAssertTrue(waitForPeerClosure(pairs[6][1], timeout: 0.25))
 
-        guard case let .atCapacity(_, _, repeatedTailcatDiagnostic) = registry.register(
+        guard case let .atCapacity(_, _, repeatedRelayDiagnostic) = registry.register(
             pairs[7][0],
             generation: generation,
-            scope: .tailcat
+            scope: .relay
         ) else {
-            XCTFail("a sustained Tailcat excess must remain rejected")
+            XCTFail("a sustained Relay excess must remain rejected")
             return
         }
-        XCTAssertFalse(repeatedTailcatDiagnostic,
-                       "repeated Tailcat rejects must not flood diagnostics while still at the Tailcat cap")
+        XCTAssertFalse(repeatedRelayDiagnostic,
+                       "repeated Relay rejects must not flood diagnostics while still at the Relay cap")
         XCTAssertTrue(waitForPeerClosure(pairs[7][1], timeout: 0.25))
 
         XCTAssertFalse(
-            registry.register(pairs[8][0], scope: .tailcat),
-            "HTTPServer.registerTailcatConnection's Bool API must also deny at the Tailcat cap"
+            registry.register(pairs[8][0], scope: .relay),
+            "HTTPServer.registerRelayConnection's Bool API must also deny at the Relay cap"
         )
         XCTAssertTrue(waitForPeerClosure(pairs[8][1], timeout: 0.25))
         XCTAssertEqual(registry.count, 6)
@@ -294,7 +294,7 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
             generation: generation,
             scope: .ordinary
         ) else {
-            XCTFail("ordinary/LAN must still be admitted after Tailcat is at its cap")
+            XCTFail("ordinary/LAN must still be admitted after Relay is at its cap")
             return
         }
         guard case .accepted = registry.register(
@@ -317,11 +317,11 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
         XCTAssertEqual(globalLimit, 8)
         XCTAssertTrue(
             firstGlobalDiagnostic,
-            "Tailcat saturation must not suppress the first global-cap diagnostic"
+            "Relay saturation must not suppress the first global-cap diagnostic"
         )
         XCTAssertTrue(waitForPeerClosure(pairs[11][1], timeout: 0.25))
 
-        XCTAssertFalse(registry.register(pairs[12][0], scope: .tailcat))
+        XCTAssertFalse(registry.register(pairs[12][0], scope: .relay))
         XCTAssertTrue(waitForPeerClosure(pairs[12][1], timeout: 0.25))
         XCTAssertEqual(registry.count, 8)
 
@@ -342,23 +342,23 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
         guard case .accepted = registry.register(
             pairs[14][0],
             generation: generation,
-            scope: .tailcat
+            scope: .relay
         ) else {
-            XCTFail("releasing a Tailcat slot below the Tailcat cap must admit the next Tailcat descriptor")
+            XCTFail("releasing a Relay slot below the Relay cap must admit the next Relay descriptor")
             return
         }
         XCTAssertEqual(registry.count, 8)
 
-        guard case let .atCapacity(_, _, rearmedTailcatDiagnostic) = registry.register(
+        guard case let .atCapacity(_, _, rearmedRelayDiagnostic) = registry.register(
             pairs[15][0],
             generation: generation,
-            scope: .tailcat
+            scope: .relay
         ) else {
-            XCTFail("refilling the Tailcat cap must reject the next Tailcat descriptor")
+            XCTFail("refilling the Relay cap must reject the next Relay descriptor")
             return
         }
-        XCTAssertTrue(rearmedTailcatDiagnostic,
-                      "a new Tailcat saturation episode may publish one new diagnostic")
+        XCTAssertTrue(rearmedRelayDiagnostic,
+                      "a new Relay saturation episode may publish one new diagnostic")
         XCTAssertTrue(waitForPeerClosure(pairs[15][1], timeout: 0.25))
         XCTAssertEqual(registry.count, 8)
 

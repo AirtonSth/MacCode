@@ -4,9 +4,9 @@ import SocketServer
 import XCTest
 @testable import AppShell
 
-/// WHY: clearing the stored account session makes the Tailcat supervisor
-/// revoke its keys and delete the published host, turns push delivery into
-/// `no_session`, and nothing restores it except a manual sign-in on the Mac.
+/// WHY: clearing the stored account session stops the relay host client from
+/// authenticating, turns push delivery into `no_session`, and nothing restores
+/// it except a manual sign-in on the Mac.
 /// A failed token refresh that is not the backend's auth rejection (offline,
 /// timeout, 5xx, 429, decode error) must therefore keep the session; only a
 /// 401 from the refresh endpoint ends it.
@@ -22,7 +22,7 @@ final class PrivateSessionTransientRefreshFailureTests: XCTestCase {
         super.tearDown()
     }
 
-    func testPush401ThenOfflineRefreshKeepsSessionAndTailcatKeys() async throws {
+    func testPush401ThenOfflineRefreshKeepsSession() async throws {
         let ctx = try makeContext()
         let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
         let api = ScriptedPrivateAccountAPI(
@@ -30,41 +30,12 @@ final class PrivateSessionTransientRefreshFailureTests: XCTestCase {
             refreshError: URLError(.notConnectedToInternet)
         )
         let bridge = try makeBridge(context: ctx, accountStore: accountStore, api: api)
-        let catalog = FakeTailcatCatalog(snapshot: makeSnapshot())
-        let tailcatBridge = FakeTailcatBridge()
-        let secureStore = FakeTailcatStore()
-        let supervisor = TailcatRuntimeSupervisor(
-            serverID: "server-1",
-            displayName: "Test Mac",
-            bridge: tailcatBridge,
-            catalog: catalog,
-            secureStore: secureStore,
-            sessionProvider: { accountStore.load() },
-            authenticator: TailcatRemoteConnectionAuthenticator(),
-            listener: FakeTailcatListener(),
-            now: { Date(timeIntervalSince1970: 1_000) },
-            automaticPolling: false,
-            statusHandler: { _ in }
-        )
-        await supervisor.setEnabled(true)
-        await supervisor.reconcileNowForTesting()
-        XCTAssertEqual(secureStore.state?.phase, .active, "fixture: the remote path must be up before the blip")
-
         let content = try outcomeContent()
         await bridge.deliver(content)
-        // What `.rc2PrivateAccountChanged` triggers in the app.
-        await supervisor.accountChanged()
 
         XCTAssertGreaterThanOrEqual(api.refreshCallCount, 1, "fixture: the 401 must have reached the refresh path")
         XCTAssertEqual(accountStore.load(), Self.session,
                        "an offline refresh is not a sign-out: the session must survive for the next attempt")
-        XCTAssertEqual(secureStore.state?.phase, .active,
-                       "a network blip must not revoke the Tailcat keys")
-        let hasActiveRuntime = await supervisor.hasActiveRuntimeForTesting
-        XCTAssertTrue(hasActiveRuntime, "a network blip must not stop the remote path")
-        let deletes = await catalog.deleteAccessTokens
-        XCTAssertTrue(deletes.isEmpty, "a network blip must not delete the published host")
-        await supervisor.setEnabled(false)
     }
 
     func testPush401ThenNonAuthRefreshFailureKeepsSession() async throws {
@@ -137,7 +108,7 @@ final class PrivateSessionTransientRefreshFailureTests: XCTestCase {
     }
 
     /// Each clear posts `.rc2PrivateAccountChanged`, and each post makes the
-    /// app run the Tailcat sign-out (revoke keys, delete the published host).
+    /// app reconnect the relay host client.
     /// A refresh rejected after the user already disconnected must not clear
     /// and notify a second time.
     func testRefreshRejectedAfterDisconnectDoesNotClearAgain() async throws {
@@ -282,25 +253,6 @@ final class PrivateSessionTransientRefreshFailureTests: XCTestCase {
             subscribed: true
         )
     )
-
-    private func makeSnapshot() -> TailcatAllowlistSnapshot {
-        TailcatAllowlistSnapshot(
-            epoch: "epoch-transient-refresh",
-            revision: 1,
-            clients: [
-                TailcatCatalogClient(
-                    clientId: "client-0",
-                    displayName: "Client 0",
-                    nodePublic: "nodekey:" + String(repeating: "a1", count: 32),
-                    transportBuildId: TailcatTransportContract.buildID,
-                    createdAt: "2026-08-30T00:00:00Z",
-                    updatedAt: "2026-08-30T00:00:00Z",
-                    leaseExpiresAt: "2026-09-06T00:00:00Z",
-                    version: 1
-                ),
-            ]
-        )
-    }
 }
 
 private final class AccountChangePostCounter: @unchecked Sendable {

@@ -294,9 +294,6 @@ public final class SidebarViewModel: ObservableObject {
         didSet { if filterText != oldValue { filteredWorkspacesCache = nil } }
     }
     @Published public var privateAccountUser: PrivateAccountUser?
-    /// Live Tailcat ("Connect from anywhere") runtime state for the header
-    /// DERP badge: green when connected (.active), yellow otherwise.
-    @Published private(set) var tailcatRuntimeStatus: TailcatRuntimeStatus = .off
     @Published public var updateAvailability: AppUpdateAvailability = .unknown
     @Published public private(set) var insomniaEnabled: Bool = false
     @Published public private(set) var insomniaAllowDisplaySleep: Bool = true
@@ -341,7 +338,6 @@ public final class SidebarViewModel: ObservableObject {
     private var lastPrivateAccountJSON: String?
     private var didPeekPrivateAccountJSON = false
     private var privateAccountObserver: NSObjectProtocol?
-    private var tailcatStatusObserver: NSObjectProtocol?
     private var accountUsageObserver: NSObjectProtocol?
     private var accountUsageDistributedObserver: NSObjectProtocol?
     /// In-flight off-main reload of usage.json. A new notification cancels the
@@ -390,16 +386,6 @@ public final class SidebarViewModel: ObservableObject {
             guard let viewModel = self else { return }
             Task { @MainActor in viewModel.reloadPrivateAccount() }
         }
-        self.tailcatStatusObserver = NotificationCenter.default.addObserver(
-            forName: .rc2TailcatRuntimeStatusChanged,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            guard let viewModel = self,
-                  let raw = note.userInfo?["rawStatus"] as? String,
-                  let status = TailcatRuntimeStatus(rawValue: raw) else { return }
-            Task { @MainActor in viewModel.applyTailcatRuntimeStatus(status) }
-        }
         self.accountUsageObserver = NotificationCenter.default.addObserver(
             forName: .rc2AccountUsageChanged,
             object: nil,
@@ -437,9 +423,6 @@ public final class SidebarViewModel: ObservableObject {
     deinit {
         if let privateAccountObserver {
             NotificationCenter.default.removeObserver(privateAccountObserver)
-        }
-        if let tailcatStatusObserver {
-            NotificationCenter.default.removeObserver(tailcatStatusObserver)
         }
         if let accountUsageObserver {
             NotificationCenter.default.removeObserver(accountUsageObserver)
@@ -873,14 +856,6 @@ public final class SidebarViewModel: ObservableObject {
         if next != privateAccountUser {
             privateAccountUser = next
         }
-    }
-
-    /// Seeded from the shared setting authority at mount and kept current by
-    /// `.rc2TailcatRuntimeStatusChanged` so the header badge never shows a
-    /// stale color while no notification is in flight.
-    func applyTailcatRuntimeStatus(_ status: TailcatRuntimeStatus) {
-        guard status != tailcatRuntimeStatus else { return }
-        tailcatRuntimeStatus = status
     }
 
     private func reloadInsomnia() {
@@ -1974,27 +1949,6 @@ struct SidebarActionRow: View {
     }
 }
 
-/// Tiny DERP connection indicator in the sidebar header: green while the
-/// Tailcat relay reports an active runtime ("Available anywhere"), yellow in
-/// every other state so "not connected" is never silent.
-struct TailcatConnectionBadge: View {
-    let status: TailcatRuntimeStatus
-
-    private var isConnected: Bool { status.isDERPConnected }
-
-    var body: some View {
-        Circle()
-            .fill(isConnected ? DS.Palette.success : DS.Palette.warning)
-            .frame(width: 7, height: 7)
-            .accessibilityLabel("Connect from anywhere")
-            .accessibilityValue(isConnected ? "Connected" : "Not connected")
-            .accessibilityIdentifier("sidebar.tailcatConnectionBadge")
-            .help(isConnected
-                  ? "Connect from anywhere: connected via DERP"
-                  : "Connect from anywhere: not connected")
-    }
-}
-
 public struct SidebarRootView: View {
     @ObservedObject var vm: SidebarViewModel
     var botsVM: BotsViewModel?
@@ -2077,18 +2031,13 @@ public struct SidebarRootView: View {
                 if vm.privateAccountUser != nil {
                     Button(action: onOpenAccount) {
                         headerAccountAvatar
-                            .overlay(alignment: .bottomTrailing) {
-                                TailcatConnectionBadge(status: vm.tailcatRuntimeStatus)
-                                    .offset(x: 2, y: 2)
-                                    .accessibilityHidden(true)
-                            }
                             .frame(width: 28, height: 32)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help(accountSubtitle + "\n" + vm.tailcatRuntimeStatus.displayText)
+                    .help(accountSubtitle)
                     .accessibilityLabel("Account")
-                    .accessibilityValue(accountSubtitle + ", " + vm.tailcatRuntimeStatus.displayText)
+                    .accessibilityValue(accountSubtitle)
                 }
             }
             .padding(.horizontal, DS.Space.md)
@@ -3302,7 +3251,6 @@ public final class SidebarView: NSObject {
     private var settingsController: SettingsWindowController?
     private var accountController: AccountWindowController?
     private let updater: AppUpdateChecking?
-    private let tailcatAccessSettingAuthority: TailcatAccessSettingAuthority
     /// Main window mounts Schedule Tasks in the workspace content column.
     public var onPresentScheduledTasks: (() -> Void)?
     /// Main window mounts Active Threads in the workspace content column.
@@ -3318,18 +3266,12 @@ public final class SidebarView: NSObject {
     public init(
         context: AppContext,
         router: AppCommandRouter,
-        updater: AppUpdateChecking? = nil,
-        tailcatAccessSettingAuthority: TailcatAccessSettingAuthority = TailcatAccessSettingAuthority()
+        updater: AppUpdateChecking? = nil
     ) {
         self.context = context
         self.router = router
         self.updater = updater
-        self.tailcatAccessSettingAuthority = tailcatAccessSettingAuthority
         self.viewModel = SidebarViewModel(context: context, router: router, updateChecker: updater)
-        // Seed the header DERP badge with the authority's current status so a
-        // sidebar mounted after the last runtime notification still shows the
-        // live color; later updates arrive via .rc2TailcatRuntimeStatusChanged.
-        self.viewModel.applyTailcatRuntimeStatus(tailcatAccessSettingAuthority.currentStatus)
         self.botsViewModel = BotsViewModel(context: context, router: router)
         let h = NSHostingView(rootView: SidebarRootView(vm: viewModel, botsVM: botsViewModel))
         h.translatesAutoresizingMaskIntoConstraints = false
@@ -3434,8 +3376,7 @@ public final class SidebarView: NSObject {
         let controller = settingsController ?? SettingsWindowController(
             context: context,
             updater: updater,
-            loadImmediately: false,
-            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
+            loadImmediately: false
         )
         settingsController = controller
         if let window = view.window {

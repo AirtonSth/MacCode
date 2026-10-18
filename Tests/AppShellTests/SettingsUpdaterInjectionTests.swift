@@ -27,8 +27,7 @@ final class SettingsUpdaterInjectionTests: XCTestCase {
 
         let controller = SettingsWindowController(
             context: ctx,
-            updater: updater,
-            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+            updater: updater
         )
 
         XCTAssertTrue(
@@ -44,8 +43,7 @@ final class SettingsUpdaterInjectionTests: XCTestCase {
 
         let controller = SettingsWindowController(
             context: ctx,
-            updater: nil,
-            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+            updater: nil
         )
 
         XCTAssertFalse(
