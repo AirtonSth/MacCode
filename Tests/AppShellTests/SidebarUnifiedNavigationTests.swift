@@ -51,9 +51,40 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
 
         XCTAssertEqual(f.vm.generalBots.first?.botID, titio.id, "Titio is pinned first in General Bots")
         let general = Set(f.vm.generalBots.map(\.botID))
-        XCTAssertTrue(general.contains(researcher.id), "a Bot with no workspace link is a general Bot")
+        XCTAssertTrue(general.contains(researcher.id), "a never-bound catalog Bot is a general Bot")
         XCTAssertTrue(general.contains(reviewer.id), "a Bot with a General grant stays general even when also linked")
         XCTAssertFalse(general.contains(developer.id), "a workspace-only Bot lives under its workspace, not General")
+
+        let revokedOnly = try f.context.botStore.create(name: "Revoked", title: "", description: "", handle: "revoked")
+        let grant = try f.context.botStore.grantContext(hostID: f.host, botID: revokedOnly.id, context: .workspace(workspace.id), actions: [.read], expectedRevision: 0)
+        _ = try f.context.botStore.revokeContext(hostID: f.host, botID: revokedOnly.id, context: .workspace(workspace.id), expectedRevision: grant.policyRevision)
+        let sendOnly = try f.context.botStore.create(name: "Send only", title: "", description: "", handle: "send-only")
+        _ = try f.context.botStore.grantContext(hostID: f.host, botID: sendOnly.id, context: .general, actions: [.send], expectedRevision: 0)
+        await f.vm.reloadAuthorizedBotConversationRowsAndWait()
+        let after = Set(f.vm.generalBots.map(\.botID))
+        XCTAssertFalse(after.contains(revokedOnly.id), "revoking a workspace grant must not relocate the Bot into General")
+        XCTAssertFalse(after.contains(sendOnly.id), "a General grant without read is not a General Bot row")
+    }
+
+    func test_conversationsHideRevokedAndForeignPinnedBotThreadsButKeepPlainWork() async throws {
+        let f = try make("conversation-authority")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let workspace = try f.router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        let plain = try f.router.createAgentThread(workspace: workspace.id, title: "Plain", provider: .codex, model: "fake", permissionMode: .supervised, reasoningEffort: .medium)
+        let bot = try f.context.botStore.create(name: "Piper", title: "", description: "", provider: .distill)
+        let grant = try f.context.botStore.grantContext(hostID: f.host, botID: bot.id, context: .workspace(workspace.id), actions: [.read], expectedRevision: 0)
+        var thread = AgentThread(workspaceId: workspace.id, title: "Secret Bot title", provider: .distill, model: "fixture")
+        thread.status = .completed
+        try f.context.botStore.createContextualConversation(BotConversation(botID: bot.id, title: "Secret Bot title", linkedAgentThreadID: thread.id),
+            newThread: thread, hostID: f.host, context: .workspace(workspace.id), policyRevision: grant.policyRevision)
+        f.vm.reload()
+        await expand(f.vm, workspace.id)
+        XCTAssertEqual(Set(f.vm.workspaceConversationRows(workspace.id).map(\.threadID)), [plain.id, thread.id])
+
+        _ = try f.context.botStore.revokeContext(hostID: f.host, botID: bot.id, context: .workspace(workspace.id), expectedRevision: grant.policyRevision)
+        await f.vm.reloadAuthorizedBotConversationRowsAndWait()
+        XCTAssertEqual(f.vm.workspaceConversationRows(workspace.id).map(\.threadID), [plain.id],
+                       "a revoked Bot conversation's title must disappear while plain work stays")
     }
 
     func test_expandIsSeparateFromOpenAndSharedBotIsTheSameIdentityUnderEachWorkspace() async throws {
