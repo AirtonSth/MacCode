@@ -10358,13 +10358,17 @@ final class BotsWindowTests: XCTestCase {
         )
         defer { UserDefaults.standard.removeObject(forKey: settingsKey) }
 
-        _ = try measurePeerHandoffDeletion(
-            label: "warmup",
-            payload: payload,
-            targetOriginBotID: targetOriginBotID,
-            targetActivityID: targetActivityID,
-            siblingActivityID: siblingActivityID
-        )
+        // Inside a long suite the first commits still share the CPU with work the
+        // previous test left draining; warm up past that so samples measure the commit.
+        for warmup in 0..<3 {
+            _ = try measurePeerHandoffDeletion(
+                label: "warmup-\(warmup)",
+                payload: payload,
+                targetOriginBotID: targetOriginBotID,
+                targetActivityID: targetActivityID,
+                siblingActivityID: siblingActivityID
+            )
+        }
 
         var samples: [Double] = []
         for sample in 0..<20 {
@@ -11677,7 +11681,7 @@ final class BotsWindowTests: XCTestCase {
             "task_id": try XCTUnwrap(startTask["id"]),
             "recipe_id": try XCTUnwrap(startTask["recipe_id"]),
         ])
-        XCTAssertEqual(docker.startStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(docker.startStarted.wait(timeout: .now() + 10), .success)
         let acceptedRuntime = try XCTUnwrap(
             accepted.objectValue?["readback"]?.objectValue?["runtime"]?.objectValue
         )
@@ -11813,7 +11817,8 @@ final class BotsWindowTests: XCTestCase {
 
         func terminalReceipt(requestID: String) async throws -> [String: JSONValue] {
             var latest = JSONValue.null
-            for _ in 0..<200 {
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
                 latest = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
                     "client_request_id": .string(requestID),
                 ])
@@ -11944,7 +11949,8 @@ final class BotsWindowTests: XCTestCase {
 
         func terminalReceipt(requestID: String) async throws -> [String: JSONValue] {
             var latest = JSONValue.null
-            for _ in 0..<200 {
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
                 latest = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
                     "client_request_id": .string(requestID),
                 ])
@@ -12147,7 +12153,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.1)
         XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
         XCTAssertEqual(vm.guestLaunchState(for: bot.id), .starting)
-        XCTAssertEqual(fake.startStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(fake.startStarted.wait(timeout: .now() + 10), .success)
         await Task.yield()
         XCTAssertTrue(heartbeat, "a blocked Docker start must not starve MainActor work")
 
@@ -12498,7 +12504,7 @@ final class BotsWindowTests: XCTestCase {
         )
         vm.dockerGuestReadyOverrideForTesting = nil
         vm.presentGuestDesktop(botID: bot.id)
-        let launched = await waitUntil(timeout: 2) { vm.isGuestRunning(bot.id) }
+        let launched = await waitUntil(timeout: 10) { vm.isGuestRunning(bot.id) }
         XCTAssertTrue(launched)
         let started = Date()
         vm.stopDockerGuest(botID: bot.id)

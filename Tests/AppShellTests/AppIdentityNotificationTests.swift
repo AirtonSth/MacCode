@@ -1471,6 +1471,16 @@ final class AppIdentityNotificationTests: XCTestCase {
         ctx.coordinator.replaceProvider(.claude, runner: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: "ok")))
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
+        // Titling is under test, not this Mac's Claude login: give send the authenticated
+        // catalog it would otherwise discover from the installed CLI.
+        router.rememberProviderSnapshotsForSend([AgentProviderSnapshot(
+            id: "claude", provider: .claude, driverKind: .claudeCLI, displayName: "Claude",
+            accentColor: "#D97757", continuationGroup: "claude", interactionModes: [.default],
+            permissionModes: [.supervised, .fullAccess], enabled: true, installed: true,
+            status: .available, authenticated: true,
+            models: [AgentModelDescriptor(id: "fake-model", label: "Fake", provider: .claude)],
+            slashCommands: []
+        )])
         let thread = AgentThread(title: "Thread", provider: .claude, model: "fake-model")
         try ctx.threadRepo.upsert(thread)
 

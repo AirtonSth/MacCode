@@ -193,7 +193,7 @@ final class AccountUsageLocalSignalTests: XCTestCase {
         ) { _ in settles += 1 }
         defer { NotificationCenter.default.removeObserver(observer) }
 
-        // Minute 0: a tick probes Claude, so the next ticks fall inside the interval.
+        // A tick probes Claude, so the next tick falls inside the interval.
         context.refreshPeriodicAccountUsage()
         let firstStarted = await waitUntilAsync { await refresher.requests.count == 1 }
         XCTAssertTrue(firstStarted)
@@ -201,8 +201,8 @@ final class AccountUsageLocalSignalTests: XCTestCase {
         let firstSettled = await waitUntil { settles == 1 }
         XCTAssertTrue(firstSettled)
 
-        // Minute 5: a tick that skips the Claude CLI is in flight when the popover opens.
-        now = now.addingTimeInterval(5 * 60)
+        // Inside the Claude CLI interval: a tick that skips the Claude CLI is in flight when the popover opens.
+        now = now.addingTimeInterval(AppContext.claudeUsageCLIProbeInterval / 2)
         context.refreshPeriodicAccountUsage()
         let tickStarted = await waitUntilAsync { await refresher.requests.count == 2 }
         XCTAssertTrue(tickStarted)
@@ -245,6 +245,10 @@ final class AccountUsageLocalSignalTests: XCTestCase {
         let (_, viewModel, appSupport) = try makeViewModel()
         defer { try? FileManager.default.removeItem(at: appSupport) }
         await viewModel.reloadAccountUsageAndWait()
+        // Mount also loads Activity counts off-main; let that unrelated first publish land
+        // so the window below only sees what the usage notification causes.
+        let countsSettled = await waitUntil { viewModel.activityCounts.isAvailable }
+        XCTAssertTrue(countsSettled, "precondition: the mount-time Activity counts load finished")
 
         var publishes = 0
         let sub = viewModel.objectWillChange.sink { publishes += 1 }

@@ -46,7 +46,11 @@ public enum PerfSwitchMetrics {
         var queueOccupiedNanoseconds: UInt64 = 0
         var slowMainSyncLogCount: Int = 0
         var lastSlowMainSyncStack: String?
+        var lastSlowMainSyncStackAt: UInt64?
     }
+
+    /// Symbolicating a stack costs tens of milliseconds on the main thread; keep one per window.
+    static let slowMainSyncStackIntervalNanoseconds: UInt64 = 30_000_000_000
 
     private static let state = OSAllocatedUnfairLock(initialState: State())
 
@@ -182,12 +186,19 @@ public enum PerfSwitchMetrics {
         // EV-20: `Thread.callStackSymbols` symbolicates on the MAIN thread, right
         // after a main-thread SQLite wait already exceeded 2 ms — i.e. exactly
         // under lock contention. In release that was a positive feedback loop
-        // (more contention → more main-thread symbolication). Debug only.
-        let stack = Thread.callStackSymbols.prefix(16).joined(separator: "\n")
-        state.withLock {
-            $0.slowMainSyncLogCount += 1
-            $0.lastSlowMainSyncStack = stack
+        // (more contention → more main-thread symbolication). Debug only, and at
+        // most one symbolicated stack per window so back-to-back slow writes do
+        // not each pay for it.
+        let now = DispatchTime.now().uptimeNanoseconds
+        let symbolicate = state.withLock { current -> Bool in
+            current.slowMainSyncLogCount += 1
+            guard current.lastSlowMainSyncStackAt.map({ now &- $0 >= slowMainSyncStackIntervalNanoseconds }) ?? true else { return false }
+            current.lastSlowMainSyncStackAt = now
+            return true
         }
+        guard symbolicate else { return }
+        let stack = Thread.callStackSymbols.prefix(16).joined(separator: "\n")
+        state.withLock { $0.lastSlowMainSyncStack = stack }
         NSLog(
             "SQLiteDB main-thread wait %.2fms\n%@",
             Double(nanoseconds) / 1_000_000.0,

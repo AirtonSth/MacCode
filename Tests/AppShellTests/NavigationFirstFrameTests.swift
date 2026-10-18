@@ -76,7 +76,7 @@ final class SidebarViewTests: XCTestCase {
 
     func test_workspaceBotsBoundaryMountsWithoutAnimation() throws {
         let sidebar = try source("Sources/AppShell/SidebarView.swift")
-        XCTAssertFalse(sidebar.contains("if vm.isBotsSelected, let botsVM"), "the unified sidebar has no Bots content boundary")
+        XCTAssertFalse(sidebar.contains("BotsRosterList("), "the unified sidebar mounts no Bots roster, so there is no content boundary to animate")
         XCTAssertFalse(
             sidebar.contains(".animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: vm.isBotsSelected)"),
             "the Workspaces/Bots boundary must not animate for 200ms"

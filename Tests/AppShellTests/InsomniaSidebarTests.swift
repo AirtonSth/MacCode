@@ -126,7 +126,11 @@ final class InsomniaSidebarTests: XCTestCase {
             run.id
         )
 
-        let refreshed = await waitUntil { vm.accountUsageSnapshot.usedTokens == 200 }
+        // Delivery is debounced twice (provider-usage flush, then the usage-changed post),
+        // so the deadline covers both windows plus scheduling slack under a loaded run.
+        let refreshed = await waitUntil(
+            timeout: AppContext.providerUsageDebounceInterval + AppContext.usageNotificationMinimumInterval + 3
+        ) { vm.accountUsageSnapshot.usedTokens == 200 }
         XCTAssertTrue(refreshed,
                       "sidebar account-usage figure must refresh when Claude/Codex provider usage is recorded")
         // Provider token-usage events record REAL provider spend only. Savings

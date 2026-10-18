@@ -414,9 +414,9 @@ public final class AppContext {
     var agentSkillsHomeOverrideForTesting: URL?
     /// The launch-time legacy purge (`startLegacyTokenSaverPurge`).
     private(set) var legacyTokenSaverPurgeTask: Task<Void, Never>?
-    private static let usageNotificationMinimumInterval: TimeInterval = 2
+    static let usageNotificationMinimumInterval: TimeInterval = 2
     /// Debounce window for coalescing per-token usage writes into one disk write.
-    private static let providerUsageDebounceInterval: TimeInterval = 0.75
+    static let providerUsageDebounceInterval: TimeInterval = 0.75
     /// Ceiling for the failed-write retry backoff. The retry never gives up: the
     /// pending delta is real provider usage, and dropping it would understate the
     /// ledger. It just stops being retried at the debounce rate.

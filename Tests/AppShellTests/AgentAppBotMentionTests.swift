@@ -115,10 +115,21 @@ final class AgentAppBotMentionTests: XCTestCase {
             conversation, newThread: pinnedThread, hostID: hostID,
             context: context, policyRevision: binding.policyRevision
         )
-        _ = try await ctx.router!.sendAgentMessage(
-            thread: pinnedThread.id, text: "test", provider: .distill,
-            model: "fake-model", permissionMode: nil, reasoningEffort: nil
-        )
+        // The public send path now refuses contextual execution (proven elsewhere), so the
+        // pinned caller is started through the coordinator, which still mints a real capability.
+        do {
+            _ = try await ctx.router!.sendAgentMessage(
+                thread: pinnedThread.id, text: "test", provider: .distill,
+                model: "fake-model", permissionMode: nil, reasoningEffort: nil
+            )
+            XCTFail("the public send path must refuse contextual execution")
+        } catch {
+            XCTAssertEqual((error as? JSONRPCError)?.message, "Contextual execution is unavailable until isolation is verified.")
+        }
+        _ = try await ctx.coordinator.startRun(AgentRunRequest(
+            threadId: pinnedThread.id, provider: .distill, model: "fake-model",
+            cwd: NSTemporaryDirectory(), prompt: "test"
+        ))
         let started = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
         XCTAssertTrue(started)
         let request = try XCTUnwrap(runner.requests.first)

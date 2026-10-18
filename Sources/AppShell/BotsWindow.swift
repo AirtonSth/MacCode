@@ -5894,7 +5894,7 @@ public final class BotsViewModel: ObservableObject {
                 NSLog("RemoteCode: manual actions of deleted bot could not be closed: \(error)")
             }
             if let service = computerGuestService {
-                Task.detached { [service] in
+                BotsViewModel.dockerWorkQueue.async {
                     service.teardown(botID: id)
                 }
             }
@@ -7025,7 +7025,9 @@ public final class BotsViewModel: ObservableObject {
         let service = computerGuestService
         let appSupport = context.appSupportDirectory
         Task.detached { [weak self, service] in
-            service?.teardown(botID: bot.id)
+            if let service {
+                await BotsViewModel.runDockerBlocking { service.teardown(botID: bot.id) }
+            }
             do {
                 _ = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id)
                 await MainActor.run {
@@ -10758,9 +10760,9 @@ public final class BotsViewModel: ObservableObject {
         }
         guard let service = computerGuestService else { return BotComputerDockerError.cliMissing.description }
         if isGuestRunning(botID) {
-            let running = await Task.detached(priority: .userInitiated) {
+            let running = await BotsViewModel.runDockerBlocking {
                 service.isContainerRunning(botID: botID)
-            }.value
+            }
             if running { return nil }
             guestRunningByBot[botID.value] = false
             guestLaunchStateByBot[botID.value] = .idle
@@ -12165,7 +12167,7 @@ public final class BotsViewModel: ObservableObject {
         guestLaunchStateByBot[botID.value] = .starting
         Task.detached {
             do {
-                let ready = try service.provision(botID: botID)
+                let ready = try await BotsViewModel.runDockerBlocking { try service.provision(botID: botID) }
                 let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
                 await MainActor.run {
                     self.rememberGuestScreen(url: url, botID: botID, running: true)
@@ -12193,7 +12195,7 @@ public final class BotsViewModel: ObservableObject {
         }
         Task.detached { [service] in
             do {
-                try service.stop(botID: botID)
+                try await BotsViewModel.runDockerBlocking { try service.stop(botID: botID) }
                 await MainActor.run {
                     self.guestRunningByBot[botID.value] = false
                     self.guestLaunchStateByBot[botID.value] = .idle
@@ -12223,7 +12225,7 @@ public final class BotsViewModel: ObservableObject {
         guestRebuildingByBot[botID.value] = true
         Task.detached {
             do {
-                let ready = try service.rebuild(botID: botID)
+                let ready = try await BotsViewModel.runDockerBlocking { try service.rebuild(botID: botID) }
                 let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
                 await MainActor.run {
                     self.guestRebuildingByBot[botID.value] = false
@@ -12270,6 +12272,26 @@ public final class BotsViewModel: ObservableObject {
         _ = try BotDesktopAdmission.requireSend(kind: kind, guestReady: ready)
     }
 
+    // Docker CLI calls block on process exit; keeping them off the Swift
+    // cooperative pool stops slow or hung probes from starving other tasks.
+    nonisolated static let dockerWorkQueue = DispatchQueue(
+        label: "RemoteCode.BotsViewModel.docker",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    nonisolated static func runDockerBlocking<T>(_ work: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            dockerWorkQueue.async { continuation.resume(with: Result { try work() }) }
+        }
+    }
+
+    nonisolated static func runDockerBlocking<T>(_ work: @escaping () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            dockerWorkQueue.async { continuation.resume(returning: work()) }
+        }
+    }
+
     private var dockerGuestProbeTask: Task<Void, Never>?
     private var dockerGuestProbeGeneration = 0
 
@@ -12280,7 +12302,7 @@ public final class BotsViewModel: ObservableObject {
         dockerGuestProbeGeneration += 1
         let generation = dockerGuestProbeGeneration
         dockerGuestProbeTask = Task.detached { [weak self] in
-            let ready = service.proveReady()
+            let ready = await BotsViewModel.runDockerBlocking { service.proveReady() }
             await MainActor.run {
                 guard let self, self.dockerGuestProbeGeneration == generation else { return }
                 self.dockerGuestProbeReason = ready ? nil : service.lastReason
