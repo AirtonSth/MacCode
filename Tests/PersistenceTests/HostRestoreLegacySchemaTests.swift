@@ -148,7 +148,7 @@ final class HostRestoreLegacySchemaTests: XCTestCase {
     }
 
     func testTrustedLegacySchemaRemainsLegacyUntilRealMigration() throws {
-        for version in [93, 96, Schema.currentVersion] {
+        for version in [93, 96, Schema.hostRestoreQueueHoldsSchemaVersion, Schema.currentVersion] {
             let db = try Schema.trustedRestoreSchema(version: version)
             let meta = try db.prepare("SELECT MAX(version) FROM schema_meta;")
             XCTAssertTrue(try meta.step())

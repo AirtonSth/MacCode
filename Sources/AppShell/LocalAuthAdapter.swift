@@ -363,6 +363,20 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         }
     }
 
+    /// Set by AppDelegate; returns the Mac relay static public key.
+    public var relayHostPublicKeyProvider: (@Sendable () -> Data?)?
+
+    public func relayHostPublicKey() -> Data? { relayHostPublicKeyProvider?() }
+
+    public func setRelayPublicKey(forBearer token: String, key: Data) -> Bool {
+        guard let trust = (try? repo.verifyCached(token: token)) ?? nil else { return false }
+        return ((try? repo.setRelayPublicKey(deviceId: trust.id, key: key)) != nil)
+    }
+
+    public func setRelayPublicKey(deviceId: String, key: Data) {
+        try? repo.setRelayPublicKey(deviceId: deviceId, key: key)
+    }
+
     public func revokeDevice(_ id: String) {
         try? repo.revoke(id: id)
         auditLoud(actor: "system", action: "device.revoke", detail: id)
