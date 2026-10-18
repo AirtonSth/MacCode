@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import Persistence
 import RemoteCodeTreaty
 
 /// Keeps the Mac's `/v1/host` socket open on the relay and bridges every relay
@@ -30,6 +31,7 @@ public final class RelayHostClient: @unchecked Sendable {
     private var streams: [String: Stream] = [:]
     private var connected = false
     private var running = false
+    private var revokeObserver: NSObjectProtocol?
 
     public var onStatusChange: ((Bool) -> Void)?
 
@@ -60,6 +62,11 @@ public final class RelayHostClient: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard !running else { return }
         running = true
+        revokeObserver = NotificationCenter.default.addObserver(
+            forName: DeviceTrustRepository.deviceRevokedNotification, object: nil, queue: nil
+        ) { [weak self] note in
+            if let id = note.userInfo?["deviceId"] as? String { self?.closeStreams(deviceId: id) }
+        }
         task = Task { [weak self] in await self?.runLoop() }
     }
 
@@ -71,7 +78,10 @@ public final class RelayHostClient: @unchecked Sendable {
         let sleeper = sleepTask
         let host = hostSocket
         let open = Array(streams.values)
+        let observer = revokeObserver
+        revokeObserver = nil
         lock.unlock()
+        if let observer { NotificationCenter.default.removeObserver(observer) }
         loop?.cancel()
         sleeper?.cancel()
         host?.close(code: 1000)
@@ -89,7 +99,12 @@ public final class RelayHostClient: @unchecked Sendable {
         sleeper?.cancel()
     }
 
-    /// Closes open relay streams of a revoked device.
+    var openStreamCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return streams.count
+    }
+
+    /// Closes open relay streams of a revoked device (also on `DeviceTrustRepository.deviceRevokedNotification`).
     public func closeStreams(deviceId: String) {
         lock.lock()
         let matching = streams.values.filter { $0.deviceId == deviceId }
@@ -254,6 +269,7 @@ public final class RelayHostClient: @unchecked Sendable {
         }
         let (outbound, outboundSink) = AsyncStream.makeStream(of: Data.self)
         let teardown: @Sendable () -> Void = {
+            counters.markEnded()
             shutdown(b, SHUT_RDWR)
             outboundSink.finish()
         }
@@ -269,6 +285,7 @@ public final class RelayHostClient: @unchecked Sendable {
         Thread.detachNewThread {
             var buffer = [UInt8](repeating: 0, count: 65536)
             while true {
+                if counters.ended { break }
                 if counters.pendingOutbound > 1_048_576 { usleep(5_000); continue }
                 var pfd = pollfd(fd: b, events: Int16(POLLIN), revents: 0)
                 let ready = poll(&pfd, 1, 500)
@@ -347,6 +364,9 @@ private final class ByteCounters: @unchecked Sendable {
     private var toMacValue: Int64 = 0
     private var fromMacValue: Int64 = 0
     private var pending = 0
+    private var endedValue = false
+    func markEnded() { lock.lock(); endedValue = true; lock.unlock() }
+    var ended: Bool { lock.lock(); defer { lock.unlock() }; return endedValue }
     func addToMac(_ n: Int) { lock.lock(); toMacValue += Int64(n); lock.unlock() }
     func addPending(_ n: Int) { lock.lock(); pending += n; lock.unlock() }
     func sentFromMac(_ n: Int) { lock.lock(); pending -= n; fromMacValue += Int64(n); lock.unlock() }

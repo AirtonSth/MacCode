@@ -1,5 +1,6 @@
 import CryptoKit
 import Darwin
+import Persistence
 import RemoteCodeTreaty
 import XCTest
 @testable import SocketServer
@@ -12,6 +13,8 @@ private final class MemorySocket: RelayWebSocket, @unchecked Sendable {
     private var closed = false
     private var code: Int?
     weak var peer: MemorySocket?
+    /// When set, sends stall briefly and then fail, like a dying relay link.
+    var stallThenFailSends = false
 
     var closeCode: Int? { lock.lock(); defer { lock.unlock() }; return code }
 
@@ -33,7 +36,13 @@ private final class MemorySocket: RelayWebSocket, @unchecked Sendable {
         }
     }
 
-    func send(_ data: Data) async throws { peer?.deliver(.binary(data)) }
+    func send(_ data: Data) async throws {
+        if stallThenFailSends {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            throw URLError(.networkConnectionLost)
+        }
+        peer?.deliver(.binary(data))
+    }
     func sendText(_ text: String) async throws { peer?.deliver(.text(text)) }
 
     func receiveMessage() async throws -> RelayMessage {
@@ -83,8 +92,16 @@ private final class RelayTestAuth: DirectAuthProvider, @unchecked Sendable {
     }
     func createPairingCode() -> String? { nil }
     func redeemPairingCode(_ code: String, deviceName: String) -> (deviceId: String, token: String)? { nil }
-    func listDevices() -> [[String: Any]] { [] }
-    func revokeDevice(_ id: String) { lock.lock(); revoked = true; lock.unlock() }
+    var deviceListPadding = 0
+    func listDevices() -> [[String: Any]] {
+        deviceListPadding == 0 ? [] : [["id": "device-1", "pad": String(repeating: "p", count: deviceListPadding)]]
+    }
+    func revokeDevice(_ id: String) {
+        lock.lock(); revoked = true; lock.unlock()
+        // The real adapter revokes through DeviceTrustRepository, which posts this.
+        NotificationCenter.default.post(
+            name: DeviceTrustRepository.deviceRevokedNotification, object: nil, userInfo: ["deviceId": id])
+    }
 }
 
 @MainActor
@@ -103,7 +120,12 @@ final class RelayHostClientTests: XCTestCase {
         private var streams: [String: MemorySocket] = [:]   // Mac side by stream id
         var client: RelayHostClient!
 
-        init(serverId: String, dispatcher: JSONRPCDispatcher) {
+        func macSide(_ id: String) -> MemorySocket {
+            lock.lock(); defer { lock.unlock() }
+            return streams[id]!
+        }
+
+        init(serverId: String, dispatcher: JSONRPCDispatcher, deviceId: String = "device-1") {
             (hostRelaySide, hostMacSide) = MemorySocket.pair()
             server = DirectHTTPServer(
                 port: UInt16.random(in: 44_001...54_000),
@@ -120,7 +142,7 @@ final class RelayHostClientTests: XCTestCase {
                 serverId: serverId,
                 hostStatic: hostKey,
                 accessToken: { "account-token" },
-                trustedDeviceForRelayKey: { $0 == phoneKey ? "device-1" : nil },
+                trustedDeviceForRelayKey: { $0 == phoneKey ? deviceId : nil },
                 webSocketFactory: { [unowned self] request in
                     let path = request.url?.path ?? ""
                     if path == "/v1/host" { return hostMacSide }
@@ -140,8 +162,8 @@ final class RelayHostClientTests: XCTestCase {
         }
     }
 
-    private func makeRig() async throws -> Rig {
-        let rig = Rig(serverId: serverId, dispatcher: JSONRPCDispatcher(router: FakeRouter()))
+    private func makeRig(deviceId: String = "device-1") async throws -> Rig {
+        let rig = Rig(serverId: serverId, dispatcher: JSONRPCDispatcher(router: FakeRouter()), deviceId: deviceId)
         rig.client.start()
         try await rig.hostRelaySide.sendText(#"{"type":"pong"}"#)
         for _ in 0..<200 where !rig.client.isConnected { try await Task.sleep(nanoseconds: 10_000_000) }
@@ -261,10 +283,9 @@ final class RelayHostClientTests: XCTestCase {
         XCTAssertEqual(phone.closeCode, 4401)
     }
 
-    func testRevokeRouteClosesRelayStreamsThroughTheHook() async throws {
+    func testRevokeRouteClosesRelayStreamsThroughTheRepositoryNotification() async throws {
         let rig = try await makeRig()
         defer { rig.client.stop() }
-        rig.server.relayStreamsRevoked = { [client = rig.client!] id in client.closeStreams(deviceId: id) }
         let (idle, idlePhone) = try await connect(rig, stream: "s-idle")
         try await idle.send(get("/v1/capabilities/authenticated", bearer: true))
         _ = try await readResponse(idle, phone: idlePhone)
@@ -283,5 +304,44 @@ final class RelayHostClientTests: XCTestCase {
             _ = try await idle.receive()
             XCTFail("the revoked device's idle stream must be closed")
         } catch {}
+    }
+
+    func testRepositoryRevokeClosesRelayStreamsWithoutTheHTTPRoute() async throws {
+        // WHY: Mac Settings revokes through the repository, not HTTP; open streams must still die.
+        let dir = NSTemporaryDirectory() + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: dir).run()
+        let repo = DeviceTrustRepository(db: db)
+        let code = try repo.createPairingCode()
+        let deviceId = try XCTUnwrap(try repo.redeemPairingCode(code.code, deviceName: "phone")).0.id
+        let rig = try await makeRig(deviceId: deviceId)
+        defer { rig.client.stop() }
+        let (channel, phone) = try await connect(rig, stream: "s-repo-revoke")
+        try await channel.send(get("/v1/capabilities/authenticated", bearer: true))
+        _ = try await readResponse(channel, phone: phone)
+
+        try repo.revoke(id: deviceId)
+        let watchdog = DispatchWorkItem { phone.close(code: 1000) }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: watchdog)
+        defer { watchdog.cancel() }
+        do {
+            _ = try await channel.receive()
+            XCTFail("stream must close when the repository revokes the device")
+        } catch {}
+        XCTAssertEqual(phone.closeCode, 4401)
+    }
+
+    func testSendFailureWithBackedUpOutputStillReleasesTheStream() async throws {
+        // WHY: a failed relay send used to leave the reader spinning on backpressure, leaking the fd and threads.
+        let rig = try await makeRig()
+        defer { rig.client.stop() }
+        rig.auth.deviceListPadding = 3_000_000
+        let (channel, phone) = try await connect(rig, stream: "s-stall")
+        XCTAssertEqual(rig.client.openStreamCount, 1)
+        rig.macSide("s-stall").stallThenFailSends = true
+        try await channel.send(get("/v1/devices", bearer: true))
+
+        for _ in 0..<500 where rig.client.openStreamCount > 0 { try await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertEqual(rig.client.openStreamCount, 0, "stream is removed once its send fails")
+        XCTAssertEqual(phone.closeCode, 1000)
     }
 }

@@ -1602,8 +1602,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public var relayAvailable: @Sendable () -> Bool = { false }
     /// Relay base URL advertised by `POST /v1/relay/keys`.
     public var relayURLString = "wss://relay.remotecode.io"
-    /// Called with the device id after a successful revoke so its relay streams close.
-    public var relayStreamsRevoked: (@Sendable (String) -> Void)?
 
     /// Decodes a base64 X25519 public key; nil when malformed.
     static func decodeRelayPublicKey(_ value: Any?) -> Data? {
@@ -4118,7 +4116,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 )
                 return
             }
-            relayStreamsRevoked?(id)
             sendJSON(fd: fd, status: 200, body: ["revoked": id], acceptEncoding: headers["accept-encoding"])
             if let owner = activeHTTPOwnerConnections.ownerFingerprint(for: fd),
                deactivated.contains(owner) {

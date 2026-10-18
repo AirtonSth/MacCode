@@ -1202,7 +1202,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         relayHostClient?.stop()
         relayHostClient = nil
         httpServer?.relayAvailable = { false }
-        httpServer?.relayStreamsRevoked = nil
         let requested = ((try? context.settingsRepo.get("relay_enabled")) ?? "0") == "1"
         // Lazy: the Keychain key is only created when pairing or the relay first needs it.
         let keyStore = relayHostKeyStore
@@ -1229,7 +1228,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             trustedDeviceForRelayKey: { (try? trust.deviceIdForRelayKey($0)) ?? nil }
         )
         http.relayAvailable = { [weak client] in client?.isConnected ?? false }
-        http.relayStreamsRevoked = { [weak client] id in client?.closeStreams(deviceId: id) }
         relayHostClient = client
         client.start()
     }

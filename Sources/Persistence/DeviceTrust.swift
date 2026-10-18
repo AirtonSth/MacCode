@@ -744,7 +744,11 @@ public final class DeviceTrustRepository {
         try st.bind(1, iso.string(from: Date())); try st.bind(2, id)
         _ = try st.step()
         Self.bumpTrustGeneration()
+        NotificationCenter.default.post(name: Self.deviceRevokedNotification, object: nil, userInfo: ["deviceId": id])
     }
+
+    /// Posted after every committed revoke; `userInfo["deviceId"]` is the device id.
+    public static let deviceRevokedNotification = Notification.Name("io.remotecode.device-trust.revoked")
 
     /// Stores (or clears) the relay key of a non-revoked device.
     public func setRelayPublicKey(deviceId: String, key: Data?) throws {
