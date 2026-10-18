@@ -18,7 +18,7 @@ enum BotGuestAgentKit {
         case missingKit
 
         var description: String {
-            "The RemoteCode app is missing its Linux agent kit (GuestAgentKit). Reinstall RemoteCode."
+            "The MacCode app is missing its Linux agent kit (GuestAgentKit). Reinstall MacCode."
         }
     }
 

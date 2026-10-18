@@ -89,7 +89,7 @@ var jsonOutput = false
 
 // Per-subcommand help strings for undocumented and advanced commands.
 let subcommandHelp: [String: String] = [
-    "ping":           "Usage: \(prog) ping\n\n  Send a liveness ping to the RemoteCode daemon.",
+    "ping":           "Usage: \(prog) ping\n\n  Send a liveness ping to the MacCode daemon.",
     "capabilities":   "Usage: \(prog) capabilities\n\n  List daemon capabilities.",
     "workspaces":     "Usage: \(prog) workspaces\n\n  List all open workspaces.",
     "new-workspace":  "Usage: \(prog) new-workspace --cwd PATH [--name NAME]\n\n  Create a new workspace at PATH.",
@@ -110,7 +110,7 @@ let subcommandHelp: [String: String] = [
     "notification":   "Usage: \(prog) notification <subcommand> [args...]\n\n  Subcommands: create list mark-read dismiss",
     "browser":        "Usage: \(prog) browser <subcommand> [args...]\n\n  Subcommands: navigate back forward reload url snapshot click focus hover check uncheck fill type select wait screenshot eval",
     "agent":          "Usage: \(prog) agent <subcommand> [args...]\n\n  Subcommands:\n    open --workspace WID\n    thread list [--workspace WID]\n    thread create [--workspace WID] [--title T] [--provider distill] [--model M]\n    send --thread TID --text TEXT [--provider P] [--model M]\n    stop --thread TID\n    models [--provider distill]",
-    "agent-app":      "Usage: \(prog) agent-app <codex|claude|grok> [PROMPT] [--prompt-file PATH] [--workspace WID] [--model M] [--permission supervised|auto_accept_edits|full_access] [--reasoning-effort LEVEL] [--turn-timeout MS] [--output-format text|json|grok-json]\n\n  Runs a persisted headless turn through the same Agent App pipeline as the UI. Runtime profiles are reserved for RemoteCode's managed provider bridge.",
+    "agent-app":      "Usage: \(prog) agent-app <codex|claude|grok> [PROMPT] [--prompt-file PATH] [--workspace WID] [--model M] [--permission supervised|auto_accept_edits|full_access] [--reasoning-effort LEVEL] [--turn-timeout MS] [--output-format text|json|grok-json]\n\n  Runs a persisted headless turn through the same Agent App pipeline as the UI. Runtime profiles are reserved for MacCode's managed provider bridge.",
 ]
 
 var rest: [String] = []
@@ -187,7 +187,7 @@ struct RPC {
                 : ""
             return ["error": [
                 "code": -1,
-                "message": "connect(\(socketPath)): \(msg). Is the RemoteCode app running?\(channelHint)",
+                "message": "connect(\(socketPath)): \(msg). Is the MacCode app running?\(channelHint)",
                 "_connect_failure": true,
                 "_mutation_delivery": "definite"
             ]]
@@ -296,7 +296,7 @@ enum AgentAppCLIError: Error, LocalizedError, AgentAppMiddlewareSendFailure {
     var errorDescription: String? {
         switch self {
         case .rpc(let message, _): return message
-        case .invalidResponse: return "RemoteCode returned an invalid RPC response."
+        case .invalidResponse: return "MacCode returned an invalid RPC response."
         case .invalidPromptFile(let path): return "Could not read --prompt-file \(path)."
         }
     }
@@ -346,7 +346,7 @@ func callAgentAppRPC(_ method: String, params: [String: AgentAppRPCValue]) throw
         let definitelyNotAccepted = error["_mutation_delivery"] as? String == "definite"
             || (code.map { $0 != -1 } ?? false)
         throw AgentAppCLIError.rpc(
-            error["message"] as? String ?? "RemoteCode RPC \(method) failed.",
+            error["message"] as? String ?? "MacCode RPC \(method) failed.",
             definitelyNotAccepted ? .definite : .ambiguous
         )
     }
@@ -583,7 +583,7 @@ case "events":
         }
         if connResult < 0 {
             let msg = String(cString: strerror(errno))
-            FileHandle.standardError.write(Data("error: connect(\(socketPath)): \(msg). Is the RemoteCode app running?\n".utf8))
+            FileHandle.standardError.write(Data("error: connect(\(socketPath)): \(msg). Is the MacCode app running?\n".utf8))
             Darwin.close(fd)
             Darwin.exit(RC2ExitCode.connectFailure)
         }
