@@ -4140,7 +4140,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "port": port,
                 "boot_epoch": Int64(bootEpoch),
                 "vpn_required": !bindLoopbackOnly,
-                "relay": relayAvailable(),
+                // `relay` stays false: shipped iOS builds refuse a host that sets it
+                // (no-relay policy for app-level relays). The byte relay is end-to-end
+                // encrypted, so it is announced under its own key.
+                "relay": false,
+                "relay_ws_v1": relayAvailable(),
                 // Optional stream control negotiated on welcome, not here.
                 "stream_interest_v1": Self.supportsStreamInterestControl,
                 // Paired iOS cold connect: one-shot authenticated capabilities

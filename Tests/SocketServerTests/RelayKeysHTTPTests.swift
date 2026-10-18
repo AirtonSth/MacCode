@@ -144,8 +144,11 @@ final class RelayKeysHTTPTests: XCTestCase {
         let auth = KeysAuth()
         let server = makeServer(auth)
         let get = "GET /v1/discovery HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
-        XCTAssertEqual(try send(server, get).json["relay"] as? Bool, false)
+        XCTAssertEqual(try send(server, get).json["relay_ws_v1"] as? Bool, false)
         server.relayAvailable = { true }
-        XCTAssertEqual(try send(server, get).json["relay"] as? Bool, true)
+        let online = try send(server, get).json
+        XCTAssertEqual(online["relay_ws_v1"] as? Bool, true)
+        // Shipped iOS builds treat `relay: true` as a terminal no-relay violation.
+        XCTAssertEqual(online["relay"] as? Bool, false)
     }
 }
