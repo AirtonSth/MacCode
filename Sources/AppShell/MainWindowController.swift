@@ -399,16 +399,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     public init(
         context: AppContext,
         router: AppCommandRouter,
-        updater: AppUpdateChecking? = nil,
-        tailcatAccessSettingAuthority: TailcatAccessSettingAuthority = TailcatAccessSettingAuthority()
+        updater: AppUpdateChecking? = nil
     ) {
         self.context = context
         self.router = router
         self.sidebar = SidebarView(
             context: context,
             router: router,
-            updater: updater,
-            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
+            updater: updater
         )
         self.sidebarWidth = Self.storedSidebarWidth(context: context)
 

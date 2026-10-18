@@ -49,8 +49,8 @@ final class RelayKeysHTTPTests: XCTestCase {
     private func send(_ server: DirectHTTPServer, _ raw: String) throws -> (status: Int, json: [String: Any]) {
         var pair: [Int32] = [0, 0]
         XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &pair), 0)
-        XCTAssertTrue(server.registerTailcatConnection(fd: pair[0]))
-        Thread.detachNewThread { server.serveTailcatConnection(fd: pair[0], peer: "relay:test") }
+        XCTAssertTrue(server.registerRelayConnection(fd: pair[0]))
+        Thread.detachNewThread { server.serveRelayConnection(fd: pair[0], peer: "relay:test") }
         let client = pair[1]
         defer { Darwin.close(client) }
         var timeout = timeval(tv_sec: 5, tv_usec: 0)

@@ -28,8 +28,6 @@ public enum MaterialWakeCoalesceClass: String, Sendable, Equatable, CaseIterable
     case notification = "notification"
     /// Host boot/identity rebaseline (force path).
     case boot = "boot"
-    /// F5: Tailcat endpoint digest changed; never produced by an EventBus kind.
-    case tailcat = "tailcat"
     /// Phase B git material kinds.
     case git = "git"
     /// Fallback bucket for unclassified silent reasons.
@@ -48,7 +46,7 @@ public enum MaterialWakeBudget: Sendable {
         switch coalesceClass {
         case .attention:
             return capacity
-        case .tailcat, .boot, .notification:
+        case .boot, .notification:
             return 2
         case .runProgress, .git, .other:
             return 1

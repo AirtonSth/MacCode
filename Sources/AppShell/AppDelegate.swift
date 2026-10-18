@@ -98,18 +98,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var bonjourPublicationGeneration = UUID()
     public private(set) var bonjourPublicationState: BonjourPublicationState = .stopped
     private var directAccessSupervisor: DirectAccessLifecycleSupervisor?
-    private let tailcatAuthenticator = TailcatRemoteConnectionAuthenticator()
-    private lazy var tailcatLoopbackListener = TailcatLoopbackListener(
-        authenticator: tailcatAuthenticator
-    )
-    var tailcatSupervisor: TailcatRuntimeSupervisor?
     private var relayHostClient: RelayHostClient?
     private let relayHostKeyStore: RelayHostKeyStoring = KeychainRelayHostKeyStore()
-    private var tailcatPathObserver: TailcatNetworkPathObserver?
-    private var tailcatSettingTask: Task<Void, Never>?
-    lazy var tailcatAccessSettingAuthority = TailcatAccessSettingAuthority { [weak self] requested in
-        self?.applyTailcatAccessSetting(requested)
-    }
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
     public private(set) var petController: PetController?
@@ -288,8 +278,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         windowController = MainWindowController(
             context: context,
             router: router,
-            updater: updater,
-            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
+            updater: updater
         )
         router.windowController = windowController
         settings = makeSettingsWindowController(context: context, updater: updater)
@@ -360,10 +349,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         NotificationCenter.default.addObserver(self, selector: #selector(remoteAccessSettingChanged),
                                                name: .rc2RemoteAccessSettingChanged, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(tailcatAccountChanged),
+        NotificationCenter.default.addObserver(self, selector: #selector(privateAccountChanged),
                                                name: .rc2PrivateAccountChanged, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(relaySettingChanged),
-                                               name: .rc2RelaySettingChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keybindingsReloaded),
                                                name: .rc2KeybindingsReloaded, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -379,41 +366,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             object: nil
         )
         configureDirectAccess()
-        let tailcatAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
-        tailcatSupervisor = TailcatRuntimeSupervisor(
-            serverID: context.liveActivityHostIdentity.serverId,
-            displayName: Host.current().localizedName ?? "RemoteCode Mac",
-            sessionProvider: { tailcatAccountStore.load() },
-            authenticator: tailcatAuthenticator,
-            listener: tailcatLoopbackListener,
-            // F5: not awaited; the send can take the URL timeout and must not hold the reconcile.
-            publishHandler: { [weak bridge = context.privateNotificationBridge] in
-                Task { [weak bridge] in await bridge?.announceTailcatEndpointIfChanged() }
-            },
-            statusHandler: { [weak self] status in
-                DispatchQueue.main.async { [weak self] in
-                    self?.tailcatAccessSettingAuthority.updateStatus(status)
-                    NotificationCenter.default.post(
-                        name: .rc2TailcatRuntimeStatusChanged,
-                        object: nil,
-                        userInfo: [
-                            "status": status.displayText,
-                            "rawStatus": status.rawValue,
-                        ]
-                    )
-                }
-            }
-        )
-        if let supervisor = tailcatSupervisor {
-            context.privateNotificationBridge.setConnectionHintSources(
-                tailcat: { await supervisor.pushHintWithEndpointDigest() }
-            )
-            // F5: a usable network path reconciles now instead of at the next poll. Straight
-            // to the actor, not through `tailcatSettingTask`: its own guards order the trigger.
-            tailcatPathObserver = TailcatNetworkPathObserver { Task { await supervisor.networkPathChanged() } }
-            tailcatPathObserver?.start()
-        }
-        configureTailcatAccess()
 
         palette = CommandPalette(router: router)
         SystemNotifier.shared.bootstrap()
@@ -719,13 +671,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         context?.botGuestMCPGateway.stop()
         directAccessSupervisor?.shutdown()
         directAccessSupervisor = nil
-        tailcatPathObserver?.stop()
-        tailcatPathObserver = nil
-        let tailcat = tailcatSupervisor
-        tailcatSupervisor = nil
         relayHostClient?.stop()
         relayHostClient = nil
-        Task { await tailcat?.shutdown() }
         providerSessionReaperTimer?.invalidate()
         ccrRetentionTimer?.invalidate()
         diagnosticsHeartbeatTimer?.invalidate()
@@ -1187,28 +1134,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         configureDirectAccess()
     }
 
-    @objc private func tailcatAccountChanged() {
-        Task { await tailcatSupervisor?.accountChanged() }
+    @objc private func privateAccountChanged() {
         relayHostClient?.accountChanged()
     }
 
-    @objc private func relaySettingChanged() {
-        configureRelay()
-    }
-
-    /// Starts or stops the relay host client from `relay_enabled` and the HTTP server state.
+    /// Starts the relay host client with the HTTP server. It idles until the Private account has a session token.
     private func configureRelay() {
         guard let context else { return }
         relayHostClient?.stop()
         relayHostClient = nil
         httpServer?.relayAvailable = { false }
-        let requested = ((try? context.settingsRepo.get("relay_enabled")) ?? "0") == "1"
         // Lazy: the Keychain key is only created when pairing or the relay first needs it.
         let keyStore = relayHostKeyStore
         localAuth?.relayHostPublicKeyProvider = {
             (try? keyStore.loadOrCreate())?.publicKey.rawRepresentation
         }
-        guard requested, let http = httpServer else { return }
+        guard let http = httpServer else { return }
         let hostKey: Curve25519.KeyAgreement.PrivateKey
         do { hostKey = try keyStore.loadOrCreate() } catch {
             NSLog("Relay host key unavailable")
@@ -1236,12 +1177,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         hangWatchdogAwakeState.value = .displaySleep
         lifecycleRecorder?.record("hang_watchdog_awake state=displaySleep")
         directAccessSupervisor?.suspend()
-        let supervisor = tailcatSupervisor
-        let previous = tailcatSettingTask
-        tailcatSettingTask = Task {
-            await previous?.value
-            await supervisor?.suspend()
-        }
     }
 
     @objc private func workspaceDidWake() {
@@ -1251,18 +1186,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let remoteEnabled = ((try? context.settingsRepo.get("remote_access_enabled")) ?? "0") == "1"
         do {
             try directAccessSupervisor?.resume(remoteEnabled: remoteEnabled)
-            let supervisor = tailcatSupervisor
-            let previous = tailcatSettingTask
-            tailcatSettingTask = Task { [weak self] in
-                await previous?.value
-                await supervisor?.resume()
-                let enabled = await supervisor?.isEnabled ?? false
-                if !enabled {
-                    await MainActor.run {
-                        self?.configureTailcatAccess()
-                    }
-                }
-            }
         } catch {
             NSLog("Failed to restart HTTP server after wake: \(error)")
             recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
@@ -1380,7 +1303,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 stopServer: { [weak self] in
                     self?.relayHostClient?.stop()
                     self?.relayHostClient = nil
-                    self?.tailcatLoopbackListener.setHTTPServer(nil)
                     self?.httpServer?.stop()
                     self?.httpServer = nil
                 },
@@ -1403,39 +1325,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         } catch {
             NSLog("Failed to start HTTP server: \(error)")
             recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
-        }
-    }
-
-    private func configureTailcatAccess() {
-        guard let context else { return }
-        let requested = TailcatAccessDefaults.isEnabled(try? context.settingsRepo.get("tailcat_access_enabled"))
-        applyTailcatAccessSetting(requested)
-    }
-
-    private func applyTailcatAccessSetting(_ requested: Bool) {
-        let listenerReady = httpServer != nil
-        NSLog(
-            "Tailcat setting requested=%@ supervisorReady=%@ listenerReady=%@",
-            requested.description,
-            (tailcatSupervisor != nil).description,
-            listenerReady.description
-        )
-        guard let tailcatSupervisor else { return }
-        let enabled = requested && listenerReady
-        // Strict FIFO with the sleep/wake tasks: a parked suspend must not run
-        // after a newer resume, and an off toggle must not be overtaken by an
-        // older queued enable. No setting may skip the wait.
-        let previous = tailcatSettingTask
-        tailcatSettingTask = Task.detached(priority: .userInitiated) {
-            await previous?.value
-            await tailcatSupervisor.setEnabled(enabled)
-        }
-        if requested && !listenerReady {
-            NotificationCenter.default.post(
-                name: .rc2TailcatRuntimeStatusChanged,
-                object: nil,
-                userInfo: ["status": TailcatRuntimeStatus.unavailable.displayText]
-            )
         }
     }
 
@@ -1473,9 +1362,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             attachmentUploadV3Store: attachmentUploadV3Store
         )
         try http.start()
-        tailcatLoopbackListener.setHTTPServer(http)
         httpServer = http
-        configureTailcatAccess()
         configureRelay()
         try? Self.resolvePetServerFailure(
             server: "HTTP server",
@@ -1973,8 +1860,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         SettingsWindowController(
             context: context,
             updater: updater,
-            loadImmediately: loadImmediately,
-            tailcatAccessSettingAuthority: tailcatAccessSettingAuthority
+            loadImmediately: loadImmediately
         )
     }
 

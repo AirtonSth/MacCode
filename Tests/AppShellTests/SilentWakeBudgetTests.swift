@@ -5,7 +5,6 @@ final class SilentWakeBudgetTests: XCTestCase {
     /// Table B1 of the F5 spec: the class is admitted while `used` is below this.
     private static let limits: [MaterialWakeCoalesceClass: Int] = [
         .attention: 3,
-        .tailcat: 2,
         .boot: 2,
         .notification: 2,
         .runProgress: 1,
@@ -15,8 +14,8 @@ final class SilentWakeBudgetTests: XCTestCase {
 
     func testAdmissionTableForEveryClassAndUsedCount() {
         // WHY: Apple's guidance is two or three silent pushes per hour. The
-        // order inside it is the product rule: attention first; the Tailcat
-        // address, the boot rebaseline and a host notification (whose silent
+        // order inside it is the product rule: attention first; the boot
+        // rebaseline and a host notification (whose silent
         // wake is its only push) before progress traffic.
         XCTAssertEqual(MaterialWakeBudget.capacity, 3)
         XCTAssertEqual(

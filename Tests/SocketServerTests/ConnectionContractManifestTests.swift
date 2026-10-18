@@ -63,37 +63,6 @@ final class ConnectionContractManifestTests: XCTestCase {
         XCTAssertEqual(seen, Set(requiredIDs), "manifesto IDs must match the Gate 0 set")
     }
 
-    func test_tailcatRouteSnapshot_encodeDecodeDoesNotIncludeIPOrHostname() throws {
-        let encoder = JSONEncoder()
-        let decoder = JSONDecoder()
-        for route in TailcatRouteSnapshot.allCases {
-            let data = try encoder.encode(route)
-            let text = String(decoding: data, as: UTF8.self)
-            XCTAssertEqual(
-                try decoder.decode(TailcatRouteSnapshot.self, from: data),
-                route
-            )
-            XCTAssertEqual(text, "\"\(route.rawValue)\"")
-            XCTAssertFalse(text.contains("://"), "route snapshot must not encode URLs")
-            XCTAssertNil(
-                text.range(of: #"\d+\.\d+\.\d+\.\d+"#, options: .regularExpression),
-                "route snapshot must not encode IPv4"
-            )
-            XCTAssertFalse(
-                text.lowercased().contains("hostname"),
-                "route snapshot must not encode hostname"
-            )
-            XCTAssertFalse(
-                text.contains(":"),
-                "route snapshot must not encode host:port"
-            )
-        }
-        XCTAssertEqual(
-            TailcatRouteSnapshot.allCases.map(\.rawValue),
-            ["direct", "remoteCodeDERP", "publicDERP", "unknown"]
-        )
-    }
-
     func test_attachmentUploadV3PrepareRoute_isAcceptedByPathParser() {
         let id = "11111111-1111-4111-8111-111111111111"
         XCTAssertEqual(

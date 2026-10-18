@@ -1721,8 +1721,7 @@ final class PaneActionTests: XCTestCase {
             defer: false
         )
         let settings = SettingsWindowController(
-            context: ctx,
-            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+            context: ctx
         )
         parent.animationBehavior = .none
         settings.window.animationBehavior = .none

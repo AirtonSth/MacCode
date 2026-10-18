@@ -73,8 +73,7 @@ final class SettingsRoutePresentationTests: XCTestCase {
         let directory = NSTemporaryDirectory() + "RC2SettingsRoute-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
         let controller = SettingsWindowController(
-            context: context,
-            tailcatAccessSettingAuthority: TailcatAccessSettingAuthority()
+            context: context
         )
         controller.window.animationBehavior = .none
         return controller

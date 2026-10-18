@@ -16,7 +16,7 @@ final class ResumeHeadWelcomeTests: XCTestCase {
     private let log = FakeDurableEventLog()
     private static let hostId = "f7-head-host"
     private static let token = "resume.head.v1"
-    private static let rotationNotice = "tailcat.rotation_notice.v1"
+    private static let rotationNotice = "other.feature.v1"
     /// The welcome key set every client that did not ask decodes with exact-key checks.
     private static let legacyWelcomeKeys: Set<String> = [
         "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
@@ -25,8 +25,6 @@ final class ResumeHeadWelcomeTests: XCTestCase {
     ]
     /// What a durable socket that did not ask gets today.
     private static let durableWelcomeKeys = legacyWelcomeKeys.union(["replayFromSequence"])
-    /// An endpoint digest of the F5 vector table (V4).
-    private static let publishedDigest = "15b48f53ead19fe5862e0892d09e068ca614eec2df67e6aa7c82eeca72e6f7c4"
 
     override func setUp() {
         super.setUp()
@@ -74,15 +72,12 @@ final class ResumeHeadWelcomeTests: XCTestCase {
         }
 
         // (g) One header carries two features; each token gates only its own key.
-        server.setTailcatEndpointDigest(Self.publishedDigest)
         let both = try await welcome(
             port: port, since: c, durable: true, resumeEpoch: 42,
             features: "\(Self.rotationNotice), \(Self.token)"
         )
-        XCTAssertEqual(Set(both.keys), Self.durableWelcomeKeys.union(["headSequence", "tailcatEndpointDigest"]))
+        XCTAssertEqual(Set(both.keys), Self.durableWelcomeKeys.union(["headSequence"]))
         XCTAssertEqual(int(both, "headSequence"), int(both, "currentSequence"))
-        XCTAssertEqual(both["tailcatEndpointDigest"] as? String, Self.publishedDigest)
-        server.setTailcatEndpointDigest(nil)
 
         // (h) A shipped iPhone sends none of these headers: one more capability string, nothing else.
         let plain = try await welcome(port: port)
@@ -110,7 +105,7 @@ final class ResumeHeadWelcomeTests: XCTestCase {
             )
             XCTAssertEqual(Set(identity.keys),
                            Self.durableWelcomeKeys.union(["apiVersion", "capabilitiesDigest"]), "since=\(since)")
-            // (2) F5's token alone, nothing published: another feature's token brings no head.
+            // (2) Another feature's token alone brings no head.
             let rotation = try await welcome(
                 port: port, since: since, durable: true, resumeEpoch: 42, features: Self.rotationNotice
             )
@@ -317,8 +312,8 @@ final class ResumeHeadWelcomeTests: XCTestCase {
     }
 
     // MARK: - Helpers
-    // (copied from DurableReplayWebSocketTests, TailcatRotationNoticeContractTests
-    // and WelcomeIdentityContractTests, where they are file-private)
+    // (copied from DurableReplayWebSocketTests and WelcomeIdentityContractTests,
+    // where they are file-private)
 
     private func startServer(
         afterWelcome: ((String) -> Void)? = nil

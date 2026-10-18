@@ -122,7 +122,7 @@ if command -v git-lfs >/dev/null 2>&1 \
   git lfs checkout
 fi
 
-# Swift 6.4's default (swiftbuild) system emits RCTailcat's module.modulemap twice.
+# Native build system, not Swift 6.4's default (swiftbuild).
 SWIFT_BUILD_SYSTEM="${RC2_SWIFT_BUILD_SYSTEM:-native}"
 BIN_DIR="$(swift build -c "$CONFIG" --build-system "$SWIFT_BUILD_SYSTEM" --show-bin-path)"
 echo "[package] building $CONFIG …"
