@@ -27,12 +27,11 @@ final class ActiveThreadsWindowTests: XCTestCase {
 
     func test_sidebarActivityUsesServiceCountsAndExplicitLabels() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("vm.activityCounts.running"))
-        XCTAssertTrue(source.contains("vm.activityCounts.needsYou"))
-        XCTAssertTrue(source.contains("title: vm.activityCounts.isAvailable"))
-        XCTAssertTrue(source.contains("\\(vm.activityCounts.running) running · \\(vm.activityCounts.needsYou) need you"))
-        XCTAssertTrue(source.contains(".accessibilityLabel(vm.activityCounts.isAvailable"))
-        XCTAssertTrue(source.contains("Activity, \\(vm.activityCounts.running) running, \\(vm.activityCounts.needsYou) need you"))
+        XCTAssertTrue(source.contains("vm.activityCounts"))
+        XCTAssertTrue(source.contains("vm.activeBotCount"), "running Bots count with the Activity subtitle")
+        XCTAssertTrue(source.contains("SidebarViewModel.activitySubtitle(vm.activityCounts, activeBots: vm.activeBotCount)"))
+        XCTAssertTrue(source.contains("\\(counts.running) running · \\(counts.needsYou) need you"))
+        XCTAssertTrue(source.contains("\"Activity, \" + SidebarViewModel.activitySubtitle"))
         XCTAssertFalse(source.contains("PetActiveThreadCountFormatter.badgeText(count: vm.activeThreadCount)"))
     }
 

@@ -1411,7 +1411,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             attachShellHost(existing)
             return
         }
-        let host = NSHostingView(rootView: ScheduledTasksRootView(vm: vm))
+        let host = NSHostingView(rootView: ScheduledTasksRootView(vm: vm, botsVM: sidebar.botsViewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
         host.layer?.backgroundColor = DS.NS.bg.cgColor
@@ -1438,7 +1438,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             attachShellHost(existing)
             return
         }
-        let host = NSHostingView(rootView: ActiveThreadsRootView(vm: vm))
+        let host = NSHostingView(rootView: ActiveThreadsRootView(vm: vm, botsVM: sidebar.botsViewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         host.wantsLayer = true
         host.layer?.backgroundColor = DS.NS.bg.cgColor

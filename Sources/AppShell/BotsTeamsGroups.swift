@@ -8,8 +8,8 @@ import DesignSystemKit
 
 // MARK: - Roster sections (pure)
 
-/// How the Bots sidebar groups the roster. Nil when there are no teams: the
-/// "My Bots" list then stays the flat roster it has always been.
+/// How the group editor groups the roster. Nil when there are no teams: the
+/// picker then stays one flat list.
 struct BotRosterSections: Equatable {
     struct Team: Equatable {
         let team: BotTeam
@@ -47,22 +47,17 @@ struct BotRosterSections: Equatable {
 @MainActor
 public final class BotTeamsGroupsController: ObservableObject {
     enum Sheet: Identifiable, Equatable {
-        case team(BotTeamID?)
+        case teams
         case newGroup(teamID: BotTeamID?)
         case editGroup(BotGroupID)
 
         var id: String {
             switch self {
-            case .team(let id): return "team.\(id?.value.uuidString ?? "new")"
+            case .teams: return "teams"
             case .newGroup(let teamID): return "group.new.\(teamID?.value.uuidString ?? "")"
             case .editGroup(let id): return "group.edit.\(id.value.uuidString)"
             }
         }
-    }
-
-    enum PendingDelete: Equatable {
-        case team(BotTeamID)
-        case group(BotGroupID)
     }
 
     @Published private(set) var teams: [BotTeam] = []
@@ -86,18 +81,14 @@ public final class BotTeamsGroupsController: ObservableObject {
     @Published private(set) var selectedGroupID: BotGroupID?
     /// The open group (hidden or not), published with the selection.
     @Published private(set) var selectedGroup: BotGroupConversation?
-    @Published var collapsedTeamIDs: Set<BotTeamID> = [] {
-        didSet { persistCollapsedTeams() }
-    }
     @Published var isInspectorVisible = true {
         didSet { UserDefaults.standard.set(isInspectorVisible, forKey: Self.inspectorDefaultsKey) }
     }
-    /// Presented by the sidebar roster (or the Bots window root).
+    /// Presented by the Bots shell root: the Teams manager and the group editors.
     @Published var sheet: Sheet?
     /// Presented by the group room itself (the inspector's Edit…), which is
     /// on screen whenever the inspector is, sidebar collapsed or not.
     @Published var roomSheet: Sheet?
-    @Published var pendingDelete: PendingDelete?
     /// The selected group's room, mounted as an embedded Agent App.
     @Published private(set) var roomVM: AgentAppViewModel?
     /// A participant's private member thread shown in place of the room.
@@ -105,7 +96,6 @@ public final class BotTeamsGroupsController: ObservableObject {
     @Published private(set) var privateThreadVM: AgentAppViewModel?
 
     static let selectedGroupDefaultsKey = "bots.selectedGroupID"
-    static let collapsedTeamsDefaultsKey = "bots.collapsedTeamIDs"
     static let inspectorDefaultsKey = "bots.groupInspector"
     static let privateThreadReadOnlyMessage = "This is the bot's private thread. Write in the group."
     static let roomPlaceholder = "Message the group. @mention a bot to choose who answers…"
@@ -135,9 +125,6 @@ public final class BotTeamsGroupsController: ObservableObject {
         let defaults = UserDefaults.standard
         if let raw = defaults.string(forKey: Self.selectedGroupDefaultsKey), let uuid = UUID(uuidString: raw) {
             selectedGroupID = BotGroupID(uuid)
-        }
-        if let raw = defaults.stringArray(forKey: Self.collapsedTeamsDefaultsKey) {
-            collapsedTeamIDs = Set(raw.compactMap(UUID.init(uuidString:)).map(BotTeamID.init))
         }
         if defaults.object(forKey: Self.inspectorDefaultsKey) != nil {
             isInspectorVisible = defaults.bool(forKey: Self.inspectorDefaultsKey)
@@ -482,21 +469,6 @@ public final class BotTeamsGroupsController: ObservableObject {
 
     // MARK: Edits
 
-    func toggleCollapsed(_ teamID: BotTeamID) {
-        if collapsedTeamIDs.contains(teamID) {
-            collapsedTeamIDs.remove(teamID)
-        } else {
-            collapsedTeamIDs.insert(teamID)
-        }
-    }
-
-    private func persistCollapsedTeams() {
-        UserDefaults.standard.set(
-            collapsedTeamIDs.map { $0.value.uuidString.lowercased() }.sorted(),
-            forKey: Self.collapsedTeamsDefaultsKey
-        )
-    }
-
     @discardableResult
     func saveTeam(id: BotTeamID?, name: String, description: String, memberBotIDs: [BotID]) -> Bool {
         do {
@@ -523,7 +495,6 @@ public final class BotTeamsGroupsController: ObservableObject {
     func deleteTeam(_ id: BotTeamID) {
         do {
             try service.deleteTeam(id: id)
-            collapsedTeamIDs.remove(id)
         } catch {
             onError?(Self.message(for: error))
         }
@@ -677,210 +648,8 @@ extension BotsViewModel {
         screen = .group
     }
 
-    func beginCreateTeam() { teamsGroups.sheet = .team(nil) }
-    func beginEditTeam(_ id: BotTeamID) { teamsGroups.sheet = .team(id) }
+    func openTeamsManager() { teamsGroups.sheet = .teams }
     func beginCreateGroup(teamID: BotTeamID? = nil) { teamsGroups.sheet = .newGroup(teamID: teamID) }
-}
-
-// MARK: - Sidebar
-
-/// "New Team…" and "New Group…" (the My Bots "+" menu and the New Bot row's
-/// context menu).
-struct BotTeamsGroupsCreateButtons: View {
-    @ObservedObject var vm: BotsViewModel
-
-    var body: some View {
-        Button("New Team…") { vm.beginCreateTeam() }
-            .disabled(!vm.isControlPlaneActive)
-            .accessibilityIdentifier("bots.roster.add.team")
-        Button("New Group…") { vm.beginCreateGroup() }
-            .disabled(!vm.isControlPlaneActive || vm.bots.isEmpty)
-            .accessibilityIdentifier("bots.roster.add.group")
-    }
-}
-
-/// Team sections, "Other Bots" and "Group Conversations" under My Bots.
-/// Bot rows are the roster's own row (`row`), never a second implementation.
-struct BotRosterTeamSections<Row: View>: View {
-    @ObservedObject var vm: BotsViewModel
-    @ObservedObject var teamsGroups: BotTeamsGroupsController
-    let sections: BotRosterSections?
-    let row: (BotDefinition) -> Row
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        if let sections {
-            ForEach(sections.teams, id: \.team.id) { section in
-                teamSection(section)
-            }
-            if !sections.otherBots.isEmpty {
-                VStack(alignment: .leading, spacing: DS.Space.lg) {
-                    sectionTitle("Other Bots")
-                    ForEach(sections.otherBots, id: \.id) { bot in row(bot) }
-                }
-                .accessibilityIdentifier("bots.roster.otherBots")
-            }
-        }
-    }
-
-    private func sectionTitle(_ title: String) -> some View {
-        Text(title)
-            .font(DS.Font.caption)
-            .foregroundColor(DS.Palette.textTertiary)
-            .padding(.horizontal, DS.Space.sm)
-    }
-
-    private func teamSection(_ section: BotRosterSections.Team) -> some View {
-        let collapsed = teamsGroups.collapsedTeamIDs.contains(section.team.id)
-        return VStack(alignment: .leading, spacing: DS.Space.lg) {
-            Button {
-                withAnimation(reduceMotion ? nil : DS.Motion.standard) { teamsGroups.toggleCollapsed(section.team.id) }
-            } label: {
-                HStack(spacing: DS.Space.xs) {
-                    Image(systemName: collapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 9, weight: .semibold))
-                        .frame(width: 12)
-                        .accessibilityHidden(true)
-                    Text(section.team.name)
-                        .font(DS.Font.caption)
-                        .lineLimit(1)
-                    Text("\(section.bots.count)")
-                        .font(DS.Font.caption2)
-                    Spacer(minLength: 0)
-                }
-                .foregroundColor(DS.Palette.textTertiary)
-                .padding(.horizontal, DS.Space.sm)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help(collapsed ? "Show \(section.team.name)" : "Hide \(section.team.name)")
-            .accessibilityLabel(section.team.name)
-            .accessibilityValue(collapsed ? "Collapsed" : "Expanded")
-            .accessibilityIdentifier("bots.roster.team.\(section.team.id.value.uuidString.lowercased())")
-            .contextMenu {
-                Button("Edit Team…") { vm.beginEditTeam(section.team.id) }
-                    .disabled(!vm.isControlPlaneActive)
-                Button("New Group from Team…") { vm.beginCreateGroup(teamID: section.team.id) }
-                    .disabled(!vm.isControlPlaneActive || section.bots.isEmpty)
-                Divider()
-                Button("Delete Team", role: .destructive) {
-                    teamsGroups.pendingDelete = .team(section.team.id)
-                }
-            }
-            if !collapsed {
-                if section.bots.isEmpty {
-                    Text(vm.searchText.isEmpty ? "No bots in this team" : "No matches")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .padding(.horizontal, DS.Space.md)
-                } else {
-                    ForEach(section.bots, id: \.id) { bot in row(bot) }
-                }
-            }
-        }
-    }
-}
-
-/// "Group Conversations": stacked participant avatars, title, attention dot.
-struct BotGroupConversationsSection: View {
-    @ObservedObject var vm: BotsViewModel
-    @ObservedObject var teamsGroups: BotTeamsGroupsController
-
-    var body: some View {
-        let visible = filteredGroups
-        if !visible.isEmpty {
-            VStack(alignment: .leading, spacing: DS.Space.sm) {
-                Text("Group Conversations")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .padding(.horizontal, DS.Space.sm)
-                ForEach(visible, id: \.id) { group in groupRow(group) }
-            }
-            .accessibilityIdentifier("bots.groups")
-        }
-    }
-
-    private var filteredGroups: [BotGroupConversation] {
-        let shown = vm.showHidden ? teamsGroups.groups : teamsGroups.groups.filter { !$0.hidden }
-        let query = vm.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return shown }
-        return shown.filter { $0.title.localizedCaseInsensitiveContains(query) }
-    }
-
-    private func dotColor(_ state: BotAttentionState) -> Color? {
-        switch state {
-        case .needsAttention: return DS.Palette.warning
-        case .unreadActivity: return DS.Palette.accent
-        case .working, .none: return nil
-        }
-    }
-
-    private func groupRow(_ group: BotGroupConversation) -> some View {
-        let selected = vm.screen == .group && teamsGroups.selectedGroupID == group.id
-        let members = teamsGroups.bots(in: group.id, from: vm.bots)
-        let names = members.map(\.name).joined(separator: ", ")
-        let key = group.id.value.uuidString.lowercased()
-        return Button {
-            // An older Bot error must not sit above the group's room.
-            vm.errorMessage = nil
-            vm.openGroup(group.id)
-        } label: {
-            HStack(spacing: DS.Space.sm) {
-                BotStackedAvatars(bots: members, size: 26)
-                    .frame(width: BotsChrome.rosterAvatarSize, height: BotsChrome.rosterAvatarSize)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(group.title)
-                        .font(selected || group.unread ? DS.Font.bodyStrong : DS.Font.body)
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(1)
-                    Text(names.isEmpty ? "No bots" : names)
-                        .font(DS.Font.caption2)
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 0)
-                if group.attentionState == .working {
-                    DSBusySpinner(label: BotsChrome.statusTitle(for: .working), identifier: "bots.groups.busy.\(key)")
-                } else if let color = dotColor(group.attentionState) {
-                    Circle()
-                        .fill(color)
-                        .frame(width: 7, height: 7)
-                        .accessibilityHidden(true)
-                }
-                if group.pinned {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .accessibilityHidden(true)
-                }
-            }
-            .padding(.horizontal, DS.Space.sm)
-            .frame(minHeight: BotsChrome.hitTarget)
-            .background(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .fill(selected ? DS.Palette.accent.opacity(0.18) : Color.white.opacity(0.001))
-            )
-            .dsHoverFill(enabled: !selected)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help("\(group.title) · \(BotsChrome.statusTitle(for: group.attentionState))")
-        .accessibilityLabel(group.title)
-        .accessibilityValue("\(group.hidden ? "Hidden. " : "")\(BotsChrome.statusTitle(for: group.attentionState)). \(names)")
-        .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityIdentifier("bots.groups.row.\(key)")
-        .contextMenu {
-            Button(group.pinned ? "Unpin" : "Pin") { teamsGroups.setPinned(!group.pinned, groupID: group.id) }
-                .disabled(!vm.isControlPlaneActive)
-            Button(group.hidden ? "Unhide" : "Hide") { teamsGroups.setHidden(!group.hidden, groupID: group.id) }
-                .disabled(!vm.isControlPlaneActive)
-                .accessibilityIdentifier("bots.groups.menu.hide")
-            Button("Edit Group…") { teamsGroups.sheet = .editGroup(group.id) }
-                .disabled(!vm.isControlPlaneActive)
-            Divider()
-            Button("Delete Group", role: .destructive) { teamsGroups.pendingDelete = .group(group.id) }
-        }
-    }
 }
 
 /// Up to three overlapping participant avatars.
@@ -906,8 +675,7 @@ struct BotStackedAvatars: View {
     }
 }
 
-/// Team/group sheets and delete confirmations. Attached once per window
-/// (sidebar roster in the main shell, the root in the detached window).
+/// The Teams manager and group editors. Attached once, on the Bots shell root.
 struct BotTeamsGroupsSheets: ViewModifier {
     @ObservedObject var vm: BotsViewModel
     @ObservedObject var teamsGroups: BotTeamsGroupsController
@@ -915,50 +683,11 @@ struct BotTeamsGroupsSheets: ViewModifier {
 
     func body(content: Content) -> some View {
         if enabled {
-            content
-                .sheet(item: $teamsGroups.sheet) { sheet in
-                    BotTeamsGroupsSheetContent(vm: vm, teamsGroups: teamsGroups, sheet: sheet)
-                }
-                .confirmationDialog(
-                    deleteTitle,
-                    isPresented: Binding(
-                        get: { teamsGroups.pendingDelete != nil },
-                        set: { if !$0 { teamsGroups.pendingDelete = nil } }
-                    ),
-                    titleVisibility: .visible
-                ) {
-                    Button("Delete", role: .destructive) {
-                        let pending = teamsGroups.pendingDelete
-                        teamsGroups.pendingDelete = nil
-                        switch pending {
-                        case .team(let id): teamsGroups.deleteTeam(id)
-                        case .group(let id): Task { await teamsGroups.deleteGroup(id) }
-                        case nil: break
-                        }
-                    }
-                    .accessibilityIdentifier("bots.teamsGroups.delete.confirm")
-                    Button("Cancel", role: .cancel) { teamsGroups.pendingDelete = nil }
-                } message: {
-                    Text(deleteMessage)
-                }
+            content.sheet(item: $teamsGroups.sheet) { sheet in
+                BotTeamsGroupsSheetContent(vm: vm, teamsGroups: teamsGroups, sheet: sheet)
+            }
         } else {
             content
-        }
-    }
-
-    private var deleteTitle: String {
-        switch teamsGroups.pendingDelete {
-        case .team(let id): return "Delete \(teamsGroups.teams.first { $0.id == id }?.name ?? "this team")?"
-        case .group(let id): return "Delete \(teamsGroups.groups.first { $0.id == id }?.title ?? "this group")?"
-        case nil: return "Delete?"
-        }
-    }
-
-    private var deleteMessage: String {
-        switch teamsGroups.pendingDelete {
-        case .team: return "The bots and their conversations stay."
-        case .group: return "The group transcript and each bot's private thread for it are deleted. The bots stay."
-        case nil: return ""
         }
     }
 }
@@ -972,8 +701,8 @@ struct BotTeamsGroupsSheetContent: View {
 
     var body: some View {
         switch sheet {
-        case .team(let id):
-            BotTeamEditorSheet(vm: vm, teamsGroups: teamsGroups, teamID: id)
+        case .teams:
+            BotTeamsManagerSheet(vm: vm, teamsGroups: teamsGroups)
         case .newGroup(let teamID):
             BotGroupEditorSheet(vm: vm, teamsGroups: teamsGroups, mode: .create(teamID: teamID))
         case .editGroup(let id):
@@ -982,79 +711,282 @@ struct BotTeamsGroupsSheetContent: View {
     }
 }
 
-struct BotTeamEditorSheet: View {
+/// One compact panel for teams: name one and press Return, click bot avatars to add or
+/// remove members, rename in place, delete with a confirmation. Group chats live below.
+struct BotTeamsManagerSheet: View {
     @ObservedObject var vm: BotsViewModel
     @ObservedObject var teamsGroups: BotTeamsGroupsController
-    let teamID: BotTeamID?
     @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
-    @State private var description = ""
-    @State private var members: [BotID] = []
-    @State private var loaded = false
+    @State private var newName = ""
+    @State private var pendingTeamDelete: BotTeam?
+    @State private var pendingGroupDelete: BotGroupConversation?
+
+    private var canEdit: Bool { vm.isControlPlaneActive }
 
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
-            Text(teamID == nil ? "New Team" : "Edit Team")
-                .font(DS.Font.title2.weight(.semibold))
-                .foregroundColor(DS.Palette.text)
-            TextField("Team name", text: $name)
-                .textFieldStyle(.roundedBorder)
-                .accessibilityIdentifier("bots.team.name")
-            TextField("Description (optional)", text: $description)
-                .textFieldStyle(.roundedBorder)
-                .accessibilityIdentifier("bots.team.description")
-            Text("Members")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-            ScrollView {
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    if vm.bots.isEmpty {
-                        Text("No bots yet").font(DS.Font.body).foregroundColor(DS.Palette.textTertiary)
-                    }
-                    ForEach(vm.bots, id: \.id) { bot in
-                        Toggle(isOn: Binding(
-                            get: { members.contains(bot.id) },
-                            set: { on in
-                                if on { if !members.contains(bot.id) { members.append(bot.id) } }
-                                else { members.removeAll { $0 == bot.id } }
-                            }
-                        )) {
-                            BotPickRow(bot: bot)
-                        }
-                        .toggleStyle(.checkbox)
-                        .accessibilityIdentifier("bots.team.member.\(bot.handle)")
-                    }
-                }
-            }
-            .frame(minHeight: 160, maxHeight: 320)
-            Text("A bot can be in several teams.")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
             HStack {
+                Text("Teams")
+                    .font(DS.Font.title2.weight(.semibold))
+                    .foregroundColor(DS.Palette.text)
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Done") { dismiss() }
+                    .buttonStyle(DSSecondaryButtonStyle())
                     .keyboardShortcut(.cancelAction)
-                Button(teamID == nil ? "Create Team" : "Save") {
-                    if teamsGroups.saveTeam(id: teamID, name: name, description: description, memberBotIDs: members) {
-                        dismiss()
-                    }
-                }
-                .buttonStyle(BotsPrimaryButtonStyle())
-                .keyboardShortcut(.defaultAction)
-                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !vm.isControlPlaneActive)
-                .accessibilityIdentifier("bots.team.save")
+                    .accessibilityIdentifier("bots.teams.done")
             }
+            HStack(spacing: DS.Space.sm) {
+                TextField("New team name", text: $newName)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit(create)
+                    .accessibilityIdentifier("bots.teams.new.name")
+                Button("Add", action: create)
+                    .buttonStyle(BotsPrimaryButtonStyle())
+                    .disabled(trimmedNewName.isEmpty || !canEdit)
+                    .accessibilityIdentifier("bots.teams.new.add")
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: DS.Space.lg) {
+                    if teamsGroups.teams.isEmpty {
+                        Text("No teams yet. Name one above and press Return.")
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityIdentifier("bots.teams.empty")
+                    }
+                    ForEach(teamsGroups.teams, id: \.id) { team in
+                        BotTeamCard(
+                            vm: vm, teamsGroups: teamsGroups, team: team,
+                            onDelete: { pendingTeamDelete = team }
+                        )
+                    }
+                    groupsSection
+                }
+            }
+            .frame(minHeight: 220, maxHeight: 420)
+            Text("Click a bot to add or remove it. A bot can be in several teams.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
         }
         .padding(DS.Space.xl)
-        .frame(width: 420)
-        .onAppear {
-            guard !loaded else { return }
-            loaded = true
-            if let teamID, let team = teamsGroups.teams.first(where: { $0.id == teamID }) {
-                name = team.name
-                description = team.description
-                members = teamsGroups.membersByTeam[teamID] ?? []
+        .frame(width: 460)
+        .confirmationDialog(
+            "Delete \(pendingTeamDelete?.name ?? "this team")?",
+            isPresented: Binding(get: { pendingTeamDelete != nil }, set: { if !$0 { pendingTeamDelete = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                if let team = pendingTeamDelete { teamsGroups.deleteTeam(team.id) }
+                pendingTeamDelete = nil
             }
+            .accessibilityIdentifier("bots.teams.delete.confirm")
+            Button("Cancel", role: .cancel) { pendingTeamDelete = nil }
+        } message: {
+            Text("The bots and their conversations stay.")
+        }
+        .confirmationDialog(
+            "Delete \(pendingGroupDelete?.title ?? "this group")?",
+            isPresented: Binding(get: { pendingGroupDelete != nil }, set: { if !$0 { pendingGroupDelete = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                if let group = pendingGroupDelete { Task { await teamsGroups.deleteGroup(group.id) } }
+                pendingGroupDelete = nil
+            }
+            .accessibilityIdentifier("bots.teams.group.delete.confirm")
+            Button("Cancel", role: .cancel) { pendingGroupDelete = nil }
+        } message: {
+            Text("The group transcript and each bot's private thread for it are deleted. The bots stay.")
+        }
+        .accessibilityIdentifier("bots.teams.manager")
+    }
+
+    private var trimmedNewName: String { newName.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    private func create() {
+        guard canEdit, !trimmedNewName.isEmpty else { return }
+        if teamsGroups.saveTeam(id: nil, name: trimmedNewName, description: "", memberBotIDs: []) { newName = "" }
+    }
+
+    private var visibleGroups: [BotGroupConversation] {
+        vm.showHidden ? teamsGroups.groups : teamsGroups.groups.filter { !$0.hidden }
+    }
+
+    @ViewBuilder
+    private var groupsSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack {
+                Text("Group chats")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer()
+                Button { vm.beginCreateGroup() } label: {
+                    Label("New group", systemImage: "plus")
+                        .font(DS.Font.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textSecondary)
+                .disabled(!canEdit || vm.bots.isEmpty)
+                .accessibilityIdentifier("bots.teams.group.new")
+            }
+            ForEach(visibleGroups, id: \.id) { group in
+                groupRow(group)
+            }
+        }
+        .accessibilityIdentifier("bots.groups")
+    }
+
+    private func groupRow(_ group: BotGroupConversation) -> some View {
+        let members = teamsGroups.bots(in: group.id, from: vm.bots)
+        let key = group.id.value.uuidString.lowercased()
+        return Button {
+            vm.errorMessage = nil
+            vm.openGroup(group.id)
+            dismiss()
+        } label: {
+            HStack(spacing: DS.Space.sm) {
+                BotStackedAvatars(bots: members, size: 22)
+                    .frame(width: 44, alignment: .leading)
+                Text(group.title).font(DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
+                Spacer(minLength: 0)
+                if group.hidden {
+                    Image(systemName: "eye.slash").font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary).accessibilityHidden(true)
+                }
+                if group.pinned {
+                    Image(systemName: "pin.fill").font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary).accessibilityHidden(true)
+                }
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .frame(minHeight: 34)
+            .dsHoverFill(enabled: true)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(group.title)
+        .accessibilityValue("\(group.hidden ? "Hidden. " : "")\(members.map(\.name).joined(separator: ", "))")
+        .accessibilityIdentifier("bots.groups.row.\(key)")
+        .contextMenu {
+            Button(group.pinned ? "Unpin" : "Pin") { teamsGroups.setPinned(!group.pinned, groupID: group.id) }
+                .disabled(!canEdit)
+            Button(group.hidden ? "Unhide" : "Hide") { teamsGroups.setHidden(!group.hidden, groupID: group.id) }
+                .disabled(!canEdit)
+            Button("Edit Group…") { teamsGroups.sheet = .editGroup(group.id) }
+                .disabled(!canEdit)
+            Divider()
+            Button("Delete Group", role: .destructive) { pendingGroupDelete = group }
+        }
+    }
+}
+
+/// One team: its name (click to rename, Return saves), a row of bot avatars to toggle
+/// membership, a new-group shortcut and delete.
+private struct BotTeamCard: View {
+    @ObservedObject var vm: BotsViewModel
+    @ObservedObject var teamsGroups: BotTeamsGroupsController
+    let team: BotTeam
+    let onDelete: () -> Void
+    @State private var name: String
+    @FocusState private var nameFocused: Bool
+
+    init(vm: BotsViewModel, teamsGroups: BotTeamsGroupsController, team: BotTeam, onDelete: @escaping () -> Void) {
+        self.vm = vm
+        self.teamsGroups = teamsGroups
+        self.team = team
+        self.onDelete = onDelete
+        _name = State(initialValue: team.name)
+    }
+
+    private var members: [BotID] { teamsGroups.membersByTeam[team.id] ?? [] }
+    private var canEdit: Bool { vm.isControlPlaneActive }
+
+    var body: some View {
+        let key = team.id.value.uuidString.lowercased()
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                TextField("Team name", text: $name)
+                    .textFieldStyle(.plain)
+                    .font(DS.Font.bodyStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .focused($nameFocused)
+                    .onSubmit(commitName)
+                    .onChange(of: nameFocused) { focused in if !focused { commitName() } }
+                    .onChange(of: team.name) { updated in if !nameFocused { name = updated } }
+                    .disabled(!canEdit)
+                    .accessibilityLabel("Team name")
+                    .accessibilityIdentifier("bots.teams.name.\(key)")
+                Text("\(members.count)")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityLabel("\(members.count) members")
+                Spacer(minLength: 0)
+                Button { vm.beginCreateGroup(teamID: team.id) } label: {
+                    Image(systemName: "bubble.left.and.bubble.right").font(.system(size: 12))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textSecondary)
+                .disabled(!canEdit || members.isEmpty)
+                .help("New group chat from \(team.name)")
+                .accessibilityLabel("New group from \(team.name)")
+                .accessibilityIdentifier("bots.teams.group.\(key)")
+                Button(action: onDelete) {
+                    Image(systemName: "trash").font(.system(size: 12))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textSecondary)
+                .disabled(!canEdit)
+                .help("Delete \(team.name)")
+                .accessibilityLabel("Delete \(team.name)")
+                .accessibilityIdentifier("bots.teams.delete.\(key)")
+            }
+            if vm.bots.isEmpty {
+                Text("No bots yet").font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+            } else {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 30, maximum: 30), spacing: DS.Space.sm)], alignment: .leading, spacing: DS.Space.sm) {
+                    ForEach(vm.bots, id: \.id) { bot in avatarToggle(bot, teamKey: key) }
+                }
+            }
+        }
+        .padding(DS.Space.md)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .fill(DS.Palette.surfaceRaised.opacity(0.6))
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("bots.teams.row.\(key)")
+    }
+
+    private func avatarToggle(_ bot: BotDefinition, teamKey: String) -> some View {
+        let isMember = members.contains(bot.id)
+        return Button { toggle(bot) } label: {
+            BotsAvatarView(name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol, size: 26)
+                .frame(width: 26, height: 26)
+                .opacity(isMember ? 1 : 0.35)
+                .overlay(Circle().stroke(isMember ? DS.Palette.accent : Color.clear, lineWidth: 2).padding(-2))
+                .frame(width: 30, height: 30)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!canEdit)
+        .help("\(isMember ? "Remove" : "Add") \(BotsViewModel.displayName(bot.name))")
+        .accessibilityLabel(BotsViewModel.displayName(bot.name))
+        .accessibilityValue(isMember ? "In team" : "Not in team")
+        .accessibilityAddTraits(isMember ? .isSelected : [])
+        .accessibilityIdentifier("bots.teams.member.\(teamKey).\(bot.handle)")
+    }
+
+    private func toggle(_ bot: BotDefinition) {
+        var next = members
+        if let index = next.firstIndex(of: bot.id) { next.remove(at: index) } else { next.append(bot.id) }
+        teamsGroups.saveTeam(id: team.id, name: team.name, description: team.description, memberBotIDs: next)
+    }
+
+    private func commitName() {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { name = team.name; return }
+        guard trimmed != team.name else { return }
+        if !teamsGroups.saveTeam(id: team.id, name: trimmed, description: team.description, memberBotIDs: members) {
+            name = team.name
         }
     }
 }
@@ -1337,7 +1269,7 @@ struct BotGroupRoomScreen: View {
             DSEmptyState(
                 icon: "person.3",
                 title: "Select a group",
-                subtitle: "Group conversations show under My Bots."
+                subtitle: "Open a group chat from Teams."
             )
             .accessibilityIdentifier("bots.group.empty")
         }

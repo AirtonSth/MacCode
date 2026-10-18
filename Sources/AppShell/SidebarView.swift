@@ -8,6 +8,7 @@ import AgentRuntime
 import Surfaces
 import DesignSystemKit
 import SocketServer
+import Combine
 
 public extension Notification.Name {
     /// Account or provider usage in usage.json changed (throttled by AppContext).
@@ -285,6 +286,9 @@ public final class SidebarViewModel: ObservableObject {
     /// Host-authoritative active agent thread count for the sidebar badge.
     @Published public private(set) var activeThreadCount: Int = 0
     @Published private(set) var activityCounts = PetActivityCounts.zero
+    /// Bots running now, from the Bots model; shown with the Activity counts.
+    @Published private(set) var activeBotCount = 0
+    private var activeBotCountSink: AnyCancellable?
     @Published private(set) var workspaceActivityCounts: [String: PetActivityCounts] = [:]
     private var activityCountsObserver: UUID?
     /// Fired when the user activates a workspace row so the shell can leave
@@ -686,6 +690,20 @@ public final class SidebarViewModel: ObservableObject {
             && !authorizedBotConversationRows.contains { $0.context == .workspace(id) }
     }
 
+    func observeActiveBots(_ botsViewModel: BotsViewModel) {
+        activeBotCountSink = botsViewModel.$activeBotCount.removeDuplicates().sink { [weak self] count in
+            self?.activeBotCount = count
+        }
+    }
+
+    /// "2 running · 1 need you", with "· 3 bots" when Bots are running.
+    static func activitySubtitle(_ counts: PetActivityCounts, activeBots: Int) -> String {
+        guard counts.isAvailable else { return "Activity unavailable" }
+        var line = "\(counts.running) running · \(counts.needsYou) need you"
+        if activeBots > 0 { line += " · \(activeBots) bot\(activeBots == 1 ? "" : "s")" }
+        return line
+    }
+
     /// Re-reads the General Bots list, e.g. after Show hidden changes.
     public func reloadGeneralBots() { reloadAuthorizedBotConversationRows() }
 
@@ -719,7 +737,7 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     /// Opens the Teams manager.
-    public func openTeams() { withBotsContent { $0.beginCreateTeam() } }
+    public func openTeams() { withBotsContent { $0.openTeamsManager() } }
 
     /// Opens the existing New Bot flow; linking it to a workspace stays an explicit grant.
     public func addBot() {
@@ -2171,18 +2189,14 @@ public struct SidebarRootView: View {
                 Button { navigate(onOpenActiveThreads) } label: {
                     SidebarActionRow(
                         symbol: "bolt.horizontal.circle",
-                        title: vm.activityCounts.isAvailable
-                            ? "Activity\n\(vm.activityCounts.running) running · \(vm.activityCounts.needsYou) need you"
-                            : "Activity\nActivity unavailable",
+                        title: "Activity\n\(SidebarViewModel.activitySubtitle(vm.activityCounts, activeBots: vm.activeBotCount))",
                         isSelected: vm.isActiveThreadsSelected
                     )
                 }
                 .buttonStyle(.plain)
-                .help(vm.activityCounts.isAvailable ? "\(vm.activityCounts.running) running · \(vm.activityCounts.needsYou) need you" : "Activity status unavailable")
+                .help(SidebarViewModel.activitySubtitle(vm.activityCounts, activeBots: vm.activeBotCount))
                 .accessibilityIdentifier("sidebar.activity")
-                .accessibilityLabel(vm.activityCounts.isAvailable
-                    ? "Activity, \(vm.activityCounts.running) running, \(vm.activityCounts.needsYou) need you"
-                    : "Activity, status unavailable")
+                .accessibilityLabel("Activity, " + SidebarViewModel.activitySubtitle(vm.activityCounts, activeBots: vm.activeBotCount))
                 .accessibilityAddTraits(vm.isActiveThreadsSelected ? .isSelected : [])
 
                 Button { navigate(onOpenScheduledTasks) } label: {
@@ -3454,6 +3468,7 @@ public final class SidebarView: NSObject {
         // live color; later updates arrive via .rc2TailcatRuntimeStatusChanged.
         self.viewModel.applyTailcatRuntimeStatus(tailcatAccessSettingAuthority.currentStatus)
         self.botsViewModel = BotsViewModel(context: context, router: router)
+        self.viewModel.observeActiveBots(botsViewModel)
         let h = NSHostingView(rootView: SidebarRootView(vm: viewModel, botsVM: botsViewModel))
         h.translatesAutoresizingMaskIntoConstraints = false
         // NSHostingView is opaque by default; let the vibrancy show.

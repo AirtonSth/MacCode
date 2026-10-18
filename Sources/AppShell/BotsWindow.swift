@@ -4211,6 +4211,11 @@ public final class BotsViewModel: ObservableObject {
 
     public func reloadActiveBotsScreen() {
         guard screen.resolvedDestination == .activeBots else { return }
+        reloadActiveBotItems()
+    }
+
+    /// Active and recently finished bot runs, for the Activity screen.
+    public func reloadActiveBotItems() {
         activeBotsHydrationCountForTesting += 1
         settleTerminalWorkingConversations()
         let liveBots = liveWorkingBots()

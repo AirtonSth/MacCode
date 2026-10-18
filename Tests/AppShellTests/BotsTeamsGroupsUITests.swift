@@ -18,7 +18,6 @@ final class BotsTeamsGroupsUITests: XCTestCase {
     private static let defaultsKeys = [
         "bots.screen", "bots.selectedBotID", "bots.searchText", "bots.showHidden",
         BotTeamsGroupsController.selectedGroupDefaultsKey,
-        BotTeamsGroupsController.collapsedTeamsDefaultsKey,
         BotTeamsGroupsController.inspectorDefaultsKey,
     ]
 
@@ -568,15 +567,43 @@ final class BotsTeamsGroupsUITests: XCTestCase {
         XCTAssertEqual(controller.teams.count, 1, "a refused save changes nothing")
     }
 
+    func test_teamsManagerSheetIsOneSheetAndItsControlsDriveTheServiceBackedStore() throws {
+        let f = try makeFixture()
+        let vm = makeViewModel(f)
+        let botCount = vm.bots.count
+        vm.openTeamsManager()
+        XCTAssertEqual(vm.teamsGroups.sheet, .teams, "the Teams button opens one manager sheet")
+
+        // What the manager's controls call: create on Return, avatar click, inline rename, delete.
+        let controller = vm.teamsGroups
+        XCTAssertTrue(controller.saveTeam(id: nil, name: "Writers", description: "", memberBotIDs: []))
+        let team = try XCTUnwrap(controller.teams.first)
+        XCTAssertTrue(controller.saveTeam(id: team.id, name: team.name, description: "", memberBotIDs: [f.ana.id]))
+        XCTAssertTrue(controller.saveTeam(id: team.id, name: team.name, description: "", memberBotIDs: [f.ana.id, f.bob.id]))
+        XCTAssertEqual(controller.membersByTeam[team.id], [f.ana.id, f.bob.id], "clicking avatars adds members")
+        XCTAssertTrue(controller.saveTeam(id: team.id, name: team.name, description: "", memberBotIDs: [f.bob.id]))
+        XCTAssertEqual(controller.membersByTeam[team.id], [f.bob.id], "clicking a member's avatar removes it")
+        XCTAssertTrue(controller.saveTeam(id: team.id, name: "Authors", description: "", memberBotIDs: [f.bob.id]))
+        XCTAssertEqual(controller.teams.first?.name, "Authors", "inline rename keeps the members")
+        XCTAssertEqual(controller.membersByTeam[team.id], [f.bob.id])
+        controller.deleteTeam(team.id)
+        XCTAssertTrue(controller.teams.isEmpty, "delete removes the team and keeps the bots")
+        XCTAssertEqual(vm.bots.count, botCount, "the bots stay")
+
+        let source = try source("Sources/AppShell/BotsTeamsGroups.swift")
+        XCTAssertTrue(source.contains(".onSubmit(create)"), "Return creates a team")
+        XCTAssertTrue(source.contains("pendingTeamDelete = team"), "delete asks first")
+        XCTAssertFalse(source.contains("BotTeamEditorSheet"), "the form editor is replaced by the manager")
+    }
+
     // MARK: - Relaunch
 
-    func test_openGroupCollapsedTeamsAndRoomDraftSurviveRelaunch() async throws {
+    func test_openGroupAndRoomDraftSurviveRelaunch() async throws {
         let f = try makeFixture()
         let team = try f.service.createTeam(name: "Writers", memberBotIDs: [f.ana.id])
         let group = try await makeGroup(f, bots: [f.ana])
         let vm = makeViewModel(f)
         vm.openGroup(group.id)
-        vm.teamsGroups.toggleCollapsed(team.id)
         let room = try XCTUnwrap(vm.teamsGroups.roomVM)
         room.prompt = "half-written"
         room.dispose()
@@ -586,7 +613,6 @@ final class BotsTeamsGroupsUITests: XCTestCase {
         router2.botsViewModel = reopened
         XCTAssertEqual(reopened.screen, .group)
         XCTAssertEqual(reopened.teamsGroups.selectedGroupID, group.id)
-        XCTAssertTrue(reopened.teamsGroups.collapsedTeamIDs.contains(team.id))
         let room2 = try XCTUnwrap(reopened.teamsGroups.roomVM)
         XCTAssertEqual(room2.embedding?.pinnedThreadId, group.roomThreadID)
         let restored = await waitUntil { room2.prompt == "half-written" }

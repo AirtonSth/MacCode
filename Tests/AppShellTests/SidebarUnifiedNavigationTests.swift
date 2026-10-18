@@ -150,6 +150,14 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         XCTAssertTrue(f.vm.visibleGeneralBots.isEmpty)
     }
 
+    func test_activitySubtitleCountsRunningBotsWithTheWorkspaceActivity() {
+        let counts = PetActivityCounts(running: 2, needsYou: 1, newResults: 0)
+        XCTAssertEqual(SidebarViewModel.activitySubtitle(counts, activeBots: 0), "2 running · 1 need you")
+        XCTAssertEqual(SidebarViewModel.activitySubtitle(counts, activeBots: 1), "2 running · 1 need you · 1 bot")
+        XCTAssertEqual(SidebarViewModel.activitySubtitle(counts, activeBots: 3), "2 running · 1 need you · 3 bots")
+        XCTAssertEqual(SidebarViewModel.activitySubtitle(.zero, activeBots: 2), "Activity unavailable")
+    }
+
     func test_newConversationLeadsAnExpandedWorkspaceAndStartsAnAgentThreadThere() async throws {
         let f = try make("new-conversation")
         defer { try? FileManager.default.removeItem(atPath: f.directory) }
