@@ -178,14 +178,18 @@ public final class SidebarViewModel: ObservableObject {
     public struct AuthorizedBotConversationRow: Identifiable, Equatable, Sendable {
         public let botID: BotID
         public let botName: String
+        public let handle: String
+        public let symbol: String
         public let context: BotContext
         public let conversationID: BotConversationID?
         public let title: String
         public var id: String { "\(botID.value.uuidString):\(context.storageKey)" }
 
-        nonisolated public init(botID: BotID, botName: String, context: BotContext, conversationID: BotConversationID?, title: String) {
+        nonisolated public init(botID: BotID, botName: String, handle: String = "", symbol: String = "", context: BotContext, conversationID: BotConversationID?, title: String) {
             self.botID = botID
             self.botName = botName
+            self.handle = handle
+            self.symbol = symbol
             self.context = context
             self.conversationID = conversationID
             self.title = title
@@ -228,6 +232,9 @@ public final class SidebarViewModel: ObservableObject {
             self.botID = botID
         }
     }
+
+    /// Default title of a thread nobody has written in yet; "+ New conversation" covers it.
+    nonisolated static let untitledThreadTitle = "New thread"
 
     /// Rows shown under one expanded workspace; the workspace row itself opens the full layout.
     nonisolated static let workspaceConversationLimit = 8
@@ -289,6 +296,8 @@ public final class SidebarViewModel: ObservableObject {
     /// Bots running now, from the Bots model; shown with the Activity counts.
     @Published private(set) var activeBotCount = 0
     private var activeBotCountSink: AnyCancellable?
+    private var botRosterSink: AnyCancellable?
+    private var botEventSubscription: UUID?
     @Published private(set) var workspaceActivityCounts: [String: PetActivityCounts] = [:]
     private var activityCountsObserver: UUID?
     /// Fired when the user activates a workspace row so the shell can leave
@@ -440,6 +449,7 @@ public final class SidebarViewModel: ObservableObject {
         }
         accountUsageReloadTask?.cancel()
         authorizedBotRowsTask?.cancel()
+        if let botEventSubscription { EventBus.shared.unsubscribe(botEventSubscription) }
         if let activityCountsObserver {
             Task { @MainActor in PetActivityCountsProjection.shared.removeObserver(activityCountsObserver) }
         }
@@ -559,7 +569,7 @@ public final class SidebarViewModel: ObservableObject {
                         return $0.0.id.value.uuidString < $1.0.id.value.uuidString
                     }
                     let conversation = matching.first?.0
-                    rows.append(AuthorizedBotConversationRow(botID: bot.id, botName: bot.name, context: binding.context, conversationID: conversation?.id, title: conversation?.title ?? "No conversations"))
+                    rows.append(AuthorizedBotConversationRow(botID: bot.id, botName: bot.name, handle: bot.handle, symbol: bot.avatarSymbol, context: binding.context, conversationID: conversation?.id, title: conversation?.title ?? "No conversations"))
                 }
             }
             return rows
@@ -595,7 +605,7 @@ public final class SidebarViewModel: ObservableObject {
             for workspaceID in expanded {
                 var rows: [WorkspaceConversationRow] = []
                 for thread in try threadRepo.list(workspaceId: workspaceID)
-                where !thread.isEphemeral && thread.parentThreadId == nil {
+                where !thread.isEphemeral && thread.parentThreadId == nil && thread.title != Self.untitledThreadTitle {
                     // A pinned Bot thread is listed only while this host may still read that exact context.
                     if let pin = try botStore.conversationContextPin(linkedTo: thread.id) {
                         guard pin.hostID == hostID, pin.context == .workspace(workspaceID),
@@ -664,15 +674,26 @@ public final class SidebarViewModel: ObservableObject {
         return rows.filter { $0.title.range(of: query, options: .caseInsensitive) != nil }
     }
 
-    /// An expanded workspace with no linked Bot offers one "Add Bot" row instead of empty sections.
+    /// An expanded workspace always leads its Bots with "+ New bot"; a search hides it.
     public func showsAddBot(_ id: WorkspaceID) -> Bool {
         expandedWorkspaceIDs.contains(id) && sidebarQuery.isEmpty
-            && !authorizedBotConversationRows.contains { $0.context == .workspace(id) }
     }
 
     func observeActiveBots(_ botsViewModel: BotsViewModel) {
         activeBotCountSink = botsViewModel.$activeBotCount.removeDuplicates().sink { [weak self] count in
             self?.activeBotCount = count
+        }
+        // Studio saves (name, avatar, pin, hide, delete) republish the roster.
+        botRosterSink = botsViewModel.$bots.dropFirst().removeDuplicates().sink { [weak self] _ in
+            self?.reloadAuthorizedBotConversationRows()
+        }
+        // RPC changes (paired phone, Titio's rc_host_call, context grants) land on the event bus.
+        if botEventSubscription == nil {
+            botEventSubscription = EventBus.shared.subscribeFromCurrent(
+                filter: .kindPrefixes(["bot.created", "bot.deleted", "bot.updated", "bot.settings.updated", "bot.conversation.updated"])
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.reloadAuthorizedBotConversationRows() }
+            }.id
         }
     }
 
@@ -1141,6 +1162,10 @@ public final class SidebarViewModel: ObservableObject {
         isBotsSelected = false
         // UX-SIDEBAR-COMPLETED-DOT: opening a workspace clears its completed dot.
         completedWorkspaces.remove(wid)
+        if !expandedWorkspaceIDs.contains(wid) {
+            expandedWorkspaceIDs.insert(wid)
+            reloadAuthorizedBotConversationRows()
+        }
         do {
             try router?.selectWorkspace(wid)
         } catch {
@@ -2742,19 +2767,14 @@ public struct SidebarRootView: View {
             navigate { if row.conversationID == nil { vm.startBotConversation(row) } else { vm.openAuthorizedBotConversation(row) } }
         } label: {
             HStack(spacing: DS.Space.sm) {
-                Image(systemName: "sparkle")
-                    .font(.system(size: 12, weight: .regular))
+                BotsAvatarView(name: row.botName, handle: row.handle, symbol: row.symbol.isEmpty ? nil : row.symbol, size: 20)
                     .frame(width: 20, height: 20)
-                    .foregroundColor(DS.Palette.textSecondary)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(row.botName).font(DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
-                    Text(row.conversationID == nil ? "New conversation" : row.title).font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
-                }
+                Text(BotsViewModel.displayName(row.botName)).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
                 Spacer(minLength: 0)
             }
             .padding(.leading, DS.Space.lg)
             .padding(.horizontal, DS.Space.sm)
-            .frame(minHeight: 36)
+            .frame(height: 30)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -2857,18 +2877,29 @@ public struct SidebarRootView: View {
         "\(name) · \(type) · \(location) · \(vm.hostDisplayName)"
     }
 
-    /// Children of an expanded workspace: its linked Bots, then Conversations. No empty sub-sections.
+    private func workspaceSectionHeader(_ title: String, id: String) -> some View {
+        Text(title)
+            .font(DS.Font.caption2)
+            .foregroundColor(DS.Palette.textTertiary)
+            .padding(.leading, DS.Space.lg + DS.Space.sm)
+            .padding(.top, DS.Space.xxs)
+            .accessibilityIdentifier(id)
+    }
+
+    /// Children of an expanded workspace: Bots (+ New bot first), then Conversations (+ New conversation first).
     @ViewBuilder
     private func workspaceChildren(_ ws: Workspace) -> some View {
-        ForEach(vm.workspaceBotRows(ws.id)) { botConversationRow($0) }
+        if vm.showsAddBot(ws.id) || !vm.workspaceBotRows(ws.id).isEmpty {
+            workspaceSectionHeader("Bots", id: "sidebar.workspaceBots.\(ws.id.value.uuidString)")
+        }
         if vm.showsAddBot(ws.id) {
-            Button { vm.addBot() } label: {
+            Button { navigate { vm.addBot() } } label: {
                 HStack(spacing: DS.Space.sm) {
-                    Image(systemName: "person.badge.plus")
+                    Image(systemName: "plus")
                         .font(.system(size: 11, weight: .regular))
                         .frame(width: 20, height: 20)
                         .foregroundColor(DS.Palette.textTertiary)
-                    Text("Add Bot\u{2026}").font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                    Text("New bot").font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
                     Spacer(minLength: 0)
                 }
                 .padding(.leading, DS.Space.lg)
@@ -2880,13 +2911,11 @@ public struct SidebarRootView: View {
             .help("Create a Bot; linking it to \(ws.name) asks for an explicit grant")
             .accessibilityIdentifier("sidebar.addBot.\(ws.id.value.uuidString)")
         }
+        ForEach(vm.workspaceBotRows(ws.id)) { botConversationRow($0) }
+        if vm.showsNewConversation(ws.id) || !vm.workspaceConversationRows(ws.id).isEmpty {
+            workspaceSectionHeader("Conversations", id: "sidebar.workspaceConversations.\(ws.id.value.uuidString)")
+        }
         if vm.showsNewConversation(ws.id) {
-            Text("Conversations")
-                .font(DS.Font.caption2)
-                .foregroundColor(DS.Palette.textTertiary)
-                .padding(.leading, DS.Space.lg + DS.Space.sm)
-                .padding(.top, DS.Space.xxs)
-                .accessibilityIdentifier("sidebar.workspaceConversations.\(ws.id.value.uuidString)")
             Button { navigate { vm.newWorkspaceConversation(in: ws.id) } } label: {
                 HStack(spacing: DS.Space.sm) {
                     Image(systemName: "plus")

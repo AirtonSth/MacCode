@@ -6,6 +6,7 @@ import AgentRuntime
 @testable import CoreModel
 import Persistence
 import Surfaces
+import SocketServer
 
 /// The single Mac sidebar from plan/02-experiencia.html: top items, General Bots with Titio first,
 /// a searchable Workspaces tree whose rows expand into linked Bots and Conversations, and a
@@ -87,6 +88,41 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
                        "a revoked Bot conversation's title must disappear while plain work stays")
     }
 
+    func test_untitledNewThreadsAreNotListedAndSelectingAWorkspaceExpandsIt() async throws {
+        // WHY: "+ New conversation" already starts work; empty "New thread" rows were noise.
+        let f = try make("untitled")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let workspace = try f.router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        let other = try f.router.createWorkspace(name: "star", cwd: NSTemporaryDirectory())
+        let real = try f.router.createAgentThread(workspace: other.id, title: "Elephant - Task", provider: .codex, model: "fake", permissionMode: .supervised, reasoningEffort: .medium)
+        _ = try f.router.createAgentThread(workspace: other.id, title: SidebarViewModel.untitledThreadTitle, provider: .codex, model: "fake", permissionMode: .supervised, reasoningEffort: .medium)
+        f.vm.reload()
+        if f.vm.expandedWorkspaceIDs.contains(other.id) { f.vm.toggleWorkspaceExpanded(other.id) }
+        _ = workspace
+        f.vm.select(other.id)
+        XCTAssertTrue(f.vm.expandedWorkspaceIDs.contains(other.id), "selecting a workspace expands its listing")
+        await f.vm.reloadAuthorizedBotConversationRowsAndWait()
+        XCTAssertEqual(f.vm.workspaceConversationRows(other.id).map(\.threadID), [real.id])
+    }
+
+    func test_reconfiguringABotRefreshesTheSidebarWithoutManualReload() async throws {
+        // WHY: renames and new workspace links made by Studio, a paired phone or Titio
+        // must show up without restarting or toggling the sidebar.
+        let f = try make("refresh")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let bot = try f.context.botStore.create(name: "Elephant Developer", title: "", description: "", handle: "elephant-developer")
+        let botsVM = BotsViewModel(context: f.context, router: f.router)
+        f.vm.observeActiveBots(botsVM)
+        await f.vm.reloadAuthorizedBotConversationRowsAndWait()
+        _ = try f.context.botStore.updateProfile(id: bot.id, name: "Developer", title: "", description: "")
+        EventBus.shared.publish(kind: .botUpdated, payload: .object(["bot_id": .string(bot.id.value.uuidString)]))
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline, f.vm.generalBots.first(where: { $0.botID == bot.id })?.name != "Developer" {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(f.vm.generalBots.first(where: { $0.botID == bot.id })?.name, "Developer")
+    }
+
     func test_expandIsSeparateFromOpenAndSharedBotIsTheSameIdentityUnderEachWorkspace() async throws {
         let f = try make("tree")
         defer { try? FileManager.default.removeItem(atPath: f.directory) }
@@ -112,12 +148,12 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         await expand(f.vm, star.id)
         XCTAssertEqual(f.vm.workspaceBotRows(star.id).map(\.botID), [shared.id], "a shared Bot is projected under every linked workspace")
         XCTAssertTrue(f.vm.workspaceConversationRows(star.id).isEmpty, "a workspace without threads shows no empty Conversations section")
-        XCTAssertFalse(f.vm.showsAddBot(star.id), "a workspace with a linked Bot does not offer Add Bot")
+        XCTAssertTrue(f.vm.showsAddBot(star.id), "Bots always lead with + New bot, even with a linked Bot")
         let empty = try f.router.createWorkspace(name: "empty", cwd: NSTemporaryDirectory())
         f.vm.reload()
         await expand(f.vm, empty.id)
         XCTAssertTrue(f.vm.workspaceBotRows(empty.id).isEmpty)
-        XCTAssertTrue(f.vm.showsAddBot(empty.id), "a workspace without Bots shows Add Bot instead of empty sections")
+        XCTAssertTrue(f.vm.showsAddBot(empty.id), "a workspace without Bots still offers + New bot")
 
         f.vm.toggleWorkspaceExpanded(elephant.id)
         XCTAssertTrue(f.vm.workspaceBotRows(elephant.id).isEmpty, "collapsing hides the children")
