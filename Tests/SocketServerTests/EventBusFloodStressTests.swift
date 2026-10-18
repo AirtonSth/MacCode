@@ -143,7 +143,7 @@ final class EventBusFloodStressTests: XCTestCase {
         let bus = EventBus()
         let chunk = String(repeating: "z", count: 32 * 1_024)
         for i in 0..<40 {
-            bus.publishRawForTesting(kind: "derp-race.\(i)", payload: .string(chunk))
+            bus.publishRawForTesting(kind: "relay-race.\(i)", payload: .string(chunk))
         }
 
         let firstPage = bus.recentEvents(since: 0, maxBytes: 512 * 1_024)

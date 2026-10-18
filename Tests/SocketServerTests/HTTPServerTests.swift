@@ -780,7 +780,7 @@ final class HTTPServerTests: XCTestCase {
     /// next request on a dedicated Thread, not on the Swift cooperative pool.
     /// WHY: that wait is a blocking read for up to the 25 s keep-alive budget.
     /// Phones hold several idle keep-alive sockets (RPC, snapshot, files) and
-    /// dead Wi-Fi/Tailcat paths never send FIN, so a few more idle sockets than
+    /// dead Wi-Fi/relay paths never send FIN, so a few more idle sockets than
     /// the pool is wide would stall every async RPC hop on the Mac and push
     /// iOS into its reconnect loop.
     @MainActor

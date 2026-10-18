@@ -1229,17 +1229,14 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     /// Indirection so the outbox send closure can bind after `self` exists.
     private let silentWakeSendBox: SilentWakeOutboxSendBox
     private struct ConnectionHintSources {
-        var tailcat: (@Sendable () async -> TailcatPushHint?)?
         var watermark: (@Sendable () -> String?)?
         var bootEpoch: (@Sendable () -> String?)?
     }
     private let connectionHintLock = NSLock()
     private var connectionHintSources = ConnectionHintSources()
-    /// F5: the resolved settings store. Besides the outbox it holds the hourly
-    /// silent-wake budget and the last Tailcat digest a delivered silent push
-    /// carried. Not `UserDefaults.standard`: that store is process-wide.
+    /// The resolved settings store. Besides the outbox it holds the hourly
+    /// silent-wake budget. Not `UserDefaults.standard`: that store is process-wide.
     private let settings: SettingsRepository
-    private static let tailcatAnnouncedDigestKey = "private.tailcat.announcedDigest.v1"
     private static let silentWakeBudgetKey = "private.silentWake.budget.v1"
     private let silentWakeBudgetLock = NSLock()
     /// Silent sends between budget admission and the backend's answer, by device.
@@ -1320,15 +1317,12 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         self.silentWakeOutbox.resumePending()
     }
 
-    /// Late-bound sources for `PushConnectionHints` (the Tailcat supervisor is
-    /// built after this bridge). Unset sources contribute nothing.
+    /// Late-bound sources for `PushConnectionHints`. Unset sources contribute nothing.
     func setConnectionHintSources(
-        tailcat: (@Sendable () async -> TailcatPushHint?)? = nil,
         watermark: (@Sendable () -> String?)? = nil,
         bootEpoch: (@Sendable () -> String?)? = nil
     ) {
         connectionHintLock.withLock {
-            if let tailcat { connectionHintSources.tailcat = tailcat }
             if let watermark { connectionHintSources.watermark = watermark }
             if let bootEpoch { connectionHintSources.bootEpoch = bootEpoch }
         }
@@ -1340,21 +1334,9 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         let sources = connectionHintLock.withLock { connectionHintSources }
         return PushConnectionHints.merge(
             into: data,
-            tailcat: await sources.tailcat?(),
             watermark: sources.watermark?(),
             bootEpoch: sources.bootEpoch?()
         )
-    }
-
-    /// F5: the digest a push built now would carry, or nil (no source, no hint, invalid digest, lease not in the future).
-    private func currentTailcatDigestForPush() async -> String? {
-        let source = connectionHintLock.withLock { connectionHintSources.tailcat }
-        return PushConnectionHints.merge(
-            into: [:],
-            tailcat: await source?(),
-            watermark: nil,
-            bootEpoch: nil
-        )[PushConnectionHints.tailcatDigestKey]
     }
 
     /// Test seam: observe the durable silent-wake outbox.
@@ -1572,57 +1554,6 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         }
     }
 
-    /// F5: a delivered silent push that carried the digest still published is
-    /// its announcement. One that carried an older digest (built before a
-    /// rotation, answered after it) never moves the baseline back.
-    private func noteAnnouncedTailcatDigest(_ carried: String?) async {
-        guard let carried else { return }
-        let current = await currentTailcatDigestForPush()
-        guard carried == current,
-              (try? settings.get(Self.tailcatAnnouncedDigestKey)) != carried else { return }
-        do {
-            try settings.set(Self.tailcatAnnouncedDigestKey, carried)
-        } catch {
-            Self.log.error("tailcat_announce baseline_write_failed: \(String(describing: error), privacy: .public)")
-        }
-    }
-
-    /// F5: asks for one silent push when the published Tailcat endpoints differ
-    /// from the last digest a delivered silent push carried to this phone.
-    func announceTailcatEndpointIfChanged() async {
-        // Nobody to tell: record nothing as announced and log nothing per renewal.
-        guard let session = accountStore.load(), session.user.subscribed,
-              pushTargetStore.load() != nil else { return }
-        guard let digest = await currentTailcatDigestForPush() else { return }
-        let baseline: String
-        do {
-            baseline = try settings.get(Self.tailcatAnnouncedDigestKey) ?? ""
-        } catch {
-            // An unreadable baseline is not "no baseline": the next renewal asks again.
-            return
-        }
-        if baseline == digest { return }
-        if baseline.isEmpty {
-            // First publish of this build: the phone has nothing older to invalidate.
-            do {
-                try settings.set(Self.tailcatAnnouncedDigestKey, digest)
-                // `notice`, not `info`: the device check counts these lines and `info` is not persisted.
-                Self.log.notice("tailcat_announce outcome=seeded")
-            } catch {
-                Self.log.error("tailcat_announce baseline_write_failed: \(String(describing: error), privacy: .public)")
-            }
-            return
-        }
-        Self.log.notice("tailcat_announce outcome=attempt")
-        // Not forced: the 30 s bucket keeps two digests off one idempotency key.
-        await deliverSilentCatchUp(
-            hostHint: "tailcat",
-            force: false,
-            payload: SilentCatchUpV1(reason: "tailcat_endpoint_changed"),
-            coalesceClass: .tailcat
-        )
-    }
-
     /// Silent APNs background wake: iOS `didReceiveRemoteNotification` runs
     /// `BackgroundSyncCoordinator` catch-up. Coalesced per reason-class 30s
     /// bucket so an attention wake cannot be suppressed by run-progress traffic.
@@ -1684,17 +1615,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         var contract = payload
         contract.catchUp = true
         let data = await withConnectionHints(contract.asPushData())
-        let carriedDigest = data[PushConnectionHints.tailcatDigestKey]
-        if coalesceClass == .tailcat, carriedDigest == nil {
-            // F5: the rotation push is about the address only; never a bare wake.
-            settleSilentWake(delivered: false, device: budgetDevice)
-            Self.log.notice("tailcat_announce outcome=no_digest")
-            return
-        }
-        // F5: the rotation push's key names its digest. Two Macs of one account rotate
-        // together; on a shared key the backend answers the second from its cache, unsent.
-        let keyHint = (coalesceClass == .tailcat ? carriedDigest : nil) ?? hostHint
-        let idempotencyKey = "catchup.\(coalesceClass.rawValue).\(keyHint).\(bucket)"
+        let idempotencyKey = "catchup.\(coalesceClass.rawValue).\(hostHint).\(bucket)"
         HostWakeMetrics.shared.increment(.silentAttempt)
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
@@ -1715,7 +1636,6 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             settleSilentWake(delivered: result.delivered, device: budgetDevice)
             if result.delivered {
                 HostWakeMetrics.shared.increment(.silentSent)
-                await noteAnnouncedTailcatDigest(carriedDigest)
             } else {
                 // Backend may signal rate limit via non-delivered without throw.
                 HostWakeMetrics.shared.increment(.silent429)
@@ -1725,8 +1645,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             HostWakeMetrics.shared.increment(.silentFailed)
             Self.log.error("Silent catch-up push failed: \(String(describing: error), privacy: .public)")
             // Durable retry only behind wake_outbox. Flag off preserves log-and-drop.
-            // F5: never for the rotation push; the next renewal is its retry.
-            if ConnectionFeatureFlags.wakeOutboxEnabled, coalesceClass != .tailcat {
+            if ConnectionFeatureFlags.wakeOutboxEnabled {
                 let record = SilentWakeOutboxRecord(
                     coalesceClass: coalesceClass,
                     hostHint: hostHint,
@@ -1783,7 +1702,6 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             settleSilentWake(delivered: result.delivered, device: budgetDevice)
             if result.delivered {
                 HostWakeMetrics.shared.increment(.silentSent)
-                await noteAnnouncedTailcatDigest(data[PushConnectionHints.tailcatDigestKey])
                 return
             }
             // Non-throwing rate-limit: retry via outbox without inventing success.

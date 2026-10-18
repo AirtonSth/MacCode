@@ -5,8 +5,7 @@ import Persistence
 import RemoteCodeTreaty
 
 /// Keeps the Mac's `/v1/host` socket open on the relay and bridges every relay
-/// stream into the local HTTP server through a socketpair, like a Tailcat
-/// connection. Untrusted initiator keys never reach the HTTP server.
+/// stream into the local HTTP server through a socketpair. Untrusted initiator keys never reach the HTTP server.
 public final class RelayHostClient: @unchecked Sendable {
     private final class Stream {
         let socket: RelayWebSocket
@@ -239,7 +238,7 @@ public final class RelayHostClient: @unchecked Sendable {
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
             DirectHTTPServer.enableCloseOnExec(fd)
         }
-        guard server.registerTailcatConnection(fd: a) else {
+        guard server.registerRelayConnection(fd: a) else {
             Darwin.close(b)
             socket.close(code: 1013)
             finish(id, stream)
@@ -265,7 +264,7 @@ public final class RelayHostClient: @unchecked Sendable {
         let peer = "relay:" + deviceId
         let server = self.server
         Thread.detachNewThread {
-            server.serveTailcatConnection(fd: a, peer: peer)
+            server.serveRelayConnection(fd: a, peer: peer)
         }
         let (outbound, outboundSink) = AsyncStream.makeStream(of: Data.self)
         let teardown: @Sendable () -> Void = {
