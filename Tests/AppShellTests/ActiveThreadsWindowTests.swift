@@ -15,7 +15,7 @@ final class ActiveThreadsWindowTests: XCTestCase {
 
     func test_sidebarPlacesActivityImmediatelyAfterNewWorkspace_beforeScheduleTasks() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.newWorkspace\")"))
+        let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.new\")"))
         let activeThreads = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.activity\")"))
         let scheduleTasks = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.scheduleTasks\")"))
         let reportBug = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.reportBug\")"))

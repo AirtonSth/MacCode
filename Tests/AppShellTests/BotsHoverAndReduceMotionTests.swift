@@ -29,13 +29,6 @@ final class BotsHoverAndReduceMotionTests: XCTestCase {
         // WHY: Bot rows and group rows sit in one list; one answering the
         // pointer without the other reads as broken. A selected row already
         // paints the Bot's own colour, so the hover layer is off there.
-        let bots = try source("Sources/AppShell/BotsWindow.swift")
-        let rosterRow = try slice(
-            bots,
-            from: "private func rosterRow(_ bot: BotDefinition) -> some View {",
-            to: ".overlay(alignment: .leading) {"
-        )
-        XCTAssertTrue(rosterRow.contains(".dsHoverFill(enabled: !selected)"))
         let groups = try source("Sources/AppShell/BotsTeamsGroups.swift")
         let groupRow = try slice(
             groups,

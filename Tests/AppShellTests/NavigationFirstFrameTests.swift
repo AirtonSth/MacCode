@@ -399,7 +399,7 @@ extension BotsWindowTests {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("vm.enableNavigationFirstFrameDeferral()"))
-        XCTAssertTrue(source.contains("BotsRootView(vm: vm, embedsRosterRail: false, showsCatalogRail: true)"))
+        XCTAssertTrue(source.contains("BotsRootView(vm: vm)"))
         XCTAssertTrue(source.contains("removePreviousShellHostAfterFirstFrame"))
     }
 

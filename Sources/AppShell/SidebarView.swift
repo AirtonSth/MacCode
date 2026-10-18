@@ -199,13 +199,17 @@ public final class SidebarViewModel: ObservableObject {
         public let name: String
         public let handle: String
         public let symbol: String
+        public let pinned: Bool
+        public let hidden: Bool
         public var id: String { botID.value.uuidString }
         public var isTitio: Bool { handle == TitioIdentity.handle }
-        nonisolated public init(botID: BotID, name: String, handle: String, symbol: String) {
+        nonisolated public init(botID: BotID, name: String, handle: String, symbol: String, pinned: Bool = false, hidden: Bool = false) {
             self.botID = botID
             self.name = name
             self.handle = handle
             self.symbol = symbol
+            self.pinned = pinned
+            self.hidden = hidden
         }
     }
 
@@ -489,11 +493,12 @@ public final class SidebarViewModel: ObservableObject {
         authorizedBotRowsWorkspaceIDs = workspaceIDs
         let loader = authorizedBotRowsLoaderForTesting
         let expanded = expandedWorkspaceIDs.intersection(workspaceIDs)
+        let includeHidden = router?.botsViewModel?.showHidden ?? false
         authorizedBotRowsTask = Task { [weak self] in
             let (result, tree) = await Task.detached {
                 let rows = if let loader { loader(botStore, threadRepo, hostID, workspaceIDs) }
                 else { Self.loadAuthorizedBotConversationRows(botStore: botStore, threadRepo: threadRepo, hostID: hostID, workspaceIDs: workspaceIDs) }
-                return (rows, Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded))
+                return (rows, Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden))
             }.value
             guard let self, !Task.isCancelled, self.authorizedBotRowsGeneration == generation else { return }
             if self.authorizedBotRowsNeedsRefresh {
@@ -578,11 +583,12 @@ public final class SidebarViewModel: ObservableObject {
         botStore: BotStore,
         threadRepo: AgentThreadRepository,
         hostID: String,
-        expanded: Set<WorkspaceID>
+        expanded: Set<WorkspaceID>,
+        includeHidden: Bool = false
     ) -> (general: [GeneralBotRow], conversations: [WorkspaceID: [WorkspaceConversationRow]])? {
         do {
-            // Same order as the Bots roster: Titio, pinned, then most recent.
-            let bots = try botStore.list().sorted { lhs, rhs in
+            // Titio, pinned, then most recent.
+            let bots = try botStore.list(includeHidden: includeHidden).sorted { lhs, rhs in
                 let lhsTitio = lhs.handle == TitioIdentity.handle, rhsTitio = rhs.handle == TitioIdentity.handle
                 if lhsTitio != rhsTitio { return lhsTitio }
                 if lhs.pinned != rhs.pinned { return lhs.pinned }
@@ -596,7 +602,7 @@ public final class SidebarViewModel: ObservableObject {
                 let generalReadable = bindings.contains { $0.context == .general && $0.state == .active && $0.actions.contains(.read) }
                 // Never-bound Bots are the pre-contextual catalog Bots the roster already lists; they open their Desk.
                 guard bot.handle == TitioIdentity.handle || generalReadable || (bindings.isEmpty && !workspaceScoped) else { continue }
-                general.append(GeneralBotRow(botID: bot.id, name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol))
+                general.append(GeneralBotRow(botID: bot.id, name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol, pinned: bot.pinned, hidden: bot.hidden))
             }
             var conversations: [WorkspaceID: [WorkspaceConversationRow]] = [:]
             for workspaceID in expanded {
@@ -626,6 +632,10 @@ public final class SidebarViewModel: ObservableObject {
 
     public var sidebarQuery: String { filterText.trimmingCharacters(in: .whitespacesAndNewlines) }
 
+    /// Inline search in the General Bots header; it filters only that list.
+    @Published public var generalBotsFilterText: String = ""
+    public var generalBotsQuery: String { generalBotsFilterText.trimmingCharacters(in: .whitespacesAndNewlines) }
+
     public func botRowMatchesQuery(_ row: AuthorizedBotConversationRow) -> Bool {
         let query = sidebarQuery
         guard !query.isEmpty else { return true }
@@ -634,7 +644,7 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public var visibleGeneralBots: [GeneralBotRow] {
-        let query = sidebarQuery
+        let query = generalBotsQuery
         guard !query.isEmpty else { return generalBots }
         return generalBots.filter {
             $0.name.range(of: query, options: .caseInsensitive) != nil
@@ -657,6 +667,11 @@ public final class SidebarViewModel: ObservableObject {
         return authorizedBotConversationRows.filter { $0.context == .workspace(id) && botRowMatchesQuery($0) }
     }
 
+    /// An expanded workspace always leads its Conversations with "+ New conversation"; a search hides it.
+    public func showsNewConversation(_ id: WorkspaceID) -> Bool {
+        expandedWorkspaceIDs.contains(id) && sidebarQuery.isEmpty
+    }
+
     public func workspaceConversationRows(_ id: WorkspaceID) -> [WorkspaceConversationRow] {
         guard expandedWorkspaceIDs.contains(id) else { return [] }
         let rows = workspaceConversations[id] ?? []
@@ -670,6 +685,41 @@ public final class SidebarViewModel: ObservableObject {
         expandedWorkspaceIDs.contains(id) && sidebarQuery.isEmpty
             && !authorizedBotConversationRows.contains { $0.context == .workspace(id) }
     }
+
+    /// Re-reads the General Bots list, e.g. after Show hidden changes.
+    public func reloadGeneralBots() { reloadAuthorizedBotConversationRows() }
+
+    /// Runs `action` once the Bots content is mounted: Edit, Delete and the Teams actions need it.
+    private func withBotsContent(_ action: (BotsViewModel) -> Void) {
+        guard let router else { return }
+        router.windowController?.presentBotsInMainContent()
+        if let botsViewModel = router.botsViewModel { action(botsViewModel) }
+    }
+
+    public func editBot(_ id: BotID) {
+        guard let bot = try? context?.botStore.get(id: id) else { return }
+        withBotsContent { $0.beginEdit(bot) }
+    }
+
+    public func requestDeleteBot(_ id: BotID) { withBotsContent { $0.pendingDeleteID = id } }
+
+    public func duplicateBot(_ id: BotID) {
+        guard let bot = try? context?.botStore.get(id: id) else { return }
+        withBotsContent { $0.duplicateFromRoster(bot) }
+    }
+
+    public func setBotPinned(_ id: BotID, _ pinned: Bool) {
+        router?.botsViewModel?.setPinned(id: id, pinned: pinned)
+        reloadAuthorizedBotConversationRows()
+    }
+
+    public func setBotHidden(_ id: BotID, _ hidden: Bool) {
+        router?.botsViewModel?.setHidden(id: id, hidden: hidden)
+        reloadAuthorizedBotConversationRows()
+    }
+
+    /// Opens the Teams manager.
+    public func openTeams() { withBotsContent { $0.beginCreateTeam() } }
 
     /// Opens the existing New Bot flow; linking it to a workspace stays an explicit grant.
     public func addBot() {
@@ -704,6 +754,17 @@ public final class SidebarViewModel: ObservableObject {
                 showOperationError("Could not start conversation", detail: router?.botsViewModel?.errorMessage ?? "This Bot context is no longer available.")
                 return reloadAuthorizedBotConversationRows()
             }
+            reloadAuthorizedBotConversationRows()
+        } catch {
+            showOperationError("Could not start conversation", detail: error.localizedDescription)
+        }
+    }
+
+    /// First row of a workspace's Conversations: starts an Agent App thread there and opens it.
+    public func newWorkspaceConversation(in workspaceID: WorkspaceID) {
+        guard let router else { return }
+        do {
+            try router.createWorkspaceConversation(workspace: workspaceID)
             reloadAuthorizedBotConversationRows()
         } catch {
             showOperationError("Could not start conversation", detail: error.localizedDescription)
@@ -2002,6 +2063,7 @@ public struct SidebarRootView: View {
     @State private var showsInsomniaOptions = false
     /// Toggled to true to programmatically focus the filter field (Cmd+F).
     @State private var filterFocusRequest: Bool = false
+    @State private var generalBotsFocusRequest: Bool = false
     /// :18 -- Timer fires at ~16 Hz while vm.dragScrollEdge != 0 to scroll toward
     /// the top or bottom of the workspace list. Stored so we can invalidate it
     /// when the drag leaves the edge zone or the drop completes.
@@ -2010,7 +2072,6 @@ public struct SidebarRootView: View {
     private let onOpenAccount: () -> Void
     private let onOpenScheduledTasks: () -> Void
     private let onOpenActiveThreads: () -> Void
-    private let onOpenBots: () -> Void
     private let keyMapper = SidebarKeyIntentMapper()
 
     public init(
@@ -2019,8 +2080,7 @@ public struct SidebarRootView: View {
         onOpenSettings: @escaping () -> Void = {},
         onOpenAccount: @escaping () -> Void = {},
         onOpenScheduledTasks: @escaping () -> Void = {},
-        onOpenActiveThreads: @escaping () -> Void = {},
-        onOpenBots: @escaping () -> Void = {}
+        onOpenActiveThreads: @escaping () -> Void = {}
     ) {
         self.vm = vm
         self.botsVM = botsVM
@@ -2028,7 +2088,6 @@ public struct SidebarRootView: View {
         self.onOpenAccount = onOpenAccount
         self.onOpenScheduledTasks = onOpenScheduledTasks
         self.onOpenActiveThreads = onOpenActiveThreads
-        self.onOpenBots = onOpenBots
     }
 
     public var body: some View {
@@ -2095,12 +2154,19 @@ public struct SidebarRootView: View {
             .frame(height: 44)
 
             VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                Button { vm.newWorkspace() } label: {
-                    SidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
+                Menu {
+                    Button { vm.newWorkspace() } label: { Label("New Workspace", systemImage: "folder.badge.plus") }
+                        .accessibilityIdentifier("sidebar.newWorkspace")
+                    Button { navigate { vm.addBot() } } label: { Label("New Bot", systemImage: "person.badge.plus") }
+                        .accessibilityIdentifier("sidebar.newBot")
+                } label: {
+                    SidebarActionRow(symbol: "plus.circle", title: "New")
                 }
+                .menuStyle(.button)
                 .buttonStyle(.plain)
-                .help("Create new workspace")
-                .accessibilityIdentifier("sidebar.newWorkspace")
+                .menuIndicator(.hidden)
+                .help("Create a workspace or a Bot")
+                .accessibilityIdentifier("sidebar.new")
 
                 Button { navigate(onOpenActiveThreads) } label: {
                     SidebarActionRow(
@@ -2230,7 +2296,6 @@ public struct SidebarRootView: View {
                 }
             }
 
-            manageBotsFooter
             accountFooter
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -2739,19 +2804,61 @@ public struct SidebarRootView: View {
     @ViewBuilder
     private var generalBotsSection: some View {
         let bots = vm.visibleGeneralBots
-        if !bots.isEmpty {
+        if !vm.generalBots.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                Text("General Bots")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .padding(.horizontal, DS.Space.sm)
-                    .padding(.bottom, DS.Space.xxs)
-                ScrollView {
-                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                        ForEach(bots) { generalBotRow($0) }
+                HStack(spacing: DS.Space.sm) {
+                    Text("General Bots")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                        .fixedSize()
+                    SidebarSearchField(
+                        placeholder: "Search",
+                        text: $vm.generalBotsFilterText,
+                        focusRequest: $generalBotsFocusRequest,
+                        accessibilityIdentifier: "sidebar.generalBots.search"
+                    )
+                    Button { vm.openTeams() } label: {
+                        Text("Teams")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .padding(.horizontal, DS.Space.sm)
+                            .frame(height: DS.Control.sidebarSearchHeight)
+                            .background(
+                                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                    .fill(DS.Palette.surfaceRaised.opacity(0.6))
+                            )
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .help("Manage Bot teams")
+                    .contextMenu {
+                        if let botsVM {
+                            Toggle("Show hidden", isOn: Binding(
+                                get: { botsVM.showHidden },
+                                set: { botsVM.showHidden = $0; vm.reloadGeneralBots() }
+                            ))
+                            .accessibilityIdentifier("sidebar.generalBots.showHidden")
+                        }
+                    }
+                    .accessibilityIdentifier("sidebar.teams")
                 }
-                .frame(maxHeight: min(CGFloat(bots.count) * 38, 190))
+                .padding(.horizontal, DS.Space.sm)
+                .padding(.bottom, DS.Space.xxs)
+                if bots.isEmpty {
+                    Text("No matches")
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .padding(.horizontal, DS.Space.sm)
+                        .padding(.vertical, DS.Space.xs)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                            ForEach(bots) { generalBotRow($0) }
+                        }
+                    }
+                    .frame(maxHeight: min(CGFloat(bots.count) * 38, 190))
+                }
             }
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
@@ -2767,7 +2874,13 @@ public struct SidebarRootView: View {
                     .frame(width: 20, height: 20)
                 Text(BotsViewModel.displayName(row.name)).font(DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
                 Spacer(minLength: 0)
-                if row.isTitio {
+                if row.hidden {
+                    Image(systemName: "eye.slash")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityHidden(true)
+                }
+                if row.isTitio || row.pinned {
                     Image(systemName: "pin.fill")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundColor(DS.Palette.textTertiary)
@@ -2781,8 +2894,16 @@ public struct SidebarRootView: View {
         .buttonStyle(.plain)
         .help(searchHelp(type: "General Bot", location: "General", name: row.name))
         .accessibilityLabel(BotsViewModel.displayName(row.name))
-        .accessibilityValue(row.isTitio ? "Pinned. General Bot" : "General Bot")
+        .accessibilityValue("\(row.pinned ? "Pinned. " : "")\(row.hidden ? "Hidden. " : "")General Bot")
         .accessibilityIdentifier("sidebar.generalBot.\(row.handle)")
+        .contextMenu {
+            Button(row.pinned ? "Unpin" : "Pin") { vm.setBotPinned(row.botID, !row.pinned) }
+            Button(row.hidden ? "Unhide" : "Hide") { vm.setBotHidden(row.botID, !row.hidden) }
+            Button("Edit in Studio") { navigate { vm.editBot(row.botID) } }
+            Button("Duplicate") { navigate { vm.duplicateBot(row.botID) } }
+            Divider()
+            Button("Delete", role: .destructive) { navigate { vm.requestDeleteBot(row.botID) } }
+        }
     }
 
     /// Host, workspace and type for one row, so equal names stay distinguishable.
@@ -2813,16 +2934,32 @@ public struct SidebarRootView: View {
             .help("Create a Bot; linking it to \(ws.name) asks for an explicit grant")
             .accessibilityIdentifier("sidebar.addBot.\(ws.id.value.uuidString)")
         }
-        let conversations = vm.workspaceConversationRows(ws.id)
-        if !conversations.isEmpty {
+        if vm.showsNewConversation(ws.id) {
             Text("Conversations")
                 .font(DS.Font.caption2)
                 .foregroundColor(DS.Palette.textTertiary)
                 .padding(.leading, DS.Space.lg + DS.Space.sm)
                 .padding(.top, DS.Space.xxs)
                 .accessibilityIdentifier("sidebar.workspaceConversations.\(ws.id.value.uuidString)")
-            ForEach(conversations) { workspaceConversationRow($0, workspace: ws) }
+            Button { navigate { vm.newWorkspaceConversation(in: ws.id) } } label: {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 11, weight: .regular))
+                        .frame(width: 20, height: 20)
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Text("New conversation").font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, DS.Space.lg)
+                .padding(.horizontal, DS.Space.sm)
+                .frame(height: 30)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Start a new conversation in \(ws.name)")
+            .accessibilityIdentifier("sidebar.newConversation.\(ws.id.value.uuidString)")
         }
+        ForEach(vm.workspaceConversationRows(ws.id)) { workspaceConversationRow($0, workspace: ws) }
     }
 
     private func workspaceConversationRow(_ row: SidebarViewModel.WorkspaceConversationRow, workspace: Workspace) -> some View {
@@ -2844,18 +2981,6 @@ public struct SidebarRootView: View {
         .help(searchHelp(type: "Conversation", location: workspace.name, name: row.title))
         .accessibilityLabel("\(workspace.name), \(row.title)")
         .accessibilityIdentifier("sidebar.conversation.\(row.id)")
-    }
-
-    private var manageBotsFooter: some View {
-        Button(action: onOpenBots) {
-            SidebarActionRow(symbol: "person.2", title: "Manage Bots and Teams\u{2026}", isSelected: vm.isBotsSelected)
-        }
-        .buttonStyle(.plain)
-        .help("Open the Bots catalog, Studio and teams")
-        .padding(.horizontal, DS.Space.md)
-        .padding(.vertical, DS.Space.xs)
-        .accessibilityIdentifier("sidebar.manageBots")
-        .accessibilityAddTraits(vm.isBotsSelected ? .isSelected : [])
     }
 
     @ViewBuilder
@@ -3307,8 +3432,6 @@ public final class SidebarView: NSObject {
     public var onPresentScheduledTasks: (() -> Void)?
     /// Main window mounts Active Threads in the workspace content column.
     public var onPresentActiveThreads: (() -> Void)?
-    /// Main window mounts Bots in the workspace content column.
-    public var onPresentBots: (() -> Void)?
     /// Fired when a workspace is selected so main content leaves shell destinations.
     public var onWorkspaceContentActivated: (() -> Void)? {
         get { viewModel.onWorkspaceContentActivated }
@@ -3363,8 +3486,7 @@ public final class SidebarView: NSObject {
             onOpenSettings: { [weak self] in self?.showSettings() },
             onOpenAccount: { [weak self] in self?.showAccount() },
             onOpenScheduledTasks: { [weak self] in self?.showScheduledTasks() },
-            onOpenActiveThreads: { [weak self] in self?.showActiveThreads() },
-            onOpenBots: { [weak self] in self?.showBots() }
+            onOpenActiveThreads: { [weak self] in self?.showActiveThreads() }
         )
     }
 
@@ -3412,7 +3534,6 @@ public final class SidebarView: NSObject {
 
     var workspacesForTesting: [Workspace] { viewModel.workspaces }
     var viewModelForTesting: SidebarViewModel { viewModel }
-    func openBotsForTesting() { showBots() }
 
     /// Canonical workspace-add path for shell-level entry points such as the
     /// header "+" and the empty-state button: DEDUP-P2, File ▸ Open Recent and
@@ -3476,15 +3597,5 @@ public final class SidebarView: NSObject {
             return
         }
         // No detached fallback: Active Threads is main-content only.
-    }
-
-    @objc private func showBots() {
-        if let onPresentBots {
-            onPresentBots()
-            return
-        }
-        guard let context, let router else { return }
-        let controller = BotsWindowController(context: context, router: router)
-        controller.show()
     }
 }

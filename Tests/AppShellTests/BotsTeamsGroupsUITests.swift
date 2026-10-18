@@ -115,7 +115,7 @@ final class BotsTeamsGroupsUITests: XCTestCase {
 
     // MARK: - Sidebar sections
 
-    func test_withNoTeams_theMyBotsListStaysTheFlatRoster() throws {
+    func test_withNoTeams_thereAreNoRosterSections() throws {
         let bots = [
             BotDefinition(handle: "ana", name: "Ana", title: "", description: ""),
             BotDefinition(handle: "bob", name: "Bob", title: "", description: ""),
@@ -124,43 +124,6 @@ final class BotsTeamsGroupsUITests: XCTestCase {
             BotRosterSections.make(roster: bots, teams: [], membersByTeam: [:]),
             "no teams must mean no sections: the roster renders exactly as before"
         )
-
-        // The flat branch is the roster's original ForEach, untouched, and the
-        // group section paints nothing until a group exists.
-        let bots_ = try source("Sources/AppShell/BotsWindow.swift")
-        let start = try XCTUnwrap(bots_.range(of: "public struct BotsRosterList"))
-        let rest = bots_[start.lowerBound...]
-        let end = rest.range(of: "\n    private func rosterStatusColor")?.lowerBound ?? rest.endIndex
-        let list = String(bots_[start.lowerBound..<end])
-        let indent = { (n: Int) in String(repeating: " ", count: n) }
-        let flatBranch = "} else {\n"
-            + indent(24) + "ForEach(vm.publishedRoster, id: \\.id) { bot in\n"
-            + indent(28) + "rosterRow(bot)\n"
-            + indent(24) + "}\n"
-            + indent(20) + "}\n"
-            + indent(20) + "BotGroupConversationsSection("
-        XCTAssertTrue(list.contains(flatBranch), "with no teams the My Bots rows are the same ForEach over publishedRoster")
-        XCTAssertTrue(list.contains("} else if let sections = BotRosterSections.make("), "sections only when teams exist")
-        XCTAssertTrue(list.contains("Text(BotsChrome.Label.myBots)"))
-        XCTAssertTrue(list.contains("Text(vm.searchText.isEmpty ? \"No bots yet\" : \"No matches\")"))
-        // The My Bots header row: title, spacer, Show hidden. The "+" menu
-        // only exists once a team or group does.
-        let headerStart = try XCTUnwrap(list.range(of: "Text(BotsChrome.Label.myBots)"))
-        let headerEnd = try XCTUnwrap(list.range(of: "Toggle(\"Show hidden\"", range: headerStart.upperBound..<list.endIndex))
-        let header = String(list[headerStart.upperBound..<headerEnd.lowerBound])
-        let gate = try XCTUnwrap(
-            header.range(of: "if !teamsGroups.teams.isEmpty || !teamsGroups.groups.isEmpty {"),
-            "no teams and no groups → the header has no new control"
-        )
-        let menu = try XCTUnwrap(header.range(of: "Menu {"))
-        XCTAssertLessThan(gate.lowerBound, menu.lowerBound, "the + menu sits inside the gate")
-        XCTAssertEqual(header.components(separatedBy: "Menu {").count, 2, "one menu, the gated one")
-        XCTAssertTrue(
-            list.contains(".contextMenu { BotTeamsGroupsCreateButtons(vm: vm) }"),
-            "with no teams yet, New Team and New Group stay reachable from the New Bot row"
-        )
-        let groupsView = try source("Sources/AppShell/BotsTeamsGroups.swift")
-        XCTAssertTrue(groupsView.contains("if !visible.isEmpty {"), "no groups → no Group Conversations header")
     }
 
     func test_aBotInTwoTeamsShowsUnderEach_andOtherBotsHoldsTheRest() {

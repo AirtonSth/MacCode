@@ -3046,6 +3046,42 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return .unavailable
     }
 
+    /// "+ New conversation" in the sidebar: the same Agent App `createThread` the command
+    /// palette's "Agent: New Thread" runs, on this workspace's Agent App surface.
+    @discardableResult
+    public func createWorkspaceConversation(workspace workspaceID: WorkspaceID) throws -> AgentThreadID {
+        guard let ctx = context, ctx.state.workspaces[workspaceID] != nil else {
+            throw LayoutError.workspaceNotFound
+        }
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        if let detachedWindow = windowController?.workspaceWindow(for: workspaceID) {
+            detachedWindow.makeKeyAndOrderFront(nil)
+        } else {
+            windowController?.show()
+            try selectWorkspace(workspaceID)
+            windowController?.presentWorkspaceContent()
+            windowController?.flushPendingRefresh()
+        }
+        let surface: AgentAppSurface
+        if let existing = preferredAgentAppSurface(in: workspaceID) {
+            surface = existing
+        } else {
+            let descriptor = try openAgentApp(workspace: workspaceID)
+            guard let created = SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface else {
+                throw LayoutError.surfaceNotFound
+            }
+            surface = created
+        }
+        try focusSurface(workspace: workspaceID, surface: surface.descriptor.id)
+        let previous = surface.viewModel.selectedThreadId
+        surface.viewModel.createThread(title: "New thread")
+        windowController?.flushPendingRefresh()
+        guard let created = surface.viewModel.selectedThreadId, created != previous else {
+            throw LayoutError.surfaceNotFound
+        }
+        return created
+    }
+
     /// Open one exact agent thread in a concrete Agent App surface.
     ///
     /// This is the canonical deep-link path for system notifications and other

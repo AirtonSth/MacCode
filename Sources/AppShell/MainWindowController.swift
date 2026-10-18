@@ -392,7 +392,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     var sidebarViewModelForTesting: SidebarViewModel { sidebar.viewModelForTesting }
     var sidebarBotsViewModelForTesting: BotsViewModel { sidebar.botsViewModel }
     /// Same callback the sidebar's "Manage Bots and Teams" footer runs.
-    func sidebarOpenBotsForTesting() { sidebar.openBotsForTesting() }
     private var destinationPersistenceTask: Task<Void, Never>?
     private var workspaceRebuildTask: Task<Void, Never>?
     private var workspaceRebuildGeneration: UInt64 = 0
@@ -444,9 +443,6 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         }
         sidebar.onPresentActiveThreads = { [weak self] in
             self?.presentActiveThreadsInMainContent()
-        }
-        sidebar.onPresentBots = { [weak self] in
-            self?.presentBotsInMainContent()
         }
         sidebar.botsViewModel.onLeaveBots = { [weak self] in
             self?.presentWorkspaceContent()
@@ -1498,7 +1494,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     }
 
     private func makeBotsShellHost(vm: BotsViewModel) -> NSView {
-        let host = ContentColumnHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false, showsCatalogRail: true))
+        let host = ContentColumnHostingView(rootView: BotsRootView(vm: vm))
         host.cancelHorizontalTitlebarGutter = BotsViewModel.cancelsWindowLeadingTitlebarGutter(
             presentsAsDetachedWindow: vm.presentsAsDetachedWindow
         )
