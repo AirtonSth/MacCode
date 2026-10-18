@@ -2,9 +2,11 @@ import CryptoKit
 import Foundation
 import os
 
-/// Finite named host catalog admitted through `remotecode-bot-self-config`.
+/// Named host catalog admitted through `remotecode-bot-self-config`.
 ///
-/// There is no generic host-call tool. Mutations require a provider-supplied
+/// `rc_host_call` is the one generic tool: the host admits it only for an
+/// active run of Titio, the built-in RemoteCode assistant, so Titio can do
+/// anything the RemoteCode UI can. Mutations require a provider-supplied
 /// `operation_id` which the MCP child maps onto the durable command-receipt
 /// `client_request_id`.
 public enum RemoteCodeHostCatalog: Sendable {
@@ -42,6 +44,7 @@ public enum RemoteCodeHostCatalog: Sendable {
     public static let botDelegateRPC = "host.bot.delegate"
     public static let scheduledTaskRunNextRPC = "host.scheduled_task.run_next"
     public static let browserScreenshotRPC = "host.browser.screenshot"
+    public static let hostCallRPC = "host.call"
 
     public static let operationIDKey = "operation_id"
     public static let genericHostCallTool = "rc_host_call"
@@ -62,7 +65,7 @@ public enum RemoteCodeHostCatalog: Sendable {
     }
 
     public static let providerDirective = """
-    Built-in RemoteCode intents (create or list workspaces, Agent App threads, Bots, Bot desk threads, and owned Bot skills) must call the named tools \(workspaceCreate), \(workspaceList), \(threadCreate), \(threadList), \(botCreate), \(botList), \(botOpen), \(botSend), \(botThreadCreate), \(botSkillCreate), and \(botSkillView). To answer what is happening in RemoteCode (running or idle threads, Bots, scheduled tasks, items that need the user) call \(activityList). To ask another Bot by name to do something call \(botDelegate). To fire a workspace's next scheduled task now call \(scheduledTaskRunNext). To capture the Mac browser into the calling Agent thread, call \(browserScreenshot); it accepts optional surface_id and reason, and requires operation_id. For a consulted Bot's skill files, use \(botSkillCreate) and \(botSkillView); `bot_write_home_file` is only for the calling Bot's own home. Never invent a generic host-call tool. Do not use Computer Use, macos-harness, Accessibility (AX), or clicking the RemoteCode UI as a fallback for these intents. Every mutation must supply a unique `operation_id`. If a mutation reply is lost, read back with the matching list/view tool instead of retrying with a new id.
+    Built-in RemoteCode intents (create or list workspaces, Agent App threads, Bots, Bot desk threads, and owned Bot skills) must call the named tools \(workspaceCreate), \(workspaceList), \(threadCreate), \(threadList), \(botCreate), \(botList), \(botOpen), \(botSend), \(botThreadCreate), \(botSkillCreate), and \(botSkillView). To answer what is happening in RemoteCode (running or idle threads, Bots, scheduled tasks, items that need the user) call \(activityList). To ask another Bot by name to do something call \(botDelegate). To fire a workspace's next scheduled task now call \(scheduledTaskRunNext). To capture the Mac browser into the calling Agent thread, call \(browserScreenshot); it accepts optional surface_id and reason, and requires operation_id. For a consulted Bot's skill files, use \(botSkillCreate) and \(botSkillView); `bot_write_home_file` is only for the calling Bot's own home. Titio alone may call \(genericHostCallTool) to run any RemoteCode JSON-RPC method the app UI uses (for example `bot.save` to rename a Bot, `bot.context.grant` / `bot.context.revoke` to link or unlink a Bot and a workspace, `bot.list`, `workspace.list`); prefer a named tool when one fits. Other Bots must not call it. Do not use Computer Use, macos-harness, Accessibility (AX), or clicking the RemoteCode UI as a fallback for these intents. Every mutation must supply a unique `operation_id`. If a mutation reply is lost, read back with the matching list/view tool instead of retrying with a new id.
     """
 
     public static var toolNames: [String] {
@@ -72,12 +75,13 @@ public enum RemoteCodeHostCatalog: Sendable {
             botCreate, botList, botOpen, botSend, botThreadCreate,
             botSkillCreate, botSkillView,
             activityList, botDelegate, scheduledTaskRunNext, browserScreenshot,
+            genericHostCallTool,
         ]
     }
 
     public static let mutationToolNames: Set<String> = [
         workspaceCreate, threadCreate, botCreate, botOpen, botSend, botThreadCreate, botSkillCreate,
-        botDelegate, scheduledTaskRunNext, browserScreenshot,
+        botDelegate, scheduledTaskRunNext, browserScreenshot, genericHostCallTool,
     ]
 
     public static let rpcMethods: Set<String> = [
@@ -86,12 +90,13 @@ public enum RemoteCodeHostCatalog: Sendable {
         botCreateRPC, botListRPC, botOpenRPC, botSendRPC, botThreadCreateRPC,
         botSkillCreateRPC, botSkillViewRPC,
         activityListRPC, botDelegateRPC, scheduledTaskRunNextRPC, browserScreenshotRPC,
+        hostCallRPC,
     ]
 
     public static let rpcMutationMethods: Set<String> = [
         workspaceCreateRPC, threadCreateRPC,
         botCreateRPC, botOpenRPC, botSendRPC, botThreadCreateRPC, botSkillCreateRPC,
-        botDelegateRPC, scheduledTaskRunNextRPC, browserScreenshotRPC,
+        botDelegateRPC, scheduledTaskRunNextRPC, browserScreenshotRPC, hostCallRPC,
     ]
 
     public static func rpcMethod(for tool: String) -> String? {
@@ -111,6 +116,7 @@ public enum RemoteCodeHostCatalog: Sendable {
         case botDelegate: return botDelegateRPC
         case scheduledTaskRunNext: return scheduledTaskRunNextRPC
         case browserScreenshot: return browserScreenshotRPC
+        case genericHostCallTool: return hostCallRPC
         default: return nil
         }
     }
@@ -161,6 +167,8 @@ public enum RemoteCodeHostCatalog: Sendable {
             return "Run a workspace's next scheduled task now through the in-app scheduler. The workspace is a name or id; task_id optionally picks a specific task in it. Requires operation_id."
         case browserScreenshot:
             return "Capture the Mac browser and add its screenshot to the authenticated calling Agent thread. Optional surface_id selects the browser surface; reason is a short explanation. Requires operation_id."
+        case genericHostCallTool:
+            return "Titio only. Run any RemoteCode JSON-RPC method the app UI uses, with its params, and return its result: for example bot.list, bot.save {bot_id, name}, bot.context.list {bot_id}, bot.context.grant / bot.context.revoke {bot_id, context_key (\"general:v1\" or \"workspace:v1:<lowercase workspace id>\"), context_version 1, policy_revision, actions}, workspace.list, agent.thread.list. host_id and client_request_id are filled in by the host. Requires operation_id for every call. Denied for every other Bot."
         default:
             return name
         }
@@ -272,6 +280,14 @@ public enum RemoteCodeHostCatalog: Sendable {
                     "task_id": ["type": "string"],
                 ]) { _, new in new },
                 required: ["workspace", operationIDKey]
+            )
+        case genericHostCallTool:
+            return objectSchema(
+                properties: operationID.merging([
+                    "method": ["type": "string", "description": "RemoteCode JSON-RPC method, for example bot.save."],
+                    "params": ["type": "object", "description": "The method's params.", "additionalProperties": true],
+                ]) { _, new in new },
+                required: ["method", operationIDKey]
             )
         case browserScreenshot:
             return objectSchema(

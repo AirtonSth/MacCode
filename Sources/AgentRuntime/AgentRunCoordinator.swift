@@ -1426,14 +1426,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let preservedUserContent = request.userMessageContent ?? request.prompt
         let outboundPrompt = request.prompt
         var effectiveEnvironment = request.environment
-        if request.provider != .distill {
-            let scopedEnvironment = await runEnvironmentProvider?(
-                request.provider,
-                request.threadId,
-                request.environment
-            ) ?? [:]
-            effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
-        }
+        // Every provider, Distill included, needs the thread's host scope (app
+        // socket, caller Bot, thread) or its RemoteCode MCP tools cannot reach the app.
+        let scopedEnvironment = await runEnvironmentProvider?(
+            request.provider,
+            request.threadId,
+            request.environment
+        ) ?? [:]
+        effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
         let attemptId = request.runId.value.uuidString
         // Parent linkage is lifecycle metadata: nested receipts attach to the
         // actual controller run.

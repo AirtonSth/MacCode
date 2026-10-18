@@ -20,10 +20,10 @@ final class RemoteCodeHostCatalogMCPTests: XCTestCase {
             let schema = try XCTUnwrap(tools.first { ($0["name"] as? String) == tool }?["inputSchema"] as? [String: Any])
             XCTAssertEqual(schema["additionalProperties"] as? Bool, false)
         }
-        XCTAssertFalse(names.contains(RemoteCodeHostCatalog.genericHostCallTool))
+        XCTAssertTrue(names.contains(RemoteCodeHostCatalog.genericHostCallTool))
 
         let unknown = try parse(server.handle(
-            #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rc_host_call","arguments":{}}}"#
+            #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rc_host","arguments":{}}}"#
         ))
         let error = try XCTUnwrap(unknown["error"] as? [String: Any])
         XCTAssertEqual(error["code"] as? Int, -32602)

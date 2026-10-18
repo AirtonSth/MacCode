@@ -57,6 +57,65 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
         XCTAssertEqual(router.createCount, 2, "unknown outcomes must not be blindly retried as a new create")
     }
 
+    private func hostCall(_ method: String, params: [String: JSONValue], operationID: String, router: HostCatalogReceiptRouter) -> JSONRPCRequest {
+        JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: RemoteCodeHostCatalog.hostCallRPC, params: [
+            "thread_id": .string(UUID().uuidString.lowercased()),
+            "run_id": .string(router.fixedRunID),
+            BotPeerDelegation.capabilityRPCParameterKey: .string(router.activeCapability),
+            "client_request_id": .string(operationID),
+            "method": .string(method),
+            "params": .object(params),
+        ])
+    }
+
+    func test_hostCallRunsAnyUIMethodForTitioAsAFullAccessMutation() async throws {
+        // WHY: Titio must be able to do anything the user can in RemoteCode,
+        // e.g. rename a Bot, through the same paired-device mutation path.
+        let router = HostCatalogReceiptRouter()
+        router.callerIsTitio = true
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let request = hostCall("bot.save", params: ["bot_id": .string(UUID().uuidString.lowercased()), "name": .string("Developer")], operationID: "rename-1", router: router)
+        let response = await dispatcher.dispatchUnixSocket(request)
+        XCTAssertNil(response.error)
+        XCTAssertEqual(router.pairedBotCalls.map(\.method), ["bot.save"])
+        XCTAssertEqual(router.pairedBotCalls.first?.params["name"]?.stringValue, "Developer")
+        XCTAssertEqual(router.pairedBotCalls.first?.params["host_id"]?.stringValue, router.activeHostID, "host binding comes from the authenticated run")
+        XCTAssertEqual(router.authorizationMutations, [true], "host.call always needs captured fullAccess")
+        let replay = await dispatcher.dispatchUnixSocket(request)
+        XCTAssertNil(replay.error)
+        XCTAssertEqual(router.pairedBotCalls.count, 1, "the same operation_id must not run the method twice")
+    }
+
+    func test_hostCallBindsBotReadsToTheRunHost() async {
+        let router = HostCatalogReceiptRouter()
+        router.callerIsTitio = true
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let response = await dispatcher.dispatchUnixSocket(hostCall("bot.guest.state", params: ["bot_id": .string(UUID().uuidString.lowercased()), "host_id": .string("forged")], operationID: "read-guest-1", router: router))
+        XCTAssertNil(response.error)
+        XCTAssertEqual(router.pairedBotCalls.first?.params["host_id"]?.stringValue, router.activeHostID, "a caller-supplied host id is replaced")
+        XCTAssertNil(router.pairedBotCalls.first?.params["client_request_id"], "reads get no receipt id")
+    }
+
+    func test_hostCallIsDeniedToEveryBotExceptTitio() async {
+        let router = HostCatalogReceiptRouter()
+        router.callerIsTitio = false
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let response = await dispatcher.dispatchUnixSocket(hostCall("bot.save", params: ["bot_id": .string("bot-1"), "name": .string("X")], operationID: "rename-2", router: router))
+        XCTAssertEqual(response.error?.code, -32098)
+        XCTAssertTrue(router.pairedBotCalls.isEmpty)
+    }
+
+    func test_hostCallCannotReenterManagedProviderMethods() async {
+        let router = HostCatalogReceiptRouter()
+        router.callerIsTitio = true
+        let dispatcher = JSONRPCDispatcher(router: router)
+        for method in [RemoteCodeHostCatalog.hostCallRPC, RemoteCodeHostCatalog.botCreateRPC, "bot.peer.ask", "rpc.batch"] {
+            let response = await dispatcher.dispatchUnixSocket(hostCall(method, params: [:], operationID: "nested-\(method.count)", router: router))
+            XCTAssertEqual(response.error?.code, -32602, method)
+        }
+        XCTAssertEqual(router.createCount, 0)
+    }
+
     func test_hostBrowserScreenshotRequiresAuthenticatedActiveRun() async {
         let router = HostCatalogReceiptRouter()
         let dispatcher = JSONRPCDispatcher(router: router)
@@ -572,6 +631,16 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
     var screenshotSurface: SurfaceID?
     var screenshotReason: String?
     var screenshotError: Error?
+    var callerIsTitio = false
+    let fixedRunID = UUID().uuidString.lowercased()
+    var pairedBotCalls: [(method: String, params: [String: JSONValue])] = []
+
+    override func managedHostCallerIsTitio(threadID: AgentThreadID) throws -> Bool { callerIsTitio }
+
+    override func dispatchPairedBotRemote(method: String, params: [String: JSONValue]) async throws -> JSONValue {
+        pairedBotCalls.append((method, params))
+        return .object(["status": .string("completed")])
+    }
 
     override func captureHostBrowserToChat(callerThread: AgentThreadID, surface: SurfaceID?, reason: String) throws -> JSONValue {
         screenshotCount += 1

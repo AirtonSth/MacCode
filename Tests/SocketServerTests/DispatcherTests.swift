@@ -73,6 +73,8 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         }
     }
 
+    func managedHostCallerIsTitio(threadID: AgentThreadID) throws -> Bool { false }
+
     func askBotPeer(
         callerThread: AgentThreadID,
         callerRun: AgentRunID,

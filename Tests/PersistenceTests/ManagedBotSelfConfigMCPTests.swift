@@ -31,7 +31,7 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
                 Set(names),
                 Set(BotSelfConfigCatalog.toolNames + RemoteCodeHostCatalog.toolNames)
             )
-            XCTAssertFalse(names.contains(RemoteCodeHostCatalog.genericHostCallTool))
+            XCTAssertTrue(names.contains(RemoteCodeHostCatalog.genericHostCallTool))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.getSettings))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.setSettings))
             XCTAssertTrue(names.contains(BotSelfConfigCatalog.listSecrets))

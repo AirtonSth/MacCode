@@ -3606,6 +3606,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return ctx
     }
 
+    public func managedHostCallerIsTitio(threadID: AgentThreadID) throws -> Bool {
+        guard let ctx = context,
+              let conversation = try ctx.botStore.conversationLinked(to: threadID),
+              let bot = try ctx.botStore.get(id: conversation.botID), bot.deletedAt == nil else { return false }
+        return bot.handle.lowercased() == TitioIdentity.handle
+    }
+
     public func authenticateManagedHostCall(
         threadID: AgentThreadID,
         runID: AgentRunID,

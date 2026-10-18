@@ -204,6 +204,41 @@ final class AgentRunCoordinatorBotSecretScopeTests: XCTestCase {
         XCTAssertEqual(adapter.requests.first(where: { $0.threadId == localThread.id })?.permissionMode, .supervised)
     }
 
+    func test_distillRunsReceiveTheThreadHostScopeSoRemoteCodeToolsReachTheApp() async throws {
+        // WHY: without the app socket and thread scope a Distill Bot (Titio) fails every
+        // rc_* / bot_* tool with "Bot delegation requires RC_REMOTE_CODE_AGENT_APP_SOCKET_PATH".
+        let tmp = NSTemporaryDirectory() + "rc2-distill-host-scope-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "titio", provider: .distill, model: "auto")
+        try threadRepo.upsert(thread)
+        let adapter = ScopeRefreshingAdapter(provider: .distill)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo,
+            providerAdapters: [.distill: adapter],
+            botSecretStore: InMemoryBotSecretStore()
+        )
+        coordinator.runEnvironmentProvider = { provider, threadId, _ in
+            [
+                BotPeerDelegation.socketEnvironmentKey: "/tmp/rc-test.sock",
+                BotPeerDelegation.threadEnvironmentKey: threadId.value.uuidString,
+                "REMOTE_CODE_AGENT_PROVIDER": provider.rawValue,
+            ]
+        }
+        let runID = AgentRunID()
+        _ = try await coordinator.startRun(.init(
+            runId: runID, threadId: thread.id, provider: .distill, model: "auto", cwd: tmp, prompt: "rename a bot"
+        ))
+        try await waitForRun(runID, in: runRepo)
+        let environment = try XCTUnwrap(adapter.requests.first?.environment)
+        XCTAssertEqual(environment[BotPeerDelegation.socketEnvironmentKey], "/tmp/rc-test.sock")
+        XCTAssertEqual(environment[BotPeerDelegation.threadEnvironmentKey], thread.id.value.uuidString)
+        XCTAssertEqual(environment[BotPeerDelegation.runEnvironmentKey], runID.value.uuidString)
+    }
+
     func test_reusedProviderSessionsRefreshWhenBotSecretsChangeButReuseWhenUnchanged() async throws {
         for provider in [AgentProvider.claude, .codex, .grok] {
             let tmp = NSTemporaryDirectory() + "rc2-bot-secret-scope-" + provider.rawValue + "-" + UUID().uuidString

@@ -2,9 +2,9 @@ import XCTest
 import CoreModel
 
 final class RemoteCodeHostCatalogTests: XCTestCase {
-    func test_catalogIsFiniteNamedToolsWithoutGenericHostCall() {
-        // WHY: the public MCP contract is a closed intent list. A generic
-        // host-call tool would dump HostMutationContract onto the provider.
+    func test_catalogIsNamedToolsPlusTitioOnlyHostCall() {
+        // WHY: named intents stay the default; rc_host_call is the one generic
+        // tool, admitted by the host only for Titio.
         let names = RemoteCodeHostCatalog.toolNames
         XCTAssertEqual(names, [
             RemoteCodeHostCatalog.workspaceCreate,
@@ -22,11 +22,12 @@ final class RemoteCodeHostCatalogTests: XCTestCase {
             RemoteCodeHostCatalog.botDelegate,
             RemoteCodeHostCatalog.scheduledTaskRunNext,
             RemoteCodeHostCatalog.browserScreenshot,
+            RemoteCodeHostCatalog.genericHostCallTool,
         ])
-        XCTAssertFalse(names.contains(RemoteCodeHostCatalog.genericHostCallTool))
         XCTAssertFalse(names.contains("rc_host"))
         XCTAssertEqual(Set(names).count, names.count)
-        XCTAssertEqual(RemoteCodeHostCatalog.rpcMethod(for: RemoteCodeHostCatalog.genericHostCallTool), nil)
+        XCTAssertEqual(RemoteCodeHostCatalog.rpcMethod(for: RemoteCodeHostCatalog.genericHostCallTool), RemoteCodeHostCatalog.hostCallRPC)
+        XCTAssertTrue(RemoteCodeHostCatalog.isMutation(RemoteCodeHostCatalog.genericHostCallTool), "host.call needs operation_id and fullAccess")
     }
 
     func test_mutationsRequireOperationIDAndMapOntoPrivateHostRPC() {

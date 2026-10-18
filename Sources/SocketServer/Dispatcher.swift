@@ -228,6 +228,8 @@ public protocol CommandRouting: AnyObject {
     func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, consultationID: UUID?, delegationCapability: String?) async throws -> JSONValue
     func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue], delegationCapability: String?) throws -> JSONValue
     func authenticateManagedHostCall(threadID: AgentThreadID, runID: AgentRunID, delegationCapability: String?, mutation: Bool, method: String) throws
+    /// True when the thread belongs to Titio, the only caller admitted to `host.call`.
+    func managedHostCallerIsTitio(threadID: AgentThreadID) throws -> Bool
     func createHostBot(name: String, title: String, description: String, handle: String?, soul: String, callerRun: AgentRunID) throws -> JSONValue
     func listHostBots() throws -> JSONValue
     func openHostBot(botID: BotID) throws -> JSONValue
@@ -518,6 +520,8 @@ public extension CommandRouting {
     func authenticateManagedHostCall(threadID: AgentThreadID, runID: AgentRunID, delegationCapability: String?, mutation: Bool, method: String) throws {
         throw JSONRPCError.notSupported("managed host catalog")
     }
+
+    func managedHostCallerIsTitio(threadID: AgentThreadID) throws -> Bool { false }
 
     func createHostBot(name: String, title: String, description: String, handle: String?, soul: String, callerRun: AgentRunID) throws -> JSONValue {
         throw JSONRPCError.notSupported("host Bot create")
@@ -1794,6 +1798,9 @@ public final class JSONRPCDispatcher {
         } catch {
             return .init(id: req.id, error: Self.mapDomainError(error, method: req.method))
         }
+        if req.method == RemoteCodeHostCatalog.hostCallRPC {
+            return await dispatchTitioHostCall(req)
+        }
         return await Self.$managedProviderSocketAuthenticated.withValue(true) {
             if Self.managedPeerReceiptMethods.contains(req.method) || isPeerReceiptStatus {
                 let context: MutationRequestContext
@@ -1858,6 +1865,74 @@ public final class JSONRPCDispatcher {
                 )
             }
             return await dispatchLocalIPC(req)
+        }
+    }
+
+    /// Inner methods `host.call` refuses: the managed provider aliases and batches,
+    /// so a call cannot re-enter this path or skip its own authentication.
+    nonisolated static func titioHostCallAdmits(_ method: String) -> Bool {
+        !method.isEmpty && method != "rpc.batch"
+            && !managedProviderSocketMethods.contains(method)
+            && !method.hasPrefix("host.") && !method.hasPrefix("bot.peer.")
+    }
+
+    /// `host.call` lets Titio run any RemoteCode RPC the app UI or a paired
+    /// device can, through the same paired-device mutation path (receipts, host
+    /// binding, events). The run is already authenticated as fullAccess.
+    private func dispatchTitioHostCall(_ req: JSONRPCRequest) async -> JSONRPCResponse {
+        let params = req.params ?? [:]
+        guard let threadUUID = params["thread_id"]?.stringValue.flatMap(UUID.init),
+              let runUUID = params["run_id"]?.stringValue.flatMap(UUID.init),
+              let operationID = params["client_request_id"]?.stringValue,
+              let method = params["method"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return .init(id: req.id, error: .invalidParams)
+        }
+        let threadID = AgentThreadID(threadUUID)
+        do {
+            guard try router.managedHostCallerIsTitio(threadID: threadID) else {
+                return .init(id: req.id, error: JSONRPCError(code: -32098, message: "rc_host_call is available only to Titio."))
+            }
+            guard Self.titioHostCallAdmits(method) else {
+                return .init(id: req.id, error: JSONRPCError(code: -32602, message: "rc_host_call cannot run \(method)."))
+            }
+            guard let active = try router.activeAgentDelegation(thread: threadID, run: AgentRunID(runUUID)) else {
+                return .init(id: req.id, error: JSONRPCError(code: -32047, message: "Host catalog requires an authenticated active run."))
+            }
+            var inner: [String: JSONValue] = params["params"]?.objectValue ?? [:]
+            if method.hasPrefix("bot.") {
+                // Paired devices send their host binding; Titio's is the run's host.
+                inner["host_id"] = .string(active.hostId)
+            }
+            if Self.hostMutationMethods.contains(method) {
+                // Deterministic per run, so a replayed operation_id reuses the receipt.
+                inner["client_request_id"] = .string(AgentMessageTransport.bodySHA256Hex(
+                    "titio-host-call-v1\u{0}\(runUUID.uuidString.lowercased())\u{0}\(operationID)"
+                ))
+            }
+            RemoteCodeHostCatalogDiagnostics.authorization(
+                decision: "titio_host_call",
+                method: method,
+                runID: runUUID.uuidString.lowercased(),
+                threadID: threadUUID.uuidString.lowercased()
+            )
+            let response = await dispatch(
+                JSONRPCRequest(jsonrpc: "2.0", id: req.id, method: method, params: inner),
+                mutationContext: MutationRequestContext(
+                    ownerFingerprint: Self.managedPeerOwnerFingerprint(
+                        hostID: active.hostId,
+                        threadID: threadUUID.uuidString.lowercased(),
+                        runID: runUUID.uuidString.lowercased(),
+                        capability: active.capability
+                    ),
+                    hostId: active.hostId,
+                    bootEpoch: 0
+                )
+            )
+            return response
+        } catch let error as JSONRPCError {
+            return .init(id: req.id, error: error)
+        } catch {
+            return .init(id: req.id, error: Self.mapDomainError(error, method: method))
         }
     }
 
