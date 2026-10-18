@@ -3000,9 +3000,12 @@ final class BotsWindowTests: XCTestCase {
             "the rail inside BotsRootView must not attach a second confirm dialog"
         )
         XCTAssertTrue(
-            source.contains("BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail)"),
-            "main-shell BotsRootView must not stack a second delete dialog beside the sidebar roster"
+            source.contains("BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail || showsCatalogRail)"),
+            "BotsRootView owns the one delete dialog whenever it shows the roster rail"
         )
+        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertFalse(sidebar.contains("BotsRosterList("),
+                       "the unified sidebar no longer hosts a roster, so no second delete dialog can stack")
     }
 
     func test_showHiddenSurvivesRelaunch_becauseShowHiddenIsUserWorkflowState() throws {
@@ -16807,16 +16810,12 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(sidebar.contains("onPresentBots"))
         XCTAssertTrue(sidebar.contains("isBotsSelected"))
         XCTAssertTrue(sidebar.contains("setBotsSelected"))
-        XCTAssertTrue(sidebar.contains("accessibilityIdentifier(\"sidebar.bots\")"))
-        XCTAssertFalse(sidebar.contains("title: \"Bots\""))
-        XCTAssertTrue(sidebar.contains("BotsModeSwitcher"))
-        XCTAssertTrue(
-            sidebar.contains("attachDeleteConfirmation: true"),
-            "sidebar roster is a sibling hosting view; Delete must attach confirm here"
-        )
-        XCTAssertTrue(bots.contains("bots.chrome.agentic"))
-        XCTAssertTrue(bots.contains("bots.chrome.bots"))
-        XCTAssertTrue(sidebar.contains("if vm.isBotsSelected"))
+        XCTAssertTrue(sidebar.contains("accessibilityIdentifier(\"sidebar.manageBots\")"),
+                      "the unified sidebar reaches the Bots catalog from Manage Bots and Teams")
+        XCTAssertFalse(sidebar.contains("BotsModeSwitcher"), "the Workspaces | Bots mode toggle is gone")
+        XCTAssertFalse(bots.contains("bots.chrome.agentic"))
+        XCTAssertTrue(main.contains("showsCatalogRail: true"),
+                      "the main shell shows the roster beside Bots content instead of in the sidebar")
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.new\")"))
         XCTAssertFalse(bots.contains("bots.fleet.row."), "Fleet Home row is not a destination")
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.roster\")"))
@@ -16849,7 +16848,6 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("bots.studio.desktop"),
             "the read-only Desktop card still ships inside the Security tab"
         )
-        XCTAssertTrue(bots.contains("bots.chrome.agentic"))
         XCTAssertFalse(bots.contains("bots.home.goal"))
         XCTAssertTrue(bots.contains("accessibilityAddTraits(selected ? .isSelected : [])"))
         XCTAssertTrue(bots.contains("BotsChrome.hitTarget"))
@@ -17046,8 +17044,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertLessThan(reportBug.lowerBound, scheduleTasks.lowerBound,
                           "Report Bug is a header icon, not a dest row under Schedule Tasks")
         XCTAssertTrue(
-            sidebar.contains("BotsModeSwitcher"),
-            "Bots is entered from the Agentic/Bots switcher, not a dest row"
+            sidebar.contains("accessibilityIdentifier(\"sidebar.manageBots\")"),
+            "Bots is entered from Manage Bots and Teams in the unified sidebar"
         )
     }
 
@@ -17112,51 +17110,14 @@ final class BotsWindowTests: XCTestCase {
                        "the attention bell is replaced by the Active Bots row")
     }
 
-    func test_modeSwitcherSitsOnGlass_andBotSearchMatchesWorkspaceFilter() throws {
-        // WHY: opaque surfaceRaised / surfaceOverlay on Agentic | Bots punches
-        // a dark slab through the sidebar NSVisualEffectView. Search bots used
-        // the 44pt Bots hit target and sat taller than Filter workspaces.
+    func test_botSearchMatchesWorkspaceFilter() throws {
+        // WHY: Search bots and the sidebar search must share one field style.
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        guard let start = bots.range(of: "public struct BotsModeSwitcher") else {
-            return XCTFail("BotsModeSwitcher must exist")
-        }
-        let rest = bots[start.lowerBound...]
-        let end = rest.range(of: "\npublic struct BotsRosterList")?.lowerBound ?? rest.endIndex
-        let switcher = String(bots[start.lowerBound..<end])
-
-        XCTAssertFalse(
-            switcher.contains("DS.Palette.surfaceRaised"),
-            "mode switcher track must not paint an opaque raised slab on glass"
-        )
-        XCTAssertFalse(
-            switcher.contains("DS.Palette.surfaceOverlay"),
-            "selected segment must not use opaque surfaceOverlay on glass"
-        )
-        XCTAssertTrue(
-            switcher.contains(".background(DS.Palette.hover)"),
-            "mode switcher track must be a translucent hover wash so sidebar glass shows through"
-        )
-        XCTAssertTrue(
-            switcher.contains("selected ? DS.Palette.pressed : Color.clear"),
-            "selected segment must be a frost wash, not a solid raised surface"
-        )
-        XCTAssertTrue(
-            bots.contains("SidebarSearchField("),
-            "Search bots must use the same SidebarSearchField as Filter workspaces"
-        )
-        XCTAssertTrue(
-            sidebar.contains("SidebarSearchField("),
-            "Filter workspaces must use the same SidebarSearchField as Search bots"
-        )
-        XCTAssertTrue(
-            sidebar.contains("placeholder: \"Filter workspaces\""),
-            "workspace filter keeps its own placeholder"
-        )
-        XCTAssertTrue(
-            bots.contains("placeholder: BotsChrome.Label.search"),
-            "bots filter keeps Search bots as the only copy difference"
-        )
+        XCTAssertTrue(bots.contains("SidebarSearchField("))
+        XCTAssertTrue(sidebar.contains("SidebarSearchField("))
+        XCTAssertTrue(sidebar.contains("placeholder: \"Search workspaces and Bots\""))
+        XCTAssertTrue(bots.contains("placeholder: BotsChrome.Label.search"))
     }
 
     private struct SeededDeskTurn {

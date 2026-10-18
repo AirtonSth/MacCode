@@ -166,7 +166,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let source = try String(contentsOf: sidebarViewURL())
         let headerStart = try XCTUnwrap(source.range(of: "HStack(spacing: 2)"))
         let headerEnd = try XCTUnwrap(
-            source.range(of: "BotsModeSwitcher(", range: headerStart.upperBound..<source.endIndex)
+            source.range(of: "Button { vm.newWorkspace() }", range: headerStart.upperBound..<source.endIndex)
         )
         let header = source[headerStart.lowerBound..<headerEnd.lowerBound]
         let account = try XCTUnwrap(header.range(of: "if vm.privateAccountUser != nil"))
@@ -192,7 +192,7 @@ final class AppIdentityNotificationTests: XCTestCase {
     func testSidebarWorkspaceFilterStaysVisibleWithoutAutofocus() throws {
         let source = try String(contentsOf: sidebarViewURL())
 
-        XCTAssertTrue(source.contains("if !vm.workspaces.isEmpty {\n                workspaceFilterField"),
+        XCTAssertTrue(source.contains("if !vm.workspaces.isEmpty || !vm.generalBots.isEmpty {\n                workspaceFilterField"),
                       "the Workspaces filter must stay visible for normal short workspace lists, not only after the list grows past an arbitrary count")
         XCTAssertFalse(source.contains("vm.workspaces.count > 6"),
                        "the Workspaces filter must not disappear for users with only a few workspaces")

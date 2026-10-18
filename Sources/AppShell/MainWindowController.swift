@@ -389,6 +389,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     /// Test seam: Workspaces <-> Bots must reattach this instance, not remount.
     var botsHostingViewForTesting: NSView? { botsHostingView }
     var sidebarWorkspacesForTesting: [Workspace] { sidebar.workspacesForTesting }
+    var sidebarViewModelForTesting: SidebarViewModel { sidebar.viewModelForTesting }
+    var sidebarBotsViewModelForTesting: BotsViewModel { sidebar.botsViewModel }
+    /// Same callback the sidebar's "Manage Bots and Teams" footer runs.
+    func sidebarOpenBotsForTesting() { sidebar.openBotsForTesting() }
     private var destinationPersistenceTask: Task<Void, Never>?
     private var workspaceRebuildTask: Task<Void, Never>?
     private var workspaceRebuildGeneration: UInt64 = 0
@@ -1494,7 +1498,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     }
 
     private func makeBotsShellHost(vm: BotsViewModel) -> NSView {
-        let host = ContentColumnHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false))
+        let host = ContentColumnHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false, showsCatalogRail: true))
         host.cancelHorizontalTitlebarGutter = BotsViewModel.cancelsWindowLeadingTitlebarGutter(
             presentsAsDetachedWindow: vm.presentsAsDetachedWindow
         )

@@ -4624,11 +4624,16 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func requestLeaveBotsMode() {
+        leaveBots { [weak self] in self?.onLeaveBots?() }
+    }
+
+    /// Any shell navigation away from Bots: keep drafts and ask before dropping an unsaved new Bot.
+    public func leaveBots(then proceed: @escaping () -> Void) {
         flushPendingDraftPersistence()
         requestLeaveUnsavedNewBot { [weak self] in
             guard let self else { return }
             self.invalidateNavigationFreshness()
-            self.onLeaveBots?()
+            proceed()
         }
     }
 
@@ -12708,85 +12713,6 @@ extension BotsViewModel: AgentRunObserver {
     }
 }
 
-// MARK: - Shared sidebar chrome
-
-/// One control for the single shell sidebar: Workspaces or Bots (roster).
-public struct BotsModeSwitcher: View {
-    public var isBotsSelected: Bool
-    public var onSelectAgentic: () -> Void
-    public var onSelectBots: () -> Void
-
-    public init(
-        isBotsSelected: Bool,
-        onSelectAgentic: @escaping () -> Void,
-        onSelectBots: @escaping () -> Void
-    ) {
-        self.isBotsSelected = isBotsSelected
-        self.onSelectAgentic = onSelectAgentic
-        self.onSelectBots = onSelectBots
-    }
-
-    public var body: some View {
-        HStack(spacing: 2) {
-            segment(
-                title: BotsChrome.Label.agentic,
-                symbol: "square.grid.2x2",
-                selected: !isBotsSelected,
-                identifier: "bots.chrome.agentic",
-                action: onSelectAgentic
-            )
-            segment(
-                title: BotsChrome.Label.bots,
-                symbol: "person.2",
-                selected: isBotsSelected,
-                identifier: "bots.chrome.bots",
-                action: onSelectBots
-            )
-        }
-        .padding(2)
-        // Glass track: the sidebar sits on NSVisualEffectView. An opaque
-        // surfaceRaised slab punches a dark block through that material.
-        .background(DS.Palette.hover)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                .strokeBorder(DS.Palette.line.opacity(0.45), lineWidth: DS.Border.hairline)
-        )
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("bots.chrome.mode")
-        .accessibilityLabel("Sidebar mode")
-        .accessibilityValue(isBotsSelected ? BotsChrome.Label.bots : BotsChrome.Label.agentic)
-    }
-
-    /// Native-feeling segmented control: recessed glass track, frosted
-    /// selected segment, compact height (desktop control, not a touch target).
-    private func segment(
-        title: String,
-        symbol: String,
-        selected: Bool,
-        identifier: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: DS.Space.xs) {
-                Image(systemName: symbol)
-                    .font(.system(size: 10, weight: .semibold))
-                    .accessibilityHidden(true)
-                Text(title)
-                    .font(DS.Font.caption.weight(selected ? .semibold : .medium))
-            }
-            .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
-            .frame(maxWidth: .infinity, minHeight: 26)
-            .background(selected ? DS.Palette.pressed : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityIdentifier(identifier)
-    }
-}
-
 /// Roster body shared by the shell sidebar and the detached Bots window.
 public struct BotsRosterList: View {
     @ObservedObject private var vm: BotsViewModel
@@ -13160,6 +13086,8 @@ public struct BotsRootView: View {
     /// Standalone Bots window keeps its own rail. The main shell hosts the
     /// roster inside the single sidebar instead.
     private let embedsRosterRail: Bool
+    /// The main shell has no Bots sidebar mode: "Manage Bots and Teams" shows the roster here.
+    private let showsCatalogRail: Bool
     @State private var pendingClearAllDeskThreads = false
     @State private var pendingDockerDataClear: BotID?
     @State private var isConfirmingTitioFactoryReset = false
@@ -13167,9 +13095,10 @@ public struct BotsRootView: View {
     @State private var contextExportModel: BotContextExportModel?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
+    public init(vm: BotsViewModel, embedsRosterRail: Bool = true, showsCatalogRail: Bool = false) {
         self.vm = vm
         self.embedsRosterRail = embedsRosterRail
+        self.showsCatalogRail = showsCatalogRail
     }
 
     private var titlebarSafeAreaEdges: Edge.Set {
@@ -13245,26 +13174,20 @@ public struct BotsRootView: View {
         } message: {
             Text("This deletes the protected value from this Bot's storage.")
         }
-        .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail))
-        .modifier(BotTeamsGroupsSheets(vm: vm, teamsGroups: vm.teamsGroups, enabled: embedsRosterRail))
+        .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail || showsCatalogRail))
+        .modifier(BotTeamsGroupsSheets(vm: vm, teamsGroups: vm.teamsGroups, enabled: embedsRosterRail || showsCatalogRail))
         .modifier(BotsUnsavedNewBotConfirmation(vm: vm))
         .onAppear { vm.scheduleFreshnessPass() }
     }
 
     private var showsRosterRail: Bool {
-        embedsRosterRail && vm.isControlPlaneActive
+        (embedsRosterRail || showsCatalogRail) && vm.isControlPlaneActive
     }
 
     private var rosterRail: some View {
         VStack(alignment: .leading, spacing: 0) {
-            BotsModeSwitcher(
-                isBotsSelected: true,
-                onSelectAgentic: { vm.requestLeaveBotsMode() },
-                onSelectBots: {}
-            )
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.top, DS.Space.xl)
             BotsRosterList(vm: vm)
+                .padding(.top, DS.Space.xl)
         }
         .frame(width: BotsChrome.rosterWidth)
         .background(DS.Palette.surface)
