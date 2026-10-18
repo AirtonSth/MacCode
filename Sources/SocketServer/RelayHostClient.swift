@@ -93,9 +93,11 @@ public final class RelayHostClient: @unchecked Sendable {
         lock.lock()
         let sleeper = sleepTask
         let host = hostSocket
+        let open = Array(streams.values)
         lock.unlock()
         host?.close(code: 1000)
         sleeper?.cancel()
+        for stream in open { terminate(stream, code: 1001) }
     }
 
     var openStreamCount: Int {
