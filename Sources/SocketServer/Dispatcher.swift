@@ -3716,7 +3716,7 @@ public final class JSONRPCDispatcher {
                 let modelSelection = try modelSelection(from: params)
                 let provider = modelSelection?.provider ?? (AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex)
                 let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue ?? "fake-model"
-                let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .supervised
+                let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .fullAccess
                 let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium
                 let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init) ?? .auto
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
@@ -3776,7 +3776,7 @@ public final class JSONRPCDispatcher {
                 let modelSelection = try modelSelection(from: params)
                 let provider = modelSelection?.provider ?? (AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex)
                 let model = modelSelection?.effectiveModel ?? params["model"]?.stringValue ?? "fake-model"
-                let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .supervised
+                let permission = params["permission_mode"]?.stringValue.flatMap(AgentPermissionMode.init) ?? .fullAccess
                 let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium
                 let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init) ?? .auto
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue

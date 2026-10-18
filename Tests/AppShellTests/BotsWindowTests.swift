@@ -5664,7 +5664,7 @@ final class BotsWindowTests: XCTestCase {
             accentColor: "#6E56CF",
             continuationGroup: "distill",
             interactionModes: [.default],
-            permissionModes: [.supervised],
+            permissionModes: [.supervised, .fullAccess],
             enabled: true,
             installed: true,
             status: .available,
@@ -7874,7 +7874,7 @@ final class BotsWindowTests: XCTestCase {
         vm.openDesk(bot)
         XCTAssertEqual(vm.deskRunProvider, .codex)
         XCTAssertEqual(vm.deskRouting.routingMode, .auto)
-        XCTAssertEqual(vm.deskRunPermissionMode, .supervised)
+        XCTAssertEqual(vm.deskRunPermissionMode, .fullAccess, "new Desk threads default to Full Access")
         XCTAssertNil(vm.resolvedProvider(for: bot))
     }
 
@@ -13595,9 +13595,9 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.attentionState(for: quinn), .none)
     }
 
-    func test_deskIdentityExposesJobProviderModelAndSupervised() throws {
+    func test_deskIdentityExposesJobProviderModelAndFullAccess() throws {
         // WHY: Desk is the live teammate, not a generic chat. The header must
-        // show who is talking, their job, the real route, and supervised mode.
+        // show who is talking, their job, the real route, and the default Full Access mode.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
@@ -13605,7 +13605,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).name, "Piper")
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).handle, "piper")
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).title, "Scout")
-        XCTAssertEqual(vm.permissionLabel(for: bot), "Supervised")
+        XCTAssertEqual(vm.permissionLabel(for: bot), "Full access")
         XCTAssertEqual(vm.desktopHonestyLabel, BotDesktopKind.logicalExecutionSpaceHonestyLabel)
     }
 

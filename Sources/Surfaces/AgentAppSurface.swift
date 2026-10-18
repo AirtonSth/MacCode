@@ -627,7 +627,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var sourceSelectionUserPinned: Bool = false
     @Published public var availableModels: [AgentModelDescriptor] = []
     @Published public var providerSnapshots: [AgentProviderSnapshot] = []
-    @Published public var permissionMode: AgentPermissionMode = .supervised
+    @Published public var permissionMode: AgentPermissionMode = .fullAccess
     @Published public var reasoningEffort: AgentReasoningEffort = .medium
     @Published public var reasoningModel: String?
     @Published public var distillMainEffortSelection: AgentEffortSelection = .automatic
@@ -7437,6 +7437,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // provider (not whatever model an older selected thread left on the VM).
         applyPreferredModelForCurrentProvider()
         normalizeSelectedModelOptions()
+        // New threads start in Full Access; the user can lower it per thread.
+        if supportedPermissionModesForSelectedProvider.contains(.fullAccess) {
+            permissionMode = .fullAccess
+        }
         // Auto admission requires revision > 0 and a current policy digest.
         // Leaving revision at the default 0 makes every first Auto send fail with
         // AgentOrchestrationAdmissionError.invalidPolicy (NSError code 4).

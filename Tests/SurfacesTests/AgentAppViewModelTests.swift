@@ -376,7 +376,7 @@ final class AgentAppViewModelTests: XCTestCase {
             accentColor: "#2F80ED",
             continuationGroup: "codex",
             interactionModes: [.default],
-            permissionModes: [.supervised],
+            permissionModes: [.supervised, .fullAccess],
             enabled: true,
             installed: true,
             status: .available,
@@ -2692,6 +2692,7 @@ final class AgentAppViewModelTests: XCTestCase {
         let adapter = CapturingProviderAdapter(provider: .codex)
         let (vm, repo) = try makeVM(adapter: adapter)
         vm.createThread(title: "dynamic approval")
+        vm.setPermissionMode(.supervised)
         let threadId = try XCTUnwrap(vm.selectedThreadId)
         let request = AssistantPendingRequest(
             id: "dynamic-permissions-1",
@@ -2720,8 +2721,10 @@ final class AgentAppViewModelTests: XCTestCase {
         let adapter = CapturingProviderAdapter(provider: .codex, responseDelayNanoseconds: 100_000_000)
         let (vm, repo) = try makeVM(adapter: adapter)
         vm.createThread(title: "A")
+        vm.setPermissionMode(.supervised)
         let threadA = try XCTUnwrap(vm.selectedThreadId)
         vm.createThread(title: "B")
+        vm.setPermissionMode(.supervised)
         let threadB = try XCTUnwrap(vm.selectedThreadId)
         vm.selectThread(threadA)
         let request = AssistantPendingRequest(
@@ -2753,8 +2756,10 @@ final class AgentAppViewModelTests: XCTestCase {
         let adapter = CapturingProviderAdapter(provider: .codex)
         let (vm, repo) = try makeVM(adapter: adapter)
         vm.createThread(title: "A")
+        vm.setPermissionMode(.supervised)
         let threadA = try XCTUnwrap(vm.selectedThreadId)
         vm.createThread(title: "B")
+        vm.setPermissionMode(.supervised)
         let threadB = try XCTUnwrap(vm.selectedThreadId)
         vm.selectThread(threadA)
         let request = AssistantPendingRequest(

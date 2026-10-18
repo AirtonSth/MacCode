@@ -135,7 +135,7 @@ final class BotDeskGuestThreadTests: XCTestCase {
         f.vm.setDeskPermissionMode(.supervised)
         XCTAssertEqual(f.vm.effectiveDeskPermissionMode, .fullAccess)
         f.vm.setDeskPermissionMode(.supervised)
-        XCTAssertEqual(f.vm.deskRouting.permissionMode, .supervised, "VM UI downgrade must be rejected")
+        XCTAssertEqual(f.vm.deskRouting.permissionMode, .fullAccess, "VM UI downgrade must be rejected")
 
         let thread = try await firstSend(f, bot: bot, provider: .distill)
         XCTAssertEqual(thread.permissionMode, .fullAccess, "new VM thread must persist full access")

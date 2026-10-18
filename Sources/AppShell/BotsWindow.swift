@@ -66,7 +66,7 @@ public struct BotDeskRouting: Equatable, Codable {
         providerInstanceID: String = AgentProvider.defaultProvider.rawValue,
         model: String = "",
         routingMode: AgentRoutingMode = .auto,
-        permissionMode: AgentPermissionMode = .supervised,
+        permissionMode: AgentPermissionMode = .fullAccess,
         reasoningEffort: AgentReasoningEffort = .medium,
         reasoningModel: String? = nil,
         distillMainEffortSelection: AgentEffortSelection? = nil,
