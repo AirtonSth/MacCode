@@ -15,8 +15,8 @@ enum BotPeerRPCError: Error, CustomStringConvertible, Equatable {
         case .missingContext(let key): return "Bot delegation requires \(key) on the active provider run."
         case .invalidContext(let key): return "Bot delegation received an invalid \(key)."
         case .socket(let message): return message
-        case .timeout(let budget): return "RemoteCode \(budget) request timed out."
-        case .invalidResponse: return "RemoteCode returned an invalid Bot delegation response."
+        case .timeout(let budget): return "MacCode \(budget) request timed out."
+        case .invalidResponse: return "MacCode returned an invalid Bot delegation response."
         case .remote(let message): return message
         }
     }
@@ -297,14 +297,14 @@ enum UnixDeadlineSession {
             let connectErrno = syscalls.errnoValue()
             if connectErrno != EINPROGRESS {
                 throw BotPeerRPCError.socket(
-                    "Bot delegation could not connect to RemoteCode: \(String(cString: strerror(connectErrno)))"
+                    "Bot delegation could not connect to MacCode: \(String(cString: strerror(connectErrno)))"
                 )
             }
             try wait(syscalls: syscalls, fd: fd, events: Int16(POLLOUT), deadline: deadline, budget: "connect")
             let socketError = syscalls.getSocketError(fd)
             guard socketError == 0 else {
                 throw BotPeerRPCError.socket(
-                    "Bot delegation could not connect to RemoteCode: \(String(cString: strerror(socketError)))"
+                    "Bot delegation could not connect to MacCode: \(String(cString: strerror(socketError)))"
                 )
             }
         }
@@ -394,10 +394,10 @@ enum UnixDeadlineSession {
                 let readErrno = syscalls.errnoValue()
                 if readErrno == EINTR { continue }
                 if readErrno == EAGAIN || readErrno == EWOULDBLOCK { continue }
-                throw BotPeerRPCError.socket("RemoteCode closed the Bot delegation request before replying.")
+                throw BotPeerRPCError.socket("MacCode closed the Bot delegation request before replying.")
             }
             guard count > 0 else {
-                throw BotPeerRPCError.socket("RemoteCode closed the Bot delegation request before replying.")
+                throw BotPeerRPCError.socket("MacCode closed the Bot delegation request before replying.")
             }
             response.append(buffer, count: count)
             if let idleTimeout {

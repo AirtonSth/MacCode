@@ -56,8 +56,8 @@ public enum KeybindingConflictDetector {
     public static let builtInMenuChords: [(chord: String, label: String)] = [
         // App menu
         (KeybindingConfig.normalize("mod+,"), "Settings"),
-        (KeybindingConfig.normalize("mod+h"), "Hide RemoteCode"),
-        (KeybindingConfig.normalize("mod+q"), "Quit RemoteCode"),
+        (KeybindingConfig.normalize("mod+h"), "Hide MacCode"),
+        (KeybindingConfig.normalize("mod+q"), "Quit MacCode"),
         // File menu
         (KeybindingConfig.normalize("mod+n"), "New Workspace"),
         (KeybindingConfig.normalize("mod+w"), "Close Tab"),

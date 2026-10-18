@@ -194,7 +194,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             // so the user can recover by deleting remotecode.sqlite and relaunching.
             let supportDir = AppPaths.appSupportDirectory(for: channel, override: appSupportOverride).path
             let alert = NSAlert()
-            alert.messageText = "RemoteCode could not open its database"
+            alert.messageText = "MacCode could not open its database"
             alert.informativeText = Self.dbOpenFailureInformativeText(
                 supportDir: supportDir,
                 errorDescription: error.localizedDescription
@@ -220,7 +220,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 alert.alertStyle = .warning
                 alert.messageText = "Previous database was corrupt"
                 alert.informativeText = """
-                    RemoteCode found and quarantined a corrupt database, then started \
+                    MacCode found and quarantined a corrupt database, then started \
                     fresh. Your previous data is preserved as a backup file (suffix \
                     ".corrupt-<date>") in:
 
@@ -1399,7 +1399,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
-        appMenu.addItem(NSMenuItem(title: "About RemoteCode", action: #selector(showAbout), keyEquivalent: ""))
+        appMenu.addItem(NSMenuItem(title: "About MacCode", action: #selector(showAbout), keyEquivalent: ""))
         let settingsItem = NSMenuItem(title: "Settings\u{2026}", action: #selector(showSettings), keyEquivalent: ",")
         settingsItem.target = self
         appMenu.addItem(settingsItem)
@@ -1408,8 +1408,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         checkUpdatesItem.target = self
         appMenu.addItem(checkUpdatesItem)
         appMenu.addItem(.separator())
-        appMenu.addItem(NSMenuItem(title: "Hide RemoteCode", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
-        appMenu.addItem(NSMenuItem(title: "Quit RemoteCode", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appMenu.addItem(NSMenuItem(title: "Hide MacCode", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
+        appMenu.addItem(NSMenuItem(title: "Quit MacCode", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         appMenuItem.submenu = appMenu
 
         // File menu
@@ -2411,7 +2411,7 @@ extension AppDelegate {
         Your workspaces and settings are stored in:
         \(supportDir)
 
-        To recover: quit RemoteCode, delete "remotecode.sqlite" from that folder, \
+        To recover: quit MacCode, delete "remotecode.sqlite" from that folder, \
         and relaunch. A backup of the previous database may be present with a \
         ".corrupt-<date>" suffix.
 

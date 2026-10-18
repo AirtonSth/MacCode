@@ -168,12 +168,12 @@ final class InsomniaSidebarTests: XCTestCase {
         XCTAssertTrue(vm.insomniaEnabled)
         XCTAssertTrue(SettingsStore(db: ctx.db).load().insomniaEnabled,
                       "turning Insomnia on must persist the active session")
-        XCTAssertEqual(power.activateReasons, ["RemoteCode Insomnia"],
+        XCTAssertEqual(power.activateReasons, ["MacCode Insomnia"],
                        "turning Insomnia on must acquire the macOS keep-awake assertion")
 
         let (_, _, reloaded, reloadedPower) = try make(dir: dir)
         XCTAssertTrue(reloaded.insomniaEnabled)
-        XCTAssertEqual(reloadedPower.activateReasons, ["RemoteCode Insomnia"],
+        XCTAssertEqual(reloadedPower.activateReasons, ["MacCode Insomnia"],
                        "a saved on choice must survive relaunch and reacquire keep-awake")
     }
 
@@ -325,6 +325,6 @@ final class InsomniaSidebarTests: XCTestCase {
         XCTAssertFalse(vm.insomniaEnabled)
         XCTAssertFalse(settings.insomniaEnabled,
                        "if macOS refuses the keep-awake assertion, the sidebar must fail loud by returning to off state")
-        XCTAssertEqual(power.activateReasons, ["RemoteCode Insomnia"])
+        XCTAssertEqual(power.activateReasons, ["MacCode Insomnia"])
     }
 }

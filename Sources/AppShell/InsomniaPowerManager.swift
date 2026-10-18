@@ -39,7 +39,7 @@ public final class MacOSInsomniaPowerManager: InsomniaPowerManaging {
     private var closedDisplaySleepAssertion: IOPMAssertionID = 0
     private var displaySleepAssertion: IOPMAssertionID = 0
     private var clamshellSleepDisabled = false
-    private var reason: String = "RemoteCode Insomnia"
+    private var reason: String = "MacCode Insomnia"
     private var options: InsomniaPowerOptions = .defaultSession
     private var screenSaverTimer: Timer?
     private lazy var privilegedPMSet = PrivilegedPMSetSleepDisabler(

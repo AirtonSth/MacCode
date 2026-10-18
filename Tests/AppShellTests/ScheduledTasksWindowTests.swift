@@ -660,7 +660,7 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("DSEmptyState("))
         XCTAssertTrue(source.contains("dsPanel("))
         XCTAssertTrue(source.contains("serviceRequiresApproval"))
-        XCTAssertTrue(source.contains("Runs inside RemoteCode while the app is open"))
+        XCTAssertTrue(source.contains("Runs inside MacCode while the app is open"))
         // Plan-faithful chrome: full-width card list + full-page editor groups.
         XCTAssertTrue(source.contains("ScheduledTaskCard("))
         XCTAssertTrue(source.contains("Automate recurring agent work"))

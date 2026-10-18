@@ -213,7 +213,7 @@ public enum BotBrowserRoute: Equatable, Sendable {
     case refused(String)
 
     public static let refusedMessage =
-        "This bot's published Desktop runtime has no available Google Chrome browser bridge. bot_browser_* is unavailable, and the RemoteCode in-app browser is never available to bots."
+        "This bot's published Desktop runtime has no available Google Chrome browser bridge. bot_browser_* is unavailable, and the MacCode in-app browser is never available to bots."
 
     public static func forPublished(_ kind: BotDesktopKind) -> BotBrowserRoute {
         switch kind {

@@ -167,15 +167,15 @@ public enum AgentAppMiddlewareError: Error, Sendable, Equatable, LocalizedError 
     public var errorDescription: String? {
         switch self {
         case .noSelectedWorkspace:
-            return "No RemoteCode workspace is selected; pass --workspace."
+            return "No MacCode workspace is selected; pass --workspace."
         case .noProviderModel(let provider):
-            return "RemoteCode returned no available \(provider.rawValue) model."
+            return "MacCode returned no available \(provider.rawValue) model."
         case .invalidNestedContext:
             return "Nested Agent App context requires parent run, parent thread, subagent node, and delegation capability together."
         case .invalidThreadResponse:
-            return "RemoteCode returned an invalid Agent App thread response."
+            return "MacCode returned an invalid Agent App thread response."
         case .runNotStarted:
-            return "RemoteCode did not start the Agent App turn."
+            return "MacCode did not start the Agent App turn."
         case .timedOut:
             return "The Agent App turn did not finish before the middleware timeout."
         case .missingAssistantResponse:

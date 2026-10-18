@@ -303,7 +303,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     private let visibleWorkspaceLabel = NSTextField(labelWithString: "")
     private let visibleFinderButton = NoDragButton(frame: .zero)
     private let visibleNewWindowButton = NoDragButton(frame: .zero)
-    private let toolbarLabel = NSTextField(labelWithString: "RemoteCode")
+    private let toolbarLabel = NSTextField(labelWithString: "MacCode")
     /// Retains the live pane controllers; their @objc button and tab
     /// targets die with them, so they must outlive a layout rebuild.
     private var paneControllers: [PaneTabsView] = []
@@ -417,8 +417,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             backing: .buffered,
             defer: false
         )
-        win.title = "RemoteCode"
-        win.configureRemoteCodeWindowAccessibility(title: "RemoteCode", identifier: "window.main")
+        win.title = "MacCode"
+        win.configureRemoteCodeWindowAccessibility(title: "MacCode", identifier: "window.main")
         // Unified titlebar: content runs full height, the system title
         // bar is transparent and titleless, so the traffic-light buttons
         // float over the app's own header row (the sidebar header).
@@ -853,9 +853,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
 	        guard let ctx = context,
 	              let wid = ctx.state.window.selectedWorkspaceID,
 	              let ws = ctx.state.workspaces[wid] else {
-	            collapsedWorkspaceLabel.stringValue = "RemoteCode"
-	            visibleWorkspaceLabel.stringValue = "RemoteCode"
-                window.title = "RemoteCode"
+	            collapsedWorkspaceLabel.stringValue = "MacCode"
+	            visibleWorkspaceLabel.stringValue = "MacCode"
+                window.title = "MacCode"
                 visibleFinderButton.isHidden = true
                 visibleNewWindowButton.isHidden = true
 	            return

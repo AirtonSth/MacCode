@@ -39,7 +39,7 @@ final class MainWindowAccessibilityExposureTests: XCTestCase {
         )
         XCTAssertEqual(
             controller.window.accessibilityTitle(),
-            "RemoteCode",
+            "MacCode",
             "The main RemoteCode window must have a stable AX title for Computer Use window matching and VoiceOver navigation."
         )
         XCTAssertEqual(

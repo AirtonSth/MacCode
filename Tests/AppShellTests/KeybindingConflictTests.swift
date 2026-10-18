@@ -56,7 +56,7 @@ final class KeybindingConflictTests: XCTestCase {
         ]
         let result = KeybindingConflictDetector.conflicts(userBindings: bindings)
         XCTAssertEqual(result.count, 1)
-        XCTAssertEqual(result.first?.builtInMenuLabel, "Quit RemoteCode")
+        XCTAssertEqual(result.first?.builtInMenuLabel, "Quit MacCode")
         XCTAssertEqual(result.first?.userCommand, "danger")
     }
 

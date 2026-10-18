@@ -95,7 +95,7 @@ struct RemoteCodeMain {
             // install must not dual-claim: unregister and exit immediately.
             do {
                 try ScheduledTaskAgentServiceManager().unregister()
-                print("Scheduled Tasks now run inside RemoteCode; background agent unregistered.")
+                print("Scheduled Tasks now run inside MacCode; background agent unregistered.")
             } catch {
                 fputs("Unable to unregister legacy Scheduled Tasks agent: \(error)\n", stderr)
             }
@@ -115,7 +115,7 @@ struct RemoteCodeMain {
             let holder = holderPID.map(String.init) ?? "unknown"
             Logger(subsystem: "io.remotecode.app", category: "lifecycle")
                 .fault("app.second_instance_exit holder=\(holder, privacy: .public)")
-            fputs("RemoteCode is already running for \(appSupportDirectory.path) (pid \(holder)); exiting.\n", stderr)
+            fputs("MacCode is already running for \(appSupportDirectory.path) (pid \(holder)); exiting.\n", stderr)
             if restoresDatabase || inspectsDatabase || createsDatabase || rollingBack || repairsContextReceipts { exit(EXIT_FAILURE) }
             if let holderPID, !LocalAuthAdapter.isE2EPairingAutoApproveEnabled {
                 NSRunningApplication(processIdentifier: holderPID)?.activate()
@@ -249,7 +249,7 @@ struct RemoteCodeMain {
         }
 
         guard let instanceLock else {
-            fputs("RemoteCode cannot start without exclusive host lock.\n", stderr)
+            fputs("MacCode cannot start without exclusive host lock.\n", stderr)
             exit(EXIT_FAILURE)
         }
         do {

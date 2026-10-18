@@ -222,7 +222,7 @@ public enum TitioVoicePrompt {
     public static let detailLimit = 1_000
 
     static let persona = """
-    You are Titio, the friendly helper who lives inside RemoteCode, a Mac app where the user runs \
+    You are Titio, the friendly helper who lives inside MacCode, a Mac app where the user runs \
     coding agents and Bots (AI teammates). You keep the user posted in your "Notifications" chat, \
     which they read on the Mac and on their iPhone.
     """
@@ -271,7 +271,7 @@ public enum TitioVoicePrompt {
             then the rest. With more than \(TitioNoticeTiming.digestMaxBullets) items, mention the first \
             \(TitioNoticeTiming.digestMaxBullets) and say how many more are in Activity.
             """
-            if catchUp { task += " They piled up while RemoteCode was closed." }
+            if catchUp { task += " They piled up while MacCode was closed." }
         }
         if cardOptions != nil {
             task += " Buttons are shown under your message, so do not list the choices as text."
@@ -473,8 +473,8 @@ extension TitioNoticeKind {
         case .providerUpdateFailed: return "Updating an agent provider's CLI failed."
         case .sshDisconnected: return "An SSH session dropped without the user asking."
         case .fileConflict: return "A file the user is editing was changed outside the editor."
-        case .serverListenerFailed: return "RemoteCode's local server could not open its port, so the iPhone may not connect."
-        case .notificationsDenied: return "macOS notifications are off for RemoteCode, so Titio can only tell the user here and through the desktop pet."
+        case .serverListenerFailed: return "MacCode's local server could not open its port, so the iPhone may not connect."
+        case .notificationsDenied: return "macOS notifications are off for MacCode, so Titio can only tell the user here and through the desktop pet."
         case .external: return "A notification arrived from a script or tool."
         }
     }

@@ -37,7 +37,7 @@ final class ChromeExtensionSetup: ObservableObject {
             try await Task.detached(priority: .userInitiated) {
                 guard let helper = AgentSkillInstaller.resolveServiceBinary() else {
                     throw NSError(domain: "RemoteCode.ChromeSetup", code: 1,
-                                  userInfo: [NSLocalizedDescriptionKey: "The Chrome connection helper is missing. Reinstall RemoteCode and try again."])
+                                  userInfo: [NSLocalizedDescriptionKey: "The Chrome connection helper is missing. Reinstall MacCode and try again."])
                 }
                 return try ChromeProfileConnection.install(executable: helper.path)
             }.value

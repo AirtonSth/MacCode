@@ -18,7 +18,7 @@ final class ChromeProfileComputerUseTests: XCTestCase {
         let executable = contents.appendingPathComponent("MacOS/RemoteCodeDistillService").path
         let installed = try ChromeProfileConnection.install(executable: executable, homeDirectory: home)
         let manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: installed.appendingPathComponent("manifest.json"))) as! [String: Any]
-        XCTAssertEqual(manifest["name"] as? String, "RemoteCode Computer Use")
+        XCTAssertEqual(manifest["name"] as? String, "MacCode Computer Use")
         let native = home.appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts/\(ChromeProfileConnection.hostName).json")
         let registration = try JSONSerialization.jsonObject(with: Data(contentsOf: native)) as! [String: Any]
         XCTAssertEqual(registration["allowed_origins"] as? [String], ["chrome-extension://\(ChromeProfileConnection.extensionID)/"])

@@ -17,15 +17,15 @@ import Persistence
 /// builds and makes the grant durable intent clear to the user.
 public enum HostFileAccessPrivacyStrings {
     public static let networkVolumes =
-        "RemoteCode needs access to project folders on network volumes so agents, terminals, and file tools can read and edit your code."
+        "MacCode needs access to project folders on network volumes so agents, terminals, and file tools can read and edit your code."
     public static let removableVolumes =
-        "RemoteCode needs access to project folders on removable volumes so agents, terminals, and file tools can read and edit your code."
+        "MacCode needs access to project folders on removable volumes so agents, terminals, and file tools can read and edit your code."
     public static let desktop =
-        "RemoteCode needs access to folders on your Desktop when you open them as workspaces."
+        "MacCode needs access to folders on your Desktop when you open them as workspaces."
     public static let documents =
-        "RemoteCode needs access to folders in Documents when you open them as workspaces."
+        "MacCode needs access to folders in Documents when you open them as workspaces."
     public static let downloads =
-        "RemoteCode needs access to folders in Downloads when you open them as workspaces."
+        "MacCode needs access to folders in Downloads when you open them as workspaces."
 
     /// Info.plist keys that package-app.sh must emit. Tests and check-app-bundle
     /// assert this set so a packaging regression cannot ship without purpose text.
@@ -367,7 +367,7 @@ public enum HostFileAccessOnboarding {
 public enum HostFileAccessCopy {
     public static let onboardingTitle = "Fewer folder permission prompts"
     public static let onboardingMessage = """
-    RemoteCode needs project folders for agents, terminals, and file tools.
+    MacCode needs project folders for agents, terminals, and file tools.
 
     macOS normally asks separately for Desktop, Documents, Downloads, and other protected locations. \
     Enabling Full Disk Access once in System Settings avoids most of those repeated prompts.
@@ -379,7 +379,7 @@ public enum HostFileAccessCopy {
     """
     public static let settingsSectionTitle = "Disk access"
     public static let settingsExplanation = """
-    For the fewest prompts, enable Full Disk Access for RemoteCode in System Settings. \
+    For the fewest prompts, enable Full Disk Access for MacCode in System Settings. \
     That covers most project folders without asking Desktop, Documents, and Downloads one by one.
 
     “Check folder access” is optional: it touches common folders once and may show system dialogs for any still-pending grants. \

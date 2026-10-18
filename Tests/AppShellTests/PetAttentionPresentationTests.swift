@@ -117,7 +117,7 @@ final class PetAttentionPresentationTests: XCTestCase {
             (.sshTransfer(.succeeded), "SSH transfer completed"),
             (.sshTransfer(.failed), "SSH transfer failed"),
             (.providerUpdateFailed, "Provider update failed"),
-            (.serverListenerFailed, "Remote Code listener needs attention")
+            (.serverListenerFailed, "MacCode listener needs attention")
         ]
 
         for (kind, title) in expected {

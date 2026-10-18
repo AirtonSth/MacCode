@@ -1641,7 +1641,7 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.isLegacyProviderThread, "the banner and disabled composer key off this flag")
         XCTAssertEqual(
             vm.legacyProviderBannerText,
-            "This conversation used Codex. RemoteCode now runs Distill only, so it is read-only."
+            "This conversation used Codex. MacCode now runs Distill only, so it is read-only."
         )
 
         vm.prompt = "hello?"

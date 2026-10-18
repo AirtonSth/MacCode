@@ -125,7 +125,7 @@ build_canary() {
     exit 1
   }
   mv "$packaged_executable" "$packaged_app/Contents/MacOS/$CANARY_NAME"
-  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName RemoteCode Agent Canary" "$packaged_app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName MacCode Agent Canary" "$packaged_app/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleName $CANARY_NAME" "$packaged_app/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $CANARY_NAME" "$packaged_app/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$packaged_app/Contents/Info.plist"

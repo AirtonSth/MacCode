@@ -50,7 +50,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         }
         public static let invalidParams = Error(code: -32602, message: "Invalid params")
         public static let controlPlaneOff = Error(code: -32081, message: "Bot control plane is off.")
-        public static let notFound = Error(code: -32044, message: "RemoteCode Bot was not found.")
+        public static let notFound = Error(code: -32044, message: "MacCode Bot was not found.")
         public static let cap = Error(code: -32082, message: "Account limit of 50 live bots reached.")
         public static let reserved = Error(code: -32083, message: "Reserved capability has no positive Bot parity.")
         public static let missingRequest = Error(code: -32097, message: "Mutation requires a non-empty client_request_id.")

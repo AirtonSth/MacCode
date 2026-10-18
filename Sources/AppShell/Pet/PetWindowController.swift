@@ -289,7 +289,7 @@ private struct PetSpriteView: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Titio")
         .accessibilityValue(model.accessibilityValue)
-        .accessibilityHint("Opens Remote Code pet status")
+        .accessibilityHint("Opens MacCode pet status")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { onActivate() }
         .accessibilityIdentifier("pet.status")
@@ -883,7 +883,7 @@ public final class PetWindowController: NSObject {
         hosting.setAccessibilityElement(true)
         hosting.setAccessibilityRole(.button)
         hosting.setAccessibilityLabel("Titio")
-        hosting.setAccessibilityHelp("Open Remote Code pet status")
+        hosting.setAccessibilityHelp("Open MacCode pet status")
         hosting.setAccessibilityIdentifier("pet.status")
         hosting.onClick = activate
         hosting.onRightClick = { [weak self, weak hosting] event in
@@ -1358,9 +1358,9 @@ public final class PetWindowController: NSObject {
     }
 
     private func contextMenu() -> NSMenu {
-        let menu = NSMenu(title: "Remote Code Pet")
+        let menu = NSMenu(title: "MacCode Pet")
         menu.addItem(menuItem("Chat with Titio", #selector(contextOpenTitio)))
-        menu.addItem(menuItem("Open Remote Code", #selector(contextOpenRemoteCode)))
+        menu.addItem(menuItem("Open MacCode", #selector(contextOpenRemoteCode)))
         menu.addItem(menuItem("Open ready items", #selector(contextOpenReadyItems)))
         menu.addItem(.separator())
         let careItem = NSMenuItem(title: "Care", action: nil, keyEquivalent: "")

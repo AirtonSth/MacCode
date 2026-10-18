@@ -1,6 +1,6 @@
-![RemoteCode in action](https://remotecode.io/videos/video-3x.gif)
+![MacCode in action](https://remotecode.io/videos/video-3x.gif)
 
-# RemoteCode for macOS
+# MacCode for macOS
 
 Your entire dev workflow — agents, terminals, browsers, and git — in one native cockpit you can drive from anywhere.
 
@@ -10,11 +10,11 @@ All a developer need to code anywhere.
 
 [Latest Release](https://remotecode.io/downloads/macos/latest/stable-macos-arm64-RemoteCode.dmg)
 
-## What RemoteCode Does
+## What MacCode Does
 
-RemoteCode is a native macOS development cockpit. It brings the tools a developer normally keeps spread across terminals, browser tabs, git windows, agent CLIs, and mobile devices into one workspace that can be controlled locally on the Mac or remotely from iPhone.
+MacCode is a native macOS development cockpit. It brings the tools a developer normally keeps spread across terminals, browser tabs, git windows, agent CLIs, and mobile devices into one workspace that can be controlled locally on the Mac or remotely from iPhone.
 
-RemoteCode is built around a simple rule: the Mac stays the source of truth. Agents, shells, git, browsers, files, and workspaces run on the Mac. Remote clients mirror and control that real host state instead of running separate copies.
+MacCode is built around a simple rule: the Mac stays the source of truth. Agents, shells, git, browsers, files, and workspaces run on the Mac. Remote clients mirror and control that real host state instead of running separate copies.
 
 ## Core Capabilities
 
@@ -135,7 +135,7 @@ RemoteCode is built around a simple rule: the Mac stays the source of truth. Age
 
 ## Architecture
 
-RemoteCode is split into focused modules:
+MacCode is split into focused modules:
 
 - `AppShell`: macOS app shell, workspaces, tabs, panes, settings, command routing, and app lifecycle.
 - `Surfaces`: native macOS surfaces for Agent App, Terminal, Browser, Files, Git/Diff, previews, and related UI.
@@ -169,7 +169,7 @@ RemoteCode is split into focused modules:
 4. Continue the agent thread, answer pending questions, stop a run, or drive a terminal command.
 5. Let the Mac keep executing while the phone mirrors host state.
 
-### Use RemoteCode as a local cockpit
+### Use MacCode as a local cockpit
 
 1. Keep Terminal, Agent App, Browser, Files, and Git tabs in one workspace.
 2. Split panes for side-by-side review.
@@ -190,7 +190,7 @@ Host flags for material silent wakes and transport keep-alive live in
 | `connection.flag.wake_outbox` | off | Durable silent outbox |
 | `connection.flag.selective_catchup` | off | Host-side selective catch-up experiment inventory |
 
-**Kill switch** (explicit `false` always wins; restart RemoteCode after change):
+**Kill switch** (explicit `false` always wins; restart MacCode after change):
 
 ```bash
 # Bundle id may be io.remotecode.app or your signed product id — check Activity Monitor / Info.plist

@@ -699,7 +699,7 @@ final class BotGuestRunResolverTests: XCTestCase {
         let thread = try makeThread(f)
         XCTAssertTrue(try f.ctx.threadRepo.setGuestRuntime(id: thread.id, "guest-v9"))
         XCTAssertTrue(f.resolver.isGuestThread(thread.id), "the adapter must not open it on the Mac")
-        await assertUnavailable(containing: "newer RemoteCode") {
+        await assertUnavailable(containing: "newer MacCode") {
             _ = try await f.resolver.prepare(self.request(thread)) { _ in }
         }
     }

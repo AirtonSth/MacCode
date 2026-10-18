@@ -238,11 +238,11 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     ) async throws -> DistillGuestLaunchPlan {
         guard placement.guestRuntime == BotGuestRuntime.distillV1 else {
             throw DistillGuestLaunchError.unavailable(
-                "this conversation was set up by a newer RemoteCode; update RemoteCode to run it."
+                "this conversation was set up by a newer MacCode; update MacCode to run it."
             )
         }
         guard deps.hostsGuestRuns else {
-            throw DistillGuestLaunchError.unavailable("bot Linux VM runs only start from the RemoteCode app.")
+            throw DistillGuestLaunchError.unavailable("bot Linux VM runs only start from the MacCode app.")
         }
         // The guest gets the app user's own sign-ins; a run meant for another
         // macOS user must not run with them.
@@ -483,7 +483,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     private func workspaceRoot(of thread: AgentThread) async throws -> String? {
         guard let workspaceID = thread.workspaceId else { return nil }
         guard let root = await deps.workspaces()[workspaceID] else {
-            throw DistillGuestLaunchError.unavailable("this conversation's workspace is no longer open in RemoteCode.")
+            throw DistillGuestLaunchError.unavailable("this conversation's workspace is no longer open in MacCode.")
         }
         return root
     }

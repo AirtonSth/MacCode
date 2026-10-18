@@ -142,7 +142,7 @@ public enum ClaudeAgentSDKBridgeLocator {
             .prefix(6)
             .joined(separator: "; ")
         let suffix = tried.isEmpty
-            ? "Install/update RemoteCode so Contents/Resources/ClaudeAgentSDKBridge.mjs is present."
+            ? "Install/update MacCode so Contents/Resources/ClaudeAgentSDKBridge.mjs is present."
             : "Tried: \(tried)"
         return "Claude Agent SDK bridge script not found (searched app Resources, Application Support cache, and local sources). \(suffix)"
     }

@@ -6268,7 +6268,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public var legacyProviderBannerText: String {
         let name = legacyProviderThreadProvider.map(providerDisplayName) ?? ""
-        return "This conversation used \(name). RemoteCode now runs Distill only, so it is read-only."
+        return "This conversation used \(name). MacCode now runs Distill only, so it is read-only."
     }
 
     /// A thread locked to a bot that was deleted is read-only; the user continues without the bot.
@@ -11682,7 +11682,7 @@ public enum AgentComposerSuggestions {
                 : command
             guard !bare.isEmpty else { continue }
             let source = localSlashCommands.contains(command) || localSlashCommands.contains("/\(bare)")
-                ? "RemoteCode command"
+                ? "MacCode command"
                 : "\(display) command"
             candidates.append(Candidate(
                 bare: bare,

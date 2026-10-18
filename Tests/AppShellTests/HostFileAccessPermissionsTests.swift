@@ -26,8 +26,8 @@ final class HostFileAccessPermissionsTests: XCTestCase {
         for (key, value) in HostFileAccessPrivacyStrings.infoPlistKeys {
             XCTAssertFalse(value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                            "\(key) purpose string must be non-empty")
-            XCTAssertTrue(value.contains("RemoteCode"),
-                          "\(key) should name RemoteCode so the system dialog is attributable")
+            XCTAssertTrue(value.contains("MacCode"),
+                          "\(key) should name MacCode so the system dialog is attributable")
         }
     }
 

@@ -2119,7 +2119,7 @@ struct FilesSurfaceRoot: View {
             return ("Not found", "questionmark.folder", "This path no longer exists in the workspace.", true)
         }
         if lower.contains("permission") || lower.contains("not permitted") {
-            return ("Permission denied", "hand.raised", "RemoteCode can't access this path.", true)
+            return ("Permission denied", "hand.raised", "MacCode can't access this path.", true)
         }
         return ("Files error", "exclamationmark.triangle", raw, true)
     }
@@ -2339,7 +2339,7 @@ struct FilesSurfaceRoot: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(DS.Palette.warning)
             VStack(alignment: .leading, spacing: 1) {
-                Text("File changed outside RemoteCode")
+                Text("File changed outside MacCode")
                     .font(DS.Font.bodyStrong)
                 Text("Saving is blocked until you reload. Reloading replaces your draft with the on-disk version.")
                     .font(DS.Font.caption)
@@ -2639,7 +2639,7 @@ private struct LargeMediaGuard<Content: View>: View {
                     .foregroundStyle(DS.Palette.textTertiary)
                 Text("Large file")
                     .font(DS.Font.title3)
-                Text("\(ByteCountFormatter.string(fromByteCount: Int64(entry.size), countStyle: .file)) - loading it in RemoteCode may be slow.")
+                Text("\(ByteCountFormatter.string(fromByteCount: Int64(entry.size), countStyle: .file)) - loading it in MacCode may be slow.")
                     .font(DS.Font.bodyDense)
                     .foregroundStyle(DS.Palette.textSecondary)
                     .multilineTextAlignment(.center)

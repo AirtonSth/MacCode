@@ -274,7 +274,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         guard Self.canUseNotificationCenter else { return }
         let deliver = { [notificationCenterClient] in
             let content = UNMutableNotificationContent()
-            content.title = "RemoteCode"
+            content.title = "MacCode"
             content.body = "Test notification — delivery is working."
             content.sound = .default
             let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)

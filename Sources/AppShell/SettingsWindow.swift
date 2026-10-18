@@ -1738,7 +1738,7 @@ public struct SettingsView: View {
                 }
             }
 
-            Text("The pet starts and stops with Remote Code. Rows use fixed summaries and never expose prompts, commands, file contents, tokens, or secret answers.")
+            Text("The pet starts and stops with MacCode. Rows use fixed summaries and never expose prompts, commands, file contents, tokens, or secret answers.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2352,7 +2352,7 @@ extension SettingsView {
                 }
             }
             if notificationStatus == .denied {
-                Text("Notifications are turned off for RemoteCode. Thread banners won't appear until you re-enable them in System Settings.")
+                Text("Notifications are turned off for MacCode. Thread banners won't appear until you re-enable them in System Settings.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.danger)
                     .accessibilityIdentifier("settings.notifications.deniedNote")
@@ -2404,7 +2404,7 @@ extension SettingsView {
     private var updateStatusText: String? {
         switch vm.updateAvailability {
         case .available: return "An update is available."
-        case .upToDate: return "RemoteCode is up to date."
+        case .upToDate: return "MacCode is up to date."
         case .failed(let message): return "Update check failed: \(message)"
         case .checking, .unknown: return nil
         }
@@ -2525,7 +2525,7 @@ public struct AccountView: View {
                 .frame(width: 42, height: 42)
 
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    Text(vm.privateAccountUser == nil ? "Sign in to RemoteCode" : "RemoteCode Account")
+                    Text(vm.privateAccountUser == nil ? "Sign in to MacCode" : "MacCode Account")
                         .font(DS.Font.title3)
                         .foregroundColor(DS.Palette.text)
                     Text(vm.privateAccountUser == nil ? "Connect your private account for backend push notifications to paired devices." : "Manage the private account connected to this Mac.")
@@ -2755,7 +2755,7 @@ public struct AccountView: View {
 
     private var accountName: String {
         guard let email = vm.privateAccountUser?.email, let local = email.split(separator: "@").first, !local.isEmpty else {
-            return "RemoteCode Account"
+            return "MacCode Account"
         }
         return String(local)
     }
@@ -2807,10 +2807,10 @@ public final class SettingsWindowController: NSObject {
             routeRegistry: routeRegistry
         ))
         let win = NSWindow(contentViewController: host)
-        win.title = "RemoteCode Settings"
+        win.title = "MacCode Settings"
         win.setAccessibilityRole(.window)
         win.setAccessibilitySubrole(.standardWindow)
-        win.setAccessibilityTitle("RemoteCode Settings")
+        win.setAccessibilityTitle("MacCode Settings")
         win.setAccessibilityIdentifier("window.settings")
         win.styleMask = [.titled, .closable, .resizable]
         // Match the SwiftUI content frame so the window doesn't open smaller
@@ -2952,7 +2952,7 @@ public final class AccountWindowController: NSObject {
         self.viewModel = SettingsViewModel(context: context, loadImmediately: loadImmediately)
         let host = NSHostingController(rootView: AccountView(vm: viewModel))
         let win = NSWindow(contentViewController: host)
-        win.title = "RemoteCode Account"
+        win.title = "MacCode Account"
         win.styleMask = [.titled, .closable]
         win.setContentSize(NSSize(width: 460, height: 360))
         win.center()

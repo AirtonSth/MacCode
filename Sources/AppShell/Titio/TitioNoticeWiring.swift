@@ -201,7 +201,7 @@ extension AppContext {
         let pending = ProviderPendingCallbackRepository(db: db)
         @Sendable func router() async throws -> AppCommandRouter {
             guard let router = await MainActor.run(body: { box.context?.router }) else {
-                throw TitioNoticeActionError(reason: "RemoteCode is not ready")
+                throw TitioNoticeActionError(reason: "MacCode is not ready")
             }
             return router
         }

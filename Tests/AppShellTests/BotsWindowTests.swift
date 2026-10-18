@@ -4533,7 +4533,7 @@ final class BotsWindowTests: XCTestCase {
         vm.setAutonomyActive(true)
         XCTAssertEqual(
             armed.nextRunLabel(isAutonomyActive: vm.isAutonomyActive),
-            "While RemoteCode is open"
+            "While MacCode is open"
         )
         vm.setRoutineEnabled(id: id, enabled: false)
         let paused = try XCTUnwrap(vm.scheduleTaskItems.first)
@@ -5739,7 +5739,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertNotNil(updated.activation.lastTestRunRequestedAt)
         XCTAssertFalse(updated.activation.isEnabled, "Test run must not silently enable a schedule")
         XCTAssertFalse(vm.isAutonomyActive)
-        XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("only while RemoteCode is open"))
+        XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("only while MacCode is open"))
     }
 
     func test_routineTestRunCreatesANewConversationForEveryExecution() throws {

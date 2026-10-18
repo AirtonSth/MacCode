@@ -739,7 +739,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         XCTAssertFalse(auto.showsServiceTierControls)
         XCTAssertTrue(auto.showsDisclaimer)
         XCTAssertEqual(auto.transition, .fadeAndSlide)
-        XCTAssertEqual(auto.disclaimer, "Remote Code will automatically orchestrate the model to maximize quality while using the fewest tokens.")
+        XCTAssertEqual(auto.disclaimer, "MacCode will automatically orchestrate the model to maximize quality while using the fewest tokens.")
         XCTAssertEqual(AgentModelPopoverPresentation.autoStatus, "Orchestration active")
         XCTAssertTrue(auto.autoToggleEnabled)
         XCTAssertEqual(auto.accessibilityLabel, "Automatic model routing")

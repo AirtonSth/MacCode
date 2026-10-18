@@ -269,7 +269,7 @@ final class BotGuestMCPGatewayTests: XCTestCase {
         _ = try fixture.store.revokeContext(hostID: "host-a", botID: fixture.botID, context: .general, expectedRevision: 1)
         delayed.release.signal()
         wait(for: [done], timeout: 5)
-        XCTAssertEqual(try errorMessage(box.value), "The RemoteCode run that made this call has ended.")
+        XCTAssertEqual(try errorMessage(box.value), "The MacCode run that made this call has ended.")
     }
 
     func test_contextualGatewayRejectsStaleAndRevokedPolicyAtIssueAndDispatch() throws {
@@ -560,7 +560,7 @@ final class BotGuestMCPGatewayTests: XCTestCase {
         gateway.revoke(runID: runID)
         wait(for: [done], timeout: 2)
         XCTAssertLessThan(Date().timeIntervalSince(revokedAt), 0.5, "a stopped run must not wait for a peer's whole turn")
-        XCTAssertEqual(try errorMessage(box.value), "The RemoteCode run that made this call has ended.")
+        XCTAssertEqual(try errorMessage(box.value), "The MacCode run that made this call has ended.")
         spy.gate?.signal()
     }
 
@@ -583,7 +583,7 @@ final class BotGuestMCPGatewayTests: XCTestCase {
 
         // A third call is refused at once rather than queued behind the others.
         let refused = try errorMessage(gateway.respond(to: post(web, call(3, BotWebCatalog.fetch), token: token), isClientGone: neverGone))
-        XCTAssertTrue(refused.hasPrefix("Too many RemoteCode tool calls at once for this run"), refused)
+        XCTAssertTrue(refused.hasPrefix("Too many MacCode tool calls at once for this run"), refused)
         XCTAssertEqual(spy.callCount, 2)
 
         // The cap is per run: another run is not starved by this one.

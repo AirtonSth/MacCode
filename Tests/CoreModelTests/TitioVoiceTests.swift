@@ -88,7 +88,7 @@ final class TitioVoiceTests: XCTestCase {
         XCTAssertTrue(prompt.contains("\"count\" : 2"))
         XCTAssertTrue(prompt.contains("Build") && prompt.contains("Deploy"))
         XCTAssertTrue(prompt.contains("failures first"))
-        XCTAssertTrue(prompt.contains("while RemoteCode was closed"))
+        XCTAssertTrue(prompt.contains("while MacCode was closed"))
     }
 
     func test_resultAndStatusPromptsStateOnlyWhatHappened() {

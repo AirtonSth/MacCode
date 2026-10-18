@@ -114,7 +114,7 @@ public enum ChromeProfileConnection {
             }
         }
         guard connected == 0 else {
-            throw Failure(message: "Chrome extension is not connected. In RemoteCode, open Settings > Computer Use > Set Up Chrome Extension. If already installed, click its toolbar button in the Chrome profile you want to use.")
+            throw Failure(message: "Chrome extension is not connected. In MacCode, open Settings > Computer Use > Set Up Chrome Extension. If already installed, click its toolbar button in the Chrome profile you want to use.")
         }
         let deadline = Date().addingTimeInterval(20)
         var request = object

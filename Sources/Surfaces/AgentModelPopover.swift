@@ -15,7 +15,7 @@ public enum AgentModelPopoverTransition: Equatable {
 }
 
 public struct AgentModelPopoverPresentation: Equatable {
-    public static let autoDisclaimer = "Remote Code will automatically orchestrate the model to maximize quality while using the fewest tokens."
+    public static let autoDisclaimer = "MacCode will automatically orchestrate the model to maximize quality while using the fewest tokens."
     public static let autoStatus = "Orchestration active"
     public static let autoAccessibilityLabel = "Automatic model routing"
     public static let autoAccessibilityHint = "Turns automatic model routing on or off."

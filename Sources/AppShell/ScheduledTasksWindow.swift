@@ -142,7 +142,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
     }
     @Published public var editorDraft: ScheduledTaskEditorDraft?
     @Published public var errorMessage: String?
-    @Published public private(set) var serviceStatus: String = "Runs inside RemoteCode while the app is open"
+    @Published public private(set) var serviceStatus: String = "Runs inside MacCode while the app is open"
     @Published public private(set) var serviceRequiresApproval = false
     @Published public private(set) var isSavingEditor = false
     /// Global kill switch: when false, automatic scheduled occurrences do not claim/run.
@@ -388,7 +388,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
     }
 
     private func reloadServiceStatus() {
-        serviceStatus = "Runs inside RemoteCode while the app is open"
+        serviceStatus = "Runs inside MacCode while the app is open"
         serviceRequiresApproval = false
     }
 
@@ -398,7 +398,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
             return
         }
         guard let scheduler = router.scheduledTaskScheduler else {
-            errorMessage = "The in-app scheduler is not ready yet. Keep RemoteCode open and retry."
+            errorMessage = "The in-app scheduler is not ready yet. Keep MacCode open and retry."
             return
         }
         // Immediate feedback: claim is async, but the card should flip to Queued
@@ -865,7 +865,7 @@ public struct ScheduledTasksRootView: View {
                     icon: "calendar.badge.clock",
                     title: vm.searchText.isEmpty ? "No scheduled tasks" : "No matching tasks",
                     subtitle: vm.searchText.isEmpty
-                        ? "Create a task to run an Agent automatically while RemoteCode is closed."
+                        ? "Create a task to run an Agent automatically while MacCode is closed."
                         : "Try another search or clear the status filter."
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

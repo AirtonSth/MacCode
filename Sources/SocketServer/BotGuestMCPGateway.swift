@@ -269,7 +269,7 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
             return Self.errorResponse(
                 id: id,
                 code: -32000,
-                message: "Too many RemoteCode tool calls at once for this run (at most \(maxConcurrentCallsPerRun)). Retry after one finishes."
+                message: "Too many MacCode tool calls at once for this run (at most \(maxConcurrentCallsPerRun)). Retry after one finishes."
             )
         }
 
@@ -315,7 +315,7 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
             return revoked ? Self.runEndedResponse(id: id) : nil
         }
         guard let reply = finished, let data = Self.guestFacing(reply).data(using: .utf8) else {
-            return Self.errorResponse(id: id, code: -32603, message: "RemoteCode returned no reply.")
+            return Self.errorResponse(id: id, code: -32603, message: "MacCode returned no reply.")
         }
         return .json(filtered(data, method: method, route: route))
     }
@@ -442,7 +442,7 @@ public final class BotGuestMCPGateway: @unchecked Sendable {
     }
 
     private static func runEndedResponse(id: Any) -> LoopbackHTTPResponse {
-        errorResponse(id: id, code: -32000, message: "The RemoteCode run that made this call has ended.")
+        errorResponse(id: id, code: -32000, message: "The MacCode run that made this call has ended.")
     }
 
     private static func errorResponse(id: Any, code: Int, message: String) -> LoopbackHTTPResponse {

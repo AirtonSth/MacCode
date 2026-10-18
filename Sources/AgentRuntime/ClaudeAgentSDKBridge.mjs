@@ -571,14 +571,14 @@ for await (const line of rl) {
           if (update?.errors && Object.keys(update.errors).length > 0) {
             emit({
               type: 'sdk_error',
-              message: `Claude Agent SDK could not refresh RemoteCode MCP servers: ${JSON.stringify(update.errors)}`,
+              message: `Claude Agent SDK could not refresh MacCode MCP servers: ${JSON.stringify(update.errors)}`,
             });
             continue;
           }
         } catch (error) {
           emit({
             type: 'sdk_error',
-            message: `Claude Agent SDK could not refresh RemoteCode MCP servers: ${String(error?.message || error)}`,
+            message: `Claude Agent SDK could not refresh MacCode MCP servers: ${String(error?.message || error)}`,
           });
           continue;
         }

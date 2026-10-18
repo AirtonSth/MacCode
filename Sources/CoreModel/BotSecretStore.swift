@@ -22,7 +22,7 @@ public enum BotSecretStoreError: Error, Equatable, CustomStringConvertible {
     public var description: String {
         switch self {
         case .invalidName:
-            return "Secret name must be an environment-variable name and cannot replace a RemoteCode runtime key."
+            return "Secret name must be an environment-variable name and cannot replace a MacCode runtime key."
         case .emptyValue:
             return "Secret value is required."
         case .keychain:

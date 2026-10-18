@@ -196,7 +196,7 @@ extension AppCommandRouter {
     /// its agent runs in the guest user's home, and BotHome is never a mountable workspace.
     /// A bot already running elsewhere keeps its container: the send queues instead of remounting.
     func botVMPreflight(_ botID: BotID, workspace: String?) async -> String? {
-        guard let ctx = context else { return "RemoteCode is not ready." }
+        guard let ctx = context else { return "MacCode is not ready." }
         let docker = botVMDocker
         let service = botVMService(appSupport: ctx.appSupportDirectory)
         let registered = Set(ctx.state.workspaces.values.map(\.cwd))
@@ -258,7 +258,7 @@ extension AppCommandRouter {
 
     /// nil on success; otherwise the user-facing failure.
     func provisionBotVM(_ botID: BotID) async -> String? {
-        guard let appSupport = context?.appSupportDirectory else { return "RemoteCode is not ready." }
+        guard let appSupport = context?.appSupportDirectory else { return "MacCode is not ready." }
         let service = botVMService(appSupport: appSupport)
         let docker = botVMDocker
         let prefetch = guestDistillPrefetch()

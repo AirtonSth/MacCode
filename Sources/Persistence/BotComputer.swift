@@ -617,6 +617,6 @@ public struct BotComputerService: Sendable {
             }
             Thread.sleep(forTimeInterval: Self.resultPollInterval)
         }
-        throw BotComputerError.invalid("Docker desktop is not available. Keep RemoteCode open.")
+        throw BotComputerError.invalid("Docker desktop is not available. Keep MacCode open.")
     }
 }

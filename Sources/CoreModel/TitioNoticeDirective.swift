@@ -16,7 +16,7 @@ public enum TitioNoticeDirective {
         let ordered = rows.sorted {
             $0.occurredAt == $1.occurredAt ? $0.key < $1.key : $0.occurredAt < $1.occurredAt
         }.suffix(maxRows)
-        var lines = ["Notices RemoteCode posted in this Titio inbox since the user's last message (oldest first):"]
+        var lines = ["Notices MacCode posted in this Titio inbox since the user's last message (oldest first):"]
         for row in ordered {
             let body = TitioNoticeCopy.body(for: TitioNoticeRenderItem(record: row), language: language, timeZone: timeZone)
             // The factual sentence leaves the run summary out; the model still needs it.

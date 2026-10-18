@@ -75,7 +75,7 @@ public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, Localiz
         case .missingWorkspace: return "The selected workspace no longer exists."
         case .inaccessibleWorkspace(let path): return "The workspace is not readable and writable: \(path)"
         case .ineligibleUser(let user): return "The system user is not eligible: \(user)"
-        case .helperUnavailable(let user): return "RemoteCode's privileged helper is unavailable for user \(user). Authorize its one-time installation, then retry."
+        case .helperUnavailable(let user): return "MacCode's privileged helper is unavailable for user \(user). Authorize its one-time installation, then retry."
         case .providerUnavailable(let reason): return reason
         case .unsupportedModel(let model): return "The selected provider does not expose model \(model)."
         case .unsupportedReasoning(let effort): return "The selected model does not support \(effort) reasoning."

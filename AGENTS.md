@@ -1,14 +1,14 @@
-# RemoteCode macOS Rules
+# MacCode macOS Rules
 
 - Browser parity is mandatory: every macOS browser URL change must emit host state so iOS mirrors the same target.
 - External URLs, localhost/dev-server URLs, and macOS file URLs must stay synchronized between macOS and iOS.
 - Browser target changes on either side must propagate to the paired side, or the control must stay host-driven/read-only.
 - Do not add browser behavior that only works on one side without updating the other side in the same change.
-- User workflow state must survive closing and reopening RemoteCode. Persist the user's active workspace, panes, selected tabs, browser URLs/titles, surface metadata, agent thread state, and other explicit user choices unless the user intentionally closes/deletes them.
+- User workflow state must survive closing and reopening MacCode. Persist the user's active workspace, panes, selected tabs, browser URLs/titles, surface metadata, agent thread state, and other explicit user choices unless the user intentionally closes/deletes them.
 
 ## Privilege escalation (mandatory)
 
-- Use the single installed root-owned helper at `/Library/PrivilegedHelperTools/io.remotecode.RunAsUserHelper`. Its first install may show one administrator dialog; it remains available after RemoteCode closes and reopens.
+- Use the single installed root-owned helper at `/Library/PrivilegedHelperTools/io.remotecode.RunAsUserHelper`. Its first install may show one administrator dialog; it remains available after MacCode closes and reopens.
 - The password is never persisted or stored. Provider run-as-user, Insomnia `pmset`, scheduled tasks, and provider teardown are the four consumers; all privilege escalation for them must call `RunAsUserProcessBootstrap`.
 - Do not use direct `sudo`, AppleScript administrator authorization, sudoers edits, or password files. The bootstrap installer is the only in-app `sudo` exception, and it must verify the helper owner, mode, and version before reuse.
 
@@ -26,7 +26,7 @@ Apply these rules to every user-visible load on macOS: navigation, tabs, rows, l
 
 ## Isolated sandbox (mandatory)
 
-The user's running RemoteCode (`io.remotecode.desktop`) is off-limits. A git worktree isolates files; it does not isolate bundle id, Application Support, SQLite, port `18217`, or `/tmp/RemoteCode.sock`.
+The user's running MacCode (`io.remotecode.desktop`) is off-limits. A git worktree isolates files; it does not isolate bundle id, Application Support, SQLite, port `18217`, or `/tmp/RemoteCode.sock`.
 
 - Create/enter a linked worktree, then edit, build, and test only there: `cd "$(scripts/isolated-sandbox.sh ensure)"`
 - Prove with `scripts/isolated-sandbox.sh test` (optional `--filter …`). Launch a second GUI only via `scripts/isolated-sandbox.sh run`.
@@ -47,7 +47,7 @@ The user's running RemoteCode (`io.remotecode.desktop`) is off-limits. A git wor
   only for one bounded, reversible E2E that must click, type, press keys, scroll, drag, or run
   AppleScript. Prefer `see`/`state` and targeted AX actions.
 - Target the exact debug bundle ID `io.remotecode.desktop.debug`, then exit the session. Never
-  target stable RemoteCode or leave SkyComputerUseService, `node_repl`, or Computer Use MCP
+  target stable MacCode or leave SkyComputerUseService, `node_repl`, or Computer Use MCP
   daemons running; never use a persistent harness `repl`.
 
 ## Shared components
@@ -74,7 +74,7 @@ The user's running RemoteCode (`io.remotecode.desktop`) is off-limits. A git wor
 
 ## macOS crash / long-running terminal diagnostics
 
-- For reports that RemoteCode closes while a long Claude terminal or Agent run is active, first collect unified logs from the app diagnostics subsystems:
+- For reports that MacCode closes while a long Claude terminal or Agent run is active, first collect unified logs from the app diagnostics subsystems:
   ```bash
   log stream --style compact --predicate 'subsystem == "io.remotecode.app" || subsystem == "io.remotecode.surfaces" || subsystem == "io.remotecode.agent"'
   ```

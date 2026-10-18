@@ -814,7 +814,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
     static let stoppedNote = "stopped before answering."
     static let supersededNote = "did not answer: a newer message took over."
     static let removedNote = "was removed before answering."
-    static let interruptedError = "RemoteCode closed while this turn was running."
+    static let interruptedError = "MacCode closed while this turn was running."
 
     /// Moves the turn and, with `outcome`, rewrites its room row in the same
     /// transaction, then publishes the row and the turn once each. Nil when

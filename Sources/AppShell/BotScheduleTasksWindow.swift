@@ -33,7 +33,7 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
     public func nextRunLabel(isAutonomyActive: Bool) -> String {
         if !isEnabled { return "Paused" }
         if !isAutonomyActive { return "Scheduler paused" }
-        return "While RemoteCode is open"
+        return "While MacCode is open"
     }
 }
 
@@ -137,7 +137,7 @@ public struct BotScheduleTasksRootView: View {
                     icon: "calendar.badge.clock",
                     title: vm.scheduleTaskSearchText.isEmpty ? "No scheduled tasks" : "No matching tasks",
                     subtitle: vm.scheduleTaskSearchText.isEmpty
-                        ? "Create a task to run a bot automatically while RemoteCode is open."
+                        ? "Create a task to run a bot automatically while MacCode is open."
                         : "Try another search or clear the status filter."
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

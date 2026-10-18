@@ -311,7 +311,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     private static func forkMarker(for request: AgentProviderForkRequest) -> String {
-        "RemoteCode fork \(request.idempotencyKey)"
+        "MacCode fork \(request.idempotencyKey)"
     }
 
     private func forkSourceSnapshot(threadId: AgentThreadID) -> (sessionId: String?, hasActiveTurn: Bool) {

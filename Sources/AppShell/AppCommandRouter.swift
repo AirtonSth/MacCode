@@ -3445,7 +3445,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         guard let normalizedHandle = BotHandle.normalize(handle),
               let peer = try ctx.botStore.list().first(where: { $0.handle == normalizedHandle }) else {
-            throw JSONRPCError(code: -32044, message: "RemoteCode Bot @\(handle) was not found.")
+            throw JSONRPCError(code: -32044, message: "MacCode Bot @\(handle) was not found.")
         }
         let delegatedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !delegatedPrompt.isEmpty else { throw JSONRPCError.invalidParams }
@@ -3502,7 +3502,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "attributed_reply_already_displayed": .bool(true),
             "next": .string(
                 replyMode == .replyOnly
-                    ? "End the turn now. RemoteCode will keep only the attributed Bot reply."
+                    ? "End the turn now. MacCode will keep only the attributed Bot reply."
                     : "Continue the original user request using this reply."
             ),
         ])
@@ -3760,7 +3760,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
               let route = try ctx.runRepo.route(of: callerRun),
               route.threadId == callerThread,
               let policy = try ctx.threadRepo.deskPolicy(of: callerThread) else {
-            throw JSONRPCError(code: -32045, message: "RemoteCode Bot runtime is unavailable.")
+            throw JSONRPCError(code: -32045, message: "MacCode Bot runtime is unavailable.")
         }
         return try botsViewModel.enqueueHostMessage(
             botID: botID,
@@ -3773,7 +3773,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func createHostBotThread(botID: BotID, title: String) throws -> JSONValue {
         guard let ctx = context else { throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.") }
         guard let bot = try ctx.botStore.get(id: botID), bot.deletedAt == nil else {
-            throw JSONRPCError(code: -32044, message: "RemoteCode Bot was not found.")
+            throw JSONRPCError(code: -32044, message: "MacCode Bot was not found.")
         }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         let conversation = BotConversation(
@@ -9128,7 +9128,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         action: BotBrowserPendingAction
     ) async throws -> String {
         guard let ctx = context else {
-            throw BotBrowserError.invalid("Bot browser is not available. Keep the RemoteCode app running and try again.")
+            throw BotBrowserError.invalid("Bot browser is not available. Keep the MacCode app running and try again.")
         }
         if action.kind == BotBrowserCatalog.act, botComputerControl.isControlledByUser(botID) {
             return Self.botBrowserRefusalPayload
@@ -9432,7 +9432,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         callerThread: AgentThreadID, surface: SurfaceID?, reason: String
     ) throws -> JSONValue {
         guard let ctx = context else {
-            throw DefiniteMutationRejection(JSONRPCError(code: -32044, message: "RemoteCode is unavailable."))
+            throw DefiniteMutationRejection(JSONRPCError(code: -32044, message: "MacCode is unavailable."))
         }
         let selected: SurfaceID
         do {
@@ -10364,7 +10364,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         } catch {
             throw JSONRPCError(
                 code: JSONRPCError.internalError.code,
-                message: "The saved SSH hosts for this workspace could not be read, so RemoteCode left them untouched. The stored entry has to be repaired before hosts can be edited."
+                message: "The saved SSH hosts for this workspace could not be read, so MacCode left them untouched. The stored entry has to be repaired before hosts can be edited."
             )
         }
     }

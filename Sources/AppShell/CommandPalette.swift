@@ -396,7 +396,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         }
         cmds.append(PaletteCommand(id: "session.save", title: "Save Session Snapshot", keywords: ["snapshot", "session"], category: .app, iconName: "camera") { router.context?.saveSnapshot() })
         // UX-011: Quit is destructive - red tint + de-prioritized in ranking.
-        cmds.append(PaletteCommand(id: "app.quit", title: "Quit RemoteCode", keywords: ["exit", "quit"], shortcut: "⌘Q", category: .app, iconName: "power", destructive: true) { NSApp.terminate(nil) })
+        cmds.append(PaletteCommand(id: "app.quit", title: "Quit MacCode", keywords: ["exit", "quit"], shortcut: "⌘Q", category: .app, iconName: "power", destructive: true) { NSApp.terminate(nil) })
         self.all = cmds
         applyFilter(currentQuery)
     }

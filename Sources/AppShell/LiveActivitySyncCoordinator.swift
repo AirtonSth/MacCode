@@ -66,9 +66,9 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
     public let revision: Int64
 
     public init(
-        title: String = "RemoteCode",
+        title: String = "MacCode",
         statusLine: String,
-        preview: String = "RemoteCode",
+        preview: String = "MacCode",
         phase: PrivateLiveActivityProjectionPhase,
         activeThreadCount: Int,
         updatedAt: Double,
@@ -585,9 +585,9 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
             threadId = nil
             workspaceId = nil
             runStartDate = nil
-            title = "RemoteCode"
+            title = "MacCode"
             statusLine = phase == .completed ? "Finished" : "Failed"
-            preview = "RemoteCode"
+            preview = "MacCode"
         }
         let contentState = PrivateLiveActivityProjectionV2(
             title: title,

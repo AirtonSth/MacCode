@@ -14224,7 +14224,7 @@ public struct BotsRootView: View {
             )
             .accessibilityIdentifier("bots.brain.digest")
             if !compact {
-                Text("compiler \(receipt.compilerVersion) · no opaque RemoteCode layer")
+                Text("compiler \(receipt.compilerVersion) · no opaque MacCode layer")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
             }
@@ -14572,7 +14572,7 @@ public struct BotsRootView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("bots.routines.honesty")
             if !vm.isAutonomyActive {
-                Text("Enabling a schedule does not run while RemoteCode is closed.")
+                Text("Enabling a schedule does not run while MacCode is closed.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
             }

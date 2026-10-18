@@ -376,9 +376,9 @@ public enum TitioNoticeCopy {
 
         case .serverListenerFailed:
             if pt {
-                return "O servidor do RemoteCode não conseguiu abrir a porta\(f.port.map { " \($0)" } ?? ""), então o iPhone pode não conectar."
+                return "O servidor do MacCode não conseguiu abrir a porta\(f.port.map { " \($0)" } ?? ""), então o iPhone pode não conectar."
             }
-            return "RemoteCode's server could not open \(f.port.map { "port \($0)" } ?? "its port"), so your iPhone may not connect."
+            return "MacCode's server could not open \(f.port.map { "port \($0)" } ?? "its port"), so your iPhone may not connect."
 
         case .providerUpdateFailed:
             if pt { return "A atualização\(title.map { " do **\($0)**" } ?? "") falhou." }
@@ -386,8 +386,8 @@ public enum TitioNoticeCopy {
 
         case .notificationsDenied:
             return pt
-                ? "As notificações do sistema estão desligadas para o RemoteCode, então eu só aviso por aqui e no pet."
-                : "System notifications are off for RemoteCode, so I'll only tell you here and from the pet."
+                ? "As notificações do sistema estão desligadas para o MacCode, então eu só aviso por aqui e no pet."
+                : "System notifications are off for MacCode, so I'll only tell you here and from the pet."
 
         case .external:
             let body = clean(f.body, max: 300)

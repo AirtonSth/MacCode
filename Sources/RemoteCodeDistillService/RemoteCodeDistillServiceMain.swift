@@ -243,7 +243,7 @@ struct RemoteCodeDistillServiceMain {
     Modes:
       subagent begin|end …              Subagents telemetry receipts
       provider-proxy <name> [args …]    nested provider PATH controller
-      \(ComputerUseHostQueue.cliArgument)              RemoteCode computer-use MCP (stdio)
+      \(ComputerUseHostQueue.cliArgument)              MacCode computer-use MCP (stdio)
       \(BotSelfConfigCatalog.cliArgument), \(BotBrowserCatalog.cliArgument), \(BotWebCatalog.cliArgument), \(BotComputerCatalog.cliArgument)
                                         bot MCP servers (stdio)
 

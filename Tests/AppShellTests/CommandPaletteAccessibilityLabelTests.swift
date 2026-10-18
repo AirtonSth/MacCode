@@ -41,10 +41,10 @@ final class CommandPaletteAccessibilityLabelTests: XCTestCase {
     func test_titleAndShortcut_appendsShortcut() {
         // WHY: the keyboard shortcut lets power users confirm the chord without
         // leaving the palette; it must appear in the VO announcement.
-        let label = CommandPalette.accessibilityLabel(title: "Quit RemoteCode",
+        let label = CommandPalette.accessibilityLabel(title: "Quit MacCode",
                                                      subtitle: "",
                                                      shortcut: "Command+Q")
-        XCTAssertEqual(label, "Quit RemoteCode, Command+Q")
+        XCTAssertEqual(label, "Quit MacCode, Command+Q")
     }
 
     // MARK: - Title + subtitle + shortcut

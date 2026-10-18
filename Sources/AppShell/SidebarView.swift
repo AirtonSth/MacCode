@@ -131,7 +131,7 @@ public final class SidebarViewModel: ObservableObject {
             let alert = NSAlert()
             alert.alertStyle = .warning
             alert.messageText = "Remove \"\(name)\"?"
-            alert.informativeText = "This removes the workspace and its tabs from RemoteCode. Files on disk are not touched."
+            alert.informativeText = "This removes the workspace and its tabs from MacCode. Files on disk are not touched."
             alert.addButton(withTitle: "Remove")
             alert.addButton(withTitle: "Cancel")
             let handler: (NSApplication.ModalResponse) -> Void = { response in
@@ -152,7 +152,7 @@ public final class SidebarViewModel: ObservableObject {
             let alert = NSAlert()
             alert.alertStyle = .warning
             alert.messageText = "Remove \(count) workspaces?"
-            alert.informativeText = "This removes the selected workspaces and their tabs from RemoteCode. Files on disk are not touched.\n\n" + names.joined(separator: "\n")
+            alert.informativeText = "This removes the selected workspaces and their tabs from MacCode. Files on disk are not touched.\n\n" + names.joined(separator: "\n")
             alert.addButton(withTitle: "Remove")
             alert.addButton(withTitle: "Cancel")
             let handler: (NSApplication.ModalResponse) -> Void = { response in
@@ -1125,13 +1125,13 @@ public final class SidebarViewModel: ObservableObject {
             return
         }
 
-        guard insomniaPower.activate(reason: "RemoteCode Insomnia", options: insomniaPowerOptions) else {
+        guard insomniaPower.activate(reason: "MacCode Insomnia", options: insomniaPowerOptions) else {
             NSLog("RemoteCode Insomnia failed to activate macOS power assertions.")
             finishInsomniaSession()
             // UX-P2: surface the failure so the user knows why the toggle snapped off.
             showOperationError(
                 "Insomnia could not keep the display or system awake",
-                detail: "macOS denied the power assertion. RemoteCode may use `pmset` to disable clamshell sleep, which requires administrator privileges. Insomnia has been turned off."
+                detail: "macOS denied the power assertion. MacCode may use `pmset` to disable clamshell sleep, which requires administrator privileges. Insomnia has been turned off."
             )
             return
         }
@@ -2347,7 +2347,7 @@ public struct SidebarRootView: View {
         components.scheme = "mailto"
         components.path = "samuelfajreldines@gmail.com"
         components.queryItems = [
-            URLQueryItem(name: "subject", value: "RemoteCode Bug Report")
+            URLQueryItem(name: "subject", value: "MacCode Bug Report")
         ]
         guard let url = components.url else { return }
         NSWorkspace.shared.open(url)
@@ -2365,15 +2365,15 @@ public struct SidebarRootView: View {
     private var updateHelpText: String {
         switch vm.updateAvailability {
         case .available:
-            return "Install the available RemoteCode update"
+            return "Install the available MacCode update"
         case .checking:
-            return "Checking for RemoteCode updates"
+            return "Checking for MacCode updates"
         case .upToDate:
-            return "Check again for RemoteCode updates"
+            return "Check again for MacCode updates"
         case .failed(let message):
             return message
         case .unknown:
-            return "Check for RemoteCode updates"
+            return "Check for MacCode updates"
         }
     }
 
@@ -2672,7 +2672,7 @@ public struct SidebarRootView: View {
     }
 
     private var accountSubtitle: String {
-        vm.privateAccountUser?.email ?? "RemoteCode Account"
+        vm.privateAccountUser?.email ?? "MacCode Account"
     }
 
     private var accountInitials: String {

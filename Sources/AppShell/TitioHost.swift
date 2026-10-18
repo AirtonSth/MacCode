@@ -211,7 +211,7 @@ extension AppCommandRouter {
         let bots = try ctx.botStore.list()
         guard let bot = bots.first(where: { $0.handle.lowercased() == key })
                 ?? bots.first(where: { $0.name.lowercased() == key }) else {
-            throw JSONRPCError(code: -32044, message: "No RemoteCode Bot named \(query).")
+            throw JSONRPCError(code: -32044, message: "No MacCode Bot named \(query).")
         }
         return try await sendHostBot(
             botID: bot.id, text: text, conversationID: conversationID,
@@ -225,7 +225,7 @@ extension AppCommandRouter {
         guard let workspace = ctx.state.workspaces.values.first(where: {
             $0.id.value.uuidString.lowercased() == key || $0.name.lowercased() == key
         }) else {
-            throw JSONRPCError(code: -32044, message: "No RemoteCode workspace named \(query).")
+            throw JSONRPCError(code: -32044, message: "No MacCode workspace named \(query).")
         }
         let tasks = try ScheduledTaskStore(db: ctx.db).list().filter { $0.workspaceID == workspace.id }
         let task: ScheduledTask?

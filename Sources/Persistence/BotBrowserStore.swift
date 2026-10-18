@@ -544,7 +544,7 @@ public struct BotBrowserService: Sendable {
             }
             Thread.sleep(forTimeInterval: 0.03)
         }
-        throw BotBrowserError.invalid("Bot browser is not available. Keep the RemoteCode app running and try again.")
+        throw BotBrowserError.invalid("Bot browser is not available. Keep the MacCode app running and try again.")
     }
 
     public func waitLogin(page: BotBrowserPageState? = nil) throws -> BotBrowserLoginWait.Result {

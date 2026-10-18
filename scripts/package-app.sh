@@ -239,10 +239,10 @@ cat > "$STAGING_APP/Contents/Info.plist" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleDisplayName</key><string>RemoteCode</string>
+  <key>CFBundleDisplayName</key><string>MacCode</string>
   <key>CFBundleExecutable</key><string>RemoteCode</string>
   <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
-  <key>CFBundleName</key><string>RemoteCode</string>
+  <key>CFBundleName</key><string>MacCode</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
@@ -270,15 +270,15 @@ cat > "$STAGING_APP/Contents/Info.plist" <<EOF
   <key>NSSupportsAutomaticTermination</key><false/>
   <key>NSSupportsSuddenTermination</key><false/>
   <key>NSNetworkVolumesUsageDescription</key>
-  <string>RemoteCode needs access to project folders on network volumes so agents, terminals, and file tools can read and edit your code.</string>
+  <string>MacCode needs access to project folders on network volumes so agents, terminals, and file tools can read and edit your code.</string>
   <key>NSRemovableVolumesUsageDescription</key>
-  <string>RemoteCode needs access to project folders on removable volumes so agents, terminals, and file tools can read and edit your code.</string>
+  <string>MacCode needs access to project folders on removable volumes so agents, terminals, and file tools can read and edit your code.</string>
   <key>NSDesktopFolderUsageDescription</key>
-  <string>RemoteCode needs access to folders on your Desktop when you open them as workspaces.</string>
+  <string>MacCode needs access to folders on your Desktop when you open them as workspaces.</string>
   <key>NSDocumentsFolderUsageDescription</key>
-  <string>RemoteCode needs access to folders in Documents when you open them as workspaces.</string>
+  <string>MacCode needs access to folders in Documents when you open them as workspaces.</string>
   <key>NSDownloadsFolderUsageDescription</key>
-  <string>RemoteCode needs access to folders in Downloads when you open them as workspaces.</string>
+  <string>MacCode needs access to folders in Downloads when you open them as workspaces.</string>
   <key>LSEnvironment</key>
   <dict>
     <key>RC2_CHANNEL</key><string>${RC2_CHANNEL_VALUE}</string>

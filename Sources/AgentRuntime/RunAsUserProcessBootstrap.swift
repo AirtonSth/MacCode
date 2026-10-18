@@ -314,7 +314,7 @@ public enum RunAsUserProcessBootstrap {
         return """
         #!/bin/sh
         /usr/bin/osascript \
-          -e 'display dialog "RemoteCode needs your macOS password once to install its privileged helper for \(who). The password is not saved." with title "RemoteCode" default answer "" with hidden answer with icon caution' \
+          -e 'display dialog "MacCode needs your macOS password once to install its privileged helper for \(who). The password is not saved." with title "MacCode" default answer "" with hidden answer with icon caution' \
           -e 'text returned of result' 2>/dev/null
         """
     }

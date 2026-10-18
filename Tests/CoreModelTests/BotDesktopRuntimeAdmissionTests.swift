@@ -109,7 +109,7 @@ final class BotDesktopRuntimeAdmissionTests: XCTestCase {
                 continue
             }
             XCTAssertTrue(message.contains("unavailable"), "refusal must fail loud for an unsupported runtime")
-            XCTAssertTrue(message.contains("RemoteCode"), "refusal must name the banned in-app browser")
+            XCTAssertTrue(message.contains("MacCode"), "refusal must name the banned in-app browser")
         }
     }
 }

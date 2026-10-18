@@ -393,7 +393,7 @@ final class BotTypesTests: XCTestCase {
         XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("Test runs are real work"))
         // The executor runs only while RemoteCode is open; the caption must
         // say so, matching the Schedule Tasks "While RemoteCode is open".
-        XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("only while RemoteCode is open"))
+        XCTAssertTrue(BotRoutineCopy.testRunHonestyCaption.contains("only while MacCode is open"))
         XCTAssertFalse(BotRoutineCopy.testRunHonestyCaption.contains("App-closed"))
     }
 

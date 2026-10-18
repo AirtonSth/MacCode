@@ -108,7 +108,7 @@ public struct PetAttentionPresentation: Sendable, Equatable {
         case .sshTransfer(.succeeded): title = "SSH transfer completed"
         case .sshTransfer(.failed): title = "SSH transfer failed"
         case .providerUpdateFailed: title = "Provider update failed"
-        case .serverListenerFailed: title = "Remote Code listener needs attention"
+        case .serverListenerFailed: title = "MacCode listener needs attention"
         }
 
         let displayThreadTitle = Self.safeThreadTitle(context.threadTitle)

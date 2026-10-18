@@ -547,7 +547,7 @@ public enum HostDatabaseRestore {
         defer { statement.reset() }
         guard try statement.step(), statement.columnText(1) == "integer",
               statement.columnInt64(0) > 0, statement.columnInt64(0) <= Int64(Schema.currentVersion) else {
-            throw SQLiteError.execute("restore requires a supported RemoteCode database schema")
+            throw SQLiteError.execute("restore requires a supported MacCode database schema")
         }
     }
 

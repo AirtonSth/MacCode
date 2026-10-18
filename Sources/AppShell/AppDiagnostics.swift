@@ -141,7 +141,7 @@ public enum ManagedProviderAdmissionError: Error, LocalizedError, Sendable, Equa
         case .providerLimitReached(let limit):
             return "This Mac is already running the safe limit of \(limit) managed provider sessions. Finish or release an idle session, then try again."
         case .hostMemoryLimitReached(let limitKB):
-            return "A new provider could not start because RemoteCode reached its low-memory host limit of \(limitKB / 1_024) MiB. Finish or release an idle session, then try again."
+            return "A new provider could not start because MacCode reached its low-memory host limit of \(limitKB / 1_024) MiB. Finish or release an idle session, then try again."
         case .managedTreeMemoryLimitReached(let limitKB):
             return "A new provider could not start because managed runtimes reached their low-memory limit of \(limitKB / 1_024) MiB. Finish or release an idle session, then try again."
         }

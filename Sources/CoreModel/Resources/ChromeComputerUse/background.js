@@ -103,7 +103,7 @@ export async function handleRequest(request) {
   if (operation === 'browser_open') {
     const url = validURL(args.url);
     if (!sessions.has(session)) {
-      if (sessions.size >= 32) throw new Error('Close an existing RemoteCode browser session first.');
+      if (sessions.size >= 32) throw new Error('Close an existing MacCode browser session first.');
       const window = await chrome.windows.getLastFocused({windowTypes: ['normal']});
       if (window.incognito) throw new Error('Open a regular Chrome window in the profile you want to use.');
       const tab = await chrome.tabs.create({windowId: window.id, url: 'about:blank', active: false});
@@ -138,7 +138,7 @@ function badge(text, title) {
 function disconnected(connection, error) {
   if (port !== connection) return;
   port = undefined;
-  badge('OFF', error || 'RemoteCode disconnected. Click to reconnect.');
+  badge('OFF', error || 'MacCode disconnected. Click to reconnect.');
   // Let any running request settle before disposing only tabs we still own.
   requests = requests.then(async () => {
     for (const session of [...sessions.keys()]) {
@@ -151,7 +151,7 @@ function connect() {
   if (port) return;
   const connection = chrome.runtime.connectNative(hostName);
   port = connection;
-  badge('ON', 'RemoteCode connected. Click to disconnect.');
+  badge('ON', 'MacCode connected. Click to disconnect.');
   connection.onMessage.addListener(request => {
     requests = requests.then(async () => {
       if (port !== connection) return;
