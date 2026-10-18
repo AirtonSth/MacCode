@@ -140,11 +140,77 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         f.vm.filterText = "develop"
         XCTAssertEqual(f.vm.treeWorkspaces.map(\.id), [elephant.id], "a Bot match keeps its workspace in the tree")
         XCTAssertEqual(f.vm.workspaceBotRows(elephant.id).map(\.botID), [developer.id], "search reveals the Bot without expanding")
-        XCTAssertTrue(f.vm.visibleGeneralBots.isEmpty)
+        XCTAssertEqual(f.vm.visibleGeneralBots.count, f.vm.generalBots.count, "the workspace search never filters General Bots")
 
-        f.vm.filterText = "titio"
-        XCTAssertEqual(f.vm.visibleGeneralBots.map(\.handle), [TitioIdentity.handle])
-        XCTAssertTrue(f.vm.treeWorkspaces.isEmpty)
+        f.vm.filterText = ""
+        f.vm.generalBotsFilterText = "titio"
+        XCTAssertEqual(f.vm.visibleGeneralBots.map(\.handle), [TitioIdentity.handle], "the inline General Bots search filters only that list")
+        XCTAssertEqual(f.vm.treeWorkspaces.count, 2, "and never the workspace tree")
+        f.vm.generalBotsFilterText = "no-such-bot"
+        XCTAssertTrue(f.vm.visibleGeneralBots.isEmpty)
+    }
+
+
+    func test_generalBotsHeaderTeamsButtonAndShowHiddenStayMountedWhenNoBotIsListed() async throws {
+        let f = try make("empty-general")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        f.vm.reload()
+        await f.vm.reloadAuthorizedBotConversationRowsAndWait()
+        XCTAssertTrue(f.vm.generalBots.isEmpty, "no bot exists: the section would have been hidden before")
+        let hosting = NSHostingView(rootView: SidebarRootView(vm: f.vm).frame(width: 300, height: 860))
+        hosting.frame = NSRect(x: 0, y: 0, width: 300, height: 860)
+        let window = NSWindow(contentRect: hosting.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+        func snapshot() throws -> Data {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+            let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+            return try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        }
+        let empty = try snapshot()
+        // Typing adds the search field's clear button; that only paints if the header is mounted.
+        f.vm.generalBotsFilterText = "x"
+        XCTAssertNotEqual(try snapshot(), empty, "the General Bots search header (with Teams and Show hidden) stays mounted with zero bots")
+        let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertFalse(source.contains("if !vm.generalBots.isEmpty {"), "the General Bots header never depends on the list being non-empty")
+    }
+
+    func test_activitySubtitleCountsRunningBotsWithTheWorkspaceActivity() {
+        let counts = PetActivityCounts(running: 2, needsYou: 1, newResults: 0)
+        XCTAssertEqual(SidebarViewModel.activitySubtitle(counts, activeBots: 0), "2 running · 1 need you")
+        XCTAssertEqual(SidebarViewModel.activitySubtitle(counts, activeBots: 1), "2 running · 1 need you · 1 bot")
+        XCTAssertEqual(SidebarViewModel.activitySubtitle(counts, activeBots: 3), "2 running · 1 need you · 3 bots")
+        XCTAssertEqual(SidebarViewModel.activitySubtitle(.zero, activeBots: 2), "Activity unavailable")
+    }
+
+    func test_newConversationLeadsAnExpandedWorkspaceAndStartsAnAgentThreadThere() async throws {
+        let f = try make("new-conversation")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let controller = MainWindowController(context: f.context, router: f.router)
+        f.router.windowController = controller
+        controller.window.isReleasedWhenClosed = false
+        defer { controller.window.close() }
+        let workspace = try f.router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        f.vm.reload()
+        if f.vm.expandedWorkspaceIDs.contains(workspace.id) { f.vm.toggleWorkspaceExpanded(workspace.id) }
+        XCTAssertFalse(f.vm.showsNewConversation(workspace.id), "a collapsed workspace shows no Conversations")
+        await expand(f.vm, workspace.id)
+        XCTAssertTrue(f.vm.showsNewConversation(workspace.id), "the first Conversations row is always + New conversation")
+        f.vm.filterText = "zzz"
+        XCTAssertFalse(f.vm.showsNewConversation(workspace.id), "a search shows matches only")
+        f.vm.filterText = ""
+
+        let before = try f.context.threadRepo.list(workspaceId: workspace.id).map(\.id)
+        let created = try f.router.createWorkspaceConversation(workspace: workspace.id)
+        XCTAssertFalse(before.contains(created))
+        XCTAssertEqual(try f.context.threadRepo.get(id: created)?.workspaceId, workspace.id, "the thread belongs to the clicked workspace")
+        XCTAssertTrue(controller.isShowingWorkspaceContent, "the new conversation opens in the workspace content")
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.all().compactMap { $0 as? AgentAppSurface }
+            .first { $0.viewModel.workspaceID == workspace.id })
+        XCTAssertEqual(surface.viewModel.selectedThreadId, created, "the Agent App has the new thread selected")
     }
 
     func test_conversationRowsOpenTheCanonicalThread() async throws {
@@ -223,26 +289,14 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
             try XCTUnwrap(source.range(of: needle, range: body.upperBound..<source.endIndex), needle).lowerBound
         }
         XCTAssertFalse(source.contains("BotsModeSwitcher"), "no Workspaces | Bots toggle")
-        let order = try ["accessibilityIdentifier(\"sidebar.newWorkspace\")", "accessibilityIdentifier(\"sidebar.activity\")",
+        let order = try ["accessibilityIdentifier(\"sidebar.new\")", "accessibilityIdentifier(\"sidebar.activity\")",
                          "accessibilityIdentifier(\"sidebar.scheduleTasks\")", "            generalBotsSection\n",
-                         "Text(\"Workspaces\")", "workspaceChildren(ws)", "            manageBotsFooter\n"].map(position)
-        XCTAssertEqual(order, order.sorted(), "top items, General Bots, Workspaces tree, Manage Bots footer")
+                         "Text(\"Workspaces\")", "workspaceChildren(ws)", "            accountFooter\n"].map(position)
+        XCTAssertEqual(order, order.sorted(), "top items, General Bots, Workspaces tree, account footer")
         XCTAssertEqual(f.vm.generalBots.first?.handle, TitioIdentity.handle)
         if let directory = ProcessInfo.processInfo.environment["RC_SIDEBAR_RENDER_DIR"] {
             try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: directory).appendingPathComponent("unified-sidebar.png"))
         }
-    }
-
-    func test_manageBotsFooterOpensTheBotsCatalogWithTheRosterBesideIt() throws {
-        let f = try make("manage")
-        defer { try? FileManager.default.removeItem(atPath: f.directory) }
-        let controller = MainWindowController(context: f.context, router: f.router)
-        f.router.windowController = controller
-        controller.window.isReleasedWhenClosed = false
-        defer { controller.window.close() }
-        controller.sidebarOpenBotsForTesting()
-        XCTAssertTrue(controller.isShowingBotsContent, "Manage Bots and Teams opens the existing Bots catalog and Studio")
-        XCTAssertTrue(controller.sidebarViewModelForTesting.isBotsSelected)
     }
 
     func test_addBotOpensTheExistingNewBotFlowWithoutAnyGrant() throws {

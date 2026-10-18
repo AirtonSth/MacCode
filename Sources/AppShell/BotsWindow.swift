@@ -4211,6 +4211,11 @@ public final class BotsViewModel: ObservableObject {
 
     public func reloadActiveBotsScreen() {
         guard screen.resolvedDestination == .activeBots else { return }
+        reloadActiveBotItems()
+    }
+
+    /// Active and recently finished bot runs, for the Activity screen.
+    public func reloadActiveBotItems() {
         activeBotsHydrationCountForTesting += 1
         settleTerminalWorkingConversations()
         let liveBots = liveWorkingBots()
@@ -8003,12 +8008,8 @@ public final class BotsViewModel: ObservableObject {
     /// full titlebar below the traffic lights, and keeping .leading hung
     /// Ceo in empty padding next to the sidebar. Constant edges also
     /// keep Desk still while the sidebar toggle animates.
-    static func ignoredSafeAreaEdges(
-        embedsRosterRail: Bool,
-        presentsAsDetachedWindow: Bool
-    ) -> Edge.Set {
+    static func ignoredSafeAreaEdges(presentsAsDetachedWindow: Bool) -> Edge.Set {
         if presentsAsDetachedWindow { return [] }
-        if embedsRosterRail { return .top }
         return [.top, .leading, .trailing]
     }
 
@@ -12746,254 +12747,9 @@ extension BotsViewModel: AgentRunObserver {
     }
 }
 
-/// Roster body shared by the shell sidebar and the detached Bots window.
-public struct BotsRosterList: View {
-    @ObservedObject private var vm: BotsViewModel
-    @ObservedObject private var teamsGroups: BotTeamsGroupsController
-    /// Sidebar hosts the roster in a sibling NSHostingView from BotsRootView.
-    /// Attach the delete confirm here so right-click Delete is not a silent latch.
-    private let attachDeleteConfirmation: Bool
-    @State private var searchFocusRequest = false
-
-    public init(
-        vm: BotsViewModel,
-        attachDeleteConfirmation: Bool = false,
-        isScheduledTasksSelected: Bool = false,
-        onOpenScheduledTasks: (() -> Void)? = nil
-    ) {
-        self.vm = vm
-        self.teamsGroups = vm.teamsGroups
-        self.attachDeleteConfirmation = attachDeleteConfirmation
-        _ = isScheduledTasksSelected
-        _ = onOpenScheduledTasks
-    }
-
-    public var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                Button(action: vm.beginCreate) {
-                    SidebarActionRow(symbol: "person.badge.plus", title: BotsChrome.Label.newBot)
-                }
-                .buttonStyle(.plain)
-                .disabled(!vm.isControlPlaneActive)
-                .help("Create a named teammate")
-                .accessibilityIdentifier("bots.new")
-                .contextMenu { BotTeamsGroupsCreateButtons(vm: vm) }
-
-                Button(action: vm.openActiveBots) {
-                    SidebarActionRow(
-                        symbol: "bolt.horizontal.circle",
-                        title: BotsChrome.Label.activeBots,
-                        isSelected: vm.screen.resolvedDestination == .activeBots,
-                        badgeText: PetActiveThreadCountFormatter.badgeText(count: vm.activeBotCount),
-                        badgeIsBlue: true
-                    )
-                }
-                .buttonStyle(.plain)
-                .help(
-                    vm.activeBotCount == 0
-                        ? BotsChrome.Label.activeBots
-                        : "\(BotsChrome.Label.activeBots) \(vm.activeBotCount)"
-                )
-                .accessibilityLabel(
-                    vm.activeBotCount == 0
-                        ? BotsChrome.Label.activeBots
-                        : "\(BotsChrome.Label.activeBots) \(vm.activeBotCount)"
-                )
-                .accessibilityIdentifier("bots.active")
-                .accessibilityAddTraits(vm.screen.resolvedDestination == .activeBots ? .isSelected : [])
-
-                Button(action: vm.openScheduleTasks) {
-                    SidebarActionRow(
-                        symbol: "calendar.badge.clock",
-                        title: BotsChrome.Label.scheduleTasks,
-                        isSelected: vm.screen.resolvedDestination == .scheduleTasks
-                    )
-                }
-                .buttonStyle(.plain)
-                .help("Create and manage scheduled bot tasks")
-                .accessibilityIdentifier("bots.scheduleTasks")
-                .accessibilityAddTraits(vm.screen.resolvedDestination == .scheduleTasks ? .isSelected : [])
-            }
-            .padding(.horizontal, DS.Space.md)
-            .padding(.bottom, DS.Space.lg)
-
-            HStack(spacing: DS.Space.sm) {
-                Text(BotsChrome.Label.myBots)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-                Spacer(minLength: 0)
-                // With no teams or groups the header stays as it was; New Team
-                // and New Group are then on the New Bot row's context menu.
-                if !teamsGroups.teams.isEmpty || !teamsGroups.groups.isEmpty {
-                    Menu {
-                        BotTeamsGroupsCreateButtons(vm: vm)
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(DS.Palette.textTertiary)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
-                    .fixedSize()
-                    .disabled(!vm.isControlPlaneActive)
-                    .help("New team or group conversation")
-                    .accessibilityLabel("New team or group")
-                    .accessibilityIdentifier("bots.roster.add")
-                }
-                Toggle("Show hidden", isOn: $vm.showHidden)
-                    .toggleStyle(.checkbox)
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityIdentifier("bots.roster.showHidden")
-            }
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.bottom, DS.Space.sm)
-
-            SidebarSearchField(
-                placeholder: BotsChrome.Label.search,
-                text: $vm.searchText,
-                focusRequest: $searchFocusRequest,
-                accessibilityIdentifier: "bots.roster.search"
-            )
-            .padding(.horizontal, DS.Space.md)
-            .padding(.bottom, DS.Space.sm)
-
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: DS.Space.lg) {
-                    if vm.publishedRoster.isEmpty {
-                        Text(vm.searchText.isEmpty ? "No bots yet" : "No matches")
-                            .font(DS.Font.body)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .padding(.horizontal, DS.Space.md)
-                            .padding(.vertical, DS.Space.sm)
-                    } else if let sections = BotRosterSections.make(
-                        roster: vm.publishedRoster,
-                        teams: teamsGroups.teams,
-                        membersByTeam: teamsGroups.membersByTeam
-                    ) {
-                        BotRosterTeamSections(vm: vm, teamsGroups: teamsGroups, sections: sections) { bot in
-                            rosterRow(bot)
-                        }
-                    } else {
-                        ForEach(vm.publishedRoster, id: \.id) { bot in
-                            rosterRow(bot)
-                        }
-                    }
-                    BotGroupConversationsSection(vm: vm, teamsGroups: teamsGroups)
-                }
-                .padding(.horizontal, DS.Space.sm)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .accessibilityIdentifier("bots.roster")
-        .modifier(BotsDeleteConfirmation(vm: vm, enabled: attachDeleteConfirmation))
-        .modifier(BotTeamsGroupsSheets(vm: vm, teamsGroups: teamsGroups, enabled: attachDeleteConfirmation))
-    }
-
-    private func rosterStatusColor(_ state: BotAttentionState) -> Color {
-        switch state {
-        case .needsAttention: return DS.Palette.warning
-        case .unreadActivity: return DS.Palette.accent
-        case .working, .none: return DS.Palette.success
-        }
-    }
-
-    private func rosterRow(_ bot: BotDefinition) -> some View {
-        let selected = vm.selectedBotID == bot.id
-            && vm.screen.resolvedDestination != .activeBots
-            && vm.screen.resolvedDestination != .scheduleTasks
-            && vm.screen.resolvedDestination != .group
-        let state = vm.attentionState(for: bot)
-        let preview = vm.rosterPreview(for: bot)
-        let displayName = BotsViewModel.displayName(bot.name)
-        let identity = BotsChrome.identityColor(
-            name: bot.name,
-            handle: bot.handle,
-            symbol: bot.avatarSymbol
-        )
-        return Button {
-            vm.openDeskFromRoster(bot)
-        } label: {
-            HStack(spacing: DS.Space.sm) {
-                ZStack(alignment: .bottomTrailing) {
-                    BotsAvatarView(
-                        name: bot.name,
-                        handle: bot.handle,
-                        symbol: bot.avatarSymbol,
-                        size: BotsChrome.rosterAvatarSize,
-                        attention: vm.activityState(for: bot)
-                    )
-                    Circle()
-                        .fill(rosterStatusColor(state))
-                        .frame(width: 7, height: 7)
-                        .overlay(Circle().stroke(DS.Palette.surface, lineWidth: 1))
-                }
-                .frame(width: BotsChrome.rosterAvatarSize, height: BotsChrome.rosterAvatarSize)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(displayName)
-                        .font(selected ? DS.Font.bodyStrong : DS.Font.body)
-                        .foregroundColor(DS.Palette.text)
-                        .lineLimit(1)
-                    Text(preview)
-                        .font(DS.Font.caption2)
-                        // The selected fill is the Bot's own colour, where
-                        // textSecondary can drop under 4.5:1.
-                        .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 0)
-                if BotsChrome.rosterShowsBusySpinner(for: vm.activityState(for: bot)) {
-                    DSBusySpinner(
-                        label: BotsChrome.statusTitle(for: .working),
-                        identifier: "bots.roster.busy.\(bot.handle)"
-                    )
-                }
-                if bot.pinned {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .accessibilityHidden(true)
-                }
-                if bot.hidden {
-                    Image(systemName: "eye.slash")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .accessibilityHidden(true)
-                }
-
-            }
-            .padding(.horizontal, DS.Space.sm)
-            .frame(minHeight: BotsChrome.hitTarget)
-            .background(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .fill(selected ? identity.opacity(0.22) : Color.white.opacity(0.001))
-            )
-            .dsHoverFill(enabled: !selected)
-            .overlay(alignment: .leading) {
-                if selected {
-                    identity
-                        .frame(width: 3)
-                        .clipShape(RoundedRectangle(cornerRadius: 1.5, style: .continuous))
-                        .padding(.vertical, 5)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help("\(displayName) · \(BotsChrome.statusTitle(for: state))")
-        .accessibilityLabel(displayName)
-        .accessibilityValue("\(bot.pinned ? "Pinned. " : "")\(bot.hidden ? "Hidden. " : "")\(BotsChrome.statusTitle(for: state)). \(preview)")
-        .accessibilityIdentifier("bots.roster.row.\(bot.handle)")
-        .contextMenu {
-            botManagementButtons(bot: bot, vm: vm, fromRoster: true)
-        }
-    }
-}
-
 @MainActor
 @ViewBuilder
-private func botManagementButtons(
+func botManagementButtons(
     bot: BotDefinition,
     vm: BotsViewModel,
     fromRoster: Bool
@@ -13116,11 +12872,6 @@ private struct BotsStudioReactiveScope<Content: View>: View {
 
 public struct BotsRootView: View {
     @ObservedObject private var vm: BotsViewModel
-    /// Standalone Bots window keeps its own rail. The main shell hosts the
-    /// roster inside the single sidebar instead.
-    private let embedsRosterRail: Bool
-    /// The main shell has no Bots sidebar mode: "Manage Bots and Teams" shows the roster here.
-    private let showsCatalogRail: Bool
     @State private var pendingClearAllDeskThreads = false
     @State private var pendingDockerDataClear: BotID?
     @State private var isConfirmingTitioFactoryReset = false
@@ -13128,28 +12879,18 @@ public struct BotsRootView: View {
     @State private var contextExportModel: BotContextExportModel?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    public init(vm: BotsViewModel, embedsRosterRail: Bool = true, showsCatalogRail: Bool = false) {
+    public init(vm: BotsViewModel) {
         self.vm = vm
-        self.embedsRosterRail = embedsRosterRail
-        self.showsCatalogRail = showsCatalogRail
     }
 
     private var titlebarSafeAreaEdges: Edge.Set {
         BotsViewModel.ignoredSafeAreaEdges(
-            embedsRosterRail: embedsRosterRail,
             presentsAsDetachedWindow: vm.presentsAsDetachedWindow
         )
     }
 
     public var body: some View {
         HStack(spacing: 0) {
-            if showsRosterRail {
-                rosterRail
-                Rectangle()
-                    .fill(DS.Palette.line)
-                    .frame(width: 1)
-                    .accessibilityHidden(true)
-            }
             VStack(spacing: 0) {
                 // A row, not an alert: an error must not block the window or
                 // take the composer's focus, and must stay until dismissed.
@@ -13180,7 +12921,7 @@ public struct BotsRootView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(minWidth: embedsRosterRail ? 980 : 700, minHeight: 680)
+        .frame(minWidth: 700, minHeight: 680)
         .background(DS.Palette.bg)
         // Sidebar (open) or the 34pt restore bar (collapsed) owns the
         // traffic lights, so Desk drops every titlebar inset: .top or the
@@ -13207,23 +12948,10 @@ public struct BotsRootView: View {
         } message: {
             Text("This deletes the protected value from this Bot's storage.")
         }
-        .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail || showsCatalogRail))
-        .modifier(BotTeamsGroupsSheets(vm: vm, teamsGroups: vm.teamsGroups, enabled: embedsRosterRail || showsCatalogRail))
+        .modifier(BotsDeleteConfirmation(vm: vm, enabled: !vm.presentsAsDetachedWindow))
+        .modifier(BotTeamsGroupsSheets(vm: vm, teamsGroups: vm.teamsGroups, enabled: !vm.presentsAsDetachedWindow))
         .modifier(BotsUnsavedNewBotConfirmation(vm: vm))
         .onAppear { vm.scheduleFreshnessPass() }
-    }
-
-    private var showsRosterRail: Bool {
-        (embedsRosterRail || showsCatalogRail) && vm.isControlPlaneActive
-    }
-
-    private var rosterRail: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            BotsRosterList(vm: vm)
-                .padding(.top, DS.Space.xl)
-        }
-        .frame(width: BotsChrome.rosterWidth)
-        .background(DS.Palette.surface)
     }
 
     // MARK: Empty desk
@@ -13344,11 +13072,9 @@ public struct BotsRootView: View {
 
     private var studioHeader: some View {
         HStack(alignment: .center, spacing: DS.Space.lg) {
-            if !showsRosterRail {
-                backButton {
-                    vm.requestLeaveUnsavedNewBot { [weak vm] in
-                        vm?.leaveStudioAfterUnsavedGate()
-                    }
+            backButton {
+                vm.requestLeaveUnsavedNewBot { [weak vm] in
+                    vm?.leaveStudioAfterUnsavedGate()
                 }
             }
             BotsAvatarView(
@@ -13378,15 +13104,6 @@ public struct BotsRootView: View {
             }
             Spacer(minLength: DS.Space.lg)
             studioHeaderNotify
-            if showsRosterRail, vm.selectedBot != nil {
-                Button(BotsChrome.Label.openChat) {
-                    vm.requestLeaveUnsavedNewBot { [weak vm] in
-                        vm?.leaveStudioAfterUnsavedGate()
-                    }
-                }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .accessibilityIdentifier("bots.studio.openChat")
-            }
             Button(BotsChrome.Label.saveBot) {
                 // The error strip is not modal, so an older message can still
                 // be set here. Clear it: presentAlertError keeps any message
@@ -15057,44 +14774,7 @@ private struct StudioFocusMultiline: View {
     }
 }
 
-// MARK: - Optional detached window (fallback if the shell presenter is missing)
-
-public final class BotsWindowController: NSWindowController, NSWindowDelegate {
-    private let viewModel: BotsViewModel
-
-    public init(context: AppContext, router: AppCommandRouter) {
-        let vm = BotsViewModel(context: context, router: router, loadImmediately: false)
-        vm.enableNavigationFirstFrameDeferral()
-        self.viewModel = vm
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 760),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Bots"
-        window.minSize = NSSize(width: 980, height: 680)
-        window.center()
-        window.backgroundColor = DS.NS.bg
-        // Unified look: the titlebar paints as part of the window surface.
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        window.contentView = NSHostingView(rootView: BotsRootView(vm: viewModel))
-        window.setAccessibilityIdentifier("bots.window")
-        super.init(window: window)
-        window.delegate = self
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    public func show() {
-        showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-}
-
-/// One bot Desk in its own window. The fleet fallback above keeps the roster.
+/// One bot Desk in its own window.
 public final class BotDeskWindowController: NSWindowController, NSWindowDelegate {
     private let viewModel: BotsViewModel
     private let onClose: () -> Void
@@ -15122,7 +14802,7 @@ public final class BotDeskWindowController: NSWindowController, NSWindowDelegate
         window.backgroundColor = DS.NS.bg
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
-        window.contentView = NSHostingView(rootView: BotsRootView(vm: vm, embedsRosterRail: false))
+        window.contentView = NSHostingView(rootView: BotsRootView(vm: vm))
         window.setAccessibilityIdentifier("bots.desk.window")
         super.init(window: window)
         window.delegate = self

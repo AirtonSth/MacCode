@@ -1534,7 +1534,6 @@ final class BotsWindowTests: XCTestCase {
         // also state-independent so Desk stays still during the toggle.
         XCTAssertEqual(
             BotsViewModel.ignoredSafeAreaEdges(
-                embedsRosterRail: false,
                 presentsAsDetachedWindow: false
             ),
             [.top, .leading, .trailing],
@@ -1575,7 +1574,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(main.contains("cancelHorizontalTitlebarGutter"))
         XCTAssertTrue(
             BotsViewModel.ignoredSafeAreaEdges(
-                embedsRosterRail: false,
                 presentsAsDetachedWindow: true
             ).isEmpty,
             "a detached Desk window has its own titlebar and must keep its insets"
@@ -1844,7 +1842,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(slice.contains("Open in New Window"))
         XCTAssertTrue(slice.contains("if !vm.presentsAsDetachedWindow"))
         XCTAssertTrue(source.contains("class BotDeskWindowController"))
-        XCTAssertTrue(source.contains("embedsRosterRail: false"))
+        XCTAssertTrue(source.contains("BotsRootView(vm: vm)"))
         XCTAssertTrue(
             slice.contains("HStack(spacing: Self.deskHeaderIconSpacing)"),
             "Studio / pop-out / inspector must cluster, not inherit the header's Space.md"
@@ -2826,125 +2824,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(vm.selectedBot).title, "Scout")
     }
 
-    func test_rosterRowOpensDesk_becauseSidebarClickIsTheChat() throws {
-        // WHY: the sidebar list is the conversation switcher. A tap must
-        // open Desk, not park on Fleet Home.
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
-        vm.openHome(bot)
-        XCTAssertEqual(vm.screen, .desk)
-        vm.openDesk(bot)
-        XCTAssertEqual(vm.screen, .desk)
-        XCTAssertEqual(vm.selectedBotID, bot.id)
-        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        guard let start = source.range(of: "private func rosterRow") else {
-            return XCTFail("roster row must exist")
-        }
-        let rest = source[start.upperBound...]
-        let end = rest.range(of: "\n    private func ")?.lowerBound ?? rest.endIndex
-        let slice = String(source[start.lowerBound..<end])
-        XCTAssertTrue(
-            slice.contains("vm.openDeskFromRoster(bot)"),
-            "clicking a roster bot must dest Desk, not openHome"
-        )
-        XCTAssertFalse(
-            slice.contains("vm.openHome(bot)"),
-            "roster tap must not land on Home"
-        )
-        XCTAssertTrue(
-            slice.contains(".contextMenu"),
-            "right-click must expose teammate actions on the roster row"
-        )
-        XCTAssertTrue(
-            slice.contains("botManagementButtons"),
-            "roster menu must share Fleet's Pin/Hide/Duplicate/Edit/Delete, not a one-off Delete"
-        )
-        let rowEnd = rest.range(of: "\n@MainActor")?.lowerBound ?? end
-        let row = String(source[start.lowerBound..<rowEnd])
-        XCTAssertTrue(
-            row.contains(".padding(.horizontal, DS.Space.sm)"),
-            "roster rows must use the same horizontal inset as workspace rows"
-        )
-        XCTAssertEqual(
-            BotsChrome.rosterAvatarSize, 48,
-            "roster avatars follow a messenger conversation list, not the 20pt workspace icon slot"
-        )
-        XCTAssertGreaterThanOrEqual(
-            BotsChrome.rosterAvatarSize, 40,
-            "blobatar eyes/glance only paint at ≥40pt; a 16pt chip hides the teammate face"
-        )
-        XCTAssertTrue(
-            row.contains("size: BotsChrome.rosterAvatarSize"),
-            "the roster must paint the conversation-list avatar, not a one-off 16pt chip"
-        )
-        XCTAssertTrue(row.contains(".frame(width: BotsChrome.rosterAvatarSize, height: BotsChrome.rosterAvatarSize)"))
-        XCTAssertFalse(
-            row.contains("size: 16"),
-            "a 16pt blob in a 20pt workspace slot is too small to read as a teammate"
-        )
-    }
-
-    func test_rosterSelectionUsesAvatarInk_becauseWorkspaceRowsTintFromIdentity() throws {
-        // WHY: Workspace rows wash the selected plate with the folder
-        // color. A bot row must use the painted avatar, not the generic
-        // selection gray.
-        let pink = BotBlobatarSpec(hue: .named("pink"))
-        XCTAssertEqual(
-            BotsChrome.identityHex(name: "Ceo", handle: "ceo", symbol: pink.token),
-            BotBlobatar.figure(name: "Ceo", spec: pink, handle: "ceo").palette.head
-        )
-        XCTAssertEqual(
-            BotsChrome.identityHex(name: "Ceo", handle: "ceo", symbol: "person.crop.circle"),
-            BotsChrome.avatarHex(for: "ceo")
-        )
-        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        guard let start = source.range(of: "private func rosterRow") else {
-            return XCTFail("roster row must exist")
-        }
-        let rest = source[start.upperBound...]
-        let end = rest.range(of: "\n    private func ")?.lowerBound ?? rest.endIndex
-        let slice = String(source[start.lowerBound..<end])
-        XCTAssertTrue(slice.contains("BotsChrome.identityColor"))
-        XCTAssertTrue(slice.contains("identity.opacity(0.22)"))
-        XCTAssertFalse(
-            slice.contains("DS.Palette.selection"),
-            "selected bot rows must not use the generic workspace-less gray"
-        )
-        XCTAssertFalse(
-            slice.contains("DS.Palette.accent"),
-            "the leading bar must follow the avatar, not the app accent"
-        )
-    }
-
-    func test_rosterShowsWorkspaceBusySpinner_becauseWorkingMustMatchAgentic() throws {
-        // WHY: dest dest Working used the same green avatar dot as Online.
-        // Agentic workspaces put a 16pt ProgressView on the trailing edge.
-        // dest dest must mount that same spinner while the teammate works.
-        XCTAssertTrue(BotsChrome.rosterShowsBusySpinner(for: .working))
-        XCTAssertFalse(BotsChrome.rosterShowsBusySpinner(for: .none))
-        XCTAssertFalse(BotsChrome.rosterShowsBusySpinner(for: .needsAttention))
-        XCTAssertFalse(BotsChrome.rosterShowsBusySpinner(for: .unreadActivity))
-
-        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        guard let start = source.range(of: "private func rosterRow") else {
-            return XCTFail("roster row must exist")
-        }
-        let rest = source[start.upperBound...]
-        let end = rest.range(of: "\n    private func ")?.lowerBound ?? rest.endIndex
-        let row = String(source[start.lowerBound..<end])
-        XCTAssertTrue(row.contains("DSBusySpinner("), "dest dest roster must reuse the workspace busy spinner")
-        XCTAssertTrue(row.contains("BotsChrome.rosterShowsBusySpinner(for: vm.activityState(for: bot))"),
-                      "a live run must keep its spinner even while a separate attention item stays open")
-        XCTAssertTrue(row.contains("bots.roster.busy"))
-
-        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        XCTAssertTrue(
-            sidebar.contains("DSBusySpinner("),
-            "Agentic workspace rows must own the same DSBusySpinner type"
-        )
-    }
-
     func test_deskHeaderHasNoBack_becauseHomeIsGoneAndRosterIsTheSwitcher() throws {
         // WHY: Chat Back used to return to Fleet Home. Home is gone, so the
         // chevron called openDesk on the same bot — a visible no-op next to
@@ -2990,23 +2869,21 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
-    func test_rosterDeleteUsesPendingConfirmation_becauseDeleteRemovesTheTeammate() throws {
+    func test_botDeleteUsesPendingConfirmation_becauseDeleteRemovesTheTeammate() throws {
         // WHY: right-click Delete is irreversible. It must go through the same
         // pendingDeleteID dialog as the Fleet overflow, not call delete(id:) now.
         let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("bots.menu.delete"))
-        XCTAssertTrue(source.contains("attachDeleteConfirmation"))
         XCTAssertTrue(
-            source.contains("BotsRosterList(vm: vm)"),
-            "the rail inside BotsRootView must not attach a second confirm dialog"
+            source.contains("BotsDeleteConfirmation(vm: vm, enabled: !vm.presentsAsDetachedWindow)"),
+            "BotsRootView owns the one delete dialog in the main shell, with no roster rail"
         )
         XCTAssertTrue(
-            source.contains("BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail || showsCatalogRail)"),
-            "BotsRootView owns the one delete dialog whenever it shows the roster rail"
+            source.contains("BotTeamsGroupsSheets(vm: vm, teamsGroups: vm.teamsGroups, enabled: !vm.presentsAsDetachedWindow)"),
+            "the Teams manager sheet stays attached once the rail is gone"
         )
-        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        XCTAssertFalse(sidebar.contains("BotsRosterList("),
-                       "the unified sidebar no longer hosts a roster, so no second delete dialog can stack")
+        XCTAssertFalse(source.contains("BotsRosterList"), "the shell has no second Bots column")
+        XCTAssertFalse(source.contains("showsRosterRail"))
     }
 
     func test_showHiddenSurvivesRelaunch_becauseShowHiddenIsUserWorkflowState() throws {
@@ -3064,10 +2941,10 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.showHidden)
         vm.showHidden = true
         XCTAssertEqual(Set(vm.fleet.map(\.id)), Set([piper.id, quinn.id]))
-        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         XCTAssertTrue(
-            source.contains("bots.roster.showHidden"),
-            "Hide on the roster is only safe if Show hidden is on the same list"
+            sidebar.contains("sidebar.generalBots.showHidden"),
+            "Hide on a General Bot is only safe if Show hidden is reachable from the same section"
         )
     }
 
@@ -3403,65 +3280,6 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(vm.fleet.first).pinned)
     }
 
-    func test_renderedRosterSpinnerTracksActivityWhileApprovalMarkerRemains() throws {
-        let context = try makeContext()
-        let vm = BotsViewModel(context: context)
-        let bot = try vm.create(name: "SpinnerFixtureUnique", title: "Scout")
-        let thread = AgentThread(title: "Run", provider: .codex, model: "test")
-        try context.threadRepo.upsert(thread)
-        try context.botStore.upsertConversation(
-            BotConversation(botID: bot.id, title: "Run chat", linkedAgentThreadID: thread.id)
-        )
-        try context.botStore.upsertAttention(
-            BotAttentionItem(botID: bot.id, kind: .approval, title: "Need you")
-        )
-        vm.reload()
-        vm.searchText = "SpinnerFixtureUnique"
-        vm.activeThreadIDsOverrideForTesting = [thread.id]
-        XCTAssertEqual(vm.activityState(for: bot), .working)
-        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention)
-
-        func capture() throws -> NSBitmapImageRep {
-            let size = NSSize(width: 280, height: 600)
-            let hosting = NSHostingView(rootView: BotsRosterList(vm: vm).frame(width: size.width, height: size.height))
-            hosting.frame = NSRect(origin: .zero, size: size)
-            hosting.wantsLayer = true
-            let window = NSWindow(contentRect: hosting.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
-            window.appearance = NSAppearance(named: .darkAqua)
-            window.contentView = hosting
-            window.layoutIfNeeded()
-            hosting.layoutSubtreeIfNeeded()
-            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
-            hosting.layoutSubtreeIfNeeded()
-            let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
-            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
-            window.contentView = nil
-            return bitmap
-        }
-
-        let active = try capture()
-        try XCTUnwrap(active.representation(using: .png, properties: [:])).write(to: URL(fileURLWithPath: "/tmp/rc-bot-spinner-active.png"))
-        vm.activeThreadIDsOverrideForTesting = []
-        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention)
-        let idle = try capture()
-        try XCTUnwrap(idle.representation(using: .png, properties: [:])).write(to: URL(fileURLWithPath: "/tmp/rc-bot-spinner-idle.png"))
-        var trailingDifferences = 0
-        // This fixture's only roster row is below the search field; exclude the Active Bots badge.
-        let rowTop = Int(Double(active.pixelsHigh) * 0.33)
-        let rowBottom = Int(Double(active.pixelsHigh) * 0.42)
-        for y in rowTop..<rowBottom {
-            for x in Int(Double(active.pixelsWide) * 0.85)..<active.pixelsWide {
-                guard let a = active.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB),
-                      let b = idle.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
-                if abs(a.redComponent - b.redComponent) + abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent) > 0.12 {
-                    trailingDifferences += 1
-                }
-            }
-        }
-        XCTAssertGreaterThan(trailingDifferences, 20, "actual trailing spinner pixels must change while approval marker remains")
-        XCTAssertEqual(vm.attentionState(for: bot), .needsAttention)
-    }
-
     func test_activeBotCountSurvivesPublishesWithoutRosterQueries_andTracksRunTransitions() throws {
         // WHY (perf BT-01): the roster body read `activeBotCount` up to 8× and
         // every read ran `liveWorkingBots()` — two SQLite queries plus a
@@ -3588,11 +3406,11 @@ final class BotsWindowTests: XCTestCase {
         vm.setPinned(id: piper.id, pinned: true)
         XCTAssertEqual(vm.fleet.first?.id, piper.id)
         XCTAssertTrue(try XCTUnwrap(vm.fleet.first).pinned)
-        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("if bot.pinned"))
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("row.pinned"))
         XCTAssertTrue(source.contains("pin.fill"))
         XCTAssertTrue(
-            source.contains("bot.pinned ? \"Pinned. \""),
+            source.contains("row.pinned ? \"Pinned. \""),
             "VoiceOver must hear Pinned so Pin is not sort-only"
         )
     }
@@ -3607,11 +3425,11 @@ final class BotsWindowTests: XCTestCase {
         vm.showHidden = true
         XCTAssertEqual(vm.fleet.first?.id, piper.id)
         XCTAssertTrue(try XCTUnwrap(vm.fleet.first).hidden)
-        let source = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("if bot.hidden"))
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("row.hidden"))
         XCTAssertTrue(source.contains("eye.slash"))
         XCTAssertTrue(
-            source.contains("bot.hidden ? \"Hidden. \""),
+            source.contains("row.hidden ? \"Hidden. \""),
             "VoiceOver must hear Hidden so Show hidden is not a silent list"
         )
     }
@@ -12735,7 +12553,7 @@ final class BotsWindowTests: XCTestCase {
                 XCTAssertTrue(transcriptText.contains("Native fixture assistant transcript content."), "\(name) capture needs real selected-thread transcript content")
                 vm.isDeskSidePaneVisible = false
             }
-            let rootView = BotsRootView(vm: vm, embedsRosterRail: true)
+            let rootView = BotsRootView(vm: vm)
             let sizingView = NSHostingView(rootView: rootView)
             let fittingSize = sizingView.fittingSize
             let captureWidth = max(1_600, ceil(fittingSize.width))
@@ -12928,7 +12746,7 @@ final class BotsWindowTests: XCTestCase {
         let (_, vm, bot, _) = try makeDockerStudio()
         vm.setStudioFilesLocation(.botFiles, for: bot)
         vm.studioTab = .files
-        let root = BotsRootView(vm: vm, embedsRosterRail: false)
+        let root = BotsRootView(vm: vm)
             .frame(width: 1_100, height: 760)
         let hosting = NSHostingView(rootView: root)
         hosting.frame = NSRect(x: 0, y: 0, width: 1_100, height: 760)
@@ -16893,23 +16711,17 @@ final class BotsWindowTests: XCTestCase {
             main.contains("vm.openFleet()"),
             "remounting Bots must keep Desk/Studio, not force Fleet Home"
         )
-        XCTAssertTrue(main.contains("embedsRosterRail: false"))
         XCTAssertTrue(main.contains("case bots"))
         XCTAssertTrue(main.contains("let title = sidebar.botsViewModel.chromeTitle"))
         XCTAssertTrue(main.contains("visibleWorkspaceLabel.stringValue = title"))
-        XCTAssertTrue(sidebar.contains("onPresentBots"))
         XCTAssertTrue(sidebar.contains("isBotsSelected"))
         XCTAssertTrue(sidebar.contains("setBotsSelected"))
-        XCTAssertTrue(sidebar.contains("accessibilityIdentifier(\"sidebar.manageBots\")"),
-                      "the unified sidebar reaches the Bots catalog from Manage Bots and Teams")
+        XCTAssertFalse(sidebar.contains("sidebar.manageBots"), "the Manage Bots and Teams footer is gone")
         XCTAssertFalse(sidebar.contains("BotsModeSwitcher"), "the Workspaces | Bots mode toggle is gone")
         XCTAssertFalse(bots.contains("bots.chrome.agentic"))
-        XCTAssertTrue(main.contains("showsCatalogRail: true"),
-                      "the main shell shows the roster beside Bots content instead of in the sidebar")
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.new\")"))
+        XCTAssertFalse(main.contains("showsCatalogRail"), "the main shell shows no roster column beside Bots content")
         XCTAssertFalse(bots.contains("bots.fleet.row."), "Fleet Home row is not a destination")
-        XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.roster\")"))
-        XCTAssertTrue(bots.contains("bots.roster.row."))
+        XCTAssertFalse(bots.contains("accessibilityIdentifier(\"bots.roster\")"), "no roster rail in the shell")
         XCTAssertFalse(bots.contains("accessibilityIdentifier(\"bots.home\")"))
         XCTAssertFalse(bots.contains("bots.home.chat"))
         XCTAssertFalse(bots.contains("bots.home.studio"))
@@ -17134,8 +16946,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertLessThan(reportBug.lowerBound, scheduleTasks.lowerBound,
                           "Report Bug is a header icon, not a dest row under Schedule Tasks")
         XCTAssertTrue(
-            sidebar.contains("accessibilityIdentifier(\"sidebar.manageBots\")"),
-            "Bots is entered from Manage Bots and Teams in the unified sidebar"
+            sidebar.contains("accessibilityIdentifier(\"sidebar.new\")"),
+            "Bots are created from the New menu in the unified sidebar"
         )
     }
 
@@ -17179,35 +16991,13 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(BotsChrome.Label.bots, "Bots")
     }
 
-    func test_botsRosterMenusMatchAgentic_becauseBotsChromeMirrorsWorkspaceActions() throws {
-        // WHY: Bots used a New Bot + bell strip. Agentic is New Workspace,
-        // Active Threads, Schedule Tasks. The Bots session must offer the
-        // same three-row menu so the mode switch does not change chrome.
-        let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
-        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        let newBot = try XCTUnwrap(bots.range(of: "accessibilityIdentifier(\"bots.new\")"))
-        let activeBots = try XCTUnwrap(bots.range(of: "accessibilityIdentifier(\"bots.active\")"))
-        let scheduleTasks = try XCTUnwrap(bots.range(of: "accessibilityIdentifier(\"bots.scheduleTasks\")"))
-        XCTAssertLessThan(newBot.lowerBound, activeBots.lowerBound)
-        XCTAssertLessThan(activeBots.lowerBound, scheduleTasks.lowerBound)
-        XCTAssertTrue(bots.contains("SidebarActionRow("),
-                      "Bots action rows must reuse Agentic sidebar chrome")
-        XCTAssertTrue(bots.contains("BotsChrome.Label.activeBots"))
-        XCTAssertTrue(bots.contains("BotsChrome.Label.scheduleTasks"))
-        XCTAssertTrue(bots.contains("vm.openScheduleTasks"),
-                      "Bots Schedule Tasks must open the bots routines overview, not Agent dest")
-        XCTAssertFalse(bots.contains("bots.roster.attention"),
-                       "the attention bell is replaced by the Active Bots row")
-    }
-
     func test_botSearchMatchesWorkspaceFilter() throws {
         // WHY: Search bots and the sidebar search must share one field style.
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        XCTAssertTrue(bots.contains("SidebarSearchField("))
         XCTAssertTrue(sidebar.contains("SidebarSearchField("))
         XCTAssertTrue(sidebar.contains("placeholder: \"Search workspaces and Bots\""))
-        XCTAssertTrue(bots.contains("placeholder: BotsChrome.Label.search"))
+        XCTAssertFalse(bots.contains("SidebarSearchField("), "the Bots shell has no second search field")
     }
 
     private struct SeededDeskTurn {
@@ -17666,19 +17456,11 @@ final class BotsWindowTests: XCTestCase {
             "the attention badge keeps its place when the name truncates"
         )
         XCTAssertTrue(header.contains("\"Open Studio for \\(BotsViewModel.displayName(bot.name))\""))
-
-        let rowStart = try XCTUnwrap(source.range(of: "private func rosterRow"))
-        let rowRest = source[rowStart.upperBound...]
-        let rowEnd = rowRest.range(of: "\n@MainActor")?.lowerBound ?? rowRest.endIndex
-        let row = String(source[rowStart.lowerBound..<rowEnd])
-        XCTAssertTrue(row.contains("let displayName = BotsViewModel.displayName(bot.name)"))
-        XCTAssertTrue(row.contains("Text(displayName)"))
-        XCTAssertTrue(row.contains(".accessibilityLabel(displayName)"), "VoiceOver must not read an empty row")
     }
 
     func test_rosterAndHeaderSubtitlesUseTextSecondary_becauseTertiaryIsUnreadableAt10pt() throws {
-        // WHY: the roster preview, the Desk header's handle and permission and
-        // the group subtitles are 10pt text the owner reads to pick a chat and
+        // WHY: the Desk header's handle and permission and the group
+        // subtitles are 10pt text the owner reads to pick a chat and
         // to see what a Bot may do. textTertiary is 3.72:1 on the rail
         // (DSContrastTests); information text needs 4.5:1, so these sites use
         // textSecondary. The token value itself does not change.
@@ -17692,18 +17474,8 @@ final class BotsWindowTests: XCTestCase {
         }
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         let groups = try String(contentsOf: sourceURL("Sources/AppShell/BotsTeamsGroups.swift"), encoding: .utf8)
-        // A selected roster row is filled with the Bot's own colour at 0.22.
-        // On the light head swatches textSecondary is about 4.0:1 there, so
-        // the selected preview uses text (at least 8:1 on every fill).
-        let preview = try slice(bots, from: "Text(preview)", to: ".lineLimit(1)")
-        XCTAssertTrue(
-            preview.contains(".foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)"),
-            preview
-        )
-        XCTAssertFalse(preview.contains("textTertiary"), preview)
         let sites = [
             try slice(bots, from: "Text(\"@\\(bot.handle)\")", to: "\"bots.desk.permission\""),
-            try slice(groups, from: "Text(names.isEmpty ? \"No bots\" : names)", to: ".lineLimit(1)"),
             try slice(groups, from: "Text(\"\\(members.count) bots · \\(group.policy.displayName)\")", to: ".lineLimit(1)"),
         ]
         for site in sites {

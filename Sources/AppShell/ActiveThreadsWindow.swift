@@ -412,6 +412,8 @@ public final class ActiveThreadsViewModel: ObservableObject {
     }
 
     /// `openBotsDesk` has already left Activity when it fails.
+    func openBotDesk(_ item: ActiveBotScreenItem) { openBot(item.botID, conversationID: nil) }
+
     private func openBot(_ botID: BotID, conversationID: BotConversationID?) {
         do {
             guard try router.openBotsDesk(botID: botID, conversationID: conversationID) else {
@@ -525,19 +527,26 @@ public struct FinishedThreadItem: Identifiable, Equatable, Sendable {
 
 public struct ActiveThreadsRootView: View {
     @ObservedObject private var vm: ActiveThreadsViewModel
+    @ObservedObject private var botsVM: BotsViewModel
 
-    public init(vm: ActiveThreadsViewModel) {
+    public init(vm: ActiveThreadsViewModel, botsVM: BotsViewModel) {
         self.vm = vm
+        self.botsVM = botsVM
     }
 
     public var body: some View {
-        ActivityRootView(router: vm.activityRouter, route: vm.pendingActivityRoute, consumeRoute: {
-            vm.pendingActivityRoute = nil
-        }, openThread: { item in
-            vm.openActivity(item)
-        }, openEvidence: { item, path in
-            vm.openEvidence(item, path: path)
-        })
+        VStack(spacing: 0) {
+            ActivityActiveBotsStrip(botsVM: botsVM) { vm.openBotDesk($0) }
+            ActivityRootView(router: vm.activityRouter, route: vm.pendingActivityRoute, consumeRoute: {
+                vm.pendingActivityRoute = nil
+            }, openThread: { item in
+                vm.openActivity(item)
+            }, openEvidence: { item, path in
+                vm.openEvidence(item, path: path)
+            })
+        }
+        .onAppear { botsVM.reloadActiveBotItems() }
+        .onChange(of: botsVM.activeBotCount) { _ in botsVM.reloadActiveBotItems() }
         .alert("Could not open conversation", isPresented: Binding(
             get: { vm.errorMessage != nil },
             set: { if !$0 { vm.errorMessage = nil } }

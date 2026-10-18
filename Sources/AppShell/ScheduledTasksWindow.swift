@@ -675,6 +675,14 @@ public final class ScheduledTasksViewModel: ObservableObject {
 
 // MARK: - Navigation screens (plan-scheduled-tasks mockups)
 
+/// Re-evaluates `content` whenever the Bots model publishes.
+struct BotsModelObserver<Content: View>: View {
+    @ObservedObject var botsVM: BotsViewModel
+    @ViewBuilder let content: () -> Content
+
+    var body: some View { content() }
+}
+
 private enum ScheduledTasksScreen: Equatable {
     case overview
     case detail
@@ -683,17 +691,35 @@ private enum ScheduledTasksScreen: Equatable {
 
 public struct ScheduledTasksRootView: View {
     @ObservedObject private var vm: ScheduledTasksViewModel
+    /// Bot schedules share this screen when the shell provides the Bots model.
+    private let botsVM: BotsViewModel?
     @State private var screen: ScheduledTasksScreen = .overview
     @State private var expandedRunIDs = Set<UUID>()
     @State private var editorReturnScreen: ScheduledTasksScreen = .overview
 
-    public init(vm: ScheduledTasksViewModel) { self.vm = vm }
+    public init(vm: ScheduledTasksViewModel, botsVM: BotsViewModel? = nil) {
+        self.vm = vm
+        self.botsVM = botsVM
+    }
 
     public var body: some View {
+        // The content reads botsVM (draft, items); an observing wrapper re-renders it on every change.
+        if let botsVM {
+            BotsModelObserver(botsVM: botsVM) { rootContent }
+        } else {
+            rootContent
+        }
+    }
+
+    private var rootContent: some View {
         VStack(spacing: 0) {
             if vm.serviceRequiresApproval {
                 serviceBanner
             }
+            if let botsVM, botsVM.scheduleTaskDraft != nil {
+                BotScheduleTaskEditorScreen(vm: botsVM)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
             Group {
                 switch screen {
                 case .overview:
@@ -720,7 +746,11 @@ public struct ScheduledTasksRootView: View {
                 Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
                 footerBar
             }
+            }
         }
+        .onAppear { syncBotSchedules() }
+        .onChange(of: vm.searchText) { _ in syncBotSchedules() }
+        .onChange(of: vm.statusFilter) { _ in syncBotSchedules() }
         .frame(minWidth: 980, minHeight: 680)
         .background(DS.Palette.bg)
         .alert("Scheduled Tasks", isPresented: Binding(
@@ -743,6 +773,14 @@ public struct ScheduledTasksRootView: View {
                 screen = vm.selectedTaskID != nil ? .detail : editorReturnScreen
             }
         }
+    }
+
+    /// Bot schedules follow this screen's search and status filter.
+    private func syncBotSchedules() {
+        guard let botsVM else { return }
+        botsVM.reloadScheduleTasks()
+        if botsVM.scheduleTaskSearchText != vm.searchText { botsVM.scheduleTaskSearchText = vm.searchText }
+        if botsVM.scheduleTaskStatusFilter != vm.statusFilter { botsVM.scheduleTaskStatusFilter = vm.statusFilter }
     }
 
     private func openEditor(returnTo: ScheduledTasksScreen) {
@@ -798,6 +836,14 @@ public struct ScheduledTasksRootView: View {
                     .buttonStyle(DSPrimaryButtonStyle())
                     .accessibilityIdentifier("scheduledTasks.new")
 
+                    if let botsVM {
+                        Button { botsVM.createScheduleTask() } label: {
+                            Label("New Bot Task", systemImage: "plus")
+                        }
+                        .buttonStyle(DSSecondaryButtonStyle())
+                        .accessibilityIdentifier("scheduledTasks.newBot")
+                    }
+
                     schedulerActiveControl
                 }
             }
@@ -814,7 +860,7 @@ public struct ScheduledTasksRootView: View {
             .padding(.horizontal, DS.Space.xxl)
             .padding(.bottom, DS.Space.xl)
 
-            if vm.tasks.isEmpty {
+            if vm.tasks.isEmpty && (botsVM?.scheduleTaskItems.isEmpty ?? true) {
                 DSEmptyState(
                     icon: "calendar.badge.clock",
                     title: vm.searchText.isEmpty ? "No scheduled tasks" : "No matching tasks",
@@ -825,7 +871,7 @@ public struct ScheduledTasksRootView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: DS.Space.md) {
+                    LazyVStack(alignment: .leading, spacing: DS.Space.md) {
                         ForEach(vm.tasks) { task in
                             ScheduledTaskCard(
                                 task: task,
@@ -847,6 +893,7 @@ public struct ScheduledTasksRootView: View {
                                 onDelete: { vm.delete(task) }
                             )
                         }
+                        if let botsVM { BotScheduleTasksSection(vm: botsVM) }
                     }
                     .padding(.horizontal, DS.Space.xxl)
                     .padding(.bottom, DS.Space.xxl)

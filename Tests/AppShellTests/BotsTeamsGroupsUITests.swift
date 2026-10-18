@@ -18,7 +18,6 @@ final class BotsTeamsGroupsUITests: XCTestCase {
     private static let defaultsKeys = [
         "bots.screen", "bots.selectedBotID", "bots.searchText", "bots.showHidden",
         BotTeamsGroupsController.selectedGroupDefaultsKey,
-        BotTeamsGroupsController.collapsedTeamsDefaultsKey,
         BotTeamsGroupsController.inspectorDefaultsKey,
     ]
 
@@ -115,7 +114,7 @@ final class BotsTeamsGroupsUITests: XCTestCase {
 
     // MARK: - Sidebar sections
 
-    func test_withNoTeams_theMyBotsListStaysTheFlatRoster() throws {
+    func test_withNoTeams_thereAreNoRosterSections() throws {
         let bots = [
             BotDefinition(handle: "ana", name: "Ana", title: "", description: ""),
             BotDefinition(handle: "bob", name: "Bob", title: "", description: ""),
@@ -124,43 +123,6 @@ final class BotsTeamsGroupsUITests: XCTestCase {
             BotRosterSections.make(roster: bots, teams: [], membersByTeam: [:]),
             "no teams must mean no sections: the roster renders exactly as before"
         )
-
-        // The flat branch is the roster's original ForEach, untouched, and the
-        // group section paints nothing until a group exists.
-        let bots_ = try source("Sources/AppShell/BotsWindow.swift")
-        let start = try XCTUnwrap(bots_.range(of: "public struct BotsRosterList"))
-        let rest = bots_[start.lowerBound...]
-        let end = rest.range(of: "\n    private func rosterStatusColor")?.lowerBound ?? rest.endIndex
-        let list = String(bots_[start.lowerBound..<end])
-        let indent = { (n: Int) in String(repeating: " ", count: n) }
-        let flatBranch = "} else {\n"
-            + indent(24) + "ForEach(vm.publishedRoster, id: \\.id) { bot in\n"
-            + indent(28) + "rosterRow(bot)\n"
-            + indent(24) + "}\n"
-            + indent(20) + "}\n"
-            + indent(20) + "BotGroupConversationsSection("
-        XCTAssertTrue(list.contains(flatBranch), "with no teams the My Bots rows are the same ForEach over publishedRoster")
-        XCTAssertTrue(list.contains("} else if let sections = BotRosterSections.make("), "sections only when teams exist")
-        XCTAssertTrue(list.contains("Text(BotsChrome.Label.myBots)"))
-        XCTAssertTrue(list.contains("Text(vm.searchText.isEmpty ? \"No bots yet\" : \"No matches\")"))
-        // The My Bots header row: title, spacer, Show hidden. The "+" menu
-        // only exists once a team or group does.
-        let headerStart = try XCTUnwrap(list.range(of: "Text(BotsChrome.Label.myBots)"))
-        let headerEnd = try XCTUnwrap(list.range(of: "Toggle(\"Show hidden\"", range: headerStart.upperBound..<list.endIndex))
-        let header = String(list[headerStart.upperBound..<headerEnd.lowerBound])
-        let gate = try XCTUnwrap(
-            header.range(of: "if !teamsGroups.teams.isEmpty || !teamsGroups.groups.isEmpty {"),
-            "no teams and no groups → the header has no new control"
-        )
-        let menu = try XCTUnwrap(header.range(of: "Menu {"))
-        XCTAssertLessThan(gate.lowerBound, menu.lowerBound, "the + menu sits inside the gate")
-        XCTAssertEqual(header.components(separatedBy: "Menu {").count, 2, "one menu, the gated one")
-        XCTAssertTrue(
-            list.contains(".contextMenu { BotTeamsGroupsCreateButtons(vm: vm) }"),
-            "with no teams yet, New Team and New Group stay reachable from the New Bot row"
-        )
-        let groupsView = try source("Sources/AppShell/BotsTeamsGroups.swift")
-        XCTAssertTrue(groupsView.contains("if !visible.isEmpty {"), "no groups → no Group Conversations header")
     }
 
     func test_aBotInTwoTeamsShowsUnderEach_andOtherBotsHoldsTheRest() {
@@ -605,15 +567,43 @@ final class BotsTeamsGroupsUITests: XCTestCase {
         XCTAssertEqual(controller.teams.count, 1, "a refused save changes nothing")
     }
 
+    func test_teamsManagerSheetIsOneSheetAndItsControlsDriveTheServiceBackedStore() throws {
+        let f = try makeFixture()
+        let vm = makeViewModel(f)
+        let botCount = vm.bots.count
+        vm.openTeamsManager()
+        XCTAssertEqual(vm.teamsGroups.sheet, .teams, "the Teams button opens one manager sheet")
+
+        // What the manager's controls call: create on Return, avatar click, inline rename, delete.
+        let controller = vm.teamsGroups
+        XCTAssertTrue(controller.saveTeam(id: nil, name: "Writers", description: "", memberBotIDs: []))
+        let team = try XCTUnwrap(controller.teams.first)
+        XCTAssertTrue(controller.saveTeam(id: team.id, name: team.name, description: "", memberBotIDs: [f.ana.id]))
+        XCTAssertTrue(controller.saveTeam(id: team.id, name: team.name, description: "", memberBotIDs: [f.ana.id, f.bob.id]))
+        XCTAssertEqual(controller.membersByTeam[team.id], [f.ana.id, f.bob.id], "clicking avatars adds members")
+        XCTAssertTrue(controller.saveTeam(id: team.id, name: team.name, description: "", memberBotIDs: [f.bob.id]))
+        XCTAssertEqual(controller.membersByTeam[team.id], [f.bob.id], "clicking a member's avatar removes it")
+        XCTAssertTrue(controller.saveTeam(id: team.id, name: "Authors", description: "", memberBotIDs: [f.bob.id]))
+        XCTAssertEqual(controller.teams.first?.name, "Authors", "inline rename keeps the members")
+        XCTAssertEqual(controller.membersByTeam[team.id], [f.bob.id])
+        controller.deleteTeam(team.id)
+        XCTAssertTrue(controller.teams.isEmpty, "delete removes the team and keeps the bots")
+        XCTAssertEqual(vm.bots.count, botCount, "the bots stay")
+
+        let source = try source("Sources/AppShell/BotsTeamsGroups.swift")
+        XCTAssertTrue(source.contains(".onSubmit(create)"), "Return creates a team")
+        XCTAssertTrue(source.contains("pendingTeamDelete = team"), "delete asks first")
+        XCTAssertFalse(source.contains("BotTeamEditorSheet"), "the form editor is replaced by the manager")
+    }
+
     // MARK: - Relaunch
 
-    func test_openGroupCollapsedTeamsAndRoomDraftSurviveRelaunch() async throws {
+    func test_openGroupAndRoomDraftSurviveRelaunch() async throws {
         let f = try makeFixture()
         let team = try f.service.createTeam(name: "Writers", memberBotIDs: [f.ana.id])
         let group = try await makeGroup(f, bots: [f.ana])
         let vm = makeViewModel(f)
         vm.openGroup(group.id)
-        vm.teamsGroups.toggleCollapsed(team.id)
         let room = try XCTUnwrap(vm.teamsGroups.roomVM)
         room.prompt = "half-written"
         room.dispose()
@@ -623,7 +613,6 @@ final class BotsTeamsGroupsUITests: XCTestCase {
         router2.botsViewModel = reopened
         XCTAssertEqual(reopened.screen, .group)
         XCTAssertEqual(reopened.teamsGroups.selectedGroupID, group.id)
-        XCTAssertTrue(reopened.teamsGroups.collapsedTeamIDs.contains(team.id))
         let room2 = try XCTUnwrap(reopened.teamsGroups.roomVM)
         XCTAssertEqual(room2.embedding?.pinnedThreadId, group.roomThreadID)
         let restored = await waitUntil { room2.prompt == "half-written" }

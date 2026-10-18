@@ -231,7 +231,7 @@ public struct BotScheduleTasksRootView: View {
     }
 }
 
-private struct BotScheduleTaskCard: View {
+struct BotScheduleTaskCard: View {
     let item: BotScheduleTaskItem
     let isAutonomyActive: Bool
     let onOpen: () -> Void
@@ -295,7 +295,7 @@ private struct BotScheduleTaskCard: View {
     }
 }
 
-private struct BotScheduleTaskEditorView: View {
+struct BotScheduleTaskEditorView: View {
     @State private var draft: BotScheduleTaskDraft
     let bots: [BotDefinition]
     let providers: [AgentProviderSnapshot]
@@ -684,6 +684,53 @@ struct BotScheduleSpecEditor: View {
             }
             .padding(.horizontal, DS.Space.lg)
             .padding(.vertical, DS.Space.md)
+        }
+    }
+}
+
+/// Bot schedules inside the Schedule Tasks screen: the same cards and actions as the Bots screen.
+struct BotScheduleTasksSection: View {
+    @ObservedObject var vm: BotsViewModel
+
+    var body: some View {
+        if !vm.scheduleTaskItems.isEmpty {
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                Text("Bot schedules")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                LazyVStack(spacing: DS.Space.md) {
+                    ForEach(vm.scheduleTaskItems) { item in
+                        BotScheduleTaskCard(
+                            item: item,
+                            isAutonomyActive: vm.isAutonomyActive,
+                            onOpen: { vm.editScheduleTask(item) },
+                            onToggle: { vm.setRoutineEnabled(id: item.id, enabled: !item.isEnabled) },
+                            onRunNow: { vm.requestRoutineTestRun(id: item.id) },
+                            onEdit: { vm.editScheduleTask(item) },
+                            onDelete: { vm.deleteScheduleTask(item) }
+                        )
+                    }
+                }
+            }
+            .accessibilityIdentifier("scheduledTasks.botSchedules")
+        }
+    }
+}
+
+/// Full-page editor for one bot schedule, shown in place of the Schedule Tasks overview.
+struct BotScheduleTaskEditorScreen: View {
+    @ObservedObject var vm: BotsViewModel
+
+    var body: some View {
+        if let draft = vm.scheduleTaskDraft {
+            BotScheduleTaskEditorView(
+                draft: draft,
+                bots: vm.fleet,
+                providers: vm.providers,
+                providersLoading: false,
+                onBack: { vm.scheduleTaskDraft = nil },
+                onSave: { vm.saveScheduleTask($0) }
+            )
         }
     }
 }
