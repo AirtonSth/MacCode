@@ -293,8 +293,8 @@ final class PetAttentionStoreTests: XCTestCase {
         let threadItem = try XCTUnwrap(fixture.store.refresh().items.first)
 
         XCTAssertEqual(
-            try fixture.store.openAndMarkRead(itemID: threadItem.id) { route in
-                XCTAssertEqual(route, threadItem.route)
+            try fixture.store.openAndMarkRead(itemID: threadItem.id) { item in
+                XCTAssertEqual(item.route, threadItem.route)
                 return false
             },
             .routeRejected
@@ -302,8 +302,8 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(fixture.threads.get(id: thread.id)).hasUnread)
 
         XCTAssertEqual(
-            try fixture.store.openAndMarkRead(itemID: threadItem.id) { route in
-                route == threadItem.route
+            try fixture.store.openAndMarkRead(itemID: threadItem.id) { item in
+                item.route == threadItem.route
             },
             .marked
         )
@@ -356,6 +356,55 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertEqual(try fixture.store.refresh().items.map(\.id), [staleItem.id])
     }
 
+    func test_openAndMarkRead_verifiesRefreshedBotConversationBeforeAcknowledging() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let bots = BotStore(db: db)
+        let threads = AgentThreadRepository(db: db)
+        let callbacks = ProviderPendingCallbackRepository(db: db)
+        let notifications = NotificationRepository(db: db)
+        let bot = try bots.create(name: "Ceo", title: "Lead", description: "", provider: .claude)
+        let convA = BotConversation(botID: bot.id, title: "A")
+        let convB = BotConversation(botID: bot.id, title: "B", attentionState: .needsAttention)
+        try bots.upsertConversation(convA)
+        try bots.upsertConversation(convB)
+        let attention = BotAttentionItem(botID: bot.id, conversationID: convA.id, kind: .question, title: "Need you")
+        try bots.upsertAttention(attention)
+        let store = PetAttentionStore(
+            threadRepository: threads,
+            callbackRepository: callbacks,
+            notificationRepository: notifications,
+            workspaceNameProvider: { _ in nil },
+            destLookup: {
+                PetDestAttentionSnapshot(
+                    bots: try bots.list(),
+                    conversations: try bots.listConversations(attentionStates: [.unreadActivity, .needsAttention]),
+                    attention: try bots.listAttention(),
+                    linkedThreadIDs: try bots.listLinkedAgentThreadIDs()
+                )
+            },
+            markBotConversationViewed: { id in
+                guard var conversation = try bots.conversation(id: id) else { return }
+                conversation.unread = false
+                conversation.attentionState = .none
+                try bots.upsertConversation(conversation)
+            },
+            acknowledgeBotAttention: { try bots.acknowledgeAttention(id: $0) }
+        )
+        let displayed = try XCTUnwrap(store.refresh().items.first { $0.id == "bot.attention:\(attention.id.value.uuidString)" })
+        try bots.upsertAttention(BotAttentionItem(
+            id: attention.id, botID: bot.id, conversationID: convB.id, kind: .question, title: "Need you"
+        ))
+        var verified: PetAttentionItem?
+        XCTAssertEqual(try store.openAndMarkRead(itemID: displayed.id) { item in
+            verified = item
+            return false
+        }, .routeRejected)
+        XCTAssertEqual(verified?.source, .bot(botID: bot.id, conversationID: convB.id, attentionItemID: attention.id))
+        XCTAssertEqual(try bots.conversation(id: convB.id)?.attentionState, .needsAttention)
+        XCTAssertNil(try bots.listAttention(includeAcknowledged: true).first?.acknowledgedAt)
+    }
+
     func test_viewingFailedOutcomeNeverAcknowledgesItsNeedsYouState() throws {
         let fixture = try fixture()
         let workspaceID = WorkspaceID(UUID())
@@ -393,8 +442,8 @@ final class PetAttentionStoreTests: XCTestCase {
 
         XCTAssertEqual(item.route, .surface(surfaceID: surfaceID, workspaceID: workspaceID))
         XCTAssertEqual(
-            try fixture.store.openAndMarkRead(itemID: item.id) { route in
-                route == .surface(surfaceID: surfaceID, workspaceID: workspaceID)
+            try fixture.store.openAndMarkRead(itemID: item.id) { currentItem in
+                currentItem.route == .surface(surfaceID: surfaceID, workspaceID: workspaceID)
             },
             .marked
         )
@@ -502,8 +551,8 @@ final class PetAttentionStoreTests: XCTestCase {
             category: PetNotificationCategory.notificationsDenied.rawValue
         ))
 
-        let result = try fixture.store.openAndMarkRead(itemID: "notification:notifications-denied") { route in
-            route == .settings(.general)
+        let result = try fixture.store.openAndMarkRead(itemID: "notification:notifications-denied") { item in
+            item.route == .settings(.general)
         }
 
         XCTAssertEqual(result, .marked,
@@ -532,8 +581,8 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertEqual(item.classification, .needsYou)
         XCTAssertEqual(item.route, .surface(surfaceID: surfaceID, workspaceID: workspaceID))
         XCTAssertEqual(
-            try fixture.store.openAndMarkRead(itemID: item.id) { route in
-                route == .surface(surfaceID: surfaceID, workspaceID: workspaceID)
+            try fixture.store.openAndMarkRead(itemID: item.id) { currentItem in
+                currentItem.route == .surface(surfaceID: surfaceID, workspaceID: workspaceID)
             },
             .retainedBlocker,
             "Agent input remains actionable until the Agent surface resolves it."

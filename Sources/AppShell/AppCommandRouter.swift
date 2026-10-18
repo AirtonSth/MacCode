@@ -2993,11 +2993,49 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// In-process schedule owner (main app). Run Now / ticks call this instead of XPC.
     public weak var scheduledTaskScheduler: ScheduledTaskScheduler?
 
+    private static func refuseContextPinnedGenericExecution(_ threadID: AgentThreadID, context ctx: AppContext) throws {
+        guard let pin = try ctx.botStore.conversationContextPin(linkedTo: threadID) else { return }
+        let authorized: Bool
+        if let conversation = try ctx.botStore.conversation(id: pin.conversationID) {
+            authorized = try ctx.botStore.authorizesConversation(conversation, hostID: ctx.liveActivityHostIdentity.serverId, action: .send)
+        } else {
+            authorized = false
+        }
+        throw JSONRPCError(code: -32602, message: authorized
+                           ? "Contextual execution is unavailable until isolation is verified."
+                           : "Contextual send authority is inactive or invalid.")
+    }
+
+    /// Resolve authorization for a context-pinned thread without applying legacy routing.
+    static func contextPinnedThreadDestination(
+        _ threadID: AgentThreadID,
+        context ctx: AppContext
+    ) throws -> AgentThreadOpenDestination? {
+        guard let pin = try ctx.botStore.conversationContextPin(linkedTo: threadID) else { return nil }
+        guard pin.hostID == ctx.liveActivityHostIdentity.serverId,
+              let conversation = try ctx.botStore.conversation(id: pin.conversationID),
+              conversation.linkedAgentThreadID == threadID,
+              conversation.botID == pin.botID,
+              let thread = try ctx.threadRepo.get(id: threadID),
+              thread.actor == .bot(pin.botID),
+              ((pin.context == .general && thread.workspaceId == nil)
+               || (thread.workspaceId.map { pin.context == .workspace($0) } ?? false)),
+              try ctx.botStore.authorizes(
+                hostID: pin.hostID,
+                botID: pin.botID,
+                context: pin.context,
+                action: .read,
+                policyRevision: pin.policyRevision
+              ) else {
+            return .unavailable
+        }
+        return .bot(conversation.botID, conversation.id)
+    }
+
     /// Where `openAgentThread` could land, checked before a caller leaves its own screen.
-    /// Same workspace check as its guard; a thread with no open workspace that a bot
-    /// conversation owns belongs in that bot's Desk instead.
     public func agentThreadOpenDestination(_ threadID: AgentThreadID) throws -> AgentThreadOpenDestination {
         guard let ctx = context else { return .unavailable }
+        if let pinned = try Self.contextPinnedThreadDestination(threadID, context: ctx) { return pinned }
         if let workspaceID = try ctx.threadRepo.workspaceId(of: threadID),
            ctx.state.workspaces[workspaceID] != nil {
             return .workspace(workspaceID)
@@ -3087,20 +3125,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     @discardableResult
     public func openBotsDesk(botID: BotID, conversationID: BotConversationID? = nil) throws -> Bool {
+        guard let ctx = context,
+              let bot = try ctx.botStore.get(id: botID) else { return false }
+        if let conversationID {
+            guard let conversation = try ctx.botStore.conversation(id: conversationID),
+                  conversation.botID == botID else { return false }
+            if try ctx.botStore.conversationContextPin(conversationID: conversationID) != nil {
+                guard let threadID = conversation.linkedAgentThreadID,
+                      try Self.contextPinnedThreadDestination(threadID, context: ctx)
+                        == .bot(botID, conversationID) else { return false }
+            }
+        }
         NSApplication.shared.activate(ignoringOtherApps: true)
         windowController?.show()
         windowController?.presentBotsInMainContent()
         windowController?.flushPendingRefresh()
         guard let vm = botsViewModel else { return false }
-        guard let bot = vm.bots.first(where: { $0.id == botID })
-                ?? (context.flatMap { try? $0.botStore.get(id: botID) }) else { return false }
-        if let conversationID {
-            guard try context?.botStore.conversation(id: conversationID)?.botID == botID else { return false }
-        }
         vm.openDesk(bot)
         if let conversationID { vm.selectDeskThread(conversationID) }
         windowController?.flushPendingRefresh()
         guard vm.selectedBotID == botID, vm.screen == .desk else { return false }
+        if let conversationID { guard vm.selectedConversation?.id == conversationID else { return false } }
         guard let destination = windowController?.window else { return false }
         return destination.isVisible && destination.isMiniaturized == false
     }
@@ -3519,6 +3564,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             mutation: mutation,
             method: method
         )
+        if try ctx.botStore.conversationContextPin(linkedTo: threadID) != nil {
+            throw JSONRPCError(code: -32084, message: "Contextual Bot delegation is unavailable until scoped peer execution is supported.")
+        }
         return ctx
     }
 
@@ -3896,7 +3944,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                failed["status"] as? String == BotRemoteControlAuthority.Status.failed.rawValue {
                 return JSONValue.from(failed)
             }
-            throw JSONRPCError(code: error.code, message: error.message)
+            let rejection = JSONRPCError(code: error.code, message: error.message)
+            if method == "bot.conversation.enqueue" {
+                // Domain errors precede enqueue or follow its transaction rollback.
+                throw DefiniteMutationRejection(rejection)
+            }
+            throw rejection
         }
     }
 
@@ -3983,6 +4036,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
         created.onHasLiveRun = { [weak self] id in
             self?.botsViewModel?.hasLiveRun(botID: id) ?? false
+        }
+        created.onContextBindingChanged = { [weak self] binding in
+            guard let self, let ctx = self.context,
+                  binding.hostID == ctx.liveActivityHostIdentity.serverId else { return false }
+            do {
+                let conversations = try ctx.botStore.listConversations(botID: binding.botID, includeGroupMembers: true)
+                let threads = try conversations.compactMap { conversation -> AgentThreadID? in
+                    guard let threadID = conversation.linkedAgentThreadID,
+                          let pin = try ctx.botStore.conversationContextPin(conversationID: conversation.id),
+                          pin.hostID == binding.hostID,
+                          pin.botID == binding.botID,
+                          pin.context == binding.context,
+                          (binding.state != .active || pin.policyRevision != binding.policyRevision) else { return nil }
+                    return threadID
+                }
+                for threadID in threads {
+                    ctx.coordinator.stopRun(threadId: threadID)
+                    try ctx.coordinator.stopDelegatedRunsForThread(threadId: threadID)
+                }
+                try BotContextGuestResources.requestRevocation(
+                    binding: binding, store: ctx.botStore, appSupport: ctx.appSupportDirectory
+                )
+                return true
+            } catch {
+                return false
+            }
         }
         created.onStopRun = { [weak self] id, conversationID, runID, runRequestID, force, requestID in
             guard let self else { return }
@@ -4967,6 +5046,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Durable provider fork of a thread into a persisted child (`agent.thread.fork`).
     public func forkAgentThread(sourceThreadId: AgentThreadID, messageID: String?) async throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try Self.refuseContextPinnedGenericExecution(sourceThreadId, context: ctx)
         guard let source = try ctx.threadRepo.get(id: sourceThreadId) else {
             throw LayoutError.workspaceNotFound
         }
@@ -4991,6 +5071,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Ephemeral fork of a thread (`agent.thread.side`). Hidden from the rail and swept at launch.
     public func sideAgentThread(sourceThreadId: AgentThreadID, text: String?) async throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try Self.refuseContextPinnedGenericExecution(sourceThreadId, context: ctx)
         guard let source = try ctx.threadRepo.get(id: sourceThreadId) else {
             throw LayoutError.workspaceNotFound
         }
@@ -5643,6 +5724,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
               let thread = try ctx.threadRepo.get(id: queued.threadId) else {
             throw JSONRPCError.invalidParams
         }
+        try Self.refuseContextPinnedGenericExecution(queued.threadId, context: ctx)
+        if try HostDatabaseRestore.requiresQueueReview(kind: .agent, id: id.value.uuidString, db: ctx.db) {
+            let dispatch = try ctx.queuedMessageRepo.dispatch(id: id)
+            guard dispatch?.state == .queued, dispatch?.runId == nil,
+                  try ctx.runRepo.get(id: AgentRunID(id.value)) == nil else {
+                throw JSONRPCError(code: -32602, message: "Restored queued outcome requires reconciliation before another send.")
+            }
+            try HostDatabaseRestore.approveQueue(kind: .agent, id: id.value.uuidString, db: ctx.db)
+        }
         if let dispatch = try ctx.queuedMessageRepo.dispatch(id: queued.id),
            let runId = dispatch.runId {
             if dispatch.state == .dispatched {
@@ -5729,6 +5819,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw JSONRPCError(code: -32000, message: "Queued message is already processing.")
         }
         let dispatchRunId = AgentRunID(queued.id.value)
+        try HostDatabaseRestore.recordQueueAttempt(kind: .agent, id: queued.id.value.uuidString, runID: dispatchRunId, db: ctx.db)
         guard try ctx.queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId) else {
             _ = try? ctx.queuedMessageRepo.release(lease)
             throw JSONRPCError(code: -32000, message: "Queued message dispatch could not be prepared.")
@@ -6058,6 +6149,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true, compilesBotPrompt: Bool = false) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        do {
+            try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
+        } catch {
+            if preflightRejectionIsDefinite { throw DefiniteMutationRejection(error) }
+            throw error
+        }
         // Status + permission + provider identity only. A leftover 26-column
         // + routing `get` hitchs every send before configureAgentThread loads
         // the row again for mutate.
@@ -6394,6 +6491,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         recoverPreparedFromPriorProcess: Bool = false,
         botVMHandOff: Bool = false
     ) async throws {
+        if let ctx = context {
+            try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
+            if let head = try ctx.queuedMessageRepo.first(threadId: thread),
+               try HostDatabaseRestore.requiresQueueReview(kind: .agent, id: head.id.value.uuidString, db: ctx.db) {
+                return
+            }
+        }
         // This gate only needs durable run-state. A full 26-column + routing
         // `get` hitchs MainActor before the next queued follow-up can start.
         // A D12 hand-off also drains a thread that never ran (still `.pending`
@@ -6811,6 +6915,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, modelSelection: AgentModelSelection? = nil) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID) {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let source = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
         let storedMarkdown: String?
         if let planMarkdown {
             storedMarkdown = planMarkdown

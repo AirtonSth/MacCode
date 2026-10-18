@@ -3,7 +3,7 @@ import CryptoKit
 
 public enum BotComputerGuestSpec {
     /// Bump when start.sh / Dockerfile change. Missing label rebuilds the image.
-    public static let recipeRevision = "5"
+    public static let recipeRevision = "7"
     /// Versioned so two app builds on different revisions sharing one Docker
     /// daemon (e.g. the debug sandbox and the installed app) never rebuild the
     /// same tag back and forth.
@@ -13,7 +13,7 @@ public enum BotComputerGuestSpec {
     /// revision label alone do not identify the recipe: another build on the
     /// same daemon can leave a different image under this tag and revision.
     public static let recipeDigestLabelKey = "remotecode.recipe.sha256"
-    public static let recipeFileNames = ["Dockerfile", "start.sh", "embed.html", "launch-browser.sh"]
+    public static let recipeFileNames = ["Dockerfile", "start.sh", "embed.html", "launch-browser.sh", "context-network.sh"]
 
     /// Digest over each recipe file's name and SHA-256 in `recipeFileNames`
     /// order; a missing file counts as absent, so adding one changes it too.
@@ -28,7 +28,7 @@ public enum BotComputerGuestSpec {
     }
     /// Bump when the container create options change. A container whose label
     /// differs is recreated, but only while the bot has no active run.
-    public static let runtimeRevision = "2"
+    public static let runtimeRevision = "7"
     public static let runtimeLabelKey = "remotecode.runtime"
     /// The bot (of the app database that created it) a container belongs to.
     public static let botIDLabelKey = "remotecode.botId"
@@ -189,7 +189,8 @@ public enum BotComputerGuestSpec {
         name: String? = nil,
         workspaces: [String] = [],
         registeredWorkspaces: Set<String>? = nil,
-        userHome: String = NSHomeDirectory()
+        userHome: String = NSHomeDirectory(),
+        contextualNetworkPolicy: Bool = false
     ) throws -> BotComputerContainerCreateOptions {
         try assertGuestHomePath(guestHome, appSupport: appSupport, botID: botID)
         for workspace in workspaces {
@@ -210,8 +211,9 @@ public enum BotComputerGuestSpec {
                 botIDLabelKey: botID.value.uuidString.lowercased(),
                 workspacesLabelKey: workspacesLabel(workspaces),
                 runtimeLabelKey: runtimeRevision,
-            ],
-            environment: ["REMOTECODE_VIEWER_TOKEN": viewerToken],
+            ].merging(contextualNetworkPolicy ? ["remotecode.context.network": "private-egress-v1"] : [:]) { current, _ in current },
+            environment: ["REMOTECODE_VIEWER_TOKEN": viewerToken]
+                .merging(contextualNetworkPolicy ? ["REMOTECODE_CONTEXT_NETWORK_POLICY": "private-egress-v1"] : [:]) { current, _ in current },
             binds: ["\(guestHome):\(guestUserHome)"]
                 + workspaces.map { "\($0):\($0)" }
                 + ["\(guestToolsURL(appSupport: appSupport).path):\(agentKitMountPoint):ro"],
@@ -221,7 +223,11 @@ public enum BotComputerGuestSpec {
             shmSize: minimumShmBytes,
             network: networkName(botID: botID),
             initProcess: true,
-            extraHosts: [hostGatewayAlias]
+            extraHosts: [hostGatewayAlias],
+            capDrop: contextualNetworkPolicy ? ["ALL"] : [],
+            capAdd: contextualNetworkPolicy ? ["NET_ADMIN"] : [],
+            securityOptions: contextualNetworkPolicy ? ["no-new-privileges:true"] : [],
+            tmpfs: contextualNetworkPolicy ? ["/run:rw,nosuid,nodev,noexec,mode=0755"] : []
         )
     }
 
@@ -392,6 +398,10 @@ public struct BotComputerContainerCreateOptions: Equatable, Sendable {
     public var initProcess: Bool = false
     /// `--add-host` entries.
     public var extraHosts: [String] = []
+    public var capDrop: [String] = []
+    public var capAdd: [String] = []
+    public var securityOptions: [String] = []
+    public var tmpfs: [String] = []
 }
 
 public enum BotComputerGuestError: Error, Equatable, LocalizedError, CustomStringConvertible {

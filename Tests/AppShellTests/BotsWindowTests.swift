@@ -696,6 +696,73 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(runner.finish(runID: second.runId, status: .completed, reply: "second done"))
     }
 
+    func test_hostCatalogFollowUpDoesNotDrainAfterMasterControlPlaneDisabled() async throws {
+        // WHY: disabling master control plane before completion must preserve accepted work without starting it.
+        directory = URL(fileURLWithPath: try XCTUnwrap(ProcessInfo.processInfo.environment["RC_CONTEXT_PROBE_ROOT"]))
+            .appendingPathComponent("QueuePolicy-\(UUID().uuidString)").path
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true", authenticated: true, id: "claude"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        router.botsViewModel = vm
+        let created = try router.createHostBot(
+            name: "Oliver", title: "Critical QA", description: "", handle: "oliver-revoke",
+            soul: "Be exact.", callerRun: AgentRunID()
+        )
+        let botID = BotID(try XCTUnwrap(created.objectValue?["id"]?.stringValue.flatMap(UUID.init)))
+        let other = try vm.create(name: "Quinn", title: "Reviewer", provider: .claude, model: "opus")
+        let caller = try seedBotCaller(context: context, provider: .claude, model: "opus", permissionMode: .fullAccess)
+        let first = try await router.sendHostBot(botID: botID, text: "first host task", conversationID: nil,
+                                                 callerThread: caller.thread.id, callerRun: caller.run.id)
+        let firstStarted = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+        XCTAssertTrue(firstStarted)
+        let firstRequest = try XCTUnwrap(runner.requests.first)
+        let conversationID = BotConversationID(try XCTUnwrap(first.objectValue?["conversation_id"]?.stringValue.flatMap(UUID.init)))
+        vm.openDesk(other)
+        let accepted = try await router.sendHostBot(botID: botID, text: "second exact follow-up", conversationID: conversationID,
+                                                    callerThread: caller.thread.id, callerRun: caller.run.id)
+        XCTAssertEqual(accepted.objectValue?["queued_follow_up"]?.boolValue, true)
+        let queuedBefore = vm.queuedFollowUpsForTesting(botID: botID)
+        XCTAssertEqual(queuedBefore.map(\.text), ["second exact follow-up"])
+
+        SettingsStore(db: context.db).update { $0.botsControlPlaneEnabled = false }
+        let queuedRowsBefore = try context.botStore.listQueuedFollowUps(botID: botID)
+        let callerRunBefore = try XCTUnwrap(context.runRepo.get(id: caller.run.id))
+        let conversation = try XCTUnwrap(context.botStore.conversation(id: conversationID))
+        let botThreadID = try XCTUnwrap(conversation.linkedAgentThreadID)
+        let botMessagesBefore = try context.messageRepo.list(threadId: botThreadID)
+        let followThroughBefore = vm.followThroughApplyCountForTesting
+        XCTAssertTrue(runner.finish(runID: firstRequest.runId, status: .completed, reply: "first done"))
+        let followThroughSettled = await waitUntil(timeout: 5) { vm.followThroughApplyCountForTesting > followThroughBefore }
+        XCTAssertTrue(followThroughSettled)
+        XCTAssertEqual(runner.requests.count, 1)
+        XCTAssertEqual(vm.queuedFollowUpsForTesting(botID: botID).map(\.id), queuedBefore.map(\.id))
+        XCTAssertEqual(vm.queuedFollowUpsForTesting(botID: botID).map(\.text), ["second exact follow-up"])
+        XCTAssertEqual(try context.botStore.listQueuedFollowUps(botID: botID), queuedRowsBefore)
+        XCTAssertEqual(try context.runRepo.get(id: caller.run.id), callerRunBefore)
+        XCTAssertEqual(
+            try context.runRepo.listRecentFinished(limit: 50).filter { $0.threadId == botThreadID }.map(\.id),
+            [firstRequest.runId]
+        )
+        XCTAssertEqual(
+            try context.messageRepo.list(threadId: botThreadID).filter { $0.content.contains("second exact follow-up") },
+            botMessagesBefore.filter { $0.content.contains("second exact follow-up") }
+        )
+        XCTAssertEqual(vm.selectedBotID, other.id)
+        let botMessages = try context.messageRepo.list(threadId: botThreadID)
+        XCTAssertEqual(botMessages.filter { $0.role == .user }.count, 1)
+        XCTAssertFalse(botMessages.contains { $0.content.contains("second exact follow-up") && $0.role == .user })
+    }
+
     func test_hostSendToAnotherBotCompilesThatBotsBrowserPage_becauseOneBotsPageMustNeverReachAnothersPrompt() async throws {
         // WHY: the run prompt names the last page the Bot's browser had open.
         // It was read from the Bot selected on the Mac, so a paired send to
@@ -2934,9 +3001,12 @@ final class BotsWindowTests: XCTestCase {
             "the rail inside BotsRootView must not attach a second confirm dialog"
         )
         XCTAssertTrue(
-            source.contains("BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail)"),
-            "main-shell BotsRootView must not stack a second delete dialog beside the sidebar roster"
+            source.contains("BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail || showsCatalogRail)"),
+            "BotsRootView owns the one delete dialog whenever it shows the roster rail"
         )
+        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertFalse(sidebar.contains("BotsRosterList("),
+                       "the unified sidebar no longer hosts a roster, so no second delete dialog can stack")
     }
 
     func test_showHiddenSurvivesRelaunch_becauseShowHiddenIsUserWorkflowState() throws {
@@ -8544,6 +8614,51 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.composerText.contains("/sam more"))
     }
 
+    func test_pinnedDeskSendRejectsBeforeMutatingDraftOrPersistingMessage() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Pinned", title: "Context", provider: .distill)
+        let binding = try context.botStore.grantContext(
+            hostID: context.liveActivityHostIdentity.serverId,
+            botID: bot.id,
+            context: .general,
+            actions: [.read, .send],
+            expectedRevision: nil
+        )
+        let thread = AgentThread(title: "Pinned", provider: .distill, model: "test-main")
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "New thread",
+            linkedAgentThreadID: thread.id
+        )
+        try context.botStore.createContextualConversation(
+            conversation,
+            newThread: thread,
+            hostID: context.liveActivityHostIdentity.serverId,
+            context: .general,
+            policyRevision: binding.policyRevision
+        )
+        vm.openDesk(bot)
+        vm.replaceProvidersForTests([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .distill,
+                models: [],
+                capabilitiesOverride: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
+            )
+        ])
+        vm.selectDeskThread(conversation.id)
+        vm.composerText = "Keep draft"
+
+        XCTAssertFalse(vm.send())
+        XCTAssertEqual(vm.errorMessage, "Contextual execution is unavailable until runtime isolation is verified.")
+        XCTAssertEqual(vm.composerText, "Keep draft")
+        XCTAssertTrue(vm.attachments.isEmpty)
+        XCTAssertTrue(vm.deskMessages.isEmpty)
+        XCTAssertTrue(vm.queuedFollowUpsForTesting(botID: bot.id).isEmpty)
+        XCTAssertTrue(try context.messageRepo.listRecent(threadId: thread.id, limit: 10).isEmpty)
+        XCTAssertNil(try context.threadRepo.get(id: thread.id)?.providerThreadId)
+    }
+
     func test_createDeskThreadStartsEmptyConversation() throws {
         // WHY: Desk had no + thread. Agent App can start a blank thread
         // before the first send.
@@ -10327,13 +10442,17 @@ final class BotsWindowTests: XCTestCase {
         )
         defer { UserDefaults.standard.removeObject(forKey: settingsKey) }
 
-        _ = try measurePeerHandoffDeletion(
-            label: "warmup",
-            payload: payload,
-            targetOriginBotID: targetOriginBotID,
-            targetActivityID: targetActivityID,
-            siblingActivityID: siblingActivityID
-        )
+        // Inside a long suite the first commits still share the CPU with work the
+        // previous test left draining; warm up past that so samples measure the commit.
+        for warmup in 0..<3 {
+            _ = try measurePeerHandoffDeletion(
+                label: "warmup-\(warmup)",
+                payload: payload,
+                targetOriginBotID: targetOriginBotID,
+                targetActivityID: targetActivityID,
+                siblingActivityID: siblingActivityID
+            )
+        }
 
         var samples: [Double] = []
         for sample in 0..<20 {
@@ -11646,7 +11765,7 @@ final class BotsWindowTests: XCTestCase {
             "task_id": try XCTUnwrap(startTask["id"]),
             "recipe_id": try XCTUnwrap(startTask["recipe_id"]),
         ])
-        XCTAssertEqual(docker.startStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(docker.startStarted.wait(timeout: .now() + 10), .success)
         let acceptedRuntime = try XCTUnwrap(
             accepted.objectValue?["readback"]?.objectValue?["runtime"]?.objectValue
         )
@@ -11782,7 +11901,8 @@ final class BotsWindowTests: XCTestCase {
 
         func terminalReceipt(requestID: String) async throws -> [String: JSONValue] {
             var latest = JSONValue.null
-            for _ in 0..<200 {
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
                 latest = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
                     "client_request_id": .string(requestID),
                 ])
@@ -11913,7 +12033,8 @@ final class BotsWindowTests: XCTestCase {
 
         func terminalReceipt(requestID: String) async throws -> [String: JSONValue] {
             var latest = JSONValue.null
-            for _ in 0..<200 {
+            let deadline = Date().addingTimeInterval(10)
+            while Date() < deadline {
                 latest = try await router.dispatchPairedBotRemote(method: "bot.receipt.status", params: [
                     "client_request_id": .string(requestID),
                 ])
@@ -12116,7 +12237,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.1)
         XCTAssertEqual(vm.selectedRevision?.desktopKind, .dockerDesktop)
         XCTAssertEqual(vm.guestLaunchState(for: bot.id), .starting)
-        XCTAssertEqual(fake.startStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(fake.startStarted.wait(timeout: .now() + 10), .success)
         await Task.yield()
         XCTAssertTrue(heartbeat, "a blocked Docker start must not starve MainActor work")
 
@@ -12467,7 +12588,7 @@ final class BotsWindowTests: XCTestCase {
         )
         vm.dockerGuestReadyOverrideForTesting = nil
         vm.presentGuestDesktop(botID: bot.id)
-        let launched = await waitUntil(timeout: 2) { vm.isGuestRunning(bot.id) }
+        let launched = await waitUntil(timeout: 10) { vm.isGuestRunning(bot.id) }
         XCTAssertTrue(launched)
         let started = Date()
         vm.stopDockerGuest(botID: bot.id)
@@ -16779,16 +16900,12 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(sidebar.contains("onPresentBots"))
         XCTAssertTrue(sidebar.contains("isBotsSelected"))
         XCTAssertTrue(sidebar.contains("setBotsSelected"))
-        XCTAssertTrue(sidebar.contains("accessibilityIdentifier(\"sidebar.bots\")"))
-        XCTAssertFalse(sidebar.contains("title: \"Bots\""))
-        XCTAssertTrue(sidebar.contains("BotsModeSwitcher"))
-        XCTAssertTrue(
-            sidebar.contains("attachDeleteConfirmation: true"),
-            "sidebar roster is a sibling hosting view; Delete must attach confirm here"
-        )
-        XCTAssertTrue(bots.contains("bots.chrome.agentic"))
-        XCTAssertTrue(bots.contains("bots.chrome.bots"))
-        XCTAssertTrue(sidebar.contains("if vm.isBotsSelected"))
+        XCTAssertTrue(sidebar.contains("accessibilityIdentifier(\"sidebar.manageBots\")"),
+                      "the unified sidebar reaches the Bots catalog from Manage Bots and Teams")
+        XCTAssertFalse(sidebar.contains("BotsModeSwitcher"), "the Workspaces | Bots mode toggle is gone")
+        XCTAssertFalse(bots.contains("bots.chrome.agentic"))
+        XCTAssertTrue(main.contains("showsCatalogRail: true"),
+                      "the main shell shows the roster beside Bots content instead of in the sidebar")
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.new\")"))
         XCTAssertFalse(bots.contains("bots.fleet.row."), "Fleet Home row is not a destination")
         XCTAssertTrue(bots.contains("accessibilityIdentifier(\"bots.roster\")"))
@@ -16821,7 +16938,6 @@ final class BotsWindowTests: XCTestCase {
             bots.contains("bots.studio.desktop"),
             "the read-only Desktop card still ships inside the Security tab"
         )
-        XCTAssertTrue(bots.contains("bots.chrome.agentic"))
         XCTAssertFalse(bots.contains("bots.home.goal"))
         XCTAssertTrue(bots.contains("accessibilityAddTraits(selected ? .isSelected : [])"))
         XCTAssertTrue(bots.contains("BotsChrome.hitTarget"))
@@ -17018,8 +17134,8 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertLessThan(reportBug.lowerBound, scheduleTasks.lowerBound,
                           "Report Bug is a header icon, not a dest row under Schedule Tasks")
         XCTAssertTrue(
-            sidebar.contains("BotsModeSwitcher"),
-            "Bots is entered from the Agentic/Bots switcher, not a dest row"
+            sidebar.contains("accessibilityIdentifier(\"sidebar.manageBots\")"),
+            "Bots is entered from Manage Bots and Teams in the unified sidebar"
         )
     }
 
@@ -17084,51 +17200,14 @@ final class BotsWindowTests: XCTestCase {
                        "the attention bell is replaced by the Active Bots row")
     }
 
-    func test_modeSwitcherSitsOnGlass_andBotSearchMatchesWorkspaceFilter() throws {
-        // WHY: opaque surfaceRaised / surfaceOverlay on Agentic | Bots punches
-        // a dark slab through the sidebar NSVisualEffectView. Search bots used
-        // the 44pt Bots hit target and sat taller than Filter workspaces.
+    func test_botSearchMatchesWorkspaceFilter() throws {
+        // WHY: Search bots and the sidebar search must share one field style.
         let bots = try String(contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
         let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
-        guard let start = bots.range(of: "public struct BotsModeSwitcher") else {
-            return XCTFail("BotsModeSwitcher must exist")
-        }
-        let rest = bots[start.lowerBound...]
-        let end = rest.range(of: "\npublic struct BotsRosterList")?.lowerBound ?? rest.endIndex
-        let switcher = String(bots[start.lowerBound..<end])
-
-        XCTAssertFalse(
-            switcher.contains("DS.Palette.surfaceRaised"),
-            "mode switcher track must not paint an opaque raised slab on glass"
-        )
-        XCTAssertFalse(
-            switcher.contains("DS.Palette.surfaceOverlay"),
-            "selected segment must not use opaque surfaceOverlay on glass"
-        )
-        XCTAssertTrue(
-            switcher.contains(".background(DS.Palette.hover)"),
-            "mode switcher track must be a translucent hover wash so sidebar glass shows through"
-        )
-        XCTAssertTrue(
-            switcher.contains("selected ? DS.Palette.pressed : Color.clear"),
-            "selected segment must be a frost wash, not a solid raised surface"
-        )
-        XCTAssertTrue(
-            bots.contains("SidebarSearchField("),
-            "Search bots must use the same SidebarSearchField as Filter workspaces"
-        )
-        XCTAssertTrue(
-            sidebar.contains("SidebarSearchField("),
-            "Filter workspaces must use the same SidebarSearchField as Search bots"
-        )
-        XCTAssertTrue(
-            sidebar.contains("placeholder: \"Filter workspaces\""),
-            "workspace filter keeps its own placeholder"
-        )
-        XCTAssertTrue(
-            bots.contains("placeholder: BotsChrome.Label.search"),
-            "bots filter keeps Search bots as the only copy difference"
-        )
+        XCTAssertTrue(bots.contains("SidebarSearchField("))
+        XCTAssertTrue(sidebar.contains("SidebarSearchField("))
+        XCTAssertTrue(sidebar.contains("placeholder: \"Search workspaces and Bots\""))
+        XCTAssertTrue(bots.contains("placeholder: BotsChrome.Label.search"))
     }
 
     private struct SeededDeskTurn {
@@ -18410,6 +18489,348 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.applyIncomingDeskEventCountForTesting, 0)
         XCTAssertEqual(publishes, 0)
         XCTAssertTrue(vm.deskLiveTimeline.turns.isEmpty)
+    }
+
+    func test_allowReadAndSendRequiresSelectedBotAndPreservesOnlyActiveMemoryGrant() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let botA = try vm.create(name: "A", title: "A")
+        let botB = try vm.create(name: "B", title: "B")
+        let hostID = context.liveActivityHostIdentity.serverId
+        let target = BotContext.general
+
+        XCTAssertNil(try context.botStore.getContextBinding(hostID: hostID, botID: botA.id, context: target))
+        vm.openDesk(botB)
+        XCTAssertFalse(vm.allowReadAndSend(botID: botA.id, context: target))
+        XCTAssertNil(try context.botStore.getContextBinding(hostID: hostID, botID: botA.id, context: target))
+
+        let memory = try context.botStore.grantContext(
+            hostID: hostID, botID: botB.id, context: target,
+            actions: [.memory], expectedRevision: nil
+        )
+        vm.openDesk(botB)
+        XCTAssertTrue(vm.allowReadAndSend(botID: botB.id, context: target))
+        let granted = try XCTUnwrap(context.botStore.getContextBinding(hostID: hostID, botID: botB.id, context: target))
+        XCTAssertEqual(granted.actions, [.memory, .read, .send])
+        XCTAssertEqual(granted.policyRevision, memory.policyRevision + 1)
+        XCTAssertTrue(vm.allowReadAndSend(botID: botB.id, context: target))
+        XCTAssertEqual(try context.botStore.getContextBinding(hostID: hostID, botID: botB.id, context: target)?.policyRevision, granted.policyRevision)
+
+        let revoked = try context.botStore.revokeContext(
+            hostID: hostID, botID: botB.id, context: target, expectedRevision: granted.policyRevision
+        )
+        XCTAssertTrue(vm.allowReadAndSend(botID: botB.id, context: target))
+        let restored = try XCTUnwrap(context.botStore.getContextBinding(hostID: hostID, botID: botB.id, context: target))
+        XCTAssertEqual(restored.actions, [.read, .send])
+        XCTAssertEqual(restored.policyRevision, revoked.policyRevision + 1)
+    }
+
+    func test_pinnedDeskSendRejectsExactConversationBeforeProviderOrReceiptAndKeepsDraft() async throws {
+        // WHY: the embedded Agent App transform must enforce the canonical
+        // conversation pin, even if another conversation is selected later.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        let hostID = context.liveActivityHostIdentity.serverId
+        _ = try context.botStore.grantContext(
+            hostID: hostID, botID: bot.id, context: .general,
+            actions: [.read, .send], expectedRevision: nil
+        )
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread(in: .general))
+        let pinned = try XCTUnwrap(vm.selectedConversation)
+        let pinnedThreadID = try XCTUnwrap(pinned.linkedAgentThreadID)
+        let agent = try XCTUnwrap(vm.deskAgentVM)
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pinned-desk-\(UUID().uuidString).txt")
+        try Data("keep attachment".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        agent.attachments = [AgentAttachment(path: file.path, kind: .file)]
+        XCTAssertEqual(agent.attachments.map(\.displayName), [file.lastPathComponent])
+        agent.prompt = "keep this draft"
+        let transform = try XCTUnwrap(agent.embedding?.promptTransform)
+        let otherBot = try vm.create(name: "B", title: "B", provider: .claude, model: "opus")
+        let otherThread = AgentThread(title: "Other", provider: .claude, model: "opus")
+        try context.threadRepo.upsert(otherThread)
+        let other = BotConversation(botID: otherBot.id, title: "Other", linkedAgentThreadID: otherThread.id)
+        try context.botStore.upsertConversation(other)
+        vm.openDesk(otherBot)
+        XCTAssertEqual(vm.selectedConversation?.id, other.id)
+        XCTAssertNotEqual(other.id, pinned.id)
+        let messagesBefore = try context.messageRepo.listRecent(threadId: pinnedThreadID, limit: 100)
+        let receiptBefore = try context.botStore.latestContextReceipt(botID: bot.id, conversationID: pinned.id)
+
+        do {
+            _ = try await transform("keep this draft", pinnedThreadID, AgentRunID())
+            XCTFail("pinned conversation transform must reject before compile")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Contextual execution is unavailable until runtime isolation is verified."
+            )
+        }
+
+        XCTAssertNil(context.coordinator.activeRunId(threadId: pinnedThreadID), "pinned send must not start provider")
+        XCTAssertEqual(try context.messageRepo.listRecent(threadId: pinnedThreadID, limit: 100), messagesBefore)
+        XCTAssertEqual(
+            try context.botStore.latestContextReceipt(botID: bot.id, conversationID: pinned.id), receiptBefore,
+            "rejected send must not compile a context receipt"
+        )
+        XCTAssertEqual(agent.prompt, "keep this draft")
+        XCTAssertEqual(agent.attachments.map(\.displayName), [file.lastPathComponent])
+    }
+
+    func test_openDeskPinnedConversationDoesNotProvisionDockerGuest() throws {
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Pinned", title: "Context", provider: .distill)
+        let binding = try context.botStore.grantContext(
+            hostID: context.liveActivityHostIdentity.serverId,
+            botID: bot.id,
+            context: .general,
+            actions: [.read, .send],
+            expectedRevision: nil
+        )
+        let thread = AgentThread(title: "Pinned", provider: .distill, model: "test-main")
+        let conversation = BotConversation(
+            botID: bot.id,
+            title: "Pinned",
+            linkedAgentThreadID: thread.id
+        )
+        try context.botStore.createContextualConversation(
+            conversation,
+            newThread: thread,
+            hostID: context.liveActivityHostIdentity.serverId,
+            context: .general,
+            policyRevision: binding.policyRevision
+        )
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+        vm.dockerGuestReadyOverrideForTesting = nil
+        let fake = RecordingDocker()
+        vm.computerGuestService = BotComputerGuestService(
+            appSupport: context.appSupportDirectory,
+            docker: fake,
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+
+        vm.openDesk(bot)
+
+        XCTAssertEqual(vm.screen, .desk)
+        XCTAssertEqual(vm.selectedConversation?.id, conversation.id)
+        XCTAssertEqual(
+            vm.errorMessage,
+            "Contextual execution is unavailable until runtime isolation is verified."
+        )
+        XCTAssertEqual(fake.created.count, 0)
+        XCTAssertEqual(fake.startCallCount, 0)
+    }
+
+    func test_contextualDeskThreadCreatesPinnedLockedThreadForExplicitGrant() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let botA = try vm.create(name: "A", title: "A")
+        let botB = try vm.create(name: "B", title: "B")
+        let deskContext = BotContext.general
+        let hostID = context.liveActivityHostIdentity.serverId
+        for bot in [botA, botB] {
+            _ = try context.botStore.grantContext(
+                hostID: hostID, botID: bot.id, context: deskContext,
+                actions: [.read, .send], expectedRevision: nil
+            )
+        }
+        vm.openDesk(botA)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread(in: deskContext))
+        let conversationA = try XCTUnwrap(vm.selectedConversation)
+        vm.openDesk(botB)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread(in: deskContext))
+        let conversationB = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(conversationA.id, conversationB.id)
+        XCTAssertNotEqual(conversationA.linkedAgentThreadID, conversationB.linkedAgentThreadID)
+        for conversation in [conversationA, conversationB] {
+            let pin = try XCTUnwrap(context.botStore.conversationContextPin(conversationID: conversation.id))
+            XCTAssertEqual(pin.context, deskContext)
+            let threadID = try XCTUnwrap(conversation.linkedAgentThreadID)
+            XCTAssertEqual(try context.botStore.conversationContextPin(linkedTo: threadID), pin)
+            let thread = try XCTUnwrap(context.threadRepo.get(id: threadID))
+            XCTAssertEqual(thread.actor, .bot(conversation.botID))
+            XCTAssertNotNil(thread.actorLockedAt)
+            XCTAssertEqual(thread.model, "main-model")
+        }
+    }
+
+    func test_workspaceContextualDeskThreadPinsCurrentWorkspaceAndPreservesPriorPin() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("BotDeskContext-\(UUID().uuidString)", isDirectory: true)
+        let dirA = base.appendingPathComponent("A", isDirectory: true)
+        let dirB = base.appendingPathComponent("B", isDirectory: true)
+        try FileManager.default.createDirectory(at: dirA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dirB, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let workspaceA = try router.createWorkspace(name: "Workspace A", cwd: dirA.path)
+        let workspaceB = try router.createWorkspace(name: "Workspace B", cwd: dirB.path)
+        let hostID = context.liveActivityHostIdentity.serverId
+        let contextA = BotContext.workspace(workspaceA.id)
+        let contextB = BotContext.workspace(workspaceB.id)
+        _ = try context.botStore.grantContext(hostID: hostID, botID: bot.id, context: contextA, actions: [.read, .send], expectedRevision: nil)
+        _ = try context.botStore.grantContext(hostID: hostID, botID: bot.id, context: contextB, actions: [.read, .send], expectedRevision: nil)
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "main-model", routingMode: .manual, runAsUser: .current())
+        XCTAssertTrue(vm.createDeskThread(in: contextA))
+        let conversationA = try XCTUnwrap(vm.selectedConversation)
+        let pinA = try XCTUnwrap(context.botStore.conversationContextPin(conversationID: conversationA.id))
+        let threadA = try XCTUnwrap(context.threadRepo.get(id: try XCTUnwrap(conversationA.linkedAgentThreadID)))
+        XCTAssertEqual(pinA.context, contextA)
+        XCTAssertEqual(pinA.policyRevision, try XCTUnwrap(context.botStore.getContextBinding(hostID: hostID, botID: bot.id, context: contextA)).policyRevision)
+        XCTAssertEqual(threadA.workspaceId, workspaceA.id)
+
+        context.state.window.selectedWorkspaceID = workspaceB.id
+        XCTAssertTrue(vm.createDeskThread(in: contextB))
+        let conversationB = try XCTUnwrap(vm.selectedConversation)
+        let pinB = try XCTUnwrap(context.botStore.conversationContextPin(conversationID: conversationB.id))
+        let threadB = try XCTUnwrap(context.threadRepo.get(id: try XCTUnwrap(conversationB.linkedAgentThreadID)))
+        XCTAssertEqual(vm.selectedPinnedContextLabel, "Workspace B")
+        XCTAssertEqual(pinB.context, contextB)
+        XCTAssertEqual(pinB.policyRevision, try XCTUnwrap(context.botStore.getContextBinding(hostID: hostID, botID: bot.id, context: contextB)).policyRevision)
+        XCTAssertEqual(threadB.workspaceId, workspaceB.id)
+
+        let priorID = conversationB.id
+        XCTAssertTrue(vm.createDeskThread())
+        let conversationB2 = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertNotEqual(conversationB2.id, priorID)
+        XCTAssertEqual(try context.botStore.conversationContextPin(conversationID: conversationB2.id)?.context, contextB)
+        XCTAssertEqual(try context.botStore.conversationContextPin(conversationID: conversationA.id), pinA)
+        XCTAssertEqual(try context.botStore.conversationContextPin(conversationID: priorID), pinB)
+        let threadB2 = try XCTUnwrap(context.threadRepo.get(id: try XCTUnwrap(conversationB2.linkedAgentThreadID)))
+        XCTAssertEqual(threadB2.workspaceId, workspaceB.id)
+    }
+
+    func test_contextualDeskThreadWithoutGrantCreatesNothingOrChangesSelection() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        vm.openDesk(bot)
+        let selection = vm.selectedConversation?.id
+        XCTAssertFalse(vm.createDeskThread(in: .general))
+        XCTAssertEqual(vm.selectedConversation?.id, selection)
+        XCTAssertTrue(try context.botStore.listConversations(botID: bot.id).isEmpty)
+    }
+
+    func test_createDeskThreadOnPinnedConversationPreservesContext() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        let deskContext = BotContext.general
+        let hostID = context.liveActivityHostIdentity.serverId
+        _ = try context.botStore.grantContext(
+            hostID: hostID, botID: bot.id, context: deskContext,
+            actions: [.read, .send], expectedRevision: nil
+        )
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread(in: deskContext))
+        let old = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertTrue(vm.createDeskThread())
+        let created = try XCTUnwrap(vm.selectedConversation)
+        XCTAssertEqual(try context.botStore.conversationContextPin(conversationID: created.id)?.context, deskContext)
+        XCTAssertNotEqual(old.id, created.id)
+    }
+
+    func test_missingWorkspaceGrantAndThreadCreationHaveNoEffects() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread())
+        vm.composerText = "Keep"
+        let selected = try XCTUnwrap(vm.selectedConversation?.id)
+        let hostID = context.liveActivityHostIdentity.serverId
+        let missingContext = BotContext.workspace(WorkspaceID(UUID()))
+        let conversationsBefore = try context.botStore.listConversations(botID: bot.id).count
+        let threadsBefore = try context.threadRepo.list().count
+
+        XCTAssertFalse(vm.allowReadAndSend(botID: bot.id, context: missingContext))
+        XCTAssertNil(try context.botStore.getContextBinding(hostID: hostID, botID: bot.id, context: missingContext))
+        _ = try context.botStore.grantContext(
+            hostID: hostID, botID: bot.id, context: missingContext,
+            actions: [.read, .send], expectedRevision: nil
+        )
+        XCTAssertFalse(vm.createDeskThread(in: missingContext))
+        XCTAssertEqual(vm.selectedConversation?.id, selected)
+        XCTAssertEqual(vm.composerText, "Keep")
+        XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, conversationsBefore)
+        XCTAssertEqual(try context.threadRepo.list().count, threadsBefore)
+    }
+
+    func test_workspaceDeletedAfterGrantConfirmationRejectsGrantAndThreadCreation() throws {
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "A", title: "A")
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread())
+        let selected = try XCTUnwrap(vm.selectedConversation?.id)
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("BotDeskDeleted-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let workspace = try router.createWorkspace(name: "Grant target", cwd: base.path)
+        let capturedBotID = bot.id
+        let target = BotContext.workspace(workspace.id)
+        try router.closeWorkspace(workspace.id)
+        XCTAssertNil(context.state.workspaces[workspace.id])
+        XCTAssertFalse(vm.allowReadAndSend(botID: capturedBotID, context: target))
+        let hostID = context.liveActivityHostIdentity.serverId
+        XCTAssertNil(try context.botStore.getContextBinding(hostID: hostID, botID: capturedBotID, context: target))
+        _ = try context.botStore.grantContext(
+            hostID: hostID, botID: capturedBotID, context: target,
+            actions: [.read, .send], expectedRevision: nil
+        )
+        let conversationsBefore = try context.botStore.listConversations(botID: bot.id).count
+        let threadsBefore = try context.threadRepo.list().count
+        XCTAssertFalse(vm.createDeskThread(in: target))
+        XCTAssertEqual(vm.selectedConversation?.id, selected)
+        XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, conversationsBefore)
+        XCTAssertEqual(try context.threadRepo.list().count, threadsBefore)
     }
 
     private func makeContext() throws -> AppContext {

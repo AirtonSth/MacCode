@@ -166,7 +166,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         let source = try String(contentsOf: sidebarViewURL())
         let headerStart = try XCTUnwrap(source.range(of: "HStack(spacing: 2)"))
         let headerEnd = try XCTUnwrap(
-            source.range(of: "BotsModeSwitcher(", range: headerStart.upperBound..<source.endIndex)
+            source.range(of: "Button { vm.newWorkspace() }", range: headerStart.upperBound..<source.endIndex)
         )
         let header = source[headerStart.lowerBound..<headerEnd.lowerBound]
         let account = try XCTUnwrap(header.range(of: "if vm.privateAccountUser != nil"))
@@ -192,7 +192,7 @@ final class AppIdentityNotificationTests: XCTestCase {
     func testSidebarWorkspaceFilterStaysVisibleWithoutAutofocus() throws {
         let source = try String(contentsOf: sidebarViewURL())
 
-        XCTAssertTrue(source.contains("if !vm.workspaces.isEmpty {\n                workspaceFilterField"),
+        XCTAssertTrue(source.contains("if !vm.workspaces.isEmpty || !vm.generalBots.isEmpty {\n                workspaceFilterField"),
                       "the Workspaces filter must stay visible for normal short workspace lists, not only after the list grows past an arbitrary count")
         XCTAssertFalse(source.contains("vm.workspaces.count > 6"),
                        "the Workspaces filter must not disappear for users with only a few workspaces")
@@ -1471,6 +1471,16 @@ final class AppIdentityNotificationTests: XCTestCase {
         ctx.coordinator.replaceProvider(.claude, runner: FakeProviderRunner(provider: .claude, scenario: .simpleAssistant(reply: "ok")))
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
+        // Titling is under test, not this Mac's Claude login: give send the authenticated
+        // catalog it would otherwise discover from the installed CLI.
+        router.rememberProviderSnapshotsForSend([AgentProviderSnapshot(
+            id: "claude", provider: .claude, driverKind: .claudeCLI, displayName: "Claude",
+            accentColor: "#D97757", continuationGroup: "claude", interactionModes: [.default],
+            permissionModes: [.supervised, .fullAccess], enabled: true, installed: true,
+            status: .available, authenticated: true,
+            models: [AgentModelDescriptor(id: "fake-model", label: "Fake", provider: .claude)],
+            slashCommands: []
+        )])
         let thread = AgentThread(title: "Thread", provider: .claude, model: "fake-model")
         try ctx.threadRepo.upsert(thread)
 

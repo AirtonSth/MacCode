@@ -1887,6 +1887,7 @@ public final class AgentThreadRepository {
                 guard try get(id: sourceThreadId) != nil else {
                     throw AgentThreadForkPersistenceError.sourceThreadNotFound
                 }
+                try requireUnscopedForkSource(sourceThreadId)
                 let sourceMessages: [AgentMessage]
                 if let forkIntentChildThreadId {
                     guard forkIntentChildThreadId == childThread.id,
@@ -1952,6 +1953,13 @@ public final class AgentThreadRepository {
         }
     }
 
+    /// Generic provider forks cannot export a pinned conversation's native history.
+    public func requireUnscopedForkSource(_ threadID: AgentThreadID) throws {
+        guard try BotStore(db: db).conversationContextPin(linkedTo: threadID) == nil else {
+            throw AgentThreadForkPersistenceError.contextualSourceUnsupported
+        }
+    }
+
     /// Creates the durable local identity before any provider mutation. The
     /// idempotency key is stable for the child identity, so a crash before the
     /// provider result is recorded can safely replay only on adapters that
@@ -1971,6 +1979,7 @@ public final class AgentThreadRepository {
                 guard try get(id: sourceThreadId) != nil else {
                     throw AgentThreadForkPersistenceError.sourceThreadNotFound
                 }
+                try requireUnscopedForkSource(sourceThreadId)
 
                 // Same durable child/key is a retry, not a second snapshot. Any
                 // mismatch is a conflict rather than an unsafe best-effort merge.
@@ -2716,6 +2725,7 @@ public enum AgentThreadForkPersistenceError: Error, Equatable {
     case childThreadConflict
     case invalidIntentState(AgentThreadForkIntentState)
     case corruptIntent
+    case contextualSourceUnsupported
 }
 
 public struct AgentMessageBodyBudgetResult: Sendable, Equatable {
@@ -3955,39 +3965,65 @@ public final class AgentQueuedMessageRepository {
         }
     }
 
+    internal func enqueueWithinTransaction(
+        threadId: AgentThreadID,
+        text: String,
+        attachments: [AgentAttachment],
+        interactionMode: AgentInteractionMode
+    ) throws -> AgentQueuedMessage {
+        let position = try nextPosition(threadId: threadId)
+        let queued = AgentQueuedMessage(
+            threadId: threadId,
+            text: text,
+            attachments: attachments,
+            interactionMode: interactionMode,
+            position: position
+        )
+        try upsertWithinTransaction(queued, routingConfiguration: nil, routingSnapshot: nil)
+        return queued
+    }
+
     public func upsert(
         _ message: AgentQueuedMessage,
         routingConfiguration: AgentRoutingConfiguration? = nil,
         routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) throws {
         try db.performSync { database in try database.transaction {
-                if try rowExists(message.id), try threadHasActiveLease(message.threadId) {
-                    throw AgentQueuedMessageMutationError.queueIsLeased
-                }
-                let st = try database.prepare("""
-                    INSERT INTO agent_queued_messages(id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET text=excluded.text, attachments_json=excluded.attachments_json, interaction_mode=excluded.interaction_mode, position=excluded.position, updated_at=excluded.updated_at;
-                """)
-                try st.bind(1, message.id.value.uuidString)
-                try st.bind(2, message.threadId.value.uuidString)
-                try st.bind(3, message.text)
-                try st.bind(4, attachmentsJSON(message.attachments))
-                try st.bind(5, message.interactionMode.rawValue)
-                try st.bind(6, Int64(message.position))
-                try st.bind(7, iso.string(from: message.createdAt))
-                try st.bind(8, iso.string(from: message.updatedAt))
-                _ = try st.step()
-                if let routingSnapshot = routingSnapshot ?? message.routingSnapshot {
-                    try persistRoutingSnapshot(routingSnapshot, queuedMessageId: message.id, database: database)
-                } else if let routingConfiguration {
-                    try persistRoutingSnapshot(
-                        AgentQueuedMessageRoutingSnapshot(configuration: routingConfiguration),
-                        queuedMessageId: message.id,
-                        database: database
-                    )
-                }
+            try upsertWithinTransaction(message, routingConfiguration: routingConfiguration, routingSnapshot: routingSnapshot)
         } }
+    }
+
+    private func upsertWithinTransaction(
+        _ message: AgentQueuedMessage,
+        routingConfiguration: AgentRoutingConfiguration?,
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot?
+    ) throws {
+        if try rowExists(message.id), try threadHasActiveLease(message.threadId) {
+            throw AgentQueuedMessageMutationError.queueIsLeased
+        }
+        let st = try db.prepare("""
+            INSERT INTO agent_queued_messages(id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET text=excluded.text, attachments_json=excluded.attachments_json, interaction_mode=excluded.interaction_mode, position=excluded.position, updated_at=excluded.updated_at;
+        """)
+        try st.bind(1, message.id.value.uuidString)
+        try st.bind(2, message.threadId.value.uuidString)
+        try st.bind(3, message.text)
+        try st.bind(4, attachmentsJSON(message.attachments))
+        try st.bind(5, message.interactionMode.rawValue)
+        try st.bind(6, Int64(message.position))
+        try st.bind(7, iso.string(from: message.createdAt))
+        try st.bind(8, iso.string(from: message.updatedAt))
+        _ = try st.step()
+        if let routingSnapshot = routingSnapshot ?? message.routingSnapshot {
+            try persistRoutingSnapshot(routingSnapshot, queuedMessageId: message.id, database: db)
+        } else if let routingConfiguration {
+            try persistRoutingSnapshot(
+                AgentQueuedMessageRoutingSnapshot(configuration: routingConfiguration),
+                queuedMessageId: message.id,
+                database: db
+            )
+        }
     }
 
     public func routingConfiguration(id: AgentQueuedMessageID) throws -> AgentRoutingConfiguration? {
@@ -4131,6 +4167,7 @@ public final class AgentQueuedMessageRepository {
             try select.bind(1, threadId.value.uuidString)
             guard try select.step() else { return }
             let message = decodeRow(select)
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: message.id.value.uuidString, db: database) else { return }
             let state = AgentQueuedMessageDispatchState(rawValue: select.columnText(10) ?? "") ?? .queued
             guard state == .queued else { return }
             if select.columnText(8) != nil,
@@ -4173,6 +4210,7 @@ public final class AgentQueuedMessageRepository {
             try select.bind(1, id.value.uuidString)
             guard try select.step() else { return }
             let message = decodeRow(select)
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: message.id.value.uuidString, db: database) else { return }
             let state = AgentQueuedMessageDispatchState(rawValue: select.columnText(10) ?? "") ?? .queued
             guard state == .queued else { return }
             if select.columnText(8) != nil,
@@ -4204,6 +4242,9 @@ public final class AgentQueuedMessageRepository {
             try st.bind(2, lease.leaseId)
             _ = try st.step()
             guard try changedRowCount() == 1 else { return false }
+            if try HostDatabaseRestore.queueAttempt(kind: .agent, id: lease.message.id.value.uuidString, db: database) != nil {
+                try HostDatabaseRestore.pauseQueue(kind: .agent, id: lease.message.id.value.uuidString, db: database)
+            }
             try normalizePositions(threadId: lease.message.threadId)
             return true
         } }
@@ -4261,6 +4302,9 @@ public final class AgentQueuedMessageRepository {
             try st.bind(3, runId.value.uuidString)
             _ = try st.step()
             guard try changedRowCount() == 1 else { return false }
+            if try HostDatabaseRestore.queueAttempt(kind: .agent, id: lease.message.id.value.uuidString, db: database) != nil {
+                try HostDatabaseRestore.pauseQueue(kind: .agent, id: lease.message.id.value.uuidString, db: database)
+            }
             if let promotedId,
                let target = try get(id: promotedId),
                target.threadId == lease.message.threadId,
@@ -4337,6 +4381,7 @@ public final class AgentQueuedMessageRepository {
         runId: AgentRunID
     ) throws -> AgentQueuedMessage? {
         try db.performSync { database in try database.transaction {
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: id.value.uuidString, db: database) else { return nil }
             let select = try database.prepare("""
                 SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at,
                        lease_id
@@ -4359,6 +4404,9 @@ public final class AgentQueuedMessageRepository {
             try update.bind(3, runId.value.uuidString)
             _ = try update.step()
             guard try changedRowCount() == 1 else { return nil }
+            if try HostDatabaseRestore.queueAttempt(kind: .agent, id: id.value.uuidString, db: database) != nil {
+                try HostDatabaseRestore.pauseQueue(kind: .agent, id: id.value.uuidString, db: database)
+            }
             return message
         } }
     }
@@ -4371,6 +4419,7 @@ public final class AgentQueuedMessageRepository {
         runId: AgentRunID
     ) throws -> AgentQueuedMessage? {
         try db.performSync { database in try database.transaction {
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: id.value.uuidString, db: database) else { return nil }
             let select = try database.prepare("""
                 SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at,
                        lease_id
@@ -4401,6 +4450,7 @@ public final class AgentQueuedMessageRepository {
     /// delete predicate. Concurrent recovery yields the row to exactly one caller.
     public func acknowledgeDispatched(id: AgentQueuedMessageID, runId: AgentRunID) throws -> AgentQueuedMessage? {
         try db.performSync { database in try database.transaction {
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: id.value.uuidString, db: database) else { return nil }
             let select = try database.prepare("""
                 SELECT id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
                 FROM agent_queued_messages
@@ -4437,6 +4487,7 @@ public final class AgentQueuedMessageRepository {
             guard try select.step(), select.columnText(9) == AgentQueuedMessageDispatchState.dispatched.rawValue,
                   let runId = select.columnText(8) else { return nil }
             let message = decodeRow(select)
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .agent, id: message.id.value.uuidString, db: database) else { return nil }
             let delete = try database.prepare("""
                 DELETE FROM agent_queued_messages
                 WHERE id = ? AND dispatch_state = 'dispatched' AND dispatch_run_id = ?;

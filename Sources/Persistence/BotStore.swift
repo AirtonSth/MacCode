@@ -1822,6 +1822,23 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
+    /// A provider acknowledgement may remove only the exact intent it accepted.
+    public func acknowledgeQueuedFollowUp(_ expected: BotQueuedFollowUpRecord) throws -> Bool {
+        try db.transaction {
+            let statement = try db.prepare("DELETE FROM bot_queued_follow_ups WHERE bot_id=? AND id=? AND conversation_id IS ? AND text=? AND payload_json=?;")
+            defer { statement.reset() }
+            try statement.bind(1, expected.botID.value.uuidString.lowercased())
+            try statement.bind(2, expected.id)
+            try statement.bind(3, expected.conversationID)
+            try statement.bind(4, expected.text)
+            try statement.bind(5, expected.payloadJSON)
+            _ = try statement.step()
+            let changes = try db.prepare("SELECT changes();")
+            defer { changes.reset() }
+            return try changes.step() && changes.columnInt64(0) == 1
+        }
+    }
+
     public func dequeueQueuedFollowUp(botID: BotID) throws -> BotQueuedFollowUpRecord? {
         try db.transaction {
             let statement = try db.prepare(
@@ -1837,6 +1854,7 @@ public final class BotStore: @unchecked Sendable {
             try statement.bind(1, botID.value.uuidString.lowercased())
             guard try statement.step() else { return nil }
             let record = try decodeQueuedFollowUp(statement)
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .bot, id: record.id, db: db) else { return nil }
             statement.reset()
             try removeQueuedFollowUpLocked(botID: botID, id: record.id, database: db)
             return record

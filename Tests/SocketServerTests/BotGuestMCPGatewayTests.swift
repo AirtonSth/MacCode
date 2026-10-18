@@ -9,6 +9,19 @@ import Persistence
 /// the door opens only for the live run's bearer, only to the allowlisted
 /// tools, never for browser-style requests, and closes the moment the run ends.
 final class BotGuestMCPGatewayTests: XCTestCase {
+    private final class DelayedSecretStore: BotSecretStore, @unchecked Sendable {
+        let base: InMemoryBotSecretStore
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+
+        init(base: InMemoryBotSecretStore) { self.base = base }
+        func list(botID: BotID) throws -> [BotSecretMetadata] { entered.signal(); release.wait(); return try base.list(botID: botID) }
+        func save(botID: BotID, name: String, value: String) throws { try base.save(botID: botID, name: name, value: value) }
+        func load(botID: BotID, name: String) throws -> String? { try base.load(botID: botID, name: name) }
+        func delete(botID: BotID, name: String) throws { try base.delete(botID: botID, name: name) }
+        func deleteAll(botID: BotID) throws { try base.deleteAll(botID: botID) }
+    }
+
     private final class Spy: @unchecked Sendable {
         private let lock = NSLock()
         private var lines: [String] = []
@@ -35,6 +48,65 @@ final class BotGuestMCPGatewayTests: XCTestCase {
 
     private let botID = UUID().uuidString
     private let runID = UUID().uuidString
+    private var fixtureDBs: [SQLiteDB] = []
+
+    private struct ContextFixture {
+        let store: BotStore
+        let botID: BotID
+        let pin: BotConversationContextPin
+        let threadID: AgentThreadID
+        let secrets: InMemoryBotSecretStore
+        let runtimeIdentity: BotContextRuntimeIdentity
+        let secretStorage: InMemoryBotSecretStore
+
+        var gatewayContext: BotGuestMCPGateway.ContextBinding {
+            .init(pin: pin, threadID: threadID)
+        }
+    }
+
+    private func contextualFixture(context: BotContext = .general, parent: ContextFixture? = nil) throws -> ContextFixture {
+        let db: SQLiteDB
+        let store: BotStore
+        let botID: BotID
+        let secrets: InMemoryBotSecretStore
+        if let parent {
+            store = parent.store
+            botID = parent.botID
+            secrets = parent.secretStorage
+            db = fixtureDBs.last!
+        } else {
+            db = try SQLiteDB(path: ":memory:")
+            fixtureDBs.append(db)
+            try Schema.migrate(db)
+            store = BotStore(db: db)
+            secrets = InMemoryBotSecretStore()
+            let support = FileManager.default.temporaryDirectory.appendingPathComponent("guest-context-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: support) }
+            let authority = BotRemoteControlAuthority(db: db, store: store, settings: SettingsStore(db: db), appSupportDirectory: support)
+            let created = try authority.dispatch(method: "bot.create", params: ["client_request_id": UUID().uuidString, "name": "Context bot"])
+            botID = BotID(try XCTUnwrap(UUID(uuidString: try XCTUnwrap(created["bot_id"] as? String))))
+        }
+        if parent == nil, let db = fixtureDBs.last {
+            let support = FileManager.default.temporaryDirectory.appendingPathComponent("guest-context-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: support) }
+            let authority = BotRemoteControlAuthority(db: db, store: store, settings: SettingsStore(db: db), appSupportDirectory: support)
+            _ = try authority.dispatch(method: "bot.context.grant", params: [
+                "client_request_id": UUID().uuidString, "host_id": "host-a", "bot_id": botID.value.uuidString,
+                "context_key": context.storageKey, "context_version": 1, "policy_revision": 0,
+                "actions": ["read", "send", "configure"],
+            ])
+        } else {
+            try store.grantContext(hostID: "host-a", botID: botID, context: context, actions: [.read, .send, .configure], expectedRevision: 0)
+        }
+        let conversationID = UUID()
+        let threadID = AgentThreadID()
+        let workspaceID: WorkspaceID? = { if case .workspace(let id) = context { return id }; return nil }()
+        let thread = AgentThread(id: threadID, workspaceId: workspaceID, title: "Context", provider: .distill, model: "test")
+        let conversation = BotConversation(id: BotConversationID(conversationID), botID: botID, title: "Context", linkedAgentThreadID: threadID)
+        let pin = try store.createContextualConversation(conversation, newThread: thread, hostID: "host-a", context: context, policyRevision: 1)
+        let identity = try BotContextRuntimeIdentity(hostID: "host-a", botID: botID, context: context, policyRevision: 1)
+        return ContextFixture(store: store, botID: botID, pin: pin, threadID: threadID, secrets: secrets, runtimeIdentity: identity, secretStorage: secrets)
+    }
     private var gateways: [BotGuestMCPGateway] = []
 
     override func tearDown() {
@@ -115,6 +187,99 @@ final class BotGuestMCPGatewayTests: XCTestCase {
 
     private let listTools = #"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#
     private let neverGone: @Sendable () -> Bool = { false }
+
+    private func contextualGateway(_ fixture: ContextFixture) -> BotGuestMCPGateway {
+        let gateway = BotGuestMCPGateway(context: fixture.gatewayContext, contextStore: fixture.store, secretStore: fixture.secrets)
+        gateways.append(gateway)
+        return gateway
+    }
+
+    private func contextualIssue(_ gateway: BotGuestMCPGateway, fixture: ContextFixture, context: BotGuestMCPGateway.ContextBinding? = nil) throws -> String {
+        try gateway.issue(.init(
+            runID: runID,
+            hostEnvironment: [BotSelfConfigCatalog.callerEnvironmentKey: fixture.botID.value.uuidString],
+            context: context ?? fixture.gatewayContext
+        )).token
+    }
+
+    private func secretNames(_ response: LoopbackHTTPResponse?) throws -> [String] {
+        let result = try XCTUnwrap(try json(response)["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        let text = try XCTUnwrap(content.first?["text"] as? String)
+        let decoded = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        return try XCTUnwrap(decoded["secrets"] as? [String])
+    }
+
+    func test_contextualSecretNamesUseOnlyPinnedRuntimeNamespaceAndRejectForeignArguments() throws {
+        let fixture = try contextualFixture()
+        let workspace = try contextualFixture(context: .workspace(WorkspaceID()), parent: fixture)
+        XCTAssertTrue(fixture.store === workspace.store)
+        XCTAssertEqual(fixture.botID, workspace.botID)
+        XCTAssertTrue(fixture.secretStorage === workspace.secretStorage)
+        XCTAssertNotEqual(fixture.runtimeIdentity.storageBotID, workspace.runtimeIdentity.storageBotID)
+        XCTAssertNotEqual(fixture.pin.conversationID, workspace.pin.conversationID)
+        XCTAssertNotEqual(fixture.threadID, workspace.threadID)
+        try fixture.secretStorage.save(botID: fixture.runtimeIdentity.storageBotID, name: "OWN_GENERAL_SECRET", value: "general raw value")
+        try fixture.secretStorage.save(botID: workspace.runtimeIdentity.storageBotID, name: "OWN_WORKSPACE_SECRET", value: "workspace raw value")
+        try fixture.secretStorage.save(botID: fixture.botID, name: "LOGICAL_GLOBAL_SECRET", value: "global raw value")
+        let gateway = contextualGateway(fixture)
+        let workspaceGateway = contextualGateway(workspace)
+        let token = try contextualIssue(gateway, fixture: fixture)
+        let workspaceToken = try contextualIssue(workspaceGateway, fixture: workspace)
+        let server = BotSelfConfigCatalog.serverName
+        let base = #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bot_list_secrets","arguments":{}}}"#
+        let names = try secretNames(gateway.respond(to: post(server, base, token: token), isClientGone: neverGone))
+        XCTAssertEqual(names, ["OWN_GENERAL_SECRET"])
+        XCTAssertFalse(names.contains("OWN_WORKSPACE_SECRET"))
+        XCTAssertFalse(names.contains("LOGICAL_GLOBAL_SECRET"))
+        let ownReply = String(decoding: try XCTUnwrap(gateway.respond(to: post(server, base, token: token), isClientGone: neverGone)?.body), as: UTF8.self)
+        XCTAssertFalse(ownReply.contains("general raw value"))
+        XCTAssertFalse(ownReply.contains("workspace raw value"))
+        XCTAssertFalse(ownReply.contains("global raw value"))
+        XCTAssertEqual(try secretNames(workspaceGateway.respond(to: post(server, base, token: workspaceToken), isClientGone: neverGone)), ["OWN_WORKSPACE_SECRET"])
+        XCTAssertEqual(gateway.respond(to: post(server, base, token: token), isClientGone: neverGone).map { $0.status }, 200)
+        XCTAssertEqual(gateway.respond(to: post(server, base, token: workspaceToken), isClientGone: neverGone)?.status, 401)
+        XCTAssertEqual(workspaceGateway.respond(to: post(server, base, token: token), isClientGone: neverGone)?.status, 401)
+        let explicit = #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bot_list_secrets","arguments":{"bot_id":"\#(fixture.botID.value.uuidString)"}}}"#
+        XCTAssertEqual(try secretNames(gateway.respond(to: post(server, explicit, token: token), isClientGone: neverGone)), ["OWN_GENERAL_SECRET"])
+        for arguments in [#"{"bot_id":"\#(UUID().uuidString)"}"#, #"[]"#, #"{"unexpected":true}"#] {
+            let body = #"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bot_list_secrets","arguments":\#(arguments)}}"#
+            let denied = try json(gateway.respond(to: post(server, body, token: token), isClientGone: neverGone))
+            XCTAssertNotNil(denied["error"], "unsupported contextual arguments must fail closed")
+        }
+        let otherContext = try contextualFixture(context: .workspace(WorkspaceID()))
+        XCTAssertThrowsError(try contextualIssue(gateway, fixture: fixture, context: otherContext.gatewayContext))
+    }
+
+    func test_contextualSecretReadSuppressesReplyAfterPolicyRevocation() throws {
+        let fixture = try contextualFixture()
+        try fixture.secrets.save(botID: fixture.runtimeIdentity.storageBotID, name: "DELAYED_SECRET", value: "never disclose")
+        let delayed = DelayedSecretStore(base: fixture.secrets)
+        let gateway = BotGuestMCPGateway(context: fixture.gatewayContext, contextStore: fixture.store, secretStore: delayed)
+        gateways.append(gateway)
+        let token = try contextualIssue(gateway, fixture: fixture)
+        let request = post(BotSelfConfigCatalog.serverName, #"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"bot_list_secrets","arguments":{}}}"#, token: token)
+        let done = expectation(description: "revoked read returns")
+        let box = ResponseBox()
+        Thread.detachNewThread { [neverGone] in
+            box.value = gateway.respond(to: request, isClientGone: neverGone)
+            done.fulfill()
+        }
+        XCTAssertEqual(delayed.entered.wait(timeout: .now() + 5), .success)
+        _ = try fixture.store.revokeContext(hostID: "host-a", botID: fixture.botID, context: .general, expectedRevision: 1)
+        delayed.release.signal()
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(try errorMessage(box.value), "The RemoteCode run that made this call has ended.")
+    }
+
+    func test_contextualGatewayRejectsStaleAndRevokedPolicyAtIssueAndDispatch() throws {
+        let fixture = try contextualFixture()
+        let gateway = contextualGateway(fixture)
+        let token = try contextualIssue(gateway, fixture: fixture)
+        _ = try fixture.store.revokeContext(hostID: "host-a", botID: fixture.botID, context: .general, expectedRevision: 1)
+        XCTAssertEqual(gateway.respond(to: post(BotSelfConfigCatalog.serverName, listTools, token: token), isClientGone: neverGone)?.status, 401)
+        XCTAssertThrowsError(try contextualIssue(gateway, fixture: fixture))
+    }
 
     // MARK: - Auth
 

@@ -87,12 +87,12 @@ public final class PetAttentionStore {
     /// blockers until their normal approval/question response resolves them.
     public func openAndMarkRead(
         itemID: String,
-        verifyRoute: (PetAttentionRoute) throws -> Bool
+        verifyRoute: (PetAttentionItem) throws -> Bool
     ) throws -> PetAttentionMarkResult {
         guard let item = try refresh().items.first(where: { $0.id == itemID }) else {
             return .notFound
         }
-        guard try verifyRoute(item.route) else { return .routeRejected }
+        guard try verifyRoute(item) else { return .routeRejected }
 
         switch item.source {
         case .callback:

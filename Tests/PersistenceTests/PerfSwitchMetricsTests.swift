@@ -116,4 +116,20 @@ final class PerfSwitchMetricsTests: XCTestCase {
             PerfSwitchMetrics.recordedIntervalsForTesting().contains { $0.name == "sqlite_main_sync" }
         )
     }
+
+    /// WHY: symbolicating a stack costs tens of milliseconds on the main thread, so a burst of slow
+    /// writes must count every wait but keep only one fresh stack per window.
+    func test_slowMainWaitBurstCountsEveryWaitButSymbolicatesOncePerWindow() {
+        PerfSwitchMetrics.resetForTesting()
+        defer { PerfSwitchMetrics.resetForTesting() }
+        for _ in 0..<5 {
+            PerfSwitchMetrics.recordQueueOccupied(nanoseconds: 5_000_000, onMainThread: true)
+        }
+        XCTAssertEqual(PerfSwitchMetrics.slowMainSyncLogCountForTesting(), 5)
+        #if DEBUG
+        let stack = PerfSwitchMetrics.lastSlowMainSyncStackForTesting()
+        XCTAssertNotNil(stack, "the first slow wait in a window keeps its stack")
+        XCTAssertEqual(PerfSwitchMetrics.mainThreadSyncCountForTesting(), 5)
+        #endif
+    }
 }

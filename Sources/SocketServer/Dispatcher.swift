@@ -980,6 +980,8 @@ public final class JSONRPCDispatcher {
         "bot.discard_new",
         "bot.save",
         "bot.delete",
+        "bot.context.grant",
+        "bot.context.revoke",
         "bot.set_pinned",
         "bot.set_hidden",
         "bot.duplicate",
@@ -992,6 +994,7 @@ public final class JSONRPCDispatcher {
         "bot.queue.reorder",
         "bot.queue.force_now",
         "bot.conversation.create",
+        "bot.conversation.enqueue",
         "bot.conversation.select",
         "bot.conversation.clear_all",
         "bot.routine.create",
@@ -1593,6 +1596,7 @@ public final class JSONRPCDispatcher {
                 }
                 kind = .botRunStopRequested
                 botTerminalPayload = terminal
+            case "bot.conversation.enqueue": kind = .botQueueUpdated
             case "bot.queue.remove", "bot.queue.update", "bot.queue.reorder", "bot.queue.force_now":
                 kind = .botQueueUpdated
             case "bot.conversation.select": kind = .botConversationSelected
@@ -1761,6 +1765,12 @@ public final class JSONRPCDispatcher {
 
     private func dispatchManagedHostUnix(_ req: JSONRPCRequest) async -> JSONRPCResponse {
         let params = req.params ?? [:]
+        if req.method == "bot.context.grant" || req.method == "bot.context.revoke" {
+            return .init(id: req.id, error: JSONRPCError(code: -32098, message: "Bot context grants require an authenticated paired connection or native UI."))
+        }
+        if ["bot.conversation.enqueue", "bot.conversation.export.preview", "bot.conversation.export"].contains(req.method) {
+            return .init(id: req.id, error: JSONRPCError(code: -32098, message: "Contextual data operations require an authenticated paired connection or native UI."))
+        }
         let peerReceiptMethod = params["method"]?.stringValue
         let isPeerReceiptStatus = req.method == "bot.peer.receipt.status"
             || (req.method == "bot.receipt.status"
@@ -2573,7 +2583,7 @@ public final class JSONRPCDispatcher {
         eventIdentity: MutationRequestContext? = nil
     ) async -> JSONRPCResponse {
         let id = req.id
-        let params = req.params ?? [:]
+        var params = req.params ?? [:]
         do {
             if Self.managedProviderSocketMethods.contains(req.method),
                !Self.managedProviderSocketAuthenticated {
@@ -2588,6 +2598,21 @@ public final class JSONRPCDispatcher {
                     inBatch: Self.rpcInBatch,
                     isExplicitV1: AgentCheckpointListContract.isExplicitV1(params: params)
                 )
+            }
+            let hasScopedContext = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
+            if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.context."), hasScopedContext {
+                let admitted = (["bot.conversation.list", "bot.conversation.export.preview", "bot.conversation.export"].contains(req.method) && eventIdentity != nil)
+                    || ((req.method == "bot.conversation.create" || req.method == "bot.conversation.select" || req.method == "bot.conversation.enqueue") && Self.centralMutationExecution)
+                guard admitted else {
+                    throw JSONRPCError(code: -32602, message: "Context resource unavailable.")
+                }
+            }
+            if req.method == "bot.context.list", let eventIdentity {
+                params["host_id"] = .string(eventIdentity.hostId)
+            } else if req.method == "bot.conversation.enqueue", let eventIdentity {
+                params["host_id"] = .string(eventIdentity.hostId)
+            } else if ["bot.conversation.list", "bot.conversation.export.preview", "bot.conversation.export"].contains(req.method), hasScopedContext, let eventIdentity {
+                params["host_id"] = .string(eventIdentity.hostId)
             }
             if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.peer.") {
                 let result = try await router.dispatchPairedBotRemote(method: req.method, params: params)
@@ -2632,7 +2657,7 @@ public final class JSONRPCDispatcher {
                             id: .number(index),
                             method: method,
                             params: callParams
-                        ))
+                        ), eventIdentity: eventIdentity)
                     }
                     if let error = response.error {
                         results.append(.object([
@@ -5257,7 +5282,7 @@ public final class JSONRPCDispatcher {
         "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
         "project.scripts",
         "agent.models.list", "agent.providers.list", "distill.accounts.list", "distill.accounts.routing.get", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
-        "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list", "bot.attachment.list",
+        "bot.context.list", "bot.list", "bot.get", "bot.settings.get", "bot.queue.list", "bot.conversation.list", "bot.attachment.list",
         "bot.routine.list", "bot.files.list", "bot.browser.state", "bot.guest.state",
         "bot.receipt.status", "bot.peer.receipt.status", "bot.attention.list",
         "bot.team.list", "bot.group.list", "bot.group.get",
@@ -5325,7 +5350,8 @@ public final class JSONRPCDispatcher {
         if namespace == "fs" || namespace == "files" {
             return "file"
         }
-        if isReadOnlyBatchMethod(method) {
+        if isReadOnlyBatchMethod(method)
+            || ["bot.conversation.export.preview", "bot.conversation.export"].contains(method) {
             return "read"
         }
         return "write"

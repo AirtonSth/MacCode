@@ -1,5 +1,20 @@
 #!/bin/bash
 set -eu
+if [ "${REMOTECODE_CONTEXT_NETWORK_POLICY:-}" = "private-egress-v1" ]; then
+    marker=/run/remotecode-context-network-ready
+    ready=0
+    for _ in $(seq 1 30); do
+        if [ -f "$marker" ]; then
+            ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$ready" -ne 1 ]; then
+        printf '%s\n' 'context network policy gate timed out' >&2
+        exit 1
+    fi
+fi
 export DISPLAY="${DISPLAY:-:1}"
 export HOME="${HOME:-/home/remotecode}"
 : "${REMOTECODE_VIEWER_TOKEN:?RemoteCode viewer token is required}"

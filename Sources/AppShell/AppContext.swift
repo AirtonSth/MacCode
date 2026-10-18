@@ -135,6 +135,8 @@ public final class AppContext {
     /// Off-MainActor owner for the authoritative HTTP workspace list read.
     public let workspaceListGateway: WorkspaceListGateway
     public let botStore: BotStore
+    let contextualSecretStore: any BotSecretStore
+    let contextualRunAdmissions = BotContextRunAdmissions()
     /// Host MCP servers for bot agents running inside their Linux guest. Binds
     /// 127.0.0.1 on the first issued run bearer; stopped at app termination.
     public let botGuestMCPGateway = BotGuestMCPGateway()
@@ -169,6 +171,7 @@ public final class AppContext {
     }()
     /// Opens once launch cleanup of bot guests is done; guest runs wait on it.
     public let botGuestLaunchBarrier = DistillGuestLaunchBarrier()
+    let guestDocker: any BotComputerDockerClienting
     /// Decides and prepares in-guest Distill runs; quit ends the ones it owns.
     private(set) var botGuestRunResolver: BotGuestRunResolver?
     /// The Distill update schedule (`startDistillAutoUpdates`); nil in a
@@ -411,9 +414,9 @@ public final class AppContext {
     var agentSkillsHomeOverrideForTesting: URL?
     /// The launch-time legacy purge (`startLegacyTokenSaverPurge`).
     private(set) var legacyTokenSaverPurgeTask: Task<Void, Never>?
-    private static let usageNotificationMinimumInterval: TimeInterval = 2
+    static let usageNotificationMinimumInterval: TimeInterval = 2
     /// Debounce window for coalescing per-token usage writes into one disk write.
-    private static let providerUsageDebounceInterval: TimeInterval = 0.75
+    static let providerUsageDebounceInterval: TimeInterval = 0.75
     /// Ceiling for the failed-write retry backoff. The retry never gives up: the
     /// pending delta is real provider usage, and dropping it would understate the
     /// ledger. It just stops being retried at the debounce rate.
@@ -583,9 +586,13 @@ public final class AppContext {
         /// Interactive RemoteCode must reconcile abandoned runs on launch.
         /// Background helpers that share the same SQLite (Scheduled Task Agent)
         /// must NOT flip every live interactive run to `interrupted`.
-        performLaunchRunReconciliation: Bool = true
+        performLaunchRunReconciliation: Bool = true,
+        contextualSecretStore: any BotSecretStore = BotKeychainSecretStore(),
+        guestDocker: any BotComputerDockerClienting = BotComputerDockerCLI()
     ) throws {
         self.channel = channel
+        self.guestDocker = guestDocker
+        self.contextualSecretStore = contextualSecretStore
         self.hostsBotGroupConversations = performLaunchRunReconciliation
         self.accountUsageRefresher = accountUsageRefresher
         self.agentSkillsHomeOverrideForTesting = agentSkillsHomeOverrideForTesting
@@ -744,6 +751,10 @@ public final class AppContext {
             },
             providerAdapters: [.codex: codex, .claude: claude, .grok: grok, .distill: distill]
         )
+        let contextualBotStore = self.botStore
+        self.coordinator.botContextPinForThread = { [contextualBotStore] threadID in
+            try contextualBotStore.conversationContextPin(linkedTo: threadID)
+        }
         self.coordinator.onRecoveredForkPrunedThreadIDs = { [weak contextReference] ids in
             await MainActor.run {
                 contextReference?.value?.enqueueRecoveredForkPrunedThreadIDs(ids)
@@ -1176,6 +1187,11 @@ public final class AppContext {
             }
         }
         coordinator.onRunFinished = { [weak self] tid, rid, status in
+            if let self {
+                BotContextGuestResources.requestFinish(
+                    runID: rid, threadID: tid, store: self.botStore, appSupport: self.appSupportDirectory
+                )
+            }
             let nextWaiting = BotVMRunRegistry.shared.releaseAndNextWaiter(runID: rid)
             let streamErrorAction = runErrorActions.take(runId: rid)
             // Read before the hop: closing a side chat stops its run and deletes

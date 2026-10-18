@@ -112,6 +112,33 @@ final class BotRoutineSchedulerTests: XCTestCase {
         return try XCTUnwrap(listed.objectValue?["routines"]?.arrayValue?.first?.objectValue)
     }
 
+    func test_dueSlotAfterContextRevocationRunsLegacyAndNeverCreatesAPinOrGrant() async throws {
+        // WHY: a routine has no contextual contract. Revoking a Bot's context grant
+        // before the slot drains must neither block the legacy run nor let the
+        // scheduler mint a contextual pin or a new binding on its own.
+        let f = try makeFixture()
+        let elephant = try f.vm.create(name: "Elephant", title: "Developer")
+        let host = f.context.liveActivityHostIdentity.serverId
+        let granted = try f.context.botStore.grantContext(hostID: host, botID: elephant.id, context: .general, actions: [.read, .send], expectedRevision: 0)
+        let revoked = try f.context.botStore.revokeContext(hostID: host, botID: elephant.id, context: .general, expectedRevision: granted.policyRevision)
+        let bindingsBefore = try f.context.botStore.listContextBindings(hostID: host, botID: elephant.id)
+        let base = Date()
+        let (_, slot) = try saveActiveRoutine(f, bot: elephant, base: base)
+
+        f.scheduler.tick(now: slot.addingTimeInterval(5))
+        await f.scheduler.settleForTesting()
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started, "a revoked contextual grant does not block the legacy routine")
+        let conversation = try XCTUnwrap(try f.context.botStore.listConversations(botID: elephant.id).first)
+        XCTAssertNil(try f.context.botStore.conversationContextPin(conversationID: conversation.id), "the scheduler must not pin a context")
+        let bindingsAfter = try f.context.botStore.listContextBindings(hostID: host, botID: elephant.id)
+        XCTAssertEqual(bindingsAfter.map(\.policyRevision), bindingsBefore.map(\.policyRevision), "no grant or revision change")
+        XCTAssertEqual(bindingsAfter.first?.state, .revoked)
+        XCTAssertEqual(bindingsAfter.first?.policyRevision, revoked.policyRevision)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
     func test_activeTaskRunsOnceWhenItsSlotIsDue_inANewConversationWithoutTouchingTheDesk() async throws {
         // WHY: "Review Empath — Daily" was Active with "Scheduler online" and
         // never ran. A due slot must start ONE real run of the Instruction in a

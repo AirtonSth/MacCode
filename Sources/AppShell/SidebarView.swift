@@ -174,6 +174,67 @@ public final class SidebarViewModel: ObservableObject {
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
 
+    public struct AuthorizedBotConversationRow: Identifiable, Equatable, Sendable {
+        public let botID: BotID
+        public let botName: String
+        public let context: BotContext
+        public let conversationID: BotConversationID?
+        public let title: String
+        public var id: String { "\(botID.value.uuidString):\(context.storageKey)" }
+
+        nonisolated public init(botID: BotID, botName: String, context: BotContext, conversationID: BotConversationID?, title: String) {
+            self.botID = botID
+            self.botName = botName
+            self.context = context
+            self.conversationID = conversationID
+            self.title = title
+        }
+    }
+
+    @Published public private(set) var authorizedBotConversationRows: [AuthorizedBotConversationRow] = []
+
+    /// One "General Bots" row: Titio, Bots with a general grant, and Bots not linked to any workspace.
+    public struct GeneralBotRow: Identifiable, Equatable, Sendable {
+        public let botID: BotID
+        public let name: String
+        public let handle: String
+        public let symbol: String
+        public var id: String { botID.value.uuidString }
+        public var isTitio: Bool { handle == TitioIdentity.handle }
+        nonisolated public init(botID: BotID, name: String, handle: String, symbol: String) {
+            self.botID = botID
+            self.name = name
+            self.handle = handle
+            self.symbol = symbol
+        }
+    }
+
+    /// A thread under an expanded workspace's "Conversations", with or without a Bot.
+    public struct WorkspaceConversationRow: Identifiable, Equatable, Sendable {
+        public let threadID: AgentThreadID
+        public let workspaceID: WorkspaceID
+        public let title: String
+        public let botID: BotID?
+        public var id: String { threadID.value.uuidString }
+        nonisolated public init(threadID: AgentThreadID, workspaceID: WorkspaceID, title: String, botID: BotID?) {
+            self.threadID = threadID
+            self.workspaceID = workspaceID
+            self.title = title
+            self.botID = botID
+        }
+    }
+
+    /// Rows shown under one expanded workspace; the workspace row itself opens the full layout.
+    nonisolated static let workspaceConversationLimit = 8
+
+    @Published public private(set) var generalBots: [GeneralBotRow] = []
+    @Published public private(set) var workspaceConversations: [WorkspaceID: [WorkspaceConversationRow]] = [:]
+    /// Disclosure state only: expanding never selects or opens a workspace.
+    @Published public private(set) var expandedWorkspaceIDs: Set<WorkspaceID> = []
+    private var didSeedExpandedWorkspace = false
+    /// Names the host in search results so equal names on different hosts stay distinguishable.
+    public let hostDisplayName: String = Host.current().localizedName ?? "This Mac"
+
     @Published public var workspaces: [Workspace] = [] {
         didSet {
             busyStateCache.removeAll(keepingCapacity: true)
@@ -286,6 +347,12 @@ public final class SidebarViewModel: ObservableObject {
     /// In-flight off-main reload of usage.json. A new notification cancels the
     /// prior task so a burst of usage changes coalesces into one read.
     private var accountUsageReloadTask: Task<Void, Never>?
+    private var authorizedBotRowsTask: Task<Void, Never>?
+    private var authorizedBotRowsGeneration: UInt64 = 0
+    private var authorizedBotRowsNeedsRefresh = false
+    private var authorizedBotRowsHostID: String?
+    private var authorizedBotRowsWorkspaceIDs: Set<WorkspaceID>?
+    var authorizedBotRowsLoaderForTesting: (@Sendable (BotStore, AgentThreadRepository, String, Set<WorkspaceID>) -> [AuthorizedBotConversationRow]?)?
     private let updateChecker: AppUpdateChecking?
     private let settingsStore: SettingsStore
     private let insomniaPower: InsomniaPowerManaging
@@ -381,11 +448,313 @@ public final class SidebarViewModel: ObservableObject {
             ProviderUsageCrossProcess.removeObserver(accountUsageDistributedObserver)
         }
         accountUsageReloadTask?.cancel()
+        authorizedBotRowsTask?.cancel()
         if let activityCountsObserver {
             Task { @MainActor in PetActivityCountsProjection.shared.removeObserver(activityCountsObserver) }
         }
         powerMonitor.stop()
         insomniaPower.releaseProcessAssertions()
+    }
+
+    private func reloadAuthorizedBotConversationRows() {
+        guard let context else {
+            authorizedBotRowsTask?.cancel()
+            authorizedBotRowsTask = nil
+            authorizedBotRowsGeneration &+= 1
+            authorizedBotConversationRows = []
+            return
+        }
+        let hostID = context.liveActivityHostIdentity.serverId
+        let workspaceIDs = Set(context.state.workspaces.keys)
+        if authorizedBotRowsTask != nil {
+            guard authorizedBotRowsHostID == hostID, authorizedBotRowsWorkspaceIDs == workspaceIDs else {
+                authorizedBotRowsGeneration &+= 1
+                authorizedBotRowsTask?.cancel()
+                authorizedBotRowsTask = nil
+                authorizedBotRowsNeedsRefresh = false
+                authorizedBotConversationRows = []
+                authorizedBotRowsHostID = nil
+                authorizedBotRowsWorkspaceIDs = nil
+                return reloadAuthorizedBotConversationRows()
+            }
+            authorizedBotRowsNeedsRefresh = true
+            return
+        }
+        let botStore = context.botStore
+        let threadRepo = context.threadRepo
+        authorizedBotRowsGeneration &+= 1
+        let generation = authorizedBotRowsGeneration
+        authorizedBotRowsNeedsRefresh = false
+        authorizedBotRowsHostID = hostID
+        authorizedBotRowsWorkspaceIDs = workspaceIDs
+        let loader = authorizedBotRowsLoaderForTesting
+        let expanded = expandedWorkspaceIDs.intersection(workspaceIDs)
+        authorizedBotRowsTask = Task { [weak self] in
+            let (result, tree) = await Task.detached {
+                let rows = if let loader { loader(botStore, threadRepo, hostID, workspaceIDs) }
+                else { Self.loadAuthorizedBotConversationRows(botStore: botStore, threadRepo: threadRepo, hostID: hostID, workspaceIDs: workspaceIDs) }
+                return (rows, Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded))
+            }.value
+            guard let self, !Task.isCancelled, self.authorizedBotRowsGeneration == generation else { return }
+            if self.authorizedBotRowsNeedsRefresh {
+                self.authorizedBotRowsTask = nil
+                self.authorizedBotRowsHostID = nil
+                self.authorizedBotRowsWorkspaceIDs = nil
+                self.reloadAuthorizedBotConversationRows()
+                return
+            }
+            guard let currentContext = self.context,
+                  currentContext.liveActivityHostIdentity.serverId == hostID,
+                  Set(currentContext.state.workspaces.keys) == workspaceIDs else {
+                self.authorizedBotRowsTask = nil
+                self.authorizedBotRowsHostID = nil
+                self.authorizedBotRowsWorkspaceIDs = nil
+                if self.context != nil {
+                    self.authorizedBotConversationRows = []
+                    self.reloadAuthorizedBotConversationRows()
+                } else {
+                    self.authorizedBotConversationRows = []
+                }
+                return
+            }
+            if let rows = result {
+                if self.authorizedBotConversationRows != rows { self.authorizedBotConversationRows = rows }
+            } else {
+                self.authorizedBotConversationRows = []
+            }
+            // A failed read must not keep showing rows from an older authority snapshot.
+            let general = tree?.general ?? [], conversations = tree?.conversations ?? [:]
+            if self.generalBots != general { self.generalBots = general }
+            if self.workspaceConversations != conversations { self.workspaceConversations = conversations }
+            self.authorizedBotRowsTask = nil
+            if self.authorizedBotRowsNeedsRefresh { self.reloadAuthorizedBotConversationRows() }
+        }
+    }
+
+    func reloadAuthorizedBotConversationRowsAndWait() async {
+        reloadAuthorizedBotConversationRows()
+        while let task = authorizedBotRowsTask {
+            await task.value
+        }
+    }
+
+    nonisolated static func loadAuthorizedBotConversationRows(
+        botStore: BotStore,
+        threadRepo: AgentThreadRepository,
+        hostID: String,
+        workspaceIDs: Set<WorkspaceID>
+    ) -> [AuthorizedBotConversationRow]? {
+        do {
+            let bots = try botStore.list()
+            var rows: [AuthorizedBotConversationRow] = []
+            for bot in bots {
+                for binding in try botStore.listContextBindings(hostID: hostID, botID: bot.id)
+                where binding.state == .active && binding.actions.contains(.read) {
+                    if case .workspace(let workspaceID) = binding.context, !workspaceIDs.contains(workspaceID) { continue }
+                    let matching = try botStore.listConversations(botID: bot.id).compactMap { conversation -> (BotConversation, AgentThread)? in
+                        guard !conversation.hidden, conversation.groupID == nil,
+                              try botStore.authorizesConversation(conversation, hostID: hostID, action: .read),
+                              let pin = try botStore.conversationContextPin(conversationID: conversation.id),
+                              pin.hostID == hostID, pin.botID == bot.id, pin.context == binding.context,
+                              pin.policyRevision == binding.policyRevision, pin.conversationID == conversation.id,
+                              let threadID = conversation.linkedAgentThreadID,
+                              let thread = try threadRepo.get(id: threadID),
+                              thread.actor == .bot(bot.id), thread.actorLockedAt != nil,
+                              thread.workspaceId == (binding.context == .general ? nil : workspaceID(for: binding.context)) else { return nil }
+                        return (conversation, thread)
+                    }.sorted {
+                        if $0.0.updatedAt != $1.0.updatedAt { return $0.0.updatedAt > $1.0.updatedAt }
+                        return $0.0.id.value.uuidString < $1.0.id.value.uuidString
+                    }
+                    let conversation = matching.first?.0
+                    rows.append(AuthorizedBotConversationRow(botID: bot.id, botName: bot.name, context: binding.context, conversationID: conversation?.id, title: conversation?.title ?? "No conversations"))
+                }
+            }
+            return rows
+        } catch { return nil }
+    }
+
+    nonisolated static func loadSidebarTree(
+        botStore: BotStore,
+        threadRepo: AgentThreadRepository,
+        hostID: String,
+        expanded: Set<WorkspaceID>
+    ) -> (general: [GeneralBotRow], conversations: [WorkspaceID: [WorkspaceConversationRow]])? {
+        do {
+            // Same order as the Bots roster: Titio, pinned, then most recent.
+            let bots = try botStore.list().sorted { lhs, rhs in
+                let lhsTitio = lhs.handle == TitioIdentity.handle, rhsTitio = rhs.handle == TitioIdentity.handle
+                if lhsTitio != rhsTitio { return lhsTitio }
+                if lhs.pinned != rhs.pinned { return lhs.pinned }
+                return lhs.updatedAt > rhs.updatedAt
+            }
+            var general: [GeneralBotRow] = []
+            for bot in bots {
+                let bindings = try botStore.listContextBindings(hostID: hostID, botID: bot.id)
+                // Any workspace binding, even revoked, means the Bot was scoped: revoking must not move it to General.
+                let workspaceScoped = bindings.contains { workspaceID(for: $0.context) != nil }
+                let generalReadable = bindings.contains { $0.context == .general && $0.state == .active && $0.actions.contains(.read) }
+                // Never-bound Bots are the pre-contextual catalog Bots the roster already lists; they open their Desk.
+                guard bot.handle == TitioIdentity.handle || generalReadable || (bindings.isEmpty && !workspaceScoped) else { continue }
+                general.append(GeneralBotRow(botID: bot.id, name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol))
+            }
+            var conversations: [WorkspaceID: [WorkspaceConversationRow]] = [:]
+            for workspaceID in expanded {
+                var rows: [WorkspaceConversationRow] = []
+                for thread in try threadRepo.list(workspaceId: workspaceID)
+                where !thread.isEphemeral && thread.parentThreadId == nil {
+                    // A pinned Bot thread is listed only while this host may still read that exact context.
+                    if let pin = try botStore.conversationContextPin(linkedTo: thread.id) {
+                        guard pin.hostID == hostID, pin.context == .workspace(workspaceID),
+                              let conversation = try botStore.conversation(id: pin.conversationID), !conversation.hidden,
+                              try botStore.authorizes(hostID: hostID, botID: pin.botID, context: pin.context,
+                                                      action: .read, policyRevision: pin.policyRevision) else { continue }
+                    }
+                    rows.append(WorkspaceConversationRow(threadID: thread.id, workspaceID: workspaceID, title: thread.title, botID: thread.actor.botID))
+                    if rows.count == workspaceConversationLimit { break }
+                }
+                conversations[workspaceID] = rows
+            }
+            return (general, conversations)
+        } catch { return nil }
+    }
+
+    public func toggleWorkspaceExpanded(_ id: WorkspaceID) {
+        if expandedWorkspaceIDs.contains(id) { expandedWorkspaceIDs.remove(id) } else { expandedWorkspaceIDs.insert(id) }
+        reloadAuthorizedBotConversationRows()
+    }
+
+    public var sidebarQuery: String { filterText.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    public func botRowMatchesQuery(_ row: AuthorizedBotConversationRow) -> Bool {
+        let query = sidebarQuery
+        guard !query.isEmpty else { return true }
+        return row.botName.range(of: query, options: .caseInsensitive) != nil
+            || row.title.range(of: query, options: .caseInsensitive) != nil
+    }
+
+    public var visibleGeneralBots: [GeneralBotRow] {
+        let query = sidebarQuery
+        guard !query.isEmpty else { return generalBots }
+        return generalBots.filter {
+            $0.name.range(of: query, options: .caseInsensitive) != nil
+                || $0.handle.range(of: query, options: .caseInsensitive) != nil
+        }
+    }
+
+    /// Workspaces in the tree: name matches, or, while searching, a linked Bot matches.
+    public var treeWorkspaces: [Workspace] {
+        guard !sidebarQuery.isEmpty else { return workspaces }
+        let byName = Set(filteredWorkspaces.map(\.id))
+        return workspaces.filter { ws in
+            byName.contains(ws.id) || authorizedBotConversationRows.contains { $0.context == .workspace(ws.id) && botRowMatchesQuery($0) }
+        }
+    }
+
+    /// Bots linked to one workspace: shown when it is expanded, or as search results.
+    public func workspaceBotRows(_ id: WorkspaceID) -> [AuthorizedBotConversationRow] {
+        guard expandedWorkspaceIDs.contains(id) || !sidebarQuery.isEmpty else { return [] }
+        return authorizedBotConversationRows.filter { $0.context == .workspace(id) && botRowMatchesQuery($0) }
+    }
+
+    public func workspaceConversationRows(_ id: WorkspaceID) -> [WorkspaceConversationRow] {
+        guard expandedWorkspaceIDs.contains(id) else { return [] }
+        let rows = workspaceConversations[id] ?? []
+        let query = sidebarQuery
+        guard !query.isEmpty else { return rows }
+        return rows.filter { $0.title.range(of: query, options: .caseInsensitive) != nil }
+    }
+
+    /// An expanded workspace with no linked Bot offers one "Add Bot" row instead of empty sections.
+    public func showsAddBot(_ id: WorkspaceID) -> Bool {
+        expandedWorkspaceIDs.contains(id) && sidebarQuery.isEmpty
+            && !authorizedBotConversationRows.contains { $0.context == .workspace(id) }
+    }
+
+    /// Opens the existing New Bot flow; linking it to a workspace stays an explicit grant.
+    public func addBot() {
+        guard let router else { return }
+        router.windowController?.presentBotsInMainContent()
+        router.botsViewModel?.beginCreate()
+    }
+
+    /// A General Bot opens its recent general conversation, or its Desk when it has none.
+    public func openGeneralBot(_ row: GeneralBotRow) {
+        if let authorized = authorizedBotConversationRows.first(where: { $0.botID == row.botID && $0.context == .general }) {
+            // General context: resume its conversation, or start one there; never a workspace transcript.
+            return authorized.conversationID == nil ? startBotConversation(authorized) : openAuthorizedBotConversation(authorized)
+        }
+        // A Bot without contextual General access opens its Desk exactly like the Bots roster does.
+        do {
+            guard let router, try router.openBotsDesk(botID: row.botID) else {
+                showOperationError("Could not open Bot", detail: "This Bot is no longer available.")
+                return reloadAuthorizedBotConversationRows()
+            }
+        } catch {
+            showOperationError("Could not open Bot", detail: error.localizedDescription)
+        }
+    }
+
+    /// The empty state of a linked Bot: start a conversation pinned to that workspace.
+    public func startBotConversation(_ row: AuthorizedBotConversationRow) {
+        do {
+            guard let router, try router.openBotsDesk(botID: row.botID),
+                  let botsViewModel = router.botsViewModel,
+                  botsViewModel.createDeskThread(in: row.context) else {
+                showOperationError("Could not start conversation", detail: router?.botsViewModel?.errorMessage ?? "This Bot context is no longer available.")
+                return reloadAuthorizedBotConversationRows()
+            }
+            reloadAuthorizedBotConversationRows()
+        } catch {
+            showOperationError("Could not start conversation", detail: error.localizedDescription)
+        }
+    }
+
+    /// Same canonical route as Activity: a Bot thread opens its Desk, any other thread its Agent App.
+    public func openWorkspaceConversation(_ row: WorkspaceConversationRow) {
+        guard let router else { return }
+        do {
+            switch try router.agentThreadOpenDestination(row.threadID) {
+            case .bot(let botID, let conversationID):
+                guard try router.openBotsDesk(botID: botID, conversationID: conversationID) else {
+                    throw LayoutError.surfaceNotFound
+                }
+            case .workspace:
+                _ = try router.openAgentThread(thread: row.threadID, markRead: false)
+            case .unavailable:
+                showOperationError("Could not open conversation", detail: "This conversation is no longer available.")
+                reloadAuthorizedBotConversationRows()
+            }
+        } catch {
+            showOperationError("Could not open conversation", detail: error.localizedDescription)
+        }
+    }
+
+    nonisolated private static func workspaceID(for context: BotContext) -> WorkspaceID? {
+        if case .workspace(let id) = context { return id }
+        return nil
+    }
+
+    public func openAuthorizedBotConversation(_ row: AuthorizedBotConversationRow) {
+        guard let conversationID = row.conversationID, let context, let router else { return }
+        do {
+            guard let conversation = try context.botStore.conversation(id: conversationID),
+                  conversation.botID == row.botID,
+                  let pin = try context.botStore.conversationContextPin(conversationID: conversationID),
+                  pin.hostID == context.liveActivityHostIdentity.serverId,
+                  pin.botID == row.botID, pin.context == row.context,
+                  let threadID = conversation.linkedAgentThreadID,
+                  try AppCommandRouter.contextPinnedThreadDestination(threadID, context: context)
+                    == .bot(row.botID, conversationID),
+                  try router.openBotsDesk(botID: row.botID, conversationID: conversationID) else {
+                showOperationError("Could not open Bot conversation", detail: "This Bot context is no longer available.")
+                reloadAuthorizedBotConversationRows()
+                return
+            }
+        } catch {
+            showOperationError("Could not open Bot conversation", detail: error.localizedDescription)
+            reloadAuthorizedBotConversationRows()
+        }
     }
 
     public func reload() {
@@ -408,6 +777,10 @@ public final class SidebarViewModel: ObservableObject {
         } else if selectedWorkspaceID != ctx.state.window.selectedWorkspaceID {
             selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
         }
+        if !didSeedExpandedWorkspace, let selected = ctx.state.window.selectedWorkspaceID {
+            didSeedExpandedWorkspace = true
+            expandedWorkspaceIDs.insert(selected)
+        }
         updateCompletedWorkspaces(from: ordered)
         if ordered != workspaces {
             workspaces = ordered
@@ -419,6 +792,7 @@ public final class SidebarViewModel: ObservableObject {
             }
         }
         refreshActiveCount()
+        reloadAuthorizedBotConversationRows()
         // PF-13: the account blob is peeked once at mount. Later rereads are
         // driven by `.rc2PrivateAccountChanged`, not every refreshFromState.
         if !didPeekPrivateAccountJSON {
@@ -758,7 +1132,7 @@ public final class SidebarViewModel: ObservableObject {
         // when a filter is active never includes workspaces the user cannot see.
         // Using the full `workspaces` array would produce a range spanning hidden
         // rows, causing "Remove" to silently delete workspaces outside the filter.
-        let visible = filteredWorkspaces
+        let visible = treeWorkspaces
         guard let start = visible.firstIndex(where: { $0.id == anchor }),
               let end = visible.firstIndex(where: { $0.id == id }) else {
             selectedWorkspaceIDs.insert(id)
@@ -1340,7 +1714,7 @@ public final class SidebarViewModel: ObservableObject {
 
     /// Moves the selected workspace up or down by `delta` within `filteredWorkspaces`.
     public func moveSelection(by delta: Int) {
-        let rows = filteredWorkspaces
+        let rows = treeWorkspaces
         guard !rows.isEmpty else { return }
         let currentIndex = rows.firstIndex(where: { $0.id == selectedWorkspaceID }) ?? -1
         let next = max(0, min(rows.count - 1, currentIndex + delta))
@@ -1720,31 +2094,6 @@ public struct SidebarRootView: View {
             .padding(.horizontal, DS.Space.md)
             .frame(height: 44)
 
-            BotsModeSwitcher(
-                isBotsSelected: vm.isBotsSelected,
-                onSelectAgentic: {
-                    if vm.isBotsSelected {
-                        botsVM?.requestLeaveBotsMode()
-                    }
-                },
-                onSelectBots: {
-                    if !vm.isBotsSelected {
-                        onOpenBots()
-                    }
-                }
-            )
-            .padding(.horizontal, DS.Space.md)
-            .padding(.bottom, DS.Space.md)
-            .accessibilityIdentifier("sidebar.bots")
-
-            if vm.isBotsSelected, let botsVM {
-                BotsRosterList(
-                    vm: botsVM,
-                    attachDeleteConfirmation: true,
-                    isScheduledTasksSelected: vm.isScheduledTasksSelected,
-                    onOpenScheduledTasks: onOpenScheduledTasks
-                )
-            } else {
             VStack(alignment: .leading, spacing: DS.Space.xxs) {
                 Button { vm.newWorkspace() } label: {
                     SidebarActionRow(symbol: "folder.badge.plus", title: "New Workspace")
@@ -1753,7 +2102,7 @@ public struct SidebarRootView: View {
                 .help("Create new workspace")
                 .accessibilityIdentifier("sidebar.newWorkspace")
 
-                Button(action: onOpenActiveThreads) {
+                Button { navigate(onOpenActiveThreads) } label: {
                     SidebarActionRow(
                         symbol: "bolt.horizontal.circle",
                         title: vm.activityCounts.isAvailable
@@ -1770,7 +2119,7 @@ public struct SidebarRootView: View {
                     : "Activity, status unavailable")
                 .accessibilityAddTraits(vm.isActiveThreadsSelected ? .isSelected : [])
 
-                Button(action: onOpenScheduledTasks) {
+                Button { navigate(onOpenScheduledTasks) } label: {
                     SidebarActionRow(
                         symbol: "calendar.badge.clock",
                         title: "Schedule Tasks",
@@ -1798,6 +2147,8 @@ public struct SidebarRootView: View {
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
 
+            generalBotsSection
+
             HStack(spacing: DS.Space.sm) {
                 Text("Workspaces")
                     .font(DS.Font.caption)
@@ -1816,7 +2167,7 @@ public struct SidebarRootView: View {
 
             // IMP-MAC_SHELL_WINDOW-009: keep the filter available whenever
             // there are workspaces, but do not auto-focus it on sidebar load.
-            if !vm.workspaces.isEmpty {
+            if !vm.workspaces.isEmpty || !vm.generalBots.isEmpty {
                 workspaceFilterField
                     .padding(.horizontal, DS.Space.md)
                     .padding(.bottom, DS.Space.sm)
@@ -1827,7 +2178,7 @@ public struct SidebarRootView: View {
             // the top or bottom edge of the list.
             ScrollViewReader { scrollProxy in
                 ScrollView {
-                    let rows = vm.filteredWorkspaces
+                    let rows = vm.treeWorkspaces
                     LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
                         if vm.workspaces.isEmpty {
                             Text("No workspaces")
@@ -1848,6 +2199,7 @@ public struct SidebarRootView: View {
                                     pinnedGroupDivider
                                 }
                                 workspaceRow(ws)
+                                workspaceChildren(ws)
                             }
                         }
                     }
@@ -1877,8 +2229,8 @@ public struct SidebarRootView: View {
                     }
                 }
             }
-            }
 
+            manageBotsFooter
             accountFooter
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -1921,11 +2273,11 @@ public struct SidebarRootView: View {
         guard let action = keyMapper.action(for: input) else { return .ignored }
         switch action {
         case .moveUp:
-            vm.moveSelection(by: -1)
+            navigate { vm.moveSelection(by: -1) }
         case .moveDown:
-            vm.moveSelection(by: 1)
+            navigate { vm.moveSelection(by: 1) }
         case .openSelected:
-            vm.openSelectedWorkspace()
+            navigate { vm.openSelectedWorkspace() }
         case .removeSelected:
             vm.removeSelectedWorkspace()
         case .focusFilter:
@@ -1950,7 +2302,7 @@ public struct SidebarRootView: View {
 
     private var workspaceFilterField: some View {
         SidebarSearchField(
-            placeholder: "Filter workspaces",
+            placeholder: "Search workspaces and Bots",
             text: $vm.filterText,
             focusRequest: $filterFocusRequest,
             accessibilityIdentifier: "sidebar.workspaceFilter"
@@ -2347,6 +2699,165 @@ public struct SidebarRootView: View {
         }
     }
 
+    /// Leaving Bots content keeps drafts and asks before dropping an unsaved new Bot, from any sidebar row.
+    private func navigate(_ action: @escaping () -> Void) {
+        if vm.isBotsSelected, let botsVM { botsVM.leaveBots(then: action) } else { action() }
+    }
+
+    private func botContextLabel(_ context: BotContext) -> String {
+        if case .workspace(let id) = context { return vm.workspaces.first { $0.id == id }?.name ?? "Workspace" }
+        return "General"
+    }
+
+    private func botConversationRow(_ row: SidebarViewModel.AuthorizedBotConversationRow) -> some View {
+        Button {
+            navigate { if row.conversationID == nil { vm.startBotConversation(row) } else { vm.openAuthorizedBotConversation(row) } }
+        } label: {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "sparkle")
+                    .font(.system(size: 12, weight: .regular))
+                    .frame(width: 20, height: 20)
+                    .foregroundColor(DS.Palette.textSecondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(row.botName).font(DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
+                    Text(row.conversationID == nil ? "New conversation" : row.title).font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, DS.Space.lg)
+            .padding(.horizontal, DS.Space.sm)
+            .frame(minHeight: 36)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(searchHelp(type: "Bot", location: botContextLabel(row.context), name: row.conversationID == nil ? "\(row.botName): New conversation" : "\(row.botName), \(row.title)"))
+        .accessibilityLabel("\(botContextLabel(row.context)), \(row.botName), \(row.title)")
+        .accessibilityIdentifier("sidebar.botConversation.\(row.id)")
+    }
+
+    /// General Bots: Titio pinned first, then general and unlinked Bots, in roster order.
+    @ViewBuilder
+    private var generalBotsSection: some View {
+        let bots = vm.visibleGeneralBots
+        if !bots.isEmpty {
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                Text("General Bots")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .padding(.horizontal, DS.Space.sm)
+                    .padding(.bottom, DS.Space.xxs)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        ForEach(bots) { generalBotRow($0) }
+                    }
+                }
+                .frame(maxHeight: min(CGFloat(bots.count) * 38, 190))
+            }
+            .padding(.horizontal, DS.Space.md)
+            .padding(.bottom, DS.Space.lg)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("sidebar.generalBots")
+        }
+    }
+
+    private func generalBotRow(_ row: SidebarViewModel.GeneralBotRow) -> some View {
+        Button { navigate { vm.openGeneralBot(row) } } label: {
+            HStack(spacing: DS.Space.sm) {
+                BotsAvatarView(name: row.name, handle: row.handle, symbol: row.symbol, size: 20)
+                    .frame(width: 20, height: 20)
+                Text(BotsViewModel.displayName(row.name)).font(DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
+                Spacer(minLength: 0)
+                if row.isTitio {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .frame(height: 34)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(searchHelp(type: "General Bot", location: "General", name: row.name))
+        .accessibilityLabel(BotsViewModel.displayName(row.name))
+        .accessibilityValue(row.isTitio ? "Pinned. General Bot" : "General Bot")
+        .accessibilityIdentifier("sidebar.generalBot.\(row.handle)")
+    }
+
+    /// Host, workspace and type for one row, so equal names stay distinguishable.
+    private func searchHelp(type: String, location: String, name: String) -> String {
+        "\(name) · \(type) · \(location) · \(vm.hostDisplayName)"
+    }
+
+    /// Children of an expanded workspace: its linked Bots, then Conversations. No empty sub-sections.
+    @ViewBuilder
+    private func workspaceChildren(_ ws: Workspace) -> some View {
+        ForEach(vm.workspaceBotRows(ws.id)) { botConversationRow($0) }
+        if vm.showsAddBot(ws.id) {
+            Button { vm.addBot() } label: {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: "person.badge.plus")
+                        .font(.system(size: 11, weight: .regular))
+                        .frame(width: 20, height: 20)
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Text("Add Bot\u{2026}").font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, DS.Space.lg)
+                .padding(.horizontal, DS.Space.sm)
+                .frame(height: 30)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Create a Bot; linking it to \(ws.name) asks for an explicit grant")
+            .accessibilityIdentifier("sidebar.addBot.\(ws.id.value.uuidString)")
+        }
+        let conversations = vm.workspaceConversationRows(ws.id)
+        if !conversations.isEmpty {
+            Text("Conversations")
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textTertiary)
+                .padding(.leading, DS.Space.lg + DS.Space.sm)
+                .padding(.top, DS.Space.xxs)
+                .accessibilityIdentifier("sidebar.workspaceConversations.\(ws.id.value.uuidString)")
+            ForEach(conversations) { workspaceConversationRow($0, workspace: ws) }
+        }
+    }
+
+    private func workspaceConversationRow(_ row: SidebarViewModel.WorkspaceConversationRow, workspace: Workspace) -> some View {
+        Button { navigate { vm.openWorkspaceConversation(row) } } label: {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: row.botID == nil ? "bubble.left" : "sparkle")
+                    .font(.system(size: 11, weight: .regular))
+                    .frame(width: 20, height: 20)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Text(row.title).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, DS.Space.lg)
+            .padding(.horizontal, DS.Space.sm)
+            .frame(height: 30)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(searchHelp(type: "Conversation", location: workspace.name, name: row.title))
+        .accessibilityLabel("\(workspace.name), \(row.title)")
+        .accessibilityIdentifier("sidebar.conversation.\(row.id)")
+    }
+
+    private var manageBotsFooter: some View {
+        Button(action: onOpenBots) {
+            SidebarActionRow(symbol: "person.2", title: "Manage Bots and Teams\u{2026}", isSelected: vm.isBotsSelected)
+        }
+        .buttonStyle(.plain)
+        .help("Open the Bots catalog, Studio and teams")
+        .padding(.horizontal, DS.Space.md)
+        .padding(.vertical, DS.Space.xs)
+        .accessibilityIdentifier("sidebar.manageBots")
+        .accessibilityAddTraits(vm.isBotsSelected ? .isSelected : [])
+    }
+
     @ViewBuilder
     private func workspaceRow(_ ws: Workspace) -> some View {
         let selected = vm.selectedWorkspaceID == ws.id
@@ -2355,12 +2866,28 @@ public struct SidebarRootView: View {
         let pinned = ws.metadata["pinned"] == "true"
         let busy = vm.isWorkspaceBusy(ws)
         let highlightTone = SidebarSelectionHighlightResolver().resolve(workspace: ws, isSelected: selected, isChecked: checked)
+        let expanded = vm.expandedWorkspaceIDs.contains(ws.id)
+        HStack(spacing: 0) {
+        Button { vm.toggleWorkspaceExpanded(ws.id) } label: {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
+                .rotationEffect(.degrees(expanded ? 90 : 0))
+                .frame(width: 16, height: 38)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(expanded ? "Collapse" : "Expand")
+        .accessibilityLabel(expanded ? "Collapse \(ws.name)" : "Expand \(ws.name)")
+        .accessibilityIdentifier("sidebar.workspaceDisclosure.\(ws.id.value.uuidString)")
         Button {
             let flags = NSEvent.modifierFlags
-            vm.selectWorkspaceRow(
-                ws,
-                extendingSelection: flags.contains(.shift),
-                togglingSelection: flags.contains(.command))
+            navigate {
+                vm.selectWorkspaceRow(
+                    ws,
+                    extendingSelection: flags.contains(.shift),
+                    togglingSelection: flags.contains(.command))
+            }
         } label: {
             HStack(spacing: DS.Space.sm) {
                 if checked {
@@ -2496,6 +3023,7 @@ public struct SidebarRootView: View {
                 Divider()
                 Button("Remove", role: .destructive) { vm.removeWorkspace(ws) }
             }
+        }
         }
     }
 }
@@ -2883,6 +3411,8 @@ public final class SidebarView: NSObject {
     }
 
     var workspacesForTesting: [Workspace] { viewModel.workspaces }
+    var viewModelForTesting: SidebarViewModel { viewModel }
+    func openBotsForTesting() { showBots() }
 
     /// Canonical workspace-add path for shell-level entry points such as the
     /// header "+" and the empty-state button: DEDUP-P2, File ▸ Open Recent and

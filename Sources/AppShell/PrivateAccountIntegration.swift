@@ -1185,32 +1185,35 @@ private actor PrivatePushSessionRefresher {
         }
 
         let api = self.api
+        let accountStore = self.accountStore
         let refreshToken = staleSession.refreshToken
+        let staleAccessToken = staleSession.accessToken
+        // The store is settled inside the shared task so every awaiter resumes
+        // after it: a joined caller must not see the stale session and retry.
         let task = Task {
-            try await api.refresh(refreshToken: refreshToken)
+            do {
+                let session = try await api.refresh(refreshToken: refreshToken)
+                accountStore.save(session)
+                return session
+            } catch {
+                // Another refresher (Settings) may have stored a newer session
+                // while this refresh was in flight: use it.
+                let current = accountStore.load()
+                if let current, current.accessToken != staleAccessToken {
+                    return current
+                }
+                // Only the backend's auth rejection ends the session. Offline,
+                // timeout, 5xx, 429 and decode errors keep it for the next try.
+                if let apiError = error as? PrivateAccountAPIError, apiError == .http(401),
+                   current?.refreshToken == refreshToken {
+                    accountStore.clear()
+                }
+                throw error
+            }
         }
         refreshTask = task
-        do {
-            let session = try await task.value
-            accountStore.save(session)
-            refreshTask = nil
-            return session
-        } catch {
-            refreshTask = nil
-            // Another refresher (Settings) may have stored a newer session
-            // while this refresh was in flight: use it.
-            let current = accountStore.load()
-            if let current, current.accessToken != staleSession.accessToken {
-                return current
-            }
-            // Only the backend's auth rejection ends the session. Offline,
-            // timeout, 5xx, 429 and decode errors keep it for the next try.
-            if let apiError = error as? PrivateAccountAPIError, apiError == .http(401),
-               current?.refreshToken == staleSession.refreshToken {
-                accountStore.clear()
-            }
-            throw error
-        }
+        defer { refreshTask = nil }
+        return try await task.value
     }
 }
 

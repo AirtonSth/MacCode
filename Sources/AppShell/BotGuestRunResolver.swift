@@ -63,6 +63,9 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         var dockerExecutable: @Sendable () throws -> String
         /// Registered workspace roots by id (MainActor state in the app).
         var workspaces: @Sendable () async -> [WorkspaceID: String]
+        var prepareContextRuntime: (@Sendable (AgentRunRequest, AgentRunID?, String, Bool) async throws -> BotContextGuestResources)? = nil
+        var contextualAdmissions: BotContextRunAdmissions? = nil
+        var contextDockerArchitecture: (@Sendable () throws -> String)? = nil
         /// The Mac distill binary, for its version (nil: not installed).
         var hostBinary: @Sendable (_ request: AgentRunRequest) -> String?
         /// Reads the Mac distill binary's version ahead of `binaryGuestPath`,
@@ -103,10 +106,26 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         (try? deps.threadRepo.guestPlacement(of: threadId))??.runsInGuest == true
     }
 
+    func preservesSessionIdentity(_ threadId: AgentThreadID) -> Bool {
+        do { return try deps.botStore.conversationContextPin(linkedTo: threadId) != nil }
+        catch { return true }
+    }
+
     func prepare(
         _ request: AgentRunRequest,
         progress: @escaping @Sendable (DistillGuestStage) -> Void
     ) async throws -> DistillGuestLaunchPlan? {
+        if try deps.botStore.conversationContextPin(linkedTo: request.threadId) != nil {
+            let work = Task {
+                try await self.preparePinnedContextRuntime(request, progress: progress)
+            }
+            request.acceptancePermit?.onInvalidate { work.cancel() }
+            return try await withTaskCancellationHandler {
+                try await work.value
+            } onCancel: {
+                work.cancel()
+            }
+        }
         guard let placement = try deps.threadRepo.guestPlacement(of: request.threadId),
               placement.runsInGuest else { return nil }
         let stamps = BotGuestPrepareIntervals()
@@ -125,6 +144,90 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             try await work.value
         } onCancel: {
             work.cancel()
+        }
+    }
+
+    private func preparePinnedContextRuntime(
+        _ request: AgentRunRequest,
+        progress: @escaping @Sendable (DistillGuestStage) -> Void
+    ) async throws -> DistillGuestLaunchPlan {
+        let unavailable = DistillGuestLaunchError.unavailable(
+            "Contextual execution is unavailable until runtime isolation is verified."
+        )
+        guard deps.hostsGuestRuns else { throw unavailable }
+        try await deps.barrier.wait()
+        try Task.checkCancellation()
+        guard let prepareContextRuntime = deps.prepareContextRuntime else { throw unavailable }
+        guard let admissions = deps.contextualAdmissions else {
+            let resources = try await prepareContextRuntime(request, nil, "", false)
+            if resources.hasCredentialMaterial { progress(.preparingAgent) }
+            try await Self.blocking { try resources.cancel() }
+            throw unavailable
+        }
+        guard let admission = try admissions.consume(request) else {
+            let resources = try await prepareContextRuntime(request, nil, "", false)
+            if resources.hasCredentialMaterial { progress(.preparingAgent) }
+            try await Self.blocking { try resources.cancel() }
+            throw unavailable
+        }
+        var resources: BotContextGuestResources?
+        var heartbeat: BotGuestLeaseHeartbeat?
+        do {
+            func validate() throws {
+                try Task.checkCancellation()
+                guard admission.validates() else { throw unavailable }
+            }
+            try validate()
+            guard request.providerBinary == nil,
+                  request.extraArgs.isEmpty, request.providerThreadId == admission.resumeCursor,
+                  !admission.model.isEmpty, request.model == admission.model,
+                  let architecture = deps.contextDockerArchitecture else { throw unavailable }
+            progress(.preparingAgent)
+            let hostBinary = deps.hostBinary(request)
+            await deps.probeHostVersion(hostBinary)
+            try validate()
+            let dockerArch = try architecture()
+            let binaryPath = try await deps.binaryGuestPath(hostBinary, dockerArch)
+            try validate()
+            let dockerExecutable = try deps.dockerExecutable()
+            progress(.startingVM)
+            let prepared = try await prepareContextRuntime(request, admission.parentRunID, admission.providerConfiguration, true)
+            resources = prepared
+            try validate()
+            guard let envFile = prepared.envFileURL else { throw unavailable }
+            let runID = request.runId.value.uuidString.lowercased()
+            let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: prepared.identity.storageBotID)
+            let leaseHeartbeat = try BotGuestLeaseHeartbeat(guestHome: guestHome, runID: runID, interval: deps.heartbeatInterval)
+            heartbeat = leaseHeartbeat
+            let guestCwd: String
+            switch admission.pin.context {
+            case .general: guestCwd = BotComputerGuestSpec.guestUserHome
+            case .workspace: guestCwd = request.cwd
+            }
+            let guestCommand = try DistillGuestLaunchPlan.guestCommand(binaryPath: binaryPath, for: request)
+            try validate()
+            progress(.launching)
+            try validate()
+            let plan = DistillGuestLaunchPlan(
+                runID: runID, dockerExecutable: dockerExecutable, container: prepared.container,
+                guestCwd: guestCwd, guestCommand: guestCommand, envFileURL: envFile, lease: nil,
+                teardown: { [weak self] _ in
+                    leaseHeartbeat.stop()
+                    do { try await Self.blocking { try prepared.cancel() } }
+                    catch { guestResolverLog.error("bot.context.finish_failed run=\(runID, privacy: .public)") }
+                    self?.forgetPlan(runID: runID)
+                },
+                onSessionOpened: admission.recordOpened
+            )
+            lock.withLock { livePlans[runID] = plan }
+            return plan
+        } catch {
+            heartbeat?.stop()
+            if let resources {
+                do { try await Self.blocking { try resources.cancel() } }
+                catch { guestResolverLog.error("bot.context.prepare_cleanup_failed run=\(request.runId.value.uuidString.lowercased(), privacy: .public)") }
+            }
+            throw Self.launchError(error)
         }
     }
 
@@ -280,23 +383,16 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                     "the model \(request.model) cannot run in the bot's Linux VM: \(reason)"
                 )
             }
-            // Relative to a no-follow descriptor: the guest can swap its
-            // `.distill` for a symlink to any Mac folder at any moment.
-            let distillDirectory = try PrivateDirectory(guestDistillHome, create: true)
-            defer { distillDirectory.close() }
-            try distillDirectory.writeAtomically(Data(rendered.toml.utf8), to: "config.toml")
-            let environment = DistillGuestEnvironment.build(
+            let envFile = try DistillGuestEnvironment.writeRunFiles(
+                rendered: rendered,
+                configDirectory: guestDistillHome,
+                guestDistillHome: DistillGuestEnvironment.distillHome,
                 providerEnvironment: request.environment,
                 runID: runID,
                 gatewayToken: issued.token,
-                modelSecrets: rendered.secretEnvironment,
                 gitIdentity: deps.gitIdentity(),
-                // Nil (no `codex` on the Mac, or it did not answer) is normal.
-                codexClientVersion: await codexClientVersionProbe.value
-            )
-            let envFile = try DistillGuestEnvironment.writeEnvFile(
-                environment, runID: runID,
-                directory: DistillGuestEnvironment.runsDirectory(appSupport: deps.appSupport)
+                codexClientVersion: await codexClientVersionProbe.value,
+                runsDirectory: DistillGuestEnvironment.runsDirectory(appSupport: deps.appSupport)
             )
             undo.append { unlink(envFile.path) }
             // Before the agent starts: its reaper ends a run with no lease.
@@ -693,7 +789,12 @@ extension AppContext {
     /// wait on; elsewhere guest threads fail.
     func makeBotGuestRunResolver(hostsGuestRuns: Bool) -> BotGuestRunResolver {
         let appSupport = appSupportDirectory
-        let docker = BotComputerDockerCLI()
+        let docker = guestDocker
+        let guestService = BotComputerGuestService(
+            appSupport: appSupport,
+            docker: docker,
+            recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
+        )
         let binaries = distillGuestBinaries
         let distillOverride = (try? settingsRepo.get("cli.distill.path")) ?? nil
         let barrier = botGuestLaunchBarrier
@@ -728,10 +829,13 @@ extension AppContext {
                 }
                 BotGuestLaunchSweep.run(
                     docker: sweepDocker, appSupport: appSupport, botIDs: botIDs, barrier: barrier,
-                    beforeOpening: trimGuestCache
+                    contextStore: store, beforeOpening: trimGuestCache
                 )
             }
         }
+        let contextStore = botStore
+        let contextThreadRepo = threadRepo
+        let contextHostID = liveActivityHostIdentity.serverId
         return BotGuestRunResolver(BotGuestRunResolver.Dependencies(
             threadRepo: threadRepo,
             botStore: botStore,
@@ -741,11 +845,7 @@ extension AppContext {
             vm: BotGuestDockerVM(
                 appSupport: appSupport,
                 docker: docker,
-                service: BotComputerGuestService(
-                    appSupport: appSupport,
-                    docker: docker,
-                    recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
-                ),
+                service: guestService,
                 resolveExecutable: { try BotComputerDockerResolver.shared.resolveHealthyExecutable() }
             ),
             binaryGuestPath: { hostBinary, arch in
@@ -759,6 +859,50 @@ extension AppContext {
                 await MainActor.run {
                     self?.state.workspaces.mapValues(\.cwd) ?? [:]
                 }
+            },
+            prepareContextRuntime: { [weak self] request, parentRunID, providerConfiguration, persistentSession in
+                guard let context = self else {
+                    throw DistillGuestLaunchError.unavailable(
+                        "Contextual execution is unavailable until runtime isolation is verified."
+                    )
+                }
+                let pin = try await BotGuestRunResolver.blocking {
+                    try contextStore.conversationContextPin(linkedTo: request.threadId)
+                }
+                let (workspace, registeredWorkspaces) = await MainActor.run { () -> (Workspace?, Set<String>) in
+                    let workspaces = context.state.workspaces
+                    let workspace: Workspace?
+                    if let pin, case .workspace(let workspaceID) = pin.context {
+                        workspace = workspaces[workspaceID]
+                    } else {
+                        workspace = nil
+                    }
+                    return (workspace, Set(workspaces.values.map(\.cwd)))
+                }
+                return try await BotGuestRunResolver.blocking {
+                    try BotContextGuestResources.prepare(
+                        request: request,
+                        hostID: contextHostID,
+                        store: contextStore,
+                        threadRepo: contextThreadRepo,
+                        service: guestService,
+                        appSupport: appSupport,
+                        workspace: workspace,
+                        registeredWorkspaces: registeredWorkspaces,
+                        secretStore: context.contextualSecretStore,
+                        parentRunID: parentRunID,
+                        providerConfiguration: providerConfiguration,
+                        persistentSession: persistentSession
+                    )
+                }
+            },
+            contextualAdmissions: contextualRunAdmissions,
+            contextDockerArchitecture: {
+                let info = try docker.info()
+                guard let architecture = DistillGuestBinaryProvisioner.dockerArchitecture(fromInfo: info) else {
+                    throw DistillGuestLaunchError.unavailable("Docker did not report its CPU architecture.")
+                }
+                return architecture
             },
             hostBinary: { request in
                 DistillProvisioner.resolveInstalledBinary(override: request.providerBinary ?? distillOverride)
@@ -790,19 +934,37 @@ enum BotGuestLaunchSweep {
     /// `docker` nil skips the in-guest step. `beforeOpening` trims the guest
     /// distill cache after the leftovers are ended and before `barrier`
     /// opens, the only moment no guest executes a cached build.
+    @discardableResult
     static func run(
         docker: (any BotComputerDockerClienting)?,
         appSupport: URL,
         botIDs: [BotID],
         barrier: DistillGuestLaunchBarrier,
+        contextStore: BotStore? = nil,
         beforeOpening: @escaping @Sendable () async -> Void = {}
-    ) {
+    ) -> BotContextGuestRecovery.Report {
+        let recovery = BotContextGuestRecovery.reconcile(docker: docker, appSupport: appSupport)
+        guestResolverLog.info("bot.context.launch_recovery reconciled=\(recovery.reconciled.count, privacy: .public) uncertain=\(recovery.failures.count, privacy: .public)")
+        var report = recovery
+        if recovery.failures.isEmpty, let contextStore {
+            do {
+                let roots = Set(try contextStore.contextDelegations().map(\.parentRunID))
+                for runID in roots {
+                    _ = try contextStore.closeContextDelegationTree(runID: runID)
+                }
+            } catch {
+                var failures = report.failures
+                failures["context-lineage"] = String(describing: error)
+                report = BotContextGuestRecovery.Report(reconciled: report.reconciled, failures: failures)
+            }
+        }
         if let docker { endLeftoverRuns(docker: docker, appSupport: appSupport, botIDs: botIDs) }
         removeLeftovers(appSupport: appSupport)
         Task {
             await beforeOpening()
             await barrier.open()
         }
+        return report
     }
 
     /// Ends what a previous session of this app left running in the

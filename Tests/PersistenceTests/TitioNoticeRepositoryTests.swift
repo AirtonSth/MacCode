@@ -362,7 +362,7 @@ final class TitioNoticeRepositoryTests: XCTestCase {
             _ = try statement.step()
             return Int(statement.columnInt64(0))
         }
-        XCTAssertEqual(version, 93)
+        XCTAssertEqual(version, Schema.currentVersion)
         XCTAssertEqual(try rowCount(db, "activity_notification_state"), 1, "existing rows survive")
         XCTAssertEqual(try rowCount(db), 0)
         XCTAssertEqual(try rowCount(db, "titio_inbox_state"), 0)

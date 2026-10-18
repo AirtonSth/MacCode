@@ -460,6 +460,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private let orchestrationRuntime: AgentOrchestrationRuntime?
     private let providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])?
     private let botSecretStore: any BotSecretStore
+    public var botContextPinForThread: (@Sendable (AgentThreadID) throws -> BotConversationContextPin?)?
     private var providers: [AgentProvider: AgentProviderAdapter]
     private var active: [AgentRunID: AgentRunHandle] = [:]
     private var activeThreads: [AgentThreadID: AgentRunID] = [:]
@@ -1450,10 +1451,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Secret loading is part of run admission, not desktop-environment
         // shaping. Reload it for every turn so resident provider processes see
         // the exact current Bot values before scope comparison or provider start.
-        effectiveEnvironment = try BotSecretEnvironment.applying(
-            to: effectiveEnvironment,
-            store: botSecretStore
-        )
+        if try botContextPinForThread?(request.threadId) != nil {
+            effectiveEnvironment = BotSecretEnvironment.scrubbingInherited(from: effectiveEnvironment)
+        } else {
+            effectiveEnvironment = try BotSecretEnvironment.applying(
+                to: effectiveEnvironment,
+                store: botSecretStore
+            )
+        }
         let effectiveReasoningEffort = Self.normalizedProviderReasoningEffort(
             provider: request.provider,
             model: request.model,
@@ -2052,6 +2057,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func stopRun(_ runId: AgentRunID) {
         lock.lock()
         let threadId = activeThreads.first(where: { $0.value == runId })?.key
+            ?? pendingProviderStarts.first(where: { $0.value.runId == runId })?.key
+        if let owner = reservedProviderStarts.removeValue(forKey: runId) {
+            cancelledProviderStartRuns[runId] = owner
+        }
         let handle = active[runId]
         lock.unlock()
         if let threadId {
@@ -4237,6 +4246,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         sourceThreadId: AgentThreadID,
         childThread: AgentThread
     ) async throws -> AgentThreadForkResult {
+        try threadRepo.requireUnscopedForkSource(sourceThreadId)
         guard sourceThreadId != childThread.id else {
             throw AgentProviderAdapterError.unsupported("fork child must have a distinct local thread identity")
         }
@@ -4292,6 +4302,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return
         }
         for intent in intents {
+            do { try threadRepo.requireUnscopedForkSource(intent.sourceThreadId) }
+            catch {
+                recordForkLaunchRecoveryError(childThreadId: intent.childThread.id, error: String(describing: error))
+                continue
+            }
             let adapter = providerAdapterSnapshot(for: intent.provider)
             guard let adapter, (await ProviderCLIProbe.runOffCooperativePool { adapter.forkSafety(threadId: intent.sourceThreadId) }).supportsDurableFork else {
                 recordForkLaunchRecoveryError(
@@ -4451,6 +4466,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         _ initialIntent: AgentThreadForkIntent,
         adapter: AgentProviderAdapter
     ) async throws -> AgentThreadForkResult {
+        try threadRepo.requireUnscopedForkSource(initialIntent.sourceThreadId)
         var intent = try threadRepo.getForkIntent(childThreadId: initialIntent.childThread.id) ?? initialIntent
         // Cheap existence + cursor. First-time fork misses the child; a 26-column
         // + routing get would only compile nil. Load the full row only to return
@@ -4879,27 +4895,43 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Stops every delegated child of `runId` by THREAD, including children
-    /// whose provider start is still in preflight. Direct children are stopped
-    /// through the normal stop path, which cascades again for deeper chains
-    /// (bot asking bot); `cascadeStopsInFlight` breaks accidental cycles.
+    /// Stops delegated descendants owned by this thread without stopping the
+    /// parent run itself. Snapshot parent IDs before resolving their durable routes.
+    public func stopDelegatedRunsForThread(threadId: AgentThreadID) throws {
+        lock.lock()
+        let parentRunIds = Set(delegatedRuns.values.map(\.parentRunId))
+        lock.unlock()
+        for parentRunId in parentRunIds {
+            guard try runRepo.route(of: parentRunId)?.threadId == threadId else { continue }
+            stopDelegatedChildRuns(of: parentRunId)
+        }
+    }
+
     private func stopDelegatedChildRuns(of runId: AgentRunID) {
         lock.lock()
         guard !cascadeStopsInFlight.contains(runId) else {
             lock.unlock()
             return
         }
-        cascadeStopsInFlight.insert(runId)
-        let childThreadIds = delegatedRuns.compactMap { _, link -> AgentThreadID? in
-            link.parentRunId == runId ? link.threadId : nil
+        var visited: Set<AgentRunID> = [runId]
+        var frontier = [runId]
+        var descendantRunIds: [AgentRunID] = []
+        while let parentRunId = frontier.popLast() {
+            for (childRunId, link) in delegatedRuns where link.parentRunId == parentRunId {
+                guard visited.insert(childRunId).inserted else { continue }
+                frontier.append(childRunId)
+                descendantRunIds.append(childRunId)
+            }
         }
+        let ownedStops = visited.subtracting(cascadeStopsInFlight)
+        cascadeStopsInFlight.formUnion(ownedStops)
         lock.unlock()
         defer {
             lock.lock()
-            cascadeStopsInFlight.remove(runId)
+            cascadeStopsInFlight.subtract(ownedStops)
             lock.unlock()
         }
-        childThreadIds.forEach { stopRun(threadId: $0) }
+        descendantRunIds.forEach { stopRun($0) }
     }
 
     private func activeRunProjectionLocked() -> ActiveRunProjection {
@@ -4981,6 +5013,25 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             throw AgentRunError.missingBinary(provider.rawValue)
         }
         return adapter
+    }
+
+    public func resumeCursorForRun(_ request: AgentRunRequest) throws -> String? {
+        let cursor = try recoverableResumeContext(for: request)?.resumeCursor
+        if request.provider == .distill, let cursor {
+            guard let providerSessionRepo else {
+                throw AgentProviderAdapterError.unsupported("Scoped provider recovery metadata is unavailable.")
+            }
+            let payload = ProviderSessionRuntimePayload.decode(try providerSessionRepo.runtimePayloadJSON(of: request.threadId) ?? nil)
+            guard payload.distillRetiredSessionIds?.contains(cursor) != true else {
+                throw AgentProviderAdapterError.unsupported("Scoped provider history was retired; explicit repair is required.")
+            }
+            let previousModel = payload.distillSessionId == cursor ? payload.distillSessionModel
+                : try providerSessionRepo.sessionModel(of: request.threadId, resumeCursor: cursor)
+            guard !DistillACPAdapter.isCrossModelFamilySwitch(from: previousModel, to: request.model) else {
+                throw AgentProviderAdapterError.unsupported("Scoped provider history cannot change model family implicitly.")
+            }
+        }
+        return cursor
     }
 
     private func recoverableResumeContext(for request: AgentRunRequest) throws -> ProviderRecoveryContext? {

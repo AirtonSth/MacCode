@@ -1041,9 +1041,138 @@ final class AgentAppViewModelTests: XCTestCase {
                        "an alias remap is not a source change and must not swap in the last-used model")
     }
 
-    /// WHY: the alias exemption is narrow. A thread pinned to a configured
-    /// instance that disappeared moves to a different instance, which is a real
-    /// source change and still resets to the preferred model.
+    /// WHY: loading real provider snapshots must restore canonical draft state only for selected thread.
+    /// WHY: canonical draft must return only to its owner thread after alias mapping.
+    func test_defaultInstanceAliasRemapRestoresCanonicalPersistedDraftAcrossThreads() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-alias-draft-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let workspaceID = WorkspaceID()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let draftRepo = AgentThreadDraftRepository(db: db)
+        let store = AgentAttachmentStore(root: URL(fileURLWithPath: tmp).appendingPathComponent("agent-attachments"))
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+                                              providers: [.distill: FakeProviderRunner(provider: .distill)])
+        let a = AgentThread(workspaceId: workspaceID, title: "A", provider: .distill, providerInstanceId: "distill", model: "muse")
+        let b = AgentThread(workspaceId: workspaceID, title: "B", provider: .distill, providerInstanceId: "distill", model: "muse")
+        try threadRepo.upsert(a)
+        try threadRepo.upsert(b)
+        let source = URL(fileURLWithPath: tmp).appendingPathComponent("private.png")
+        try Data("image".utf8).write(to: source)
+        let attachment = AgentAttachment(path: source.path, kind: .image, mimeType: "image/png", sizeBytes: 5)
+        try draftRepo.upsert(AgentThreadDraft(threadId: a.id, providerInstanceId: "distill-acp",
+                                              text: "canonical draft", attachments: [attachment], interactionMode: .default))
+
+        let cold = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp, coordinator: coordinator,
+                                     threadRepo: threadRepo, messageRepo: messageRepo,
+                                     draftRepo: draftRepo, attachmentStore: store, initialThreadId: a.id)
+        let distillACP = AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: [AgentModelDescriptor(id: "muse", label: "Muse", provider: .distill)],
+            binaryPath: "/usr/bin/true", authenticated: true, id: "distill-acp"
+        )
+        cold.providerSnapshotLoader = { [distillACP] }
+        await cold.loadProviderSnapshots()
+        XCTAssertEqual(cold.prompt, "canonical draft")
+        XCTAssertEqual(cold.attachments, [attachment])
+        XCTAssertEqual(cold.interactionMode, .default)
+
+        XCTAssertEqual(cold.interactionMode, .default)
+        cold.selectThread(b.id)
+        await cold.waitForSelectThreadHydrationForTesting()
+        XCTAssertEqual(cold.prompt, "")
+        XCTAssertTrue(cold.attachments.isEmpty)
+        XCTAssertEqual(cold.interactionMode, .default)
+        cold.selectThread(a.id)
+        await cold.waitForSelectThreadHydrationForTesting()
+        await cold.loadProviderSnapshots()
+        XCTAssertEqual(cold.prompt, "canonical draft")
+        XCTAssertEqual(cold.attachments, [attachment])
+        XCTAssertEqual(cold.interactionMode, .default)
+    }
+
+    /// WHY: a user's cleared raw-alias edit must not revive stale canonical draft.
+    /// WHY: a user's cleared raw-alias edit must not revive stale canonical draft.
+    func test_defaultInstanceAliasRemapPreservesPlanDraftOnlyOnItsThread() async throws {
+        let (vm, threads) = try makeVM()
+        defer { vm.dispose(); try? FileManager.default.removeItem(atPath: vm.cwd) }
+        let drafts = try XCTUnwrap(vm.draftRepo)
+        let a = AgentThread(workspaceId: vm.workspaceID, title: "Plan draft A", provider: .codex, providerInstanceId: "codex", model: "gpt-test")
+        let b = AgentThread(workspaceId: vm.workspaceID, title: "Empty B", provider: .codex, providerInstanceId: "codex", model: "gpt-test")
+        try threads.upsert(a)
+        try threads.upsert(b)
+        let file = URL(fileURLWithPath: vm.cwd).appendingPathComponent("plan-draft.png")
+        try Data("image".utf8).write(to: file)
+        let attachment = AgentAttachment(path: file.path, kind: .image, mimeType: "image/png", sizeBytes: 5)
+        try drafts.upsert(AgentThreadDraft(threadId: a.id, providerInstanceId: "codex-cli", text: "Plan only for A", attachments: [attachment], interactionMode: .plan))
+        vm.selectThread(a.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertEqual(vm.providerInstanceId, "codex")
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-test", label: "GPT", provider: .codex)],
+            binaryPath: "/usr/bin/true", authenticated: true, id: "codex-cli"
+        )
+        XCTAssertTrue(snapshot.interactionModes.contains(.plan))
+        vm.providerSnapshotLoader = { [snapshot] }
+        await vm.loadProviderSnapshots()
+        XCTAssertEqual(vm.prompt, "Plan only for A")
+        XCTAssertEqual(vm.attachments, [attachment])
+        XCTAssertEqual(vm.interactionMode, .plan)
+        vm.selectThread(b.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertTrue(vm.prompt.isEmpty)
+        XCTAssertTrue(vm.attachments.isEmpty)
+        XCTAssertEqual(vm.interactionMode, .default)
+        vm.selectThread(a.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        await vm.loadProviderSnapshots()
+        XCTAssertEqual(vm.prompt, "Plan only for A")
+        XCTAssertEqual(vm.attachments, [attachment])
+        XCTAssertEqual(vm.interactionMode, .plan)
+    }
+
+    func test_defaultInstanceAliasRemapDoesNotRestoreCanonicalDraftAfterRawEditCleared() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-alias-clear-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let workspaceID = WorkspaceID()
+        let repo = AgentThreadRepository(db: db)
+        let draftRepo = AgentThreadDraftRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo, threadRepo: repo,
+                                              providers: [.distill: FakeProviderRunner(provider: .distill)])
+        let vm = AgentAppViewModel(workspaceID: workspaceID, cwd: tmp, coordinator: coordinator,
+                                   threadRepo: repo, messageRepo: messageRepo, draftRepo: draftRepo,
+                                   attachmentStore: AgentAttachmentStore(root: URL(fileURLWithPath: tmp).appendingPathComponent("agent-attachments")),
+                                   promptHistoryStore: PromptHistoryStore(db: db))
+        let thread = AgentThread(workspaceId: workspaceID, title: "A", provider: .distill,
+                                 providerInstanceId: "distill", model: "muse")
+        try repo.upsert(thread)
+        vm.selectThread(thread.id)
+        await vm.waitForSelectThreadHydrationForTesting()
+        let canonical = AgentThreadDraft(threadId: thread.id, providerInstanceId: "distill-acp",
+                                         text: "old canonical", attachments: [], interactionMode: .default)
+        // Write canonical row through the real repository owned by the VM setup.
+        try draftRepo.upsert(canonical)
+        vm.prompt = "temporary raw edit"
+        vm.promptWasEdited()
+        vm.prompt = ""
+        vm.promptWasEdited()
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: [AgentModelDescriptor(id: "muse", label: "Muse", provider: .distill)],
+            binaryPath: "/usr/bin/true", authenticated: true, id: "distill-acp"
+        )
+        vm.providerSnapshotLoader = { [snapshot] }
+        await vm.loadProviderSnapshots()
+        XCTAssertEqual(vm.prompt, "")
+    }
+
+    /// WHY: a thread pinned to a vanished configured instance changed sources and must use preferred model.
     func test_realInstanceChange_stillAppliesPreferredModel() async throws {
         let (vm, repo) = try makeVM()
         let suiteName = "rc2-instance-model-" + UUID().uuidString

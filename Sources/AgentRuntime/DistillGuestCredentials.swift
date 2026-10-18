@@ -650,7 +650,7 @@ public struct PrivateDirectory {
     }
 
     /// Nested managed paths must be opened relative to the already trusted parent.
-    func child(_ name: String, create: Bool) throws -> PrivateDirectory {
+    public func child(_ name: String, create: Bool) throws -> PrivateDirectory {
         guard name != ".", name != "..", !name.contains("/"), !name.isEmpty else {
             throw DistillGuestCredentialError.unsafeDirectory(path: path)
         }
@@ -675,8 +675,9 @@ public struct PrivateDirectory {
         return PrivateDirectory(path: "\(path)/\(name)", descriptor: fd)
     }
 
-    /// Used only for the owned accounts mirror; symlinks are unlinked, never traversed.
-    func removeTree(_ name: String) {
+    /// Removes a managed child; symlinks are unlinked, never traversed.
+    public func removeTree(_ name: String) {
+        guard name != ".", name != "..", !name.contains("/"), !name.isEmpty else { return }
         if let directory = try? child(name, create: false) {
             for entry in directory.entries() { directory.removeTree(entry) }
             directory.close()
@@ -686,13 +687,20 @@ public struct PrivateDirectory {
 
     public func close() { Darwin.close(descriptor) }
 
+    public func synchronize() throws {
+        guard fsync(descriptor) == 0 else {
+            throw DistillGuestCredentialError.writeFailed(path: path, errno: errno)
+        }
+    }
+
     /// Far above any credential file; a bigger one is treated as differing.
     static let readLimit = 1 << 20
 
     /// Nil when missing, unreadable, larger than `readLimit` or not a regular
     /// file (a symlink included). The guest owns this directory: a FIFO there
     /// would block a plain open and a sparse 64 GiB file would be read whole.
-    func read(_ name: String) -> Data? {
+    public func read(_ name: String) -> Data? {
+        guard !name.isEmpty, name != ".", name != "..", !name.contains("/") else { return nil }
         let fd = openat(descriptor, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { return nil }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
@@ -742,22 +750,28 @@ public struct PrivateDirectory {
         unlinkat(descriptor, name, 0) == 0
     }
 
-    public func entries() -> [String] {
+    public func entriesChecked() throws -> [String] {
         let fd = dup(descriptor)
-        guard fd >= 0 else { return [] }
+        guard fd >= 0 else { throw DistillGuestCredentialError.writeFailed(path: path, errno: errno) }
         guard let stream = fdopendir(fd) else {
+            let code = errno
             Darwin.close(fd)
-            return []
+            throw DistillGuestCredentialError.writeFailed(path: path, errno: code)
         }
         defer { closedir(stream) }
         rewinddir(stream)
         var names: [String] = []
+        errno = 0
         while let entry = readdir(stream) {
             let name = withUnsafeBytes(of: entry.pointee.d_name) { raw in
                 String(cString: raw.bindMemory(to: CChar.self).baseAddress!)
             }
             if name != "." && name != ".." { names.append(name) }
         }
+        let code = errno
+        guard code == 0 else { throw DistillGuestCredentialError.writeFailed(path: path, errno: code) }
         return names
     }
+
+    public func entries() -> [String] { (try? entriesChecked()) ?? [] }
 }

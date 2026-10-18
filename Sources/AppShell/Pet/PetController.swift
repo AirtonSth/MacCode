@@ -1079,9 +1079,12 @@ public final class PetController {
 
     private func open(_ item: PetAttentionItem) {
         do {
-            let result = try attentionStore.openAndMarkRead(itemID: item.id) { [weak self] route in
+            let result = try attentionStore.openAndMarkRead(itemID: item.id) { [weak self] currentItem in
                 guard let self else { return false }
-                return try self.verifyAndOpen(route)
+                let conversationID: BotConversationID?
+                if case .bot(_, let id, _) = currentItem.source { conversationID = id }
+                else { conversationID = nil }
+                return try self.verifyAndOpen(currentItem.route, conversationID: conversationID)
             }
             switch result {
             case .marked, .retainedBlocker:
@@ -1100,7 +1103,14 @@ public final class PetController {
 
     private func openActive(_ item: PetActiveThreadItem) {
         do {
-            let opened = try verifyAndOpen(item.route)
+            let route: PetAttentionRoute
+            if case .botsDesk = item.route,
+               try AppCommandRouter.contextPinnedThreadDestination(item.threadID, context: context) != nil {
+                route = .agentThread(threadID: item.threadID, workspaceID: nil)
+            } else {
+                route = item.route
+            }
+            let opened = try verifyAndOpen(route)
             if opened {
                 model.routeError = nil
                 windowController?.closePopover(restoringPreviousKeyWindow: false)
@@ -1383,12 +1393,23 @@ public final class PetController {
         activeThreadChromeByID.removeValue(forKey: AgentThreadID(uuid))
     }
 
-    private func verifyAndOpen(_ route: PetAttentionRoute) throws -> Bool {
+    private func verifyAndOpen(_ route: PetAttentionRoute, conversationID: BotConversationID? = nil) throws -> Bool {
         switch route {
         case .agentThread(let threadID, _):
-            let descriptor = try router.openAgentThread(thread: threadID, markRead: false)
-            guard let window = SurfaceRegistry.shared.surface(descriptor.id)?.view.window else { return false }
-            return window.isVisible && !window.isMiniaturized && destinationWindowIsKey(window)
+            switch try router.agentThreadOpenDestination(threadID) {
+            case .bot(let botID, let conversationID):
+                guard try router.openBotsDesk(botID: botID, conversationID: conversationID) else { return false }
+                guard let destination = router.windowController?.window,
+                      destination.isVisible,
+                      !destination.isMiniaturized else { return false }
+                return destinationWindowIsKey(destination)
+            case .unavailable:
+                return false
+            case .workspace:
+                let descriptor = try router.openAgentThread(thread: threadID, markRead: false)
+                guard let window = SurfaceRegistry.shared.surface(descriptor.id)?.view.window else { return false }
+                return window.isVisible && !window.isMiniaturized && destinationWindowIsKey(window)
+            }
         case .surface(let surfaceID, let requestedWorkspaceID):
             let requestedStillOwnsSurface = requestedWorkspaceID.flatMap { workspaceID in
                 context.state.workspaces[workspaceID]?.layout.contains(surfaceID: surfaceID) == true
@@ -1424,7 +1445,7 @@ public final class PetController {
         case .settings(let settingsRoute):
             return openSettings(settingsRoute)
         case .botsDesk(let botID):
-            guard try router.openBotsDesk(botID: botID) else { return false }
+            guard try router.openBotsDesk(botID: botID, conversationID: conversationID) else { return false }
             guard let destination = router.windowController?.window,
                   destination.isVisible,
                   !destination.isMiniaturized else { return false }

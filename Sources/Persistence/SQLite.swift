@@ -471,6 +471,62 @@ public final class SQLiteDB {
         }
     }
 
+    /// Copies this database into destination using SQLite's online backup API.
+    /// The caller must ensure no transaction is active on either connection.
+    public func backup(to destination: SQLiteDB) throws {
+        guard self !== destination else {
+            throw SQLiteError.execute("cannot back up a database to itself")
+        }
+        guard !refersToSameFile(as: destination) else {
+            throw SQLiteError.execute("source and destination refer to the same database file")
+        }
+
+        let first = path < destination.path ? self : destination
+        let second = first === self ? destination : self
+        try first.performSync { _ in
+            try second.performSync { _ in
+                guard let sourceHandle = handle, let destinationHandle = destination.handle else {
+                    throw SQLiteError.execute("database backup connection is closed")
+                }
+                guard transactionDepth == 0, destination.transactionDepth == 0,
+                      sqlite3_get_autocommit(sourceHandle) != 0,
+                      sqlite3_get_autocommit(destinationHandle) != 0 else {
+                    throw SQLiteError.execute("database backup requires no active transaction")
+                }
+                resetTouchedStatements()
+                destination.resetTouchedStatements()
+                guard let backup = sqlite3_backup_init(destinationHandle, "main", sourceHandle, "main") else {
+                    throw SQLiteError.execute(String(cString: sqlite3_errmsg(destinationHandle)))
+                }
+                let stepResult = sqlite3_backup_step(backup, -1)
+                let stepMessage = String(cString: sqlite3_errmsg(destinationHandle))
+                let finishResult = sqlite3_backup_finish(backup)
+                guard stepResult == SQLITE_DONE else {
+                    throw SQLiteError.execute(stepMessage)
+                }
+                guard finishResult == SQLITE_OK else {
+                    throw SQLiteError.execute(String(cString: sqlite3_errmsg(destinationHandle)))
+                }
+                destination.cachedEventRowCount = nil
+                destination.cachedTerminalOutputBytes = nil
+            }
+        }
+    }
+
+    private func refersToSameFile(as other: SQLiteDB) -> Bool {
+        if URL(fileURLWithPath: path).standardizedFileURL.path
+            == URL(fileURLWithPath: other.path).standardizedFileURL.path {
+            return true
+        }
+        guard let first = try? FileManager.default.attributesOfItem(atPath: path),
+              let second = try? FileManager.default.attributesOfItem(atPath: other.path),
+              let firstDevice = first[.systemNumber] as? NSNumber,
+              let firstFile = first[.systemFileNumber] as? NSNumber,
+              let secondDevice = second[.systemNumber] as? NSNumber,
+              let secondFile = second[.systemFileNumber] as? NSNumber else { return false }
+        return firstDevice == secondDevice && firstFile == secondFile
+    }
+
     /// PF-00 (c): the idle capture blocked on `NSRecursiveLock` (operationLock)
     /// before `queue.sync`. Measure the caller-thread wait, not just the inner hop.
     private func measureCallerWaitIfOnMain<T>(_ body: () throws -> T) rethrows -> T {

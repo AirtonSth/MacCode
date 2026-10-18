@@ -147,6 +147,124 @@ final class ActiveThreadsWindowTests: XCTestCase {
     }
 
     @MainActor
+    func test_activityOpensColdCanonicalBotConversationInVisibleDeskWindow() throws {
+        let directory = NSTemporaryDirectory() + "rc-active-canonical-bot-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let controller = MainWindowController(context: context, router: router)
+        router.windowController = controller
+        controller.window.isReleasedWhenClosed = false
+        controller.show()
+        defer { controller.window.close() }
+
+        let workspace = try router.createWorkspace(name: "Canonical Activity", cwd: NSTemporaryDirectory())
+        defer {
+            for surface in SurfaceRegistry.shared.all().compactMap({ $0 as? AgentAppSurface })
+                where surface.viewModel.workspaceID == workspace.id {
+                surface.close()
+                SurfaceRegistry.shared.unregister(surface.descriptor.id)
+            }
+        }
+        let bot = try context.botStore.create(name: "Piper", title: "Scout", description: "", provider: .distill)
+        let grant = try context.botStore.grantContext(
+            hostID: context.liveActivityHostIdentity.serverId, botID: bot.id,
+            context: .workspace(workspace.id), actions: [.read], expectedRevision: 0
+        )
+        let thread = AgentThread(workspaceId: workspace.id, title: "Canonical Activity target", provider: .distill, model: "test")
+        let conversation = BotConversation(botID: bot.id, title: "Canonical Activity target", linkedAgentThreadID: thread.id)
+        try context.botStore.createContextualConversation(
+            conversation, newThread: thread, hostID: context.liveActivityHostIdentity.serverId,
+            context: .workspace(workspace.id), policyRevision: grant.policyRevision
+        )
+        let run = AgentRun(
+            threadId: thread.id, provider: .distill, providerInstanceId: "distill", model: "test",
+            status: .completed, startedAt: Date(), finishedAt: Date()
+        )
+        try context.runRepo.upsert(run)
+
+        let activity = ActiveThreadsViewModel(context: context, router: router, loadImmediately: false)
+        activity.reloadFinished()
+        let item = try XCTUnwrap(activity.finishedItems.first { $0.runID == run.id })
+        XCTAssertFalse(router.botsViewModel?.conversations.contains(where: { $0.id == conversation.id }) ?? false,
+                      "cold target must not already be in the Desk view model cache")
+        activity.openFinished(item)
+
+        XCTAssertEqual(router.botsViewModel?.selectedBotID, bot.id)
+        XCTAssertEqual(router.botsViewModel?.screen, .desk)
+        let selectedConversation = try XCTUnwrap(router.botsViewModel?.selectedConversation)
+        XCTAssertEqual(selectedConversation.id, conversation.id)
+        XCTAssertEqual(selectedConversation.linkedAgentThreadID, thread.id)
+        XCTAssertEqual(router.botsViewModel?.selectedPinnedContextLabel, workspace.name)
+        XCTAssertTrue(controller.window.isVisible)
+    }
+
+    @MainActor
+    func test_threadOpenDestinationPrioritizesAuthorizedCanonicalContextPins() throws {
+        let directory = NSTemporaryDirectory() + "rc-context-destination-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspaceA = try router.createWorkspace(name: "A", cwd: NSTemporaryDirectory())
+        let workspaceB = try router.createWorkspace(name: "B", cwd: NSTemporaryDirectory())
+        let hostID = context.liveActivityHostIdentity.serverId
+        let bot = try context.botStore.create(name: "Piper", title: "Scout", description: "", provider: .distill)
+
+        func pin(_ contextValue: BotContext, workspaceID: WorkspaceID?, host: String) throws -> (AgentThread, BotConversation) {
+            let grant = try context.botStore.grantContext(
+                hostID: host, botID: bot.id, context: contextValue, actions: [.read], expectedRevision: nil
+            )
+            let thread = AgentThread(workspaceId: workspaceID, title: "context", provider: .distill, model: "distill")
+            let conversation = BotConversation(botID: bot.id, title: "context", linkedAgentThreadID: thread.id)
+            try context.botStore.createContextualConversation(
+                conversation, newThread: thread, hostID: host, context: contextValue, policyRevision: grant.policyRevision
+            )
+            return (thread, conversation)
+        }
+
+        let workspacePin = try pin(.workspace(workspaceA.id), workspaceID: workspaceA.id, host: hostID)
+        XCTAssertEqual(try router.agentThreadOpenDestination(workspacePin.0.id), .bot(bot.id, workspacePin.1.id))
+        let generalPin = try pin(.general, workspaceID: nil, host: hostID)
+        XCTAssertEqual(try router.agentThreadOpenDestination(generalPin.0.id), .bot(bot.id, generalPin.1.id))
+
+        var mismatchedThread = try XCTUnwrap(context.threadRepo.get(id: workspacePin.0.id))
+        mismatchedThread.workspaceId = workspaceB.id
+        try context.threadRepo.upsert(mismatchedThread)
+        XCTAssertEqual(try context.threadRepo.get(id: mismatchedThread.id)?.workspaceId, workspaceA.id,
+                       "canonical thread placement must survive an attempted move")
+        XCTAssertEqual(try router.agentThreadOpenDestination(mismatchedThread.id), .bot(bot.id, workspacePin.1.id))
+
+        let revokedPin = try pin(.workspace(workspaceB.id), workspaceID: workspaceB.id, host: hostID)
+        let revoked = try context.botStore.revokeContext(
+            hostID: hostID, botID: bot.id, context: .workspace(workspaceB.id), expectedRevision: 1
+        )
+        XCTAssertEqual(revoked.state, .revoked)
+        XCTAssertEqual(try router.agentThreadOpenDestination(revokedPin.0.id), .unavailable)
+
+        let foreignWorkspace = try router.createWorkspace(name: "Foreign", cwd: NSTemporaryDirectory())
+        let foreignPin = try pin(.workspace(foreignWorkspace.id), workspaceID: foreignWorkspace.id, host: "foreign-host")
+        XCTAssertEqual(try router.agentThreadOpenDestination(foreignPin.0.id), .unavailable)
+
+        let legacyBotThread = AgentThread(
+            workspaceId: workspaceA.id, title: "legacy bot", provider: .claude, model: "m",
+            actor: .bot(bot.id), actorLockedAt: Date()
+        )
+        try context.threadRepo.upsert(legacyBotThread)
+        let legacyConversation = BotConversation(botID: bot.id, title: "legacy", linkedAgentThreadID: legacyBotThread.id)
+        try context.botStore.upsertConversation(legacyConversation)
+        XCTAssertEqual(try router.agentThreadOpenDestination(legacyBotThread.id), .workspace(workspaceA.id))
+
+        let unrelatedThread = AgentThread(workspaceId: workspaceB.id, title: "mismatch", provider: .distill, model: "distill")
+        let unrelatedConversation = BotConversation(botID: bot.id, title: "mismatch", linkedAgentThreadID: unrelatedThread.id)
+        XCTAssertThrowsError(try context.botStore.createContextualConversation(
+            unrelatedConversation, newThread: unrelatedThread, hostID: hostID,
+            context: .workspace(workspaceA.id), policyRevision: 1
+        ))
+    }
+
+    @MainActor
     func test_openActivity_unreachableThread_failsInPlaceWithReadableErrorAndReplacesStaleAlert() throws {
         // WHY: the open used to leave Activity first and fail a frame later on a hidden view,
         // as "CoreModel.LayoutError error 0". That alert then popped up on the next Activity
@@ -439,5 +557,49 @@ final class ActiveThreadsWindowTests: XCTestCase {
                        "opening a busy terminal must switch to its workspace")
         XCTAssertEqual(context.state.workspaces[first.id]?.layout.find(paneID: paneID)?.selectedSurfaceID, target.id,
                        "opening a busy tab must select it inside its pane, not just its workspace")
+    }
+
+    @MainActor
+    func test_selectDeskThreadOpensLegacyAndPreservesStateWhenPinnedContextRevoked() throws {
+        let directory = NSTemporaryDirectory() + "rc-select-legacy-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .distill)
+        vm.openDesk(bot)
+
+        let unpinned = BotConversation(botID: bot.id, title: "uncached legacy")
+        try context.botStore.upsertConversation(unpinned)
+        vm.selectDeskThread(unpinned.id)
+        XCTAssertEqual(vm.selectedConversation?.id, unpinned.id)
+
+        let workspace = try AppCommandRouter(context: context).createWorkspace(name: "Ordinary", cwd: NSTemporaryDirectory())
+        let thread = AgentThread(workspaceId: workspace.id, title: "ordinary", provider: .distill, model: "test")
+        try context.threadRepo.upsert(thread)
+        let linked = BotConversation(botID: bot.id, title: "linked legacy", linkedAgentThreadID: thread.id)
+        try context.botStore.upsertConversation(linked)
+        vm.selectDeskThread(linked.id)
+        XCTAssertEqual(vm.selectedConversation?.id, linked.id)
+
+        let hostID = context.liveActivityHostIdentity.serverId
+        let pinnedGrant = try context.botStore.grantContext(
+            hostID: hostID, botID: bot.id, context: .workspace(workspace.id), actions: [.read], expectedRevision: 0
+        )
+        let pinnedThread = AgentThread(workspaceId: workspace.id, title: "pinned", provider: .distill, model: "test")
+        let pinned = BotConversation(botID: bot.id, title: "revoked", linkedAgentThreadID: pinnedThread.id)
+        try context.botStore.createContextualConversation(
+            pinned, newThread: pinnedThread, hostID: hostID, context: .workspace(workspace.id),
+            policyRevision: pinnedGrant.policyRevision
+        )
+        _ = try context.botStore.revokeContext(
+            hostID: hostID, botID: bot.id, context: .workspace(workspace.id), expectedRevision: 1
+        )
+        let selectionBeforeRefusal = vm.selectedConversation?.id
+        let cacheBeforeRefusal = vm.conversations.map(\.id)
+        vm.selectDeskThread(pinned.id)
+        XCTAssertEqual(vm.selectedConversation?.id, selectionBeforeRefusal)
+        XCTAssertEqual(vm.conversations.map(\.id), cacheBeforeRefusal)
+        XCTAssertFalse(vm.conversations.contains { $0.id == pinned.id })
+        XCTAssertFalse(vm.errorMessage?.isEmpty ?? true)
     }
 }

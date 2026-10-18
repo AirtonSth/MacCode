@@ -102,6 +102,7 @@ public protocol BotComputerDockerClienting: Sendable {
     func rename(from: String, to: String) throws
     func ensureNetwork(name: String) throws
     func removeNetwork(name: String) throws
+    func networkExists(name: String) throws -> Bool
     func remove(name: String) throws
     func removeMatching(namePrefix: String) throws
     func top(name: String) throws -> String
@@ -109,6 +110,10 @@ public protocol BotComputerDockerClienting: Sendable {
 
 public extension BotComputerDockerClienting {
     func removeNetwork(name: String) throws {}
+
+    func networkExists(name: String) throws -> Bool {
+        throw BotComputerDockerError.provisioningFailed
+    }
 
     func top(name: String) throws -> String { "" }
 
@@ -279,6 +284,10 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
         for host in options.extraHosts {
             args += ["--add-host", host]
         }
+        for capability in options.capDrop { args += ["--cap-drop", capability] }
+        for capability in options.capAdd { args += ["--cap-add", capability] }
+        for option in options.securityOptions { args += ["--security-opt", option] }
+        for mount in options.tmpfs { args += ["--tmpfs", mount] }
         for (key, value) in options.labels.sorted(by: { $0.key < $1.key }) {
             args += ["--label", "\(key)=\(value)"]
         }
@@ -371,7 +380,10 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             name,
         ])
         // Line 2: the home bind's source, JSON-quoted (it may hold spaces).
-        let lines = (String(data: data, encoding: .utf8) ?? "")
+        guard let decoded = String(data: data, encoding: .utf8) else {
+            throw BotComputerDockerError.provisioningFailed
+        }
+        let lines = decoded
             .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
         let text = (lines.first.map(String.init) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -379,7 +391,17 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .flatMap { try? JSONDecoder().decode(String.self, from: Data($0.utf8)) }
         let parts = text.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: false)
-        let running = parts.first.map { $0.caseInsensitiveCompare("true") == .orderedSame } ?? false
+        guard let runningToken = parts.first else {
+            throw BotComputerDockerError.provisioningFailed
+        }
+        let running: Bool
+        if runningToken.caseInsensitiveCompare("true") == .orderedSame {
+            running = true
+        } else if runningToken.caseInsensitiveCompare("false") == .orderedSame {
+            running = false
+        } else {
+            throw BotComputerDockerError.provisioningFailed
+        }
         let image = parts.dropFirst().first.map(String.init) ?? ""
         let port = Int(parts.dropFirst(2).first.map(String.init) ?? "") ?? 0
         let rest = parts.dropFirst(3).first.map(String.init) ?? ""
@@ -401,9 +423,10 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
 
     public func containerExists(name: String) throws -> Bool {
         let data = try run(["ps", "-aq", "--filter", "name=^/\(name)$"])
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty == false
+        guard let output = String(data: data, encoding: .utf8) else {
+            throw BotComputerDockerError.provisioningFailed
+        }
+        return output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
     public func exec(
@@ -436,6 +459,14 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
 
     public func removeNetwork(name: String) throws {
         _ = try run(["network", "rm", name])
+    }
+
+    public func networkExists(name: String) throws -> Bool {
+        let data = try run(["network", "ls", "-q", "--filter", "name=^\(name)$"])
+        guard let output = String(data: data, encoding: .utf8) else {
+            throw BotComputerDockerError.provisioningFailed
+        }
+        return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     public func top(name: String) throws -> String {

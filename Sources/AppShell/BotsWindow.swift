@@ -1094,6 +1094,11 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         continuationConversationID: BotConversationID? = nil,
         continuationPeerThreadID: AgentThreadID? = nil
     ) -> Task<Void, Never>? {
+        do {
+            guard try botStore.conversationContextPin(linkedTo: originThread.id) == nil else { return nil }
+        } catch {
+            return nil
+        }
         let display = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let peerDisplay = peerText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !display.isEmpty,
@@ -2918,6 +2923,8 @@ private final class DeskSendWork {
     var task: Task<Void, Never>!
     var threadID: AgentThreadID?
     var runID: AgentRunID?
+    var queuedRecord: BotQueuedFollowUpRecord?
+    var providerAccepted = false
 }
 
 /// One in-flight stop join per bot so concurrent stops share the same await.
@@ -3504,8 +3511,10 @@ public final class BotsViewModel: ObservableObject {
     private var studioSupportByBot: [BotID: BotStudioSupportSnapshot] = [:]
     private var revisionByID: [BotRevisionID: BotRevision] = [:]
     @Published public private(set) var conversations: [BotConversation] = []
+    @Published public private(set) var selectedPinnedContextLabel = "Legacy"
     @Published public private(set) var selectedConversation: BotConversation? {
         didSet {
+            if oldValue?.id != selectedConversation?.id { refreshPinnedContextLabel() }
             let previousThreadID = oldValue?.linkedAgentThreadID
             if let previousThreadID,
                previousThreadID != selectedConversation?.linkedAgentThreadID {
@@ -4625,11 +4634,16 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func requestLeaveBotsMode() {
+        leaveBots { [weak self] in self?.onLeaveBots?() }
+    }
+
+    /// Any shell navigation away from Bots: keep drafts and ask before dropping an unsaved new Bot.
+    public func leaveBots(then proceed: @escaping () -> Void) {
         flushPendingDraftPersistence()
         requestLeaveUnsavedNewBot { [weak self] in
             guard let self else { return }
             self.invalidateNavigationFreshness()
-            self.onLeaveBots?()
+            proceed()
         }
     }
 
@@ -4888,8 +4902,13 @@ public final class BotsViewModel: ObservableObject {
         drainQueuedFollowUp()
         deskTimelineRejoinToken &+= 1
         lastGuestScreenURL = guestScreenURLByBot[bot.id.value]
-        if displayedDesktopKind == .dockerDesktop {
-            presentGuestDesktop(botID: bot.id)
+        if (desktopKindOverrideForTesting ?? displayedDesktopKind) == .dockerDesktop {
+            do {
+                try rejectContextualConversationSend(for: bot)
+                presentGuestDesktop(botID: bot.id)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -5059,29 +5078,194 @@ public final class BotsViewModel: ObservableObject {
         guard navigationFreshnessIsCurrent(generation, botID: botID) else { return }
         deskTimelineRejoinToken &+= 1
         lastGuestScreenURL = guestScreenURLByBot[botID.value]
-        if displayedDesktopKind == .dockerDesktop {
-            presentGuestDesktop(botID: botID)
+        if (desktopKindOverrideForTesting ?? displayedDesktopKind) == .dockerDesktop {
+            do {
+                try rejectContextualConversationSend(for: storedBot)
+                presentGuestDesktop(botID: botID)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
+    }
+
+    public var existingWorkspaceContexts: [(id: WorkspaceID, name: String)] {
+        context.state.workspaces.values.map { ($0.id, $0.name) }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func refreshPinnedContextLabel() {
+        guard let conversation = selectedConversation else { selectedPinnedContextLabel = "Legacy"; return }
+        do {
+            guard let pin = try botStore.conversationContextPin(conversationID: conversation.id) else {
+                selectedPinnedContextLabel = "Legacy"
+                return
+            }
+            switch pin.context {
+            case .general: selectedPinnedContextLabel = "General"
+            case .workspace(let id): selectedPinnedContextLabel = context.state.workspaces[id].map { $0.name } ?? "Context unavailable"
+            }
+        } catch { selectedPinnedContextLabel = "Context unavailable" }
+    }
+
+    func makeContextExportModel(copy: @escaping (String) -> Void = { text in
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }) throws -> BotContextExportModel {
+        guard let botID = selectedBotID, let bot = try botStore.get(id: botID),
+              let conversation = selectedConversation, conversation.botID == botID,
+              let threadID = conversation.linkedAgentThreadID,
+              let pin = try botStore.conversationContextPin(conversationID: conversation.id),
+              pin.hostID == context.liveActivityHostIdentity.serverId,
+              try botStore.authorizes(hostID: pin.hostID, botID: botID, context: pin.context, action: .read, policyRevision: pin.policyRevision),
+              try botStore.authorizes(hostID: pin.hostID, botID: botID, context: pin.context, action: .export, policyRevision: pin.policyRevision),
+              let router = router ?? context.router else {
+            throw NSError(domain: "BotContextExport", code: 1, userInfo: [NSLocalizedDescriptionKey: "This conversation needs current read and export permission. Policy changes require a new conversation."])
+        }
+        let rows = try context.messageRepo.list(threadId: threadID)
+            .filter { $0.role == .user || $0.role == .assistant }
+            .map { BotContextExportModel.Row(id: $0.id.value.uuidString.lowercased(), role: $0.role.rawValue, text: $0.content) }
+        let targets = try botStore.listContextBindings(hostID: pin.hostID, botID: botID)
+            .filter { $0.state == .active && $0.actions.contains(.send) }
+            .compactMap { binding -> BotContextExportModel.Target? in
+                let label: String
+                switch binding.context {
+                case .general: label = "General"
+                case .workspace(let id):
+                    guard let workspace = context.state.workspaces[id] else { return nil }
+                    label = workspace.name
+                }
+                return .init(key: binding.context.storageKey, revision: binding.policyRevision, label: label)
+            }
+        let origin = BotContextExportModel.Origin(hostID: pin.hostID, botID: botID.value.uuidString.lowercased(),
+            contextKey: pin.context.storageKey, contextVersion: pin.contextVersion, policyRevision: pin.policyRevision,
+            conversationID: conversation.id.value.uuidString.lowercased(), hostLabel: pin.hostID,
+            botLabel: Self.displayName(bot.name), sourceLabel: selectedPinnedContextLabel)
+        return BotContextExportModel(origin: origin, rows: rows, targets: targets,
+            request: { method, params in try await router.dispatchPairedBotRemote(method: method, params: params) },
+            currentSource: { [weak self] in
+                self?.selectedBotID == botID && self?.selectedConversation?.id == conversation.id
+                    && self?.context.liveActivityHostIdentity.serverId == pin.hostID
+            }, copy: copy)
+    }
+
+    @discardableResult
+    public func allowReadAndSend(botID: BotID, context: BotContext) -> Bool {
+        guard selectedBotID == botID else { return false }
+        if case .workspace(let id) = context, self.context.state.workspaces[id] == nil {
+            errorMessage = "This workspace no longer exists."
+            return false
+        }
+        let hostID = self.context.liveActivityHostIdentity.serverId
+        do {
+            let current = try botStore.getContextBinding(hostID: hostID, botID: botID, context: context)
+            if let current, current.state == .active, current.actions.isSuperset(of: [.read, .send]) { return true }
+            let actions: Set<BotContextAction>
+            if let current, current.state == .active {
+                actions = current.actions.union([.read, .send])
+            } else {
+                actions = [.read, .send]
+            }
+            try botStore.grantContext(hostID: hostID, botID: botID, context: context, actions: actions, expectedRevision: current?.policyRevision)
+            return true
+        } catch { errorMessage = error.localizedDescription; return false }
     }
 
     @discardableResult
     public func createDeskThread() -> Bool {
+        if let conversation = selectedConversation, conversation.botID == selectedBotID {
+            do {
+                if let pin = try botStore.conversationContextPin(conversationID: conversation.id) {
+                    return createDeskThread(in: pin.context)
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+                return false
+            }
+        }
+        return insertDeskConversation(botID: selectedBot?.id, routing: deskRouting)
+    }
+
+    @discardableResult
+    public func createDeskThread(in context: BotContext) -> Bool {
         guard let bot = selectedBot else { return false }
-        // No rail reveal: every + (header, rail, FAB) and test runs keep the
-        // user's panel layout and its saved hide choice.
-        let conversation = BotConversation(botID: bot.id, title: "New thread")
+        if case .workspace(let id) = context, self.context.state.workspaces[id] == nil {
+            errorMessage = "This workspace no longer exists."
+            return false
+        }
+        let hostID = self.context.liveActivityHostIdentity.serverId
+        do {
+            guard let binding = try botStore.getContextBinding(hostID: hostID, botID: bot.id, context: context),
+                  binding.state == .active,
+                  binding.actions.isSuperset(of: [.read, .send]) else {
+                errorMessage = "This Bot has no active read and send grant for this context."
+                return false
+            }
+            let route = deskRouting
+            guard route.provider == .distill,
+                  route.runAsUser.isCurrentAccount else {
+                errorMessage = "Contextual threads require the current Distill account."
+                return false
+            }
+            let model = Self.resolvedUnlinkedDeskModel(
+                route,
+                snapshot: selectedDeskSnapshot,
+                lastUsed: lastModelStore.model(for: route.provider)
+            )
+            guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                errorMessage = "Select a Main model before creating a contextual thread."
+                return false
+            }
+            var routing = route
+            routing.provider = .distill
+            routing.model = model
+            let workspaceID: WorkspaceID? = if case .workspace(let id) = context { id } else { nil }
+            var thread = AgentThread(
+                workspaceId: workspaceID, title: "New thread", provider: .distill,
+                providerInstanceId: route.providerInstanceID, model: model,
+                permissionMode: route.permissionMode, reasoningEffort: route.reasoningEffort,
+                serviceTier: route.serviceTier,
+                modelSelection: AgentModelSelection(
+                    provider: .distill, modelId: model,
+                    reasoningEffort: route.reasoningEffort, serviceTier: route.serviceTier,
+                    distillMainEffortSelection: route.distillMainEffortSelection ?? .fixed(route.reasoningEffort),
+                    distillReasoningEffortSelection: route.distillReasoningEffortSelection ?? .automatic,
+                    distillUltracode: route.distillUltracode
+                ),
+                runAsUser: route.runAsUser
+            )
+            thread.reasoningModel = route.reasoningModel
+            let conversation = BotConversation(botID: bot.id, title: "New thread", linkedAgentThreadID: thread.id)
+            try botStore.createContextualConversation(
+                conversation, newThread: thread, hostID: hostID,
+                context: context, policyRevision: binding.policyRevision
+            )
+            return insertDeskConversation(conversation, botID: bot.id, routing: routing)
+        } catch {
+            errorMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    @discardableResult
+    private func insertDeskConversation(_ conversation: BotConversation, botID: BotID, routing: BotDeskRouting) -> Bool {
+        conversations.removeAll { $0.id == conversation.id }
+        conversations.insert(conversation, at: 0)
+        deskRoutingByConversation[conversation.id] = routing
+        persistDeskRouting(for: conversation.id, botID: botID)
+        selectDeskThread(conversation.id)
+        return true
+    }
+
+    @discardableResult
+    private func insertDeskConversation(botID: BotID?, routing: BotDeskRouting) -> Bool {
+        guard let botID else { return false }
+        let conversation = BotConversation(botID: botID, title: "New thread")
         do {
             try botStore.upsertConversation(conversation)
         } catch {
-            errorMessage = String(describing: error)
+            errorMessage = error.localizedDescription
             return false
         }
-        conversations.removeAll { $0.id == conversation.id }
-        conversations.insert(conversation, at: 0)
-        deskRoutingByConversation[conversation.id] = deskRouting
-        persistDeskRouting(for: conversation.id, botID: bot.id)
-        selectDeskThread(conversation.id)
-        return true
+        return insertDeskConversation(conversation, botID: botID, routing: routing)
     }
 
     public var filteredDeskConversations: [BotConversation] {
@@ -5166,7 +5350,33 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func selectDeskThread(_ id: BotConversationID) {
-        guard let conversation = conversations.first(where: { $0.id == id }) else { return }
+        let conversation: BotConversation
+        do {
+            guard let resolved = try conversations.first(where: { $0.id == id })
+                    ?? context.botStore.conversation(id: id) else {
+                errorMessage = "Could not open conversation: It no longer exists."
+                return
+            }
+            guard resolved.botID == selectedBotID else {
+                errorMessage = "Could not open conversation: It belongs to another Bot."
+                return
+            }
+            if try context.botStore.conversationContextPin(conversationID: id) != nil {
+                guard let threadID = resolved.linkedAgentThreadID,
+                      try AppCommandRouter.contextPinnedThreadDestination(threadID, context: context)
+                        == .bot(resolved.botID, resolved.id) else {
+                    errorMessage = "Could not open conversation: Its pinned context is unavailable."
+                    return
+                }
+            }
+            conversation = resolved
+        } catch {
+            errorMessage = "Could not open conversation: \(error.localizedDescription)"
+            return
+        }
+        if !conversations.contains(where: { $0.id == id }) {
+            conversations.append(conversation)
+        }
         captureDeskRouting()
         selectedConversation = conversation
         publishInterestedDeskThreadID()
@@ -5694,7 +5904,7 @@ public final class BotsViewModel: ObservableObject {
                 NSLog("RemoteCode: manual actions of deleted bot could not be closed: \(error)")
             }
             if let service = computerGuestService {
-                Task.detached { [service] in
+                BotsViewModel.dockerWorkQueue.async {
                     service.teardown(botID: id)
                 }
             }
@@ -6132,6 +6342,7 @@ public final class BotsViewModel: ObservableObject {
         let next: [BotQueuedFollowUp]? = items.isEmpty ? nil : items
         guard queuedFollowUpsByBot[botID] != next else { return }
         queuedFollowUpsByBot[botID] = next
+        cancelChangedQueuedStarts(botID: botID)
         syncQueuedFollowUps()
     }
 
@@ -6157,6 +6368,28 @@ public final class BotsViewModel: ObservableObject {
               let threadID = conversation.linkedAgentThreadID else {
             throw BotStoreError.invalidRow("queued follow-up authority is stale")
         }
+        guard try botStore.conversationContextPin(conversationID: conversationID) == nil else {
+            throw BotStoreError.invalidInput("Contextual execution is unavailable until isolation is verified.")
+        }
+        func ownsQueuedDeskSendReservation() -> Bool {
+            (deskSendTasks[botID] ?? []).contains {
+                $0.threadID == threadID && $0.queuedRecord?.id.caseInsensitiveCompare(id) == .orderedSame
+            }
+        }
+        if context.coordinator.hasPendingProviderStart(threadId: threadID) || ownsQueuedDeskSendReservation() {
+            return ["force_status": "queued", "conversation_id": conversationID.value.uuidString.lowercased(), "thread_id": threadID.value.uuidString.lowercased()]
+        }
+        if let attempt = try HostDatabaseRestore.queueAttempt(kind: .bot, id: id, db: context.db),
+           try context.runRepo.get(id: attempt) != nil {
+            if context.coordinator.activeRunId(threadId: threadID) == attempt {
+                return ["force_status": "started", "run_id": attempt.value.uuidString.lowercased(), "conversation_id": conversationID.value.uuidString.lowercased(), "thread_id": threadID.value.uuidString.lowercased()]
+            }
+            throw BotStoreError.invalidInput("Restored queued outcome requires reconciliation before another send.")
+        }
+        if try HostDatabaseRestore.requiresQueueReview(kind: .bot, id: id, db: context.db) {
+            try admitDesktopSend(bot: bot)
+            try HostDatabaseRestore.approveQueue(kind: .bot, id: id, db: context.db)
+        }
         if try liveThreadIDs(for: botID).contains(threadID) {
             stopDeskThread(conversationID)
             return [
@@ -6166,6 +6399,9 @@ public final class BotsViewModel: ObservableObject {
             ]
         }
         drainHostQueuedFollowUp(bot: bot, conversation: conversation)
+        if context.coordinator.hasPendingProviderStart(threadId: threadID) || ownsQueuedDeskSendReservation() {
+            return ["force_status": "queued", "conversation_id": conversationID.value.uuidString.lowercased(), "thread_id": threadID.value.uuidString.lowercased()]
+        }
         guard queuedFollowUpsByBot[botID]?.contains(where: { $0.id == itemID }) != true,
               let runID = context.coordinator.activeRunId(threadId: threadID) else {
             throw BotStoreError.invalidRow("queued follow-up did not start")
@@ -6222,6 +6458,26 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    private struct BotContextualSendUnavailable: LocalizedError {
+        var errorDescription: String? {
+            "Contextual execution is unavailable until runtime isolation is verified."
+        }
+    }
+
+    private func rejectContextualConversationSend(for bot: BotDefinition) throws {
+        let conversation = selectedConversation.flatMap { $0.botID == bot.id ? $0 : nil }
+            ?? selectedConversationByBot[bot.id].flatMap { rememberedID in
+                destConversations(botID: bot.id).first { $0.id == rememberedID }
+            }
+        guard let conversation else { return }
+        try rejectContextualConversationSend(conversation)
+    }
+
+    private func rejectContextualConversationSend(_ conversation: BotConversation) throws {
+        guard try botStore.conversationContextPin(conversationID: conversation.id) != nil else { return }
+        throw BotContextualSendUnavailable()
+    }
+
     private func deskLinkedThreadID(for conversationID: BotConversationID) -> AgentThreadID? {
         if let selected = selectedConversation, selected.id == conversationID {
             return selected.linkedAgentThreadID
@@ -6237,6 +6493,12 @@ public final class BotsViewModel: ObservableObject {
         guard let bot = selectedBot else { return false }
         if let message = deskDistillEffortValidationMessage {
             errorMessage = message
+            return false
+        }
+        do {
+            try rejectContextualConversationSend(for: bot)
+        } catch {
+            errorMessage = error.localizedDescription
             return false
         }
         do {
@@ -6338,13 +6600,17 @@ public final class BotsViewModel: ObservableObject {
         guard resolvedRouter() != nil, try currentRevision(for: bot) != nil else {
             throw BotStoreError.invalidRow("Bot runtime is unavailable")
         }
-        try admitDesktopSend(bot: bot)
-
-        if let conversationID {
-            guard let existing = try botStore.conversation(id: conversationID),
+        let existingConversation = try conversationID.map { id -> BotConversation in
+            guard let existing = try botStore.conversation(id: id),
                   existing.botID == bot.id, existing.groupID == nil else {
                 throw BotStoreError.notFound
             }
+            try rejectContextualConversationSend(existing)
+            return existing
+        }
+        try admitDesktopSend(bot: bot)
+
+        if let existing = existingConversation {
             if existing.id == titioInboxConversationID {
                 // An LLM must never approve or answer for the user (§0.2):
                 // only the paired user's own text may reach the intercept,
@@ -6769,7 +7035,9 @@ public final class BotsViewModel: ObservableObject {
         let service = computerGuestService
         let appSupport = context.appSupportDirectory
         Task.detached { [weak self, service] in
-            service?.teardown(botID: bot.id)
+            if let service {
+                await BotsViewModel.runDockerBlocking { service.teardown(botID: bot.id) }
+            }
             do {
                 _ = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id)
                 await MainActor.run {
@@ -7897,7 +8165,18 @@ public final class BotsViewModel: ObservableObject {
         brainPane = pane
     }
 
+    private func cancelChangedQueuedStarts(botID: BotID) {
+        let items = queuedFollowUpsByBot[botID] ?? []
+        for work in deskSendTasks[botID] ?? [] where !work.providerAccepted {
+            if let record = work.queuedRecord,
+               items.first(where: { $0.id.uuidString.lowercased() == record.id.lowercased() }) != decodeQueuedFollowUp(record) {
+                work.task.cancel()
+            }
+        }
+    }
+
     private func persistQueuedFollowUps() {
+        for botID in Array(deskSendTasks.keys) { cancelChangedQueuedStarts(botID: botID) }
         let liveIDs = Set(queuedFollowUpsByBot.keys)
         let stored = try? botStore.listAllQueuedFollowUps()
         if let stored {
@@ -9934,6 +10213,7 @@ public final class BotsViewModel: ObservableObject {
                 title: Self.titleFromFirstMessage(text)
             )
         }
+        try rejectContextualConversationSend(conversation)
         if conversation.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || conversation.title == "New thread" {
             conversation.title = Self.titleFromFirstMessage(text)
@@ -10491,9 +10771,9 @@ public final class BotsViewModel: ObservableObject {
         }
         guard let service = computerGuestService else { return BotComputerDockerError.cliMissing.description }
         if isGuestRunning(botID) {
-            let running = await Task.detached(priority: .userInitiated) {
+            let running = await BotsViewModel.runDockerBlocking {
                 service.isContainerRunning(botID: botID)
-            }.value
+            }
             if running { return nil }
             guestRunningByBot[botID.value] = false
             guestLaunchStateByBot[botID.value] = .idle
@@ -10686,6 +10966,11 @@ public final class BotsViewModel: ObservableObject {
         threadID: AgentThreadID,
         runID: AgentRunID
     ) throws -> String {
+        guard let pinnedConversation = try botStore.conversation(id: conversationID),
+              pinnedConversation.botID == botID else {
+            throw BotStoreError.notFound
+        }
+        try rejectContextualConversationSend(pinnedConversation)
         guard let bot = bots.first(where: { $0.id == botID }) ?? (try? botStore.get(id: botID)),
               let revision = try currentRevision(for: bot) else {
             throw BotDeskSendRefused(reason: "Bot runtime is unavailable.")
@@ -11197,7 +11482,8 @@ public final class BotsViewModel: ObservableObject {
         conversation: BotConversation,
         userText: String,
         attachments: [AgentAttachment],
-        routingOverride: BotDeskRouting? = nil
+        routingOverride: BotDeskRouting? = nil,
+        queuedRecord: BotQueuedFollowUpRecord? = nil
     ) throws -> BotStartedRun? {
         // Dest first. Send used to listMemory/listSkillBindings after the
         // bubble painted. Both Desk and host-catalog sends snapshot the same
@@ -11223,16 +11509,24 @@ public final class BotsViewModel: ObservableObject {
             routing: routing,
             router: router
         )
+        if let queuedRecord {
+            try HostDatabaseRestore.recordQueueAttempt(kind: .bot, id: queuedRecord.id, runID: prepared.runID, db: context.db)
+        }
         beginDeskSendInFlight(for: bot.id)
         let epoch = deskStopEpoch[bot.id] ?? 0
         let work = DeskSendWork()
         work.threadID = prepared.thread.id
         work.runID = prepared.runID
+        work.queuedRecord = queuedRecord
         context.coordinator.reserveProviderStart(threadId: prepared.thread.id, runId: prepared.runID)
         work.task = EventBus.outsideMutationCapture {
             Task { [weak self] in
                 guard let self else { return }
                 defer {
+                    if !work.providerAccepted, let record = work.queuedRecord {
+                        do { try HostDatabaseRestore.pauseQueue(kind: .bot, id: record.id, db: self.context.db) }
+                        catch { self.errorMessage = "Queued message review state could not be saved: \(error)" }
+                    }
                     if let threadID = work.threadID, let runID = work.runID {
                         self.context.coordinator.discardProviderStartReservation(
                             threadId: threadID,
@@ -11268,6 +11562,15 @@ public final class BotsViewModel: ObservableObject {
                 // provider has accepted the turn or the start has failed.
                 let signposter = PerfSwitchMetrics.signposter
                 let startInterval = signposter.beginInterval("bot_send_start", id: signposter.makeSignpostID())
+                if let expected = queuedRecord {
+                    guard let current = try? self.botStore.listQueuedFollowUps(botID: bot.id).first(where: { $0.id == expected.id }),
+                          current.text == expected.text, current.payloadJSON == expected.payloadJSON,
+                          current.conversationID == expected.conversationID else {
+                        self.forgetDeskSend(work, botID: bot.id)
+                        self.clearDeskSendInFlight(for: bot.id)
+                        return
+                    }
+                }
                 let brain = self.destBrainInputs(for: bot, deskCache: deskBrain)
                 let started = await self.startSupervisedRun(
                     bot: bot,
@@ -11282,15 +11585,36 @@ public final class BotsViewModel: ObservableObject {
                     expectedEpoch: epoch
                 )
                 signposter.endInterval("bot_send_start", startInterval)
-                self.forgetDeskSend(work, botID: bot.id)
-                self.clearDeskSendInFlight(for: bot.id)
                 if let started {
+                    work.providerAccepted = true
+                    if let record = queuedRecord {
+                        do {
+                            if try self.botStore.acknowledgeQueuedFollowUp(record) {
+                                self.queuedFollowUpsByBot[bot.id]?.removeAll { $0.id.uuidString.lowercased() == record.id.lowercased() }
+                                if self.queuedFollowUpsByBot[bot.id]?.isEmpty == true { self.queuedFollowUpsByBot[bot.id] = nil }
+                                self.syncQueuedFollowUps()
+                                EventBus.shared.publish(kind: .botQueueUpdated, payload: .object([
+                                    "bot_id": .string(bot.id.value.uuidString.lowercased()),
+                                ]))
+                            } else {
+                                try HostDatabaseRestore.pauseQueue(kind: .bot, id: record.id, db: self.context.db)
+                                self.reloadQueuedFollowUpsFromStore(botID: bot.id)
+                                self.errorMessage = "Queued message changed during admission; review delivery before retrying."
+                            }
+                        } catch {
+                            self.errorMessage = "Queued message acknowledgement could not be saved: \(error)"
+                        }
+                    }
+                    self.forgetDeskSend(work, botID: bot.id)
+                    self.clearDeskSendInFlight(for: bot.id)
                     self.lastSendStartedProviderRun = true
                     self.lastLinkedRunIDByBot[bot.id] = started.runID
                     self.restoreDeskWorkLog(botID: bot.id)
                     self.restoreDeskLiveTurn(botID: bot.id)
                     _ = await self.followLinkedRun(bot: bot, started: started)
                 } else {
+                    self.forgetDeskSend(work, botID: bot.id)
+                    self.clearDeskSendInFlight(for: bot.id)
                     self.deskSendInFlightStartedAt = nil
                     self.recordNeedsAttention(bot: bot, conversation: prepared.conversation, userText: userText)
                 }
@@ -11587,11 +11911,35 @@ public final class BotsViewModel: ObservableObject {
         queuedFollowUps = selectedBotID.flatMap { queuedFollowUpsByBot[$0] } ?? []
     }
 
+    private func queuedFollowUpMayDrain(_ item: BotQueuedFollowUp, botID: BotID) -> Bool {
+        guard (deskSendTasks[botID] ?? []).isEmpty else { return false }
+        do {
+            guard try !HostDatabaseRestore.requiresQueueReview(kind: .bot, id: item.id.uuidString, db: context.db) else { return false }
+            if let attempt = try HostDatabaseRestore.queueAttempt(kind: .bot, id: item.id.uuidString, db: context.db),
+               try context.runRepo.get(id: attempt) != nil {
+                try HostDatabaseRestore.pauseQueue(kind: .bot, id: item.id.uuidString, db: context.db)
+                return false
+            }
+            return true
+        } catch {
+            errorMessage = String(describing: error)
+            return false
+        }
+    }
+
     private func drainQueuedFollowUp() {
         guard let bot = selectedBot else { return }
         guard !deskRunIsLive else { return }
         guard let next = queuedFollowUpsByBot[bot.id]?.first else {
             syncQueuedFollowUps()
+            return
+        }
+        guard queuedFollowUpMayDrain(next, botID: bot.id) else { return }
+        if let id = next.conversationID {
+            do {
+                guard let conversation = try botStore.conversation(id: id) else { return }
+                drainHostQueuedFollowUp(bot: bot, conversation: conversation)
+            } catch { errorMessage = String(describing: error) }
             return
         }
         composerText = next.text
@@ -11616,10 +11964,16 @@ public final class BotsViewModel: ObservableObject {
             $0.conversationID == conversation.id
         }), let next = queuedFollowUpsByBot[bot.id]?[index] else { return }
         if let threadID = conversation.linkedAgentThreadID,
-           context.coordinator.activeRunId(threadId: threadID) != nil {
+           (context.coordinator.activeRunId(threadId: threadID) != nil || context.coordinator.hasPendingProviderStart(threadId: threadID)) {
             return
         }
         do {
+            guard let bot = try botStore.get(id: bot.id), bot.deletedAt == nil,
+                  conversation.botID == bot.id else { throw BotStoreError.notFound }
+            try rejectContextualConversationSend(conversation)
+            guard queuedFollowUpMayDrain(next, botID: bot.id),
+                  let record = try botStore.listQueuedFollowUps(botID: bot.id).first(where: { $0.id.lowercased() == next.id.uuidString.lowercased() }),
+                  decodeQueuedFollowUp(record) == next else { return }
             try admitDesktopSend(bot: bot)
             let display = AgentChatTranscriptChrome.displayUserLine(
                 text: next.text,
@@ -11641,20 +11995,17 @@ public final class BotsViewModel: ObservableObject {
                 conversation: target,
                 userText: next.text,
                 attachments: next.attachments,
-                routingOverride: next.routing
+                routingOverride: next.routing,
+                queuedRecord: record
             ) {
                 stampDeskUserMessageIdentity(runID: started.runID, botID: bot.id)
+            } else {
+                try HostDatabaseRestore.pauseQueue(kind: .bot, id: next.id.uuidString, db: context.db)
             }
         } catch {
             errorMessage = String(describing: error)
             return
         }
-        queuedFollowUpsByBot[bot.id]?.removeAll { $0.id == next.id }
-        if queuedFollowUpsByBot[bot.id]?.isEmpty == true {
-            queuedFollowUpsByBot[bot.id] = nil
-        }
-        persistQueuedFollowUps()
-        syncQueuedFollowUps()
     }
 
     private func applyFollowThrough(
@@ -11827,7 +12178,7 @@ public final class BotsViewModel: ObservableObject {
         guestLaunchStateByBot[botID.value] = .starting
         Task.detached {
             do {
-                let ready = try service.provision(botID: botID)
+                let ready = try await BotsViewModel.runDockerBlocking { try service.provision(botID: botID) }
                 let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
                 await MainActor.run {
                     self.rememberGuestScreen(url: url, botID: botID, running: true)
@@ -11855,7 +12206,7 @@ public final class BotsViewModel: ObservableObject {
         }
         Task.detached { [service] in
             do {
-                try service.stop(botID: botID)
+                try await BotsViewModel.runDockerBlocking { try service.stop(botID: botID) }
                 await MainActor.run {
                     self.guestRunningByBot[botID.value] = false
                     self.guestLaunchStateByBot[botID.value] = .idle
@@ -11885,7 +12236,7 @@ public final class BotsViewModel: ObservableObject {
         guestRebuildingByBot[botID.value] = true
         Task.detached {
             do {
-                let ready = try service.rebuild(botID: botID)
+                let ready = try await BotsViewModel.runDockerBlocking { try service.rebuild(botID: botID) }
                 let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
                 await MainActor.run {
                     self.guestRebuildingByBot[botID.value] = false
@@ -11914,6 +12265,7 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func admitDesktopSend(bot: BotDefinition) throws {
+        guard settingsStore.reload().isBotControlPlaneActive else { throw BotPublishError.controlPlaneDisabled }
         let revision = try currentRevision(for: bot)
         let kind = desktopKindOverrideForTesting
             ?? resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace)
@@ -11931,6 +12283,26 @@ public final class BotsViewModel: ObservableObject {
         _ = try BotDesktopAdmission.requireSend(kind: kind, guestReady: ready)
     }
 
+    // Docker CLI calls block on process exit; keeping them off the Swift
+    // cooperative pool stops slow or hung probes from starving other tasks.
+    nonisolated static let dockerWorkQueue = DispatchQueue(
+        label: "RemoteCode.BotsViewModel.docker",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+
+    nonisolated static func runDockerBlocking<T>(_ work: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            dockerWorkQueue.async { continuation.resume(with: Result { try work() }) }
+        }
+    }
+
+    nonisolated static func runDockerBlocking<T>(_ work: @escaping () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            dockerWorkQueue.async { continuation.resume(returning: work()) }
+        }
+    }
+
     private var dockerGuestProbeTask: Task<Void, Never>?
     private var dockerGuestProbeGeneration = 0
 
@@ -11941,7 +12313,7 @@ public final class BotsViewModel: ObservableObject {
         dockerGuestProbeGeneration += 1
         let generation = dockerGuestProbeGeneration
         dockerGuestProbeTask = Task.detached { [weak self] in
-            let ready = service.proveReady()
+            let ready = await BotsViewModel.runDockerBlocking { service.proveReady() }
             await MainActor.run {
                 guard let self, self.dockerGuestProbeGeneration == generation else { return }
                 self.dockerGuestProbeReason = ready ? nil : service.lastReason
@@ -12374,85 +12746,6 @@ extension BotsViewModel: AgentRunObserver {
     }
 }
 
-// MARK: - Shared sidebar chrome
-
-/// One control for the single shell sidebar: Workspaces or Bots (roster).
-public struct BotsModeSwitcher: View {
-    public var isBotsSelected: Bool
-    public var onSelectAgentic: () -> Void
-    public var onSelectBots: () -> Void
-
-    public init(
-        isBotsSelected: Bool,
-        onSelectAgentic: @escaping () -> Void,
-        onSelectBots: @escaping () -> Void
-    ) {
-        self.isBotsSelected = isBotsSelected
-        self.onSelectAgentic = onSelectAgentic
-        self.onSelectBots = onSelectBots
-    }
-
-    public var body: some View {
-        HStack(spacing: 2) {
-            segment(
-                title: BotsChrome.Label.agentic,
-                symbol: "square.grid.2x2",
-                selected: !isBotsSelected,
-                identifier: "bots.chrome.agentic",
-                action: onSelectAgentic
-            )
-            segment(
-                title: BotsChrome.Label.bots,
-                symbol: "person.2",
-                selected: isBotsSelected,
-                identifier: "bots.chrome.bots",
-                action: onSelectBots
-            )
-        }
-        .padding(2)
-        // Glass track: the sidebar sits on NSVisualEffectView. An opaque
-        // surfaceRaised slab punches a dark block through that material.
-        .background(DS.Palette.hover)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                .strokeBorder(DS.Palette.line.opacity(0.45), lineWidth: DS.Border.hairline)
-        )
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("bots.chrome.mode")
-        .accessibilityLabel("Sidebar mode")
-        .accessibilityValue(isBotsSelected ? BotsChrome.Label.bots : BotsChrome.Label.agentic)
-    }
-
-    /// Native-feeling segmented control: recessed glass track, frosted
-    /// selected segment, compact height (desktop control, not a touch target).
-    private func segment(
-        title: String,
-        symbol: String,
-        selected: Bool,
-        identifier: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: DS.Space.xs) {
-                Image(systemName: symbol)
-                    .font(.system(size: 10, weight: .semibold))
-                    .accessibilityHidden(true)
-                Text(title)
-                    .font(DS.Font.caption.weight(selected ? .semibold : .medium))
-            }
-            .foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary)
-            .frame(maxWidth: .infinity, minHeight: 26)
-            .background(selected ? DS.Palette.pressed : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-        .accessibilityIdentifier(identifier)
-    }
-}
-
 /// Roster body shared by the shell sidebar and the detached Bots window.
 public struct BotsRosterList: View {
     @ObservedObject private var vm: BotsViewModel
@@ -12826,14 +13119,19 @@ public struct BotsRootView: View {
     /// Standalone Bots window keeps its own rail. The main shell hosts the
     /// roster inside the single sidebar instead.
     private let embedsRosterRail: Bool
+    /// The main shell has no Bots sidebar mode: "Manage Bots and Teams" shows the roster here.
+    private let showsCatalogRail: Bool
     @State private var pendingClearAllDeskThreads = false
     @State private var pendingDockerDataClear: BotID?
     @State private var isConfirmingTitioFactoryReset = false
+    @State private var pendingContextGrant: (botID: BotID, context: BotContext, contextName: String)?
+    @State private var contextExportModel: BotContextExportModel?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    public init(vm: BotsViewModel, embedsRosterRail: Bool = true) {
+    public init(vm: BotsViewModel, embedsRosterRail: Bool = true, showsCatalogRail: Bool = false) {
         self.vm = vm
         self.embedsRosterRail = embedsRosterRail
+        self.showsCatalogRail = showsCatalogRail
     }
 
     private var titlebarSafeAreaEdges: Edge.Set {
@@ -12909,26 +13207,20 @@ public struct BotsRootView: View {
         } message: {
             Text("This deletes the protected value from this Bot's storage.")
         }
-        .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail))
-        .modifier(BotTeamsGroupsSheets(vm: vm, teamsGroups: vm.teamsGroups, enabled: embedsRosterRail))
+        .modifier(BotsDeleteConfirmation(vm: vm, enabled: embedsRosterRail || showsCatalogRail))
+        .modifier(BotTeamsGroupsSheets(vm: vm, teamsGroups: vm.teamsGroups, enabled: embedsRosterRail || showsCatalogRail))
         .modifier(BotsUnsavedNewBotConfirmation(vm: vm))
         .onAppear { vm.scheduleFreshnessPass() }
     }
 
     private var showsRosterRail: Bool {
-        embedsRosterRail && vm.isControlPlaneActive
+        (embedsRosterRail || showsCatalogRail) && vm.isControlPlaneActive
     }
 
     private var rosterRail: some View {
         VStack(alignment: .leading, spacing: 0) {
-            BotsModeSwitcher(
-                isBotsSelected: true,
-                onSelectAgentic: { vm.requestLeaveBotsMode() },
-                onSelectBots: {}
-            )
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.top, DS.Space.xl)
             BotsRosterList(vm: vm)
+                .padding(.top, DS.Space.xl)
         }
         .frame(width: BotsChrome.rosterWidth)
         .background(DS.Palette.surface)
@@ -13745,6 +14037,41 @@ public struct BotsRootView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Open Studio for \(BotsViewModel.displayName(bot.name))")
             .accessibilityIdentifier("bots.desk.identity")
+            Menu {
+                Text(vm.selectedPinnedContextLabel)
+                Text("Contextual execution unavailable")
+                Divider()
+                Button("Export selected excerpts…") {
+                    do { contextExportModel = try vm.makeContextExportModel() }
+                    catch { vm.errorMessage = error.localizedDescription }
+                }
+                .disabled(vm.selectedPinnedContextLabel == "Legacy")
+                .accessibilityIdentifier("bots.desk.export.open")
+                Divider()
+                Button("New conversation in General") { vm.createDeskThread(in: .general) }
+                ForEach(vm.existingWorkspaceContexts, id: \.id) { workspace in
+                    Button("New conversation in \(workspace.name)") { vm.createDeskThread(in: .workspace(workspace.id)) }
+                }
+                if let botID = vm.selectedBotID {
+                    Divider()
+                    Button("Allow read and send in General…") {
+                        pendingContextGrant = (botID, .general, "General")
+                    }
+                    ForEach(vm.existingWorkspaceContexts, id: \.id) { workspace in
+                        Button("Allow read and send in \(workspace.name)…") {
+                            pendingContextGrant = (botID, .workspace(workspace.id), workspace.name)
+                        }
+                    }
+                }
+            } label: {
+                Text("Context: \(vm.selectedPinnedContextLabel)\(vm.selectedPinnedContextLabel == "Legacy" ? "" : " · execution unavailable")")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(1)
+            }
+            .help("Contextual conversations keep a fixed context. Contextual execution is unavailable.")
+            .accessibilityLabel("Conversation context: \(vm.selectedPinnedContextLabel). Contextual execution unavailable.")
+            .accessibilityIdentifier("bots.desk.context")
             Spacer(minLength: DS.Space.lg)
             HStack(spacing: Self.deskHeaderIconSpacing) {
                 DSIconButton("gearshape", help: "Studio") {
@@ -13778,6 +14105,20 @@ public struct BotsRootView: View {
         .padding(.trailing, DS.Space.xl)
         .frame(height: 44)
         .dsBar(edge: .bottom)
+        .sheet(item: $contextExportModel, onDismiss: { contextExportModel?.cancel(); contextExportModel = nil }) { model in
+            BotContextExportSheet(model: model)
+        }
+        .onChange(of: vm.selectedBotID) { _, _ in contextExportModel?.invalidate() }
+        .onChange(of: vm.selectedConversation?.id) { _, _ in contextExportModel?.invalidate() }
+        .confirmationDialog("Allow read and send in \(pendingContextGrant?.contextName ?? "context") for \(pendingContextGrant?.botID.description ?? "Bot")?", isPresented: Binding(get: { pendingContextGrant != nil }, set: { if !$0 { pendingContextGrant = nil } }), titleVisibility: .visible) {
+            Button("Allow read and send") {
+                if let target = pendingContextGrant { _ = vm.allowReadAndSend(botID: target.botID, context: target.context) }
+                pendingContextGrant = nil
+            }
+            Button("Cancel", role: .cancel) { pendingContextGrant = nil }
+        } message: {
+            Text("Grant only conversation read and send rights in \(pendingContextGrant?.contextName ?? "this context") for Bot \(pendingContextGrant?.botID.description ?? "unknown"). Execution remains unavailable.")
+        }
     }
 
     private func deskChat(_ bot: BotDefinition) -> some View {

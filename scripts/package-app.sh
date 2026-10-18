@@ -138,6 +138,11 @@ if [ ! -x "$SCHEDULED_TASK_AGENT" ]; then echo "missing $SCHEDULED_TASK_AGENT"; 
 if [ ! -x "$CLI" ]; then echo "missing $CLI"; exit 1; fi
 if [ ! -x "$DISTILL_SERVICE" ]; then echo "missing $DISTILL_SERVICE"; exit 1; fi
 if [ ! -x "$RUN_AS_USER_HELPER" ]; then echo "missing $RUN_AS_USER_HELPER"; exit 1; fi
+DATABASE_SCHEMA_VERSION="$("$BIN" --database-schema-version)"
+if ! [[ "$DATABASE_SCHEMA_VERSION" =~ ^[0-9]+$ ]]; then
+  echo "[package] invalid database schema version: $DATABASE_SCHEMA_VERSION" >&2
+  exit 1
+fi
 
 APP_PATH="${RC2_PACKAGE_APP_OUTPUT:-$DIST/$BUNDLE}"
 APP_EXECUTABLE="$APP_PATH/Contents/MacOS/RemoteCode"
@@ -242,6 +247,7 @@ cat > "$STAGING_APP/Contents/Info.plist" <<EOF
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundleVersion</key><string>${VERSION}</string>
+  <key>RC2DatabaseSchemaVersion</key><integer>${DATABASE_SCHEMA_VERSION}</integer>
   <key>CFBundleDocumentTypes</key>
   <array>
     <dict>

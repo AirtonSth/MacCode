@@ -12,6 +12,7 @@ public protocol DistillGuestLaunchResolving: Sendable {
     /// True when the thread runs inside a guest. Reads durable state only and
     /// has no side effects: recovery and transcript reads call it on open.
     func isGuestThread(_ threadId: AgentThreadID) -> Bool
+    func preservesSessionIdentity(_ threadId: AgentThreadID) -> Bool
     /// A launch plan for a guest thread, nil for a Mac thread. Throws when the
     /// thread belongs in a guest that cannot run it now; the run fails rather
     /// than run on the Mac. `progress` reports each stage as it starts.
@@ -19,6 +20,10 @@ public protocol DistillGuestLaunchResolving: Sendable {
         _ request: AgentRunRequest,
         progress: @escaping @Sendable (DistillGuestStage) -> Void
     ) async throws -> DistillGuestLaunchPlan?
+}
+
+public extension DistillGuestLaunchResolving {
+    func preservesSessionIdentity(_ threadId: AgentThreadID) -> Bool { false }
 }
 
 /// Why a guest thread cannot run now. It never runs on the Mac instead.
@@ -139,6 +144,7 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
     public let lease: DistillGuestLease?
     private let teardown: @Sendable (AgentRunStatus) async -> Void
     private let teardownTimeout: TimeInterval
+    private let onSessionOpened: (@Sendable (String) throws -> Void)?
     private let killGuestBody: @Sendable () async -> Void
     private let killGuestDetachedBody: @Sendable () -> Void
     private let lock = NSLock()
@@ -173,7 +179,8 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         teardown: @escaping @Sendable (AgentRunStatus) async -> Void,
         killGuest: (@Sendable () async -> Void)? = nil,
         killGuestDetached: (@Sendable () -> Void)? = nil,
-        teardownTimeout: TimeInterval = DistillGuestLaunchPlan.teardownTimeout
+        teardownTimeout: TimeInterval = DistillGuestLaunchPlan.teardownTimeout,
+        onSessionOpened: (@Sendable (String) throws -> Void)? = nil
     ) {
         self.runID = runID
         self.dockerExecutable = dockerExecutable
@@ -184,6 +191,7 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         self.lease = lease
         self.teardown = teardown
         self.teardownTimeout = teardownTimeout
+        self.onSessionOpened = onSessionOpened
         let killArguments = Self.killArguments(container: container, runID: runID, detached: false)
         let detachedArguments = Self.killArguments(container: container, runID: runID, detached: true)
         self.killGuestBody = killGuest ?? {
@@ -192,6 +200,10 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         self.killGuestDetachedBody = killGuestDetached ?? {
             Self.startDocker(dockerExecutable, detachedArguments, runID: runID)
         }
+    }
+
+    public func recordSessionOpened(_ id: String) throws {
+        try onSessionOpened?(id)
     }
 
     /// No `-e`: every value rides in the env file, so none shows in `ps`.

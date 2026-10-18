@@ -30,6 +30,8 @@ public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStri
     case screenshotTooLarge(actualBytes: Int, maximumBytes: Int)
     case screenshotResultTooLarge(actualBytes: Int, maximumBytes: Int)
     case rebuildWhileRunActive(threadTitle: String)
+    case contextualRuntimeUnavailable
+    case contextualRuntimeCapacityReached(limit: Int)
 
     public var description: String {
         switch self {
@@ -40,6 +42,10 @@ public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStri
         case .rebuildWhileRunActive(let threadTitle):
             return "The Linux desktop was not rebuilt: \(threadTitle) is running on it. "
                 + "Rebuild after that run finishes."
+        case .contextualRuntimeUnavailable:
+            return "Contextual guest runtime is unavailable."
+        case .contextualRuntimeCapacityReached(let limit):
+            return "At most \(limit) contextual desktops can run at once. Retry after one finishes."
         }
     }
 }
@@ -189,13 +195,65 @@ public final class BotComputerGuestService: @unchecked Sendable {
     /// before starting in it; that run holding the bot does not keep an
     /// outdated container. nil treats any run holding the bot as another's.
     public func provision(botID: BotID, requestingThreadID: AgentThreadID? = nil) throws -> BotComputerGuestReady {
-        try provision(botID: botID, keeping: [], requestingThreadID: requestingThreadID)
+        try provision(botID: botID, keeping: [], requestingThreadID: requestingThreadID, contextualNetworkPolicy: false)
+    }
+
+    public func provision(
+        contextBinding: BotContextBinding,
+        workspace: Workspace?,
+        registeredWorkspaces: Set<String>,
+        requestingThreadID: AgentThreadID? = nil
+    ) throws -> BotComputerGuestReady {
+        guard contextBinding.state == .active, contextBinding.actions.contains(.send) else {
+            throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+        }
+        let identity = try BotContextRuntimeIdentity(binding: contextBinding)
+        let desired: Set<String>
+        switch contextBinding.context {
+        case .general:
+            guard workspace == nil else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+            desired = []
+        case .workspace(let workspaceID):
+            guard contextBinding.actions.contains(.files), let workspace,
+                  workspace.id == workspaceID,
+                  registeredWorkspaces.contains(workspace.cwd) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            try BotComputerGuestSpec.assertWorkspaceMountPath(workspace.cwd, registeredWorkspaces: registeredWorkspaces)
+            let canonicalWorkspace = URL(fileURLWithPath: workspace.cwd).resolvingSymlinksInPath().standardizedFileURL.path
+            let canonicalSupport = appSupport.resolvingSymlinksInPath().standardizedFileURL.path
+            guard canonicalWorkspace != canonicalSupport,
+                  !canonicalWorkspace.hasPrefix(canonicalSupport + "/"),
+                  !canonicalSupport.hasPrefix(canonicalWorkspace + "/") else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            desired = [workspace.cwd]
+        }
+        let manifestURL = BotComputerGuestSpec.workspacesURL(appSupport: appSupport, botID: identity.storageBotID)
+        let existing: Set<String>
+        if FileManager.default.fileExists(atPath: manifestURL.path) {
+            guard let data = try? Data(contentsOf: manifestURL),
+                  let paths = try? JSONDecoder().decode([String].self, from: data) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            existing = Set(paths)
+        } else {
+            existing = []
+        }
+        guard existing.isSubset(of: desired) else {
+            throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+        }
+        if let path = desired.first {
+            try ensureWorkspaceMounted(botID: identity.storageBotID, workspace: path, registered: registeredWorkspaces, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true)
+        }
+        return try provision(botID: identity.storageBotID, keeping: desired, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true)
     }
 
     private func provision(
         botID: BotID,
         keeping: Set<String>,
-        requestingThreadID: AgentThreadID?
+        requestingThreadID: AgentThreadID?,
+        contextualNetworkPolicy: Bool = false
     ) throws -> BotComputerGuestReady {
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
         // A reused container sees the current kit through its bind too.
@@ -207,6 +265,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let image = try resolvedImage(botID: botID)
         let workspaces = prunedWorkspaces(botID: botID, keeping: keeping)
         if let existing = try? docker.inspect(name: name) {
+            let policyLabel = existing.labels["remotecode.context.network"] == "private-egress-v1"
+            guard contextualNetworkPolicy == policyLabel else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
             if networkMatches(existing, network: network),
                currentWorkspacesLabel(existing) == BotComputerGuestSpec.workspacesLabel(workspaces),
                heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID)
@@ -216,7 +278,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
                     Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }
                     try docker.start(name: name)
                 }
-                return try readyState(name: name, botID: botID, resumed: true)
+                return try readyState(name: name, botID: botID, resumed: true, contextualNetworkPolicy: contextualNetworkPolicy)
             }
             try? docker.remove(name: name)
         }
@@ -227,14 +289,15 @@ public final class BotComputerGuestService: @unchecked Sendable {
             appSupport: appSupport,
             viewerToken: viewerToken,
             image: image,
-            workspaces: workspaces
+            workspaces: workspaces,
+            contextualNetworkPolicy: contextualNetworkPolicy
         )
         options.network = network
         _ = try createContainer(options)
         // Unproven until `readyState` has its screenshot.
         Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }
         try docker.start(name: name)
-        return try readyState(name: name, botID: botID, resumed: false)
+        return try readyState(name: name, botID: botID, resumed: false, contextualNetworkPolicy: contextualNetworkPolicy)
     }
 
     /// The bot's container when it is already running and nothing about it is
@@ -307,19 +370,28 @@ public final class BotComputerGuestService: @unchecked Sendable {
         botID: BotID,
         workspace: String,
         registered: Set<String>,
-        requestingThreadID: AgentThreadID? = nil
+        requestingThreadID: AgentThreadID? = nil,
+        contextualNetworkPolicy: Bool = false
     ) throws {
         try BotComputerGuestSpec.assertWorkspaceMountPath(workspace, registeredWorkspaces: registered)
+        let canonical = BotComputerGuestSpec.containerName(botID: botID)
+        let existing = try? docker.inspect(name: canonical)
+        if let existing {
+            let policyLabel = existing.labels["remotecode.context.network"] == "private-egress-v1"
+            guard contextualNetworkPolicy == policyLabel else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+        }
         try BotGuestAgentKit.materialize(appSupport: appSupport)
         let stored = prunedWorkspaces(botID: botID, keeping: [workspace])
         let wanted = Array(Set(stored).union([workspace])).sorted()
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
-        let canonical = BotComputerGuestSpec.containerName(botID: botID)
-        guard let existing = try? docker.inspect(name: canonical) else {
+        guard existing != nil else {
             try saveWorkspaces(wanted, botID: botID)
-            _ = try provision(botID: botID, keeping: [workspace], requestingThreadID: requestingThreadID)
+            _ = try provision(botID: botID, keeping: [workspace], requestingThreadID: requestingThreadID, contextualNetworkPolicy: contextualNetworkPolicy)
             return
         }
+        guard let existing else { return }
         if stored.contains(workspace),
            existing.labels[BotComputerGuestSpec.workspacesLabelKey] == BotComputerGuestSpec.workspacesLabel(wanted),
            runtimeIsCurrent(existing) || heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID) {
@@ -334,7 +406,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
             viewerToken: try viewerToken(botID: botID),
             image: try resolvedImage(botID: botID),
             workspaces: wanted,
-            registeredWorkspaces: registered.union(stored)
+            registeredWorkspaces: registered.union(stored),
+            contextualNetworkPolicy: contextualNetworkPolicy
         )
         options.network = network
         if (try? docker.containerExists(name: backup)) == true {
@@ -434,6 +507,140 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     public func stop(botID: BotID) throws {
         try docker.stop(name: BotComputerGuestSpec.containerName(botID: botID))
+    }
+
+    public func stop(identity: BotContextRuntimeIdentity) throws {
+        try stop(botID: identity.storageBotID)
+    }
+
+    public func inspectForContextRecovery(identity: BotContextRuntimeIdentity) throws -> BotComputerContainerInspect? {
+        let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+        guard try docker.containerExists(name: name) else { return nil }
+        let actual = try docker.inspect(name: name)
+        try validateGatewayRuntime(actual, identity: identity)
+        let expectedHome = BotComputerGuestSpec.guestHomeURL(appSupport: appSupport, botID: identity.storageBotID)
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        guard let source = actual.homeSource,
+              URL(fileURLWithPath: source).resolvingSymlinksInPath().standardizedFileURL.path == expectedHome else {
+            throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+        }
+        return actual
+    }
+
+    public func stopForContextRecovery(identity: BotContextRuntimeIdentity) throws {
+        guard let before = try inspectForContextRecovery(identity: identity), before.running else { return }
+        try docker.stop(name: BotComputerGuestSpec.containerName(botID: identity.storageBotID))
+        guard let after = try inspectForContextRecovery(identity: identity), !after.running else {
+            throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+        }
+    }
+
+    public func installGatewayLease(
+        identity: BotContextRuntimeIdentity,
+        runID: AgentRunID,
+        port: UInt16
+    ) throws -> BotContextGatewayLease {
+        guard port > 0 else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+        let name = BotComputerGuestSpec.containerName(botID: identity.storageBotID)
+        do {
+            let inspect = try docker.inspect(name: name)
+            try validateGatewayRuntime(inspect, identity: identity)
+            guard inspect.running else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+            let hosts = try docker.exec(name: name, command: ["/bin/cat", "/etc/hosts"], user: "0", detach: false)
+            guard let hostAddress = Self.gatewayIPv4(from: hosts) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            let run = runID.value.uuidString.lowercased()
+            let output = try docker.exec(
+                name: name,
+                command: ["/usr/local/bin/rc-context-network", "--allow-gateway", run, hostAddress, String(port)],
+                user: "0", detach: false
+            )
+            guard output == Data("context-gateway-lease-v1\n".utf8) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            return BotContextGatewayLease(identity: identity, runID: runID, hostAddress: hostAddress, port: port)
+        } catch {
+            stateLock.withLock { _lastReady = nil; _lastReason = "Context gateway lease failed; runtime cleanup unconfirmed." }
+            Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }
+            throw error
+        }
+    }
+
+    public func revokeGatewayLease(_ lease: BotContextGatewayLease) throws {
+        let name = BotComputerGuestSpec.containerName(botID: lease.identity.storageBotID)
+        do {
+            let inspect = try docker.inspect(name: name)
+            try validateGatewayRuntime(inspect, identity: lease.identity)
+            guard inspect.running else { return }
+            let output = try docker.exec(
+                name: name,
+                command: ["/usr/local/bin/rc-context-network", "--revoke-gateway", lease.runID.value.uuidString.lowercased(), lease.hostAddress, String(lease.port)],
+                user: "0", detach: false
+            )
+            guard output == Data("context-gateway-revoked-v1\n".utf8) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+        } catch {
+            stateLock.withLock { _lastReady = nil; _lastReason = "Context gateway cleanup unconfirmed." }
+            Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }
+            throw error
+        }
+    }
+
+    private func validateGatewayRuntime(_ inspect: BotComputerContainerInspect, identity: BotContextRuntimeIdentity) throws {
+        guard inspect.labels[BotComputerGuestSpec.botIDLabelKey] == identity.storageBotID.value.uuidString.lowercased(),
+              inspect.labels["remotecode.context.network"] == "private-egress-v1",
+              inspect.labels[BotComputerGuestSpec.runtimeLabelKey] == BotComputerGuestSpec.runtimeRevision,
+              inspect.networkNames == [BotComputerGuestSpec.networkName(botID: identity.storageBotID)] else {
+            throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+        }
+    }
+
+    static func gatewayIPv4(from data: Data) -> String? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let matches = text.split(whereSeparator: \.isNewline).compactMap { line -> String? in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count > 1, fields.dropFirst().contains("host.docker.internal") else { return nil }
+            return String(fields[0])
+        }
+        guard matches.count == 1 else { return nil }
+        let parts = matches[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        let nums = parts.compactMap { part -> UInt8? in
+            guard let value = UInt8(part), String(value) == part else { return nil }
+            return value
+        }
+        guard nums.count == 4, nums != [0, 0, 0, 0],
+              (nums[0] == 10)
+                || (nums[0] == 172 && (16...31).contains(nums[1]))
+                || (nums[0] == 192 && nums[1] == 168)
+                || (nums[0] == 100 && (64...127).contains(nums[1]))
+                || (nums[0] == 169 && nums[1] == 254)
+                || (nums[0] == 198 && (18...19).contains(nums[1]))
+                || (nums[0] == 0 && nums[1...].contains(where: { $0 != 0 })) else { return nil }
+        return matches[0]
+    }
+
+    public func wipe(identity: BotContextRuntimeIdentity) throws {
+        let botID = identity.storageBotID
+        let name = BotComputerGuestSpec.containerName(botID: botID)
+        let network = BotComputerGuestSpec.networkName(botID: botID)
+        var containerRemovalError: Error?
+        do { try docker.remove(name: name) } catch { containerRemovalError = error }
+        var networkRemovalError: Error?
+        do { try docker.removeNetwork(name: network) } catch { networkRemovalError = error }
+
+        let containerExists: Bool
+        do { containerExists = try docker.containerExists(name: name) }
+        catch { throw containerRemovalError ?? networkRemovalError ?? error }
+        let networkExists: Bool
+        do { networkExists = try docker.networkExists(name: network) }
+        catch { throw containerRemovalError ?? networkRemovalError ?? error }
+        guard !containerExists, !networkExists else {
+            throw containerRemovalError ?? networkRemovalError ?? BotComputerDockerError.provisioningFailed
+        }
+        try BotGuestHome.wipe(appSupport: appSupport, botID: botID)
     }
 
     /// What Docker says right now (one `docker inspect`): false when the
@@ -550,6 +757,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
     /// Otherwise the rebuild holds the bot itself until it is done, so a send
     /// made during the build queues instead of starting on the old container.
     public func rebuild(botID: BotID, requestingThreadID: AgentThreadID? = nil) throws -> BotComputerGuestReady {
+        let container = BotComputerGuestSpec.containerName(botID: botID)
+        if try docker.containerExists(name: container) {
+            let existing = try docker.inspect(name: container)
+            guard existing.labels["remotecode.context.network"] != "private-egress-v1" else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+        }
         let claim = BotVMRunRegistry.Entry(
             threadID: AgentThreadID(), runID: AgentRunID(), title: Self.rebuildClaimTitle, workspace: ""
         )
@@ -784,7 +998,24 @@ public final class BotComputerGuestService: @unchecked Sendable {
         throw lastError
     }
 
-    private func readyState(name: String, botID: BotID, resumed: Bool) throws -> BotComputerGuestReady {
+    private func readyState(name: String, botID: BotID, resumed: Bool, contextualNetworkPolicy: Bool = false) throws -> BotComputerGuestReady {
+        if contextualNetworkPolicy {
+            Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }
+            do {
+                let initial = try docker.inspect(name: name)
+                guard initial.labels["remotecode.context.network"] == "private-egress-v1" else {
+                    throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+                }
+                let output = try docker.exec(name: name, command: ["/usr/local/bin/rc-context-network"], user: "0", detach: false, workdir: nil, environment: [:])
+                guard output == Data("context-network-policy-v1\n".utf8) else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+            } catch {
+                stateLock.withLock { _lastReady = nil; _lastReason = "Context network policy bootstrap failed; runtime cleanup unconfirmed." }
+                do { try docker.stop(name: name) } catch {
+                    stateLock.withLock { _lastReason = "Context network policy bootstrap failed; runtime cleanup unconfirmed: stop failed: \(error)." }
+                }
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+        }
         let png = try waitForPNG(name: name)
         Self.unprovenLock.withLock { _ = Self.unprovenContainers.remove(name) }
         let hash = try BotComputerGuestObserve.validatePNG(png)

@@ -1,4 +1,6 @@
 import Foundation
+import CoreFoundation
+import CryptoKit
 import CoreModel
 import os
 
@@ -70,6 +72,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     public var onHasLiveRun: ((BotID) -> Bool)?
     public var onStopRun: ((BotID, String?, String?, String?, Bool, String) -> Void)?
+    public var onContextBindingChanged: ((BotContextBinding) -> Bool)?
     public var onStartGuest: ((BotID, String, String, [String: Any]) -> Void)?
     public var onStopGuest: ((BotID, String, [String: Any]) -> Void)?
     public var onRebuildGuest: ((BotID, String, [String: Any]) -> Void)?
@@ -253,7 +256,38 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         if Self.reservedCapabilityIDs.contains(params["capability_id"] as? String ?? "") {
             throw Error.reserved
         }
+        let contextMethods: Set<String> = ["context.list", "context.grant", "context.revoke"]
+        if name == "conversation.enqueue" {
+            let fields: Set<String> = ["client_request_id", "host_id", "bot_id", "context_key", "context_version", "policy_revision", "conversation_id", "text"]
+            guard Set(params.keys) == fields else { throw Error.invalidParams }
+        }
+        if contextMethods.contains(name) {
+            guard Set(params.keys).isSubset(of: ["host_id", "bot_id", "context_key", "context_version", "policy_revision", "actions", "client_request_id"]) else { throw Error.invalidParams }
+        }
+        let hasContext = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
+        if hasContext && ["conversation.list", "conversation.select"].contains(name) {
+            let fields: Set<String> = name == "conversation.list"
+                ? ["host_id", "bot_id", "context_key", "context_version", "policy_revision"]
+                : ["host_id", "bot_id", "context_key", "context_version", "policy_revision", "client_request_id", "conversation_id"]
+            guard Set(params.keys).isSubset(of: fields) else { throw Error.invalidParams }
+        }
+        if hasContext, !contextMethods.contains(name) {
+            guard let context = parseContext(params), let (hostID, botID) = contextIdentity(params),
+                  let revision = integer(params["policy_revision"]), revision > 0,
+                  let action = contextAction(for: name) else { throw Error.invalidParams }
+            guard try store.authorizes(hostID: hostID, botID: botID, context: context, action: action, policyRevision: revision) else {
+                throw Error(code: -32084, message: "Bot context authority is not active for this request.")
+            }
+            if !["conversation.create", "conversation.list", "conversation.select", "conversation.enqueue", "conversation.export.preview", "conversation.export"].contains(name) { throw Error(code: -32602, message: "Context resource unavailable.") }
+            if name == "conversation.create" {
+                guard Set(params.keys).isSubset(of: ["client_request_id", "bot_id", "title", "host_id", "context_key", "context_version", "policy_revision"]) else { throw Error.invalidParams }
+            }
+        }
         switch name {
+        case "context.list":
+            return try contextList(params: params)
+        case "context.grant", "context.revoke":
+            return try mutate(name: name, params: params, now: now)
         case "list":
             return try list(params: params)
         case "get":
@@ -264,6 +298,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try queueList(params: params)
         case "conversation.list":
             return try conversationList(params: params)
+        case "conversation.export.preview", "conversation.export":
+            return try conversationExport(params: params, confirmed: name == "conversation.export")
         case "attachment.list":
             return try attachmentList(params: params)
         case "routine.list":
@@ -490,6 +526,16 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     ) -> (run: [String: Any], notification: [String: Any]?) {
         var run = routineRunRecord(routine, scheduledAt: scheduledAt, now: now)
         do {
+            if scheduledAt != nil {
+                guard settings.reload().isBotAutonomyActive else {
+                    routineSlotsNeedReseed = true
+                    throw Error(code: -32081, message: "Automatic bot tasks are paused.")
+                }
+                guard let current = try store.listEnabledRoutines().first(where: { $0.definition.id == routine.definition.id }),
+                      current.definition == routine.definition else {
+                    throw Error(code: -32079, message: "Scheduled task changed, was disabled or was removed before execution.")
+                }
+            }
             guard let onRoutineSend else {
                 throw Error(code: -32091, message: "Bot runtime is unavailable.")
             }
@@ -868,6 +914,61 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     // MARK: - Reads
 
+    private func contextList(params: [String: Any]) throws -> [String: Any] {
+        guard Set(params.keys).isSubset(of: ["host_id", "bot_id"]),
+              let (hostID, botID) = contextIdentity(params) else { throw Error.invalidParams }
+        return ["bindings": try store.listContextBindings(hostID: hostID, botID: botID).map(encodeContextBinding)]
+    }
+
+    private func encodeContextBinding(_ binding: BotContextBinding) -> [String: Any] {
+        ["host_id": binding.hostID, "bot_id": binding.botID.value.uuidString.lowercased(),
+         "context_key": binding.context.storageKey, "context_version": BotContext.contractVersion,
+         "policy_revision": binding.policyRevision, "state": binding.state.rawValue,
+         "actions": binding.actions.map(\.rawValue).sorted()]
+    }
+
+    private func contextIdentity(_ params: [String: Any]) -> (String, BotID)? {
+        guard let host = string(params, "host_id"), !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let raw = string(params, "bot_id"), let uuid = UUID(uuidString: raw) else { return nil }
+        return (host, BotID(uuid))
+    }
+
+    private func contextTarget(_ params: [String: Any]) throws -> (String, BotID, BotContext) {
+        guard let (host, botID) = contextIdentity(params), let context = parseContext(params) else { throw Error.invalidParams }
+        return (host, botID, context)
+    }
+
+    private func contextAction(for method: String) -> BotContextAction? {
+        switch method {
+        case "get", "list", "settings.get", "queue.list", "conversation.list", "attachment.list", "routine.list", "files.list", "browser.state", "guest.state": return .read
+        case "send", "queue.force_now", "conversation.create", "conversation.select", "conversation.clear_all", "conversation.fork", "conversation.enqueue": return .send
+        case "attachment.stage", "attachment.import", "attachment.remove", "files.mutate", "files.open_tab", "files.split", "files.location.set", "browser.action", "link.open", "guest.input", "guest.start", "guest.stop", "guest.rebuild", "guest.revoke", "guest.control": return .files
+        case "conversation.export.preview", "conversation.export": return .export
+        case "soul.set": return .memory
+        case "settings.set", "save", "set_pinned", "set_hidden", "desktop.set", "avatar.set", "handle.set", "verbosity.set", "caveman.set", "routing.set": return .configure
+        case "routine.create", "routine.update", "routine.enable", "routine.run", "routine.delete", "scheduler.tick": return .schedule
+        case "peer.ask", "peer.self_config": return .delegate
+        default: return nil
+        }
+    }
+
+    private func parseContext(_ params: [String: Any]) -> BotContext? {
+        guard let version = integer(params["context_version"]), version == BotContext.contractVersion,
+              let key = string(params, "context_key") else { return nil }
+        if key == "general:v1" { return .general }
+        let prefix = "workspace:v1:"
+        guard key.hasPrefix(prefix), let uuid = UUID(uuidString: String(key.dropFirst(prefix.count))),
+              key == "workspace:v1:\(uuid.uuidString.lowercased())" else { return nil }
+        return .workspace(WorkspaceID(uuid))
+    }
+
+    private func integer(_ value: Any?) -> Int64? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue.rounded(.towardZero) == number.doubleValue,
+              number.doubleValue >= Double(Int64.min), number.doubleValue < Double(Int64.max) else { return nil }
+        return number.int64Value
+    }
+
     private func list(params: [String: Any]) throws -> [String: Any] {
         let includeHidden = (params["include_hidden"] as? Bool) ?? false
         let bots = try store.list(includeHidden: includeHidden).map { try encodeBot($0) }
@@ -899,12 +1000,110 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return ["items": encodeQueue(items)]
     }
 
+    private func conversationExport(params: [String: Any], confirmed: Bool) throws -> [String: Any] {
+        var fields: Set<String> = ["host_id", "bot_id", "context_key", "context_version", "policy_revision", "conversation_id", "target_context_key", "target_policy_revision", "message_ids"]
+        if confirmed { fields.formUnion(["approved", "selection_sha256"]) }
+        guard Set(params.keys) == fields else { throw Error.invalidParams }
+        return try db.transaction {
+            try requireControlPlane()
+            let denied = Error(code: -32084, message: "Contextual export is not authorized for this selection.")
+            var targetParams = params
+            targetParams["context_key"] = params["target_context_key"]
+            guard let sourceContext = parseContext(params), let targetContext = parseContext(targetParams),
+                  let (hostID, botID) = contextIdentity(params),
+                  let revision = integer(params["policy_revision"]), revision > 0,
+                  let targetRevision = integer(params["target_policy_revision"]), targetRevision > 0,
+                  try store.authorizes(hostID: hostID, botID: botID, context: sourceContext, action: .read, policyRevision: revision),
+                  try store.authorizes(hostID: hostID, botID: botID, context: sourceContext, action: .export, policyRevision: revision),
+                  try store.authorizes(hostID: hostID, botID: botID, context: targetContext, action: .send, policyRevision: targetRevision),
+                  let rawConversation = string(params, "conversation_id"), let conversationID = UUID(uuidString: rawConversation),
+                  let conversation = try store.conversation(id: BotConversationID(conversationID)),
+                  conversation.botID == botID, conversation.groupID == nil,
+                  let threadID = conversation.linkedAgentThreadID,
+                  let pin = try store.conversationContextPin(conversationID: conversation.id),
+                  pin.hostID == hostID, pin.botID == botID, pin.context == sourceContext,
+                  pin.contextVersion == BotContext.contractVersion, pin.policyRevision == revision,
+                  let thread = try AgentThreadRepository(db: db).get(id: threadID),
+                  thread.actor == .bot(botID), thread.actorLockedAt != nil,
+                  thread.provider == .distill, thread.executionTarget == .vm,
+                  let rawIDs = params["message_ids"] as? [String], !rawIDs.isEmpty, rawIDs.count <= 32 else { throw denied }
+            switch sourceContext {
+            case .general: guard thread.workspaceId == nil else { throw denied }
+            case .workspace(let workspace): guard thread.workspaceId == workspace else { throw denied }
+            }
+            let ids = rawIDs.compactMap(UUID.init(uuidString:))
+            guard ids.count == rawIDs.count, Set(ids).count == ids.count else { throw denied }
+            let repository = AgentMessageRepository(db: db)
+            var messages: [[String: Any]] = []
+            var excerpts: [String] = []
+            var byteCount: Int64 = 0
+            for id in ids {
+                let membership = try db.prepare("SELECT length(CAST(content AS BLOB)) FROM agent_messages WHERE id=? COLLATE NOCASE AND thread_id=? COLLATE NOCASE;")
+                defer { membership.reset() }
+                try membership.bind(1, id.uuidString)
+                try membership.bind(2, threadID.value.uuidString)
+                guard try membership.step(), membership.columnInt64(0) >= 0 else { throw denied }
+                byteCount += membership.columnInt64(0)
+                guard byteCount <= 65_536,
+                      let message = try repository.get(id: AgentMessageID(id)), message.threadId == threadID,
+                      message.role == .user || message.role == .assistant,
+                      !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw denied }
+                messages.append(["id": id.uuidString.lowercased(), "role": message.role.rawValue, "text": message.content])
+                excerpts.append("\(message.role.rawValue):\n\(message.content)")
+            }
+            var result: [String: Any] = [
+                "host_id": hostID, "bot_id": botID.value.uuidString.lowercased(),
+                "conversation_id": conversation.id.value.uuidString.lowercased(),
+                "context_key": sourceContext.storageKey, "context_version": BotContext.contractVersion,
+                "policy_revision": revision, "target_context_key": targetContext.storageKey,
+                "target_policy_revision": targetRevision, "messages": messages,
+            ]
+            let canonical = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys, .withoutEscapingSlashes])
+            let digest = SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
+            if confirmed {
+                guard let approved = params["approved"] as? NSNumber,
+                      CFGetTypeID(approved) == CFBooleanGetTypeID(), approved.boolValue,
+                      string(params, "selection_sha256") == digest else { throw denied }
+            }
+            if confirmed {
+                // Receipt holds identifiers, counts and the digest only; never message text.
+                let receipt: [String: Any] = [
+                    "bot_id": botID.value.uuidString.lowercased(), "conversation_id": conversation.id.value.uuidString.lowercased(),
+                    "source_context_key": sourceContext.storageKey, "source_policy_revision": revision,
+                    "target_context_key": targetContext.storageKey, "target_policy_revision": targetRevision,
+                    "message_ids": ids.map { $0.uuidString.lowercased() }, "bytes": byteCount, "selection_sha256": digest,
+                ]
+                let detail = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys, .withoutEscapingSlashes])
+                try DeviceTrustRepository(db: db).audit(actor: "bot:\(hostID)", action: "bot.context.export", detail: String(decoding: detail, as: UTF8.self))
+            }
+            result["selection_sha256"] = digest
+            result["summary"] = excerpts.joined(separator: "\n\n")
+            result["exported"] = confirmed
+            result["execution_available"] = false
+            return result
+        }
+    }
+
     private func conversationList(params: [String: Any]) throws -> [String: Any] {
         let bot = try requireBot(params)
         let botID = id(bot)
         let inboxID = bot.handle.lowercased() == TitioIdentity.handle
             ? onTitioInbox?()?["conversation_id"] as? String : nil
-        let rows = try store.listConversations(botID: bot.id).map { conversation in
+        let scoped = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
+        let requestedContext = scoped ? parseContext(params) : nil
+        let requestedHost = scoped ? string(params, "host_id") : nil
+        let requestedRevision = scoped ? integer(params["policy_revision"]) : nil
+        var selectedIsVisible = false
+        let rows = try store.listConversations(botID: bot.id).compactMap { conversation -> [String: Any]? in
+            let pin = try store.conversationContextPin(conversationID: conversation.id)
+            if scoped {
+                guard let pin, let requestedContext, let requestedHost, let requestedRevision,
+                      let requestedVersion = integer(params["context_version"]),
+                      pin.hostID == requestedHost, pin.botID == bot.id, pin.context == requestedContext,
+                      Int64(pin.contextVersion) == requestedVersion, pin.policyRevision == requestedRevision else { return nil }
+            } else if pin != nil { return nil }
+            let conversationID = conversation.id.value.uuidString.lowercased()
+            if selectedConversation[botID] == conversationID { selectedIsVisible = true }
             var row: [String: Any] = [
                 "id": conversation.id.value.uuidString.lowercased(),
                 "title": conversation.title,
@@ -914,7 +1113,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             if row["id"] as? String == inboxID {
                 row["kind"] = "titio_inbox"
             }
-            let conversationID = conversation.id.value.uuidString.lowercased()
+            if let pin {
+                row["context_key"] = pin.context.storageKey
+                row["context_version"] = pin.contextVersion
+                row["policy_revision"] = pin.policyRevision
+                row["host_id"] = pin.hostID
+            }
             if let identity = liveConversationIdentity(
                 botID: botID,
                 conversationID: conversationID,
@@ -930,10 +1134,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             }
             return row
         }
-        return [
-            "conversations": rows,
-            "selected_id": selectedConversation[botID] as Any,
-        ]
+        var result: [String: Any] = ["conversations": rows]
+        if selectedIsVisible, let selected = selectedConversation[botID] { result["selected_id"] = selected }
+        return result
     }
 
     private func routineList(params: [String: Any]) throws -> [String: Any] {
@@ -1027,6 +1230,34 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             }
             return existing
         }
+        if name == "conversation.enqueue" {
+            let oldReceipts = receipts
+            let oldClaims = receiptClaims
+            let oldPersistedSidecarJSON = persistedSidecarJSON
+            do {
+                return try db.transaction {
+                    receipts = oldReceipts
+                    receiptClaims = oldClaims
+                    persistedSidecarJSON = oldPersistedSidecarJSON
+                    guard let context = parseContext(params),
+                          let (hostID, botID) = contextIdentity(params),
+                          let revision = integer(params["policy_revision"]), revision > 0,
+                          try store.authorizes(hostID: hostID, botID: botID, context: context, action: .send, policyRevision: revision) else {
+                        throw Error(code: -32084, message: "Bot context authority is not active for this request.")
+                    }
+                    let result = try perform(name: name, params: params, requestID: requestID, now: now)
+                    receipts[requestID] = result
+                    receiptClaims[requestID] = claim
+                    guard persistSidecar(withinTransaction: true).isEmpty else { throw Error.invalidParams }
+                    return result
+                }
+            } catch {
+                receipts = oldReceipts
+                receiptClaims = oldClaims
+                persistedSidecarJSON = oldPersistedSidecarJSON
+                throw error
+            }
+        }
         let result: [String: Any]
         do {
             result = try perform(name: name, params: params, requestID: requestID, now: now)
@@ -1059,12 +1290,35 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             withJSONObject: business,
             options: [.sortedKeys, .withoutEscapingSlashes]
         )
+        if name == "conversation.enqueue" {
+            return ["method": name, "params_sha256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()]
+        }
         guard let canonical = String(data: data, encoding: .utf8) else { throw Error.invalidParams }
         return ["method": name, "params": canonical]
     }
 
     private func perform(name: String, params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         switch name {
+        case "context.grant", "context.revoke":
+            let (hostID, botID, context) = try contextTarget(params)
+            guard let revision = integer(params["policy_revision"]) else { throw Error.invalidParams }
+            let binding: BotContextBinding
+            do {
+                if name == "context.grant" {
+                    guard let rawActions = params["actions"] as? [String], !rawActions.isEmpty,
+                          rawActions.count == Set(rawActions).count,
+                          let actions = Optional(Set(rawActions.compactMap(BotContextAction.init(rawValue:)))),
+                          actions.count == rawActions.count else { throw Error.invalidParams }
+                    binding = try store.grantContext(hostID: hostID, botID: botID, context: context, actions: actions, expectedRevision: revision)
+                } else {
+                    binding = try store.revokeContext(hostID: hostID, botID: botID, context: context, expectedRevision: revision)
+                }
+            } catch let error as BotStoreError {
+                throw Error(code: -32602, message: error.description)
+            }
+            var readback = encodeContextBinding(binding)
+            readback["run_cancellation_requested"] = onContextBindingChanged?(binding) ?? false
+            return receipt(requestID: requestID, status: .completed, botID: botID.value.uuidString.lowercased(), readback: readback)
         case "create":
             return try create(params: params, requestID: requestID, now: now)
         case "discard_new":
@@ -1095,6 +1349,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try stop(params: params, requestID: requestID, force: name == "force_stop", now: now)
         case "conversation.create":
             return try conversationCreate(params: params, requestID: requestID)
+        case "conversation.enqueue":
+            return try conversationEnqueue(params: params, requestID: requestID)
         case "conversation.select":
             return try conversationSelect(params: params, requestID: requestID)
         case "conversation.clear_all":
@@ -1440,6 +1696,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let hostID = string(params, "host_id") ?? ""
         let requestedConversationID = string(params, "conversation_id")
         let targetConversationID = requestedConversationID ?? selectedConversation[botID]
+        if let targetConversationID, let uuid = UUID(uuidString: targetConversationID),
+           try store.conversationContextPin(conversationID: BotConversationID(uuid)) != nil {
+            throw Error(code: -32602, message: "Context resource unavailable.")
+        }
         let conversation: BotConversationID?
         if let requestedConversationID, !requestedConversationID.isEmpty {
             guard let uuid = UUID(uuidString: requestedConversationID),
@@ -1704,6 +1964,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     }
 
     private func queueForceNow(params: [String: Any], requestID: String) throws -> [String: Any] {
+        try requireControlPlane()
         let bot = try requireBot(params)
         let itemID = string(params, "id") ?? ""
         var rows = try store.listQueuedFollowUps(botID: bot.id)
@@ -1824,6 +2085,36 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func conversationCreate(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let title = string(params, "title") ?? "New thread"
+        if ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil }) {
+            guard Set(params.keys).isSubset(of: ["client_request_id", "bot_id", "title", "host_id", "context_key", "context_version", "policy_revision"]),
+                  let context = parseContext(params), let (hostID, contextBotID) = contextIdentity(params),
+                  contextBotID == bot.id, let revision = integer(params["policy_revision"]), revision > 0,
+                  bot.currentRevisionID != nil,
+                  try store.authorizes(hostID: hostID, botID: bot.id, context: context, action: .read, policyRevision: revision),
+                  try store.authorizes(hostID: hostID, botID: bot.id, context: context, action: .send, policyRevision: revision) else {
+                throw Error(code: -32084, message: "Bot context authority is not active for this request.")
+            }
+            let route = routingPref[id(bot)]
+            guard route?["provider"] as? String == AgentProvider.distill.rawValue,
+                  let model = route?["model"] as? String,
+                  !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw Error(code: -32602, message: "Select an explicit Distill Main model before creating a contextual conversation.")
+            }
+            let workspaceID: WorkspaceID?
+            switch context {
+            case .general: workspaceID = nil
+            case .workspace(let workspace): workspaceID = workspace
+            }
+            let thread = AgentThread(workspaceId: workspaceID, title: title, provider: .distill, model: model)
+            let conversation = BotConversation(botID: bot.id, title: title, linkedAgentThreadID: thread.id)
+            let pin = try store.createContextualConversation(conversation, newThread: thread, hostID: hostID, context: context, policyRevision: revision)
+            selectedConversation[id(bot)] = conversation.id.value.uuidString.lowercased()
+            return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+                "conversation_id": conversation.id.value.uuidString.lowercased(), "thread_id": thread.id.value.uuidString.lowercased(),
+                "context_key": pin.context.storageKey, "context_version": pin.contextVersion,
+                "policy_revision": pin.policyRevision, "host_id": pin.hostID, "title": conversation.title,
+            ])
+        }
         let conversation = BotConversation(botID: bot.id, title: title)
         try store.upsertConversation(conversation)
         selectedConversation[id(bot)] = conversation.id.value.uuidString.lowercased()
@@ -1833,12 +2124,68 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         ])
     }
 
+
+    private func conversationEnqueue(params: [String: Any], requestID: String) throws -> [String: Any] {
+        try requireControlPlane()
+        let bot = try requireBot(params)
+        guard let text = params["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let context = parseContext(params), let (hostID, botID) = contextIdentity(params),
+              let revision = integer(params["policy_revision"]), revision > 0,
+              let conversationRaw = params["conversation_id"] as? String,
+              let conversationUUID = UUID(uuidString: conversationRaw),
+              let conversation = try store.conversation(id: BotConversationID(conversationUUID)),
+              bot.id == botID, conversation.botID == botID, conversation.groupID == nil,
+              let threadID = conversation.linkedAgentThreadID,
+              let pin = try store.conversationContextPin(conversationID: conversation.id),
+              pin.hostID == hostID, pin.botID == botID, pin.context == context,
+              Int64(pin.contextVersion) == integer(params["context_version"]), pin.policyRevision == revision,
+              let thread = try AgentThreadRepository(db: db).get(id: threadID),
+              thread.actor == .bot(botID), thread.actorLockedAt != nil,
+              thread.executionTarget == .vm, thread.provider == .distill,
+              (context == .general ? thread.workspaceId == nil : { if case .workspace(let workspace) = context { return thread.workspaceId == workspace }; return false }()),
+              thread.parentThreadId == nil,
+              thread.isEphemeral == false,
+              try store.authorizes(hostID: hostID, botID: botID, context: context, action: .send, policyRevision: revision) else {
+            throw Error(code: -32084, message: "Bot context authority is not active for this request.")
+        }
+        let queued = try AgentQueuedMessageRepository(db: db).enqueueWithinTransaction(
+            threadId: threadID, text: text, attachments: [], interactionMode: .default
+        )
+        try HostDatabaseRestore.pauseQueue(kind: .agent, id: queued.id.value.uuidString, db: db)
+        return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "enqueued": true,
+            "queue_id": queued.id.value.uuidString.lowercased(),
+            "conversation_id": conversation.id.value.uuidString.lowercased(),
+            "thread_id": threadID.value.uuidString.lowercased(),
+            "host_id": hostID,
+            "context_key": context.storageKey,
+            "context_version": pin.contextVersion,
+            "policy_revision": pin.policyRevision,
+            "execution_available": false,
+            "requires_user_send": true,
+        ])
+    }
+
     private func conversationSelect(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         let conversationID = string(params, "conversation_id") ?? ""
         guard let uuid = UUID(uuidString: conversationID),
               let conversation = try store.conversation(id: BotConversationID(uuid)) else { throw Error.conversationGone }
         guard conversation.botID == bot.id, conversation.groupID == nil else { throw Error.crossTarget }
+        let scoped = ["context_key", "context_version", "policy_revision"].contains(where: { params[$0] != nil })
+        let pin = try store.conversationContextPin(conversationID: conversation.id)
+        if scoped {
+            guard Set(params.keys).isSubset(of: ["client_request_id", "conversation_id", "bot_id", "host_id", "context_key", "context_version", "policy_revision"]),
+                  let requestedContext = parseContext(params), let hostID = string(params, "host_id"),
+                  let revision = integer(params["policy_revision"]),
+                  let version = integer(params["context_version"]),
+                  let pin, pin.hostID == hostID, pin.botID == bot.id, pin.context == requestedContext,
+                  pin.contextVersion == version, pin.policyRevision == revision else {
+                throw Error(code: -32602, message: "Context resource unavailable.")
+            }
+        } else if pin != nil {
+            throw Error(code: -32602, message: "Context resource unavailable.")
+        }
         let normalizedID = conversation.id.value.uuidString.lowercased()
         selectedConversation[id(bot)] = normalizedID
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
@@ -1920,6 +2267,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// iOS Run now: the phone's Test run. A real send in a new conversation;
     /// the receipt fails with the reason when the run could not start.
     private func routineRun(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
+        try requireControlPlane()
         let bot = try requireBot(params)
         guard let routineID = string(params, "routine_id"),
               let routineUUID = UUID(uuidString: routineID),
@@ -3486,7 +3834,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     // MARK: - Helpers
 
     private func requireControlPlane() throws {
-        guard settings.load().isBotControlPlaneActive else { throw Error.controlPlaneOff }
+        guard settings.reload().isBotControlPlaneActive else { throw Error.controlPlaneOff }
     }
 
     private func requireBot(_ params: [String: Any]) throws -> BotDefinition {
@@ -4331,7 +4679,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// instead of one per key. Returns the keys that were not written; those
     /// stay out of `persistedSidecarJSON`, so the next persist writes them again.
     @discardableResult
-    private func persistSidecar() -> [String] {
+    private func persistSidecar(withinTransaction: Bool = false) -> [String] {
         var failed: [String] = []
         var changed: [(key: String, json: Data)] = []
         func save(_ key: String, _ value: Any) {
@@ -4367,17 +4715,21 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         guard !changed.isEmpty else { return failed }
         var rejected: [String] = []
         do {
-            try db.transaction {
-                // The transaction helper runs this block again after a lock retry.
+            let writeRows = {
                 rejected = []
                 for row in changed {
                     do {
-                        try writeSidecarRow(row.key, String(decoding: row.json, as: UTF8.self), database: db)
+                        try self.writeSidecarRow(row.key, String(decoding: row.json, as: UTF8.self), database: self.db)
                     } catch {
-                        // Only this statement is undone; the other rows still commit.
                         rejected.append(row.key)
                     }
                 }
+            }
+            if withinTransaction {
+                writeRows()
+                guard rejected.isEmpty else { return failed + rejected }
+            } else {
+                try db.transaction(writeRows)
             }
         } catch {
             // What reached the database is unknown: write these rows again next time.

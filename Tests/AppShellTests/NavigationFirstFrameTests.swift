@@ -76,20 +76,12 @@ final class SidebarViewTests: XCTestCase {
 
     func test_workspaceBotsBoundaryMountsWithoutAnimation() throws {
         let sidebar = try source("Sources/AppShell/SidebarView.swift")
-        let start = try XCTUnwrap(sidebar.range(of: "if vm.isBotsSelected, let botsVM"))
-        let tail = sidebar[start.upperBound...]
-        let end = tail.range(of: "\n            accountFooter")?.lowerBound ?? tail.endIndex
-        let boundary = String(tail[..<end])
-        XCTAssertFalse(boundary.contains(".transition("), "Workspaces/Bots sidebar content must mount in the first frame")
+        XCTAssertFalse(sidebar.contains("BotsRosterList("), "the unified sidebar mounts no Bots roster, so there is no content boundary to animate")
         XCTAssertFalse(
             sidebar.contains(".animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: vm.isBotsSelected)"),
             "the Workspaces/Bots boundary must not animate for 200ms"
         )
         let bots = try source("Sources/AppShell/BotsWindow.swift")
-        XCTAssertFalse(
-            bots.contains(".animation(DS.Motion.micro, value: selected)"),
-            "the Workspaces/Bots switcher must not animate the selected segment"
-        )
         XCTAssertTrue(bots.contains("publishedRoster"))
         XCTAssertTrue(bots.contains("waitForCommittedFrame"))
     }
@@ -407,7 +399,7 @@ extension BotsWindowTests {
             encoding: .utf8
         )
         XCTAssertTrue(source.contains("vm.enableNavigationFirstFrameDeferral()"))
-        XCTAssertTrue(source.contains("BotsRootView(vm: vm, embedsRosterRail: false)"))
+        XCTAssertTrue(source.contains("BotsRootView(vm: vm, embedsRosterRail: false, showsCatalogRail: true)"))
         XCTAssertTrue(source.contains("removePreviousShellHostAfterFirstFrame"))
     }
 

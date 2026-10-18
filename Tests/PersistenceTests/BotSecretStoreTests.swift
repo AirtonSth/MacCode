@@ -88,6 +88,45 @@ final class BotSecretStoreTests: XCTestCase {
         XCTAssertEqual(try secretStore.list(botID: other).map(\.name), ["OTHER_TOKEN", "SERVICE_TOKEN"])
     }
 
+    func test_contextStoreSeparatesNamespacesForSameLogicalBot() throws {
+        let logicalBot = BotID()
+        let identityA = try BotContextRuntimeIdentity(hostID: "host", botID: logicalBot, context: .general, policyRevision: 1)
+        let identityB = try BotContextRuntimeIdentity(hostID: "host", botID: logicalBot, context: .workspace(WorkspaceID()), policyRevision: 1)
+        let backing = InMemoryBotSecretStore()
+        let storeA = BotContextSecretStore(identity: identityA, store: backing, authorizes: { true })
+        let storeB = BotContextSecretStore(identity: identityB, store: backing, authorizes: { true })
+
+        try storeA.save(botID: logicalBot, name: "MARKER", value: "A")
+        try storeB.save(botID: logicalBot, name: "MARKER", value: "B")
+        XCTAssertEqual(try storeA.load(botID: logicalBot, name: "MARKER"), "A")
+        XCTAssertEqual(try storeB.load(botID: logicalBot, name: "MARKER"), "B")
+        XCTAssertEqual(try backing.load(botID: logicalBot, name: "MARKER"), nil)
+    }
+
+    func test_contextStoreDeniesForeignBotAndInitialDenialWithoutStorageAccess() throws {
+        let logicalBot = BotID()
+        let identity = try BotContextRuntimeIdentity(hostID: "host", botID: logicalBot, context: .general, policyRevision: 1)
+        let backing = CountingSecretStore()
+        let denied = BotContextSecretStore(identity: identity, store: backing, authorizes: { false })
+        XCTAssertThrowsError(try denied.list(botID: logicalBot))
+        XCTAssertThrowsError(try BotContextSecretStore(identity: identity, store: backing, authorizes: { true }).list(botID: BotID()))
+        XCTAssertEqual(backing.operationCount, 0)
+    }
+
+    func test_contextStoreRechecksAuthorizationAfterReadAndListing() throws {
+        let logicalBot = BotID()
+        let identity = try BotContextRuntimeIdentity(hostID: "host", botID: logicalBot, context: .general, policyRevision: 1)
+        let backing = CountingSecretStore()
+        try backing.save(botID: identity.storageBotID, name: "MARKER", value: "secret")
+        let authorized = AuthorizationFlag()
+        authorized.value = true
+        backing.onRead = { authorized.value = false }
+        let scoped = BotContextSecretStore(identity: identity, store: backing, authorizes: { authorized.value })
+        XCTAssertThrowsError(try scoped.load(botID: logicalBot, name: "MARKER"))
+        authorized.value = true
+        XCTAssertThrowsError(try scoped.list(botID: logicalBot))
+    }
+
     func test_secretNamesRequireASCIIEnvironmentKeys_andReserveRemoteCodeControlKeys() throws {
         XCTAssertTrue(BotKeychainSecretStore.isValidName("SERVICE_TOKEN"))
         XCTAssertTrue(BotKeychainSecretStore.isValidName("_private2"))
@@ -153,5 +192,55 @@ final class BotSecretStoreTests: XCTestCase {
         XCTAssertEqual(deleted["deleted"] as? Bool, true)
         XCTAssertTrue(try secretStore.list(botID: caller.id).isEmpty)
         XCTAssertEqual(try secretStore.list(botID: other.id).map(\.name), ["OTHER_TOKEN"])
+    }
+}
+
+private final class AuthorizationFlag: @unchecked Sendable {
+    var value = false
+}
+
+private final class CountingSecretStore: BotSecretStore, @unchecked Sendable {
+    private let backing = InMemoryBotSecretStore()
+    private let lock = NSLock()
+    private var count = 0
+    var onRead: (() -> Void)?
+
+    var operationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    private func record() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    func list(botID: BotID) throws -> [BotSecretMetadata] {
+        record()
+        onRead?()
+        return try backing.list(botID: botID)
+    }
+
+    func save(botID: BotID, name: String, value: String) throws {
+        record()
+        try backing.save(botID: botID, name: name, value: value)
+    }
+
+    func load(botID: BotID, name: String) throws -> String? {
+        record()
+        onRead?()
+        return try backing.load(botID: botID, name: name)
+    }
+
+    func delete(botID: BotID, name: String) throws {
+        record()
+        try backing.delete(botID: botID, name: name)
+    }
+
+    func deleteAll(botID: BotID) throws {
+        record()
+        try backing.deleteAll(botID: botID)
     }
 }

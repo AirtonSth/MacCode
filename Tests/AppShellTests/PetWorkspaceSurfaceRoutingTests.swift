@@ -1,4 +1,5 @@
 import AppKit
+import AgentRuntime
 import XCTest
 @testable import AppShell
 import CoreModel
@@ -291,6 +292,70 @@ final class PetWorkspaceSurfaceRoutingTests: XCTestCase {
         )
     }
 
+    func test_pinnedBotAttentionOpensExactContextsAndRetainsRevokedTarget() throws {
+        let fixture = try makeFixture(prefix: "PinnedBot")
+        defer { fixture.cleanup() }
+        let workspace = try fixture.router.createWorkspace(name: "Pinned workspace", cwd: NSTemporaryDirectory())
+        fixture.trackSurfaces(in: workspace.id)
+        let bot = try fixture.context.botStore.create(name: "Pinned Bot", title: "Scout", description: "", provider: .distill)
+        let hostID = fixture.context.liveActivityHostIdentity.serverId
+        var conversations: [BotConversation] = []
+        var attentionItems: [BotAttentionItem] = []
+        for pinContext in [BotContext.general, .workspace(workspace.id)] {
+            let grant = try fixture.context.botStore.grantContext(
+                hostID: hostID, botID: bot.id, context: pinContext, actions: [.read], expectedRevision: 0
+            )
+            let thread = AgentThread(workspaceId: pinContext == .general ? nil : workspace.id,
+                                     title: "Pinned attention", provider: .distill, model: "test")
+            let conversation = BotConversation(botID: bot.id, title: "Pinned attention",
+                                               attentionState: .needsAttention, linkedAgentThreadID: thread.id)
+            try fixture.context.botStore.createContextualConversation(
+                conversation, newThread: thread, hostID: hostID, context: pinContext, policyRevision: grant.policyRevision
+            )
+            try fixture.context.runRepo.upsert(AgentRun(threadId: thread.id, provider: .distill, model: "test", status: .completed))
+            let attention = BotAttentionItem(botID: bot.id, conversationID: conversation.id, kind: .question, title: "Context question")
+            try fixture.context.botStore.upsertAttention(attention)
+            attentionItems.append(attention)
+            conversations.append(conversation)
+        }
+        let pet = try fixture.startPet()
+        defer { pet.stop() }
+        for (conversation, attention) in zip(conversations, attentionItems) {
+            fixture.open(itemID: "bot.attention:\(attention.id.value.uuidString)", with: pet)
+            XCTAssertEqual(fixture.router.botsViewModel?.selectedBotID, bot.id)
+            XCTAssertEqual(fixture.router.botsViewModel?.screen, .desk)
+            XCTAssertEqual(fixture.router.botsViewModel?.selectedConversation?.id, conversation.id)
+            XCTAssertTrue(fixture.windowController.window.isVisible)
+            XCTAssertFalse(fixture.windowController.window.isMiniaturized)
+            XCTAssertNil(try fixture.context.botStore.listAttention(includeAcknowledged: true).first { $0.id == attention.id }?.acknowledgedAt)
+            XCTAssertNil(pet.modelForTests.routeError)
+        }
+        fixture.open(itemID: "bot.attention:\(attentionItems[0].id.value.uuidString)", with: pet)
+        let workspaceThreadID = try XCTUnwrap(conversations[1].linkedAgentThreadID)
+        fixture.context.coordinator.onActiveRunProjectionChanged?(
+            ActiveRunProjection(runs: [.init(threadId: workspaceThreadID, runId: AgentRunID())]), .started
+        )
+        let deadline = Date().addingTimeInterval(3)
+        while pet.modelForTests.activeThreads.first?.route != .botsDesk(botID: bot.id), Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+        }
+        let active = try XCTUnwrap(pet.modelForTests.activeThreads.first { $0.threadID == workspaceThreadID })
+        pet.windowControllerForTests.onOpenActiveThread?(active)
+        XCTAssertEqual(fixture.router.botsViewModel?.selectedConversation?.id, conversations[1].id,
+                       "an active Bot row must open its exact thread, not the previously selected context")
+        fixture.open(itemID: "bot.attention:\(attentionItems[0].id.value.uuidString)", with: pet)
+        _ = try fixture.context.botStore.revokeContext(
+            hostID: hostID, botID: bot.id, context: .workspace(workspace.id), expectedRevision: 1
+        )
+        pet.windowControllerForTests.onOpenActiveThread?(active)
+        XCTAssertEqual(fixture.router.botsViewModel?.selectedConversation?.id, conversations[0].id)
+        fixture.open(itemID: "bot.attention:\(attentionItems[1].id.value.uuidString)", with: pet)
+        XCTAssertEqual(fixture.router.botsViewModel?.selectedConversation?.id, conversations[0].id,
+                       "revoked attention must not change the visible conversation")
+        XCTAssertNil(try fixture.context.botStore.listAttention(includeAcknowledged: true).first { $0.id == attentionItems[1].id }?.acknowledgedAt)
+        XCTAssertNotNil(pet.modelForTests.routeError)
+    }
+
     private func makeFixture(prefix: String) throws -> PetRouteFixture {
         let fixture = try PetRouteFixture(prefix: prefix)
         let directory = fixture.directory
@@ -333,7 +398,7 @@ private final class PetRouteFixture {
         var drained = false
         DispatchQueue.main.async { drained = true }
         let deadline = Date().addingTimeInterval(1)
-        while !drained, RunLoop.main.run(mode: .default, before: deadline) {}
+        while !drained, Date() < deadline, RunLoop.main.run(mode: .default, before: deadline) {}
         XCTAssertTrue(drained, "The queued window tree refresh must finish before route verification.")
     }
 

@@ -33,6 +33,66 @@ public enum BotSecretStoreError: Error, Equatable, CustomStringConvertible {
     }
 }
 
+public enum BotContextSecretStoreError: Error, Equatable, CustomStringConvertible {
+    case unavailable
+
+    public var description: String {
+        "Contextual secret storage is unavailable."
+    }
+}
+
+/// Bot-secret access scoped to one authorized contextual storage namespace.
+public struct BotContextSecretStore: BotSecretStore {
+    private let identity: BotContextRuntimeIdentity
+    private let store: any BotSecretStore
+    private let authorizes: @Sendable () -> Bool
+
+    public init(
+        identity: BotContextRuntimeIdentity,
+        store: any BotSecretStore,
+        authorizes: @escaping @Sendable () -> Bool
+    ) {
+        self.identity = identity
+        self.store = store
+        self.authorizes = authorizes
+    }
+
+    public func list(botID: BotID) throws -> [BotSecretMetadata] {
+        try authorize(botID)
+        let result = try store.list(botID: identity.storageBotID)
+        try authorize(botID)
+        return result
+    }
+
+    public func save(botID: BotID, name: String, value: String) throws {
+        try authorize(botID)
+        try store.save(botID: identity.storageBotID, name: name, value: value)
+    }
+
+    public func load(botID: BotID, name: String) throws -> String? {
+        try authorize(botID)
+        let result = try store.load(botID: identity.storageBotID, name: name)
+        try authorize(botID)
+        return result
+    }
+
+    public func delete(botID: BotID, name: String) throws {
+        try authorize(botID)
+        try store.delete(botID: identity.storageBotID, name: name)
+    }
+
+    public func deleteAll(botID: BotID) throws {
+        try authorize(botID)
+        try store.deleteAll(botID: identity.storageBotID)
+    }
+
+    private func authorize(_ botID: BotID) throws {
+        guard botID == identity.botID, authorizes() else {
+            throw BotContextSecretStoreError.unavailable
+        }
+    }
+}
+
 public enum BotSecretEnvironmentError: Error, Equatable, CustomStringConvertible {
     case protectedStorageUnavailable
 

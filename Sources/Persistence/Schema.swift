@@ -65,7 +65,11 @@ public enum Schema {
     /// its source (exactly-once delivery across replays, producers and restarts)
     /// and the singleton inbox state (conversation id, unread, preview, armed reply).
     static let titioNoticesSchemaVersion = 93
-    public static let currentVersion: Int = titioNoticesSchemaVersion
+    static let botContextsSchemaVersion = 94
+    static let botConversationContextsSchemaVersion = 95
+    static let botContextDelegationsSchemaVersion = 96
+    static let hostRestoreQueueHoldsSchemaVersion = 97
+    public static let currentVersion: Int = hostRestoreQueueHoldsSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1847,6 +1851,101 @@ public enum Schema {
         UPDATE bots SET caveman_enabled = 0 WHERE lower(handle) = 'titio';
         """),
         SchemaStep(titioNoticesSchemaVersion, titioNoticesMigrationSQL),
+        SchemaStep(botContextsSchemaVersion, """
+        CREATE TABLE IF NOT EXISTS bot_context_bindings (
+            host_id TEXT NOT NULL CHECK(length(trim(host_id)) > 0),
+            bot_id TEXT NOT NULL,
+            context_key TEXT NOT NULL,
+            contract_version INTEGER NOT NULL CHECK(typeof(contract_version) = 'integer'),
+            state TEXT NOT NULL CHECK(state IN ('active', 'revoked')),
+            policy_revision INTEGER NOT NULL CHECK(typeof(policy_revision) = 'integer' AND policy_revision > 0),
+            actions TEXT NOT NULL,
+            PRIMARY KEY(host_id, bot_id, context_key),
+            FOREIGN KEY(bot_id) REFERENCES bots(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_context_bindings_bot ON bot_context_bindings(bot_id, host_id);
+        """),
+        SchemaStep(botConversationContextsSchemaVersion, """
+        CREATE TABLE IF NOT EXISTS bot_conversation_contexts (
+            conversation_id TEXT PRIMARY KEY NOT NULL,
+            host_id TEXT NOT NULL CHECK(length(trim(host_id)) > 0),
+            bot_id TEXT NOT NULL,
+            context_key TEXT NOT NULL,
+            policy_revision INTEGER NOT NULL CHECK(typeof(policy_revision) = 'integer' AND policy_revision > 0),
+            context_version INTEGER NOT NULL CHECK(typeof(context_version) = 'integer'),
+            thread_id TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            FOREIGN KEY(conversation_id) REFERENCES bot_conversations(id) ON DELETE CASCADE
+        );
+        CREATE TRIGGER IF NOT EXISTS bot_conversation_contexts_immutable
+        BEFORE UPDATE ON bot_conversation_contexts
+        BEGIN SELECT RAISE(ABORT, 'bot conversation context is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS bot_conversation_contexts_link_guard
+        BEFORE INSERT ON bot_conversation_contexts
+        WHEN NOT EXISTS (
+            SELECT 1 FROM bot_conversations
+            WHERE id = NEW.conversation_id
+              AND bot_id = NEW.bot_id
+              AND linked_agent_thread_id = NEW.thread_id COLLATE NOCASE
+        )
+        BEGIN SELECT RAISE(ABORT, 'conversation context thread mismatch'); END;
+        CREATE TRIGGER IF NOT EXISTS bot_conversation_pinned_thread_immutable
+        BEFORE UPDATE OF linked_agent_thread_id ON bot_conversations
+        WHEN EXISTS (
+            SELECT 1 FROM bot_conversation_contexts
+            WHERE conversation_id = OLD.id
+              AND OLD.linked_agent_thread_id IS NOT NEW.linked_agent_thread_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'pinned conversation thread is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS bot_conversation_pinned_thread_insert_guard
+        BEFORE INSERT ON bot_conversations
+        WHEN NEW.linked_agent_thread_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM bot_conversation_contexts
+            WHERE thread_id = NEW.linked_agent_thread_id COLLATE NOCASE
+              AND conversation_id <> NEW.id
+        )
+        BEGIN SELECT RAISE(ABORT, 'thread already has a contextual conversation'); END;
+        CREATE TRIGGER IF NOT EXISTS bot_conversation_pinned_thread_update_guard
+        BEFORE UPDATE OF linked_agent_thread_id ON bot_conversations
+        WHEN NEW.linked_agent_thread_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM bot_conversation_contexts
+            WHERE thread_id = NEW.linked_agent_thread_id COLLATE NOCASE
+              AND conversation_id <> OLD.id
+        )
+        BEGIN SELECT RAISE(ABORT, 'thread already has a contextual conversation'); END;
+        """),
+        SchemaStep(botContextDelegationsSchemaVersion, """
+        CREATE TABLE IF NOT EXISTS bot_context_delegations (
+            child_run_id TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+            parent_run_id TEXT NOT NULL COLLATE NOCASE,
+            payload_json TEXT NOT NULL CHECK(length(payload_json) <= 16384),
+            closed INTEGER NOT NULL DEFAULT 0 CHECK(typeof(closed) = 'integer' AND closed IN (0, 1))
+        );
+        CREATE INDEX IF NOT EXISTS idx_bot_context_delegations_parent_run
+            ON bot_context_delegations(parent_run_id);
+        CREATE TRIGGER IF NOT EXISTS bot_context_delegations_insert_guard
+        BEFORE INSERT ON bot_context_delegations
+        WHEN EXISTS (SELECT 1 FROM bot_context_delegations WHERE child_run_id = NEW.child_run_id)
+        BEGIN SELECT RAISE(ABORT, 'bot context delegation already exists'); END;
+        CREATE TRIGGER IF NOT EXISTS bot_context_delegations_update_guard
+        BEFORE UPDATE ON bot_context_delegations
+        WHEN NEW.child_run_id COLLATE BINARY IS NOT OLD.child_run_id COLLATE BINARY
+          OR NEW.parent_run_id COLLATE BINARY IS NOT OLD.parent_run_id COLLATE BINARY
+          OR NEW.payload_json IS NOT OLD.payload_json
+          OR NEW.closed < OLD.closed
+        BEGIN SELECT RAISE(ABORT, 'bot context delegation is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS bot_context_delegations_delete_guard
+        BEFORE DELETE ON bot_context_delegations
+        BEGIN SELECT RAISE(ABORT, 'bot context delegation cannot be deleted'); END;
+        """),
+        SchemaStep(hostRestoreQueueHoldsSchemaVersion, """
+        CREATE TABLE IF NOT EXISTS host_restore_queue_holds (
+            kind TEXT NOT NULL CHECK(kind IN ('agent','bot')),
+            queue_id TEXT NOT NULL COLLATE NOCASE,
+            approved INTEGER NOT NULL DEFAULT 0 CHECK(approved IN (0,1)),
+            attempt_run_id TEXT,
+            PRIMARY KEY(kind, queue_id)
+        );
+        """),
     ]
 
     /// Additive and idempotent. `key` reuses today's banner identifiers, so a
@@ -2046,6 +2145,17 @@ public enum Schema {
     // PERF: ISO8601DateFormatter is expensive; reuse one for migration timestamps.
     private static let migrationAppliedAtLock = NSLock()
     private static let migrationAppliedAtFormatter = ISO8601DateFormatter()
+
+    static func trustedRestoreSchema(version: Int) throws -> SQLiteDB {
+        guard [93, 96, currentVersion].contains(version) else {
+            throw SQLiteError.execute("unsupported restore schema version")
+        }
+        let db = try SQLiteDB(path: ":memory:")
+        try migrateSteps(db, steps.filter { $0.version <= version })
+        try healBotTeamsGroupsSchema(db)
+        try db.execute(botConversationRoutingMigrationSQL)
+        return db
+    }
 
     public static func migrate(_ db: SQLiteDB) throws {
         try migrateSteps(db, steps)
