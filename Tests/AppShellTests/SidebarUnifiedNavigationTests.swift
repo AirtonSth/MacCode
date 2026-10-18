@@ -140,14 +140,18 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         f.vm.filterText = "develop"
         XCTAssertEqual(f.vm.treeWorkspaces.map(\.id), [elephant.id], "a Bot match keeps its workspace in the tree")
         XCTAssertEqual(f.vm.workspaceBotRows(elephant.id).map(\.botID), [developer.id], "search reveals the Bot without expanding")
-        XCTAssertEqual(f.vm.visibleGeneralBots.count, f.vm.generalBots.count, "the workspace search never filters General Bots")
+        XCTAssertFalse(f.vm.visibleGeneralBots.contains { $0.handle == TitioIdentity.handle }, "one search filters General Bots too")
 
-        f.vm.filterText = ""
-        f.vm.generalBotsFilterText = "titio"
-        XCTAssertEqual(f.vm.visibleGeneralBots.map(\.handle), [TitioIdentity.handle], "the inline General Bots search filters only that list")
-        XCTAssertEqual(f.vm.treeWorkspaces.count, 2, "and never the workspace tree")
-        f.vm.generalBotsFilterText = "no-such-bot"
+        f.vm.filterText = "titio"
+        XCTAssertEqual(f.vm.visibleGeneralBots.map(\.handle), [TitioIdentity.handle], "the same search finds a General Bot")
+        XCTAssertTrue(f.vm.treeWorkspaces.isEmpty, "and filters the workspace tree with the same query")
+        f.vm.filterText = "no-such-bot"
         XCTAssertTrue(f.vm.visibleGeneralBots.isEmpty)
+        let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertEqual(source.components(separatedBy: "SidebarSearchField(").count - 1, 1, "the sidebar mounts exactly one search field")
+        XCTAssertEqual(source.components(separatedBy: "SidebarSectionMoreMenu(help:").count - 1, 2, "Bots and Workspaces headers share one \"...\" menu component")
+        XCTAssertTrue(source.contains("Text(\"Bots\")") && !source.contains("Text(\"General Bots\")"), "the section is titled Bots")
     }
 
 
@@ -157,22 +161,6 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         f.vm.reload()
         await f.vm.reloadAuthorizedBotConversationRowsAndWait()
         XCTAssertTrue(f.vm.generalBots.isEmpty, "no bot exists: the section would have been hidden before")
-        let hosting = NSHostingView(rootView: SidebarRootView(vm: f.vm).frame(width: 300, height: 860))
-        hosting.frame = NSRect(x: 0, y: 0, width: 300, height: 860)
-        let window = NSWindow(contentRect: hosting.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
-        window.contentView = hosting
-        hosting.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
-        func snapshot() throws -> Data {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
-            let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
-            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
-            return try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
-        }
-        let empty = try snapshot()
-        // Typing adds the search field's clear button; that only paints if the header is mounted.
-        f.vm.generalBotsFilterText = "x"
-        XCTAssertNotEqual(try snapshot(), empty, "the General Bots search header (with Teams and Show hidden) stays mounted with zero bots")
         let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         XCTAssertFalse(source.contains("if !vm.generalBots.isEmpty {"), "the General Bots header never depends on the list being non-empty")

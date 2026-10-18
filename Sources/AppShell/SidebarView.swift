@@ -619,10 +619,6 @@ public final class SidebarViewModel: ObservableObject {
 
     public var sidebarQuery: String { filterText.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-    /// Inline search in the General Bots header; it filters only that list.
-    @Published public var generalBotsFilterText: String = ""
-    public var generalBotsQuery: String { generalBotsFilterText.trimmingCharacters(in: .whitespacesAndNewlines) }
-
     public func botRowMatchesQuery(_ row: AuthorizedBotConversationRow) -> Bool {
         let query = sidebarQuery
         guard !query.isEmpty else { return true }
@@ -630,8 +626,9 @@ public final class SidebarViewModel: ObservableObject {
             || row.title.range(of: query, options: .caseInsensitive) != nil
     }
 
+    /// The one sidebar search also filters General Bots by name or handle.
     public var visibleGeneralBots: [GeneralBotRow] {
-        let query = generalBotsQuery
+        let query = sidebarQuery
         guard !query.isEmpty else { return generalBots }
         return generalBots.filter {
             $0.name.range(of: query, options: .caseInsensitive) != nil
@@ -2035,7 +2032,6 @@ public struct SidebarRootView: View {
     @State private var showsInsomniaOptions = false
     /// Toggled to true to programmatically focus the filter field (Cmd+F).
     @State private var filterFocusRequest: Bool = false
-    @State private var generalBotsFocusRequest: Bool = false
     /// :18 -- Timer fires at ~16 Hz while vm.dragScrollEdge != 0 to scroll toward
     /// the top or bottom of the workspace list. Stored so we can invalidate it
     /// when the drag leaves the edge zone or the drop completes.
@@ -2176,6 +2172,14 @@ public struct SidebarRootView: View {
             .padding(.horizontal, DS.Space.md)
             .padding(.bottom, DS.Space.lg)
 
+            // IMP-MAC_SHELL_WINDOW-009: keep the filter available whenever
+            // there are workspaces or Bots, but do not auto-focus it on sidebar load.
+            if !vm.workspaces.isEmpty || !vm.generalBots.isEmpty {
+                workspaceFilterField
+                    .padding(.horizontal, DS.Space.md)
+                    .padding(.bottom, DS.Space.sm)
+            }
+
             generalBotsSection
 
             HStack(spacing: DS.Space.sm) {
@@ -2190,17 +2194,13 @@ public struct SidebarRootView: View {
                         .foregroundColor(DS.Palette.danger)
                         .accessibilityIdentifier("sidebar.removeSelected")
                 }
+                SidebarSectionMoreMenu(help: "Workspace actions", accessibilityIdentifier: "sidebar.workspaces.more") {
+                    Button { vm.newWorkspace() } label: { Label("New Workspace", systemImage: "folder.badge.plus") }
+                        .accessibilityIdentifier("sidebar.workspaces.newWorkspace")
+                }
             }
             .padding(.horizontal, DS.Space.lg)
             .padding(.bottom, DS.Space.sm)
-
-            // IMP-MAC_SHELL_WINDOW-009: keep the filter available whenever
-            // there are workspaces, but do not auto-focus it on sidebar load.
-            if !vm.workspaces.isEmpty || !vm.generalBots.isEmpty {
-                workspaceFilterField
-                    .padding(.horizontal, DS.Space.md)
-                    .padding(.bottom, DS.Space.sm)
-            }
 
             // :18 -- ScrollViewReader exposes a proxy so the edge-scroll timer
             // can call scrollTo(first/last) while the user holds a drag near
@@ -2763,39 +2763,25 @@ public struct SidebarRootView: View {
         .accessibilityIdentifier("sidebar.botConversation.\(row.id)")
     }
 
-    /// General Bots: Titio pinned first, then general and unlinked Bots, in roster order.
+    /// Bots: Titio pinned first, then general and unlinked Bots, in roster order.
     @ViewBuilder
     private var generalBotsSection: some View {
         let bots = vm.visibleGeneralBots
         VStack(alignment: .leading, spacing: DS.Space.xxs) {
             HStack(spacing: DS.Space.sm) {
-                Text("General Bots")
+                Text("Bots")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
                     .lineLimit(1)
                     .fixedSize()
-                SidebarSearchField(
-                    placeholder: "Search",
-                    text: $vm.generalBotsFilterText,
-                    focusRequest: $generalBotsFocusRequest,
-                    accessibilityIdentifier: "sidebar.generalBots.search"
-                )
-                Button { vm.openTeams() } label: {
-                    Text("Teams")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .padding(.horizontal, DS.Space.sm)
-                        .frame(height: DS.Control.sidebarSearchHeight)
-                        .background(
-                            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                                .fill(DS.Palette.surfaceRaised.opacity(0.6))
-                        )
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Manage Bot teams")
-                .contextMenu {
+                Spacer(minLength: 0)
+                SidebarSectionMoreMenu(help: "Bot actions", accessibilityIdentifier: "sidebar.bots.more") {
+                    Button { navigate { vm.addBot() } } label: { Label("New Bot", systemImage: "person.badge.plus") }
+                        .accessibilityIdentifier("sidebar.bots.newBot")
+                    Button { vm.openTeams() } label: { Label("Teams", systemImage: "person.3") }
+                        .accessibilityIdentifier("sidebar.teams")
                     if let botsVM {
+                        Divider()
                         Toggle("Show hidden", isOn: Binding(
                             get: { botsVM.showHidden },
                             set: { botsVM.showHidden = $0; vm.reloadGeneralBots() }
@@ -2803,7 +2789,6 @@ public struct SidebarRootView: View {
                         .accessibilityIdentifier("sidebar.generalBots.showHidden")
                     }
                 }
-                .accessibilityIdentifier("sidebar.teams")
             }
             .padding(.horizontal, DS.Space.sm)
             .padding(.bottom, DS.Space.xxs)
@@ -3551,5 +3536,29 @@ public final class SidebarView: NSObject {
             return
         }
         // No detached fallback: Active Threads is main-content only.
+    }
+}
+
+/// The "..." menu on the right of a sidebar section header (Bots, Workspaces).
+struct SidebarSectionMoreMenu<Content: View>: View {
+    let help: String
+    let accessibilityIdentifier: String
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        Menu(content: content) {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(width: 24, height: DS.Control.sidebarSearchHeight)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(help)
+        .accessibilityLabel(help)
+        .accessibilityIdentifier(accessibilityIdentifier)
     }
 }
