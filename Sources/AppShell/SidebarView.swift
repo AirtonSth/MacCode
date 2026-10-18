@@ -2818,67 +2818,65 @@ public struct SidebarRootView: View {
     @ViewBuilder
     private var generalBotsSection: some View {
         let bots = vm.visibleGeneralBots
-        if !vm.generalBots.isEmpty {
-            VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                HStack(spacing: DS.Space.sm) {
-                    Text("General Bots")
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            HStack(spacing: DS.Space.sm) {
+                Text("General Bots")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+                    .fixedSize()
+                SidebarSearchField(
+                    placeholder: "Search",
+                    text: $vm.generalBotsFilterText,
+                    focusRequest: $generalBotsFocusRequest,
+                    accessibilityIdentifier: "sidebar.generalBots.search"
+                )
+                Button { vm.openTeams() } label: {
+                    Text("Teams")
                         .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                        .fixedSize()
-                    SidebarSearchField(
-                        placeholder: "Search",
-                        text: $vm.generalBotsFilterText,
-                        focusRequest: $generalBotsFocusRequest,
-                        accessibilityIdentifier: "sidebar.generalBots.search"
-                    )
-                    Button { vm.openTeams() } label: {
-                        Text("Teams")
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .padding(.horizontal, DS.Space.sm)
-                            .frame(height: DS.Control.sidebarSearchHeight)
-                            .background(
-                                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                                    .fill(DS.Palette.surfaceRaised.opacity(0.6))
-                            )
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Manage Bot teams")
-                    .contextMenu {
-                        if let botsVM {
-                            Toggle("Show hidden", isOn: Binding(
-                                get: { botsVM.showHidden },
-                                set: { botsVM.showHidden = $0; vm.reloadGeneralBots() }
-                            ))
-                            .accessibilityIdentifier("sidebar.generalBots.showHidden")
-                        }
-                    }
-                    .accessibilityIdentifier("sidebar.teams")
-                }
-                .padding(.horizontal, DS.Space.sm)
-                .padding(.bottom, DS.Space.xxs)
-                if bots.isEmpty {
-                    Text("No matches")
-                        .font(DS.Font.body)
-                        .foregroundColor(DS.Palette.textTertiary)
+                        .foregroundColor(DS.Palette.textSecondary)
                         .padding(.horizontal, DS.Space.sm)
-                        .padding(.vertical, DS.Space.xs)
-                } else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                            ForEach(bots) { generalBotRow($0) }
-                        }
-                    }
-                    .frame(maxHeight: min(CGFloat(bots.count) * 38, 190))
+                        .frame(height: DS.Control.sidebarSearchHeight)
+                        .background(
+                            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                .fill(DS.Palette.surfaceRaised.opacity(0.6))
+                        )
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .help("Manage Bot teams")
+                .contextMenu {
+                    if let botsVM {
+                        Toggle("Show hidden", isOn: Binding(
+                            get: { botsVM.showHidden },
+                            set: { botsVM.showHidden = $0; vm.reloadGeneralBots() }
+                        ))
+                        .accessibilityIdentifier("sidebar.generalBots.showHidden")
+                    }
+                }
+                .accessibilityIdentifier("sidebar.teams")
             }
-            .padding(.horizontal, DS.Space.md)
-            .padding(.bottom, DS.Space.lg)
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("sidebar.generalBots")
+            .padding(.horizontal, DS.Space.sm)
+            .padding(.bottom, DS.Space.xxs)
+            if bots.isEmpty {
+                Text(vm.generalBots.isEmpty ? "No bots" : "No matches")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .padding(.horizontal, DS.Space.sm)
+                    .padding(.vertical, DS.Space.xs)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        ForEach(bots) { generalBotRow($0) }
+                    }
+                }
+                .frame(maxHeight: min(CGFloat(bots.count) * 38, 190))
+            }
         }
+        .padding(.horizontal, DS.Space.md)
+        .padding(.bottom, DS.Space.lg)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("sidebar.generalBots")
     }
 
     private func generalBotRow(_ row: SidebarViewModel.GeneralBotRow) -> some View {

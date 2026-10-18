@@ -17459,8 +17459,8 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_rosterAndHeaderSubtitlesUseTextSecondary_becauseTertiaryIsUnreadableAt10pt() throws {
-        // WHY: the roster preview, the Desk header's handle and permission and
-        // the group subtitles are 10pt text the owner reads to pick a chat and
+        // WHY: the Desk header's handle and permission and the group
+        // subtitles are 10pt text the owner reads to pick a chat and
         // to see what a Bot may do. textTertiary is 3.72:1 on the rail
         // (DSContrastTests); information text needs 4.5:1, so these sites use
         // textSecondary. The token value itself does not change.
@@ -17476,7 +17476,6 @@ final class BotsWindowTests: XCTestCase {
         let groups = try String(contentsOf: sourceURL("Sources/AppShell/BotsTeamsGroups.swift"), encoding: .utf8)
         let sites = [
             try slice(bots, from: "Text(\"@\\(bot.handle)\")", to: "\"bots.desk.permission\""),
-            try slice(groups, from: "Text(names.isEmpty ? \"No bots\" : names)", to: ".lineLimit(1)"),
             try slice(groups, from: "Text(\"\\(members.count) bots · \\(group.policy.displayName)\")", to: ".lineLimit(1)"),
         ]
         for site in sites {

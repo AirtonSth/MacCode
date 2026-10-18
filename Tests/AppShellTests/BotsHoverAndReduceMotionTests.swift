@@ -26,16 +26,15 @@ final class BotsHoverAndReduceMotionTests: XCTestCase {
     }
 
     func test_rosterRowsAnswerThePointerUnlessSelected_becauseASelectedRowKeepsTheBotColour() throws {
-        // WHY: Bot rows and group rows sit in one list; one answering the
-        // pointer without the other reads as broken. A selected row already
-        // paints the Bot's own colour, so the hover layer is off there.
+        // WHY: group rows in the Teams manager answer the pointer like every
+        // other list row; one that does not reads as broken.
         let groups = try source("Sources/AppShell/BotsTeamsGroups.swift")
         let groupRow = try slice(
             groups,
             from: "private func groupRow(_ group: BotGroupConversation) -> some View {",
             to: ".buttonStyle(.plain)"
         )
-        XCTAssertTrue(groupRow.contains(".dsHoverFill(enabled: !selected)"))
+        XCTAssertTrue(groupRow.contains(".dsHoverFill(enabled: true)"))
     }
 
     func test_paneAndTeamAnimationsAreOffUnderReduceMotion_becauseAPaneSlideIsRealMovement() throws {
@@ -44,8 +43,8 @@ final class BotsHoverAndReduceMotionTests: XCTestCase {
         let expected = [
             // desk rail toggle, inspector toggle, rail onHide, two value animations
             "Sources/AppShell/BotsWindow.swift": 5,
-            // team collapse, group inspector toggle
-            "Sources/AppShell/BotsTeamsGroups.swift": 2,
+            // group inspector toggle
+            "Sources/AppShell/BotsTeamsGroups.swift": 1,
         ]
         for (path, gatedCount) in expected {
             let text = try source(path)

@@ -1,4 +1,6 @@
 import XCTest
+import SwiftUI
+import AppKit
 import Combine
 import CoreModel
 @testable import AppShell
@@ -88,6 +90,38 @@ final class ScheduledTasksWindowTests: XCTestCase {
         persistedTask.routingMode = .auto
         XCTAssertEqual(persistedTask.effectiveRoutingMode, .manual)
         XCTAssertEqual(ScheduledTaskEditorDraft(task: persistedTask, now: now).routingMode, .manual)
+    }
+
+    @MainActor
+    func test_botTaskEditorReplacesTheOverviewTheMomentTheBotsModelPublishesADraft() async throws {
+        let directory = NSTemporaryDirectory() + "RC2SchedBots-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        _ = try context.botStore.create(name: "Writer", title: "", description: "", handle: "writer")
+        let botsVM = BotsViewModel(context: context, router: router)
+        let viewModel = ScheduledTasksViewModel(context: context, router: router, loadImmediately: false)
+        let hosting = NSHostingView(rootView: ScheduledTasksRootView(vm: viewModel, botsVM: botsVM).frame(width: 1000, height: 700))
+        hosting.frame = NSRect(x: 0, y: 0, width: 1000, height: 700)
+        let window = NSWindow(contentRect: hosting.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+        func snapshot() throws -> Data {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+            let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+            return try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        }
+        let overview = try snapshot()
+
+        botsVM.createScheduleTask()
+        let editor = try snapshot()
+        XCTAssertNotEqual(editor, overview, "New Bot Task must replace the overview with the editor without any other state change")
+
+        botsVM.scheduleTaskDraft = nil
+        XCTAssertEqual(try snapshot(), overview, "Back/Save must return to the overview")
     }
 
     func test_sidebarPlacesScheduleTasksAfterActivity_becauseNavigationOrderIsContractual() throws {

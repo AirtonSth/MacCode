@@ -675,6 +675,14 @@ public final class ScheduledTasksViewModel: ObservableObject {
 
 // MARK: - Navigation screens (plan-scheduled-tasks mockups)
 
+/// Re-evaluates `content` whenever the Bots model publishes.
+struct BotsModelObserver<Content: View>: View {
+    @ObservedObject var botsVM: BotsViewModel
+    @ViewBuilder let content: () -> Content
+
+    var body: some View { content() }
+}
+
 private enum ScheduledTasksScreen: Equatable {
     case overview
     case detail
@@ -695,6 +703,15 @@ public struct ScheduledTasksRootView: View {
     }
 
     public var body: some View {
+        // The content reads botsVM (draft, items); an observing wrapper re-renders it on every change.
+        if let botsVM {
+            BotsModelObserver(botsVM: botsVM) { rootContent }
+        } else {
+            rootContent
+        }
+    }
+
+    private var rootContent: some View {
         VStack(spacing: 0) {
             if vm.serviceRequiresApproval {
                 serviceBanner

@@ -150,6 +150,34 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         XCTAssertTrue(f.vm.visibleGeneralBots.isEmpty)
     }
 
+
+    func test_generalBotsHeaderTeamsButtonAndShowHiddenStayMountedWhenNoBotIsListed() async throws {
+        let f = try make("empty-general")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        f.vm.reload()
+        await f.vm.reloadAuthorizedBotConversationRowsAndWait()
+        XCTAssertTrue(f.vm.generalBots.isEmpty, "no bot exists: the section would have been hidden before")
+        let hosting = NSHostingView(rootView: SidebarRootView(vm: f.vm).frame(width: 300, height: 860))
+        hosting.frame = NSRect(x: 0, y: 0, width: 300, height: 860)
+        let window = NSWindow(contentRect: hosting.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+        func snapshot() throws -> Data {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+            let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+            hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+            return try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        }
+        let empty = try snapshot()
+        // Typing adds the search field's clear button; that only paints if the header is mounted.
+        f.vm.generalBotsFilterText = "x"
+        XCTAssertNotEqual(try snapshot(), empty, "the General Bots search header (with Teams and Show hidden) stays mounted with zero bots")
+        let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertFalse(source.contains("if !vm.generalBots.isEmpty {"), "the General Bots header never depends on the list being non-empty")
+    }
+
     func test_activitySubtitleCountsRunningBotsWithTheWorkspaceActivity() {
         let counts = PetActivityCounts(running: 2, needsYou: 1, newResults: 0)
         XCTAssertEqual(SidebarViewModel.activitySubtitle(counts, activeBots: 0), "2 running · 1 need you")
