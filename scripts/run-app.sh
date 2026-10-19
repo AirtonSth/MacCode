@@ -2,11 +2,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Executable and process name stay RemoteCode; the bundle and window owner are MacCode.
 APP_NAME="RemoteCode"
-APP_BUNDLE="dist/${APP_NAME}.app"
+APP_DISPLAY_NAME="MacCode"
+APP_BUNDLE="dist/${APP_DISPLAY_NAME}.app"
+LEGACY_BUNDLE="dist/${APP_NAME}.app"
 
 has_onscreen_window() {
-  swift - "$APP_NAME" <<'SWIFT'
+  swift - "$APP_DISPLAY_NAME" <<'SWIFT'
 import CoreGraphics
 import Foundation
 
@@ -39,11 +42,14 @@ fi
 
 # Stop only this worktree's executable. A global `pkill -x RemoteCode` could
 # interrupt another checkout or the user's stable Agent App session.
-app_exec="$PWD/$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-running_pids="$(ps -axo pid=,command= \
-  | awk -v executable="$app_exec" -f scripts/exact-executable-pids.awk)"
-for pid in $running_pids; do
-  kill "$pid" 2>/dev/null || true
+# Also stop the pre-rename dist/RemoteCode.app so an old Dock pin can't keep it alive.
+for bundle in "$APP_BUNDLE" "$LEGACY_BUNDLE"; do
+  app_exec="$PWD/$bundle/Contents/MacOS/$APP_NAME"
+  running_pids="$(ps -axo pid=,command= \
+    | awk -v executable="$app_exec" -f scripts/exact-executable-pids.awk)"
+  for pid in $running_pids; do
+    kill "$pid" 2>/dev/null || true
+  done
 done
 # Use the release build by default while preserving the existing config override.
 # An explicit caller override still wins; the package guard rejects debug here.
@@ -52,16 +58,21 @@ done
 RC2_REPLACE_RUNNING_APP=1 \
 RC2_CONFIG="${RC2_CONFIG:-release}" \
 ./scripts/package-app.sh
+# The stale pre-rename bundle would be relaunched by an old Dock pin; drop it.
+if [[ -d "$LEGACY_BUNDLE" ]]; then
+  rm -rf "$LEGACY_BUNDLE"
+  echo "[run] removed stale $LEGACY_BUNDLE; pin $APP_BUNDLE in the Dock instead" >&2
+fi
 /usr/bin/open -n "$APP_BUNDLE"
 
 if [[ "${1:-}" == "--verify" ]]; then
   for _ in {1..20}; do
     if pgrep -x "$APP_NAME" >/dev/null && has_onscreen_window; then
-      echo "[run] ${APP_NAME} is running with an onscreen window"
+      echo "[run] ${APP_DISPLAY_NAME} is running with an onscreen window"
       exit 0
     fi
     sleep 0.25
   done
-  echo "[run] ${APP_NAME} did not start with an onscreen window" >&2
+  echo "[run] ${APP_DISPLAY_NAME} did not start with an onscreen window" >&2
   exit 1
 fi

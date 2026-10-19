@@ -23,7 +23,7 @@ trap cleanup EXIT
 cd "$MACOS_DIR"
 pkill -x "$APP_NAME" 2>/dev/null || true
 RC2_REPLACE_RUNNING_APP=1 RC2_CONFIG=debug ./scripts/package-app.sh >/dev/null
-RC2_APP_SUPPORT="$APP_SUPPORT" RC2_DB_PATH="$DB_PATH" /usr/bin/open -n "dist/${APP_NAME}.app"
+RC2_APP_SUPPORT="$APP_SUPPORT" RC2_DB_PATH="$DB_PATH" /usr/bin/open -n "dist/MacCode.app"
 
 for _ in {1..80}; do
   if curl -fsS "$BASE/healthz" >/dev/null 2>&1; then
