@@ -879,6 +879,11 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     /// An expanded workspace always leads its Bots with "+ New bot"; a search hides it.
+    func hasWorkspaceChildren(_ id: WorkspaceID) -> Bool {
+        !(activeSurfaceRows[id] ?? []).isEmpty || showsAddBot(id) || !workspaceBotRows(id).isEmpty
+            || showsNewConversation(id) || !workspaceConversationRows(id).isEmpty
+    }
+
     public func showsAddBot(_ id: WorkspaceID) -> Bool {
         expandedWorkspaceIDs.contains(id) && sidebarQuery.isEmpty
     }
@@ -3200,9 +3205,22 @@ public struct SidebarRootView: View {
             .accessibilityIdentifier(id)
     }
 
-    /// Children of an expanded workspace: Bots (+ New bot first), then Conversations (+ New conversation first).
+    /// Children sit on a darker inset panel so the workspace level reads apart from its contents.
     @ViewBuilder
     private func workspaceChildren(_ ws: Workspace) -> some View {
+        if vm.hasWorkspaceChildren(ws.id) {
+            VStack(alignment: .leading, spacing: DS.Space.xxs) { workspaceChildRows(ws) }
+                .padding(.vertical, DS.Space.xxs)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                        .fill(DS.Palette.bg)
+                )
+        }
+    }
+
+    /// Children of an expanded workspace: Open Tabs, Bots (+ New bot first), then Conversations (+ New conversation first).
+    @ViewBuilder
+    private func workspaceChildRows(_ ws: Workspace) -> some View {
         if let tabs = vm.activeSurfaceRows[ws.id], !tabs.isEmpty {
             workspaceSectionHeader("Open Tabs", id: "sidebar.workspaceOpenTabs.\(ws.id.value.uuidString)")
             let visible = vm.visibleTab(in: ws)?.id
