@@ -103,6 +103,21 @@ final class FilesEditorIntelligenceTests: XCTestCase {
             "one undo must remove the accepted completion as a single edit")
     }
 
+    @MainActor
+    func test_acceptingWordCompletionIsOneUndoableEdit() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
+                              styleMask: [.titled], backing: .buffered, defer: true)
+        let textView = CodeEditorTextView()
+        textView.allowsUndo = true
+        window.contentView = textView
+        textView.string = "pri"
+        textView.insertCompletion("print", forPartialWordRange: NSRange(location: 0, length: 3), movement: 0, isFinal: true)
+        XCTAssertEqual(textView.string, "print")
+        textView.undoManager?.undo()
+        XCTAssertEqual(textView.string, "pri",
+            "accepting an IntelliSense item must be a single undo step")
+    }
+
     // MARK: Inline completion request/provider boundary
 
     func test_requestCarriesPathLanguageAndSurroundingContext() {
