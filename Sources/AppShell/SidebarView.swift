@@ -3230,14 +3230,15 @@ public struct SidebarRootView: View {
         "\(name) · \(type) · \(location) · \(vm.hostDisplayName)"
     }
 
-    /// Rows under a workspace section title sit one step right of the title.
-    private static let workspaceChildIndent = DS.Space.lg + DS.Space.sm + DS.Space.md
+    /// Section titles line up with the workspace folder icon (row inset `sm`); rows sit
+    /// one `lg` step right of the title.
+    private static let workspaceChildIndent = DS.Space.lg
 
     private func workspaceSectionHeader(_ title: String, id: String) -> some View {
         Text(title)
             .font(DS.Font.caption2)
             .foregroundColor(DS.Palette.textTertiary)
-            .padding(.leading, DS.Space.lg + DS.Space.sm)
+            .padding(.leading, DS.Space.sm)
             .padding(.top, DS.Space.xxs)
             .accessibilityIdentifier(id)
     }
