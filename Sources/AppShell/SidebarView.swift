@@ -3243,16 +3243,18 @@ public struct SidebarRootView: View {
     @ViewBuilder
     private func workspaceChildren(_ ws: Workspace) -> some View {
         if vm.hasWorkspaceChildren(ws.id) {
+            // Hangs off the workspace row's square bottom edge, aligned with its left border
+            // (the chevron column is 16 pt wide); the LazyVStack gap is cancelled so they touch.
             VStack(alignment: .leading, spacing: DS.Space.xxs) { workspaceChildRows(ws) }
                 .padding(.vertical, DS.Space.xs)
-                .background(WorkspaceDropdownPanel())
-                .padding(.leading, DS.Space.md)
-                .padding(.top, 2)
+                .background(
+                    UnevenRoundedRectangle(bottomLeadingRadius: DS.Radius.control, bottomTrailingRadius: DS.Radius.control, style: .continuous)
+                        .fill(Color.black.opacity(0.05))
+                )
+                .padding(.leading, 16)
+                .padding(.top, -DS.Space.xxs)
                 .padding(.bottom, DS.Space.xs)
-                .transition(reduceMotion ? .opacity : .asymmetric(
-                    insertion: .scale(scale: 0.97, anchor: .top).combined(with: .opacity).combined(with: .offset(y: -6)),
-                    removal: .scale(scale: 0.98, anchor: .top).combined(with: .opacity)
-                ))
+                .transition(.opacity)
         }
     }
 
@@ -3497,7 +3499,7 @@ public struct SidebarRootView: View {
                        value: vm.completedWorkspaces.contains(ws.id))
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 38)
-            .sidebarRowChrome(selected: selected || checked, tone: highlightTone)
+            .sidebarRowChrome(selected: selected || checked, tone: highlightTone, squareBottom: expanded && vm.hasWorkspaceChildren(ws.id))
             .overlay(alignment: .top) {
                 if vm.dropTargetWorkspaceID == ws.id {
                     Capsule()
@@ -3646,13 +3648,19 @@ private struct TabColorMenuLabel: View {
 private struct SidebarRowChrome: ViewModifier {
     let tone: SidebarHighlightTone
     let selected: Bool
+    /// An expanded workspace row squares its bottom edge so its dropdown attaches below it.
+    var squareBottom = false
     @State private var hovering = false
 
     func body(content: Content) -> some View {
+        let radius = DS.Radius.control
         content
             .background(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .fill(Self.fill(tone, hovering: hovering))
+                UnevenRoundedRectangle(
+                    topLeadingRadius: radius, bottomLeadingRadius: squareBottom ? 0 : radius,
+                    bottomTrailingRadius: squareBottom ? 0 : radius, topTrailingRadius: radius, style: .continuous
+                )
+                .fill(Self.fill(tone, hovering: hovering))
             )
             .overlay(alignment: .leading) {
                 if tone != .none {
@@ -3686,38 +3694,8 @@ private struct SidebarRowChrome: ViewModifier {
 }
 
 private extension View {
-    func sidebarRowChrome(selected: Bool, tone: SidebarHighlightTone? = nil) -> some View {
-        modifier(SidebarRowChrome(tone: tone ?? (selected ? .selection : .none), selected: selected))
-    }
-}
-
-/// Dropdown card for an expanded workspace: a glass sheet that hangs off the workspace
-/// row, nested one indent in, lit from the top edge and floating on a soft shadow.
-/// The material turns opaque on its own under Reduce Transparency.
-private struct WorkspaceDropdownPanel: View {
-    private let shape = RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
-
-    var body: some View {
-        shape
-            .fill(.thinMaterial)
-            .overlay(
-                shape.fill(LinearGradient(
-                    colors: [Color.white.opacity(0.035), Color.black.opacity(0.10)],
-                    startPoint: .top, endPoint: .bottom
-                ))
-            )
-            .overlay(
-                shape.strokeBorder(
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.10), Color.white.opacity(0.03)],
-                        startPoint: .top, endPoint: .bottom
-                    ),
-                    lineWidth: 0.5
-                )
-            )
-            .shadow(color: .black.opacity(0.28), radius: 10, y: 6)
-            .shadow(color: .black.opacity(0.12), radius: 1, y: 0.5)
-            .accessibilityHidden(true)
+    func sidebarRowChrome(selected: Bool, tone: SidebarHighlightTone? = nil, squareBottom: Bool = false) -> some View {
+        modifier(SidebarRowChrome(tone: tone ?? (selected ? .selection : .none), selected: selected, squareBottom: squareBottom))
     }
 }
 
