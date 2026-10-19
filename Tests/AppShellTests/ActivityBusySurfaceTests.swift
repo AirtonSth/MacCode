@@ -29,3 +29,18 @@ final class ActivityBusySurfaceTests: XCTestCase {
         XCTAssertEqual(items.last?.title, "SSH", "an untitled SSH tab still needs a readable label")
     }
 }
+
+/// Busy terminal/SSH tabs are listed under their workspace above Bots so the user sees
+/// live shell work without opening Activity; browser loads would flicker and stay out.
+final class SidebarActiveSurfaceRowsTests: XCTestCase {
+    func test_groupsBusyShellTabsByWorkspace_excludesBrowser() {
+        let ws = WorkspaceID(UUID())
+        func item(_ type: SurfaceType) -> ActiveSurfaceItem {
+            let id = SurfaceID(UUID())
+            return ActiveSurfaceItem(id: id.value, workspaceID: ws, workspaceName: "Test", surfaceID: id, title: "\(type)", type: type)
+        }
+        let terminal = item(.terminal), ssh = item(.ssh), browser = item(.browser)
+        let rows = SidebarViewModel.activeSurfaceRows([terminal, ssh, browser])
+        XCTAssertEqual(rows[ws]?.map(\.surfaceID), [terminal.surfaceID, ssh.surfaceID])
+    }
+}

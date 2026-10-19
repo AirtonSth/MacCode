@@ -388,8 +388,11 @@ public final class SidebarViewModel: ObservableObject {
             busyTooltipCache.removeAll(keepingCapacity: true)
             busySurfaceTitlesCache.removeAll(keepingCapacity: true)
             filteredWorkspacesCache = nil
+            refreshActiveSurfaceRows()
         }
     }
+    /// Busy terminal/SSH/diff tabs per workspace, listed above Bots in an expanded workspace.
+    @Published private(set) var activeSurfaceRows: [WorkspaceID: [ActiveSurfaceItem]] = [:]
     /// PERF-MAC_SHELL_WINDOW-003: memoize per-workspace busy state for the
     /// lifetime of one `workspaces` snapshot so repeated SwiftUI `body`
     /// evaluations don't re-walk panes/surfaces (and the registry) on
@@ -409,6 +412,24 @@ public final class SidebarViewModel: ObservableObject {
     // invalidate only when workspaces or filterText changes so repeated renders
     // without filter changes are O(1).
     private var filteredWorkspacesCache: [Workspace]?
+    private func refreshActiveSurfaceRows() {
+        let next = Self.activeSurfaceRows(ActiveSurfaceProjector.items(workspaces: workspaces) {
+            SurfaceRegistry.shared.surface($0.id)?.isBusy == true
+        })
+        if next != activeSurfaceRows { activeSurfaceRows = next }
+    }
+
+    /// Browser page loads flicker on every navigation and are not user work, so they stay out.
+    nonisolated static func activeSurfaceRows(_ items: [ActiveSurfaceItem]) -> [WorkspaceID: [ActiveSurfaceItem]] {
+        Dictionary(grouping: items.filter { $0.type != .browser }, by: \.workspaceID)
+    }
+
+    func openActiveSurface(_ item: ActiveSurfaceItem) {
+        router?.windowController?.presentWorkspaceContent()
+        try? router?.selectWorkspace(item.workspaceID)
+        try? router?.focusSurface(workspace: item.workspaceID, surface: item.surfaceID)
+    }
+
     /// UX-SIDEBAR-COMPLETED-DOT: workspaces whose in-progress action just finished
     /// (busy → idle) and that the user has not opened since. Drives the small
     /// "action completed" dot shown in the spinner's slot. Cleared when the
@@ -1151,6 +1172,7 @@ public final class SidebarViewModel: ObservableObject {
 
     /// Refresh shared server counts after the current UI turn.
     func refreshActiveCount() {
+        refreshActiveSurfaceRows()
         guard let router else { return }
         PetActivityCountsProjection.shared.refresh(router: router, workspaceIDs: workspaces.map(\.id))
     }
@@ -3167,6 +3189,7 @@ public struct SidebarRootView: View {
     /// Children of an expanded workspace: Bots (+ New bot first), then Conversations (+ New conversation first).
     @ViewBuilder
     private func workspaceChildren(_ ws: Workspace) -> some View {
+        ForEach(vm.activeSurfaceRows[ws.id] ?? []) { activeSurfaceRow($0) }
         if vm.showsAddBot(ws.id) || !vm.workspaceBotRows(ws.id).isEmpty {
             workspaceSectionHeader("Bots", id: "sidebar.workspaceBots.\(ws.id.value.uuidString)")
         }
@@ -3238,6 +3261,28 @@ public struct SidebarRootView: View {
             .accessibilityLabel(toggle.expanded ? "Show fewer conversations" : "Show \(toggle.hidden) more conversations")
             .accessibilityIdentifier("sidebar.conversationsToggle.\(ws.id.value.uuidString)")
         }
+    }
+
+    private func activeSurfaceRow(_ item: ActiveSurfaceItem) -> some View {
+        Button { navigate { vm.openActiveSurface(item) } } label: {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: item.type == .ssh ? "network" : (item.type == .terminal ? "terminal" : "doc.text.magnifyingglass"))
+                    .font(.system(size: 11, weight: .regular))
+                    .frame(width: 20, height: 20)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Text(item.title).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                Spacer(minLength: 0)
+                DSBusySpinner(label: "Running")
+            }
+            .padding(.leading, DS.Space.lg)
+            .padding(.horizontal, DS.Space.sm)
+            .frame(height: 30)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Open \(item.title)")
+        .accessibilityLabel("\(item.title), running")
+        .accessibilityIdentifier("sidebar.activeSurface.\(item.surfaceID.value.uuidString)")
     }
 
     private func loopGlyph(_ label: String) -> some View {
