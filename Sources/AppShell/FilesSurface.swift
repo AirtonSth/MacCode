@@ -41,7 +41,13 @@ final class FilesSurface: NSObject, Surface {
             metadata["selected_relative_path"] = selectedPath
         }
         self.descriptor = SurfaceDescriptor(type: .files, title: title, iconName: "folder", metadata: metadata)
-        self.model = FilesViewModel(surfaceID: descriptor.id, workspaceID: workspaceID, root: cwd, router: router)
+        self.model = FilesViewModel(
+            surfaceID: descriptor.id,
+            workspaceID: workspaceID,
+            root: cwd,
+            router: router,
+            inlineCompletionProvider: DistillInlineCompletionProvider.distillCLI()
+        )
         self.view = NSHostingView(rootView: FilesSurfaceRoot(model: model))
         super.init()
         DispatchQueue.main.async { [model] in model.loadInitialState() }
@@ -173,6 +179,28 @@ struct FileEntry: Identifiable, Equatable {
         resolved?.dragPayload = dragPayload
         resolved?.moveDragPayload = moveDragPayload
         return resolved
+    }
+
+    /// Minimal entry for restoring a persisted open tab before its identity
+    /// is refreshed by `filesEditOpen` / `fsWorkspaceRead`.
+    static func placeholder(relativePath: String, root: String) -> FileEntry? {
+        let name = (relativePath as NSString).lastPathComponent
+        guard !name.isEmpty else { return nil }
+        let path = (root as NSString).appendingPathComponent(relativePath)
+        return FileEntry(value: .object([
+            "name": .string(name),
+            "path": .string(path),
+            "relative_path": .string(relativePath),
+            "type": .string("file"),
+            "size": .number(0),
+            "is_hidden": .bool(false),
+            "identity": .object([
+                "kind": .string("code"),
+                "mime": .string("text/plain"),
+                "is_editable": .bool(true),
+                "editability_reason": .string("editable"),
+            ]),
+        ]))
     }
 
     static func icon(isDirectory: Bool, kind: String) -> String {
@@ -1033,6 +1061,9 @@ final class FilesViewModel: ObservableObject {
     @Published var currentDirectory = ""
     @Published var entries: [FileEntry] = []
     @Published var selectedEntry: FileEntry?
+    /// VS Code-style open file tabs. Explorer activation adds to this list;
+    /// selecting another tab keeps each dirty draft alive in `sessionCache`.
+    @Published var openTabs: [FileEntry] = []
     @Published var draftText = ""
     @Published var renderedText = ""
     @Published var errorText: String?
@@ -1063,6 +1094,8 @@ final class FilesViewModel: ObservableObject {
     let workspaceID: WorkspaceID
     let root: String
     weak var router: (any FilesSurfaceRouting)?
+    /// Distill-backed inline completion used by the editor. Injected by tests.
+    let inlineCompletionProvider: (any InlineCompletionProviding)?
     private var sessionID: String?
     private var draftRevision = 0
     private var lastSyncedText = ""
@@ -1094,11 +1127,18 @@ final class FilesViewModel: ObservableObject {
     var selectedPath: String? { selectedEntry?.relativePath }
     var visibleText: String { draftText.isEmpty ? renderedText : draftText }
 
-    init(surfaceID: SurfaceID, workspaceID: WorkspaceID, root: String, router: any FilesSurfaceRouting) {
+    init(
+        surfaceID: SurfaceID,
+        workspaceID: WorkspaceID,
+        root: String,
+        router: any FilesSurfaceRouting,
+        inlineCompletionProvider: (any InlineCompletionProviding)? = nil
+    ) {
         self.surfaceID = surfaceID
         self.workspaceID = workspaceID
         self.root = root
         self.router = router
+        self.inlineCompletionProvider = inlineCompletionProvider
         // Subscribe from the current head, not `nil` (which replays the entire retained
         // backlog into this surface on the main thread). This surface loads its own state
         // explicitly via loadInitialState()/filesStateGet (PERF-MAC_FILES-003).
@@ -1136,12 +1176,15 @@ final class FilesViewModel: ObservableObject {
                 currentDirectory = initialFilesDirectory(stateDirectory: stateDirectory, selectedPath: initialSelectedPath)
                 readerMode = state["reader_mode"]?.stringValue ?? "source"
                 dirtyPaths = Self.dirtyPaths(from: state)
+                if case .array(let tabs) = state["open_tabs"] ?? .array([]) {
+                    restoreOpenTabs(tabs.compactMap(\.stringValue))
+                }
             }
             loadDirectory(currentDirectory)
             if let initialSelectedPath,
                let entry = entries.first(where: { !$0.isDirectory && $0.relativePath == initialSelectedPath }) {
                 selectedEntry = entry
-                loadFile(entry)
+                openFileInTab(entry)
             }
         } catch {
             errorText = String(describing: error)
@@ -1252,7 +1295,87 @@ final class FilesViewModel: ObservableObject {
             loadDirectory(entry.relativePath)
             return
         }
+        openFileInTab(entry)
+    }
+
+    /// Explorer activation: open (or focus) a file tab, then load it.
+    func openFileInTab(_ entry: FileEntry) {
+        if let index = openTabs.firstIndex(where: { $0.id == entry.id }) {
+            openTabs[index] = entry
+        } else {
+            openTabs.append(entry)
+            if openTabs.count > Self.maximumOpenTabs {
+                let removable = openTabs.firstIndex(where: { !dirtyPaths.contains($0.relativePath) && $0.id != entry.id })
+                if let removable { removeTab(at: removable, closeSession: true) }
+            }
+        }
         loadFile(entry)
+        persistOpenTabs()
+    }
+
+    /// Activate an already-open tab (the tab bar path).
+    func activateTab(_ entry: FileEntry) {
+        guard selectedEntry?.id != entry.id else { return }
+        selectedEntry = entry
+        errorText = nil
+        loadFile(entry)
+        persistOpenTabs()
+    }
+
+    /// Close a tab and activate its right neighbour (or left when it was last).
+    func closeTab(_ entry: FileEntry) {
+        guard let index = openTabs.firstIndex(where: { $0.id == entry.id }) else { return }
+        let wasActive = selectedEntry?.id == entry.id
+        removeTab(at: index, closeSession: true)
+        if wasActive {
+            let next = openTabs.indices.contains(index) ? openTabs[index] : openTabs.last
+            if let next {
+                selectedEntry = next
+                loadFile(next)
+            } else {
+                selectedEntry = nil
+                sessionID = nil
+                sessionPath = nil
+                setDraft("")
+                renderedText = ""
+                isDirty = false
+            }
+        }
+        persistOpenTabs()
+    }
+
+    private func removeTab(at index: Int, closeSession: Bool) {
+        guard openTabs.indices.contains(index) else { return }
+        let removed = openTabs.remove(at: index)
+        guard closeSession else { return }
+        if sessionPath == removed.relativePath, let sessionID {
+            _ = try? router?.filesEditClose(sessionID: sessionID)
+            self.sessionID = nil
+            self.sessionPath = nil
+        }
+        sessionCache.removeValue(forKey: removed.relativePath)
+    }
+
+    func isTabDirty(_ entry: FileEntry) -> Bool {
+        if selectedEntry?.id == entry.id { return isDirty }
+        return dirtyPaths.contains(entry.relativePath) || sessionCache[entry.relativePath]?.isDirty == true
+    }
+
+    private static let maximumOpenTabs = 24
+
+    private func persistOpenTabs() {
+        _ = try? router?.filesStateUpdate(surface: surfaceID, patch: [
+            "open_tabs": .array(openTabs.map { .string($0.relativePath) })
+        ], baseRevision: nil, deviceID: "mac-local")
+    }
+
+    /// Rebuild tabs from persisted relative paths without listing their
+    /// directories. Identity (kind/language) is refreshed when the tab loads.
+    private func restoreOpenTabs(_ paths: [String]) {
+        openTabs = paths.prefix(Self.maximumOpenTabs).compactMap { relative in
+            guard !relative.isEmpty else { return nil }
+            return FileEntry.placeholder(relativePath: relative, root: root)
+        }
     }
 
     func selectIfNeeded(_ entry: FileEntry) {
@@ -1372,7 +1495,7 @@ final class FilesViewModel: ObservableObject {
             loadDirectory(currentDirectory)
             if let created {
                 selectedEntry = created
-                loadFile(created)
+                openFileInTab(created)
             }
         } catch {
             errorText = String(describing: error)
@@ -1431,6 +1554,10 @@ final class FilesViewModel: ObservableObject {
             let result = try router?.fsWorkspaceRename(workspace: workspaceID, path: entry.relativePath, newName: name)
             let renamed = result.flatMap(FileEntry.init(value:))
             loadDirectory(currentDirectory)
+            if let renamed, let tabIndex = openTabs.firstIndex(where: { $0.id == entry.id }) {
+                openTabs[tabIndex] = renamed
+                persistOpenTabs()
+            }
             if selectedEntry?.id == entry.id, let renamed {
                 selectedEntry = renamed
                 loadFile(renamed)
@@ -1455,6 +1582,9 @@ final class FilesViewModel: ObservableObject {
             renderedText = ""
             isDirty = false
         }
+        let deletedIDs = Set(entries.map(\.id))
+        openTabs.removeAll { deletedIDs.contains($0.id) }
+        persistOpenTabs()
         let urls = recycleURLs(forAbsolutePaths: entries.map(\.path))
         dirtyPaths = update.dirtyPaths
         NSWorkspace.shared.recycle(urls) { [weak self] _, error in
@@ -1895,7 +2025,10 @@ struct FilesSurfaceRoot: View {
                 HStack(spacing: 8) {
                     Text("Files")
                         .font(DS.Font.title3)
-                    Spacer()
+                        .lineLimit(1)
+                        .fixedSize()
+                        .layoutPriority(1)
+                    Spacer(minLength: 4)
                     DSIconButton("sidebar.left", help: "Hide file sidebar") {
                         sidebarIntent = .forcedHidden
                         sidebarVisible = false
@@ -2267,6 +2400,10 @@ struct FilesSurfaceRoot: View {
     private var reader: some View {
         GeometryReader { proxy in
             VStack(spacing: 0) {
+                if !model.openTabs.isEmpty {
+                    openTabBar
+                    Divider().overlay(DS.Palette.line)
+                }
                 readerHeader
                 Divider().overlay(DS.Palette.line)
                 if model.conflictActive {
@@ -2415,6 +2552,65 @@ struct FilesSurfaceRoot: View {
         .padding(.vertical, 8)
         .background(DS.Palette.surfaceRaised)
         .accessibilityIdentifier("files.saveError.banner")
+    }
+
+    /// VS Code-style editor tab strip: active tab, dirty dot, per-tab close.
+    private var openTabBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 1) {
+                ForEach(model.openTabs) { entry in
+                    openTab(entry)
+                }
+            }
+        }
+        .frame(height: 32)
+        .background(DS.Palette.surface)
+        .accessibilityIdentifier("files.tabs.strip")
+    }
+
+    private func openTab(_ entry: FileEntry) -> some View {
+        let isActive = model.selectedEntry?.id == entry.id
+        let isDirty = model.isTabDirty(entry)
+        return HStack(spacing: 6) {
+            Image(systemName: entry.icon)
+                .font(.system(size: 11))
+                .foregroundStyle(isActive ? DS.Palette.accent : DS.Palette.textTertiary)
+            Text(entry.name)
+                .font(DS.Font.caption)
+                .lineLimit(1)
+            if isDirty {
+                Circle()
+                    .fill(DS.Palette.warning)
+                    .frame(width: 6, height: 6)
+                    .accessibilityLabel("Unsaved changes")
+            }
+            Button {
+                model.closeTab(entry)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .semibold))
+                    .padding(3)
+            }
+            .buttonStyle(.plain)
+            .opacity(isActive ? 0.9 : 0.45)
+            .help("Close \(entry.name)")
+            .accessibilityLabel("Close \(entry.name)")
+            .accessibilityIdentifier("files.tab.close.\(entry.relativePath)")
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 32)
+        .foregroundStyle(isActive ? DS.Palette.text : DS.Palette.textSecondary)
+        .background(isActive ? DS.Palette.bg : Color.clear)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(isActive ? DS.Palette.accent : Color.clear)
+                .frame(height: 2)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { model.activateTab(entry) }
+        .accessibilityElement(children: .contain)
+        .accessibilityAddTraits(isActive ? .isSelected : [])
+        .accessibilityIdentifier("files.tab.\(entry.relativePath)")
     }
 
     private var readerHeader: some View {
@@ -2589,7 +2785,12 @@ struct FilesSurfaceRoot: View {
     }
 
     private var editor: some View {
-        CodeTextEditor(text: $model.draftText) { newValue in
+        CodeTextEditor(
+            text: $model.draftText,
+            language: model.selectedEntry?.language,
+            filePath: model.selectedPath ?? model.root,
+            inlineCompletionProvider: model.inlineCompletionProvider
+        ) { newValue in
             model.editorChanged(newValue)
         }
     }
@@ -3055,6 +3256,9 @@ private struct WebFileView: NSViewRepresentable {
 
 private struct CodeTextEditor: NSViewRepresentable {
     @Binding var text: String
+    let language: String?
+    let filePath: String
+    let inlineCompletionProvider: (any InlineCompletionProviding)?
     let onChange: (String) -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -3064,17 +3268,8 @@ private struct CodeTextEditor: NSViewRepresentable {
         scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true
 
-        let textView = NSTextView()
-        textView.isRichText = false
-        textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.isAutomaticDashSubstitutionEnabled = false
-        textView.isAutomaticTextReplacementEnabled = false
-        textView.allowsUndo = true
-        // Native Cmd+F find-in-file over the editor via NSTextView's built-in find bar
-        // (IMP-MAC_FILES-001). The responder chain routes Cmd+F to performTextFinderAction:
-        // automatically once the find bar is enabled.
-        textView.usesFindBar = true
-        textView.isIncrementalSearchingEnabled = true
+        let textView = CodeEditorTextView()
+        textView.configureForEditing()
         textView.delegate = context.coordinator
         textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         let palette = EditorColorPalette.resolve(isDark: NSApp.effectiveAppearance.isDark)
@@ -3091,7 +3286,15 @@ private struct CodeTextEditor: NSViewRepresentable {
         textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = false
         textView.string = text
+        textView.language = language
+        textView.completionItemsForPrefix = { [weak textView] _, caret in
+            guard let textView else { return [] }
+            return FileCompletionEngine.completions(in: textView.string, caret: caret, language: language)
+        }
         context.coordinator.textView = textView
+        context.coordinator.language = language
+        context.coordinator.filePath = filePath
+        context.coordinator.inlineProvider = inlineCompletionProvider
         context.coordinator.applyHighlight(to: textView)
         scroll.documentView = textView
         let ruler = CodeLineNumberRulerView(textView: textView)
@@ -3104,9 +3307,11 @@ private struct CodeTextEditor: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let textView = context.coordinator.textView ?? scroll.documentView as? NSTextView else { return }
-        // Re-apply palette when the system appearance changes (e.g. user switches light/dark mode
-        // while the editor is open). The check avoids redundant attribute churn on every unrelated
-        // @Published change.
+        context.coordinator.language = language
+        context.coordinator.filePath = filePath
+        context.coordinator.inlineProvider = inlineCompletionProvider
+        (textView as? CodeEditorTextView)?.language = language
+        // Re-apply palette when the system appearance changes (light/dark).
         let newPalette = EditorColorPalette.resolve(isDark: NSApp.effectiveAppearance.isDark)
         if newPalette != context.coordinator.currentPalette {
             context.coordinator.currentPalette = newPalette
@@ -3118,18 +3323,18 @@ private struct CodeTextEditor: NSViewRepresentable {
             return
         }
         if textView.string != text {
-            let oldText = textView.string
-            let selectedRanges = textView.selectedRanges
-            textView.string = text
-            // Incremental highlight: re-tokenize only the changed lines so remote patches on
-            // large files do not rebuild the whole attributed string (PERF-MAC_FILES-014).
-            context.coordinator.applyHighlightIncremental(oldText: oldText, to: textView)
-            textView.selectedRanges = selectedRanges
+            (textView as? CodeEditorTextView)?.clearGhost()
+            if let editor = textView as? CodeEditorTextView {
+                if let oldText = editor.replaceTextPreservingSelection(text) {
+                    context.coordinator.applyHighlightIncremental(oldText: oldText, to: textView)
+                }
+            } else {
+                textView.string = text
+                context.coordinator.applyHighlight(to: textView)
+            }
             context.coordinator.lineNumberRuler?.invalidateLineStartCache()
             context.coordinator.lineNumberRuler?.needsDisplay = true
         }
-        // When text is unchanged the edit originated from the text view itself and was
-        // already highlighted in textDidChange; re-highlighting here is redundant (PERF-MAC_FILES-001/008).
     }
 
     func makeCoordinator() -> Coordinator {
@@ -3138,9 +3343,15 @@ private struct CodeTextEditor: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         let onChange: (String) -> Void
-        weak var textView: NSTextView?
+        weak var textView: CodeEditorTextView?
         weak var lineNumberRuler: CodeLineNumberRulerView?
+        var language: String?
+        var filePath = ""
+        var inlineProvider: (any InlineCompletionProviding)?
         private var applyingHighlight = false
+        private var inlineTask: Task<Void, Never>?
+        private var inlineDebounceTimer: Timer?
+        private var inlineGeneration = 0
         /// Last applied palette; compared in `updateNSView` to skip redundant attribute churn.
         var currentPalette: EditorColorPalette = EditorColorPalette.resolve(isDark: true)
 
@@ -3148,24 +3359,84 @@ private struct CodeTextEditor: NSViewRepresentable {
             self.onChange = onChange
         }
 
+        deinit {
+            inlineTask?.cancel()
+            inlineDebounceTimer?.invalidate()
+        }
+
         func textDidChange(_ notification: Notification) {
-            guard let textView = notification.object as? NSTextView else { return }
+            guard let textView = notification.object as? CodeEditorTextView else { return }
             onChange(textView.string)
+            textView.clearGhost()
             highlightEditedRange(in: textView)
             lineNumberRuler?.invalidateLineStartCache()
             lineNumberRuler?.needsDisplay = true
+            scheduleInlineCompletion(in: textView)
+            scheduleWordCompletion(in: textView)
+        }
+
+        // MARK: IntelliSense
+
+        /// VS Code-style auto trigger: a short identifier under the caret opens
+        /// the native completion list; the list narrows on every further keystroke.
+        private func scheduleWordCompletion(in textView: CodeEditorTextView) {
+            let caret = textView.selectedRange().location
+            guard let range = FileCompletionEngine.replacementRange(in: textView.string, caret: caret),
+                  range.length >= 2 else { return }
+            let items = FileCompletionEngine.completions(
+                in: textView.string, caret: caret, language: language, limit: 1
+            )
+            guard !items.isEmpty else { return }
+            DispatchQueue.main.async { [weak textView] in
+                guard let textView, textView.window?.firstResponder === textView else { return }
+                textView.complete(nil)
+            }
+        }
+
+        // MARK: Distill inline completion
+
+        /// One request per typing pause. The result is stored as ghost text
+        /// only; the document is never mutated until the user presses Tab.
+        private func scheduleInlineCompletion(in textView: CodeEditorTextView) {
+            inlineDebounceTimer?.invalidate()
+            inlineTask?.cancel()
+            guard let provider = inlineProvider, !textView.string.isEmpty else { return }
+            inlineGeneration += 1
+            let generation = inlineGeneration
+            let path = filePath
+            let language = language
+            let text = textView.string
+            let caret = textView.selectedRange().location
+            guard textView.selectedRange().length == 0 else { return }
+            inlineDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.65, repeats: false) { [weak self, weak textView] _ in
+                guard let self, let textView else { return }
+                let request = InlineCompletionRequest(path: path, language: language, text: text, caret: caret)
+                self.inlineTask = Task { [weak self, weak textView] in
+                    let completion = try? await provider.complete(request)
+                    guard !Task.isCancelled, let self, let textView, let completion else { return }
+                    await MainActor.run {
+                        guard generation == self.inlineGeneration,
+                              textView.string == text,
+                              textView.selectedRange().location == caret,
+                              textView.selectedRange().length == 0 else { return }
+                        textView.showGhost(completion, at: caret)
+                    }
+                }
+            }
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = notification.object as? CodeEditorTextView else { return }
+            if textView.selectedRange().length > 0 { textView.clearGhost() }
         }
 
         /// Re-highlight only the paragraph(s) touched by the last edit instead of the whole
         /// document, keeping per-keystroke cost bounded for large files (PERF-MAC_FILES-001).
-        /// Mutates attributes in place over the changed range; never touches characters.
         private func highlightEditedRange(in textView: NSTextView) {
             guard !applyingHighlight, let storage = textView.textStorage else { return }
             applyingHighlight = true
             defer { applyingHighlight = false }
             let nsText = storage.string as NSString
-            // editedRange covers the just-changed characters; expand to whole paragraphs so
-            // multi-line tokens (strings/comments) re-tokenize cleanly.
             let edited = storage.editedRange.location == NSNotFound
                 ? NSRange(location: 0, length: nsText.length)
                 : storage.editedRange
@@ -3202,16 +3473,10 @@ private struct CodeTextEditor: NSViewRepresentable {
         }
 
         /// Re-highlight only the lines that changed between `oldText` and the current textView
-        /// content (PERF-MAC_FILES-014). Falls back to a full `applyHighlight` when the changed
-        /// range covers the whole document (e.g. file replaced entirely).
-        ///
-        /// Called from `updateNSView` after `textView.string` is set to the new remote content.
-        /// Never calls `setAttributedString` - mutates attributes in place - so cursor position,
-        /// scroll offset, and selection are undisturbed.
+        /// content (PERF-MAC_FILES-014). Never moves the selection or scroll offset.
         func applyHighlightIncremental(oldText: String, to textView: NSTextView) {
             guard !applyingHighlight else { return }
             let ranges = changedLineRanges(oldText: oldText, newText: textView.string)
-            // No changed lines (content identical) or entire document changed: use full highlight.
             guard !ranges.isEmpty else { return }
             let nsNew = textView.string as NSString
             let fullRange = NSRange(location: 0, length: nsNew.length)
@@ -3235,6 +3500,131 @@ private struct CodeTextEditor: NSViewRepresentable {
             lineNumberRuler?.invalidateLineStartCache()
             lineNumberRuler?.needsDisplay = true
         }
+    }
+}
+
+// MARK: - Editor text view (completion + ghost text)
+
+/// NSTextView subclass that owns IntelliSense and Distill ghost text.
+///
+/// Word completions go through AppKit's native completion list, so acceptance
+/// is one standard undoable edit. AI completions stay non-destructive: they
+/// are painted after the caret and inserted only on Tab.
+final class CodeEditorTextView: NSTextView {
+    var language: String?
+    var completionItemsForPrefix: ((String, Int) -> [FileCompletionItem])?
+
+    private var ghostText: String?
+    private var ghostCaret = 0
+
+    /// Code-editor behaviour shared by every mount: plain text, no smart
+    /// substitutions, undo, and the native incremental find bar.
+    func configureForEditing() {
+        isRichText = false
+        isAutomaticQuoteSubstitutionEnabled = false
+        isAutomaticDashSubstitutionEnabled = false
+        isAutomaticTextReplacementEnabled = false
+        allowsUndo = true
+        usesFindBar = true
+        isIncrementalSearchingEnabled = true
+    }
+
+    /// Replaces content from a remote/disk update without losing the caret or
+    /// selection. Returns the previous text so callers can re-highlight only
+    /// the changed lines; nil when the text was already equal.
+    @discardableResult
+    func replaceTextPreservingSelection(_ newText: String) -> String? {
+        guard string != newText else { return nil }
+        let old = string
+        let selection = selectedRanges
+        string = newText
+        selectedRanges = selection
+        return old
+    }
+
+    func showGhost(_ text: String, at caret: Int) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        ghostText = trimmed
+        ghostCaret = caret
+        needsDisplay = true
+    }
+
+    func clearGhost() {
+        guard ghostText != nil else { return }
+        ghostText = nil
+        needsDisplay = true
+    }
+
+    var hasGhost: Bool { ghostText != nil }
+
+    func acceptGhost() {
+        guard let ghost = ghostText else { return }
+        let caret = min(ghostCaret, (string as NSString).length)
+        ghostText = nil
+        // `insertText(_:replacementRange:)` is the same undoable path as typing.
+        insertText(ghost, replacementRange: NSRange(location: caret, length: 0))
+        needsDisplay = true
+    }
+
+    override func completions(forPartialWordRange charRange: NSRange, indexOfSelectedItem index: UnsafeMutablePointer<Int>?) -> [String]? {
+        let items = completionItemsForPrefix?(string, NSMaxRange(charRange)) ?? []
+        guard !items.isEmpty else { return nil }
+        index?.pointee = 0
+        return items.map(\.insertText)
+    }
+
+    override func insertCompletion(_ word: String, forPartialWordRange charRange: NSRange, movement: Int, isFinal flag: Bool) {
+        insertText(word, replacementRange: charRange)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 48, hasGhost { // Tab
+            acceptGhost()
+            return
+        }
+        if event.keyCode == 53, hasGhost { // Escape
+            clearGhost()
+            return
+        }
+        if event.keyCode == 49, event.modifierFlags.contains(.control) { // Ctrl+Space
+            complete(nil)
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let ghostText, let origin = ghostOrigin() else { return }
+        let firstLine = ghostText.components(separatedBy: .newlines).first ?? ghostText
+        let display = ghostText.contains("\n") ? firstLine + " \u{2026}" : firstLine
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.62),
+        ]
+        (display as NSString).draw(at: origin, withAttributes: attrs)
+    }
+
+    private func ghostOrigin() -> NSPoint? {
+        guard let layoutManager, let textContainer else { return nil }
+        let ns = string as NSString
+        let caret = max(0, min(ghostCaret, ns.length))
+        let inset = textContainerOrigin
+        if caret < ns.length {
+            let glyph = layoutManager.glyphIndexForCharacter(at: caret)
+            guard glyph < layoutManager.numberOfGlyphs else { return nil }
+            let rect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: textContainer)
+            return NSPoint(x: rect.minX + inset.x, y: rect.minY + inset.y)
+        }
+        if ns.length > 0 {
+            let glyph = layoutManager.glyphIndexForCharacter(at: ns.length - 1)
+            guard glyph < layoutManager.numberOfGlyphs else { return nil }
+            let rect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: textContainer)
+            return NSPoint(x: rect.maxX + inset.x, y: rect.minY + inset.y)
+        }
+        let rect = layoutManager.extraLineFragmentRect
+        return NSPoint(x: rect.minX + inset.x, y: rect.minY + inset.y)
     }
 }
 
