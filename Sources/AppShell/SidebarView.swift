@@ -2596,8 +2596,7 @@ public struct SidebarRootView: View {
                                 if index == separatorIdx {
                                     pinnedGroupDivider
                                 }
-                                workspaceRow(ws)
-                                workspaceChildren(ws)
+                                workspaceGroup(ws)
                             }
                         }
                     }
@@ -3243,18 +3242,31 @@ public struct SidebarRootView: View {
     @ViewBuilder
     private func workspaceChildren(_ ws: Workspace) -> some View {
         if vm.hasWorkspaceChildren(ws.id) {
-            // Hangs off the workspace row's square bottom edge, aligned with its left border
-            // (the chevron column is 16 pt wide); the LazyVStack gap is cancelled so they touch.
+            // Rows start at the workspace row's left border (the chevron column is 16 pt wide)
+            // and run to the sidebar's right edge, where their selection bar sits.
             VStack(alignment: .leading, spacing: DS.Space.xxs) { workspaceChildRows(ws) }
-                .padding(.vertical, DS.Space.xs)
-                .background(
-                    UnevenRoundedRectangle(bottomLeadingRadius: DS.Radius.control, bottomTrailingRadius: DS.Radius.control, style: .continuous)
-                        .fill(Color.black.opacity(0.15))
-                )
+                .padding(.top, DS.Space.xxs)
+                .padding(.bottom, DS.Space.sm)
                 .padding(.leading, 16)
-                .padding(.top, -DS.Space.xxs)
-                .padding(.bottom, DS.Space.xs)
+                .environment(\.sidebarDropdownRow, true)
                 .transition(.opacity)
+        }
+    }
+
+    /// An expanded workspace and its children share one full-width 15% black band, flush
+    /// with the sidebar's right edge; the list's horizontal inset is cancelled for it.
+    @ViewBuilder
+    private func workspaceGroup(_ ws: Workspace) -> some View {
+        let open = vm.expandedWorkspaceIDs.contains(ws.id) && vm.hasWorkspaceChildren(ws.id)
+        VStack(alignment: .leading, spacing: 0) {
+            workspaceRow(ws)
+            workspaceChildren(ws)
+        }
+        .padding(.trailing, open ? -DS.Space.sm : 0)
+        .background {
+            if open {
+                Rectangle().fill(Color.black.opacity(0.15)).padding(.leading, -DS.Space.sm)
+            }
         }
     }
 
@@ -3499,7 +3511,7 @@ public struct SidebarRootView: View {
                        value: vm.completedWorkspaces.contains(ws.id))
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 38)
-            .sidebarRowChrome(selected: selected || checked, tone: highlightTone, squareBottom: expanded && vm.hasWorkspaceChildren(ws.id))
+            .sidebarRowChrome(selected: selected || checked, tone: highlightTone, flushTrailing: expanded && vm.hasWorkspaceChildren(ws.id))
             .overlay(alignment: .top) {
                 if vm.dropTargetWorkspaceID == ws.id {
                     Capsule()
@@ -3648,21 +3660,24 @@ private struct TabColorMenuLabel: View {
 private struct SidebarRowChrome: ViewModifier {
     let tone: SidebarHighlightTone
     let selected: Bool
-    /// An expanded workspace row squares its bottom edge so its dropdown attaches below it.
-    var squareBottom = false
+    /// An expanded workspace row runs flush to the sidebar's right edge.
+    var flushTrailing = false
+    /// Rows inside an expanded workspace: flush right, selection bar on the right edge.
+    @Environment(\.sidebarDropdownRow) private var dropdownRow
     @State private var hovering = false
 
     func body(content: Content) -> some View {
         let radius = DS.Radius.control
+        let trailing = flushTrailing || dropdownRow ? 0 : radius
         content
             .background(
                 UnevenRoundedRectangle(
-                    topLeadingRadius: radius, bottomLeadingRadius: squareBottom ? 0 : radius,
-                    bottomTrailingRadius: squareBottom ? 0 : radius, topTrailingRadius: radius, style: .continuous
+                    topLeadingRadius: radius, bottomLeadingRadius: radius,
+                    bottomTrailingRadius: trailing, topTrailingRadius: trailing, style: .continuous
                 )
                 .fill(Self.fill(tone, hovering: hovering))
             )
-            .overlay(alignment: .leading) {
+            .overlay(alignment: dropdownRow ? .trailing : .leading) {
                 if tone != .none {
                     Self.bar(tone)
                         .frame(width: 3)
@@ -3694,8 +3709,19 @@ private struct SidebarRowChrome: ViewModifier {
 }
 
 private extension View {
-    func sidebarRowChrome(selected: Bool, tone: SidebarHighlightTone? = nil, squareBottom: Bool = false) -> some View {
-        modifier(SidebarRowChrome(tone: tone ?? (selected ? .selection : .none), selected: selected, squareBottom: squareBottom))
+    func sidebarRowChrome(selected: Bool, tone: SidebarHighlightTone? = nil, flushTrailing: Bool = false) -> some View {
+        modifier(SidebarRowChrome(tone: tone ?? (selected ? .selection : .none), selected: selected, flushTrailing: flushTrailing))
+    }
+}
+
+private struct SidebarDropdownRowKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var sidebarDropdownRow: Bool {
+        get { self[SidebarDropdownRowKey.self] }
+        set { self[SidebarDropdownRowKey.self] = newValue }
     }
 }
 

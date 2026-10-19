@@ -319,7 +319,7 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         XCTAssertFalse(source.contains("BotsModeSwitcher"), "no Workspaces | Bots toggle")
         let order = try ["accessibilityIdentifier(\"sidebar.new\")", "accessibilityIdentifier(\"sidebar.activity\")",
                          "accessibilityIdentifier(\"sidebar.scheduleTasks\")", "            generalBotsSection\n",
-                         "Text(\"Workspaces\")", "workspaceChildren(ws)", "            accountFooter\n"].map(position)
+                         "Text(\"Workspaces\")", "workspaceGroup(ws)", "            accountFooter\n"].map(position)
         XCTAssertEqual(order, order.sorted(), "top items, General Bots, Workspaces tree, account footer")
         XCTAssertEqual(f.vm.generalBots.first?.handle, TitioIdentity.handle)
         if let directory = ProcessInfo.processInfo.environment["RC_SIDEBAR_RENDER_DIR"] {
