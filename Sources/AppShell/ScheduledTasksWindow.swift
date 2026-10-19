@@ -830,7 +830,10 @@ public struct ScheduledTasksRootView: View {
                 }
                 VStack(alignment: .leading, spacing: DS.Space.md) {
                     overviewTitle
-                    HStack(spacing: DS.Space.md) { overviewActions }
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: DS.Space.md) { overviewActions }
+                        VStack(alignment: .leading, spacing: DS.Space.sm) { overviewActions }
+                    }
                 }
             }
             .padding(.horizontal, DS.Space.xxl)

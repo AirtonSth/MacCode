@@ -62,7 +62,7 @@ final class AppResponsiveMinimumWidthTests: XCTestCase {
         context.router = router
         let screens: [(String, AnyView)] = [
             ("settings", AnyView(SettingsView(vm: SettingsViewModel(context: context)))),
-            ("schedule", AnyView(ScheduledTasksRootView(vm: ScheduledTasksViewModel(context: context, router: router, loadImmediately: false)))),
+            ("schedule", AnyView(ScheduledTasksRootView(vm: ScheduledTasksViewModel(context: context, router: router, loadImmediately: false), botsVM: BotsViewModel(context: context)))),
             ("bots", AnyView(BotsRootView(vm: BotsViewModel(context: context)))),
             ("bots-studio", AnyView(BotsRootView(vm: try studioViewModel(context)))),
         ]
