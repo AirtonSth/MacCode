@@ -1451,7 +1451,7 @@ public struct SettingsView: View {
             }
         }
         .padding(DS.Space.xl)
-        .frame(minWidth: 620, maxWidth: .infinity, minHeight: 480)
+        .frame(minWidth: 360, maxWidth: .infinity, minHeight: 480)
         .background(DS.Palette.bg)
         .task { await vm.refreshNotificationStatus() }
         .task { await vm.refreshStorageUsage() }
@@ -2547,7 +2547,7 @@ public struct AccountView: View {
             }
         }
         .padding(DS.Space.xxl)
-        .frame(width: 460)
+        .frame(minWidth: 320, idealWidth: 460, maxWidth: 460)
         .background(DS.Palette.bg)
     }
 

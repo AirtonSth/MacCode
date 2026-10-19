@@ -133,23 +133,28 @@ final class BotBlobatarTests: XCTestCase {
     }
 
     func test_newShapesAreDistinctAndRoundTrip_becausePickingOneMustStick() {
-        for shape in [BotBlobatarShape.star, .ghost, .bean, .drop] {
+        for shape in [BotBlobatarShape.spark, .ghost, .bean, .drop] {
             let spec = BotBlobatarSpec(shape: shape, hue: .named("lime"))
             let f = BotBlobatar.figure(name: "Piper", spec: spec)
             XCTAssertEqual(f.resolvedShape.rawValue, shape.rawValue, "a picked \(shape) must draw that silhouette")
             XCTAssertEqual(BotBlobatarSpec.parse(spec.token), spec, "Studio must reload the picked \(shape)")
             XCTAssertEqual(f.eyes.count, 2, "every new shape still has a face")
         }
-        XCTAssertGreaterThanOrEqual(BotBlobatar.figure(name: "Piper", spec: BotBlobatarSpec(shape: .star)).petals.count, 5)
+        XCTAssertGreaterThanOrEqual(BotBlobatar.figure(name: "Piper", spec: BotBlobatarSpec(shape: .spark)).petals.count, 5)
         XCTAssertEqual(BotBlobatar.figure(name: "Piper", spec: BotBlobatarSpec(shape: .drop)).petals.count, 1)
         XCTAssertEqual(BotBlobatar.figure(name: "Piper", spec: BotBlobatarSpec(shape: .bean)).petals.count, 0)
     }
 
     func test_autoNeverPicksANewShape_becauseHashedAvatarsMustNotChange() {
-        let extra: Set<BotBlobatarResolvedShape> = [.star, .ghost, .bean, .drop]
+        let extra: Set<BotBlobatarResolvedShape> = [.spark, .ghost, .bean, .drop]
         for i in 0..<200 {
             XCTAssertFalse(extra.contains(BotBlobatar.figure(name: "seed-\(i)", spec: .default).resolvedShape))
         }
+    }
+
+    func test_starStaysTheLegacySymbolName_becauseBotsAlreadyAskForStarAsAnSFSymbol() {
+        XCTAssertNil(BotBlobatarSpec.parse("star"), "a new shape must not steal the legacy Star avatar name")
+        XCTAssertEqual(BotBlobatarSpec.parse("spark")?.shape, .spark)
     }
 
     func test_newHuesParse_becauseTheStudioOffersMoreColors() {

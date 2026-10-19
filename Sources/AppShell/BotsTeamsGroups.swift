@@ -768,7 +768,7 @@ struct BotTeamsManagerSheet: View {
                 .foregroundColor(DS.Palette.textTertiary)
         }
         .padding(DS.Space.xl)
-        .frame(width: 460)
+        .frame(minWidth: 320, idealWidth: 460, maxWidth: 460)
         .confirmationDialog(
             "Delete \(pendingTeamDelete?.name ?? "this team")?",
             isPresented: Binding(get: { pendingTeamDelete != nil }, set: { if !$0 { pendingTeamDelete = nil } }),
@@ -1109,7 +1109,7 @@ struct BotGroupEditorSheet: View {
             }
         }
         .padding(DS.Space.xl)
-        .frame(width: 460)
+        .frame(minWidth: 320, idealWidth: 460, maxWidth: 460)
         .onAppear(perform: load)
         .onChange(of: selected) { ids in
             if let current = lead, !ids.contains(current) { lead = nil }

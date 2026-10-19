@@ -751,7 +751,7 @@ public struct ScheduledTasksRootView: View {
         .onAppear { syncBotSchedules() }
         .onChange(of: vm.searchText) { _ in syncBotSchedules() }
         .onChange(of: vm.statusFilter) { _ in syncBotSchedules() }
-        .frame(minWidth: 980, minHeight: 680)
+        .frame(minWidth: 360, minHeight: 480)
         .background(DS.Palette.bg)
         .alert("Scheduled Tasks", isPresented: Binding(
             get: { vm.errorMessage != nil },

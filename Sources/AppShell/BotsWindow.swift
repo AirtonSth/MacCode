@@ -12999,7 +12999,7 @@ public struct BotsRootView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(minWidth: 700, minHeight: 680)
+        .frame(minWidth: 360, minHeight: 480)
         .background(DS.Palette.bg)
         // Sidebar (open) or the 34pt restore bar (collapsed) owns the
         // traffic lights, so Desk drops every titlebar inset: .top or the

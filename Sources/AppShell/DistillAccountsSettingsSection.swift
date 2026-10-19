@@ -38,7 +38,7 @@ struct DistillAccountsSettingsSection: View {
         .sheet(isPresented: $showingPanel) {
             DistillAccountsPanelHost(controller: controller, loadModels: loadModels)
                 .padding(DS.Space.xxl)
-                .frame(width: 820, height: 640)
+                .frame(minWidth: 360, idealWidth: 820, maxWidth: 820, minHeight: 480, idealHeight: 640)
                 .background(DS.Palette.bg)
                 .foregroundStyle(DS.Palette.text)
         }

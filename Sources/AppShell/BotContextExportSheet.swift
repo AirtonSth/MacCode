@@ -380,7 +380,7 @@ struct BotContextExportSheet: View {
             }
         }
         .padding(DS.Space.lg)
-        .frame(minWidth: 520, minHeight: 420)
+        .frame(minWidth: 360, idealWidth: 520, minHeight: 420)
         .onChange(of: model.sourceIsCurrent) { _, current in
             if !current { model.invalidate() }
         }

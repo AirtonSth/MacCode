@@ -6,7 +6,7 @@ import Foundation
 /// (frozen previews, selected chip, circular hue swatches) follows
 /// jeremy-prt/bloub (MIT). No npm package, no animation engine.
 public enum BotBlobatarShape: String, CaseIterable, Sendable {
-    case auto, round, organic, boxy, nub, cloud, sun, star, ghost, bean, drop
+    case auto, round, organic, boxy, nub, cloud, sun, spark, ghost, bean, drop
 
     public var displayName: String {
         switch self {
@@ -17,7 +17,7 @@ public enum BotBlobatarShape: String, CaseIterable, Sendable {
         case .nub: return "Nub"
         case .cloud: return "Cloud"
         case .sun: return "Sun"
-        case .star: return "Star"
+        case .spark: return "Spark"
         case .ghost: return "Ghost"
         case .bean: return "Bean"
         case .drop: return "Drop"
@@ -27,7 +27,7 @@ public enum BotBlobatarShape: String, CaseIterable, Sendable {
     /// Picked-only silhouettes: `auto` never resolves to them, so hashed avatars keep their look.
     var extraShape: BotBlobatarResolvedShape? {
         switch self {
-        case .star: return .star
+        case .spark: return .spark
         case .ghost: return .ghost
         case .bean: return .bean
         case .drop: return .drop
@@ -46,7 +46,7 @@ public enum BotBlobatarShape: String, CaseIterable, Sendable {
         case .cloud: return 0.885
         case .sun: return 0.965
         // Extra shapes reuse the round band for eyes and palette, then reshape the body.
-        case .star, .ghost, .bean, .drop: return 0.14
+        case .spark, .ghost, .bean, .drop: return 0.14
         }
     }
 }
@@ -278,7 +278,7 @@ public struct BotBlobatarPetal: Equatable, Sendable {
 }
 
 public enum BotBlobatarResolvedShape: String, Sendable {
-    case round, organic, boxy, nub, cloud, sun, star, ghost, bean, drop
+    case round, organic, boxy, nub, cloud, sun, spark, ghost, bean, drop
 }
 
 public struct BotBlobatarFigure: Equatable, Sendable {
@@ -588,7 +588,7 @@ private func coreScale(_ shape: BotBlobatarResolvedShape) -> Double {
     case .cloud: return 0.78
     case .sun: return 0.7
     case .nub: return 0.88
-    case .star: return 0.72
+    case .spark: return 0.72
     case .ghost: return 0.95
     case .bean: return 0.92
     case .drop: return 0.9
@@ -602,7 +602,7 @@ private func reshape(_ base: Layout, as shape: BotBlobatarResolvedShape, traits 
     let b = base.body
     let r = b.rx
     switch shape {
-    case .star:
+    case .spark:
         let count = t.int("star.n", 5, 7)
         let off = -Double.pi / 2
         out.body.rx = r * 0.78

@@ -221,7 +221,7 @@ public struct DistillAccountsPanel: View {
                     }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                         .disabled(unavailable || newLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }.frame(minHeight: 44)
-            }.padding(DS.Space.xxl).frame(width: 360)
+            }.padding(DS.Space.xxl).frame(minWidth: 300, idealWidth: 360, maxWidth: 360)
                 .font(DS.Font.body).foregroundStyle(DS.Palette.text)
                 .background(DS.Palette.bg)
         }

@@ -3718,7 +3718,7 @@ private struct SSHHostFormSheet: View {
             }
         }
         .padding(DS.Space.lg)
-        .frame(width: 460)
+        .frame(minWidth: 320, idealWidth: 460, maxWidth: 460)
         .background(DS.Palette.surfaceRaised)
         .onAppear { hostFieldFocused = true }
     }

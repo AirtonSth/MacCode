@@ -132,6 +132,6 @@ struct TitioQuickChatView: View {
             )
         }
         .padding(12)
-        .frame(width: 520)
+        .frame(minWidth: 320, idealWidth: 520, maxWidth: 520)
     }
 }

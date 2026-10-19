@@ -96,7 +96,7 @@ public struct AgentModelAutoRoutingCard: View {
             }
         }
         .padding(DS.Space.lg)
-        .frame(width: 360, alignment: .leading)
+        .frame(minWidth: 280, idealWidth: 360, maxWidth: 360, alignment: .leading)
         .background(
             LinearGradient(
                 colors: [DS.Palette.surfaceRaised, DS.Palette.success.opacity(0.12)],
