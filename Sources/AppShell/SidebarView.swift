@@ -3092,7 +3092,7 @@ public struct SidebarRootView: View {
                 if let loop = vm.loopLabelsByBot[row.botID] { loopGlyph(loop) }
                 if running { DSBusySpinner(label: "Running") }
             }
-            .padding(.leading, DS.Space.lg)
+            .padding(.leading, Self.workspaceChildIndent)
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 30)
             .sidebarRowChrome(selected: selected)
@@ -3230,6 +3230,9 @@ public struct SidebarRootView: View {
         "\(name) · \(type) · \(location) · \(vm.hostDisplayName)"
     }
 
+    /// Rows under a workspace section title sit one step right of the title.
+    private static let workspaceChildIndent = DS.Space.lg + DS.Space.sm + DS.Space.md
+
     private func workspaceSectionHeader(_ title: String, id: String) -> some View {
         Text(title)
             .font(DS.Font.caption2)
@@ -3247,10 +3250,6 @@ public struct SidebarRootView: View {
             // (the chevron column is 16 pt wide); the LazyVStack gap is cancelled so they touch.
             VStack(alignment: .leading, spacing: DS.Space.xxs) { workspaceChildRows(ws) }
                 .padding(.vertical, DS.Space.xs)
-                .background(
-                    UnevenRoundedRectangle(bottomLeadingRadius: DS.Radius.control, bottomTrailingRadius: DS.Radius.control, style: .continuous)
-                        .fill(Color.black.opacity(0.15))
-                )
                 .padding(.leading, 16)
                 .padding(.top, -DS.Space.xxs)
                 .padding(.bottom, DS.Space.xs)
@@ -3279,7 +3278,7 @@ public struct SidebarRootView: View {
                     Text("New bot").font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
                     Spacer(minLength: 0)
                 }
-                .padding(.leading, DS.Space.lg)
+                .padding(.leading, Self.workspaceChildIndent)
                 .padding(.horizontal, DS.Space.sm)
                 .frame(height: 30)
                 .contentShape(Rectangle())
@@ -3302,7 +3301,7 @@ public struct SidebarRootView: View {
                     Text("New conversation").font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
                     Spacer(minLength: 0)
                 }
-                .padding(.leading, DS.Space.lg)
+                .padding(.leading, Self.workspaceChildIndent)
                 .padding(.horizontal, DS.Space.sm)
                 .frame(height: 30)
                 .contentShape(Rectangle())
@@ -3328,7 +3327,7 @@ public struct SidebarRootView: View {
                     Text(label).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
                     Spacer(minLength: 0)
                 }
-                .padding(.leading, DS.Space.lg)
+                .padding(.leading, Self.workspaceChildIndent)
                 .padding(.horizontal, DS.Space.sm)
                 .frame(height: 30)
                 .contentShape(Rectangle())
@@ -3351,7 +3350,7 @@ public struct SidebarRootView: View {
                 Spacer(minLength: 0)
                 if busy { DSBusySpinner(label: "Running") }
             }
-            .padding(.leading, DS.Space.lg)
+            .padding(.leading, Self.workspaceChildIndent)
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 30)
             .background(busy && !selected ? RoundedRectangle(cornerRadius: DS.Radius.control).fill(DS.Palette.text.opacity(0.06)) : nil)
@@ -3403,7 +3402,7 @@ public struct SidebarRootView: View {
                 if let loop = vm.loopLabelsByThread[row.threadID] { loopGlyph(loop) }
                 if running { DSBusySpinner(label: "Running") }
             }
-            .padding(.leading, DS.Space.lg)
+            .padding(.leading, Self.workspaceChildIndent)
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 30)
             .sidebarRowChrome(selected: selected)
