@@ -3251,6 +3251,7 @@ public struct SidebarRootView: View {
             // (the chevron column is 16 pt wide); the LazyVStack gap is cancelled so they touch.
             VStack(alignment: .leading, spacing: DS.Space.xxs) { workspaceChildRows(ws) }
                 .padding(.vertical, DS.Space.xs)
+                .environment(\.sidebarSubmenuRow, true)
                 .padding(.leading, 16)
                 .padding(.top, -DS.Space.xxs)
                 .padding(.bottom, DS.Space.xs)
@@ -3650,6 +3651,8 @@ private struct SidebarRowChrome: ViewModifier {
     let selected: Bool
     /// An expanded workspace row squares its bottom edge so its dropdown attaches below it.
     var squareBottom = false
+    /// Rows inside an expanded workspace put their selection bar on the right edge.
+    @Environment(\.sidebarSubmenuRow) private var submenuRow
     @State private var hovering = false
 
     func body(content: Content) -> some View {
@@ -3662,7 +3665,7 @@ private struct SidebarRowChrome: ViewModifier {
                 )
                 .fill(Self.fill(tone, hovering: hovering))
             )
-            .overlay(alignment: .leading) {
+            .overlay(alignment: submenuRow ? .trailing : .leading) {
                 if tone != .none {
                     Self.bar(tone)
                         .frame(width: 3)
@@ -3696,6 +3699,17 @@ private struct SidebarRowChrome: ViewModifier {
 private extension View {
     func sidebarRowChrome(selected: Bool, tone: SidebarHighlightTone? = nil, squareBottom: Bool = false) -> some View {
         modifier(SidebarRowChrome(tone: tone ?? (selected ? .selection : .none), selected: selected, squareBottom: squareBottom))
+    }
+}
+
+private struct SidebarSubmenuRowKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var sidebarSubmenuRow: Bool {
+        get { self[SidebarSubmenuRowKey.self] }
+        set { self[SidebarSubmenuRowKey.self] = newValue }
     }
 }
 
