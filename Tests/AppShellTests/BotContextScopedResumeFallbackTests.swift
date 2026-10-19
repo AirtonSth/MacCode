@@ -31,6 +31,11 @@ final class BotContextScopedResumeFallbackTests: XCTestCase {
             linkedAgentThreadID: thread.id), newThread: thread, hostID: grant.hostID,
             context: grant.context, policyRevision: grant.policyRevision)
         let resolver = try XCTUnwrap(context.botGuestRunResolver)
+        XCTAssertFalse(resolver.preservesSessionIdentity(thread.id), "a pinned thread without an isolated admission runs like a normal bot thread")
+        let pin = try XCTUnwrap(context.botStore.conversationContextPin(linkedTo: thread.id))
+        try context.contextualRunAdmissions.register(.init(runID: AgentRunID(), threadID: thread.id, pin: pin,
+            parentRunID: nil, model: model, cwd: workspace.cwd, permit: AgentRunAcceptancePermit(),
+            providerConfiguration: "", validates: { true }))
         XCTAssertTrue(resolver.preservesSessionIdentity(thread.id))
         let adapter = DistillACPAdapter()
         adapter.setGuestLaunchResolver(resolver)

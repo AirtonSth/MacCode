@@ -730,7 +730,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let requiresResourceAdmission = ManagedProviderAdmissionPolicy.requiresProviderStartPreflight
         let profile = managedProcessMemoryProfile
         let gate = ManagedProviderAdmissionGate()
-        // Resource accounting stays best-effort; contextual authorization fails closed.
+        // Resource accounting stays best-effort; pin authorization fails closed.
         context.coordinator.providerAdmissionCheck = { [weak self] provider, threadId in
             guard let self else { throw NSError(domain: "RemoteCode.BotContext", code: 2, userInfo: [NSLocalizedDescriptionKey: "Bot context authority is unavailable."]) }
             let pin = try await MainActor.run { try self.context.botStore.conversationContextPin(linkedTo: threadId) }
@@ -740,7 +740,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                     return try self.context.botStore.authorizesConversation(conversation, hostID: self.context.liveActivityHostIdentity.serverId, action: .send)
                 }
                 guard authorized else { throw NSError(domain: "RemoteCode.BotContext", code: 1, userInfo: [NSLocalizedDescriptionKey: "Bot conversation context is no longer authorized."]) }
-                throw NSError(domain: "RemoteCode.BotContext", code: 2, userInfo: [NSLocalizedDescriptionKey: "Contextual Bot execution is unavailable until scoped runtime isolation is supported."])
             }
             guard requiresResourceAdmission else { return }
             guard let store = ProviderProcessOwnership.shared.store() else { return }

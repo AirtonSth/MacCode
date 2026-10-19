@@ -107,6 +107,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     }
 
     func preservesSessionIdentity(_ threadId: AgentThreadID) -> Bool {
+        guard deps.contextualAdmissions?.hasAdmission(threadID: threadId) == true else { return false }
         do { return try deps.botStore.conversationContextPin(linkedTo: threadId) != nil }
         catch { return true }
     }
@@ -115,7 +116,8 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         _ request: AgentRunRequest,
         progress: @escaping @Sendable (DistillGuestStage) -> Void
     ) async throws -> DistillGuestLaunchPlan? {
-        if try deps.botStore.conversationContextPin(linkedTo: request.threadId) != nil {
+        if deps.contextualAdmissions?.hasAdmission(for: request.runId) == true,
+           try deps.botStore.conversationContextPin(linkedTo: request.threadId) != nil {
             let work = Task {
                 try await self.preparePinnedContextRuntime(request, progress: progress)
             }

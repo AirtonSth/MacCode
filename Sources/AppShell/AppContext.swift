@@ -792,8 +792,11 @@ public final class AppContext {
             providerAdapters: [.codex: codex, .claude: claude, .grok: grok, .distill: distill]
         )
         let contextualBotStore = self.botStore
-        self.coordinator.botContextPinForThread = { [contextualBotStore] threadID in
-            try contextualBotStore.conversationContextPin(linkedTo: threadID)
+        let contextualAdmissions = self.contextualRunAdmissions
+        // Only the internal isolated path scrubs the environment; a pinned thread otherwise runs like a normal bot thread.
+        self.coordinator.botContextPinForThread = { [contextualBotStore, contextualAdmissions] threadID in
+            guard contextualAdmissions.hasAdmission(threadID: threadID) else { return nil }
+            return try contextualBotStore.conversationContextPin(linkedTo: threadID)
         }
         self.coordinator.onRecoveredForkPrunedThreadIDs = { [weak contextReference] ids in
             await MainActor.run {

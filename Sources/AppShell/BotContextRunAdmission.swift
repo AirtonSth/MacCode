@@ -64,6 +64,14 @@ final class BotContextRunAdmissions: @unchecked Sendable {
         return admission
     }
 
+    func hasAdmission(for runID: AgentRunID) -> Bool {
+        lock.withLock { admissions[runID] != nil }
+    }
+
+    func hasAdmission(threadID: AgentThreadID) -> Bool {
+        lock.withLock { admissions.values.contains { $0.threadID == threadID } }
+    }
+
     func discard(runID: AgentRunID) {
         lock.lock()
         defer { lock.unlock() }

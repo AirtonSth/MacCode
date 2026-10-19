@@ -2997,6 +2997,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// In-process schedule owner (main app). Run Now / ticks call this instead of XPC.
     public weak var scheduledTaskScheduler: ScheduledTaskScheduler?
 
+    /// Fork, side and plan-implementation branch a pinned thread into another thread, which the pin does not authorize.
     private static func refuseContextPinnedGenericExecution(_ threadID: AgentThreadID, context ctx: AppContext) throws {
         guard let pin = try ctx.botStore.conversationContextPin(linkedTo: threadID) else { return }
         let authorized: Bool
@@ -3006,8 +3007,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             authorized = false
         }
         throw JSONRPCError(code: -32602, message: authorized
-                           ? "Contextual execution is unavailable until isolation is verified."
+                           ? "Contextual conversations cannot be forked or continued in another thread."
                            : "Contextual send authority is inactive or invalid.")
+    }
+
+    /// A pinned thread sends like any bot thread; only a revoked or foreign pin refuses.
+    private static func requireContextPinnedSendAuthority(_ threadID: AgentThreadID, context ctx: AppContext) throws {
+        guard let pin = try ctx.botStore.conversationContextPin(linkedTo: threadID) else { return }
+        guard let conversation = try ctx.botStore.conversation(id: pin.conversationID),
+              try ctx.botStore.authorizesConversation(conversation, hostID: ctx.liveActivityHostIdentity.serverId, action: .send) else {
+            throw JSONRPCError(code: -32602, message: "Contextual send authority is inactive or invalid.")
+        }
     }
 
     /// Resolve authorization for a context-pinned thread without applying legacy routing.
@@ -3604,9 +3614,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             mutation: mutation,
             method: method
         )
-        if try ctx.botStore.conversationContextPin(linkedTo: threadID) != nil {
-            throw JSONRPCError(code: -32084, message: "Contextual Bot delegation is unavailable until scoped peer execution is supported.")
-        }
         return ctx
     }
 
@@ -5772,7 +5779,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
               let thread = try ctx.threadRepo.get(id: queued.threadId) else {
             throw JSONRPCError.invalidParams
         }
-        try Self.refuseContextPinnedGenericExecution(queued.threadId, context: ctx)
+        try Self.requireContextPinnedSendAuthority(queued.threadId, context: ctx)
         if try HostDatabaseRestore.requiresQueueReview(kind: .agent, id: id.value.uuidString, db: ctx.db) {
             let dispatch = try ctx.queuedMessageRepo.dispatch(id: id)
             guard dispatch?.state == .queued, dispatch?.runId == nil,
@@ -6262,7 +6269,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true, compilesBotPrompt: Bool = false, attachToProviderPromptId: String? = nil) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         do {
-            try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
+            try Self.requireContextPinnedSendAuthority(thread, context: ctx)
         } catch {
             if preflightRejectionIsDefinite { throw DefiniteMutationRejection(error) }
             throw error
@@ -6609,7 +6616,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         botVMHandOff: Bool = false
     ) async throws {
         if let ctx = context {
-            try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
+            try Self.requireContextPinnedSendAuthority(thread, context: ctx)
             if let head = try ctx.queuedMessageRepo.first(threadId: thread),
                try HostDatabaseRestore.requiresQueueReview(kind: .agent, id: head.id.value.uuidString, db: ctx.db) {
                 return

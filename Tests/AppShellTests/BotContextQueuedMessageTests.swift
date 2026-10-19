@@ -40,18 +40,19 @@ final class BotContextQueuedMessageTests: XCTestCase {
         return query.columnInt64(0)
     }
 
-    func test_validPinnedThreadRefusesPublicGenericSendBeforePreflightAndAttachments() async throws {
-        let f = try fixture("valid-send")
+    func test_revokedPinnedThreadRefusesPublicGenericSendBeforePreflightAndAttachments() async throws {
+        let f = try fixture("revoked-send")
         defer { try? FileManager.default.removeItem(at: f.root) }
+        _ = try f.context.botStore.revokeContext(hostID: f.context.liveActivityHostIdentity.serverId, botID: f.botID, context: .general, expectedRevision: 1)
         var resolved: [[AgentAttachment]] = []
         f.router.sendAgentMessageResolvedAttachmentsProbeForTesting = { resolved.append($0) }
 
         do {
             _ = try await f.router.sendAgentMessage(thread: f.thread.id, text: "must not send", provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)
-            XCTFail("pinned generic send must fail closed")
+            XCTFail("revoked pinned send must fail closed")
         } catch let error as JSONRPCError {
             XCTAssertEqual(error.code, -32602)
-            XCTAssertTrue(error.message.contains("Contextual execution is unavailable"))
+            XCTAssertTrue(error.message.contains("authority is inactive or invalid"))
         }
         do {
             _ = try await f.router.sendAgentMessageRouting(thread: f.thread.id, text: "remote refusal", provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil, serviceTier: nil, interactionMode: nil, modelSelection: nil, providerInstanceId: nil, attachments: [], routing: nil)
@@ -65,6 +66,18 @@ final class BotContextQueuedMessageTests: XCTestCase {
         XCTAssertEqual(try f.context.messageRepo.list(threadId: f.thread.id).count, 0)
         XCTAssertTrue(try f.context.queuedMessageRepo.list(threadId: f.thread.id).isEmpty)
         XCTAssertEqual(try runCount(f.context, threadID: f.thread.id), 0)
+    }
+
+    func test_validPinnedThreadPublicGenericSendPassesTheAuthorityGate() async throws {
+        // WHY: an active pin must reach normal send admission, never the old isolation refusal.
+        let f = try fixture("valid-send")
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        do {
+            _ = try await f.router.sendAgentMessage(thread: f.thread.id, text: "hello", provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)
+        } catch {
+            XCTAssertFalse(String(describing: error).contains("Contextual execution"), "\(error)")
+            XCTAssertFalse(String(describing: error).contains("authority is inactive"), "\(error)")
+        }
     }
 
     func test_pinnedPlanImplementationRefusesBeforeCreatingOrMutatingForEitherThreadMode() async throws {

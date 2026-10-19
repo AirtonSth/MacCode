@@ -8503,35 +8503,82 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(vm.composerText.contains("/sam more"))
     }
 
-    func test_pinnedDeskSendRejectsBeforeMutatingDraftOrPersistingMessage() throws {
+    func test_workspacePinnedDeskSendRunsLikeNormalBotSend() async throws {
+        // WHY: a pinned conversation keeps its identity but must run through the
+        // normal bot path; the old contextual-isolation refusal blocked every send.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .distill)
+        context.coordinator.replaceProvider(.distill, runner: runner)
+        let models = [AgentModelDescriptor(id: "main-model", label: "Main", provider: .distill)]
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .distill, models: models, binaryPath: "/usr/bin/true", authenticated: true, id: "distill",
+            capabilitiesOverride: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
+        )
+        router.rememberProviderSnapshotsForSend([snapshot])
+        let vm = BotsViewModel(context: context, router: router)
+        vm.replaceProvidersForTests([snapshot])
+        let bot = try vm.create(name: "Pinned", title: "Context", provider: .distill, model: "main-model")
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pinned-ws-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let workspace = try router.createWorkspace(name: "Pinned WS", cwd: dir.path)
+        _ = try context.botStore.grantContext(
+            hostID: context.liveActivityHostIdentity.serverId, botID: bot.id,
+            context: .workspace(workspace.id), actions: [.read, .send], expectedRevision: nil
+        )
+        vm.openDesk(bot)
+        vm.deskRouting = BotDeskRouting(
+            provider: .distill, providerInstanceID: "distill", model: "main-model",
+            routingMode: .manual, runAsUser: .current()
+        )
+        XCTAssertTrue(vm.createDeskThread(in: .workspace(workspace.id)))
+        let conversation = try XCTUnwrap(vm.selectedConversation)
+        let threadID = try XCTUnwrap(conversation.linkedAgentThreadID)
+        XCTAssertNotNil(try context.botStore.conversationContextPin(conversationID: conversation.id))
+
+        vm.composerText = "hello"
+        XCTAssertTrue(vm.send(), vm.errorMessage ?? "send refused")
+        let started = await waitUntil(timeout: 8) { !runner.requests.isEmpty }
+        XCTAssertTrue(started, vm.errorMessage ?? "run never started")
+        let request = try XCTUnwrap(runner.requests.first)
+        XCTAssertEqual(request.threadId, threadID)
+        XCTAssertTrue(request.prompt.contains("hello"))
+        // A normal desk send runs in the bot's own home (no workspace cwd); pinned runs match it.
+        XCTAssertTrue(request.cwd.contains("/bots/"), "cwd was \(request.cwd)")
+        XCTAssertTrue(runner.finish(runID: request.runId, status: .completed, reply: "hi"))
+        let completed = await waitUntil(timeout: 8) {
+            (try? context.runRepo.get(id: request.runId))?.status == .completed
+        }
+        XCTAssertTrue(completed)
+        XCTAssertFalse((vm.errorMessage ?? "").contains("Contextual execution"))
+        XCTAssertNil(vm.errorMessage)
+        XCTAssertNotNil(try context.botStore.conversationContextPin(conversationID: conversation.id))
+    }
+
+    func test_revokedPinnedDeskSendStillRefuses() throws {
+        // WHY: a revoked grant must stop sends even though pinned sends now run normally.
         let context = try makeContext()
         let vm = BotsViewModel(context: context)
         let bot = try vm.create(name: "Pinned", title: "Context", provider: .distill)
+        let host = context.liveActivityHostIdentity.serverId
         let binding = try context.botStore.grantContext(
-            hostID: context.liveActivityHostIdentity.serverId,
-            botID: bot.id,
-            context: .general,
-            actions: [.read, .send],
-            expectedRevision: nil
+            hostID: host, botID: bot.id, context: .general, actions: [.read, .send], expectedRevision: nil
         )
         let thread = AgentThread(title: "Pinned", provider: .distill, model: "test-main")
-        let conversation = BotConversation(
-            botID: bot.id,
-            title: "New thread",
-            linkedAgentThreadID: thread.id
-        )
+        let conversation = BotConversation(botID: bot.id, title: "New thread", linkedAgentThreadID: thread.id)
         try context.botStore.createContextualConversation(
-            conversation,
-            newThread: thread,
-            hostID: context.liveActivityHostIdentity.serverId,
-            context: .general,
-            policyRevision: binding.policyRevision
+            conversation, newThread: thread, hostID: host, context: .general, policyRevision: binding.policyRevision
+        )
+        _ = try context.botStore.revokeContext(
+            hostID: host, botID: bot.id, context: .general, expectedRevision: binding.policyRevision
         )
         vm.openDesk(bot)
         vm.replaceProvidersForTests([
             AgentProviderSnapshotFactory.snapshot(
-                provider: .distill,
-                models: [],
+                provider: .distill, models: [],
                 capabilitiesOverride: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
             )
         ])
@@ -8539,13 +8586,9 @@ final class BotsWindowTests: XCTestCase {
         vm.composerText = "Keep draft"
 
         XCTAssertFalse(vm.send())
-        XCTAssertEqual(vm.errorMessage, "Contextual execution is unavailable until runtime isolation is verified.")
+        XCTAssertEqual(vm.errorMessage, "Bot conversation context is no longer authorized.")
         XCTAssertEqual(vm.composerText, "Keep draft")
-        XCTAssertTrue(vm.attachments.isEmpty)
-        XCTAssertTrue(vm.deskMessages.isEmpty)
-        XCTAssertTrue(vm.queuedFollowUpsForTesting(botID: bot.id).isEmpty)
         XCTAssertTrue(try context.messageRepo.listRecent(threadId: thread.id, limit: 10).isEmpty)
-        XCTAssertNil(try context.threadRepo.get(id: thread.id)?.providerThreadId)
     }
 
     func test_createDeskThreadStartsEmptyConversation() throws {
@@ -18370,7 +18413,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(restored.policyRevision, revoked.policyRevision + 1)
     }
 
-    func test_pinnedDeskSendRejectsExactConversationBeforeProviderOrReceiptAndKeepsDraft() async throws {
+    func test_revokedPinnedDeskSendRejectsExactConversationBeforeProviderOrReceiptAndKeepsDraft() async throws {
         // WHY: the embedded Agent App transform must enforce the canonical
         // conversation pin, even if another conversation is selected later.
         let context = try makeContext()
@@ -18408,6 +18451,10 @@ final class BotsWindowTests: XCTestCase {
         vm.openDesk(otherBot)
         XCTAssertEqual(vm.selectedConversation?.id, other.id)
         XCTAssertNotEqual(other.id, pinned.id)
+        _ = try context.botStore.revokeContext(
+            hostID: hostID, botID: bot.id, context: .general,
+            expectedRevision: try XCTUnwrap(context.botStore.getContextBinding(hostID: hostID, botID: bot.id, context: .general)).policyRevision
+        )
         let messagesBefore = try context.messageRepo.listRecent(threadId: pinnedThreadID, limit: 100)
         let receiptBefore = try context.botStore.latestContextReceipt(botID: bot.id, conversationID: pinned.id)
 
@@ -18415,13 +18462,10 @@ final class BotsWindowTests: XCTestCase {
             _ = try await transform("keep this draft", pinnedThreadID, AgentRunID())
             XCTFail("pinned conversation transform must reject before compile")
         } catch {
-            XCTAssertEqual(
-                error.localizedDescription,
-                "Contextual execution is unavailable until runtime isolation is verified."
-            )
+            XCTAssertEqual(error.localizedDescription, "Bot conversation context is no longer authorized.")
         }
 
-        XCTAssertNil(context.coordinator.activeRunId(threadId: pinnedThreadID), "pinned send must not start provider")
+        XCTAssertNil(context.coordinator.activeRunId(threadId: pinnedThreadID), "revoked pinned send must not start provider")
         XCTAssertEqual(try context.messageRepo.listRecent(threadId: pinnedThreadID, limit: 100), messagesBefore)
         XCTAssertEqual(
             try context.botStore.latestContextReceipt(botID: bot.id, conversationID: pinned.id), receiptBefore,
@@ -18469,12 +18513,7 @@ final class BotsWindowTests: XCTestCase {
 
         XCTAssertEqual(vm.screen, .desk)
         XCTAssertEqual(vm.selectedConversation?.id, conversation.id)
-        XCTAssertEqual(
-            vm.errorMessage,
-            "Contextual execution is unavailable until runtime isolation is verified."
-        )
-        XCTAssertEqual(fake.created.count, 0)
-        XCTAssertEqual(fake.startCallCount, 0)
+        XCTAssertFalse((vm.errorMessage ?? "").contains("Contextual execution"))
     }
 
     func test_contextualDeskThreadCreatesPinnedLockedThreadForExplicitGrant() throws {

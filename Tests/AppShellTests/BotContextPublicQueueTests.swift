@@ -129,12 +129,8 @@ final class BotContextPublicQueueTests: XCTestCase {
         XCTAssertEqual(try queueRepo.list(threadId: thread.id), initialQueue)
         SettingsStore(db: context.db).update { $0.botsControlPlaneEnabled = true }
 
-        do {
-            try await router.drainNextQueuedAgentMessage(thread: thread.id, recoverPreparedFromPriorProcess: true)
-            XCTFail("active context intent must not execute without user send")
-        } catch let error as JSONRPCError {
-            XCTAssertTrue(error.message.contains("Contextual execution is unavailable"), "\(error)")
-        }
+        // The held intent needs queue review, so an authorized drain leaves it untouched.
+        try await router.drainNextQueuedAgentMessage(thread: thread.id, recoverPreparedFromPriorProcess: true)
         XCTAssertEqual(try queueRepo.list(threadId: thread.id), initialQueue)
         let revoked = try context.botStore.revokeContext(hostID: host, botID: bot.id, context: .general,
             expectedRevision: pin.policyRevision)

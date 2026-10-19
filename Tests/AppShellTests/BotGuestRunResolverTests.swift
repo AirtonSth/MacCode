@@ -233,7 +233,7 @@ final class BotGuestRunResolverTests: XCTestCase {
         await plan.finish(.completed).value
     }
 
-    func test_contextPinnedThreadRefusesBeforeGuestPreparationOrMacFallback() async throws {
+    func test_contextPinnedThreadWithoutAdmissionPreparesLikeANormalThread() async throws {
         for marked in [true, false] {
             let f = try await makeFixture()
             let grant = try f.ctx.botStore.grantContext(
@@ -251,21 +251,17 @@ final class BotGuestRunResolverTests: XCTestCase {
                 context: .general,
                 policyRevision: grant.policyRevision
             )
-            let marker = try Data(contentsOf: f.hostHome.appendingPathComponent("claude-auth.json"))
-
-            do {
-                _ = try await f.resolver.prepare(request(thread)) { _ in }
-                XCTFail("context-pinned thread must refuse execution")
-            } catch let error as DistillGuestLaunchError {
-                XCTAssertEqual(error, .unavailable("Contextual execution is unavailable until runtime isolation is verified."))
+            // Without an internal isolated admission, a pinned thread prepares exactly like a non-pinned one.
+            let plan = try await f.resolver.prepare(request(thread)) { _ in }
+            if marked {
+                let launch = try unwrapPlan(plan)
+                XCTAssertEqual(f.vm.calls.count, 1, "a marked pinned thread uses the bot's guest VM")
+                await launch.finish(.completed).value
+            } else {
+                XCTAssertNil(plan, "an unmarked pinned thread stays on the Mac like a normal one")
+                XCTAssertEqual(f.vm.calls.count, 0)
             }
-
-            XCTAssertEqual(try Data(contentsOf: f.hostHome.appendingPathComponent("claude-auth.json")), marker)
-            XCTAssertEqual(f.vm.calls.count, 0)
-            XCTAssertTrue(f.refreshes.values.isEmpty)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: f.guestDistillHome.path))
-            XCTAssertFalse(FileManager.default.fileExists(atPath: f.runsDirectory.path))
-            XCTAssertNil(f.registry.active(botID: f.bot.id))
+            f.resolver.endRunsForAppTermination()
         }
     }
 

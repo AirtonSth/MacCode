@@ -75,9 +75,8 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(parsed.body, "Inbox is clear.")
     }
 
-    func test_pinnedCallerCannotListOrAskPeersAndAgentAppMentionCreatesNothing() async throws {
-        // WHY: a contextual Bot may not inspect peer identity or dispatch a
-        // Mac-hosted peer before scoped execution exists.
+    func test_pinnedCallerListsPeersAndRevokedPinMentionCreatesNothing() async throws {
+        // WHY: a pinned Bot runs like a normal Bot, but a revoked pin must not dispatch peers.
         let (_, botsVM, _, quinn, _, ctx) = try makeWiredMentionSurface(peerReply: "unused")
         defer {
             for threadID in ctx.coordinator.activeThreadIdsSnapshot() { ctx.coordinator.stopRun(threadId: threadID) }
@@ -115,57 +114,25 @@ final class AgentAppBotMentionTests: XCTestCase {
             conversation, newThread: pinnedThread, hostID: hostID,
             context: context, policyRevision: binding.policyRevision
         )
-        // The public send path now refuses contextual execution (proven elsewhere), so the
-        // pinned caller is started through the coordinator, which still mints a real capability.
-        do {
-            _ = try await ctx.router!.sendAgentMessage(
-                thread: pinnedThread.id, text: "test", provider: .distill,
-                model: "fake-model", permissionMode: nil, reasoningEffort: nil
-            )
-            XCTFail("the public send path must refuse contextual execution")
-        } catch {
-            XCTAssertEqual((error as? JSONRPCError)?.message, "Contextual execution is unavailable until isolation is verified.")
-        }
-        _ = try await ctx.coordinator.startRun(AgentRunRequest(
-            threadId: pinnedThread.id, provider: .distill, model: "fake-model",
-            cwd: NSTemporaryDirectory(), prompt: "test"
-        ))
+        // A pinned thread sends through the public path like any bot thread.
+        _ = try await ctx.router!.sendAgentMessage(
+            thread: pinnedThread.id, text: "test", provider: .distill,
+            model: "fake-model", permissionMode: nil, reasoningEffort: nil
+        )
         let started = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
         XCTAssertTrue(started)
         let request = try XCTUnwrap(runner.requests.first)
         let capability = try XCTUnwrap(
             request.environment[AgentDelegationCapabilityTransport.environmentKey]
         )
-        XCTAssertThrowsError(try ctx.router!.listBotPeers(
+        XCTAssertNoThrow(try ctx.router!.listBotPeers(
             callerThread: pinnedThread.id, callerRun: request.runId,
             delegationCapability: capability
-        )) { error in
-            XCTAssertEqual((error as? JSONRPCError)?.code, -32084)
-            XCTAssertEqual((error as? JSONRPCError)?.message, "Contextual Bot delegation is unavailable until scoped peer execution is supported.")
-        }
-        for handle in [peerA.handle, peerB.handle, "unknown-peer"] {
-            do {
-                _ = try await ctx.router!.askBotPeer(
-                    callerThread: pinnedThread.id, callerRun: request.runId,
-                    handle: handle, prompt: "inspect", replyMode: .consult,
-                    delegationCapability: capability
-                )
-                XCTFail("pinned caller must not ask peer")
-            } catch {
-                XCTAssertEqual((error as? JSONRPCError)?.code, -32084)
-                XCTAssertEqual((error as? JSONRPCError)?.message, "Contextual Bot delegation is unavailable until scoped peer execution is supported.")
-            }
-        }
-        XCTAssertThrowsError(try ctx.router!.invokeDelegatedBotSelfConfig(
-            callerThread: pinnedThread.id,
-            callerRun: request.runId,
-            toolName: BotSelfConfigCatalog.getSettings,
-            arguments: [:],
-            delegationCapability: capability
-        )) { error in
-            XCTAssertEqual((error as? JSONRPCError)?.code, -32084)
-            XCTAssertEqual((error as? JSONRPCError)?.message, "Contextual Bot delegation is unavailable until scoped peer execution is supported.")
-        }
+        ))
+        // A revoked pin stops Agent App mentions from creating anything.
+        _ = try ctx.botStore.revokeContext(
+            hostID: hostID, botID: bot.id, context: context, expectedRevision: binding.policyRevision
+        )
         let beforeConversations = try ctx.botStore.listConversations(botID: peerB.id).count
         let beforeMessages = try ctx.messageRepo.list(threadId: pinnedThread.id).count
         let accepted = ctx.botPeerHandoffAuthority.submitAgentAppMention(

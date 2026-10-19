@@ -109,7 +109,7 @@ final class BotContextForkAuthorityTests: XCTestCase {
         let f = try fixture("router")
         defer { try? FileManager.default.removeItem(at: f.root) }
         let before = try counts(f.context, f.thread.id)
-        try await assertRouterDenied(f, message: "Contextual execution is unavailable")
+        try await assertRouterDenied(f, message: "cannot be forked or continued")
         XCTAssertEqual(try counts(f.context, f.thread.id), before)
         _ = try f.context.botStore.revokeContext(hostID: f.host, botID: f.bot.id, context: .general, expectedRevision: f.revision)
         try await assertRouterDenied(f, message: "authority is inactive or invalid")

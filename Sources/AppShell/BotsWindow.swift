@@ -1095,7 +1095,10 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         continuationPeerThreadID: AgentThreadID? = nil
     ) -> Task<Void, Never>? {
         do {
-            guard try botStore.conversationContextPin(linkedTo: originThread.id) == nil else { return nil }
+            if let pin = try botStore.conversationContextPin(linkedTo: originThread.id) {
+                guard try botStore.authorizes(hostID: pin.hostID, botID: pin.botID, context: pin.context,
+                                              action: .send, policyRevision: pin.policyRevision) else { return nil }
+            }
         } catch {
             return nil
         }
@@ -4908,12 +4911,7 @@ public final class BotsViewModel: ObservableObject {
         deskTimelineRejoinToken &+= 1
         lastGuestScreenURL = guestScreenURLByBot[bot.id.value]
         if (desktopKindOverrideForTesting ?? displayedDesktopKind) == .dockerDesktop {
-            do {
-                try rejectContextualConversationSend(for: bot)
-                presentGuestDesktop(botID: bot.id)
-            } catch {
-                errorMessage = error.localizedDescription
-            }
+            presentGuestDesktop(botID: bot.id)
         }
     }
 
@@ -5084,12 +5082,7 @@ public final class BotsViewModel: ObservableObject {
         deskTimelineRejoinToken &+= 1
         lastGuestScreenURL = guestScreenURLByBot[botID.value]
         if (desktopKindOverrideForTesting ?? displayedDesktopKind) == .dockerDesktop {
-            do {
-                try rejectContextualConversationSend(for: storedBot)
-                presentGuestDesktop(botID: botID)
-            } catch {
-                errorMessage = error.localizedDescription
-            }
+            presentGuestDesktop(botID: botID)
         }
     }
 
@@ -6386,9 +6379,7 @@ public final class BotsViewModel: ObservableObject {
               let threadID = conversation.linkedAgentThreadID else {
             throw BotStoreError.invalidRow("queued follow-up authority is stale")
         }
-        guard try botStore.conversationContextPin(conversationID: conversationID) == nil else {
-            throw BotStoreError.invalidInput("Contextual execution is unavailable until isolation is verified.")
-        }
+        try requireContextualSendAuthority(conversation)
         func ownsQueuedDeskSendReservation() -> Bool {
             (deskSendTasks[botID] ?? []).contains {
                 $0.threadID == threadID && $0.queuedRecord?.id.caseInsensitiveCompare(id) == .orderedSame
@@ -6476,24 +6467,25 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
-    private struct BotContextualSendUnavailable: LocalizedError {
-        var errorDescription: String? {
-            "Contextual execution is unavailable until runtime isolation is verified."
-        }
+    private struct BotContextSendUnauthorized: LocalizedError {
+        var errorDescription: String? { "Bot conversation context is no longer authorized." }
     }
 
-    private func rejectContextualConversationSend(for bot: BotDefinition) throws {
+    private func requireContextualSendAuthority(for bot: BotDefinition) throws {
         let conversation = selectedConversation.flatMap { $0.botID == bot.id ? $0 : nil }
             ?? selectedConversationByBot[bot.id].flatMap { rememberedID in
                 destConversations(botID: bot.id).first { $0.id == rememberedID }
             }
         guard let conversation else { return }
-        try rejectContextualConversationSend(conversation)
+        try requireContextualSendAuthority(conversation)
     }
 
-    private func rejectContextualConversationSend(_ conversation: BotConversation) throws {
+    /// A pinned conversation sends like any bot conversation; a revoked or foreign pin still refuses.
+    private func requireContextualSendAuthority(_ conversation: BotConversation) throws {
         guard try botStore.conversationContextPin(conversationID: conversation.id) != nil else { return }
-        throw BotContextualSendUnavailable()
+        guard try botStore.authorizesConversation(
+            conversation, hostID: context.liveActivityHostIdentity.serverId, action: .send
+        ) else { throw BotContextSendUnauthorized() }
     }
 
     private func deskLinkedThreadID(for conversationID: BotConversationID) -> AgentThreadID? {
@@ -6514,7 +6506,7 @@ public final class BotsViewModel: ObservableObject {
             return false
         }
         do {
-            try rejectContextualConversationSend(for: bot)
+            try requireContextualSendAuthority(for: bot)
         } catch {
             errorMessage = error.localizedDescription
             return false
@@ -6623,7 +6615,7 @@ public final class BotsViewModel: ObservableObject {
                   existing.botID == bot.id, existing.groupID == nil else {
                 throw BotStoreError.notFound
             }
-            try rejectContextualConversationSend(existing)
+            try requireContextualSendAuthority(existing)
             return existing
         }
         try admitDesktopSend(bot: bot)
@@ -10277,7 +10269,7 @@ public final class BotsViewModel: ObservableObject {
                 title: Self.titleFromFirstMessage(text)
             )
         }
-        try rejectContextualConversationSend(conversation)
+        try requireContextualSendAuthority(conversation)
         if conversation.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || conversation.title == "New thread" {
             conversation.title = Self.titleFromFirstMessage(text)
@@ -11034,7 +11026,7 @@ public final class BotsViewModel: ObservableObject {
               pinnedConversation.botID == botID else {
             throw BotStoreError.notFound
         }
-        try rejectContextualConversationSend(pinnedConversation)
+        try requireContextualSendAuthority(pinnedConversation)
         guard let bot = bots.first(where: { $0.id == botID }) ?? (try? botStore.get(id: botID)),
               let revision = try currentRevision(for: bot) else {
             throw BotDeskSendRefused(reason: "Bot runtime is unavailable.")
@@ -12034,7 +12026,7 @@ public final class BotsViewModel: ObservableObject {
         do {
             guard let bot = try botStore.get(id: bot.id), bot.deletedAt == nil,
                   conversation.botID == bot.id else { throw BotStoreError.notFound }
-            try rejectContextualConversationSend(conversation)
+            try requireContextualSendAuthority(conversation)
             guard queuedFollowUpMayDrain(next, botID: bot.id),
                   let record = try botStore.listQueuedFollowUps(botID: bot.id).first(where: { $0.id.lowercased() == next.id.uuidString.lowercased() }),
                   decodeQueuedFollowUp(record) == next else { return }
@@ -13822,7 +13814,6 @@ public struct BotsRootView: View {
             .accessibilityIdentifier("bots.desk.identity")
             Menu {
                 Text(vm.selectedPinnedContextLabel)
-                Text("Contextual execution unavailable")
                 Divider()
                 Button("Export selected excerpts…") {
                     do { contextExportModel = try vm.makeContextExportModel() }
@@ -13847,13 +13838,13 @@ public struct BotsRootView: View {
                     }
                 }
             } label: {
-                Text("Context: \(vm.selectedPinnedContextLabel)\(vm.selectedPinnedContextLabel == "Legacy" ? "" : " · execution unavailable")")
+                Text("Context: \(vm.selectedPinnedContextLabel)")
                     .font(DS.Font.caption2)
                     .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
             }
-            .help("Contextual conversations keep a fixed context. Contextual execution is unavailable.")
-            .accessibilityLabel("Conversation context: \(vm.selectedPinnedContextLabel). Contextual execution unavailable.")
+            .help("Contextual conversations keep a fixed context.")
+            .accessibilityLabel("Conversation context: \(vm.selectedPinnedContextLabel)")
             .accessibilityIdentifier("bots.desk.context")
             Spacer(minLength: DS.Space.lg)
             HStack(spacing: Self.deskHeaderIconSpacing) {

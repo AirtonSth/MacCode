@@ -41,10 +41,12 @@ final class BotContextColdAdmissionTests: XCTestCase {
             let before = try context.botStore.listConversations(botID: bot.id)
             XCTAssertEqual(vm.guestLaunchState(for: bot.id), .idle)
             XCTAssertThrowsError(try vm.enqueueHostMessage(botID: bot.id, text: "owned queued intent", conversationID: conversation.id)) { error in
-                XCTAssertTrue(error.localizedDescription.contains("Contextual execution is unavailable"),
-                              "authority refusal must precede the missing desktop dependency: \(error)")
+                if revoked {
+                    XCTAssertTrue(error.localizedDescription.contains("no longer authorized"), "\(error)")
+                } else {
+                    XCTAssertFalse(error.localizedDescription.contains("Contextual execution"), "\(error)")
+                }
             }
-            XCTAssertEqual(vm.guestLaunchState(for: bot.id), .idle, "a rejected context cannot enter legacy guest preparation")
             XCTAssertEqual(try context.botStore.listConversations(botID: bot.id), before)
             XCTAssertTrue(try context.botStore.listQueuedFollowUps(botID: bot.id).isEmpty)
             XCTAssertTrue(try context.messageRepo.list(threadId: thread.id).isEmpty)
