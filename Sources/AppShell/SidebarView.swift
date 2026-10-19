@@ -391,8 +391,10 @@ public final class SidebarViewModel: ObservableObject {
             refreshActiveSurfaceRows()
         }
     }
-    /// Busy terminal/SSH/diff tabs per workspace, listed above Bots in an expanded workspace.
+    /// Open tabs per workspace, listed under "Open Tabs" above Bots in an expanded workspace.
     @Published private(set) var activeSurfaceRows: [WorkspaceID: [ActiveSurfaceItem]] = [:]
+    /// Tabs among `activeSurfaceRows` with work in flight; they get the spinner.
+    @Published private(set) var busySurfaceIDs: Set<SurfaceID> = []
     /// PERF-MAC_SHELL_WINDOW-003: memoize per-workspace busy state for the
     /// lifetime of one `workspaces` snapshot so repeated SwiftUI `body`
     /// evaluations don't re-walk panes/surfaces (and the registry) on
@@ -413,15 +415,16 @@ public final class SidebarViewModel: ObservableObject {
     // without filter changes are O(1).
     private var filteredWorkspacesCache: [Workspace]?
     private func refreshActiveSurfaceRows() {
-        let next = Self.activeSurfaceRows(ActiveSurfaceProjector.items(workspaces: workspaces) {
-            SurfaceRegistry.shared.surface($0.id)?.isBusy == true
-        })
+        let all = ActiveSurfaceProjector.items(workspaces: workspaces) { _ in true }
+        let next = Dictionary(grouping: all, by: \.workspaceID)
+        let busy = Set(Self.busyTabs(all) { SurfaceRegistry.shared.surface($0.surfaceID)?.isBusy == true }.map(\.surfaceID))
         if next != activeSurfaceRows { activeSurfaceRows = next }
+        if busy != busySurfaceIDs { busySurfaceIDs = busy }
     }
 
-    /// Browser page loads flicker on every navigation and are not user work, so they stay out.
-    nonisolated static func activeSurfaceRows(_ items: [ActiveSurfaceItem]) -> [WorkspaceID: [ActiveSurfaceItem]] {
-        Dictionary(grouping: items.filter { $0.type != .browser }, by: \.workspaceID)
+    /// Browser page loads flicker on every navigation and are not user work, so they get no spinner.
+    nonisolated static func busyTabs(_ items: [ActiveSurfaceItem], isBusy: (ActiveSurfaceItem) -> Bool) -> [ActiveSurfaceItem] {
+        items.filter { $0.type != .browser && isBusy($0) }
     }
 
     func openActiveSurface(_ item: ActiveSurfaceItem) {
@@ -3189,7 +3192,10 @@ public struct SidebarRootView: View {
     /// Children of an expanded workspace: Bots (+ New bot first), then Conversations (+ New conversation first).
     @ViewBuilder
     private func workspaceChildren(_ ws: Workspace) -> some View {
-        ForEach(vm.activeSurfaceRows[ws.id] ?? []) { activeSurfaceRow($0) }
+        if let tabs = vm.activeSurfaceRows[ws.id], !tabs.isEmpty {
+            workspaceSectionHeader("Open Tabs", id: "sidebar.workspaceOpenTabs.\(ws.id.value.uuidString)")
+            ForEach(tabs) { activeSurfaceRow($0) }
+        }
         if vm.showsAddBot(ws.id) || !vm.workspaceBotRows(ws.id).isEmpty {
             workspaceSectionHeader("Bots", id: "sidebar.workspaceBots.\(ws.id.value.uuidString)")
         }
@@ -3264,25 +3270,39 @@ public struct SidebarRootView: View {
     }
 
     private func activeSurfaceRow(_ item: ActiveSurfaceItem) -> some View {
-        Button { navigate { vm.openActiveSurface(item) } } label: {
+        let busy = vm.busySurfaceIDs.contains(item.surfaceID)
+        return Button { navigate { vm.openActiveSurface(item) } } label: {
             HStack(spacing: DS.Space.sm) {
-                Image(systemName: item.type == .ssh ? "network" : (item.type == .terminal ? "terminal" : "doc.text.magnifyingglass"))
+                Image(systemName: Self.tabSymbol(item.type))
                     .font(.system(size: 11, weight: .regular))
                     .frame(width: 20, height: 20)
                     .foregroundColor(DS.Palette.textTertiary)
                 Text(item.title).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
                 Spacer(minLength: 0)
-                DSBusySpinner(label: "Running")
+                if busy { DSBusySpinner(label: "Running") }
             }
             .padding(.leading, DS.Space.lg)
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 30)
+            .background(busy ? RoundedRectangle(cornerRadius: DS.Radius.control).fill(DS.Palette.text.opacity(0.06)) : nil)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help("Open \(item.title)")
-        .accessibilityLabel("\(item.title), running")
+        .accessibilityLabel(busy ? "\(item.title), running" : item.title)
         .accessibilityIdentifier("sidebar.activeSurface.\(item.surfaceID.value.uuidString)")
+    }
+
+    private static func tabSymbol(_ type: SurfaceType) -> String {
+        switch type {
+        case .terminal: return "terminal"
+        case .ssh: return "network"
+        case .browser: return "globe"
+        case .files: return "folder"
+        case .markdown, .filePreview: return "doc.text"
+        case .rightSidebarTool: return "doc.text.magnifyingglass"
+        case .agentApp: return "bubble.left"
+        }
     }
 
     private func loopGlyph(_ label: String) -> some View {

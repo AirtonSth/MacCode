@@ -30,17 +30,18 @@ final class ActivityBusySurfaceTests: XCTestCase {
     }
 }
 
-/// Busy terminal/SSH tabs are listed under their workspace above Bots so the user sees
-/// live shell work without opening Activity; browser loads would flicker and stay out.
+/// Every open tab is listed under "Open Tabs"; only busy shell work spins. Browser loads
+/// flicker on each navigation, so a loading browser tab must not spin.
 final class SidebarActiveSurfaceRowsTests: XCTestCase {
-    func test_groupsBusyShellTabsByWorkspace_excludesBrowser() {
+    func test_onlyBusyNonBrowserTabsSpin() {
         let ws = WorkspaceID(UUID())
         func item(_ type: SurfaceType) -> ActiveSurfaceItem {
             let id = SurfaceID(UUID())
             return ActiveSurfaceItem(id: id.value, workspaceID: ws, workspaceName: "Test", surfaceID: id, title: "\(type)", type: type)
         }
-        let terminal = item(.terminal), ssh = item(.ssh), browser = item(.browser)
-        let rows = SidebarViewModel.activeSurfaceRows([terminal, ssh, browser])
-        XCTAssertEqual(rows[ws]?.map(\.surfaceID), [terminal.surfaceID, ssh.surfaceID])
+        let terminal = item(.terminal), ssh = item(.ssh), files = item(.files), browser = item(.browser)
+        let busy: Set<SurfaceID> = [terminal.surfaceID, ssh.surfaceID, browser.surfaceID]
+        let spinning = SidebarViewModel.busyTabs([terminal, ssh, files, browser]) { busy.contains($0.surfaceID) }
+        XCTAssertEqual(spinning.map(\.surfaceID), [terminal.surfaceID, ssh.surfaceID])
     }
 }
