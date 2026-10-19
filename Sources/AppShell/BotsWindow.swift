@@ -4559,13 +4559,18 @@ public final class BotsViewModel: ObservableObject {
         deskLiveTimeline = timeline
     }
 
-    public func beginCreate() {
+    public func beginCreate() { beginCreate(inWorkspace: nil) }
+
+    /// `workspaceID` creates a Bot exclusive to that workspace: it is owned by it and
+    /// granted read and send there only, so it never appears in General.
+    public func beginCreate(inWorkspace workspaceID: WorkspaceID?, then created: (() -> Void)? = nil) {
         requestLeaveUnsavedNewBot { [weak self] in
-            self?.beginCreateNow()
+            self?.beginCreateNow(inWorkspace: workspaceID)
+            created?()
         }
     }
 
-    private func beginCreateNow() {
+    private func beginCreateNow(inWorkspace workspaceID: WorkspaceID? = nil) {
         guard isControlPlaneActive else {
             errorMessage = "Turn on Bot control plane in Settings"
             return
@@ -4583,8 +4588,18 @@ public final class BotsViewModel: ObservableObject {
                 title: "",
                 description: "",
                 soul: BotStandingInstructions.fallback(name: name, title: "", description: ""),
-                avatarSymbol: BotBlobatarSpec.default.token
+                avatarSymbol: BotBlobatarSpec.default.token,
+                workspaceID: workspaceID
             )
+            if let workspaceID {
+                try botStore.grantContext(
+                    hostID: context.liveActivityHostIdentity.serverId,
+                    botID: bot.id,
+                    context: .workspace(workspaceID),
+                    actions: [.read, .send],
+                    expectedRevision: nil
+                )
+            }
             beginEdit(bot)
             botIDBeforeCreate = previous
             markUnpublishedNewBot(bot.id)
@@ -5614,7 +5629,8 @@ public final class BotsViewModel: ObservableObject {
         soul: String = "",
         avatarSymbol: String = "person.crop.circle",
         notificationsEnabled: Bool = true,
-        desktopKind: BotDesktopKind = .logicalExecutionSpace
+        desktopKind: BotDesktopKind = .logicalExecutionSpace,
+        workspaceID: WorkspaceID? = nil
     ) throws -> BotDefinition {
         guard isControlPlaneActive else {
             errorMessage = "Turn on Bot control plane in Settings"
@@ -5628,7 +5644,7 @@ public final class BotsViewModel: ObservableObject {
             avatarSymbol: avatarSymbol,
             soul: soul,
             desktopKind: resolvedDesktopKind(desktopKind),
-            workspaceID: context.state.window.selectedWorkspaceID,
+            workspaceID: workspaceID ?? context.state.window.selectedWorkspaceID,
             notificationsEnabled: notificationsEnabled
         )
         // Dest first. Create used to reloadFleet (every teammate's
@@ -12423,6 +12439,13 @@ public final class BotsViewModel: ObservableObject {
         // (two roster queries + coordinator lock); the refresh rides the
         // first settle now.
         guard settledTerminalRunIDByThread[threadId] != runId else { return false }
+        // The provider's terminal status reaches observers before the coordinator commits
+        // the run row. Settling on a still-running row paints Working and swallows the
+        // real didFinish, so wait for the durable terminal.
+        if let durable = try? context.runRepo.get(id: runId),
+           !BotsDeskFollowThrough.isTerminal(durable.status) {
+            return false
+        }
         settledTerminalRunIDByThread[threadId] = runId
         if botStore.cachedBotID(linkedTo: threadId) == nil {
             if screen == .desk,
@@ -13280,37 +13303,23 @@ public struct BotsRootView: View {
         return VStack(alignment: .leading, spacing: DS.Space.xl) {
             studioSectionHeader("Reply Style")
             labeledField(
-                "Verbosity",
-                caption: "Human: the Bot writes like a person and the chat shows only its messages. Verbose: the chat also shows every command, edit and tool it runs."
+                "Reply style",
+                caption: style.verbosity == .human
+                    ? "Writes like a person explaining to someone who isn't technical. The chat hides commands and tool steps and shows only what the Bot is thinking right now."
+                    : "Can include files, commands and code, and the chat shows every step it runs."
             ) {
-                Picker("Verbosity", selection: Binding(
+                Picker("Reply style", selection: Binding(
                     get: { style.verbosity },
                     set: { vm.studioDraft.verbosity = $0 }
                 )) {
-                    Text("Human").tag(BotReplyVerbosity.human)
-                    Text("Verbose").tag(BotReplyVerbosity.verbose)
+                    Text("Simple").tag(BotReplyVerbosity.human)
+                    Text("Technical").tag(BotReplyVerbosity.verbose)
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(maxWidth: 260, alignment: .leading)
                 .accessibilityIdentifier("bots.studio.verbosity")
             }
-            Toggle(isOn: Binding(
-                get: { style.caveman },
-                set: { vm.studioDraft.cavemanEnabled = $0 }
-            )) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Caveman")
-                        .font(DS.Font.body)
-                        .foregroundColor(DS.Palette.text)
-                    Text("Short, terse replies.")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                }
-            }
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .accessibilityIdentifier("bots.studio.caveman")
         }
         .disabled(!vm.isControlPlaneActive)
         .accessibilityIdentifier("bots.studio.replyStyle")

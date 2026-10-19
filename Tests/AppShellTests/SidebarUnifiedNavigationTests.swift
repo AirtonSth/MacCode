@@ -88,6 +88,34 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
                        "a revoked Bot conversation's title must disappear while plain work stays")
     }
 
+    func test_botMadeConversationRowShowsTheBotAvatarAndPlainWorkKeepsTheChatIcon() async throws {
+        // WHY: the user must tell at a glance which conversations a Bot made; plain work keeps bubble.left.
+        let f = try make("conversation-avatar")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let botsVM = BotsViewModel(context: f.context)
+        f.router.botsViewModel = botsVM
+        let workspace = try f.router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        let plain = try f.router.createAgentThread(workspace: workspace.id, title: "Plain", provider: .codex, model: "fake", permissionMode: .supervised, reasoningEffort: .medium)
+        let bot = try f.context.botStore.create(name: "Piper", title: "", description: "", provider: .distill)
+        let grant = try f.context.botStore.grantContext(hostID: f.host, botID: bot.id, context: .workspace(workspace.id), actions: [.read], expectedRevision: 0)
+        var thread = AgentThread(workspaceId: workspace.id, title: "Bot work", provider: .distill, model: "fixture")
+        thread.status = .completed
+        try f.context.botStore.createContextualConversation(BotConversation(botID: bot.id, title: "Bot work", linkedAgentThreadID: thread.id),
+            newThread: thread, hostID: f.host, context: .workspace(workspace.id), policyRevision: grant.policyRevision)
+        botsVM.reload()
+        f.vm.reload()
+        await expand(f.vm, workspace.id)
+        let rows = f.vm.workspaceConversationRows(workspace.id)
+        let botRow = try XCTUnwrap(rows.first { $0.threadID == thread.id })
+        let plainRow = try XCTUnwrap(rows.first { $0.threadID == plain.id })
+        XCTAssertEqual(f.vm.conversationBot(botRow)?.id, bot.id, "a Bot-made conversation row resolves its Bot for the avatar")
+        XCTAssertNil(f.vm.conversationBot(plainRow), "plain work has no Bot, so the row keeps the chat icon")
+        let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("if let bot = vm.conversationBot(row) {"), "the row view must branch on the resolved Bot")
+        XCTAssertTrue(source.contains("Image(systemName: \"bubble.left\")"), "the chat-icon fallback must stay")
+    }
+
     func test_untitledNewThreadsAreNotListedAndSelectingAWorkspaceExpandsIt() async throws {
         // WHY: "+ New conversation" already starts work; empty "New thread" rows were noise.
         let f = try make("untitled")
@@ -344,5 +372,28 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         XCTAssertTrue(botsVM.needsUnsavedNewBotConfirm, "the draft stays unpublished until the user saves it")
         XCTAssertTrue(try f.context.botStore.listContextBindings(hostID: f.host, botID: draft).isEmpty,
                       "Add Bot never grants a context; linking to a workspace is a separate explicit step")
+    }
+
+    func test_addBotFromAWorkspaceCreatesABotExclusiveToThatWorkspace() throws {
+        let f = try make("addbotws")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let controller = MainWindowController(context: f.context, router: f.router)
+        f.router.windowController = controller
+        controller.window.isReleasedWhenClosed = false
+        defer { controller.window.close() }
+        SettingsStore(db: f.context.db).update { $0.botsControlPlaneEnabled = true }
+        let botsVM = controller.sidebarBotsViewModelForTesting
+        f.router.botsViewModel = botsVM
+        let workspace = try f.router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory()).id
+        controller.sidebarViewModelForTesting.addBot(inWorkspace: workspace)
+        let draft = try XCTUnwrap(botsVM.selectedBotID)
+        XCTAssertEqual(botsVM.screen, .studio, "New bot in a workspace still opens Studio so the user names it")
+        XCTAssertEqual(try f.context.botStore.get(id: draft)?.workspaceID, workspace,
+                       "the Bot is owned by the workspace where + New bot was clicked")
+        let bindings = try f.context.botStore.listContextBindings(hostID: f.host, botID: draft)
+        XCTAssertEqual(bindings.map(\.context), [.workspace(workspace)],
+                       "the Bot is exclusive: granted only in that workspace, never General")
+        XCTAssertTrue(bindings[0].state == .active && bindings[0].actions.isSuperset(of: [.read, .send]),
+                      "it must be usable in its workspace right away, so it lists under that workspace's Bots")
     }
 }

@@ -271,7 +271,7 @@ struct InlineCompletionRequest: Equatable, Sendable {
         You are an inline code completion engine inside a macOS code editor.
         Complete the code at the <cursor> marker. Reply with ONLY the characters to insert at the cursor.
         Do not repeat the prefix, do not add markdown fences, do not explain.
-        Keep it short: one expression or at most two lines.
+        Complete the current statement or block; at most 8 lines.
 
         File: \((path as NSString).lastPathComponent)
         Language: \(languageName)
@@ -317,9 +317,9 @@ final class DistillInlineCompletionProvider: InlineCompletionProviding {
     /// Strips markdown fences, reasoning preambles and duplicated context.
     /// Returns nil when nothing safe remains.
     static func sanitize(_ raw: String, prefix: String, suffix: String) -> String? {
-        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
-        if text.hasPrefix("```") {
+        var text = raw
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("```") {
             var lines = text.components(separatedBy: "\n")
             lines.removeFirst()
             if let lastFence = lines.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix("```") }) {
@@ -335,8 +335,8 @@ final class DistillInlineCompletionProvider: InlineCompletionProviding {
         if !suffix.isEmpty, suffix.hasPrefix(text) {
             return nil
         }
-        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, text.count <= 500 else { return nil }
+        while let last = text.last, last.isWhitespace { text.removeLast() }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.count <= 500 else { return nil }
         return text
     }
 

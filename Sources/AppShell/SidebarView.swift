@@ -893,6 +893,12 @@ public final class SidebarViewModel: ObservableObject {
             || showsNewConversation(id) || !workspaceConversationRows(id).isEmpty
     }
 
+    /// The Bot that made this conversation, so its row shows the Bot's avatar instead of the chat icon.
+    func conversationBot(_ row: WorkspaceConversationRow) -> BotDefinition? {
+        guard let id = row.botID else { return nil }
+        return router?.botsViewModel?.bots.first { $0.id == id }
+    }
+
     public func showsAddBot(_ id: WorkspaceID) -> Bool {
         expandedWorkspaceIDs.contains(id) && sidebarQuery.isEmpty
     }
@@ -1049,11 +1055,15 @@ public final class SidebarViewModel: ObservableObject {
     /// Opens the Teams manager.
     public func openTeams() { withBotsContent { $0.openTeamsManager() } }
 
-    /// Opens the existing New Bot flow; linking it to a workspace stays an explicit grant.
-    public func addBot() {
+    /// Opens the New Bot flow. From a workspace's "+ New bot" the Bot is exclusive to that workspace.
+    public func addBot(inWorkspace workspaceID: WorkspaceID? = nil) {
         guard let router else { return }
         router.windowController?.presentBotsInMainContent()
-        router.botsViewModel?.beginCreate()
+        router.botsViewModel?.beginCreate(inWorkspace: workspaceID) { [weak self] in
+            guard workspaceID != nil else { return }
+            self?.reloadAuthorizedBotConversationRows()
+            self?.reload()
+        }
     }
 
     /// A General Bot opens its recent general conversation, or its Desk when it has none.
@@ -3271,7 +3281,7 @@ public struct SidebarRootView: View {
             workspaceSectionHeader("Bots", id: "sidebar.workspaceBots.\(ws.id.value.uuidString)")
         }
         if vm.showsAddBot(ws.id) {
-            Button { navigate { vm.addBot() } } label: {
+            Button { navigate { vm.addBot(inWorkspace: ws.id) } } label: {
                 HStack(spacing: DS.Space.sm) {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .regular))
@@ -3286,7 +3296,7 @@ public struct SidebarRootView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Create a Bot; linking it to \(ws.name) asks for an explicit grant")
+            .help("Create a Bot exclusive to \(ws.name)")
             .accessibilityIdentifier("sidebar.addBot.\(ws.id.value.uuidString)")
         }
         ForEach(vm.workspaceBotRows(ws.id)) { botConversationRow($0) }
@@ -3392,10 +3402,16 @@ public struct SidebarRootView: View {
         let running = vm.runningThreadIDs.contains(row.threadID)
         return Button { navigate { vm.openWorkspaceConversation(row) } } label: {
             HStack(spacing: DS.Space.sm) {
-                Image(systemName: "bubble.left")
-                    .font(.system(size: 11, weight: .regular))
-                    .frame(width: 20, height: 20)
-                    .foregroundColor(DS.Palette.textTertiary)
+                if let bot = vm.conversationBot(row) {
+                    BotsAvatarView(name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol.isEmpty ? nil : bot.avatarSymbol, size: 20, attention: running ? .working : .none)
+                        .frame(width: 20, height: 20)
+                        .accessibilityIdentifier("sidebar.conversationBotAvatar.\(row.threadID.value.uuidString)")
+                } else {
+                    Image(systemName: "bubble.left")
+                        .font(.system(size: 11, weight: .regular))
+                        .frame(width: 20, height: 20)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
                 Text(AgentThreadTitle.display(row.title)).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary).lineLimit(1)
                 if let age {
                     Text("· \(age)").font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1).fixedSize()

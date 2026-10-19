@@ -611,6 +611,73 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
         XCTAssertNotEqual(a, c)
     }
 
+    func test_liveThought_latestReasoningWinsOverEarlierOne() {
+        // WHY: the line must show what the model thinks now; an older thought
+        // left on screen reads as stale progress.
+        let turn = AssistantTurnSnapshot(turnId: "t", items: [
+            reasoning("r1", "Old plan"),
+            tool("c1", state: .completed),
+            reasoning("r2", "New plan")
+        ])
+        XCTAssertEqual(AgentChatLiveTurnChrome.liveThought(turn), "New plan")
+    }
+
+    func test_liveThought_persistsWhileToolRunsAfterIt() {
+        // WHY: the thought stays while a tool runs; it clears only when the
+        // next thought or the answer replaces it.
+        let turn = AssistantTurnSnapshot(turnId: "t", items: [
+            reasoning("r1", "Checking the build"),
+            tool("c1", state: .streaming)
+        ])
+        XCTAssertEqual(AgentChatLiveTurnChrome.liveThought(turn), "Checking the build")
+    }
+
+    func test_liveThought_hiddenOnceAnswerStarts() {
+        // WHY: once the answer is being written, a thought line above it would
+        // duplicate reasoning the user is already reading.
+        let turn = AssistantTurnSnapshot(turnId: "t", items: [
+            reasoning("r1", "Thinking it through"),
+            AssistantItem(id: "m1", turnId: "t", type: .assistantMessage, state: .streaming, body: "Answer", startedAtMs: 3)
+        ])
+        XCTAssertNil(AgentChatLiveTurnChrome.liveThought(turn))
+    }
+
+    func test_liveThought_keepsLastThreeLinesWithBoldStrippedAndCapsLength() {
+        // WHY: the line is a fixed-height tail; full reasoning bodies would
+        // grow the transcript on every token.
+        let six = (1...6).map { "line \($0)" }.joined(separator: "\n")
+        let shortTail = AgentChatLiveTurnChrome.liveThought(
+            AssistantTurnSnapshot(turnId: "t", items: [reasoning("r1", six)])
+        )
+        XCTAssertEqual(shortTail, "line 4\nline 5\nline 6")
+
+        let bold = AgentChatLiveTurnChrome.liveThought(
+            AssistantTurnSnapshot(turnId: "t", items: [reasoning("r2", "**Plan** ok")])
+        )
+        XCTAssertEqual(bold, "Plan ok", "markdown bold markers must not reach the user")
+
+        let long = AgentChatLiveTurnChrome.liveThought(
+            AssistantTurnSnapshot(turnId: "t", items: [reasoning("r3", String(repeating: "x", count: 1000))])
+        )
+        XCTAssertNotNil(long)
+        XCTAssertLessThanOrEqual(long?.count ?? .max, 281, "cap keeps the line bounded")
+        XCTAssertTrue(long?.hasPrefix("…") ?? false, "a cut tail is marked with an ellipsis")
+    }
+
+    func test_liveThought_nilWithoutReasoningOrText() {
+        // WHY: no reasoning means no thinking line; "Working…" stays the only signal.
+        XCTAssertNil(AgentChatLiveTurnChrome.liveThought(AssistantTurnSnapshot(turnId: "t", items: [tool("c1", state: .streaming)])))
+        XCTAssertNil(AgentChatLiveTurnChrome.liveThought(AssistantTurnSnapshot(turnId: "t", items: [reasoning("r1", "  \n ")])))
+    }
+
+    private func reasoning(_ id: String, _ body: String) -> AssistantItem {
+        AssistantItem(id: id, turnId: "t", type: .reasoning, state: .streaming, body: body, startedAtMs: 1)
+    }
+
+    private func tool(_ id: String, state: AssistantItemState) -> AssistantItem {
+        AssistantItem(id: id, turnId: "t", type: .commandExecution, state: state, body: "ls", startedAtMs: 2)
+    }
+
     func test_toolGroupSummary_isMemoizedByMemberIdentity() {
         let items = [
             AssistantItem(id: "c1", turnId: "t", type: .commandExecution, state: .completed, body: "ls", startedAtMs: 1),

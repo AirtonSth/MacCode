@@ -1969,7 +1969,7 @@ public final class AppContext {
             environment[BotSelfConfigCatalog.callerEnvironmentKey] =
                 conversation.botID.value.uuidString.lowercased()
             if let bot = try? botStore.get(id: conversation.botID) {
-                environment[BotRunMCPAdmission.cavemanEnvironmentKey] = bot.cavemanEnabled ? "1" : "0"
+                environment[BotRunMCPAdmission.cavemanEnvironmentKey] = "0"
             }
             if let bot = try? botStore.get(id: conversation.botID),
                let revisionID = bot.currentRevisionID,

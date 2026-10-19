@@ -775,11 +775,11 @@ struct EditorColorPalette: Equatable {
         if isDark {
             return EditorColorPalette(
                 isDark:              true,
-                background:          NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1),
-                text:                NSColor(red: 0.83, green: 0.83, blue: 0.83, alpha: 1),
+                background:          NSColor(red: 0.122, green: 0.122, blue: 0.122, alpha: 1),
+                text:                NSColor(red: 0.8, green: 0.8, blue: 0.8, alpha: 1),
                 insertionPoint:      .white,
-                lineNumberBackground: NSColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1),
-                lineNumberText:      NSColor(red: 0.45, green: 0.47, blue: 0.50, alpha: 1)
+                lineNumberBackground: NSColor(red: 0.122, green: 0.122, blue: 0.122, alpha: 1),
+                lineNumberText:      NSColor(red: 0.431, green: 0.463, blue: 0.502, alpha: 1)
             )
         } else {
             return EditorColorPalette(
@@ -1076,6 +1076,8 @@ final class FilesViewModel: ObservableObject {
     // whenever the displayed directory changes (P1). `expandedPaths` is the @Published trigger that
     // makes SwiftUI re-render the affected subtree.
     @Published var expandedPaths: Set<String> = []
+    @Published var caretLine = 1
+    @Published var caretColumn = 1
     private lazy var treeStore = FileTreeStore<FileEntry>(lister: { [weak self] path in
         try self?.listEntries(at: path) ?? []
     })
@@ -1269,6 +1271,10 @@ final class FilesViewModel: ObservableObject {
     func entryForSelectionID(_ id: String) -> FileEntry? {
         entries.first(where: { $0.id == id })
             ?? treeStore.cachedItem(id: id)
+    }
+
+    func collapseAll() {
+        expandedPaths = []
     }
 
     func isExpanded(_ directory: FileEntry) -> Bool {
@@ -1864,6 +1870,87 @@ final class FilesViewModel: ObservableObject {
 }
 
 /// Shared Files UI. Agent App panes and Studio bot home both host this view.
+private enum VSCodeTheme {
+    static let sideBarBackground = color(0x181818)
+    static let editorBackground = color(0x1F1F1F)
+    static let tabsContainer = color(0x181818)
+    static let activeTab = color(0x1F1F1F)
+    static let inactiveTab = color(0x181818)
+    static let tabActiveBorderTop = color(0x0078D4)
+    static let border = color(0x2B2B2B)
+    static let listHover = color(0x2A2D2E)
+    static let listActiveSelection = color(0x37373D)
+    static let listFocusedSelection = color(0x04395E)
+    static let focusBorder = color(0x0078D4)
+    static let foreground = color(0xCCCCCC)
+    static let inactiveForeground = color(0x9D9D9D)
+    static let sectionHeader = color(0xCCCCCC)
+    static let indentGuide = color(0x585858)
+    static let dirty = color(0xFFFFFF)
+    static let modifiedText = color(0xE2C08D)
+    static let statusBar = color(0x181818)
+    static let statusBarForeground = color(0xCCCCCC)
+    static let statusBarBorder = color(0x2B2B2B)
+    static let inputBackground = color(0x313131)
+    static let inputBorder = color(0x3C3C3C)
+
+    static func color(_ hex: UInt32) -> Color {
+        Color(
+            red: Double((hex >> 16) & 0xFF) / 255,
+            green: Double((hex >> 8) & 0xFF) / 255,
+            blue: Double(hex & 0xFF) / 255
+        )
+    }
+}
+
+/// VS Code Dark Modern file-type colors keyed by extension (case-insensitive).
+func fileIconColorHex(for filename: String) -> UInt32 {
+    switch (filename as NSString).pathExtension.lowercased() {
+    case "swift": return 0xF05138
+    case "ts", "tsx": return 0x3178C6
+    case "js", "jsx": return 0xF1DD3F
+    case "json": return 0xCBCB41
+    case "md": return 0x519ABA
+    case "py": return 0x3572A5
+    case "go": return 0x00ADD8
+    case "rs": return 0xDEA584
+    case "html": return 0xE44D26
+    case "css", "scss": return 0x42A5F5
+    case "sh", "zsh", "bash": return 0x89E051
+    case "yml", "yaml": return 0xCB171E
+    default: return 0x9D9D9D
+    }
+}
+
+/// Status bar label for a language id. nil or empty means plain text.
+func languageDisplayName(_ language: String?) -> String {
+    let id = (language ?? "").lowercased()
+    switch id {
+    case "swift": return "Swift"
+    case "typescript": return "TypeScript"
+    case "javascript": return "JavaScript"
+    case "python": return "Python"
+    case "go": return "Go"
+    case "rust": return "Rust"
+    case "json": return "JSON"
+    case "markdown": return "Markdown"
+    case "html": return "HTML"
+    case "css": return "CSS"
+    case "shell script", "shellscript", "shell", "bash", "zsh", "sh": return "Shell Script"
+    case "yaml", "yml": return "YAML"
+    case "", "text", "plaintext", "plain text": return "Plain Text"
+    default: return language.map { $0.prefix(1).uppercased() + $0.dropFirst() } ?? "Plain Text"
+    }
+}
+
+/// 1-based line and column of a UTF-16 caret offset.
+func caretLineColumn(text: String, utf16Offset: Int) -> (line: Int, column: Int) {
+    let offsets = buildLineStartOffsets(text: text)
+    let index = lineIndex(forCharOffset: utf16Offset, in: offsets)
+    let lineStart = offsets.isEmpty ? 0 : offsets[index]
+    return (index + 1, utf16Offset - lineStart + 1)
+}
+
 struct FilesSurfaceRoot: View {
     @ObservedObject var model: FilesViewModel
     @AppStorage("files.sidebar.width.v2") private var sidebarWidth: Double = 260
@@ -1888,6 +1975,11 @@ struct FilesSurfaceRoot: View {
     @State private var dropTargeted = false
     @FocusState private var newFileFieldFocused: Bool
     @State private var nameFilter = ""
+    @State private var explorerHovered = false
+    @State private var hoveredRowID: String?
+    @State private var hoveredTabID: String?
+    @State private var hoveredCloseTabID: String?
+    @FocusState private var nameFilterFocused: Bool
     // PERF: visibleEntries filters on every SwiftUI body evaluation (scroll, selection, etc.).
     // Cache last result and only recompute when entries, showHidden, or nameFilter changes —
     // mirrors SidebarView.filteredWorkspacesCache, avoids O(N) filter on transient body passes.
@@ -1904,6 +1996,7 @@ struct FilesSurfaceRoot: View {
 
     var body: some View {
         GeometryReader { proxy in
+            VStack(spacing: 0) {
             HStack(spacing: 0) {
                 if sidebarVisible {
                     sidebar
@@ -1922,8 +2015,10 @@ struct FilesSurfaceRoot: View {
             .onChange(of: model.readerMode) { _ in
                 applyAdaptiveSidebar(width: proxy.size.width, event: .structural)
             }
+            statusBar
+            }
         }
-        .background(DS.Palette.bg)
+        .background(VSCodeTheme.editorBackground)
         .foregroundStyle(DS.Palette.text)
         .alert("Discard unsaved changes?", isPresented: $confirmDiscard) {
             Button("Discard Changes", role: .destructive) { model.discard() }
@@ -2020,70 +2115,105 @@ struct FilesSurfaceRoot: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Text("Files")
-                        .font(DS.Font.title3)
-                        .lineLimit(1)
-                        .fixedSize()
-                        .layoutPriority(1)
-                    Spacer(minLength: 4)
-                    DSIconButton("sidebar.left", help: "Hide file sidebar") {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 4) {
+                Text("EXPLORER")
+                    .font(.system(size: 11, weight: .semibold))
+                    .tracking(0.5)
+                    .foregroundStyle(VSCodeTheme.inactiveForeground)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Menu {
+                    Toggle("Show Hidden Files", isOn: $showHidden)
+                        .accessibilityIdentifier("files.showHidden.toggle")
+                    Divider()
+                    Button("Hide file sidebar") {
                         sidebarIntent = .forcedHidden
                         sidebarVisible = false
                     }
-                    .accessibilityLabel("Hide file sidebar")
-                    // Toggle dotfile visibility; off by default so common dev clutter (.git, .DS_Store)
-                    // stays hidden until asked for (IMP-MAC_FILES-014).
-                    DSIconButton(showHidden ? "eye" : "eye.slash", help: showHidden ? "Hide hidden files" : "Show hidden files") {
-                        showHidden.toggle()
-                    }
-                    .accessibilityLabel(showHidden ? "Hide hidden files" : "Show hidden files")
-                    .accessibilityIdentifier("files.showHidden.toggle")
-                    DSIconButton("plus", help: "New file") {
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13))
+                        .foregroundStyle(VSCodeTheme.inactiveForeground)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("More actions")
+                .accessibilityLabel("More actions")
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 35)
+            HStack(spacing: 2) {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                Text((model.root as NSString).lastPathComponent.uppercased())
+                    .font(.system(size: 11, weight: .bold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                if explorerHovered {
+                    explorerAction("doc.badge.plus", label: "New file", id: "files.newFile.button") {
                         newFileName = ""
                         showNewFileDialog = true
                     }
-                    .accessibilityLabel("New file")
-                    .accessibilityIdentifier("files.newFile.button")
-                    DSIconButton("folder.badge.plus", help: "New folder") {
+                    explorerAction("folder.badge.plus", label: "New folder", id: "files.newFolder.button") {
                         newFolderName = ""
                         showNewFolderDialog = true
                     }
-                    .accessibilityLabel("New folder")
-                    .accessibilityIdentifier("files.newFolder.button")
+                    explorerAction("arrow.clockwise", label: "Refresh", id: "files.refresh.button") {
+                        model.loadDirectory(model.currentDirectory)
+                    }
+                    explorerAction("rectangle.compress.vertical", label: "Collapse folders", id: "files.collapseAll.button") {
+                        model.collapseAll()
+                    }
                 }
-                TextField("Path", text: $pathInput)
-                    .font(DS.Font.monoSmall)
-                    .textFieldStyle(.plain)
-                    .foregroundStyle(pathInvalid ? DS.Palette.danger : DS.Palette.textSecondary)
-                    .lineLimit(1)
-                    .onSubmit { submitPath() }
-                    .help("Type a workspace path and press Return")
-                    .accessibilityLabel("Workspace path")
-                    .accessibilityIdentifier("files.path.field")
-                breadcrumb
             }
+            .foregroundStyle(VSCodeTheme.sectionHeader)
+            .padding(.horizontal, 4)
+            .frame(height: 22)
             TextField("Filter files\u{2026}", text: $nameFilter)
                 .textFieldStyle(.plain)
-                .font(DS.Font.bodyDense)
+                .focused($nameFilterFocused)
+                .font(.system(size: 12))
                 .padding(.horizontal, 6)
-                .padding(.vertical, 4)
-                .background(DS.Palette.surfaceOverlay, in: RoundedRectangle(cornerRadius: DS.Radius.control))
-                .foregroundStyle(DS.Palette.text)
+                .frame(height: 24)
+                .background(VSCodeTheme.inputBackground)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 2)
+                        .stroke(nameFilterFocused ? VSCodeTheme.focusBorder : VSCodeTheme.inputBorder, lineWidth: 1)
+                )
+                .foregroundStyle(VSCodeTheme.foreground)
+                .padding(.horizontal, 8)
+                .padding(.bottom, 6)
                 .accessibilityLabel("Filter files by name")
                 .accessibilityIdentifier("files.nameFilter.field")
                 .onChange(of: model.currentDirectory) { _ in nameFilter = "" }
+            TextField("Path", text: $pathInput)
+                .font(.system(size: 11, design: .monospaced))
+                .textFieldStyle(.plain)
+                .foregroundStyle(pathInvalid ? DS.Palette.danger : VSCodeTheme.inactiveForeground)
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+                .frame(height: 22)
+                .onSubmit { submitPath() }
+                .help("Type a workspace path and press Return")
+                .accessibilityLabel("Workspace path")
+                .accessibilityIdentifier("files.path.field")
+            breadcrumb
             List(selection: $selectedFileIDs) {
                 if !model.currentDirectory.isEmpty {
                     Button {
                         navigateToParent()
                     } label: {
-                        row(icon: "arrow.turn.up.left", name: "..", detail: "Parent", active: false)
+                        treeRow(icon: "arrow.turn.up.left", iconColor: VSCodeTheme.inactiveForeground, name: "..", depth: 0) {
+                            Color.clear.frame(width: 16, height: 22)
+                        }
                     }
                     .buttonStyle(.plain)
-                    .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
+                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                     .listRowBackground(Color.clear)
                     // Cmd+Up navigates up a level for keyboard users, since the ".." row is not part
                     // of the List selection set and arrow keys never reach it (UX-MAC_FILES-012).
@@ -2095,14 +2225,35 @@ struct FilesSurfaceRoot: View {
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
+            .background(VSCodeTheme.sideBarBackground)
             .accessibilityIdentifier("files.sidebar.list")
             if model.isLoading {
                 ProgressView().controlSize(.small)
+                    .padding(.vertical, 4)
                     .accessibilityIdentifier("files.sidebar.loading")
             }
         }
-        .padding(12)
-        .background(DS.Palette.surface)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .background(VSCodeTheme.sideBarBackground)
+        .foregroundStyle(VSCodeTheme.foreground)
+        .overlay(alignment: .trailing) {
+            Rectangle().fill(VSCodeTheme.border).frame(width: 1)
+        }
+        .onHover { explorerHovered = $0 }
+    }
+
+    private func explorerAction(_ symbol: String, label: String, id: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 13))
+                .foregroundStyle(VSCodeTheme.inactiveForeground)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(label)
+        .accessibilityLabel(label)
+        .accessibilityIdentifier(id)
     }
 
     private var displayPath: String {
@@ -2155,42 +2306,56 @@ struct FilesSurfaceRoot: View {
 
     private func entryRow(_ entry: FileEntry, depth: Int) -> some View {
         let isDropTarget = dropTargetedFolderPath == entry.relativePath
-        return HStack(spacing: 0) {
-            if depth > 0 {
-                Spacer().frame(width: CGFloat(depth) * 14)
-            }
+        let isExpanded = entry.isDirectory && model.isExpanded(entry)
+        return treeRow(
+            icon: entry.isDirectory ? (isExpanded ? "folder.fill" : "folder") : entry.icon,
+            iconColor: VSCodeTheme.color(entry.isDirectory ? 0xDCB67A : fileIconColorHex(for: entry.name)),
+            name: entry.name,
+            depth: depth,
+            active: model.selectedEntry?.id == entry.id,
+            focused: selectedFileIDs.contains(entry.id),
+            hovered: hoveredRowID == entry.id,
+            dirty: model.dirtyPaths.contains(entry.relativePath),
+            dirtyPath: entry.relativePath
+        ) {
             if entry.isDirectory {
                 Button {
                     model.toggleExpand(entry)
                 } label: {
-                    Image(systemName: model.isExpanded(entry) ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(DS.Palette.textTertiary)
-                        .frame(width: 14, height: 14)
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(VSCodeTheme.inactiveForeground)
+                        .frame(width: 16, height: 22)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(model.isExpanded(entry) ? "Collapse folder" : "Expand folder")
+                .accessibilityLabel(isExpanded ? "Collapse folder" : "Expand folder")
                 .accessibilityIdentifier("files.disclosure.\(entry.relativePath)")
             } else {
-                Spacer().frame(width: 14)
+                Color.clear.frame(width: 16, height: 22)
             }
-            row(icon: entry.icon, name: entry.name, detail: entry.kind, active: model.selectedEntry?.id == entry.id || selectedFileIDs.contains(entry.id), dirty: model.dirtyPaths.contains(entry.relativePath), dirtyPath: entry.relativePath)
-                .overlay {
-                    if isDropTarget {
-                        RoundedRectangle(cornerRadius: DS.Radius.control)
-                            .stroke(DS.Palette.accent, lineWidth: 1.5)
-                            .allowsHitTesting(false)
-                            .accessibilityIdentifier("files.moveDropIndicator.\(entry.relativePath)")
-                    }
-                }
-                .onTapGesture {
-                    selectedFileIDs = [entry.id]
-                    model.selectIfNeeded(entry)
-                }
+        }
+        .overlay {
+            if isDropTarget {
+                Rectangle()
+                    .stroke(VSCodeTheme.focusBorder, lineWidth: 1.5)
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("files.moveDropIndicator.\(entry.relativePath)")
+            }
+        }
+        .onTapGesture {
+            selectedFileIDs = [entry.id]
+            model.selectIfNeeded(entry)
+        }
+        .onHover { inside in
+            if inside {
+                hoveredRowID = entry.id
+            } else if hoveredRowID == entry.id {
+                hoveredRowID = nil
+            }
         }
         .tag(entry.id)
-        .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
+        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
         .listRowBackground(Color.clear)
         .contextMenu { fileContextMenu(for: entry) }
 	        .fileTabDragPayload(entry.dragPayload)
@@ -2265,23 +2430,25 @@ struct FilesSurfaceRoot: View {
             HStack(spacing: 2) {
                 Button("root") { model.loadDirectory("") }
                     .buttonStyle(.plain)
-                    .foregroundStyle(segments.isEmpty ? DS.Palette.text : DS.Palette.accent)
+                    .foregroundStyle(segments.isEmpty ? VSCodeTheme.foreground : VSCodeTheme.inactiveForeground)
                     .accessibilityIdentifier("files.breadcrumb.root")
                 ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
                     Image(systemName: "chevron.right")
                         .font(.system(size: 8))
-                        .foregroundStyle(DS.Palette.textTertiary)
+                        .foregroundStyle(VSCodeTheme.inactiveForeground)
                     Button(segment) {
                         model.loadDirectory(segments[0...index].joined(separator: "/"))
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(index == segments.count - 1 ? DS.Palette.text : DS.Palette.accent)
+                    .foregroundStyle(index == segments.count - 1 ? VSCodeTheme.foreground : VSCodeTheme.inactiveForeground)
                     .accessibilityIdentifier("files.breadcrumb.\(segment)")
                 }
             }
-            .font(DS.Font.caption2)
+            .font(.system(size: 11))
             .lineLimit(1)
         }
+        .frame(height: 22)
+        .padding(.horizontal, 8)
     }
 
     private func navigateToParent() {
@@ -2462,7 +2629,7 @@ struct FilesSurfaceRoot: View {
                     .accessibilityIdentifier("files.split.dropIndicator")
                 }
             }
-            .background(DS.Palette.bg)
+            .background(VSCodeTheme.editorBackground)
         }
     }
 
@@ -2557,99 +2724,108 @@ struct FilesSurfaceRoot: View {
     /// VS Code-style editor tab strip: active tab, dirty dot, per-tab close.
     private var openTabBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 1) {
+            HStack(spacing: 0) {
                 ForEach(model.openTabs) { entry in
                     openTab(entry)
                 }
             }
         }
-        .frame(height: 32)
-        .background(DS.Palette.surface)
+        .frame(height: 35)
+        .background(VSCodeTheme.tabsContainer)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(VSCodeTheme.border).frame(height: 1)
+        }
         .accessibilityIdentifier("files.tabs.strip")
     }
 
     private func openTab(_ entry: FileEntry) -> some View {
         let isActive = model.selectedEntry?.id == entry.id
         let isDirty = model.isTabDirty(entry)
+        let isHovered = hoveredTabID == entry.id
+        let showDot = isDirty && !isHovered
+        let showClose = !showDot && (isHovered || isActive)
+        let closeHovered = hoveredCloseTabID == entry.id
         return HStack(spacing: 6) {
             Image(systemName: entry.icon)
-                .font(.system(size: 11))
-                .foregroundStyle(isActive ? DS.Palette.accent : DS.Palette.textTertiary)
+                .font(.system(size: 14))
+                .foregroundStyle(VSCodeTheme.color(fileIconColorHex(for: entry.name)))
             Text(entry.name)
-                .font(DS.Font.caption)
+                .font(.system(size: 13))
                 .lineLimit(1)
-            if isDirty {
-                Circle()
-                    .fill(DS.Palette.warning)
-                    .frame(width: 6, height: 6)
-                    .accessibilityLabel("Unsaved changes")
-            }
             Button {
                 model.closeTab(entry)
             } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 8, weight: .semibold))
-                    .padding(3)
+                ZStack {
+                    if showDot {
+                        Circle()
+                            .fill(VSCodeTheme.dirty)
+                            .frame(width: 8, height: 8)
+                    } else if showClose {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10))
+                    }
+                }
+                .frame(width: 20, height: 20)
+                .background(closeHovered ? Color.white.opacity(0.1) : Color.clear, in: RoundedRectangle(cornerRadius: 4))
             }
             .buttonStyle(.plain)
-            .opacity(isActive ? 0.9 : 0.45)
+            .onHover { inside in
+                if inside {
+                    hoveredCloseTabID = entry.id
+                } else if hoveredCloseTabID == entry.id {
+                    hoveredCloseTabID = nil
+                }
+            }
             .help("Close \(entry.name)")
-            .accessibilityLabel("Close \(entry.name)")
+            .accessibilityLabel(isDirty ? "Close \(entry.name), Unsaved changes" : "Close \(entry.name)")
             .accessibilityIdentifier("files.tab.close.\(entry.relativePath)")
         }
         .padding(.horizontal, 10)
-        .frame(height: 32)
-        .foregroundStyle(isActive ? DS.Palette.text : DS.Palette.textSecondary)
-        .background(isActive ? DS.Palette.bg : Color.clear)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(isActive ? DS.Palette.accent : Color.clear)
-                .frame(height: 2)
+        .frame(minWidth: 80, minHeight: 35, maxHeight: 35)
+        .foregroundStyle(isActive ? Color.white : VSCodeTheme.inactiveForeground)
+        .background(isActive ? VSCodeTheme.activeTab : VSCodeTheme.inactiveTab)
+        .overlay(alignment: .top) {
+            if isActive {
+                Rectangle().fill(VSCodeTheme.tabActiveBorderTop).frame(height: 1)
+            }
+        }
+        .overlay(alignment: .trailing) {
+            Rectangle().fill(VSCodeTheme.border).frame(width: 1)
         }
         .contentShape(Rectangle())
+        .onHover { inside in
+            if inside {
+                hoveredTabID = entry.id
+            } else if hoveredTabID == entry.id {
+                hoveredTabID = nil
+            }
+        }
         .onTapGesture { model.activateTab(entry) }
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(isActive ? .isSelected : [])
         .accessibilityIdentifier("files.tab.\(entry.relativePath)")
     }
 
+    /// Breadcrumb bar above the editor with the reader controls on the right.
     private var readerHeader: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 8) {
-                    if !sidebarVisible {
-                        DSIconButton("sidebar.left", help: "Show file sidebar") {
-                            sidebarIntent = .forcedVisible
-                            sidebarVisible = true
-                        }
-                        .accessibilityLabel("Show file sidebar")
-                    }
-                    Text(model.selectedEntry?.name ?? "No file selected")
-                        .font(DS.Font.bodyStrong)
-                        .lineLimit(1)
+        HStack(spacing: 8) {
+            if !sidebarVisible {
+                DSIconButton("sidebar.left", help: "Show file sidebar") {
+                    sidebarIntent = .forcedVisible
+                    sidebarVisible = true
                 }
-                Text(model.selectedEntry?.relativePath ?? model.root)
-                    .font(DS.Font.monoSmall)
-                    .foregroundStyle(DS.Palette.textTertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if let entry = model.selectedEntry, !entry.isDirectory, let detail = fileMetaSubtitle(entry) {
-                    Text(detail)
-                        .font(DS.Font.caption2)
-                        .foregroundStyle(DS.Palette.textTertiary)
-                        .lineLimit(1)
-                        .accessibilityIdentifier("files.header.meta")
-                }
+                .accessibilityLabel("Show file sidebar")
             }
-            Spacer()
+            breadcrumbPath
+            Spacer(minLength: 8)
             if model.isDirty {
                 Label("Unsaved", systemImage: "circle.fill")
-                    .font(DS.Font.captionStrong)
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(DS.Palette.warning)
             }
             Text(model.syncLabel)
-                .font(DS.Font.caption)
-                .foregroundStyle(DS.Palette.textSecondary)
+                .font(.system(size: 11))
+                .foregroundStyle(VSCodeTheme.inactiveForeground)
                 .help(model.syncDetail)
                 .accessibilityIdentifier("files.sync.label")
             Picker("", selection: $model.readerMode) {
@@ -2658,7 +2834,8 @@ struct FilesSurfaceRoot: View {
                 Text("Split").tag("split")
             }
             .pickerStyle(.segmented)
-            .frame(width: 190)
+            .controlSize(.small)
+            .frame(width: 150)
             .onChange(of: model.readerMode) { newValue in model.setReaderMode(newValue) }
             .accessibilityIdentifier("files.readerMode.picker")
             // UX-P3: visible text labels so the Save/Discard affordance is legible
@@ -2666,32 +2843,64 @@ struct FilesSurfaceRoot: View {
             Button { model.save() } label: {
                 HStack(spacing: 4) {
                     DisketteIcon()
-                        .frame(width: 14, height: 14)
+                        .frame(width: 12, height: 12)
                     Text("Save")
-                        .font(DS.Font.captionStrong)
+                        .font(.system(size: 11, weight: .semibold))
                 }
             }
-                .help("Save (Command-S)")
-                .keyboardShortcut("s", modifiers: .command)
-                .disabled(!model.isDirty)
-                .accessibilityLabel("Save file")
-                .accessibilityIdentifier("files.save.button")
+            .help("Save (Command-S)")
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(!model.isDirty)
+            .accessibilityLabel("Save file")
+            .accessibilityIdentifier("files.save.button")
             Button { confirmDiscard = true } label: {
                 Label("Discard", systemImage: "arrow.uturn.backward")
-                    .font(DS.Font.captionStrong)
+                    .font(.system(size: 11, weight: .semibold))
             }
-                .help("Discard unsaved changes (Command-Delete)")
-                // UX-P3: keyboard shortcut for discard so keyboard users can trigger
-                // the confirm dialog without reaching for the mouse.
-                .keyboardShortcut(.delete, modifiers: .command)
-                .disabled(!model.isDirty)
-                .accessibilityLabel("Discard unsaved changes")
-                .accessibilityIdentifier("files.discard.button")
+            // UX-P3: keyboard shortcut for discard so keyboard users can trigger
+            // the confirm dialog without reaching for the mouse.
+            .help("Discard unsaved changes (Command-Delete)")
+            .keyboardShortcut(.delete, modifiers: .command)
+            .disabled(!model.isDirty)
+            .accessibilityLabel("Discard unsaved changes")
+            .accessibilityIdentifier("files.discard.button")
         }
         .buttonStyle(.borderless)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(DS.Palette.surfaceRaised)
+        .padding(.horizontal, 8)
+        .frame(height: 22)
+        .background(VSCodeTheme.editorBackground)
+    }
+
+    /// Path segments of the selected file, shown as the editor breadcrumb.
+    private var breadcrumbPath: some View {
+        let segments = (model.selectedEntry?.relativePath ?? "").split(separator: "/").map(String.init)
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 4) {
+                if segments.isEmpty {
+                    Text("No file selected")
+                        .foregroundStyle(VSCodeTheme.inactiveForeground)
+                }
+                ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
+                    let isLast = index == segments.count - 1
+                    if index > 0 {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9))
+                            .foregroundStyle(VSCodeTheme.inactiveForeground)
+                    }
+                    if isLast, let entry = model.selectedEntry {
+                        Image(systemName: entry.icon)
+                            .font(.system(size: 12))
+                            .foregroundStyle(VSCodeTheme.color(fileIconColorHex(for: entry.name)))
+                    }
+                    Text(segment)
+                        .foregroundStyle(isLast ? VSCodeTheme.foreground : VSCodeTheme.inactiveForeground)
+                }
+            }
+            .font(.system(size: 12))
+            .lineLimit(1)
+        }
+        .frame(height: 22)
+        .accessibilityIdentifier("files.editor.breadcrumbs")
     }
 
     private var sidebarIntent: AdaptiveSidebarIntent {
@@ -2789,36 +2998,111 @@ struct FilesSurfaceRoot: View {
             text: $model.draftText,
             language: model.selectedEntry?.language,
             filePath: model.selectedPath ?? model.root,
-            inlineCompletionProvider: model.inlineCompletionProvider
+            absolutePath: model.selectedEntry?.path,
+            rootPath: model.root,
+            inlineCompletionProvider: model.inlineCompletionProvider,
+            onCaretChange: { line, column in
+                model.caretLine = line
+                model.caretColumn = column
+            }
         ) { newValue in
             model.editorChanged(newValue)
         }
     }
 
-    private func row(icon: String, name: String, detail: String, active: Bool, dirty: Bool = false, dirtyPath: String? = nil) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon)
-                .frame(width: 18)
-                .foregroundStyle(active ? DS.Palette.accent : DS.Palette.textSecondary)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(name).font(DS.Font.bodyDense).lineLimit(1)
-                Text(detail).font(DS.Font.caption2).foregroundStyle(DS.Palette.textTertiary).lineLimit(1)
+    private func treeRow<Disclosure: View>(
+        icon: String,
+        iconColor: Color,
+        name: String,
+        depth: Int,
+        active: Bool = false,
+        focused: Bool = false,
+        hovered: Bool = false,
+        dirty: Bool = false,
+        dirtyPath: String? = nil,
+        @ViewBuilder disclosure: () -> Disclosure
+    ) -> some View {
+        let fill: Color = focused ? VSCodeTheme.listFocusedSelection
+            : active ? VSCodeTheme.listActiveSelection
+            : hovered ? VSCodeTheme.listHover
+            : .clear
+        return HStack(spacing: 0) {
+            Spacer().frame(width: 8)
+            ForEach(0..<depth, id: \.self) { _ in
+                Rectangle()
+                    .fill(VSCodeTheme.indentGuide.opacity(0.4))
+                    .frame(width: 1, height: 22)
+                    .frame(width: 8, height: 22)
             }
-            Spacer(minLength: 0)
+            disclosure()
+            Image(systemName: icon)
+                .font(.system(size: 14))
+                .foregroundStyle(iconColor)
+                .frame(width: 16, height: 22)
+            Text(name)
+                .font(.system(size: 13))
+                .lineLimit(1)
+                .foregroundStyle(dirty ? VSCodeTheme.modifiedText : VSCodeTheme.foreground)
+                .padding(.leading, 4)
+            Spacer(minLength: 4)
             if dirty {
                 Circle()
-                    .fill(DS.Palette.warning)
-                    .frame(width: 7, height: 7)
+                    .fill(VSCodeTheme.dirty)
+                    .frame(width: 8, height: 8)
+                    .padding(.trailing, 8)
                     .accessibilityLabel("Unsaved changes")
                     .accessibilityIdentifier("files.dirtyDot.\(dirtyPath ?? "")")
             }
         }
-        .padding(.horizontal, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 34)
-        .background(active ? DS.Palette.selection : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control))
+        .frame(height: 22)
+        .background(fill)
+        .overlay {
+            if focused {
+                Rectangle().stroke(VSCodeTheme.focusBorder, lineWidth: 1)
+            }
+        }
         .contentShape(Rectangle())
+    }
+
+    /// Bottom status bar: branch and workspace on the left, editor state on the right.
+    private var statusBar: some View {
+        let entry = model.selectedEntry
+        let isText = entry?.kind == "code" || entry?.kind == "text"
+        return HStack(spacing: 8) {
+            Image(systemName: "arrow.triangle.branch")
+            Text((model.root as NSString).lastPathComponent)
+            if let entry = entry, !entry.isDirectory, let detail = fileMetaSubtitle(entry) {
+                Text(detail)
+                    .accessibilityIdentifier("files.header.meta")
+            }
+            Spacer(minLength: 8)
+            if isText {
+                Text("Ln \(model.caretLine), Col \(model.caretColumn)")
+                    .accessibilityIdentifier("files.status.cursor")
+                Text("Spaces: 4")
+                Text("UTF-8")
+                Text("LF")
+                Text(languageDisplayName(entry?.language))
+                    .accessibilityIdentifier("files.status.language")
+                HStack(spacing: 3) {
+                    Image(systemName: "sparkles")
+                    Text("Distill")
+                }
+                .foregroundStyle(model.inlineCompletionProvider != nil ? VSCodeTheme.statusBarForeground : VSCodeTheme.statusBarForeground.opacity(0.5))
+                .accessibilityIdentifier("files.status.distill")
+            }
+        }
+        .font(.system(size: 12))
+        .lineLimit(1)
+        .foregroundStyle(VSCodeTheme.statusBarForeground)
+        .padding(.horizontal, 8)
+        .frame(height: 22)
+        .frame(maxWidth: .infinity)
+        .background(VSCodeTheme.statusBar)
+        .overlay(alignment: .top) {
+            Rectangle().fill(VSCodeTheme.statusBarBorder).frame(height: 1)
+        }
     }
 }
 
@@ -3258,7 +3542,10 @@ private struct CodeTextEditor: NSViewRepresentable {
     @Binding var text: String
     let language: String?
     let filePath: String
+    let absolutePath: String?
+    let rootPath: String
     let inlineCompletionProvider: (any InlineCompletionProviding)?
+    var onCaretChange: (Int, Int) -> Void = { _, _ in }
     let onChange: (String) -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -3295,6 +3582,19 @@ private struct CodeTextEditor: NSViewRepresentable {
         context.coordinator.language = language
         context.coordinator.filePath = filePath
         context.coordinator.inlineProvider = inlineCompletionProvider
+        let coordinator = context.coordinator
+        textView.onCompletionRequest = { [weak coordinator, weak textView] explicit in
+            guard let coordinator, let textView else { return }
+            coordinator.requestCompletion(in: textView, explicit: explicit)
+        }
+        textView.onHoverRequest = { [weak coordinator, weak textView] index in
+            guard let coordinator, let textView else { return }
+            coordinator.requestHover(in: textView, at: index)
+        }
+        textView.suggest.onDismiss = { [weak coordinator] in coordinator?.cancelCompletion() }
+        context.coordinator.rootPath = rootPath
+        context.coordinator.absolutePath = absolutePath
+        context.coordinator.switchLanguageServer(to: absolutePath)
         context.coordinator.applyHighlight(to: textView)
         scroll.documentView = textView
         let ruler = CodeLineNumberRulerView(textView: textView)
@@ -3311,6 +3611,11 @@ private struct CodeTextEditor: NSViewRepresentable {
         context.coordinator.filePath = filePath
         context.coordinator.inlineProvider = inlineCompletionProvider
         (textView as? CodeEditorTextView)?.language = language
+        if absolutePath != context.coordinator.absolutePath || rootPath != context.coordinator.rootPath {
+            context.coordinator.absolutePath = absolutePath
+            context.coordinator.rootPath = rootPath
+            context.coordinator.switchLanguageServer(to: absolutePath)
+        }
         // Re-apply palette when the system appearance changes (light/dark).
         let newPalette = EditorColorPalette.resolve(isDark: NSApp.effectiveAppearance.isDark)
         if newPalette != context.coordinator.currentPalette {
@@ -3334,15 +3639,23 @@ private struct CodeTextEditor: NSViewRepresentable {
             }
             context.coordinator.lineNumberRuler?.invalidateLineStartCache()
             context.coordinator.lineNumberRuler?.needsDisplay = true
+            context.coordinator.documentReplacedExternally()
         }
     }
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onChange: onChange)
+    static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+        coordinator.tearDown()
     }
 
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onChange: onChange, onCaretChange: onCaretChange)
+    }
+
+    @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         let onChange: (String) -> Void
+        let onCaretChange: (Int, Int) -> Void
+        private var lastCaret: (line: Int, column: Int)?
         weak var textView: CodeEditorTextView?
         weak var lineNumberRuler: CodeLineNumberRulerView?
         var language: String?
@@ -3352,11 +3665,30 @@ private struct CodeTextEditor: NSViewRepresentable {
         private var inlineTask: Task<Void, Never>?
         private var inlineDebounceTimer: Timer?
         private var inlineGeneration = 0
+        var absolutePath: String?
+        var rootPath = ""
+        private var lspClient: LanguageServerClient?
+        private var lspPath: String?
+        private var lspGeneration = 0
+        private var lspDirty = false
+        private var lspLease: (command: [String], root: String)?
+        private var lspSubscription: (client: LanguageServerClient, id: UUID)?
+        private var lspOpenTask: Task<Void, Never>?
+        private var lspSendTail: Task<Void, Never>?
+        private var lspChangeTimer: Timer?
+        private var completionGeneration = 0
+        private var hoverGeneration = 0
+        private var completionTask: Task<Void, Never>?
+        /// Entries last shown and the document text they were computed for.
+        private var completionEntries: [SuggestEntry] = []
+        private var completionDocumentText: String?
+        private static var loggedLanguageFailures = Set<String>()
         /// Last applied palette; compared in `updateNSView` to skip redundant attribute churn.
         var currentPalette: EditorColorPalette = EditorColorPalette.resolve(isDark: true)
 
-        init(onChange: @escaping (String) -> Void) {
+        init(onChange: @escaping (String) -> Void, onCaretChange: @escaping (Int, Int) -> Void) {
             self.onChange = onChange
+            self.onCaretChange = onCaretChange
         }
 
         deinit {
@@ -3372,24 +3704,289 @@ private struct CodeTextEditor: NSViewRepresentable {
             lineNumberRuler?.invalidateLineStartCache()
             lineNumberRuler?.needsDisplay = true
             scheduleInlineCompletion(in: textView)
-            scheduleWordCompletion(in: textView)
+            scheduleLanguageServerChange()
+            updateSuggestions(in: textView)
         }
 
         // MARK: IntelliSense
 
-        /// VS Code-style auto trigger: a short identifier under the caret opens
-        /// the native completion list; the list narrows on every further keystroke.
-        private func scheduleWordCompletion(in textView: CodeEditorTextView) {
+        /// Auto trigger: an identifier character, `.` or `::` before the caret requests
+        /// completions. Any other typed character hides the list.
+        private func updateSuggestions(in textView: CodeEditorTextView) {
+            guard !textView.isAcceptingSuggestion else { return }
             let caret = textView.selectedRange().location
-            guard let range = FileCompletionEngine.replacementRange(in: textView.string, caret: caret),
-                  range.length >= 2 else { return }
-            let items = FileCompletionEngine.completions(
-                in: textView.string, caret: caret, language: language, limit: 1
+            guard caret > 0 else {
+                textView.suggest.hide()
+                return
+            }
+            let ns = textView.string as NSString
+            let previous = ns.character(at: caret - 1)
+            if FileCompletionEngine.isIdentifierCharacter(previous) {
+                if textView.suggest.isVisible {
+                    if textView.string != completionDocumentText {
+                        // LSP ranges were computed for the older text; fall back to the current word.
+                        completionEntries = completionEntries.map { entry in
+                            var entry = entry
+                            entry.replaceRange = nil
+                            return entry
+                        }
+                        showSuggestions(completionEntries, prefix: currentPrefix(in: textView), in: textView)
+                    } else {
+                        textView.suggest.update(prefix: currentPrefix(in: textView))
+                    }
+                }
+                requestCompletion(in: textView, explicit: false)
+            } else if previous == 0x2E || (previous == 0x3A && caret > 1 && ns.character(at: caret - 2) == 0x3A) {
+                textView.suggest.hide()
+                requestCompletion(in: textView, explicit: false)
+            } else {
+                textView.suggest.hide()
+            }
+        }
+
+        private func currentPrefix(in textView: CodeEditorTextView) -> String {
+            let text = textView.string
+            guard let range = FileCompletionEngine.replacementRange(in: text, caret: textView.selectedRange().location) else {
+                return ""
+            }
+            return (text as NSString).substring(with: range)
+        }
+
+        /// Word entries show at once; LSP entries merge in when they return, if still current.
+        func requestCompletion(in textView: CodeEditorTextView, explicit: Bool) {
+            let selection = textView.selectedRange()
+            guard selection.length == 0 else { return }
+            let text = textView.string
+            let caret = selection.location
+            let prefix = currentPrefix(in: textView)
+            let words = wordEntries(FileCompletionEngine.completions(in: text, caret: caret, language: language))
+            completionGeneration += 1
+            let generation = completionGeneration
+            completionTask?.cancel()
+            if explicit || !textView.suggest.isVisible {
+                showSuggestions(words, prefix: prefix, in: textView)
+            }
+            guard let client = lspClient, let path = lspPath else { return }
+            let position = LSPText.position(forUTF16Offset: caret, in: text)
+            let pending = flushLanguageServerChange()
+            completionTask = Task { @MainActor [weak self, weak textView] in
+                await pending?.value
+                let items = (try? await client.completion(path: path, position: position)) ?? []
+                guard !Task.isCancelled, let self, let textView, generation == self.completionGeneration,
+                      textView.string == text,
+                      textView.selectedRange() == NSRange(location: caret, length: 0),
+                      textView.window?.firstResponder === textView else { return }
+                let merged = items.map { self.languageServerEntry($0, in: text) } + words
+                self.showSuggestions(merged, prefix: prefix, in: textView)
+            }
+        }
+
+        private func showSuggestions(_ entries: [SuggestEntry], prefix: String, in textView: CodeEditorTextView) {
+            guard !entries.isEmpty else {
+                textView.suggest.hide()
+                return
+            }
+            completionEntries = entries
+            completionDocumentText = textView.string
+            textView.suggest.show(entries: entries, prefix: prefix, anchor: textView.caretRect(), in: textView)
+        }
+
+        /// Invalidates in-flight LSP results. Bound to Escape in the suggest widget.
+        func cancelCompletion() {
+            completionGeneration += 1
+            completionTask?.cancel()
+            completionTask = nil
+        }
+
+        /// Text changed without typing (remote/disk update). Hides suggestions and syncs the server.
+        func documentReplacedExternally() {
+            cancelCompletion()
+            textView?.suggest.hide()
+            scheduleLanguageServerChange()
+        }
+
+        private func wordEntries(_ items: [FileCompletionItem]) -> [SuggestEntry] {
+            items.map { item in
+                SuggestEntry(
+                    label: item.label,
+                    insertText: item.insertText,
+                    kind: SuggestKind(item.kind),
+                    detail: item.detail,
+                    documentation: nil,
+                    sortText: nil,
+                    filterText: nil,
+                    replaceRange: nil,
+                    source: .word
+                )
+            }
+        }
+
+        private func languageServerEntry(_ item: LSPCompletionItem, in text: String) -> SuggestEntry {
+            SuggestEntry(
+                label: item.label,
+                insertText: item.insertText,
+                kind: SuggestKind(lspKind: item.kind),
+                detail: item.detail,
+                documentation: item.documentation,
+                sortText: item.sortText,
+                filterText: item.filterText,
+                replaceRange: item.replaceRange.map { editorNSRange($0, in: text) },
+                source: .languageServer
             )
-            guard !items.isEmpty else { return }
-            DispatchQueue.main.async { [weak textView] in
-                guard let textView, textView.window?.firstResponder === textView else { return }
-                textView.complete(nil)
+        }
+
+        // MARK: Language server
+
+        /// Opens `path` on the shared server for `rootPath`. Closes the previous file first.
+        /// No server for the file type means word completion only.
+        func switchLanguageServer(to path: String?) {
+            lspGeneration += 1
+            let generation = lspGeneration
+            lspChangeTimer?.invalidate()
+            lspChangeTimer = nil
+            lspOpenTask?.cancel()
+            lspOpenTask = nil
+            completionTask?.cancel()
+            if let oldPath = lspPath, let client = lspClient {
+                let previous = lspSendTail
+                Task { await previous?.value; await client.didClose(path: oldPath) }
+            }
+            lspClient = nil
+            lspPath = nil
+            lspDirty = false
+            lspSendTail = nil
+            let previousSubscription = lspSubscription
+            let previousLease = lspLease
+            lspSubscription = nil
+            lspLease = nil
+            // Acquire the next lease before releasing the old one so switching files on the
+            // same server never drops the pool's lease count to zero and restarts it.
+            let releasePrevious: @Sendable () async -> Void = {
+                if let previousSubscription { await previousSubscription.client.removeDiagnosticsHandler(previousSubscription.id) }
+                if let previousLease { await LanguageServerPool.shared.release(command: previousLease.command, rootPath: previousLease.root) }
+            }
+            guard let path, !rootPath.isEmpty,
+                  let command = LanguageServerRegistry.command(forPath: path, language: language) else {
+                Task { await releasePrevious() }
+                return
+            }
+            let root = rootPath
+            let languageID = LanguageServerRegistry.languageID(forPath: path)
+            lspOpenTask = Task { @MainActor [weak self] in
+                let client: LanguageServerClient
+                do {
+                    client = try await LanguageServerPool.shared.client(command: command, rootPath: root)
+                    await releasePrevious()
+                } catch {
+                    await releasePrevious()
+                    self?.logLanguageServerFailure(command)
+                    return
+                }
+                guard let self, generation == self.lspGeneration else {
+                    await LanguageServerPool.shared.release(command: command, rootPath: root)
+                    return
+                }
+                let id = await client.addDiagnosticsHandler { [weak self] diagPath, diagnostics in
+                    Task { @MainActor in self?.applyLanguageDiagnostics(path: diagPath, diagnostics) }
+                }
+                guard generation == self.lspGeneration, let textView = self.textView else {
+                    await client.removeDiagnosticsHandler(id)
+                    await LanguageServerPool.shared.release(command: command, rootPath: root)
+                    return
+                }
+                self.lspLease = (command, root)
+                self.lspSubscription = (client, id)
+                self.lspSendTail = Task { await client.didOpen(path: path, languageID: languageID, version: 1, text: textView.string) }
+                self.lspClient = client
+                self.lspPath = path
+                self.lspDirty = false
+                self.lspOpenTask = nil
+            }
+        }
+
+        func tearDown() {
+            lspGeneration += 1
+            lspChangeTimer?.invalidate()
+            lspChangeTimer = nil
+            lspOpenTask?.cancel()
+            lspOpenTask = nil
+            completionTask?.cancel()
+            completionTask = nil
+            if let path = lspPath, let client = lspClient {
+                let previous = lspSendTail
+                Task { await previous?.value; await client.didClose(path: path) }
+            }
+            lspClient = nil
+            lspPath = nil
+            lspSendTail = nil
+            releaseLanguageServer()
+            textView?.suggest.hide()
+            textView?.hideHover()
+        }
+
+        /// Removes this coordinator's diagnostics subscriber and drops its pool lease.
+        /// The returned task finishes before a following acquire, so the server is not stopped and restarted.
+        @discardableResult
+        private func releaseLanguageServer() -> Task<Void, Never>? {
+            let subscription = lspSubscription
+            let lease = lspLease
+            lspSubscription = nil
+            lspLease = nil
+            guard subscription != nil || lease != nil else { return nil }
+            return Task {
+                if let subscription { await subscription.client.removeDiagnosticsHandler(subscription.id) }
+                if let lease { await LanguageServerPool.shared.release(command: lease.command, rootPath: lease.root) }
+            }
+        }
+
+        private func logLanguageServerFailure(_ command: [String]) {
+            let exe = command.first ?? ""
+            guard Self.loggedLanguageFailures.insert(exe).inserted else { return }
+            NSLog("[files.lsp] launch failed for %@; using word completion only", exe)
+        }
+
+        private func applyLanguageDiagnostics(path: String, _ diagnostics: [LSPDiagnostic]) {
+            guard path == absolutePath, let textView else { return }
+            textView.applyDiagnostics(diagnostics)
+        }
+
+        private func scheduleLanguageServerChange() {
+            guard lspPath != nil || lspOpenTask != nil else { return }
+            lspDirty = true
+            lspChangeTimer?.invalidate()
+            lspChangeTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
+                Task { @MainActor in self?.flushLanguageServerChange() }
+            }
+        }
+
+        /// Queues a full-text didChange when dirty. Returns the send queue tail so requests can wait for it.
+        @discardableResult
+        private func flushLanguageServerChange() -> Task<Void, Never>? {
+            lspChangeTimer?.invalidate()
+            lspChangeTimer = nil
+            guard lspDirty, let client = lspClient, let path = lspPath, let textView = self.textView else {
+                return lspSendTail
+            }
+            lspDirty = false
+            let previous = lspSendTail
+            let text = textView.string
+            lspSendTail = Task { await previous?.value; await client.didChange(path: path, text: text) }
+            return lspSendTail
+        }
+
+        func requestHover(in textView: CodeEditorTextView, at index: Int) {
+            guard let client = lspClient, let path = lspPath else { return }
+            hoverGeneration += 1
+            let generation = hoverGeneration
+            let text = textView.string
+            let position = LSPText.position(forUTF16Offset: index, in: text)
+            let pending = flushLanguageServerChange()
+            Task { @MainActor [weak self, weak textView] in
+                await pending?.value
+                let hover = try? await client.hover(path: path, position: position)
+                guard let self, let textView, let hover, generation == self.hoverGeneration,
+                      textView.hoverIndex == index, textView.string == text else { return }
+                textView.showHover(hover, at: index)
             }
         }
 
@@ -3428,6 +4025,10 @@ private struct CodeTextEditor: NSViewRepresentable {
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let textView = notification.object as? CodeEditorTextView else { return }
             if textView.selectedRange().length > 0 { textView.clearGhost() }
+            let caret = caretLineColumn(text: textView.string, utf16Offset: textView.selectedRange().location)
+            guard lastCaret?.line != caret.line || lastCaret?.column != caret.column else { return }
+            lastCaret = caret
+            onCaretChange(caret.line, caret.column)
         }
 
         /// Re-highlight only the paragraph(s) touched by the last edit instead of the whole
@@ -3452,6 +4053,7 @@ private struct CodeTextEditor: NSViewRepresentable {
                 applyHighlightSpans(highlightCodeLine(lineText), lineRange: range, to: storage)
             }
             storage.endEditing()
+            (textView as? CodeEditorTextView)?.reapplyDiagnostics()
         }
 
         func applyHighlight(to textView: NSTextView) {
@@ -3467,6 +4069,7 @@ private struct CodeTextEditor: NSViewRepresentable {
                 textView.enclosingScrollView?.contentView.scroll(to: scrollOrigin)
                 textView.enclosingScrollView?.reflectScrolledClipView(textView.enclosingScrollView!.contentView)
             }
+            (textView as? CodeEditorTextView)?.reapplyDiagnostics()
             lineNumberRuler?.invalidateLineStartCache()
             lineNumberRuler?.needsDisplay = true
             applyingHighlight = false
@@ -3503,19 +4106,44 @@ private struct CodeTextEditor: NSViewRepresentable {
     }
 }
 
-// MARK: - Editor text view (completion + ghost text)
+// MARK: - Editor text view (completion, diagnostics, hover, ghost text)
 
-/// NSTextView subclass that owns IntelliSense and Distill ghost text.
+/// NSTextView subclass that owns IntelliSense, diagnostics, hover and Distill ghost text.
 ///
-/// Word completions go through AppKit's native completion list, so acceptance
-/// is one standard undoable edit. AI completions stay non-destructive: they
-/// are painted after the caret and inserted only on Tab.
+/// Completions use `SuggestWidgetController`. Acceptance is one undoable `insertText` edit.
+/// AI completions stay non-destructive: they are painted after the caret and inserted only
+/// on Tab or Cmd+Right (next word).
 final class CodeEditorTextView: NSTextView {
     var language: String?
     var completionItemsForPrefix: ((String, Int) -> [FileCompletionItem])?
+    /// `true` for explicit Ctrl+Space, `false` for automatic triggers.
+    var onCompletionRequest: ((Bool) -> Void)?
+    /// Character index under a rested mouse.
+    var onHoverRequest: ((Int) -> Void)?
+    /// True while a suggestion is inserted so the insert does not reopen the list.
+    var isAcceptingSuggestion = false
+    /// Painted diagnostics with their document ranges.
+    var diagnostics: [(NSRange, LSPDiagnostic)] = []
+    /// Index the pending or shown hover is for; nil when none.
+    var hoverIndex: Int?
+
+    lazy var suggest: SuggestWidgetController = {
+        let controller = SuggestWidgetController()
+        controller.onAccept = { [weak self] entry in self?.acceptSuggestion(entry) }
+        return controller
+    }()
 
     private var ghostText: String?
     private var ghostCaret = 0
+    private var lastDiagnostics: [LSPDiagnostic] = []
+    private var hoverTimer: Timer?
+    private var hoverRestPoint: NSPoint?
+    private var shownHoverPoint: NSPoint?
+    private var hoverTrackingArea: NSTrackingArea?
+    private lazy var hoverPanel = EditorHoverPanel()
+    private static let ghostColor = NSColor(srgbRed: 0.8, green: 0.8, blue: 0.8, alpha: 0.45)
+
+    private var monoFont: NSFont { font ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular) }
 
     /// Code-editor behaviour shared by every mount: plain text, no smart
     /// substitutions, undo, and the native incremental find bar.
@@ -3543,7 +4171,8 @@ final class CodeEditorTextView: NSTextView {
     }
 
     func showGhost(_ text: String, at caret: Int) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmed = text
+        while let last = trimmed.last, last.isWhitespace { trimmed.removeLast() }
         guard !trimmed.isEmpty else { return }
         ghostText = trimmed
         ghostCaret = caret
@@ -3562,9 +4191,41 @@ final class CodeEditorTextView: NSTextView {
         guard let ghost = ghostText else { return }
         let caret = min(ghostCaret, (string as NSString).length)
         ghostText = nil
-        // `insertText(_:replacementRange:)` is the same undoable path as typing.
-        insertText(ghost, replacementRange: NSRange(location: caret, length: 0))
+        insertWithoutSuggest(ghost, range: NSRange(location: caret, length: 0))
         needsDisplay = true
+    }
+
+    /// Accepts the next word or line break of the ghost; the remainder stays as ghost.
+    private func acceptGhostWord() {
+        guard let ghost = ghostText else { return }
+        let chunk = GhostTextLayout.nextWordChunk(ghost)
+        guard !chunk.isEmpty else { return }
+        let caret = min(ghostCaret, (string as NSString).length)
+        ghostText = nil
+        insertWithoutSuggest(chunk, range: NSRange(location: caret, length: 0))
+        let remainder = String(ghost.dropFirst(chunk.count))
+        ghostCaret = caret + (chunk as NSString).length
+        ghostText = remainder.isEmpty ? nil : remainder
+        needsDisplay = true
+    }
+
+    func acceptSuggestion(_ entry: SuggestEntry) {
+        let caret = selectedRange().location
+        var range = FileCompletionEngine.replacementRange(in: string, caret: caret)
+            ?? NSRange(location: caret, length: 0)
+        if let replace = entry.replaceRange, replace.location <= caret, caret <= NSMaxRange(replace),
+           NSMaxRange(replace) <= (string as NSString).length {
+            range = replace
+        }
+        clearGhost()
+        insertWithoutSuggest(entry.insertText, range: range)
+    }
+
+    private func insertWithoutSuggest(_ text: String, range: NSRange) {
+        isAcceptingSuggestion = true
+        defer { isAcceptingSuggestion = false }
+        // `insertText(_:replacementRange:)` is the same undoable path as typing.
+        insertText(text, replacementRange: range)
     }
 
     override func completions(forPartialWordRange charRange: NSRange, indexOfSelectedItem index: UnsafeMutablePointer<Int>?) -> [String]? {
@@ -3578,7 +4239,36 @@ final class CodeEditorTextView: NSTextView {
         insertText(word, replacementRange: charRange)
     }
 
+    /// Caret rect in text-view coordinates.
+    func caretRect() -> NSRect {
+        caretRect(at: selectedRange().location)
+    }
+
+    private func caretRect(at index: Int) -> NSRect {
+        let origin = caretOrigin(at: index) ?? .zero
+        let height = layoutManager?.defaultLineHeight(for: monoFont) ?? 14
+        return NSRect(x: origin.x, y: origin.y, width: 1, height: height)
+    }
+
     override func keyDown(with event: NSEvent) {
+        if suggest.isVisible, suggest.handleKeyDown(event) { return }
+        let command = event.modifierFlags.contains(.command)
+        if event.keyCode == 49, event.modifierFlags.contains(.control) { // Ctrl+Space
+            if suggest.isVisible {
+                suggest.toggleDetails()
+            } else {
+                onCompletionRequest?(true)
+            }
+            return
+        }
+        if event.keyCode == 124, command, hasGhost { // Cmd+Right
+            acceptGhostWord()
+            return
+        }
+        if event.keyCode == 123 || event.keyCode == 124 {
+            suggest.hide()
+        }
+        hideHover()
         if event.keyCode == 48, hasGhost { // Tab
             acceptGhost()
             return
@@ -3587,29 +4277,151 @@ final class CodeEditorTextView: NSTextView {
             clearGhost()
             return
         }
-        if event.keyCode == 49, event.modifierFlags.contains(.control) { // Ctrl+Space
-            complete(nil)
+        super.keyDown(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        suggest.hide()
+        hideHover()
+        super.mouseDown(with: event)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        hideHover()
+        super.scrollWheel(with: event)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        suggest.hide()
+        hideHover()
+        return super.resignFirstResponder()
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil {
+            suggest.hide()
+            hideHover()
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        let point = convert(event.locationInWindow, from: nil)
+        if let shown = shownHoverPoint, hypot(point.x - shown.x, point.y - shown.y) > 4 {
+            hideHover()
+        }
+        hoverRestPoint = point
+        hoverTimer?.invalidate()
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.hoverRestDidElapse() }
+        }
+    }
+
+    private func hoverRestDidElapse() {
+        hoverTimer = nil
+        guard let point = hoverRestPoint, window != nil, !string.isEmpty else { return }
+        let index = min(characterIndexForInsertion(at: point), (string as NSString).length - 1)
+        hoverIndex = index
+        shownHoverPoint = point
+        if let hit = diagnostics.first(where: { NSLocationInRange(index, $0.0) }) {
+            showHover(hit.1.message, at: index)
             return
         }
-        super.keyDown(with: event)
+        onHoverRequest?(index)
+    }
+
+    func showHover(_ text: String, at index: Int) {
+        guard window != nil else { return }
+        hoverPanel.show(text, above: caretRect(at: index), in: self)
+    }
+
+    func hideHover() {
+        hoverTimer?.invalidate()
+        hoverTimer = nil
+        hoverRestPoint = nil
+        shownHoverPoint = nil
+        hoverIndex = nil
+        hoverPanel.hide()
+    }
+
+    /// Replaces the painted diagnostics with `items`.
+    func applyDiagnostics(_ items: [LSPDiagnostic]) {
+        lastDiagnostics = items
+        reapplyDiagnostics()
+    }
+
+    /// Temporary attributes do not survive every storage edit, so highlight passes call this again.
+    func reapplyDiagnostics() {
+        guard let layoutManager else { return }
+        guard !lastDiagnostics.isEmpty || !diagnostics.isEmpty else { return }
+        let text = string
+        let length = (text as NSString).length
+        let full = NSRange(location: 0, length: length)
+        layoutManager.removeTemporaryAttribute(.underlineStyle, forCharacterRange: full)
+        layoutManager.removeTemporaryAttribute(.underlineColor, forCharacterRange: full)
+        diagnostics = []
+        let lineStarts = buildLineStartOffsets(text: text)
+        for item in lastDiagnostics {
+            guard let color = Self.underlineColor(forSeverity: item.severity) else { continue }
+            var range = diagnosticNSRange(item.range, lineStarts: lineStarts, length: length)
+            if range.length == 0 { range.length = min(1, length - range.location) }
+            guard range.length > 0 else { continue }
+            diagnostics.append((range, item))
+            layoutManager.addTemporaryAttributes([
+                .underlineStyle: NSUnderlineStyle.single.rawValue | NSUnderlineStyle.patternDot.rawValue,
+                .underlineColor: color,
+            ], forCharacterRange: range)
+        }
+    }
+
+    private static func underlineColor(forSeverity severity: Int) -> NSColor? {
+        switch severity {
+        case 1: return NSColor(srgbRed: 0xF1 / 255.0, green: 0x4C / 255.0, blue: 0x4C / 255.0, alpha: 1)
+        case 2: return NSColor(srgbRed: 0xCC / 255.0, green: 0xA7 / 255.0, blue: 0x00 / 255.0, alpha: 1)
+        case 3: return NSColor(srgbRed: 0x37 / 255.0, green: 0x94 / 255.0, blue: 0xFF / 255.0, alpha: 1)
+        default: return nil
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard let ghostText, let origin = ghostOrigin() else { return }
-        let firstLine = ghostText.components(separatedBy: .newlines).first ?? ghostText
-        let display = ghostText.contains("\n") ? firstLine + " \u{2026}" : firstLine
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor.withAlphaComponent(0.62),
-        ]
-        (display as NSString).draw(at: origin, withAttributes: attrs)
+        guard let ghostText, let origin = caretOrigin(at: ghostCaret) else { return }
+        let parts = GhostTextLayout.split(ghostText)
+        let attrs: [NSAttributedString.Key: Any] = [.font: monoFont, .foregroundColor: Self.ghostColor]
+        if !parts.inline.isEmpty {
+            (parts.inline as NSString).draw(at: origin, withAttributes: attrs)
+        }
+        guard let layoutManager, !parts.lines.isEmpty else { return }
+        let lineHeight = layoutManager.defaultLineHeight(for: monoFont)
+        let x = textContainerOrigin.x
+        let width = max(0, visibleRect.maxX - x)
+        var y = origin.y + lineHeight
+        for line in parts.lines {
+            backgroundColor.setFill()
+            NSRect(x: x, y: y, width: width, height: lineHeight).fill()
+            (line as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
+            y += lineHeight
+        }
     }
 
-    private func ghostOrigin() -> NSPoint? {
+    private func caretOrigin(at index: Int) -> NSPoint? {
         guard let layoutManager, let textContainer else { return nil }
         let ns = string as NSString
-        let caret = max(0, min(ghostCaret, ns.length))
+        let caret = max(0, min(index, ns.length))
         let inset = textContainerOrigin
         if caret < ns.length {
             let glyph = layoutManager.glyphIndexForCharacter(at: caret)
@@ -3625,6 +4437,87 @@ final class CodeEditorTextView: NSTextView {
         }
         let rect = layoutManager.extraLineFragmentRect
         return NSPoint(x: rect.minX + inset.x, y: rect.minY + inset.y)
+    }
+}
+
+/// LSP range to document range using prebuilt line starts. Clamps like `editorNSRange`, without rescanning `text`.
+private func diagnosticNSRange(_ range: LSPRange, lineStarts: [Int], length: Int) -> NSRange {
+    func offset(_ position: LSPPosition) -> Int {
+        guard position.line < lineStarts.count else { return length }
+        let lineStart = lineStarts[position.line]
+        let lineEnd = position.line + 1 < lineStarts.count ? lineStarts[position.line + 1] - 1 : length
+        return max(lineStart, min(lineStart + position.character, lineEnd))
+    }
+    let start = min(offset(range.start), length)
+    let end = min(max(offset(range.end), start), length)
+    return NSRange(location: start, length: end - start)
+}
+
+/// LSP range to document range, clamped to `text`.
+private func editorNSRange(_ range: LSPRange, in text: String) -> NSRange {
+    let length = (text as NSString).length
+    let start = min(LSPText.utf16Offset(for: range.start, in: text), length)
+    let end = min(max(LSPText.utf16Offset(for: range.end, in: text), start), length)
+    return NSRange(location: start, length: end - start)
+}
+
+/// Tooltip-style panel for diagnostics and LSP hover text.
+@MainActor
+private final class EditorHoverPanel {
+    private static let maxWidth: CGFloat = 500
+    private static let padding: CGFloat = 8
+
+    private let panel = NSPanel(
+        contentRect: .zero,
+        styleMask: [.borderless, .nonactivatingPanel],
+        backing: .buffered,
+        defer: true
+    )
+    private let box = NSView()
+    private let label = NSTextField(wrappingLabelWithString: "")
+
+    init() {
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.contentView = box
+        box.wantsLayer = true
+        box.layer?.backgroundColor = NSColor(srgbRed: 0x25 / 255.0, green: 0x25 / 255.0, blue: 0x26 / 255.0, alpha: 1).cgColor
+        box.layer?.borderColor = NSColor(srgbRed: 0x45 / 255.0, green: 0x45 / 255.0, blue: 0x45 / 255.0, alpha: 1).cgColor
+        box.layer?.borderWidth = 1
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = NSColor(srgbRed: 0xCC / 255.0, green: 0xCC / 255.0, blue: 0xCC / 255.0, alpha: 1)
+        label.isSelectable = false
+        label.maximumNumberOfLines = 0
+        label.lineBreakMode = .byWordWrapping
+        box.addSubview(label)
+    }
+
+    func show(_ text: String, above rect: NSRect, in view: NSView) {
+        guard let window = view.window else { return }
+        label.stringValue = text
+        let textWidth = Self.maxWidth - 2 * Self.padding
+        let fit = label.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: textWidth, height: .greatestFiniteMagnitude)) ?? .zero
+        let size = NSSize(
+            width: min(Self.maxWidth, ceil(fit.width) + 2 * Self.padding),
+            height: ceil(fit.height) + 2 * Self.padding
+        )
+        box.frame = NSRect(origin: .zero, size: size)
+        label.frame = box.bounds.insetBy(dx: Self.padding, dy: Self.padding)
+        let screen = window.convertToScreen(view.convert(rect, to: nil))
+        if panel.parent !== window {
+            panel.parent?.removeChildWindow(panel)
+            window.addChildWindow(panel, ordered: .above)
+        }
+        panel.setFrame(NSRect(origin: NSPoint(x: screen.minX, y: screen.maxY + 2), size: size), display: true)
+        panel.orderFront(nil)
+    }
+
+    func hide() {
+        panel.parent?.removeChildWindow(panel)
+        panel.orderOut(nil)
     }
 }
 

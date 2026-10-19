@@ -648,6 +648,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         logDiagnosticsHeartbeat(reason: "will_terminate")
         stopInProcessScheduledTaskScheduler()
         removeScheduledTaskStoreObserver()
+        LanguageServerPool.terminateAllProcessesNow()
         context?.stopDistillAutoUpdates()
         disableInsomniaForAppClose()
         // Token Saver was removed, so quit only purges what older builds

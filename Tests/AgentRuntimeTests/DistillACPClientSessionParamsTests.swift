@@ -332,12 +332,13 @@ final class DistillBotCavemanEnvironmentTests: XCTestCase {
         ]
     }
 
-    func test_cavemanBotRunsDistillCavemanFullWithNoOverrideRules() {
+    func test_cavemanFlagBotRunStillGetsHumanReplyRules() {
+        // WHY: the host now stamps "0" for every Bot; a leftover "1" must
+        // still get the human rules so no Bot falls back to caveman prose.
         let env = botRun(caveman: true)
         XCTAssertEqual(DistillACPClient.launchEnvironment(env)["GROK_CAVEMAN"], "full",
                        "a host value never changes a Bot's level")
-        XCTAssertNil(BotRunMCPAdmission.distillSessionRules(environment: env),
-                     "telling a caveman Bot to ignore caveman would undo its setting")
+        XCTAssertEqual(BotRunMCPAdmission.distillSessionRules(environment: env), BotRunMCPAdmission.distillBotReplyRules)
     }
 
     func test_cavemanOffBotKeepsFullSentences() {

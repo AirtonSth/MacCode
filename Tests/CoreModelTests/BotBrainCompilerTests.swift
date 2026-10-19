@@ -1855,8 +1855,7 @@ final class BotBrainCompilerTests: XCTestCase {
         // Fala tarefa." The turn payload carried no reply style at all; it now
         // asks for natural, complete sentences in the user's language on every
         // provider, ahead of Instructions so a custom soul still has the last word.
-        // Since 2026-10-15 this is the Caveman-off style (Titio's default);
-        // caveman Bots get `cavemanStyleLine` instead (see the reply style tests).
+        // Caveman no longer shapes Bot replies; the flag is ignored here.
         var (bot, revision) = greetingFixture()
         bot.cavemanEnabled = false
         let payload = BotBrainCompiler.composeRunPrompt(bot: bot, revision: revision, userText: "bom dia")
@@ -1887,14 +1886,16 @@ final class BotReplyStylePromptTests: XCTestCase {
         return BotBrainCompiler.composeRunPrompt(bot: bot, revision: revision, userText: "oi")
     }
 
-    func test_cavemanBotIsToldToBeTerseAndNotToWriteFullSentences() {
-        // WHY: caveman is the default for every Bot; the full-sentence style
-        // would contradict it in the same prompt.
+    func test_cavemanFlagDoesNotShapeSimpleReplies() {
+        // WHY: Caveman telegraphed replies for owners who are not technical;
+        // a stored caveman flag must not change the Simple prompt.
         let bot = BotDefinition(handle: "ceo", name: "Ceo", title: "", description: "")
         XCTAssertTrue(bot.cavemanEnabled)
         let payload = prompt(for: bot)
-        XCTAssertTrue(payload.contains(BotStandingInstructions.cavemanStyleLine))
-        XCTAssertFalse(payload.contains(BotStandingInstructions.replyStyleLine))
+        XCTAssertTrue(payload.contains(BotStandingInstructions.replyStyleLine))
+        XCTAssertTrue(payload.contains(BotStandingInstructions.humanVerbosityLine))
+        XCTAssertTrue(payload.contains(BotStandingInstructions.choicesLine))
+        XCTAssertFalse(payload.contains(BotStandingInstructions.cavemanStyleLine))
     }
 
     func test_titioWritesFullSentencesByDefault() {
@@ -1914,6 +1915,8 @@ final class BotReplyStylePromptTests: XCTestCase {
         XCTAssertTrue(BotStandingInstructions.humanVerbosityLine.contains("never narrate your process"))
         bot.verbosity = .verbose
         XCTAssertFalse(prompt(for: bot).contains(BotStandingInstructions.humanVerbosityLine))
+        XCTAssertTrue(prompt(for: bot).contains(BotStandingInstructions.technicalVerbosityLine))
+        XCTAssertFalse(prompt(for: bot).contains(BotStandingInstructions.cavemanStyleLine))
     }
 
     func test_everyBotIsTaughtTheChoicesBlockTheChatParses() throws {

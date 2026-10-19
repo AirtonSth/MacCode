@@ -355,16 +355,19 @@ public enum BotStandingInstructions {
     public static let replyStyleLine =
         "Reply style: write to the user like a real person, in the user's language: natural, warm, complete sentences with articles and connecting words. No telegraphic fragments, shorthand or robotic status lines, and no AI filler. Stay concise: a greeting gets a short, friendly greeting back. Keep code, commands, paths and names exact."
 
-    /// Caveman on (every Bot but Titio by default): short and terse, still
-    /// exact. Replaces `replyStyleLine`, which asks for full sentences.
+    /// Legacy: no longer added to Bot prompts. Kept for other callers.
     public static let cavemanStyleLine =
         "Reply style: caveman. Talk short and terse, in the user's language: drop filler, pleasantries and hedging; short sentences or fragments are fine and articles are optional. Keep facts, numbers, code, commands, paths and names exact."
 
-    /// Verbosity Human (the default): the chat shows only the Bot's messages,
-    /// so it writes like a person (the humanizer rules) and never narrates
-    /// tool work the user cannot see.
+    /// Simple (the default): for a non-technical reader. The chat shows only
+    /// the Bot's messages, so it never narrates tool work the user cannot see.
     public static let humanVerbosityLine =
-        "Write like a human, not an AI: no openers like \"Great question\" or \"Certainly!\", no flattery, no inflated or promotional words, no em dashes, no lists of three added for rhythm, no signposting such as \"Here's the thing\", no headings or bold in a short reply, no closing offers of more help. The user does not see your commands, edits or tool calls: never narrate your process or list what you ran. Tell them the result, what changed and what you need from them."
+        "Write for someone who is not technical, like a capable colleague giving a quick update in chat. Use plain words in the user's language and short paragraphs. Start with the outcome and what it means for them, include the concrete facts that matter (times, numbers, names, what changed), and finish with what you need from them, if anything. Do not paste code, diffs, logs, stack traces, file paths, commands, IDs or hashes unless the user asks for them; describe them in plain words instead (say \"the checkout page\", not a file name). The user does not see your commands, edits or tool calls: never narrate your process or list the steps and tools you used. No headings or bold, and a list only when it really helps. Sound like a person, not an AI: no openers like \"Great question\" or \"Certainly!\", no flattery, no em dashes, no closing offers of more help."
+
+    /// Technical: appended instead of `humanVerbosityLine` when the Bot shows
+    /// technical detail.
+    public static let technicalVerbosityLine =
+        "The user wants technical detail: you may include file paths, commands, short code snippets and IDs when they help, but still start with the result, keep paragraphs short, and do not narrate every step you took."
 
     /// Ready-made answers: when the user must pick from a few likely answers,
     /// the Bot ends its message with a `choices` block that the chat turns
@@ -373,9 +376,10 @@ public enum BotStandingInstructions {
         "When the user has to choose and the likely answers are few (2 to 6), offer them ready-made: end your message with a fenced block whose info string is choices, holding one JSON object, e.g. ```choices\n{\"question\":\"Which one?\",\"hint\":\"optional short note\",\"multiple\":false,\"options\":[\"First option\",\"Second option\"]}\n```. Keep options short, in the user's language; set multiple to true when several can apply. The chat shows it as buttons and the user can still type their own answer. Do not use it for open-ended questions."
 
     /// The reply style lines one Bot gets on every turn.
+    /// `cavemanEnabled` is ignored here: Caveman no longer shapes Bot replies.
     public static func replyStyleLines(for bot: BotDefinition) -> [String] {
-        var lines = [bot.cavemanEnabled ? cavemanStyleLine : replyStyleLine]
-        if bot.verbosity == .human { lines.append(humanVerbosityLine) }
+        var lines = [replyStyleLine]
+        lines.append(bot.verbosity == .human ? humanVerbosityLine : technicalVerbosityLine)
         lines.append(choicesLine)
         return lines
     }
@@ -531,9 +535,9 @@ public enum BotStandingInstructions {
 
 /// How much of a Bot's work its chat shows, and how it writes.
 public enum BotReplyVerbosity: String, Codable, Sendable, Equatable, CaseIterable {
-    /// Writes like a person; the chat shows only its messages.
+    /// Simple (default): writes for a non-technical reader; the chat shows only its messages.
     case human
-    /// Today's chat: every command, edit and tool row shows too.
+    /// Technical: may include files, commands and code; the chat shows every step it runs.
     case verbose
 }
 
@@ -557,6 +561,7 @@ public struct BotDefinition: Codable, Sendable, Equatable {
     public var directoryEpoch: Int
     public var notificationsEnabled: Bool
     public var verbosity: BotReplyVerbosity
+    /// Legacy: persisted for iOS/RPC compatibility; Bot prompts ignore it.
     public var cavemanEnabled: Bool
     public var createdAt: Date
     public var updatedAt: Date

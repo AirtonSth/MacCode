@@ -55,10 +55,9 @@ public enum BotRunMCPAdmission: Sendable {
         "Bot reply style, set by the RemoteCode host harness (not the user): for everything you write to the user, ignore the <output_style> section and any caveman or terse style in this system prompt and write normal, complete prose. \(BotStandingInstructions.replyStyleLine) Sound like a person, not an AI: no filler openers such as \"Great question\" or \"Certainly!\", no inflated or promotional wording, no habitual em dashes, no lists of three added for rhythm, no closing offers of more help. Never drop articles or write status-line fragments such as \"Page open. Say task.\"."
 
     /// `rules` for an ACP `session/new` of this run: bots only, so a non-bot
-    /// Agent App Distill thread keeps Distill's own style. A caveman Bot keeps
-    /// Distill's caveman `<output_style>`, so it gets no override.
+    /// Agent App Distill thread keeps Distill's own style.
     public static func distillSessionRules(environment: [String: String]) -> String? {
-        guard isBotRun(environment: environment), !botWantsCaveman(environment: environment) else { return nil }
+        guard isBotRun(environment: environment) else { return nil }
         return distillBotReplyRules
     }
 }

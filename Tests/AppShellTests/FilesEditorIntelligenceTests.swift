@@ -204,6 +204,11 @@ final class FilesEditorIntelligenceTests: XCTestCase {
         XCTAssertTrue(prompts[0].contains("let x = "))
     }
 
+    func test_sanitizeKeepsLeadingWhitespaceOfIndentedCompletion() {
+        XCTAssertEqual(DistillInlineCompletionProvider.sanitize("  bar()\n}", prefix: "", suffix: ""), "  bar()\n}",
+            "leading indentation is part of the completion; trimming it breaks the inserted block")
+    }
+
     func test_providerRejectsCompletionThatOnlyRepeatsTheSuffix() {
         XCTAssertNil(DistillInlineCompletionProvider.sanitize("next()", prefix: "x.", suffix: "next()"),
             "a completion duplicating existing following text must be dropped")

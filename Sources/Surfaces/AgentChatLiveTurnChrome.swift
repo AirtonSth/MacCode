@@ -101,6 +101,23 @@ public enum AgentChatLiveTurnChrome {
         item.body.isEmpty ? (AgentTimelineItemPresentation.make(for: item).detail ?? "") : item.body
     }
 
+    /// The thought the model is on right now: the latest reasoning item, until
+    /// the answer starts. Tail only, so the line stays one fixed-height box.
+    public static func liveThought(_ turn: AssistantTurnSnapshot) -> String? {
+        guard let index = turn.items.lastIndex(where: { $0.type == .reasoning }) else { return nil }
+        guard !turn.items[(index + 1)...].contains(where: { $0.type == .assistantMessage }) else { return nil }
+        let text = reasoningText(turn.items[index])
+            .replacingOccurrences(of: "**", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        let lines = text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .suffix(3)
+        let tail = lines.joined(separator: "\n")
+        return tail.count > 280 ? "…" + String(tail.suffix(280)) : tail
+    }
+
     public static func isGroupableTool(_ type: AssistantItemType) -> Bool {
         switch type {
         case .tool, .commandExecution, .mcpToolCall, .dynamicToolCall, .collabToolCall, .webSearch, .imageView, .fileChange:
@@ -489,7 +506,7 @@ public struct AgentChatReasoningRow: View, Equatable {
     public var body: some View {
         let text = AgentChatLiveTurnChrome.reasoningText(item)
         let streaming = item.state == .streaming
-        let expanded = streaming || expandedIDs.contains(item.id)
+        let expanded = !streaming && expandedIDs.contains(item.id)
         VStack(alignment: .leading, spacing: DS.Space.xs) {
             Button {
                 guard !streaming, !text.isEmpty else { return }
@@ -980,6 +997,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
                 == rhs.turn.items.last.map { AgentChatLiveTurnChrome.liveTextFingerprint($0.body) }
             && lhs.turn.items.last.map { AgentChatLiveTurnChrome.liveTextFingerprint($0.output) }
                 == rhs.turn.items.last.map { AgentChatLiveTurnChrome.liveTextFingerprint($0.output) }
+            && liveThoughtFingerprint(lhs.turn) == liveThoughtFingerprint(rhs.turn)
             && (lhs.renderFinal == nil) == (rhs.renderFinal == nil)
             && (lhs.afterWork == nil) == (rhs.afterWork == nil)
     }
@@ -1036,6 +1054,9 @@ public struct AgentChatLiveTurnView: View, Equatable {
                             expandedToolGroups: $expandedToolGroups
                         )
                     }
+                    if live, let thought = AgentChatLiveTurnChrome.liveThought(turn) {
+                        AgentChatLiveThinkingLine(turnId: turn.turnId, text: thought)
+                    }
                 }
                 .padding(.leading, showsWorkHeader ? 0 : DS.Space.md)
                 .accessibilityIdentifier("agent.work.timeline.\(turn.turnId)")
@@ -1066,13 +1087,21 @@ public struct AgentChatLiveTurnView: View, Equatable {
         .accessibilityIdentifier("bots.desk.liveTurn.\(turn.turnId)")
     }
 
+    static func liveThoughtFingerprint(_ turn: AssistantTurnSnapshot) -> UInt64? {
+        AgentChatLiveTurnChrome.liveThought(turn).map { AgentChatLiveTurnChrome.liveTextFingerprint($0) }
+    }
+
     /// Verbosity Human: a "Working" line while live, and the turn's errors.
     /// Hidden work still owns up to its failures (iOS parity): an error the
     /// user cannot see would read as a silent success.
     @ViewBuilder
     private func hiddenWorkSection(activity: [AssistantItem]) -> some View {
         if live && showsWorkHeader {
-            AgentChatHiddenWorkStatus(turn: turn)
+            if let thought = AgentChatLiveTurnChrome.liveThought(turn) {
+                AgentChatLiveThinkingLine(turnId: turn.turnId, text: thought)
+            } else {
+                AgentChatHiddenWorkStatus(turn: turn)
+            }
         }
         ForEach(AgentChatLiveTurnChrome.visibleErrors(in: activity)) { item in
             AgentChatLiveItemRow(
@@ -1082,6 +1111,40 @@ public struct AgentChatLiveTurnView: View, Equatable {
             )
             .equatable()
         }
+    }
+}
+
+/// Live "thinking" line: the model's current thought, tail only.
+public struct AgentChatLiveThinkingLine: View {
+    public let turnId: String
+    public let text: String
+
+    public init(turnId: String, text: String) {
+        self.turnId = turnId
+        self.text = text
+    }
+
+    public var body: some View {
+        HStack(alignment: .top, spacing: DS.Space.sm) {
+            Image(systemName: "circle.dotted")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text("Thinking…")
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                Text(text)
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(3)
+                    .truncationMode(.head)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("agent.liveThinking.\(turnId)")
     }
 }
 

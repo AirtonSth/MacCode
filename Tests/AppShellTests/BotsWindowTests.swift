@@ -2665,6 +2665,33 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(turn.items.first { $0.id == "r-watermark" }).body, "seed A B")
     }
 
+    func test_terminalStatusBeforeDurableCommitDoesNotLeaveBotWorking() throws {
+        // WHY: the provider's terminal status reaches the Bots view before the coordinator
+        // commits the run row. Settling on that still-running row painted Working and
+        // ignored the real finish, so finished Bots kept spinning for a minute or more.
+        let fixture = try makeDeskReplayFixture()
+        var run = fixture.run
+        run.status = .running
+        run.finishedAt = nil
+        try fixture.context.runRepo.upsert(run)
+
+        fixture.viewModel.adoptLinkedRunTerminalForTests(runId: run.id, threadId: fixture.thread.id)
+
+        run.status = .completed
+        run.finishedAt = Date()
+        try fixture.context.runRepo.upsert(run)
+        fixture.viewModel.adoptLinkedRunTerminalForTests(runId: run.id, threadId: fixture.thread.id)
+
+        let conversation = try XCTUnwrap(
+            fixture.context.botStore.listConversations(botID: fixture.bot.id)
+                .first { $0.linkedAgentThreadID == fixture.thread.id }
+        )
+        XCTAssertNotEqual(conversation.attentionState, .working,
+            "the durable finish must settle the conversation; an early terminal status must not pin it Working")
+        XCTAssertNotEqual(fixture.viewModel.attentionState(for: fixture.bot), .working,
+            "the Bot avatar must stop spinning once its run is durably finished")
+    }
+
     func test_deskLiveObserverWatermarkReconcilesPersistPollObserverRaceAtTerminal() throws {
         // WHY: persistence can finish before its observer Task reaches MainActor.
         // If the poll replays first, the late callback paints the same delta a
