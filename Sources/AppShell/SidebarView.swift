@@ -3249,7 +3249,7 @@ public struct SidebarRootView: View {
                 .padding(.vertical, DS.Space.xs)
                 .background(
                     UnevenRoundedRectangle(bottomLeadingRadius: DS.Radius.control, bottomTrailingRadius: DS.Radius.control, style: .continuous)
-                        .fill(Color.black.opacity(0.05))
+                        .fill(Color.black.opacity(0.15))
                 )
                 .padding(.leading, 16)
                 .padding(.top, -DS.Space.xxs)
