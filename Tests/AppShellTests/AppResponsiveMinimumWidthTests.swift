@@ -2,6 +2,7 @@ import XCTest
 import SwiftUI
 import AppKit
 @testable import AppShell
+import Persistence
 
 /// WHY: every screen opens in a resizable pane or window; none may force a width
 /// wider than a narrow pane (320 pt) at its root.
@@ -49,6 +50,7 @@ final class AppResponsiveMinimumWidthTests: XCTestCase {
             ("settings", AnyView(SettingsView(vm: SettingsViewModel(context: context)))),
             ("schedule", AnyView(ScheduledTasksRootView(vm: ScheduledTasksViewModel(context: context, router: router, loadImmediately: false)))),
             ("bots", AnyView(BotsRootView(vm: BotsViewModel(context: context)))),
+            ("bots-studio", AnyView(BotsRootView(vm: try studioViewModel(context)))),
         ]
         let artifacts = ProcessInfo.processInfo.environment["REMOTE_CODE_RESPONSIVE_ARTIFACT_DIR"]
         for (name, view) in screens {
@@ -71,5 +73,13 @@ final class AppResponsiveMinimumWidthTests: XCTestCase {
                 window.contentView = nil
             }
         }
+    }
+
+    private func studioViewModel(_ context: AppContext) throws -> BotsViewModel {
+        SettingsStore(db: context.db).update { $0.botsControlPlaneEnabled = true }
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "A teammate with a fairly long display name", title: "Backend reviewer")
+        vm.beginEdit(bot)
+        return vm
     }
 }

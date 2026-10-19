@@ -77,7 +77,8 @@ struct BotBlobatarEditor: View {
     }
 
     private var hueRow: some View {
-        HStack(spacing: DS.Space.sm) {
+        // Adaptive grid: 15 swatches wrap onto more rows instead of widening the picker.
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 24, maximum: 28), spacing: DS.Space.sm)], alignment: .leading, spacing: DS.Space.sm) {
             let autoSelected = spec.hue == .auto
             Button {
                 apply { $0.hue = .auto }
@@ -94,6 +95,7 @@ struct BotBlobatarEditor: View {
             .accessibilityLabel("auto")
             .accessibilityAddTraits(autoSelected ? .isSelected : [])
             .accessibilityIdentifier("bots.studio.avatar.hue.auto")
+            .gridCellColumns(2)
 
             ForEach(BotBlobatar.studioHues, id: \.id) { swatch in
                 let selected = spec.hue == .named(swatch.id)
@@ -118,8 +120,8 @@ struct BotBlobatarEditor: View {
                 .accessibilityLabel(swatch.id)
                 .accessibilityAddTraits(selected ? .isSelected : [])
                 .accessibilityIdentifier("bots.studio.avatar.hue.\(swatch.id)")
+                .frame(width: 24, height: 24)
             }
-            Spacer(minLength: 0)
         }
         .accessibilityIdentifier("bots.studio.avatar.hue")
     }

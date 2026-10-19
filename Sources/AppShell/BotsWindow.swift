@@ -12951,6 +12951,10 @@ private struct BotsStudioReactiveScope<Content: View>: View {
 public struct BotsRootView: View {
     @ObservedObject private var vm: BotsViewModel
     @State private var pendingClearAllDeskThreads = false
+    /// Studio's measured width; below `studioCompactWidth` its columns stack.
+    @State private var studioWidth: CGFloat = 1_000
+    private static let studioCompactWidth: CGFloat = 640
+    private var studioCompact: Bool { studioWidth < Self.studioCompactWidth }
     @State private var pendingDockerDataClear: BotID?
     @State private var isConfirmingTitioFactoryReset = false
     @State private var pendingContextGrant: (botID: BotID, context: BotContext, contextName: String)?
@@ -13077,6 +13081,17 @@ public struct BotsRootView: View {
     }
 
     private var studioScreen: some View {
+        // The pane's proposed width (not the content's) decides when Studio stacks.
+        GeometryReader { proxy in
+            studioScreenContent
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .onAppear { studioWidth = proxy.size.width }
+                .onChange(of: proxy.size.width) { studioWidth = $0 }
+        }
+        .accessibilityIdentifier("bots.studio")
+    }
+
+    private var studioScreenContent: some View {
         VStack(spacing: 0) {
             studioHeader
             studioTabs
@@ -13102,7 +13117,7 @@ public struct BotsRootView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .accessibilityIdentifier("bots.studio")
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// Every Studio tab scrolls and fills the available width; side gutters
@@ -13110,9 +13125,11 @@ public struct BotsRootView: View {
     private func studioPage<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         ScrollView {
             content()
-                .padding(.horizontal, DS.Space.huge)
+                .padding(.horizontal, studioCompact ? DS.Space.xl : DS.Space.huge)
                 .padding(.vertical, DS.Space.xxl)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // Pin the page to the pane width so long field text and captions wrap or scroll
+                // inside it instead of widening the page past the pane.
+                .frame(width: studioWidth, alignment: .leading)
         }
     }
 
@@ -13149,7 +13166,27 @@ public struct BotsRootView: View {
     }
 
     private var studioHeader: some View {
-        HStack(alignment: .center, spacing: DS.Space.lg) {
+        // Narrow panes put Notify and Save under the identity instead of squeezing the name.
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: DS.Space.lg) {
+                studioHeaderIdentity
+                Spacer(minLength: DS.Space.lg)
+                studioHeaderActions
+            }
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                HStack(alignment: .center, spacing: DS.Space.lg) { studioHeaderIdentity }
+                HStack(spacing: DS.Space.lg) { studioHeaderActions }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, studioCompact ? DS.Space.xl : DS.Space.xxl)
+        .padding(.vertical, DS.Space.xl)
+        .frame(width: studioWidth, alignment: .leading)
+        .dsBar(edge: .bottom)
+    }
+
+    @ViewBuilder
+    private var studioHeaderIdentity: some View {
             backButton {
                 vm.requestLeaveUnsavedNewBot { [weak vm] in
                     vm?.leaveStudioAfterUnsavedGate()
@@ -13174,13 +13211,17 @@ public struct BotsRootView: View {
                 Text(vm.studioDraft.name.isEmpty ? "New Bot" : vm.studioDraft.name)
                     .font(DS.Font.title2.weight(.semibold))
                     .foregroundColor(DS.Palette.text)
+                    .lineLimit(2)
                     .accessibilityIdentifier("bots.studio.name")
                 Text(vm.studioDraft.title.isEmpty ? "No job yet" : vm.studioDraft.title)
                     .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textSecondary)
                     .accessibilityIdentifier("bots.studio.role")
             }
-            Spacer(minLength: DS.Space.lg)
+    }
+
+    @ViewBuilder
+    private var studioHeaderActions: some View {
             studioHeaderNotify
             Button(BotsChrome.Label.saveBot) {
                 // The error strip is not modal, so an older message can still
@@ -13197,10 +13238,6 @@ public struct BotsRootView: View {
             .keyboardShortcut("s", modifiers: .command)
             .disabled(!vm.isControlPlaneActive)
             .accessibilityIdentifier("bots.studio.save")
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .padding(.vertical, DS.Space.xl)
-        .dsBar(edge: .bottom)
     }
 
     /// Quiet header setting. Save stays the only solid CTA; a Profile
@@ -13233,6 +13270,13 @@ public struct BotsRootView: View {
     }
 
     private var studioTabs: some View {
+        ScrollView(.horizontal, showsIndicators: false) { studioTabRow }
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(DS.Palette.line).frame(height: 1)
+            }
+    }
+
+    private var studioTabRow: some View {
         HStack(spacing: DS.Space.sm) {
             ForEach(BotStudioTab.allCases.filter(\.isUserFacing)) { tab in
                 let selected = resolvedStudioTab == tab
@@ -13259,15 +13303,39 @@ public struct BotsRootView: View {
                 .accessibilityAddTraits(selected ? .isSelected : [])
                 .accessibilityIdentifier(tab.accessibilityIdentifier)
             }
-            Spacer()
         }
         .padding(.horizontal, DS.Space.xxl)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(DS.Palette.line).frame(height: 1)
+    }
+
+    @ViewBuilder
+    private var studioProfile: some View {
+        // Narrow panes stack the avatar picker under the form instead of a fixed 280 pt column.
+        if studioCompact {
+            VStack(alignment: .leading, spacing: DS.Space.huge) {
+                studioProfileForm
+                if !vm.studioEditsTitio { studioAvatarPane }
+            }
+        } else {
+            studioProfileColumns
         }
     }
 
-    private var studioProfile: some View {
+    private var studioProfileForm: some View {
+        VStack(alignment: .leading, spacing: DS.Space.huge) {
+            studioIdentity
+            studioRule
+            studioSoul
+            studioRule
+            studioReplyStyle
+            if vm.studioEditsTitio {
+                studioRule
+                studioTitioFactoryReset
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var studioProfileColumns: some View {
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: DS.Space.huge) {
                 studioIdentity
@@ -13364,7 +13432,7 @@ public struct BotsRootView: View {
     private var studioIdentity: some View {
         VStack(alignment: .leading, spacing: DS.Space.xl) {
             studioSectionHeader(BotsChrome.Label.roleAndIdentity)
-            HStack(alignment: .top, spacing: DS.Space.xl) {
+            (studioCompact ? AnyLayout(VStackLayout(alignment: .leading, spacing: DS.Space.xl)) : AnyLayout(HStackLayout(alignment: .top, spacing: DS.Space.xl))) {
                 labeledField("Name") {
                     studioField(
                         placeholder: "e.g. Piper",

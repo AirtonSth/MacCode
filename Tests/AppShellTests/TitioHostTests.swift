@@ -431,9 +431,12 @@ final class TitioHostTests: XCTestCase {
             encoding: .utf8
         )
         let start = try XCTUnwrap(window.range(of: "private var studioProfile: some View {"))
-        let profile = String(window[start.upperBound...].prefix(1_200))
+        let profile = String(window[start.upperBound...].prefix(2_400))
+        // Wide Studio has two columns; a narrow pane stacks them. Both mount the pane only for other Bots.
         XCTAssertTrue(profile.contains("if !vm.studioEditsTitio {\n                studioAvatarPane"),
-                      "the avatar pane mounts only for other Bots")
+                      "the wide layout mounts the avatar pane only for other Bots")
+        XCTAssertTrue(profile.contains("if !vm.studioEditsTitio { studioAvatarPane }"),
+                      "the stacked layout mounts the avatar pane only for other Bots")
         XCTAssertTrue(profile.contains("studioTitioFactoryReset"))
         XCTAssertTrue(window.contains(".disabled(vm.studioEditsTitio)"), "Titio's slug is how the app finds it")
     }

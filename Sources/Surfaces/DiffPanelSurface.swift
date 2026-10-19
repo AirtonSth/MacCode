@@ -1129,9 +1129,19 @@ public struct DiffPanelView: View {
     public init(vm: DiffPanelViewModel) { self.vm = vm }
 
     public var body: some View {
-        HSplitView {
-            leftColumn.frame(minWidth: 160, idealWidth: 320)
-            diffBody.frame(minWidth: 200)
+        // Narrow panes stack the file list over the diff instead of squeezing two columns.
+        GeometryReader { proxy in
+            if proxy.size.width < 560 {
+                VSplitView {
+                    leftColumn.frame(minHeight: 120, idealHeight: 220)
+                    diffBody.frame(minHeight: 160)
+                }
+            } else {
+                HSplitView {
+                    leftColumn.frame(minWidth: 160, idealWidth: 320)
+                    diffBody.frame(minWidth: 200)
+                }
+            }
         }
         .background(DS.Palette.bg)
         // UX-012: arrow keys move the selection through the active list;
@@ -2159,7 +2169,7 @@ public struct DiffPanelView: View {
         Button { binding.wrappedValue.toggle() } label: {
             HStack(spacing: 3) {
                 if let icon { Image(systemName: icon).font(.system(size: 9, weight: .semibold)) }
-                Text(title)
+                Text(title).lineLimit(1).fixedSize()
             }
                 .font(DS.Font.caption2.weight(.medium))
                 .foregroundColor(binding.wrappedValue ? DS.Palette.onAccent : DS.Palette.textSecondary)
