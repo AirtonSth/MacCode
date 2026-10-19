@@ -3255,7 +3255,7 @@ public final class BotsViewModel: ObservableObject {
     /// `liveWorkingBots()` SQLite reads (perf BT-01). Refreshed only where the
     /// inputs change — see `refreshActiveBotCount()`.
     @Published public private(set) var activeBotCount: Int = 0
-    @Published private var liveRosterBotIDs: Set<BotID> = []
+    @Published public private(set) var liveRosterBotIDs: Set<BotID> = []
     /// Stored roster snapshot so ForEach does not re-filter/sort `fleet` on
     /// unrelated @Published writes (desk timeline, inspector).
     @Published public private(set) var publishedRoster: [BotDefinition] = []
@@ -5839,6 +5839,19 @@ public final class BotsViewModel: ObservableObject {
             } else {
                 reloadFleet()
             }
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    /// Persists a drag reorder of the top-level Bots and tells clients to refetch.
+    public func reorderBots(orderedIDs: [BotID]) {
+        do {
+            try botStore.reorder(orderedIDs: orderedIDs)
+            EventBus.shared.publish(kind: .botUpdated, payload: .object([
+                "method": .string("bot.reorder"),
+                "ordered_bot_ids": .array(orderedIDs.map { .string($0.value.uuidString) })
+            ]))
         } catch {
             errorMessage = String(describing: error)
         }
@@ -13729,8 +13742,11 @@ public struct BotsRootView: View {
                                 .truncationMode(.tail)
                                 .help(BotsViewModel.displayName(bot.name))
                                 .accessibilityIdentifier("bots.desk.name")
-                            attentionBadge(vm.attentionState(for: bot))
+                            attentionBadge(vm.activityState(for: bot))
                                 .layoutPriority(1)
+                            if vm.liveRosterBotIDs.contains(bot.id) {
+                                DSBusySpinner(label: "Running", identifier: "bots.desk.running")
+                            }
                         }
                         HStack(spacing: DS.Space.sm) {
                             Text(bot.title.isEmpty ? "No job yet" : bot.title)

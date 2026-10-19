@@ -133,6 +133,7 @@ public enum HostMutationContract {
     bot.context.revoke
     bot.set_pinned
     bot.set_hidden
+    bot.reorder
     bot.duplicate
     bot.settings.set
     bot.send
@@ -410,6 +411,8 @@ public enum HostMutationContract {
                 return []
             case "bot.settings.set":
                 return [.string("key")]
+            case "bot.reorder":
+                return [.uuidArray("ordered_bot_ids")]
             case "bot.queue.remove", "bot.queue.force_now":
                 return [.uuid("bot_id"), .uuid("id")]
             case "bot.queue.update":

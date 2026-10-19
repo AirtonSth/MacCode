@@ -216,7 +216,7 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
         )
     }
 
-    /// WHY: RemoteCode.app and the scheduled-task LaunchAgent both reconcile at
+    /// WHY: MacCode.app and the scheduled-task LaunchAgent both reconcile at
     /// login. Before the loser-tolerant reconcile, the loser's moveItem threw
     /// "file exists" and the error persisted for the whole app session even
     /// though the identical pinned package was already installed.

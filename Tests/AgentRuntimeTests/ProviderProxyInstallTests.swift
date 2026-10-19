@@ -221,13 +221,13 @@ final class ProviderProxyInstallTests: XCTestCase {
     }
 
     func test_installProviderProxies_repairsDanglingAliasFromRemovedCanonicalBundle() throws {
-        // WHY: an app upgrade may remove the old canonical RemoteCode.app
+        // WHY: an app upgrade may remove the old canonical MacCode.app
         // before reconciliation; its now-dangling managed aliases must heal.
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
         let activeBinary = try fakeServiceBinary(in: home)
         let realBins = try fakeProviderBins(in: home, names: ProviderProxyCatalog.providers)
         let removedBinary = home
-            .appendingPathComponent("old/RemoteCode.app/Contents/MacOS")
+            .appendingPathComponent("old/MacCode.app/Contents/MacOS")
             .appendingPathComponent("RemoteCodeDistillService")
         let installer = AgentSkillInstaller(homeDirectory: home)
         let managedBin = installer.managedCLIBinURL
@@ -834,7 +834,7 @@ final class ProviderProxyInstallTests: XCTestCase {
         let oldService = home
             .appendingPathComponent("old/.build/debug/RemoteCodeDistillService")
         let activeService = home
-            .appendingPathComponent("new/RemoteCode.app/Contents/MacOS/RemoteCodeDistillService")
+            .appendingPathComponent("new/MacCode.app/Contents/MacOS/RemoteCodeDistillService")
         for service in [oldService, activeService] {
             try FileManager.default.createDirectory(
                 at: service.deletingLastPathComponent(),

@@ -3,7 +3,7 @@
 # execute provider CLIs as another macOS user through the shared helper.
 #
 # Usage:
-#   sudo scripts/install-run-as-user-helper.sh [/path/to/RemoteCode.app]
+#   sudo scripts/install-run-as-user-helper.sh [/path/to/MacCode.app]
 #
 # Security notes:
 # - Helper drops to the target uid/gid before exec.
@@ -16,7 +16,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-APP_PATH="${1:-dist/RemoteCode.app}"
+APP_PATH="${1:-dist/MacCode.app}"
 SRC="$APP_PATH/Contents/MacOS/RemoteCodeRunAsUserHelper"
 if [ ! -x "$SRC" ]; then
   # Fall back to SwiftPM build product

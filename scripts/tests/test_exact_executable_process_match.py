@@ -9,14 +9,14 @@ PROCESS_FILTER = REPOSITORY_ROOT / "scripts" / "exact-executable-pids.awk"
 
 class ExactExecutableProcessMatchTests(unittest.TestCase):
     def test_remote_code_match_does_not_capture_distill_service_prefix(self):
-        executable = "/worktree/dist/RemoteCode.app/Contents/MacOS/RemoteCode"
+        executable = "/worktree/dist/MacCode.app/Contents/MacOS/RemoteCode"
         processes = "\n".join(
             [
                 f"101 {executable}",
                 f"102 {executable}DistillService mcp",
                 f"103 {executable}RunAsUserHelper",
                 f"104 {executable} --scheduled-task-agent-unregister",
-                "105 /other/worktree/dist/RemoteCode.app/Contents/MacOS/RemoteCode",
+                "105 /other/worktree/dist/MacCode.app/Contents/MacOS/RemoteCode",
             ]
         )
 

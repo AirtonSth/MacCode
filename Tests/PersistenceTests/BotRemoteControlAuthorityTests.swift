@@ -2629,6 +2629,34 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(try store.list(includeHidden: true).count, 0)
     }
 
+    func test_reorder_roundTripsThroughBotList_becauseClientsRefetchOrderFromTheHost() throws {
+        var ids: [String] = []
+        for (index, name) in ["Aaa", "Bbb", "Ccc"].enumerated() {
+            let created = try authority.dispatch(method: "bot.create", params: [
+                "client_request_id": "ro-create-\(index)", "name": name,
+            ])
+            ids.append(try XCTUnwrap(created["bot_id"] as? String))
+        }
+        let before = try authority.dispatch(method: "bot.list", params: [:])
+        XCTAssertTrue((before["bots"] as? [[String: Any]])?.allSatisfy { $0["sort_order"] is NSNull } == true)
+
+        let result = try authority.dispatch(method: "bot.reorder", params: [
+            "client_request_id": "ro-1", "ordered_bot_ids": [ids[0], ids[2], ids[1]],
+        ])
+        XCTAssertEqual(result["ok"] as? Bool, true)
+        XCTAssertEqual(result["status"] as? String, "completed")
+        let listed = try XCTUnwrap(try authority.dispatch(method: "bot.list", params: [:])["bots"] as? [[String: Any]])
+        XCTAssertEqual(listed.map { $0["id"] as? String }, [ids[0], ids[2], ids[1]])
+        XCTAssertEqual(listed.map { $0["sort_order"] as? Int }, [0, 1, 2])
+
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.reorder", params: [
+            "client_request_id": "ro-2", "ordered_bot_ids": [UUID().uuidString.lowercased()],
+        ]), "unknown id is rejected like other bot RPCs")
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.reorder", params: [
+            "client_request_id": "ro-3", "ordered_bot_ids": ["nope"],
+        ]))
+    }
+
     func test_deleteClearsOnlyThatBotsLiveAttentionAndSelectionAcrossRelaunch() throws {
         // WHY: deleting one teammate must close its transient work without
         // erasing another teammate's active run, attention, or selection.

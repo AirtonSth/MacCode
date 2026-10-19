@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# QA-mac:71 -- structural validation of a packaged RemoteCode.app bundle (T026).
+# QA-mac:71 -- structural validation of a packaged MacCode.app bundle (T026).
 #
 # WHY: package-app.sh runs `codesign --verify` only when a human packages locally,
 # so a malformed bundle (9-byte PkgInfo, missing executable, invalid Info.plist,
@@ -7,7 +7,7 @@
 # asserts the structural invariants that must hold for the bundle to launch and be
 # discoverable, independent of codesigning.
 #
-# Usage: check-app-bundle.sh /path/to/RemoteCode.app
+# Usage: check-app-bundle.sh /path/to/MacCode.app
 # Exit 0 = all structural checks pass; exit 1 = at least one failed.
 set -euo pipefail
 

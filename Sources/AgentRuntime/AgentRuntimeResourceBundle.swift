@@ -16,7 +16,7 @@ enum AgentRuntimeResourceBundleError: Error, Equatable {
 /// When either misses, the accessor `fatalError`s on first touch — uncatchable.
 /// Developer machines still work because (2) exists; customers crashed at launch
 /// on v2.0.85–v2.0.87 when `AgentSkillInstaller.reconcileRemoteCodeOrchestrate`
-/// touched it from `AppContext.init` (RemoteCode.app abort + scheduled-task
+/// touched it from `AppContext.init` (MacCode.app abort + scheduled-task
 /// LaunchAgent crash-loop).
 ///
 /// Pass criteria: find `Contents/Resources/RemoteCode_AgentRuntime.bundle` first,
@@ -56,7 +56,7 @@ enum AgentRuntimeResourceBundle {
         }
 
         let mainURL = main.bundleURL
-        // Standard macOS app: …/RemoteCode.app/Contents/Resources/…
+        // Standard macOS app: …/MacCode.app/Contents/Resources/…
         urls.append(
             mainURL
                 .appendingPathComponent("Contents", isDirectory: true)

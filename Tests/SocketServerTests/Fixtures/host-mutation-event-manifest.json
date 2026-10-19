@@ -176,6 +176,7 @@
     {"method": "bot.context.revoke", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.context.list"]},
     {"method": "bot.set_pinned", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
     {"method": "bot.set_hidden", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
+    {"method": "bot.reorder", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
     {"method": "bot.duplicate", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.created"], "readbackMethods": ["bot.list"]},
     {"method": "bot.settings.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.settings.updated"], "readbackMethods": ["bot.settings.get"]},
     {"method": "bot.send", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.message.accepted", "bot.run.started", "bot.message.queued", "bot.run.stream", "bot.run.completed", "bot.run.failed"], "readbackMethods": ["bot.queue.list", "bot.receipt.status"]},

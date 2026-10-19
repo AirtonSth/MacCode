@@ -95,7 +95,7 @@ final class LegacyTokenSaverPurgeTests: XCTestCase {
     }
 
     func test_uninstallCommandWrappers_prunesStrayNodeWrapperPointingAtAnotherDistillBuild() throws {
-        // WHY: production leftovers point at dist/RemoteCode.app/.../RemoteCodeDistillService
+        // WHY: production leftovers point at dist/MacCode.app/.../RemoteCodeDistillService
         // while the purge may resolve a different build. Ownership is the target name;
         // a stray `node` link makes `#!/usr/bin/env node` (Homebrew Codex) start the service.
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }

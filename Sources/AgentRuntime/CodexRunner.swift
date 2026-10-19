@@ -29,7 +29,7 @@ public enum ProcessLocator {
             let expanded = (trimmed as NSString).expandingTildeInPath
             return FileManager.default.isExecutableFile(atPath: expanded) ? expanded : nil
         }
-        // Prefer a co-located privileged helper next to RemoteCode.app/Contents/MacOS.
+        // Prefer a co-located privileged helper next to MacCode.app/Contents/MacOS.
         if trimmed == "RemoteCodeRunAsUserHelper" || trimmed == "io.remotecode.RunAsUserHelper" {
             let candidates = [
                 "/Library/PrivilegedHelperTools/io.remotecode.RunAsUserHelper",

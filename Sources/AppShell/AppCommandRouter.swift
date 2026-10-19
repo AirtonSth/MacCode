@@ -3188,7 +3188,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     /// Prefer the currently focused Agent App tab, then layout order. This makes
     /// an explicit deep link deterministic without changing any sibling surface.
-    private func preferredAgentAppSurface(in workspaceID: WorkspaceID) -> AgentAppSurface? {
+    func preferredAgentAppSurface(in workspaceID: WorkspaceID) -> AgentAppSurface? {
         guard let workspace = context?.state.workspaces[workspaceID] else { return nil }
         let candidates = SurfaceRegistry.shared.all().compactMap { $0 as? AgentAppSurface }
             .filter { $0.viewModel.workspaceID == workspaceID }

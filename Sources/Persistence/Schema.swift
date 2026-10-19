@@ -72,7 +72,9 @@ public enum Schema {
     /// v98 adds device_trust.relay_public_key (X25519 key the paired device uses
     /// for the end-to-end relay channel).
     static let relayKeysSchemaVersion = 98
-    public static let currentVersion: Int = relayKeysSchemaVersion
+    /// v99 adds bots.sort_order (user drag order; NULL = never ordered).
+    static let botSortOrderSchemaVersion = 99
+    public static let currentVersion: Int = botSortOrderSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1952,6 +1954,9 @@ public enum Schema {
         SchemaStep(relayKeysSchemaVersion, """
         ALTER TABLE device_trust ADD COLUMN relay_public_key BLOB;
         """),
+        SchemaStep(botSortOrderSchemaVersion, """
+        ALTER TABLE bots ADD COLUMN sort_order INTEGER;
+        """),
     ]
 
     /// Additive and idempotent. `key` reuses today's banner identifiers, so a
@@ -2153,7 +2158,7 @@ public enum Schema {
     private static let migrationAppliedAtFormatter = ISO8601DateFormatter()
 
     static func trustedRestoreSchema(version: Int) throws -> SQLiteDB {
-        guard [93, 96, hostRestoreQueueHoldsSchemaVersion, currentVersion].contains(version) else {
+        guard [93, 96, hostRestoreQueueHoldsSchemaVersion, relayKeysSchemaVersion, currentVersion].contains(version) else {
             throw SQLiteError.execute("unsupported restore schema version")
         }
         let db = try SQLiteDB(path: ":memory:")

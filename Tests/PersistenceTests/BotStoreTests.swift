@@ -843,4 +843,36 @@ final class BotStoreTests: XCTestCase {
         // Pinning does not change membership; it only proves the write path still refreshes.
         XCTAssertEqual(try store.listCached().count, 2)
     }
+
+    func test_reorder_writesIndexForListedAndKeepsUnlistedAfterInRelativeOrder_becauseDragOrderMustPersist() throws {
+        let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+        func make(_ name: String, _ offset: TimeInterval) throws -> BotDefinition {
+            try store.create(name: name, title: "t", description: "d", handle: name.lowercased(), soul: "s",
+                             provider: .claude, model: "opus", now: t0.addingTimeInterval(offset))
+        }
+        let a = try make("Aaa", 0), b = try make("Bbb", 10), c = try make("Ccc", 20), d = try make("Ddd", 30)
+        XCTAssertNil(try store.get(id: a.id)?.sortOrder, "never-ordered bots have no sort_order")
+
+        try store.reorder(orderedIDs: [c.id, a.id])
+
+        XCTAssertEqual(try store.get(id: c.id)?.sortOrder, 0)
+        XCTAssertEqual(try store.get(id: a.id)?.sortOrder, 1)
+        // Unlisted keep relative (newest-first) order after the listed ones.
+        XCTAssertEqual(try store.get(id: d.id)?.sortOrder, 2)
+        XCTAssertEqual(try store.get(id: b.id)?.sortOrder, 3)
+        XCTAssertEqual(BotOrdering.sorted(try store.list()).map(\.id), [c.id, a.id, d.id, b.id])
+
+        XCTAssertThrowsError(try store.reorder(orderedIDs: [BotID()]), "unknown id must not silently reorder")
+        XCTAssertEqual(try store.get(id: c.id)?.sortOrder, 0)
+    }
+
+    func test_migrationAddsBotSortOrderColumnAtV99_becauseOldDatabasesMustUpgrade() throws {
+        XCTAssertEqual(Schema.botSortOrderSchemaVersion, 99)
+        XCTAssertEqual(Schema.steps.last?.version, Schema.currentVersion)
+        let statement = try db.prepare("PRAGMA table_info(bots);")
+        defer { statement.reset() }
+        var columns: [String: String] = [:]
+        while try statement.step() { columns[statement.columnText(1) ?? ""] = statement.columnText(2) }
+        XCTAssertEqual(columns["sort_order"], "INTEGER")
+    }
 }

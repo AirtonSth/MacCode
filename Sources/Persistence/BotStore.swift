@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import os
 
 public enum BotStoreError: Error, Equatable, CustomStringConvertible {
     case notFound
@@ -175,7 +176,7 @@ public final class BotStore: @unchecked Sendable {
         listCacheState.withLock { listQueryCountForTesting += 1 }
 #endif
         return try db.performSync { database in
-            var sql = Self.botSelect + " WHERE 1=1"
+            var sql = try botSelect(database) + " WHERE 1=1"
             if !includeDeleted { sql += " AND deleted_at IS NULL" }
             if !includeHidden { sql += " AND (hidden = 0 OR deleted_at IS NOT NULL)" }
             sql += " ORDER BY updated_at DESC;"
@@ -201,7 +202,7 @@ public final class BotStore: @unchecked Sendable {
             for start in stride(from: 0, to: ids.count, by: Self.lookupBatchSize) {
                 let batch = ids[start..<min(start + Self.lookupBatchSize, ids.count)]
                 let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
-                let statement = try database.prepare(Self.botSelect + " WHERE id IN (\(marks));")
+                let statement = try database.prepare(try botSelect(database) + " WHERE id IN (\(marks));")
                 defer { statement.reset() }
                 for (index, id) in batch.enumerated() {
                     try statement.bind(Int32(index + 1), id.value.uuidString.lowercased())
@@ -419,6 +420,31 @@ public final class BotStore: @unchecked Sendable {
             try statement.bind(2, string(now))
             try statement.bind(3, id.value.uuidString.lowercased())
             _ = try statement.step()
+        }
+        bumpBotsListRevision()
+    }
+
+    /// Writes sort_order = index for each listed live bot. Live bots not listed
+    /// keep their current relative order after the listed ones. Unknown ids throw.
+    public func reorder(orderedIDs: [BotID]) throws {
+        var seen = Set<BotID>()
+        let listed = orderedIDs.filter { seen.insert($0).inserted }
+        try db.transaction {
+            let select = try db.prepare(try botSelect(db) + " WHERE deleted_at IS NULL;")
+            var live: [BotDefinition] = []
+            while try select.step() { live.append(try decodeBot(select)) }
+            select.reset()
+            let liveSet = Set(live.map(\.id))
+            guard listed.allSatisfy({ liveSet.contains($0) }) else { throw BotStoreError.notFound }
+            let rest = BotOrdering.sorted(live).map(\.id).filter { !seen.contains($0) }
+            let statement = try db.prepare("UPDATE bots SET sort_order = ? WHERE id = ? AND deleted_at IS NULL;")
+            defer { statement.reset() }
+            for (index, id) in (listed + rest).enumerated() {
+                statement.reset()
+                try statement.bind(1, index)
+                try statement.bind(2, id.value.uuidString.lowercased())
+                _ = try statement.step()
+            }
         }
         bumpBotsListRevision()
     }
@@ -2244,7 +2270,7 @@ public final class BotStore: @unchecked Sendable {
     }
 
     func loadBot(id: BotID, database: SQLiteDB) throws -> BotDefinition? {
-        let statement = try database.prepare(Self.botSelect + " WHERE id = ? LIMIT 1;")
+        let statement = try database.prepare(try botSelect(database) + " WHERE id = ? LIMIT 1;")
         defer { statement.reset() }
         try statement.bind(1, id.value.uuidString.lowercased())
         return try statement.step() ? try decodeBot(statement) : nil
@@ -2394,7 +2420,8 @@ public final class BotStore: @unchecked Sendable {
             createdAt: created,
             updatedAt: updated,
             deletedAt: date(statement.columnText(13)),
-            workspaceID: workspace
+            workspaceID: workspace,
+            sortOrder: statement.columnIsNull(17) ? nil : Int(statement.columnInt64(17))
         )
     }
 
@@ -2582,13 +2609,27 @@ public final class BotStore: @unchecked Sendable {
         string.flatMap(dates.date(from:))
     }
 
-    private static let botSelect = """
-        SELECT id, handle, name, title, description, avatar_symbol, pinned, hidden,
-               current_revision_id, directory_epoch, notifications_enabled,
-               created_at, updated_at, deleted_at, workspace_id,
-               reply_verbosity, caveman_enabled
-        FROM bots
-        """
+    /// Restore review reads bots from trusted legacy schemas (v93/v96) that
+    /// predate `sort_order`; those select NULL for it. Only a positive probe is
+    /// cached, so a database migrated later is re-probed.
+    private let sortOrderColumnState = OSAllocatedUnfairLock(initialState: false)
+
+    private func botSelect(_ database: SQLiteDB) throws -> String {
+        var hasSortOrder = sortOrderColumnState.withLock { $0 }
+        if !hasSortOrder {
+            let info = try database.prepare("PRAGMA table_info(bots);")
+            defer { info.reset() }
+            while try info.step() { if info.columnText(1) == "sort_order" { hasSortOrder = true; break } }
+            if hasSortOrder { sortOrderColumnState.withLock { $0 = true } }
+        }
+        return """
+            SELECT id, handle, name, title, description, avatar_symbol, pinned, hidden,
+                   current_revision_id, directory_epoch, notifications_enabled,
+                   created_at, updated_at, deleted_at, workspace_id,
+                   reply_verbosity, caveman_enabled, \(hasSortOrder ? "sort_order" : "NULL AS sort_order")
+            FROM bots
+            """
+    }
 
     private static let revisionSelect = """
         SELECT id, bot_id, revision_number, name, title, description, soul, provider,

@@ -6,7 +6,7 @@ final class ChromeProfileComputerUseTests: XCTestCase {
     func testInstallerUsesPackagedResourcesAndOnlyRegistersItsOwnExtension() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("rc-chrome-install-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
-        let contents = root.appendingPathComponent("RemoteCode.app/Contents")
+        let contents = root.appendingPathComponent("MacCode.app/Contents")
         let resources = contents.appendingPathComponent("Resources/RemoteCode_CoreModel.bundle/ChromeComputerUse")
         try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
         let source = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()

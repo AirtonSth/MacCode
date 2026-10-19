@@ -278,7 +278,7 @@ class TerminalIOSGeometryDriverValidationTests(unittest.TestCase):
 
     def test_validate_only_rejects_wrong_primary_executable_without_rpc(self):
         loaded = [
-            "/Applications/RemoteCode.app/Contents/MacOS/RemoteCode",
+            "/Applications/MacCode.app/Contents/MacOS/RemoteCode",
             str(self.executable.resolve()),
             "/usr/lib/dyld",
         ]

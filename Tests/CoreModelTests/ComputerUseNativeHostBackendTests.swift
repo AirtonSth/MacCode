@@ -26,7 +26,7 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
                 screenCapturePermission: { screenCapture },
                 capture: { _ in .unavailable("test") },
                 uiTree: { _ in nil },
-                hostLauncherPath: { "/Applications/RemoteCode.app/Contents/MacOS/RemoteCode" }
+                hostLauncherPath: { "/Applications/MacCode.app/Contents/MacOS/RemoteCode" }
             ))
         }
         let missing = await backend(accessibility: false, screenCapture: false).invoke(
@@ -36,9 +36,9 @@ final class ComputerUseNativeHostBackendTests: XCTestCase {
         let text = try XCTUnwrap(missing.content.first?.text)
         // JSONSerialization escapes "/" as "\/"; compare on unescaped content.
         let unescaped = text.replacingOccurrences(of: "\\/", with: "/")
-        XCTAssertTrue(unescaped.contains("\"launched_by\":\"/Applications/RemoteCode.app/Contents/MacOS/RemoteCode\""), unescaped)
+        XCTAssertTrue(unescaped.contains("\"launched_by\":\"/Applications/MacCode.app/Contents/MacOS/RemoteCode\""), unescaped)
         XCTAssertTrue(unescaped.contains("\"remediation\":"), unescaped)
-        XCTAssertTrue(unescaped.contains("Screen Recording and Accessibility for /Applications/RemoteCode.app"), unescaped)
+        XCTAssertTrue(unescaped.contains("Screen Recording and Accessibility for /Applications/MacCode.app"), unescaped)
         XCTAssertTrue(unescaped.contains("remove the entry and add the app again"), unescaped)
 
         let granted = await backend(accessibility: true, screenCapture: true).invoke(

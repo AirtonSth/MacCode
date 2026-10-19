@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 
 CONFIG="${RC2_CONFIG:-release}"
 DIST="dist"
-BUNDLE="RemoteCode.app"
+BUNDLE="MacCode.app"
 BUNDLE_ID="${RC2_BUNDLE_ID:-io.remotecode.desktop}"
 # Derive RC2_CHANNEL_VALUE from BUNDLE_ID so LSEnvironment is always consistent
 # with the bundle id — stable=io.remotecode.desktop, canary=io.remotecode.desktop.canary,
@@ -89,7 +89,7 @@ if [ "${RC2_REQUIRE_SPARKLE_KEY:-0}" = "1" ] && [ -z "$SPARKLE_PUBLIC_ED_KEY" ];
   exit 1
 fi
 
-# The owner-facing app at dist/RemoteCode.app must never be a debug build:
+# The owner-facing app at dist/MacCode.app must never be a debug build:
 # SwiftUI diffing, JSONDecoder and AttributedString(markdown:) run 5-20x
 # slower under -Onone, amplifying every transcript/streaming cost (perf audit
 # X-00: the running app was a 216 MB debug binary). The isolated sandbox

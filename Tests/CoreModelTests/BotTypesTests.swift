@@ -409,4 +409,18 @@ final class BotTypesTests: XCTestCase {
             "permission honesty is a compiler layer, not starter soul"
         )
     }
+
+    func test_botOrdering_titioThenPinnedThenSortOrderNilLastThenUpdatedDesc() {
+        func bot(_ handle: String, pinned: Bool = false, order: Int? = nil, updated: TimeInterval = 0) -> BotDefinition {
+            BotDefinition(handle: handle, name: handle, title: "", description: "", pinned: pinned,
+                          updatedAt: Date(timeIntervalSince1970: updated), sortOrder: order)
+        }
+        let input = [
+            bot("new", updated: 90), bot("old", updated: 10), bot("o2", order: 2, updated: 1),
+            bot("o1", order: 1, updated: 2), bot("pin", pinned: true, updated: 0),
+            bot("pin0", pinned: true, order: 0, updated: 0), bot(TitioIdentity.handle),
+        ]
+        XCTAssertEqual(BotOrdering.sorted(input).map(\.handle),
+                       [TitioIdentity.handle, "pin0", "pin", "o1", "o2", "new", "old"])
+    }
 }

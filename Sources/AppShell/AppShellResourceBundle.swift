@@ -39,7 +39,7 @@ enum AppShellResourceBundle {
         }
 
         let mainURL = main.bundleURL
-        // Standard macOS app: …/RemoteCode.app/Contents/Resources/…
+        // Standard macOS app: …/MacCode.app/Contents/Resources/…
         urls.append(
             mainURL
                 .appendingPathComponent("Contents", isDirectory: true)

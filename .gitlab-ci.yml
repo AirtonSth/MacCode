@@ -229,9 +229,9 @@ stable_macos_arm64_dmg:
 
       MOUNT="$(mktemp -d)"
       hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "dist/$ASSET_NAME"
-      codesign --verify --deep --strict --verbose=4 "$MOUNT/RemoteCode.app"
-      spctl --assess --type execute --verbose=4 "$MOUNT/RemoteCode.app"
-      bash scripts/orchestrate-launch-smoke.sh "$MOUNT/RemoteCode.app"
+      codesign --verify --deep --strict --verbose=4 "$MOUNT/MacCode.app"
+      spctl --assess --type execute --verbose=4 "$MOUNT/MacCode.app"
+      bash scripts/orchestrate-launch-smoke.sh "$MOUNT/MacCode.app"
       hdiutil detach "$MOUNT"
       rmdir "$MOUNT"
       MOUNT=""

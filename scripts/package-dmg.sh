@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build RemoteCode.app and wrap it in a Developer ID-signed DMG.
+# Build MacCode.app and wrap it in a Developer ID-signed DMG.
 # This script must fail if a Developer ID Application identity is unavailable.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ASSET_NAME="${RC2_DMG_NAME:-stable-macos-arm64-RemoteCode.dmg}"
 DIST="dist"
-APP_NAME="RemoteCode.app"
+APP_NAME="MacCode.app"
 DMG_ROOT="$DIST/dmg-root"
 DMG_BUILD_ROOT="$DIST/dmg-build"
 DMG_BUILD_APP="$DMG_BUILD_ROOT/$APP_NAME"
@@ -103,7 +103,7 @@ assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Vers
 assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Installer.xpc"
 
 hdiutil create \
-  -volname "RemoteCode" \
+  -volname "MacCode" \
   -srcfolder "$DMG_ROOT" \
   -ov \
   -format UDRW \
@@ -128,7 +128,7 @@ fi
 
 osascript <<OSA
 tell application "Finder"
-  tell disk "RemoteCode"
+  tell disk "MacCode"
     open
     set current view of container window to icon view
     set toolbar visible of container window to false
@@ -139,7 +139,7 @@ tell application "Finder"
     set arrangement of theViewOptions to not arranged
     set icon size of theViewOptions to 128
     set background picture of theViewOptions to file "background:background.png"
-    set position of item "RemoteCode.app" of container window to {220, 240}
+    set position of item "MacCode.app" of container window to {220, 240}
     set position of item "Applications" of container window to {580, 240}
     update without registering applications
     delay 1

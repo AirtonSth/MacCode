@@ -988,6 +988,7 @@ public final class JSONRPCDispatcher {
         "bot.context.revoke",
         "bot.set_pinned",
         "bot.set_hidden",
+        "bot.reorder",
         "bot.duplicate",
         "bot.send",
         "bot.stop",

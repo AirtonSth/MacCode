@@ -945,7 +945,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "attachment.stage", "attachment.import", "attachment.remove", "files.mutate", "files.open_tab", "files.split", "files.location.set", "browser.action", "link.open", "guest.input", "guest.start", "guest.stop", "guest.rebuild", "guest.revoke", "guest.control": return .files
         case "conversation.export.preview", "conversation.export": return .export
         case "soul.set": return .memory
-        case "settings.set", "save", "set_pinned", "set_hidden", "desktop.set", "avatar.set", "handle.set", "verbosity.set", "caveman.set", "routing.set": return .configure
+        case "settings.set", "save", "set_pinned", "set_hidden", "reorder", "desktop.set", "avatar.set", "handle.set", "verbosity.set", "caveman.set", "routing.set": return .configure
         case "routine.create", "routine.update", "routine.enable", "routine.run", "routine.delete", "scheduler.tick": return .schedule
         case "peer.ask", "peer.self_config": return .delegate
         default: return nil
@@ -971,7 +971,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func list(params: [String: Any]) throws -> [String: Any] {
         let includeHidden = (params["include_hidden"] as? Bool) ?? false
-        let bots = try store.list(includeHidden: includeHidden).map { try encodeBot($0) }
+        let bots = try BotOrdering.sorted(store.list(includeHidden: includeHidden)).map { try encodeBot($0) }
         return ["bots": bots, "unpublished_ids": Array(unpublished).sorted()]
     }
 
@@ -1331,6 +1331,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try setPinned(params: params, requestID: requestID, now: now)
         case "set_hidden":
             return try setHidden(params: params, requestID: requestID, now: now)
+        case "reorder":
+            return try reorder(params: params, requestID: requestID)
         case "duplicate":
             return try duplicate(params: params, requestID: requestID, now: now)
         case "settings.set":
@@ -1622,6 +1624,18 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: ["pinned": pinned])
     }
 
+    private func reorder(params: [String: Any], requestID: String) throws -> [String: Any] {
+        guard let raw = params["ordered_bot_ids"] as? [String] else { throw Error.invalidParams }
+        var ids: [BotID] = []
+        for value in raw {
+            guard let uuid = UUID(uuidString: value) else { throw Error.invalidParams }
+            ids.append(BotID(uuid))
+        }
+        do { try store.reorder(orderedIDs: ids) } catch BotStoreError.notFound { throw Error.notFound }
+        var result = receipt(requestID: requestID, status: .completed, botID: nil, readback: ["ok": true])
+        result["ok"] = true
+        return result
+    }
     private func setHidden(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         let bot = try requireBot(params)
         let hidden = bool(params, "hidden") ?? false
@@ -3871,6 +3885,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "desktop_kind": revision.desktopKind.advertisedOrLogical.rawValue,
             "current_revision_id": revision.id.value.uuidString.lowercased(),
             "workspace_id": NSNull(),
+            "sort_order": bot.sortOrder.map { $0 as Any } ?? NSNull(),
         ]
         if let routing = routingPref[id(bot)] {
             body["routing"] = routing

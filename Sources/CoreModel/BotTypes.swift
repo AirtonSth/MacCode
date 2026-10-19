@@ -562,6 +562,8 @@ public struct BotDefinition: Codable, Sendable, Equatable {
     public var updatedAt: Date
     public var deletedAt: Date?
     public var workspaceID: WorkspaceID?
+    /// User drag order (ascending). nil = never ordered.
+    public var sortOrder: Int?
 
     public init(
         id: BotID = BotID(),
@@ -580,7 +582,8 @@ public struct BotDefinition: Codable, Sendable, Equatable {
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
         deletedAt: Date? = nil,
-        workspaceID: WorkspaceID? = nil
+        workspaceID: WorkspaceID? = nil,
+        sortOrder: Int? = nil
     ) {
         self.id = id
         self.handle = handle
@@ -599,12 +602,13 @@ public struct BotDefinition: Codable, Sendable, Equatable {
         self.updatedAt = updatedAt
         self.deletedAt = deletedAt
         self.workspaceID = workspaceID
+        self.sortOrder = sortOrder
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, handle, name, title, description, avatarSymbol, pinned, hidden
         case currentRevisionID, directoryEpoch, notificationsEnabled, verbosity, cavemanEnabled
-        case createdAt, updatedAt, deletedAt, workspaceID
+        case createdAt, updatedAt, deletedAt, workspaceID, sortOrder
     }
 
     /// Encoded Bots written before reply style existed still decode.
@@ -628,6 +632,26 @@ public struct BotDefinition: Codable, Sendable, Equatable {
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
         deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
         workspaceID = try c.decodeIfPresent(WorkspaceID.self, forKey: .workspaceID)
+        sortOrder = try c.decodeIfPresent(Int.self, forKey: .sortOrder)
+    }
+}
+
+/// Central bot order: Titio first, pinned, user sort_order ascending (nil last),
+/// then most recently updated.
+public enum BotOrdering {
+    public static func sorted(_ bots: [BotDefinition]) -> [BotDefinition] {
+        func isTitio(_ bot: BotDefinition) -> Bool { bot.handle.lowercased() == TitioIdentity.handle }
+        return bots.sorted { a, b in
+            let ta = isTitio(a), tb = isTitio(b)
+            if ta != tb { return ta }
+            if a.pinned != b.pinned { return a.pinned }
+            if a.sortOrder != b.sortOrder {
+                guard let x = a.sortOrder else { return false }
+                guard let y = b.sortOrder else { return true }
+                return x < y
+            }
+            return a.updatedAt > b.updatedAt
+        }
     }
 }
 

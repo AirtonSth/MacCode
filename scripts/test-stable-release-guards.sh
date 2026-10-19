@@ -217,12 +217,12 @@ then
   exit 1
 fi
 # shellcheck disable=SC2016
-if ! printf '%s\n' "$stable_rules" | grep -F 'bash scripts/orchestrate-launch-smoke.sh "$MOUNT/RemoteCode.app"' >/dev/null; then
+if ! printf '%s\n' "$stable_rules" | grep -F 'bash scripts/orchestrate-launch-smoke.sh "$MOUNT/MacCode.app"' >/dev/null; then
   echo "FAIL: stable publication does not gate on mounted-app launch smoke" >&2
   exit 1
 fi
 # shellcheck disable=SC2016
-if printf '%s\n' "$stable_rules" | grep -F 'orchestrate-launch-smoke.sh "$MOUNT/RemoteCode.app" ||' >/dev/null; then
+if printf '%s\n' "$stable_rules" | grep -F 'orchestrate-launch-smoke.sh "$MOUNT/MacCode.app" ||' >/dev/null; then
   echo "FAIL: stable launch smoke is still non-gating" >&2
   exit 1
 fi

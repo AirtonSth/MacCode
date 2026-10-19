@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch a packaged RemoteCode.app once and verify AppContext.init completes
+# Launch a packaged MacCode.app once and verify AppContext.init completes
 # without aborting and the orchestrate reconcile logs no failure. Catches
 # launch-abort regressions (EXC_BREAKPOINT class, e.g. the v2.0.85-v2.0.87
 # Bundle.module crash) that structural file checks cannot see.
@@ -8,10 +8,10 @@
 # so this smoke proves the launch invariant (never abort), not packaged-path
 # resolution order — that is pinned by AgentRuntimeResourceBundleTests.
 #
-# Usage: orchestrate-launch-smoke.sh /path/to/RemoteCode.app
+# Usage: orchestrate-launch-smoke.sh /path/to/MacCode.app
 set -euo pipefail
 
-APP="${1:?usage: orchestrate-launch-smoke.sh /path/to/RemoteCode.app}"
+APP="${1:?usage: orchestrate-launch-smoke.sh /path/to/MacCode.app}"
 EXE_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Contents/Info.plist" 2>/dev/null || echo RemoteCode)"
 EXE="$APP/Contents/MacOS/$EXE_NAME"
 [ -x "$EXE" ] || { echo "[smoke] missing executable $EXE" >&2; exit 1; }

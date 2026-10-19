@@ -41,7 +41,7 @@ final class AppIdentityNotificationTests: XCTestCase {
     func testPackageScriptBuildsRemoteCodeAppWithLegacyIcon() throws {
         let script = try String(contentsOf: packageScriptURL())
 
-        XCTAssertTrue(script.contains("BUNDLE=\"RemoteCode.app\""))
+        XCTAssertTrue(script.contains("BUNDLE=\"MacCode.app\""))
         XCTAssertTrue(script.contains("BUNDLE_ID=\"${RC2_BUNDLE_ID:-io.remotecode.desktop}\""))
         XCTAssertTrue(script.contains("<key>CFBundleDisplayName</key><string>MacCode</string>"))
         XCTAssertTrue(script.contains("<key>CFBundleIconFile</key><string>AppIcon</string>"))
@@ -52,7 +52,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertTrue(script.contains("DISTILL_SERVICE=\"$BIN_DIR/RemoteCodeDistillService\""),
                       "packaging must require the RemoteCodeDistillService executable")
         XCTAssertTrue(script.contains("Contents/MacOS/RemoteCodeDistillService"),
-                      "RemoteCode.app must contain the sidecar so Bundle.main can resolve it without global installs")
+                      "MacCode.app must contain the sidecar so Bundle.main can resolve it without global installs")
         XCTAssertTrue(script.contains("SCHEDULED_TASK_AGENT=\"$BIN_DIR/RemoteCodeScheduledTaskAgent\""),
                       "packaging must require a supplemental Scheduled Tasks agent executable")
         XCTAssertTrue(script.contains("Contents/Resources/RemoteCodeScheduledTaskAgent"),

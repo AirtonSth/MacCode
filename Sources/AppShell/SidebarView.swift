@@ -224,13 +224,26 @@ public final class SidebarViewModel: ObservableObject {
         public let workspaceID: WorkspaceID
         public let title: String
         public let botID: BotID?
+        public let updatedAt: Date
         public var id: String { threadID.value.uuidString }
-        nonisolated public init(threadID: AgentThreadID, workspaceID: WorkspaceID, title: String, botID: BotID?) {
+        nonisolated public init(threadID: AgentThreadID, workspaceID: WorkspaceID, title: String, botID: BotID?, updatedAt: Date = .distantPast) {
             self.threadID = threadID
             self.workspaceID = workspaceID
             self.title = title
             self.botID = botID
+            self.updatedAt = updatedAt
         }
+    }
+
+    /// Pure: row id -> short age ("4m") for rows whose displayed title repeats in the same list.
+    nonisolated static func duplicateTitleAges(_ rows: [WorkspaceConversationRow], now: Date) -> [String: String] {
+        let counts = rows.reduce(into: [String: Int]()) { $0[AgentThreadTitle.display($1.title), default: 0] += 1 }
+        var out: [String: String] = [:]
+        for row in rows where counts[AgentThreadTitle.display(row.title), default: 0] > 1 {
+            let seconds = max(0, Int(now.timeIntervalSince(row.updatedAt)))
+            out[row.id] = seconds < 60 ? "now" : seconds < 3600 ? "\(seconds / 60)m" : seconds < 86_400 ? "\(seconds / 3600)h" : "\(seconds / 86_400)d"
+        }
+        return out
     }
 
     /// Default title of a thread nobody has written in yet; "+ New conversation" covers it.
@@ -239,7 +252,60 @@ public final class SidebarViewModel: ObservableObject {
     /// Rows shown under one expanded workspace; the workspace row itself opens the full layout.
     nonisolated static let workspaceConversationLimit = 8
 
+    /// What the Bots desk shows right now; nil unless the desk is the active surface.
+    public struct DeskSelection: Equatable, Sendable {
+        public let botID: BotID
+        public let context: BotContext?
+        public let threadID: AgentThreadID?
+        nonisolated public init(botID: BotID, context: BotContext?, threadID: AgentThreadID?) {
+            self.botID = botID
+            self.context = context
+            self.threadID = threadID
+        }
+    }
+
+    /// Pure: the desk selection only counts while Bots owns the main content on its Chat screen.
+    nonisolated static func deskSelection(
+        isBotsSelected: Bool, screen: BotsScreen, botID: BotID?, context: BotContext?, threadID: AgentThreadID?
+    ) -> DeskSelection? {
+        guard isBotsSelected, screen == .desk, let botID else { return nil }
+        return DeskSelection(botID: botID, context: context, threadID: threadID)
+    }
+
+    /// A top-level Bot row is selected for the General context (or a legacy unpinned chat).
+    nonisolated static func isGeneralBotSelected(_ botID: BotID, in selection: DeskSelection?) -> Bool {
+        guard let selection, selection.botID == botID else { return false }
+        return selection.context == nil || selection.context == .general
+    }
+
+    /// A workspace Bot row is selected only for its own workspace context.
+    nonisolated static func isBotConversationSelected(botID: BotID, context: BotContext, in selection: DeskSelection?) -> Bool {
+        guard let selection, selection.botID == botID else { return false }
+        return selection.context == context
+    }
+
+    /// Pure drag result: `dragged` leaves its slot and lands immediately before `target`.
+    nonisolated static func reorderedBotIDs(_ ids: [BotID], moving dragged: BotID, before target: BotID) -> [BotID] {
+        guard dragged != target, ids.contains(dragged), ids.contains(target) else { return ids }
+        var next = ids.filter { $0 != dragged }
+        next.insert(dragged, at: next.firstIndex(of: target) ?? next.endIndex)
+        return next
+    }
+
+    /// Pure: untitled threads stay hidden unless they are running or open.
+    nonisolated static func showsThread(title: String, id: AgentThreadID, keep: Set<AgentThreadID>) -> Bool {
+        title != untitledThreadTitle || keep.contains(id)
+    }
+
     @Published public private(set) var generalBots: [GeneralBotRow] = []
+    @Published private(set) var runningBotIDs: Set<BotID> = []
+    @Published private(set) var deskSelection: DeskSelection?
+    @Published private(set) var runningThreadIDs: Set<AgentThreadID> = []
+    @Published private(set) var selectedThreadID: AgentThreadID?
+    public var draggingBotID: BotID?
+    @Published public var dropTargetBotID: BotID?
+    private var runningBotsSink: AnyCancellable?
+    private var deskSelectionSink: AnyCancellable?
     @Published public private(set) var workspaceConversations: [WorkspaceID: [WorkspaceConversationRow]] = [:]
     /// Disclosure state only: expanding never selects or opens a workspace.
     @Published public private(set) var expandedWorkspaceIDs: Set<WorkspaceID> = []
@@ -491,11 +557,19 @@ public final class SidebarViewModel: ObservableObject {
         let loader = authorizedBotRowsLoaderForTesting
         let expanded = expandedWorkspaceIDs.intersection(workspaceIDs)
         let includeHidden = router?.botsViewModel?.showHidden ?? false
+        let live = context.coordinator.activeThreadIdsSnapshot()
+        if live != runningThreadIDs { runningThreadIDs = live }
+        var selectedThread: AgentThreadID?
+        if !isBotsSelected, let wid = selectedWorkspaceID {
+            selectedThread = router?.preferredAgentAppSurface(in: wid)?.viewModel.selectedThreadId
+        }
+        if selectedThread != selectedThreadID { selectedThreadID = selectedThread }
+        let keepUntitled = live.union(selectedThread.map { [$0] } ?? []).union(deskSelection?.threadID.map { [$0] } ?? [])
         authorizedBotRowsTask = Task { [weak self] in
             let (result, tree) = await Task.detached {
                 let rows = if let loader { loader(botStore, threadRepo, hostID, workspaceIDs) }
                 else { Self.loadAuthorizedBotConversationRows(botStore: botStore, threadRepo: threadRepo, hostID: hostID, workspaceIDs: workspaceIDs) }
-                return (rows, Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden))
+                return (rows, Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden, keepUntitled: keepUntitled))
             }.value
             guard let self, !Task.isCancelled, self.authorizedBotRowsGeneration == generation else { return }
             if self.authorizedBotRowsNeedsRefresh {
@@ -547,7 +621,7 @@ public final class SidebarViewModel: ObservableObject {
         workspaceIDs: Set<WorkspaceID>
     ) -> [AuthorizedBotConversationRow]? {
         do {
-            let bots = try botStore.list()
+            let bots = BotOrdering.sorted(try botStore.list())
             var rows: [AuthorizedBotConversationRow] = []
             for bot in bots {
                 for binding in try botStore.listContextBindings(hostID: hostID, botID: bot.id)
@@ -581,16 +655,12 @@ public final class SidebarViewModel: ObservableObject {
         threadRepo: AgentThreadRepository,
         hostID: String,
         expanded: Set<WorkspaceID>,
-        includeHidden: Bool = false
+        includeHidden: Bool = false,
+        keepUntitled: Set<AgentThreadID> = []
     ) -> (general: [GeneralBotRow], conversations: [WorkspaceID: [WorkspaceConversationRow]])? {
         do {
-            // Titio, pinned, then most recent.
-            let bots = try botStore.list(includeHidden: includeHidden).sorted { lhs, rhs in
-                let lhsTitio = lhs.handle == TitioIdentity.handle, rhsTitio = rhs.handle == TitioIdentity.handle
-                if lhsTitio != rhsTitio { return lhsTitio }
-                if lhs.pinned != rhs.pinned { return lhs.pinned }
-                return lhs.updatedAt > rhs.updatedAt
-            }
+            // Titio, pinned, user drag order, then most recent.
+            let bots = BotOrdering.sorted(try botStore.list(includeHidden: includeHidden))
             var general: [GeneralBotRow] = []
             for bot in bots {
                 let bindings = try botStore.listContextBindings(hostID: hostID, botID: bot.id)
@@ -605,7 +675,7 @@ public final class SidebarViewModel: ObservableObject {
             for workspaceID in expanded {
                 var rows: [WorkspaceConversationRow] = []
                 for thread in try threadRepo.list(workspaceId: workspaceID)
-                where !thread.isEphemeral && thread.parentThreadId == nil && thread.title != Self.untitledThreadTitle {
+                where !thread.isEphemeral && thread.parentThreadId == nil && Self.showsThread(title: thread.title, id: thread.id, keep: keepUntitled) {
                     // A pinned Bot thread is listed only while this host may still read that exact context.
                     if let pin = try botStore.conversationContextPin(linkedTo: thread.id) {
                         guard pin.hostID == hostID, pin.context == .workspace(workspaceID),
@@ -613,7 +683,7 @@ public final class SidebarViewModel: ObservableObject {
                               try botStore.authorizes(hostID: hostID, botID: pin.botID, context: pin.context,
                                                       action: .read, policyRevision: pin.policyRevision) else { continue }
                     }
-                    rows.append(WorkspaceConversationRow(threadID: thread.id, workspaceID: workspaceID, title: thread.title, botID: thread.actor.botID))
+                    rows.append(WorkspaceConversationRow(threadID: thread.id, workspaceID: workspaceID, title: thread.title, botID: thread.actor.botID, updatedAt: thread.updatedAt))
                     if rows.count == workspaceConversationLimit { break }
                 }
                 conversations[workspaceID] = rows
@@ -683,6 +753,21 @@ public final class SidebarViewModel: ObservableObject {
         activeBotCountSink = botsViewModel.$activeBotCount.removeDuplicates().sink { [weak self] count in
             self?.activeBotCount = count
         }
+        runningBotsSink = botsViewModel.$liveRosterBotIDs.removeDuplicates().sink { [weak self] ids in
+            self?.runningBotIDs = ids
+        }
+        deskSelectionSink = Publishers.CombineLatest4(
+            $isBotsSelected, botsViewModel.$screen, botsViewModel.$selectedBotID, botsViewModel.$selectedConversation
+        ).sink { [weak self] isBots, screen, botID, conversation in
+            guard let self else { return }
+            let context = conversation.flatMap { try? self.context?.botStore.conversationContextPin(conversationID: $0.id)?.context }
+            let next = Self.deskSelection(isBotsSelected: isBots, screen: screen, botID: botID,
+                                          context: context, threadID: conversation?.linkedAgentThreadID)
+            if next != self.deskSelection {
+                self.deskSelection = next
+                self.reloadAuthorizedBotConversationRows()
+            }
+        }
         // Studio saves (name, avatar, pin, hide, delete) republish the roster.
         botRosterSink = botsViewModel.$bots.dropFirst().removeDuplicates().sink { [weak self] _ in
             self?.reloadAuthorizedBotConversationRows()
@@ -690,7 +775,7 @@ public final class SidebarViewModel: ObservableObject {
         // RPC changes (paired phone, Titio's rc_host_call, context grants) land on the event bus.
         if botEventSubscription == nil {
             botEventSubscription = EventBus.shared.subscribeFromCurrent(
-                filter: .kindPrefixes(["bot.created", "bot.deleted", "bot.updated", "bot.settings.updated", "bot.conversation.updated"])
+                filter: .kindPrefixes(["bot.created", "bot.deleted", "bot.updated", "bot.settings.updated", "bot.conversation.updated", "surface.updated"])
             ) { [weak self] _ in
                 Task { @MainActor [weak self] in self?.reloadAuthorizedBotConversationRows() }
             }.id
@@ -730,6 +815,32 @@ public final class SidebarViewModel: ObservableObject {
     public func setBotPinned(_ id: BotID, _ pinned: Bool) {
         router?.botsViewModel?.setPinned(id: id, pinned: pinned)
         reloadAuthorizedBotConversationRows()
+    }
+
+    /// Drops `dragged` just before `target` among the listed top-level Bots and persists the order.
+    /// With `inWorkspace`, the move applies to the full Bot order so workspace rows keep every other Bot's slot.
+    public func reorderBot(_ dragged: BotID, before target: BotID, inWorkspace: Bool = false) {
+        defer { draggingBotID = nil; dropTargetBotID = nil }
+        let current: [BotID]
+        if inWorkspace {
+            guard let all = try? context?.botStore.list(includeHidden: true) else { return }
+            current = BotOrdering.sorted(all).map(\.id)
+        } else {
+            current = generalBots.map(\.botID)
+        }
+        let ids = Self.reorderedBotIDs(current, moving: dragged, before: target)
+        guard ids != current else { return }
+        if let botsViewModel = router?.botsViewModel {
+            botsViewModel.reorderBots(orderedIDs: ids)
+        } else {
+            do { try context?.botStore.reorder(orderedIDs: ids) } catch { showOperationError("Could not reorder Bots", detail: error.localizedDescription) }
+        }
+        reloadAuthorizedBotConversationRows()
+    }
+
+    func botPinnedAndHidden(_ id: BotID) -> (pinned: Bool, hidden: Bool) {
+        guard let bot = try? context?.botStore.get(id: id) else { return (false, false) }
+        return (bot.pinned, bot.hidden)
     }
 
     public func setBotHidden(_ id: BotID, _ hidden: Bool) {
@@ -840,11 +951,9 @@ public final class SidebarViewModel: ObservableObject {
     public func reload() {
         guard let ctx = context else { return }
         let loaded = (try? router?.listWorkspaces()) ?? ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
-        // MRU: present the list ordered by most-recently-used so a workspace stays at
-        // the top after activity instead of snapping back to its prior slot. Derived
-        // from the durable per-workspace lastActivity timestamp, so it is immune to any
-        // transient window-order churn.
-        let ordered = LayoutReducer.mostRecentlyUsedOrder(loaded)
+        // The stored window order is the single order: pinned first, activity promotes
+        // within a group, and a drag reorder lands here. Re-sorting would undo the drop.
+        let ordered = loaded
         // Refresh the selection first so a workspace that completed AND became
         // selected this tick is correctly treated as "being viewed" (no dot).
         // While a shell destination owns the main content, keep every workspace
@@ -2724,34 +2833,6 @@ public struct SidebarRootView: View {
         return counts.newResults > 0 ? "New result" : ""
     }
 
-    // MARK: Row highlight helpers
-
-    private func rowHighlightColor(for tone: SidebarHighlightTone) -> Color {
-        switch tone {
-        case .workspaceColor(let hex):
-            return Color(hex: hex).opacity(0.22)
-        case .accent:
-            return DS.Palette.accent.opacity(0.22)
-        case .selection:
-            return DS.Palette.selection.opacity(0.75)
-        case .none:
-            return Color.white.opacity(0.001)
-        }
-    }
-
-    private func rowEdgeBarColor(for tone: SidebarHighlightTone) -> Color {
-        switch tone {
-        case .workspaceColor(let hex):
-            return Color(hex: hex)
-        case .accent:
-            return DS.Palette.accent
-        case .selection:
-            return DS.Palette.accent
-        case .none:
-            return Color.clear
-        }
-    }
-
     /// Leaving Bots content keeps drafts and asks before dropping an unsaved new Bot, from any sidebar row.
     private func navigate(_ action: @escaping () -> Void) {
         if vm.isBotsSelected, let botsVM { botsVM.leaveBots(then: action) } else { action() }
@@ -2763,24 +2844,47 @@ public struct SidebarRootView: View {
     }
 
     private func botConversationRow(_ row: SidebarViewModel.AuthorizedBotConversationRow) -> some View {
-        Button {
+        let selected = SidebarViewModel.isBotConversationSelected(botID: row.botID, context: row.context, in: vm.deskSelection)
+        let running = vm.runningBotIDs.contains(row.botID)
+        return Button {
             navigate { if row.conversationID == nil { vm.startBotConversation(row) } else { vm.openAuthorizedBotConversation(row) } }
         } label: {
             HStack(spacing: DS.Space.sm) {
-                BotsAvatarView(name: row.botName, handle: row.handle, symbol: row.symbol.isEmpty ? nil : row.symbol, size: 20)
+                BotsAvatarView(name: row.botName, handle: row.handle, symbol: row.symbol.isEmpty ? nil : row.symbol, size: 20, attention: running ? .working : .none)
                     .frame(width: 20, height: 20)
-                Text(BotsViewModel.displayName(row.botName)).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                Text(BotsViewModel.displayName(row.botName)).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary).lineLimit(1)
                 Spacer(minLength: 0)
+                if running { DSBusySpinner(label: "Running") }
             }
             .padding(.leading, DS.Space.lg)
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 30)
-            .contentShape(Rectangle())
+            .sidebarRowChrome(selected: selected)
+            .overlay(alignment: .top) {
+                if vm.dropTargetBotID == row.botID {
+                    Capsule().fill(DS.Palette.accent).frame(height: 2).padding(.horizontal, DS.Space.sm)
+                }
+            }
         }
         .buttonStyle(.plain)
+        .onDrag {
+            vm.draggingBotID = row.botID
+            return NSItemProvider(object: row.botID.value.uuidString as NSString)
+        }
+        .onDrop(of: [.text], delegate: BotDropDelegate(vm: vm, target: row.botID, inWorkspace: true))
         .help(searchHelp(type: "Bot", location: botContextLabel(row.context), name: row.conversationID == nil ? "\(row.botName): New conversation" : "\(row.botName), \(row.title)"))
         .accessibilityLabel("\(botContextLabel(row.context)), \(row.botName), \(row.title)")
+        .accessibilityValue(running ? "Running" : "")
         .accessibilityIdentifier("sidebar.botConversation.\(row.id)")
+        .contextMenu {
+            let state = vm.botPinnedAndHidden(row.botID)
+            Button(state.pinned ? "Unpin" : "Pin") { vm.setBotPinned(row.botID, !state.pinned) }
+            Button(state.hidden ? "Unhide" : "Hide") { vm.setBotHidden(row.botID, !state.hidden) }
+            Button("Edit in Studio") { navigate { vm.editBot(row.botID) } }
+            Button("Duplicate") { navigate { vm.duplicateBot(row.botID) } }
+            Divider()
+            Button("Delete", role: .destructive) { navigate { vm.requestDeleteBot(row.botID) } }
+        }
     }
 
     /// Bots: Titio pinned first, then general and unlinked Bots, in roster order.
@@ -2834,12 +2938,15 @@ public struct SidebarRootView: View {
     }
 
     private func generalBotRow(_ row: SidebarViewModel.GeneralBotRow) -> some View {
-        Button { navigate { vm.openGeneralBot(row) } } label: {
+        let selected = SidebarViewModel.isGeneralBotSelected(row.botID, in: vm.deskSelection)
+        let running = vm.runningBotIDs.contains(row.botID)
+        return Button { navigate { vm.openGeneralBot(row) } } label: {
             HStack(spacing: DS.Space.sm) {
-                BotsAvatarView(name: row.name, handle: row.handle, symbol: row.symbol, size: 20)
+                BotsAvatarView(name: row.name, handle: row.handle, symbol: row.symbol, size: 20, attention: running ? .working : .none)
                     .frame(width: 20, height: 20)
-                Text(BotsViewModel.displayName(row.name)).font(DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
+                Text(BotsViewModel.displayName(row.name)).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
                 Spacer(minLength: 0)
+                if running { DSBusySpinner(label: "Running") }
                 if row.hidden {
                     Image(systemName: "eye.slash")
                         .font(.system(size: 9, weight: .semibold))
@@ -2855,12 +2962,22 @@ public struct SidebarRootView: View {
             }
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 34)
-            .contentShape(Rectangle())
+            .sidebarRowChrome(selected: selected)
+            .overlay(alignment: .top) {
+                if vm.dropTargetBotID == row.botID {
+                    Capsule().fill(DS.Palette.accent).frame(height: 2).padding(.horizontal, DS.Space.sm)
+                }
+            }
         }
         .buttonStyle(.plain)
+        .onDrag {
+            vm.draggingBotID = row.botID
+            return NSItemProvider(object: row.botID.value.uuidString as NSString)
+        }
+        .onDrop(of: [.text], delegate: BotDropDelegate(vm: vm, target: row.botID))
         .help(searchHelp(type: "General Bot", location: "General", name: row.name))
         .accessibilityLabel(BotsViewModel.displayName(row.name))
-        .accessibilityValue("\(row.pinned ? "Pinned. " : "")\(row.hidden ? "Hidden. " : "")General Bot")
+        .accessibilityValue("\(running ? "Running. " : "")\(row.pinned ? "Pinned. " : "")\(row.hidden ? "Hidden. " : "")General Bot")
         .accessibilityIdentifier("sidebar.generalBot.\(row.handle)")
         .contextMenu {
             Button(row.pinned ? "Unpin" : "Pin") { vm.setBotPinned(row.botID, !row.pinned) }
@@ -2934,27 +3051,36 @@ public struct SidebarRootView: View {
             .help("Start a new conversation in \(ws.name)")
             .accessibilityIdentifier("sidebar.newConversation.\(ws.id.value.uuidString)")
         }
-        ForEach(vm.workspaceConversationRows(ws.id)) { workspaceConversationRow($0, workspace: ws) }
+        let conversations = vm.workspaceConversationRows(ws.id)
+        let ages = SidebarViewModel.duplicateTitleAges(conversations, now: Date())
+        ForEach(conversations) { workspaceConversationRow($0, workspace: ws, age: ages[$0.id]) }
     }
 
-    private func workspaceConversationRow(_ row: SidebarViewModel.WorkspaceConversationRow, workspace: Workspace) -> some View {
-        Button { navigate { vm.openWorkspaceConversation(row) } } label: {
+    private func workspaceConversationRow(_ row: SidebarViewModel.WorkspaceConversationRow, workspace: Workspace, age: String?) -> some View {
+        let selected = vm.selectedThreadID == row.threadID || vm.deskSelection?.threadID == row.threadID
+        let running = vm.runningThreadIDs.contains(row.threadID)
+        return Button { navigate { vm.openWorkspaceConversation(row) } } label: {
             HStack(spacing: DS.Space.sm) {
                 Image(systemName: row.botID == nil ? "bubble.left" : "sparkle")
                     .font(.system(size: 11, weight: .regular))
                     .frame(width: 20, height: 20)
                     .foregroundColor(DS.Palette.textTertiary)
-                Text(row.title).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                Text(AgentThreadTitle.display(row.title)).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary).lineLimit(1)
+                if let age {
+                    Text("· \(age)").font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1).fixedSize()
+                }
                 Spacer(minLength: 0)
+                if running { DSBusySpinner(label: "Running") }
             }
             .padding(.leading, DS.Space.lg)
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 30)
-            .contentShape(Rectangle())
+            .sidebarRowChrome(selected: selected)
         }
         .buttonStyle(.plain)
         .help(searchHelp(type: "Conversation", location: workspace.name, name: row.title))
-        .accessibilityLabel("\(workspace.name), \(row.title)")
+        .accessibilityLabel("\(workspace.name), \(row.title)\(age.map { ", updated \($0)" } ?? "")")
+        .accessibilityValue(running ? "Running" : "")
         .accessibilityIdentifier("sidebar.conversation.\(row.id)")
     }
 
@@ -3039,23 +3165,7 @@ public struct SidebarRootView: View {
                        value: vm.completedWorkspaces.contains(ws.id))
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 38)
-            .background(
-                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .fill(rowHighlightColor(for: highlightTone))
-            )
-            .overlay(alignment: .leading) {
-                // Left-edge bar: visible only when row is selected (single or checked).
-                // Uses workspace color when available, accent as fallback.
-                if highlightTone != .none {
-                    rowEdgeBarColor(for: highlightTone)
-                        .frame(width: 3)
-                        .clipShape(
-                            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                        )
-                        .padding(.vertical, 5)
-                }
-            }
-            .contentShape(Rectangle())
+            .sidebarRowChrome(selected: selected || checked, tone: highlightTone)
             .overlay(alignment: .top) {
                 if vm.dropTargetWorkspaceID == ws.id {
                     Capsule()
@@ -3198,6 +3308,76 @@ private struct TabColorMenuLabel: View {
         image.isTemplate = false
         return image
     }
+}
+
+/// One selected/hover look for every sidebar row: tone fill plus the 3pt edge bar.
+private struct SidebarRowChrome: ViewModifier {
+    let tone: SidebarHighlightTone
+    let selected: Bool
+    @State private var hovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                    .fill(Self.fill(tone, hovering: hovering))
+            )
+            .overlay(alignment: .leading) {
+                if tone != .none {
+                    Self.bar(tone)
+                        .frame(width: 3)
+                        .clipShape(RoundedRectangle(cornerRadius: 1.5, style: .continuous))
+                        .padding(.vertical, 5)
+                }
+            }
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+            .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    static func fill(_ tone: SidebarHighlightTone, hovering: Bool) -> Color {
+        switch tone {
+        case .workspaceColor(let hex): return Color(hex: hex).opacity(0.22)
+        case .accent: return DS.Palette.accent.opacity(0.22)
+        case .selection: return DS.Palette.selection.opacity(0.75)
+        case .none: return hovering ? DS.Palette.selection.opacity(0.35) : Color.white.opacity(0.001)
+        }
+    }
+
+    static func bar(_ tone: SidebarHighlightTone) -> Color {
+        switch tone {
+        case .workspaceColor(let hex): return Color(hex: hex)
+        case .accent, .selection: return DS.Palette.accent
+        case .none: return Color.clear
+        }
+    }
+}
+
+private extension View {
+    func sidebarRowChrome(selected: Bool, tone: SidebarHighlightTone? = nil) -> some View {
+        modifier(SidebarRowChrome(tone: tone ?? (selected ? .selection : .none), selected: selected))
+    }
+}
+
+private struct BotDropDelegate: DropDelegate {
+    @ObservedObject var vm: SidebarViewModel
+    let target: BotID
+    var inWorkspace = false
+
+    func dropEntered(info: DropInfo) {
+        vm.dropTargetBotID = (vm.draggingBotID != nil && vm.draggingBotID != target) ? target : nil
+    }
+
+    func dropExited(info: DropInfo) {
+        if vm.dropTargetBotID == target { vm.dropTargetBotID = nil }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        if let dragged = vm.draggingBotID { vm.reorderBot(dragged, before: target, inWorkspace: inWorkspace) }
+        return true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
 }
 
 private struct WorkspaceDropDelegate: DropDelegate {

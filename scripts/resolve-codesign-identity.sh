@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Resolve a codesign identity for local RemoteCode.app packaging.
+# Resolve a codesign identity for local MacCode.app packaging.
 #
 # WHY: Ad-hoc signatures (`codesign --sign -`) bind macOS TCC (Files & Folders /
 # Network Volumes) to a CDHash that changes whenever the app payload changes.

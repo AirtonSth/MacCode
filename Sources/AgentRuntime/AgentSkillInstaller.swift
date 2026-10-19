@@ -1284,7 +1284,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             return false
         }
         let path = destination.path
-        return path.contains("/RemoteCode.app/Contents/MacOS/")
+        return path.contains("/MacCode.app/Contents/MacOS/")
+            || path.contains("/RemoteCode.app/Contents/MacOS/")
             || isRemoteCodeAppBundleService(destination)
             || path.contains("/.build/")
             || path.contains("/Build/Products/")
@@ -1293,7 +1294,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     }
 
     /// Development and canary builds may use a product name other than
-    /// `RemoteCode.app`. The bundle identifier is the stable ownership marker;
+    /// `MacCode.app`. The bundle identifier is the stable ownership marker;
     /// relying on the product name stranded managed aliases on an older build.
     private func isRemoteCodeAppBundleService(_ destination: URL) -> Bool {
         let macOSDirectory = destination.deletingLastPathComponent()
@@ -1984,7 +1985,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             break
         }
 
-        // Both RemoteCode.app and the scheduled-task LaunchAgent reconcile at
+        // Both MacCode.app and the scheduled-task LaunchAgent reconcile at
         // login; the loser of that race can fail the staging/move below after
         // the winner installed the identical pinned package. Losing is success:
         // re-inspect and report .skipped instead of surfacing a session-long
