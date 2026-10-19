@@ -427,6 +427,17 @@ public final class SidebarViewModel: ObservableObject {
         items.filter { $0.type != .browser && isBusy($0) }
     }
 
+    /// The tab on screen in the selected workspace's focused pane; drives which sidebar row is selected.
+    func visibleTab(in ws: Workspace) -> SurfaceDescriptor? {
+        guard !isBotsSelected, selectedWorkspaceID == ws.id else { return nil }
+        return Self.visibleTab(in: ws)
+    }
+
+    nonisolated static func visibleTab(in ws: Workspace) -> SurfaceDescriptor? {
+        guard let pane = (ws.focusedPaneID ?? ws.layout.paneIDs().first).flatMap(ws.layout.find(paneID:)) else { return nil }
+        return pane.surfaces.first { $0.id == pane.selectedSurfaceID }
+    }
+
     func openActiveSurface(_ item: ActiveSurfaceItem) {
         router?.windowController?.presentWorkspaceContent()
         try? router?.selectWorkspace(item.workspaceID)
@@ -3194,7 +3205,8 @@ public struct SidebarRootView: View {
     private func workspaceChildren(_ ws: Workspace) -> some View {
         if let tabs = vm.activeSurfaceRows[ws.id], !tabs.isEmpty {
             workspaceSectionHeader("Open Tabs", id: "sidebar.workspaceOpenTabs.\(ws.id.value.uuidString)")
-            ForEach(tabs) { activeSurfaceRow($0) }
+            let visible = vm.visibleTab(in: ws)?.id
+            ForEach(tabs) { activeSurfaceRow($0, selected: $0.surfaceID == visible) }
         }
         if vm.showsAddBot(ws.id) || !vm.workspaceBotRows(ws.id).isEmpty {
             workspaceSectionHeader("Bots", id: "sidebar.workspaceBots.\(ws.id.value.uuidString)")
@@ -3269,7 +3281,7 @@ public struct SidebarRootView: View {
         }
     }
 
-    private func activeSurfaceRow(_ item: ActiveSurfaceItem) -> some View {
+    private func activeSurfaceRow(_ item: ActiveSurfaceItem, selected: Bool) -> some View {
         let busy = vm.busySurfaceIDs.contains(item.surfaceID)
         return Button { navigate { vm.openActiveSurface(item) } } label: {
             HStack(spacing: DS.Space.sm) {
@@ -3277,15 +3289,15 @@ public struct SidebarRootView: View {
                     .font(.system(size: 11, weight: .regular))
                     .frame(width: 20, height: 20)
                     .foregroundColor(DS.Palette.textTertiary)
-                Text(item.title).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                Text(item.title).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary).lineLimit(1)
                 Spacer(minLength: 0)
                 if busy { DSBusySpinner(label: "Running") }
             }
             .padding(.leading, DS.Space.lg)
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 30)
-            .background(busy ? RoundedRectangle(cornerRadius: DS.Radius.control).fill(DS.Palette.text.opacity(0.06)) : nil)
-            .contentShape(Rectangle())
+            .background(busy && !selected ? RoundedRectangle(cornerRadius: DS.Radius.control).fill(DS.Palette.text.opacity(0.06)) : nil)
+            .sidebarRowChrome(selected: selected)
         }
         .buttonStyle(.plain)
         .help("Open \(item.title)")
@@ -3315,7 +3327,9 @@ public struct SidebarRootView: View {
     }
 
     private func workspaceConversationRow(_ row: SidebarViewModel.WorkspaceConversationRow, workspace: Workspace, age: String?) -> some View {
-        let selected = vm.selectedThreadID == row.threadID || vm.deskSelection?.threadID == row.threadID
+        // A non-Agent tab on screen (Files, Terminal, ...) owns the selection, not the Agent App's thread.
+        let tabOnScreen = vm.visibleTab(in: workspace).map { $0.type != .agentApp } ?? false
+        let selected = (!tabOnScreen && vm.selectedThreadID == row.threadID) || vm.deskSelection?.threadID == row.threadID
         let running = vm.runningThreadIDs.contains(row.threadID)
         return Button { navigate { vm.openWorkspaceConversation(row) } } label: {
             HStack(spacing: DS.Space.sm) {

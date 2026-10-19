@@ -45,3 +45,16 @@ final class SidebarActiveSurfaceRowsTests: XCTestCase {
         XCTAssertEqual(spinning.map(\.surfaceID), [terminal.surfaceID, ssh.surfaceID])
     }
 }
+
+/// The sidebar marks the tab the user is looking at; with Files on screen the Files row
+/// is selected instead of the Agent App's last conversation.
+final class SidebarVisibleTabTests: XCTestCase {
+    func test_visibleTabIsFocusedPaneSelection() {
+        let files = SurfaceDescriptor(type: .files, title: "Files")
+        let agent = SurfaceDescriptor(type: .agentApp, title: "Agent App")
+        var pane = PaneNode(surfaces: [files, agent])
+        pane.selectedSurfaceID = files.id
+        let ws = Workspace(name: "elephant", cwd: "/tmp", layout: .pane(pane), focusedPaneID: pane.id)
+        XCTAssertEqual(SidebarViewModel.visibleTab(in: ws)?.id, files.id)
+    }
+}
