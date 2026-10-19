@@ -856,7 +856,7 @@ struct ActivityRootView: View {
             if let status = model.batchStatus { statusStrip(status).transition(.opacity) }
         }
         .animation(DS.Motion.micro, value: model.batchStatus != nil)
-        .frame(minWidth: 540, minHeight: 420)
+        .frame(minWidth: 320, minHeight: 420)
         .background(DS.Palette.bg)
         .onAppear {
             if let route { apply(route) }
@@ -902,28 +902,43 @@ struct ActivityRootView: View {
                     if model.loading || model.batchRunning { DSBusySpinner(label: "Updating activity", identifier: "activity.busy") }
                 }.frame(width: 16, height: 16)
             }
-            HStack(spacing: DS.Space.md) {
-                SidebarSearchField(placeholder: "Search title or summary", text: $model.search, focusRequest: $searchFocusRequest, accessibilityIdentifier: "activity.search")
-                    .frame(minWidth: 160, maxWidth: 420)
-                Picker("Workspace", selection: $model.workspaceID) {
-                    Text("All workspaces").tag("")
-                    ForEach(workspaces, id: \.id) { workspace in Text(workspace.name).tag(workspace.id) }
-                }.labelsHidden().frame(width: 170)
-                Picker("Period", selection: $model.period) {
-                    ForEach(ActivityViewModel.Period.allCases) { period in Text(period.title).tag(period) }
-                }.labelsHidden().frame(width: 145)
-                if model.tab == .finished {
-                    Picker("Outcome", selection: $model.outcome) {
-                        Text("All outcomes").tag("")
-                        Text("Completed").tag("completed")
-                        Text("Failed").tag("failed")
-                        Text("Interrupted").tag("interrupted")
-                        Text("Stopped by you").tag("stopped")
-                    }.labelsHidden().frame(width: 150)
+            // Wide panes keep one filter row; narrow ones put search on its own line and let the pickers share the next.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: DS.Space.md) {
+                    searchField.frame(minWidth: 160, maxWidth: 420)
+                    filterPickers(fixedWidths: true)
+                    Spacer(minLength: 0)
                 }
-                Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: DS.Space.sm) {
+                    searchField.frame(maxWidth: .infinity)
+                    HStack(spacing: DS.Space.sm) { filterPickers(fixedWidths: false) }
+                }
             }
         }.padding(.horizontal, DS.Space.xl).padding(.top, DS.Space.xl).padding(.bottom, DS.Space.lg)
+    }
+
+    private var searchField: some View {
+        SidebarSearchField(placeholder: "Search title or summary", text: $model.search, focusRequest: $searchFocusRequest, accessibilityIdentifier: "activity.search")
+    }
+
+    @ViewBuilder
+    private func filterPickers(fixedWidths: Bool) -> some View {
+        Picker("Workspace", selection: $model.workspaceID) {
+            Text("All workspaces").tag("")
+            ForEach(workspaces, id: \.id) { workspace in Text(workspace.name).tag(workspace.id) }
+        }.labelsHidden().frame(width: fixedWidths ? 170 : nil).frame(minWidth: 0, maxWidth: fixedWidths ? nil : .infinity)
+        Picker("Period", selection: $model.period) {
+            ForEach(ActivityViewModel.Period.allCases) { period in Text(period.title).tag(period) }
+        }.labelsHidden().frame(width: fixedWidths ? 145 : nil).frame(minWidth: 0, maxWidth: fixedWidths ? nil : .infinity)
+        if model.tab == .finished {
+            Picker("Outcome", selection: $model.outcome) {
+                Text("All outcomes").tag("")
+                Text("Completed").tag("completed")
+                Text("Failed").tag("failed")
+                Text("Interrupted").tag("interrupted")
+                Text("Stopped by you").tag("stopped")
+            }.labelsHidden().frame(width: fixedWidths ? 150 : nil).frame(minWidth: 0, maxWidth: fixedWidths ? nil : .infinity)
+        }
     }
 
     private var tabBar: some View {
@@ -931,7 +946,8 @@ struct ActivityRootView: View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: DS.Space.sm) { tabs; Spacer(minLength: DS.Space.lg); bulkActions }
             VStack(alignment: .leading, spacing: DS.Space.md) {
-                HStack(spacing: DS.Space.sm) { tabs }
+                // Narrowest panes scroll the tab chips instead of clipping them.
+                ScrollView(.horizontal, showsIndicators: false) { HStack(spacing: DS.Space.sm) { tabs } }
                 HStack(spacing: DS.Space.sm) { bulkActions }
             }
         }

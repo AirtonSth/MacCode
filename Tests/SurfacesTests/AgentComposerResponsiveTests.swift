@@ -17,8 +17,12 @@ final class AgentComposerResponsiveTests: XCTestCase {
             onSend: {}, onStop: {}, onAttach: { _ in }, onRemoveAttachment: { _ in },
             composerIdentifier: "c", sendIdentifier: "s", leadingControls: chips
         )
-        let size = NSHostingController(rootView: bar).sizeThatFits(in: CGSize(width: 360, height: 400))
-        XCTAssertLessThanOrEqual(size.width, 361,
-            "a long control row must scroll inside the composer, not widen it past its pane")
+        // Same bar hosts the Bots Desk footer (run-as, models, fixed-size Ultracode, permission).
+        let controller = NSHostingController(rootView: bar)
+        for width in [320.0, 360.0, 500.0, 900.0] {
+            let size = controller.sizeThatFits(in: CGSize(width: width, height: 400))
+            XCTAssertLessThanOrEqual(size.width, width + 1,
+                "a long control row must scroll inside the composer, not widen a \(Int(width)) pt pane")
+        }
     }
 }
