@@ -44,12 +44,12 @@ final class SidebarAuthorizedBotConversationTests: XCTestCase {
         XCTAssertEqual(try AppCommandRouter.contextPinnedThreadDestination(thread.id, context: context), .bot(linked.id, conversation.id), "the row must resolve to its exact pinned Bot conversation")
         let botsViewModel = BotsViewModel(context: context, router: router)
         router.botsViewModel = botsViewModel
-        for targetRow in viewModel.authorizedBotConversationRows {
-            viewModel.openAuthorizedBotConversation(targetRow)
-            XCTAssertEqual(botsViewModel.selectedBotID, linked.id)
-            XCTAssertEqual(botsViewModel.selectedConversation?.id, targetRow.conversationID)
-            XCTAssertEqual(botsViewModel.selectedPinnedContextLabel, targetRow.context == .general ? "General" : workspace.name)
-        }
+        // Only a General Bot opens its Desk; a workspace Bot opens as a workspace tab (SidebarUnifiedNavigationTests).
+        let generalRow = try XCTUnwrap(viewModel.authorizedBotConversationRows.first(where: { $0.context == .general }))
+        viewModel.openAuthorizedBotConversation(generalRow)
+        XCTAssertEqual(botsViewModel.selectedBotID, linked.id)
+        XCTAssertEqual(botsViewModel.selectedConversation?.id, generalRow.conversationID)
+        XCTAssertEqual(botsViewModel.selectedPinnedContextLabel, "General")
         XCTAssertFalse(viewModel.authorizedBotConversationRows.contains(where: { $0.botID == implicit.id || $0.botID == sendOnly.id }), "legacy workspace metadata and send-only grants must not authorize sidebar links")
     }
 

@@ -272,11 +272,15 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         let surface = try XCTUnwrap(SurfaceRegistry.shared.all().compactMap { $0 as? AgentAppSurface }.first { $0.viewModel.workspaceID == workspace.id })
         XCTAssertEqual(surface.viewModel.selectedThreadId, plain.id, "a plain conversation opens its exact thread in the Agent App")
 
-        let botsVM = controller.sidebarBotsViewModelForTesting
         vm.openWorkspaceConversation(botRow)
-        XCTAssertTrue(controller.isShowingBotsContent)
-        XCTAssertEqual(botsVM.selectedBotID, bot.id)
-        XCTAssertEqual(botsVM.selectedConversation?.id, conversation.id, "a Bot conversation opens its exact Desk conversation")
+        XCTAssertFalse(controller.isShowingBotsContent, "a workspace Bot conversation stays in its workspace")
+        XCTAssertEqual(surface.viewModel.selectedThreadId, botThread.id, "a workspace Bot conversation opens as a workspace tab")
+
+        let botLinkRow = try XCTUnwrap(vm.workspaceBotRows(workspace.id).first)
+        vm.openWorkspaceConversation(plainRow)
+        vm.openAuthorizedBotConversation(botLinkRow)
+        XCTAssertFalse(controller.isShowingBotsContent, "the workspace Bot row opens as a workspace tab, not the Bots Desk")
+        XCTAssertEqual(surface.viewModel.selectedThreadId, botThread.id)
 
         let botLink = try XCTUnwrap(vm.workspaceBotRows(workspace.id).first)
         XCTAssertEqual(botLink.conversationID, conversation.id, "the Bot row resumes its recent contextual conversation")

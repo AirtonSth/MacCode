@@ -1066,6 +1066,7 @@ public final class SidebarViewModel: ObservableObject {
 
     /// The empty state of a linked Bot: start a conversation pinned to that workspace.
     public func startBotConversation(_ row: AuthorizedBotConversationRow) {
+        if case .workspace = row.context { return startWorkspaceBotConversation(row) }
         do {
             guard let router, try router.openBotsDesk(botID: row.botID),
                   let botsViewModel = router.botsViewModel,
@@ -1076,6 +1077,27 @@ public final class SidebarViewModel: ObservableObject {
             reloadAuthorizedBotConversationRows()
         } catch {
             showOperationError("Could not start conversation", detail: error.localizedDescription)
+        }
+    }
+
+    /// A workspace Bot's new conversation keeps the Desk's contextual grant checks but
+    /// opens as an Agent App tab of that workspace instead of switching to Bots.
+    private func startWorkspaceBotConversation(_ row: AuthorizedBotConversationRow) {
+        do {
+            guard let router, let context, let botsViewModel = router.botsViewModel,
+                  let bot = try context.botStore.get(id: row.botID) else {
+                throw BotsViewModel.BotDeskSendRefused(reason: "This Bot context is no longer available.")
+            }
+            botsViewModel.openDesk(bot)
+            guard botsViewModel.createDeskThread(in: row.context),
+                  let threadID = botsViewModel.selectedConversation?.linkedAgentThreadID else {
+                throw BotsViewModel.BotDeskSendRefused(reason: botsViewModel.errorMessage ?? "This Bot context is no longer available.")
+            }
+            _ = try router.openAgentThread(thread: threadID, markRead: false)
+            reloadAuthorizedBotConversationRows()
+        } catch {
+            showOperationError("Could not start conversation", detail: error.localizedDescription)
+            reloadAuthorizedBotConversationRows()
         }
     }
 
@@ -1095,11 +1117,8 @@ public final class SidebarViewModel: ObservableObject {
         guard let router else { return }
         do {
             switch try router.agentThreadOpenDestination(row.threadID) {
-            case .bot(let botID, let conversationID):
-                guard try router.openBotsDesk(botID: botID, conversationID: conversationID) else {
-                    throw LayoutError.surfaceNotFound
-                }
-            case .workspace:
+            case .bot, .workspace:
+                // Every row here belongs to this workspace, Bot threads included: open it as a tab.
                 _ = try router.openAgentThread(thread: row.threadID, markRead: false)
             case .unavailable:
                 showOperationError("Could not open conversation", detail: "This conversation is no longer available.")
@@ -1126,7 +1145,7 @@ public final class SidebarViewModel: ObservableObject {
                   let threadID = conversation.linkedAgentThreadID,
                   try AppCommandRouter.contextPinnedThreadDestination(threadID, context: context)
                     == .bot(row.botID, conversationID),
-                  try router.openBotsDesk(botID: row.botID, conversationID: conversationID) else {
+                  try Self.openBotThread(threadID, botID: row.botID, conversationID: conversationID, context: row.context, router: router) else {
                 showOperationError("Could not open Bot conversation", detail: "This Bot context is no longer available.")
                 reloadAuthorizedBotConversationRows()
                 return
@@ -1135,6 +1154,12 @@ public final class SidebarViewModel: ObservableObject {
             showOperationError("Could not open Bot conversation", detail: error.localizedDescription)
             reloadAuthorizedBotConversationRows()
         }
+    }
+
+    /// General Bots live in the Bots Desk; a workspace Bot's thread opens as a tab of its workspace.
+    private static func openBotThread(_ threadID: AgentThreadID, botID: BotID, conversationID: BotConversationID, context: BotContext, router: AppCommandRouter) throws -> Bool {
+        guard case .workspace = context else { return try router.openBotsDesk(botID: botID, conversationID: conversationID) }
+        return try router.openAgentThread(thread: threadID, markRead: false).type == .agentApp
     }
 
     private func saveExpandedConversationWorkspaces() {
