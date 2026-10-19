@@ -13,6 +13,8 @@ final class ActivityService: @unchecked Sendable {
     private let workspaceNames: [WorkspaceID: String]
     private let activeRunIDProvider: (AgentThreadID) -> AgentRunID?
     private let registeredScripts: [AgentActivityItem]
+    /// Live terminal and SSH tabs with a busy foreground job; never persisted.
+    private let busySurfaces: [AgentActivityItem]
 
     @MainActor
     init(context: AppContext, activeRunIDProvider: ((AgentThreadID) -> AgentRunID?)? = nil) {
@@ -31,7 +33,11 @@ final class ActivityService: @unchecked Sendable {
                 workspaceName: context.state.workspaces[script.workspaceID]?.name, occurredAt: script.startedAt, startedAt: script.startedAt
             )
         }
-
+        busySurfaces = Self.busySurfaceItems(
+            ActiveSurfaceProjector.currentItems(context: context),
+            excluding: Set(registeredScripts.compactMap(\.surfaceID)),
+            now: Date()
+        )
     }
 
     /// Database-only seam for parity tests and benches over a copy of real data.
@@ -41,6 +47,23 @@ final class ActivityService: @unchecked Sendable {
         workspaceNames = [:]
         self.activeRunIDProvider = activeRunIDProvider
         registeredScripts = []
+        busySurfaces = []
+    }
+
+    /// Busy terminal and SSH tabs count as running work. Project-script tabs already
+    /// have their own row, and browser/diff loading is not user work.
+    static func busySurfaceItems(_ surfaces: [ActiveSurfaceItem], excluding scriptSurfaceIDs: Set<UUID>, now: Date) -> [AgentActivityItem] {
+        surfaces
+            .filter { ($0.type == .terminal || $0.type == .ssh) && !scriptSurfaceIDs.contains($0.surfaceID.value) }
+            .map { surface in
+                let label = surface.type == .ssh ? "SSH" : "Terminal"
+                return AgentActivityItem(
+                    id: "surface:\(surface.surfaceID.value.uuidString)", kind: .operation,
+                    workspaceID: surface.workspaceID.value, surfaceID: surface.surfaceID.value, state: .running,
+                    title: PetAttentionRedactor.safeContextLabel(surface.title) ?? label,
+                    workspaceName: surface.workspaceName, occurredAt: now, originLabel: label
+                )
+            }
     }
 
     func list(_ params: [String: JSONValue]) throws -> JSONValue {
@@ -198,6 +221,7 @@ final class ActivityService: @unchecked Sendable {
         }
 
         items.append(contentsOf: registeredScripts)
+        items.append(contentsOf: busySurfaces)
         items.append(contentsOf: origins.botRequests)
         items.append(contentsOf: origins.scheduledOccurrences)
         return items.filter { $0.occurredAt <= snapshotAt && filter.matches($0) }

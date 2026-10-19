@@ -269,7 +269,7 @@ final class ActivityViewModel: ObservableObject {
 
     private func subscribeToActivityInvalidations() {
         eventSubscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { [weak self] event in
-            guard ["notification.created", "notification.read", "notification.dismissed", "bots.attention.changed", "bot.attention.updated", "bot.scheduler.updated", "operation.updated", "agent.run.started", "agent.run.completed", "agent.run.failed", "agent.run.finished", "agent.run.cancelled", "agent.request.opened", "agent.request.resolved", "agent.user_input.requested", "agent.user_input.resolved"].contains(event.kind) else { return }
+            guard ["notification.created", "notification.read", "notification.dismissed", "bots.attention.changed", "bot.attention.updated", "bot.scheduler.updated", "operation.updated", "surface.updated", "agent.run.started", "agent.run.completed", "agent.run.failed", "agent.run.finished", "agent.run.cancelled", "agent.request.opened", "agent.request.resolved", "agent.user_input.requested", "agent.user_input.resolved"].contains(event.kind) else { return }
             Task { @MainActor [weak self] in self?.scheduleInvalidationRefresh() }
         }
     }
