@@ -1721,7 +1721,7 @@ final class BotComputerGuestServiceTests: XCTestCase {
             botID: botID, threadID: AgentThreadID(), workspace: nil, registeredWorkspaces: []
         )) { error in
             XCTAssertEqual(String(describing: error),
-                           "VM indisponível: the bot's Linux image lacks git, wmctrl. "
+                           "VM unavailable: the bot's Linux image lacks git, wmctrl. "
                            + "Add them to the bot's Dockerfile, or restore the default one, and rebuild.")
         }
         XCTAssertEqual(fake.lastExec?.user, BotComputerGuestSpec.agentUser, "probed as the user the agent runs as")

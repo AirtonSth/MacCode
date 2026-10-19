@@ -55,6 +55,11 @@ The user's running MacCode (`io.remotecode.desktop`) is off-limits. A git worktr
 - Reusing components is welcome and encouraged when it is done well. If two surfaces already show the same control (composer chips, popovers, bubbles, live-turn chrome, queued header), extract one component and mount it from both. Do not copy a second SwiftUI implementation just because the caller lives in another file.
 - "Well done" means the shared type owns the real look, copy, a11y, and behavior — not a lookalike fork, and not a wrapper that still paints its own capsule. Different products stay different (Desk editor placeholder, workspace-less Local execution, bot @mentions). Same control must stay one component.
 
+## Schedule Tasks parity (mandatory)
+
+- Every change to the Agent App or to Bots must also land in Schedule Tasks in the same change. If a new message can set it (run as user/Bot, model, efforts, Auto profile, Ultracode, permission, plan mode, Local/Worktree execution, and anything added later), the scheduled task editor must be able to set it, persist it, and apply it when the run fires — for both workspace tasks and Bot schedules.
+- Schedule Tasks has one "New Task" entry point; choosing a Bot in "Run as" turns the draft into a Bot schedule. Do not add a second creation button.
+
 ## Token Saver removed (2026-10-06)
 
 - Token Saver was removed on 2026-10-06; do not reintroduce Distill compression, PATH wrappers, dialect injection, Graphify or the librarian without an owner decision.

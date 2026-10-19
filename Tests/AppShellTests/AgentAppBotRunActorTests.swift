@@ -276,7 +276,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         try f.ctx.botStore.delete(id: f.bot.id)
         f.vm.prompt = "anyone there?"
         await f.vm.send()
-        XCTAssertEqual(f.vm.statusMessage, "Bot Quinn foi apagado. Use \"Continuar sem bot\".")
+        XCTAssertEqual(f.vm.statusMessage, "Bot Quinn has been deleted. Use \"Continue without bot\".")
         try await Task.sleep(nanoseconds: 200_000_000)
         XCTAssertTrue(f.runner.requests.isEmpty, "a deleted bot must not run")
         let stored = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
@@ -306,7 +306,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertTrue(f.vm.selectedThreadBotUnavailable, "banner shows once the bot is gone")
         f.vm.prompt = "still there?"
         await f.vm.send()
-        XCTAssertEqual(f.vm.statusMessage, "Bot Quinn foi apagado. Use \"Continuar sem bot\".")
+        XCTAssertEqual(f.vm.statusMessage, "Bot Quinn has been deleted. Use \"Continue without bot\".")
         try await Task.sleep(nanoseconds: 200_000_000)
         XCTAssertEqual(f.runner.requests.count, 1, "no second run for a deleted bot")
     }

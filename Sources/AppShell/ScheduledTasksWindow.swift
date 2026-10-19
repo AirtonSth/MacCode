@@ -30,6 +30,11 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
     public var distillMainEffortSelection: AgentEffortSelection?
     public var distillReasoningEffortSelection: AgentEffortSelection?
     public var routingMode: AgentRoutingMode
+    public var distillUltracode: Bool
+    public var permissionMode: AgentPermissionMode
+    public var interactionMode: AgentInteractionMode
+    public var executionMode: AgentExecutionMode
+    public var baseBranch: String
     public var frequencyRules: [ScheduledFrequencyRule]
     public var timeZoneIdentifier: String
     public var isEnabled: Bool
@@ -51,6 +56,11 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         distillMainEffortSelection = task?.distillMainEffortSelection
         distillReasoningEffortSelection = task?.distillReasoningEffortSelection
         routingMode = provider == .distill ? .manual : (task?.effectiveRoutingMode ?? .auto)
+        distillUltracode = task?.distillUltracode ?? false
+        permissionMode = task?.permissionMode ?? .fullAccess
+        interactionMode = task?.interactionMode ?? .default
+        executionMode = task?.executionMode ?? .local
+        baseBranch = task?.baseBranch ?? ""
         timeZoneIdentifier = task?.timeZoneIdentifier ?? TimeZone.current.identifier
         isEnabled = task?.isEnabled ?? true
         if let recurrence = task?.recurrence {
@@ -97,6 +107,11 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
             distillReasoningEffortSelection: provider == .distill
                 ? (distillReasoningEffortSelection ?? .automatic) : nil,
             routingMode: provider == .distill ? .manual : routingMode,
+            distillUltracode: provider == .distill && distillUltracode,
+            permissionMode: interactionMode == .plan ? .supervised : permissionMode,
+            interactionMode: interactionMode,
+            executionMode: executionMode,
+            baseBranch: executionMode == .worktree ? baseBranch.trimmingCharacters(in: .whitespacesAndNewlines) : nil,
             recurrence: recurrence,
             timeZoneIdentifier: timeZoneIdentifier,
             isEnabled: isEnabled,
@@ -731,6 +746,7 @@ public struct ScheduledTasksRootView: View {
                         ScheduledTaskEditorView(
                             draft: draft,
                             vm: vm,
+                            botsVM: botsVM,
                             onBack: { closeEditor(cancel: true) },
                             onCancel: { closeEditor(cancel: true) },
                             onSave: { vm.saveEditor($0) }
@@ -923,14 +939,6 @@ public struct ScheduledTasksRootView: View {
         }
         .buttonStyle(DSPrimaryButtonStyle())
         .accessibilityIdentifier("scheduledTasks.new")
-
-        if let botsVM {
-            Button { botsVM.createScheduleTask() } label: {
-                Label("New Bot Task", systemImage: "plus").lineLimit(1).fixedSize()
-            }
-            .buttonStyle(DSSecondaryButtonStyle())
-            .accessibilityIdentifier("scheduledTasks.newBot")
-        }
 
         schedulerActiveControl
     }
@@ -1480,6 +1488,8 @@ private struct ScheduledTaskEditorView: View {
     @State private var showSourceOptions = false
     @State private var showModelOptions = false
     @ObservedObject var vm: ScheduledTasksViewModel
+    /// Present when the shell offers Bots: "Run as" then lists them like the Agent App composer.
+    let botsVM: BotsViewModel?
     let onBack: () -> Void
     let onCancel: () -> Void
     let onSave: (ScheduledTaskEditorDraft) -> Void
@@ -1487,12 +1497,14 @@ private struct ScheduledTaskEditorView: View {
     init(
         draft: ScheduledTaskEditorDraft,
         vm: ScheduledTasksViewModel,
+        botsVM: BotsViewModel? = nil,
         onBack: @escaping () -> Void,
         onCancel: @escaping () -> Void,
         onSave: @escaping (ScheduledTaskEditorDraft) -> Void
     ) {
         self._draft = State(initialValue: draft)
         self.vm = vm
+        self.botsVM = botsVM
         self.onBack = onBack
         self.onCancel = onCancel
         self.onSave = onSave
@@ -1644,6 +1656,18 @@ private struct ScheduledTaskEditorView: View {
                         }
                     }
 
+                    editorGroup("Run options") {
+                        ScheduledRunOptionsEditor(
+                            showsUltracode: draft.provider == .distill,
+                            ultracode: $draft.distillUltracode,
+                            permission: $draft.permissionMode,
+                            plan: Binding(get: { draft.interactionMode == .plan }, set: { draft.interactionMode = $0 ? .plan : .default }),
+                            execution: Binding(get: { draft.executionMode }, set: { draft.executionMode = $0 }),
+                            baseBranch: Binding(get: { draft.baseBranch }, set: { draft.baseBranch = $0 }),
+                            identifierPrefix: "scheduledTasks.editor"
+                        )
+                    }
+
                     editorGroup("Frequency") {
                         ScheduledFrequencyEditor(
                             rules: $draft.frequencyRules,
@@ -1656,7 +1680,7 @@ private struct ScheduledTaskEditorView: View {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundColor(DS.Palette.warning)
                             .accessibilityHidden(true)
-                        Text("Runs unattended with Full Access in the selected workspace.")
+                        Text(ScheduledRunOptionsEditor.unattendedNotice(permission: draft.interactionMode == .plan ? .supervised : draft.permissionMode))
                             .font(DS.Font.caption)
                             .foregroundColor(DS.Palette.textSecondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1771,14 +1795,20 @@ private struct ScheduledTaskEditorView: View {
             ?? users.first(where: { $0.shortName == draft.runAsUser })
             ?? AgentRunAsUser(generatedUID: "", shortName: draft.runAsUser, uid: draft.runAsUID, gid: 0, homePath: "")
         return AgentRunAsUserCapsule(
-            users: users,
+            usersProvider: { users },
             selected: selected,
             runLocked: false,
             identityLocked: false,
             accessibilityIdentifier: "scheduledTasks.editor.runAsUser",
+            botsProvider: botsVM.map { bots in { bots.fleet } },
             onSelect: { user in
                 draft.runAsUser = user.shortName
                 draft.runAsUID = user.uid
+            },
+            onSelectActor: { actor in
+                guard let botID = actor.botID, let botsVM else { return }
+                botsVM.beginScheduleTask(botID: botID, carrying: draft)
+                onCancel()
             }
         )
     }
@@ -1953,6 +1983,8 @@ private struct ScheduledTaskEditorView: View {
     }
 
     private func confirmAndSave() {
+        let permission = draft.interactionMode == .plan ? AgentPermissionMode.supervised : draft.permissionMode
+        guard permission == .fullAccess else { onSave(draft); return }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Allow this task to run with Full Access?"
@@ -2098,5 +2130,85 @@ private extension ScheduledWeekday {
         case .friday: return "Fri"
         case .saturday: return "Sat"
         }
+    }
+}
+
+/// The run options a new Agent App message carries, for any scheduled task
+/// (workspace or Bot): Ultracode, permission, plan mode and execution location.
+/// One component so the two schedule editors cannot drift from each other.
+struct ScheduledRunOptionsEditor: View {
+    let showsUltracode: Bool
+    @Binding var ultracode: Bool
+    @Binding var permission: AgentPermissionMode
+    /// Nil hides plan mode and execution location (Bot runs use the Bot's own setup).
+    var plan: Binding<Bool>?
+    var execution: Binding<AgentExecutionMode>?
+    var baseBranch: Binding<String>?
+    let identifierPrefix: String
+
+    /// Plan mode always runs supervised, like the Agent App composer.
+    static func effectivePermission(_ permission: AgentPermissionMode, plan: Bool) -> AgentPermissionMode {
+        plan ? .supervised : permission
+    }
+
+    static func unattendedNotice(permission: AgentPermissionMode) -> String {
+        switch permission {
+        case .fullAccess: return "Runs unattended with Full Access in the selected workspace."
+        case .autoAcceptEdits: return "Runs unattended; file edits are accepted automatically and other actions wait for approval."
+        case .supervised: return "Runs unattended; every action that needs approval waits for you."
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            if showsUltracode {
+                Toggle("Ultracode", isOn: $ultracode)
+                    .toggleStyle(.checkbox)
+                    .help("Plan, fan out to parallel subagents, then integrate and verify")
+                    .accessibilityIdentifier("\(identifierPrefix).ultracode")
+            }
+            if let plan {
+                Toggle("Plan mode", isOn: plan)
+                    .toggleStyle(.checkbox)
+                    .help("Propose a plan first; runs supervised")
+                    .accessibilityIdentifier("\(identifierPrefix).planMode")
+            }
+            HStack(spacing: DS.Space.md) {
+                Text("Permission")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                AgentPermissionCapsule(
+                    selected: Self.effectivePermission(permission, plan: plan?.wrappedValue ?? false),
+                    modes: AgentPermissionMode.allCases,
+                    disabled: plan?.wrappedValue ?? false,
+                    help: (plan?.wrappedValue ?? false) ? "Plan mode runs supervised" : "Permission mode",
+                    accessibilityIdentifier: "\(identifierPrefix).permission",
+                    onSelect: { permission = $0 }
+                )
+            }
+            if let execution {
+                HStack(spacing: DS.Space.md) {
+                    Text("Execution")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                    Picker("Execution", selection: execution) {
+                        Text("Local").tag(AgentExecutionMode.local)
+                        Text("Worktree").tag(AgentExecutionMode.worktree)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                    .accessibilityIdentifier("\(identifierPrefix).execution")
+                }
+                if execution.wrappedValue == .worktree, let baseBranch {
+                    TextField("Base branch", text: baseBranch)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("\(identifierPrefix).baseBranch")
+                }
+            }
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

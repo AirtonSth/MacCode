@@ -126,6 +126,23 @@ final class ScheduledTaskStoreTests: XCTestCase {
         XCTAssertEqual(try store.list(), [task])
     }
 
+    func test_newMessageRunOptionsRoundTrip_becauseScheduledRunsMustMatchTheAgentAppComposer() throws {
+        var task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        task.provider = .distill
+        task.providerInstanceID = "distill"
+        task.model = "auto"
+        task.distillUltracode = true
+        task.permissionMode = .autoAcceptEdits
+        task.interactionMode = .plan
+        task.executionMode = .worktree
+        task.baseBranch = "production"
+
+        try store.save(task)
+
+        XCTAssertEqual(try store.get(id: task.id), task)
+        XCTAssertEqual(try store.list(), [task])
+    }
+
     func test_claimDueDeduplicatesOccurrenceAndBlocksSameTaskOverlap_becauseCrashesMustNotDoubleRun() throws {
         let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
         try store.save(task)

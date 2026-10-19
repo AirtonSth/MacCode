@@ -8,6 +8,8 @@ import Persistence
 @MainActor
 struct RemoteCodeMain {
     static func main() {
+        // App chrome and Foundation/AppKit errors stay English regardless of the macOS language.
+        UserDefaults.standard.set(["en"], forKey: "AppleLanguages")
         // Priority: explicit env override -> bundle-id derivation -> .debug
         let channel: ReleaseChannel
         if let envRaw = ProcessInfo.processInfo.environment["RC2_CHANNEL"],

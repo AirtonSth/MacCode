@@ -142,9 +142,10 @@ final class SidebarSelectionAndBotOrderTests: XCTestCase {
         // WHY: the open/running thread stays visible past the cap and the hidden count must exclude it.
         let rows = convRows(12)
         let always = rows[10].threadID
+        let cap = SidebarViewModel.workspaceConversationLimit
         let out = SidebarViewModel.visibleConversations(rows, expanded: false, always: [always])
-        XCTAssertEqual(out.rows, Array(rows[0..<8]) + [rows[10]])
-        XCTAssertEqual(out.hidden, 3)
+        XCTAssertEqual(out.rows, Array(rows[0..<cap]) + [rows[10]])
+        XCTAssertEqual(out.hidden, rows.count - cap - 1)
         XCTAssertTrue(out.showsToggle)
     }
 

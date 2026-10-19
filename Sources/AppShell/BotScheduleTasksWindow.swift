@@ -380,6 +380,20 @@ struct BotScheduleTaskEditorView: View {
                         providers: providers,
                         providersLoading: providersLoading
                     )
+                    labeled("Run options") {
+                        ScheduledRunOptionsEditor(
+                            showsUltracode: draft.spec.provider == .distill,
+                            ultracode: Binding(
+                                get: { draft.spec.distillUltracode ?? false },
+                                set: { draft.spec.distillUltracode = $0 }
+                            ),
+                            permission: Binding(
+                                get: { draft.spec.permissionMode ?? .fullAccess },
+                                set: { draft.spec.permissionMode = $0 }
+                            ),
+                            identifierPrefix: "bots.scheduleTasks.editor"
+                        )
+                    }
                     Toggle("Active", isOn: $draft.isEnabled)
                         .accessibilityIdentifier("bots.scheduleTasks.editor.active")
                     Text(BotRoutineCopy.testRunHonestyCaption)

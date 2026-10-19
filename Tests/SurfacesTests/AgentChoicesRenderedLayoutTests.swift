@@ -84,7 +84,7 @@ final class AgentChoicesRenderedLayoutTests: XCTestCase {
         return (bitmap, window)
     }
 
-    func testRenderedChoiceNoticesPreserveComposerAndFillWideAndNarrowWindows() async throws {
+    func testRenderedChoiceNoticesSitInTheTimelineAndPreserveTheComposer() async throws {
         let notices = try makeHarness()
         let empty = try makeHarness(withNotices: false)
         defer {
@@ -120,11 +120,6 @@ final class AgentChoicesRenderedLayoutTests: XCTestCase {
                 differs(left, y) && differs(middle, y) && differs(right, y)
             }
             XCTAssertGreaterThan(filledRows.count, 4, "real card backgrounds must span the available chat width")
-            XCTAssertLessThanOrEqual(
-                CGFloat(filledRows.count * 4) / scale,
-                AgentAppView.choicesViewportHeight(availableHeight: size.height) + 8,
-                "rendered cards must stay inside the bounded scroll viewport"
-            )
         }
     }
 }

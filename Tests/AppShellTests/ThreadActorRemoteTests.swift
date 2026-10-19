@@ -606,7 +606,7 @@ final class ThreadActorRemoteTests: XCTestCase {
         vm.setRunActor(.bot(f.vmBot.id))
         vm.prompt = "primeira"
         await vm.send()
-        XCTAssertTrue(vm.statusMessage.contains("VM indisponível"), vm.statusMessage)
+        XCTAssertTrue(vm.statusMessage.contains("VM unavailable"), vm.statusMessage)
 
         // The VM is down: the user chooses the Mac for this thread.
         vm.runSelectedThreadOnMac()

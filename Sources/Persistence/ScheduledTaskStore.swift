@@ -80,8 +80,9 @@ public final class ScheduledTaskStore: @unchecked Sendable {
                     provider, provider_instance_id,
                     model, reasoning_effort, reasoning_model, distill_main_effort_json, distill_reasoning_effort_json,
                     routing_mode, recurrence_json, timezone_id, enabled, next_run_at,
-                    last_run_at, lease_owner, lease_expires_at, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                    last_run_at, lease_owner, lease_expires_at, created_at, updated_at,
+                    distill_ultracode, permission_mode, interaction_mode, execution_mode, base_branch
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title=excluded.title, prompt=excluded.prompt, workspace_id=excluded.workspace_id,
                     workspace_path_snapshot=excluded.workspace_path_snapshot,
@@ -93,7 +94,10 @@ public final class ScheduledTaskStore: @unchecked Sendable {
                     routing_mode=excluded.routing_mode, recurrence_json=excluded.recurrence_json,
                     timezone_id=excluded.timezone_id, enabled=excluded.enabled,
                     next_run_at=excluded.next_run_at, last_run_at=excluded.last_run_at,
-                    updated_at=excluded.updated_at;
+                    updated_at=excluded.updated_at,
+                    distill_ultracode=excluded.distill_ultracode, permission_mode=excluded.permission_mode,
+                    interaction_mode=excluded.interaction_mode, execution_mode=excluded.execution_mode,
+                    base_branch=excluded.base_branch;
                 """)
             defer { statement.reset() }
             try bindTask(task, recurrenceJSON: recurrence, statement: statement)
@@ -560,6 +564,11 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         try statement.bind(20, string(task.lastRunAt))
         try statement.bind(21, string(task.createdAt))
         try statement.bind(22, string(task.updatedAt))
+        try statement.bind(23, task.distillUltracode)
+        try statement.bind(24, task.permissionMode.rawValue)
+        try statement.bind(25, task.interactionMode.rawValue)
+        try statement.bind(26, task.executionMode.rawValue)
+        try statement.bind(27, task.baseBranch)
     }
 
     private func decodeTask(_ statement: SQLiteStatement) throws -> ScheduledTask {
@@ -590,6 +599,11 @@ public final class ScheduledTaskStore: @unchecked Sendable {
             distillMainEffortSelection: mainEffortSelection,
             distillReasoningEffortSelection: reasoningEffortSelection,
             routingMode: routingMode,
+            distillUltracode: statement.columnInt64(24) != 0,
+            permissionMode: statement.columnText(25).flatMap(AgentPermissionMode.init(rawValue:)) ?? .fullAccess,
+            interactionMode: statement.columnText(26).flatMap(AgentInteractionMode.init(rawValue:)) ?? .default,
+            executionMode: statement.columnText(27).flatMap(AgentExecutionMode.init(rawValue:)) ?? .local,
+            baseBranch: statement.columnText(28),
             recurrence: recurrence, timeZoneIdentifier: timeZone,
             isEnabled: statement.columnInt64(17) != 0,
             nextRunAt: date(statement.columnText(18)), lastRunAt: date(statement.columnText(19)),
@@ -710,7 +724,8 @@ public final class ScheduledTaskStore: @unchecked Sendable {
                provider, provider_instance_id, model, reasoning_effort, reasoning_model,
                distill_main_effort_json, distill_reasoning_effort_json,
                routing_mode, recurrence_json, timezone_id, enabled, next_run_at,
-               last_run_at, lease_owner, lease_expires_at, created_at, updated_at
+               last_run_at, lease_owner, lease_expires_at, created_at, updated_at,
+               distill_ultracode, permission_mode, interaction_mode, execution_mode, base_branch
         FROM scheduled_tasks
         """
 

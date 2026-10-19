@@ -27,7 +27,7 @@ final class AgentActivityServiceTests: XCTestCase {
         let context = try makeContext()
         let thread = try makeThread(context)
         let failed = try makeRun(context, thread: thread, status: .failed, at: 100)
-        let completed = try makeRun(context, thread: thread, status: .completed, at: 200)
+        let completed = try makeRun(context, thread: try makeThread(context), status: .completed, at: 200)
         let bot = try context.botStore.create(name: "Piper", title: "Scout", description: "", provider: .claude)
         let conversation = BotConversation(botID: bot.id, title: "Deploy check", attentionState: .needsAttention)
         try context.botStore.upsertConversation(conversation)
@@ -168,7 +168,7 @@ final class AgentActivityServiceTests: XCTestCase {
         let firstThread = try makeThread(context, workspace: workspaceA)
         let secondThread = try makeThread(context, workspace: workspaceB)
         _ = try makeRun(context, thread: firstThread, status: .completed, at: 100.125)
-        _ = try makeRun(context, thread: firstThread, status: .failed, at: 100.875)
+        _ = try makeRun(context, thread: try makeThread(context, workspace: workspaceA), status: .failed, at: 100.875)
         _ = try makeRun(context, thread: secondThread, status: .completed, at: 100.5)
         let activity = service(context)
         let first = try decodePage(activity.list(["workspace_id": .string(workspaceA.description), "section": .string("finished"), "limit": .number(1)]))
@@ -205,9 +205,10 @@ final class AgentActivityServiceTests: XCTestCase {
         let context = try makeContext()
         let thread = try makeThread(context)
         let first = try makeRun(context, thread: thread, status: .completed, at: 100)
-        let second = try makeRun(context, thread: thread, status: .completed, at: 101)
+        let otherThread = try makeThread(context)
+        let second = try makeRun(context, thread: otherThread, status: .completed, at: 101)
         try insertCheckpoint(context, runID: first.id, threadID: thread.id, file: "first.swift", sequence: 1, turnID: "provider-turn-a")
-        try insertCheckpoint(context, runID: second.id, threadID: thread.id, file: "second.swift", sequence: 2, turnID: "provider-turn-b")
+        try insertCheckpoint(context, runID: second.id, threadID: otherThread.id, file: "second.swift", sequence: 2, turnID: "provider-turn-b")
 
         let page = try decodePage(service(context).list([:]))
         let firstItem = try XCTUnwrap(page.items.first { $0.runID == first.id.value })
@@ -391,6 +392,32 @@ final class AgentActivityServiceTests: XCTestCase {
             .string("run:\(orphan.id.description)")
         ]), "acknowledged": .bool(false)])
         XCTAssertEqual(try decodePage(service(context).list([:])).counts.needsYou, 3, "Undo puts every cleared item back")
+    }
+
+    func test_conversationShowsOnlyItsLatestResultAndALaterRunSettlesAnOldFailure() throws {
+        // WHY: the owner (2026-10-19) saw Needs you 32 / Finished 841 for a few dozen
+        // conversations. Activity is an inbox: one row per conversation result, and a
+        // failure the user already retried no longer needs them.
+        let context = try makeContext()
+        let retried = try makeThread(context)
+        let oldFailure = try makeRun(context, thread: retried, status: .failed, at: 100)
+        let retry = try makeRun(context, thread: retried, status: .completed, at: 200)
+        let stillFailing = try makeThread(context)
+        let earlierPass = try makeRun(context, thread: stillFailing, status: .completed, at: 100)
+        let latestFailure = try makeRun(context, thread: stillFailing, status: .failed, at: 300)
+        let rerunning = try makeThread(context)
+        let failedBeforeRerun = try makeRun(context, thread: rerunning, status: .failed, at: 100)
+        let rerun = try makeRun(context, thread: rerunning, status: .running, at: 400)
+
+        let page = try decodePage(service(context, activeRunID: rerun.id).list([:]))
+        let runIDs = Set(page.items.compactMap(\.runID))
+        XCTAssertTrue(runIDs.contains(retry.id.value))
+        XCTAssertFalse(runIDs.contains(oldFailure.id.value), "a retried failure is history, not a result")
+        XCTAssertFalse(runIDs.contains(earlierPass.id.value), "only the latest result of a conversation is listed")
+        XCTAssertEqual(page.counts.finished, 3)
+        XCTAssertEqual(Set(page.items.filter(\.needsAction).compactMap(\.runID)), [latestFailure.id.value],
+                       "a failure whose conversation is running again no longer needs you")
+        XCTAssertTrue(runIDs.contains(failedBeforeRerun.id.value), "its result still shows until the new run finishes")
     }
 
     private func makeContext() throws -> AppContext {

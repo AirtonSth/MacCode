@@ -33,6 +33,13 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
     /// Optional for backward-compatible Codable decoding of tasks serialized
     /// before scheduled Auto routing existed. Missing values mean Manual.
     public var routingMode: AgentRoutingMode?
+    /// Same run options a new Agent App message carries.
+    public var distillUltracode: Bool
+    public var permissionMode: AgentPermissionMode
+    public var interactionMode: AgentInteractionMode
+    public var executionMode: AgentExecutionMode
+    /// Required when `executionMode` is `.worktree`.
+    public var baseBranch: String?
     public var recurrence: ScheduledTaskRecurrence
     public var timeZoneIdentifier: String
     public var isEnabled: Bool
@@ -57,6 +64,11 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
         routingMode: AgentRoutingMode = .manual,
+        distillUltracode: Bool = false,
+        permissionMode: AgentPermissionMode = .fullAccess,
+        interactionMode: AgentInteractionMode = .default,
+        executionMode: AgentExecutionMode = .local,
+        baseBranch: String? = nil,
         recurrence: ScheduledTaskRecurrence,
         timeZoneIdentifier: String,
         isEnabled: Bool = true,
@@ -80,6 +92,11 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         self.distillMainEffortSelection = distillMainEffortSelection
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
         self.routingMode = routingMode
+        self.distillUltracode = distillUltracode
+        self.permissionMode = permissionMode
+        self.interactionMode = interactionMode
+        self.executionMode = executionMode
+        self.baseBranch = baseBranch
         self.recurrence = recurrence
         self.timeZoneIdentifier = timeZoneIdentifier
         self.isEnabled = isEnabled
@@ -88,6 +105,46 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         migrateLegacyProvider()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, prompt, workspaceID, workspacePathSnapshot, runAsUser, runAsUID
+        case provider, providerInstanceID, model, reasoningEffort, reasoningModel
+        case distillMainEffortSelection, distillReasoningEffortSelection, routingMode
+        case distillUltracode, permissionMode, interactionMode, executionMode, baseBranch
+        case recurrence, timeZoneIdentifier, isEnabled, nextRunAt, lastRunAt, createdAt, updatedAt
+    }
+
+    /// Tasks serialized before the run options existed keep the old run: Full Access, Local, no Ultracode.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        prompt = try c.decode(String.self, forKey: .prompt)
+        workspaceID = try c.decode(WorkspaceID.self, forKey: .workspaceID)
+        workspacePathSnapshot = try c.decode(String.self, forKey: .workspacePathSnapshot)
+        runAsUser = try c.decode(String.self, forKey: .runAsUser)
+        runAsUID = try c.decode(UInt32.self, forKey: .runAsUID)
+        provider = try c.decode(AgentProvider.self, forKey: .provider)
+        providerInstanceID = try c.decode(String.self, forKey: .providerInstanceID)
+        model = try c.decode(String.self, forKey: .model)
+        reasoningEffort = try c.decode(AgentReasoningEffort.self, forKey: .reasoningEffort)
+        reasoningModel = try c.decodeIfPresent(String.self, forKey: .reasoningModel)
+        distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
+        distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
+        routingMode = try c.decodeIfPresent(AgentRoutingMode.self, forKey: .routingMode)
+        distillUltracode = try c.decodeIfPresent(Bool.self, forKey: .distillUltracode) ?? false
+        permissionMode = try c.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode) ?? .fullAccess
+        interactionMode = try c.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode) ?? .default
+        executionMode = try c.decodeIfPresent(AgentExecutionMode.self, forKey: .executionMode) ?? .local
+        baseBranch = try c.decodeIfPresent(String.self, forKey: .baseBranch)
+        recurrence = try c.decode(ScheduledTaskRecurrence.self, forKey: .recurrence)
+        timeZoneIdentifier = try c.decode(String.self, forKey: .timeZoneIdentifier)
+        isEnabled = try c.decode(Bool.self, forKey: .isEnabled)
+        nextRunAt = try c.decodeIfPresent(Date.self, forKey: .nextRunAt)
+        lastRunAt = try c.decodeIfPresent(Date.self, forKey: .lastRunAt)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
     }
 
     /// RemoteCode runs Distill only: a saved Codex/Claude/Grok route becomes Distill defaults.
@@ -127,6 +184,10 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         if effectiveRoutingMode == .manual,
            model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             errors.append("Model is required.")
+        }
+        if executionMode == .worktree,
+           (baseBranch ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errors.append("Worktree runs need a base branch.")
         }
         if TimeZone(identifier: timeZoneIdentifier) == nil { errors.append("Time zone must be a valid IANA identifier.") }
         if case .multiple(let rules) = recurrence {

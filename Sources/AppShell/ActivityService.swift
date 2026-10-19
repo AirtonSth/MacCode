@@ -126,9 +126,21 @@ final class ActivityService: @unchecked Sendable {
         let resultByRun = Dictionary(uniqueKeysWithValues: resultRows.map { ($0.runId.description, $0) })
         let checkpointByRun = includeDisplayDetail ? try checkpointEvidence(runIDs: runs.map(\.runID)) : [:]
         let notificationStates = try loadNotificationStates(db: readDB)
+        // Activity is an inbox, not a run log: a conversation shows its latest result, and a
+        // failure the conversation already moved past (a later run) no longer needs the user.
+        var latestRunByThread = [String: AgentRunID]()
+        var latestResultByThread = [String: AgentRunID]()
+        // Only runs the snapshot can see compete, so a page cursor stays stable while new runs land.
+        for row in runs where (row.finishedAt ?? row.startedAt) <= snapshotAt {
+            let key = row.threadID.description
+            if latestRunByThread[key] == nil { latestRunByThread[key] = row.runID }
+            if latestResultByThread[key] == nil, Self.terminalRunStatuses.contains(row.status) { latestResultByThread[key] = row.runID }
+        }
 
         var items = runs.compactMap { row -> AgentActivityItem? in
             guard let thread = threadByID[row.threadID.description] else { return nil }
+            if Self.terminalRunStatuses.contains(row.status), latestResultByThread[row.threadID.description] != row.runID { return nil }
+            let superseded = latestRunByThread[row.threadID.description] != row.runID
             let result = resultByRun[row.runID.description]
             let state: AgentActivityState
             switch row.status {
@@ -143,8 +155,8 @@ final class ActivityService: @unchecked Sendable {
             let terminal = Self.isTerminal(state)
             // Clear all reaches a run left "running" with no live process too.
             let orphanAcknowledgedAt = state == .needsYou ? notificationStates[Self.orphanRunLedgerKey(row.runID)]?.acknowledgedAt : nil
-            let needsAction = (state == .needsYou && orphanAcknowledgedAt == nil)
-                || ((state == .failed || state == .interrupted) && result?.attentionAcknowledgedAt == nil)
+            let needsAction = !superseded && ((state == .needsYou && orphanAcknowledgedAt == nil)
+                || ((state == .failed || state == .interrupted) && result?.attentionAcknowledgedAt == nil))
             let checkpoint = checkpointByRun[row.runID.description]
             let workspaceName = thread.workspaceId.flatMap { workspaceNames[$0] }
             let botLink = origins.botLinksByThreadID[thread.id.value.uuidString.lowercased()]
@@ -576,6 +588,7 @@ final class ActivityService: @unchecked Sendable {
         }, by: { $0.0 }).mapValues { Self.counts(for: $0.map { $0.1 }) }
     }
 
+    private static let terminalRunStatuses: Set<String> = ["completed", "failed", "interrupted", "cancelled"]
     private static func isTerminal(_ state: AgentActivityState) -> Bool {
         [.completed, .failed, .interrupted, .stopped].contains(state)
     }

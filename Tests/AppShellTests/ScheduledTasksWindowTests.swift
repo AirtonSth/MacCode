@@ -124,6 +124,42 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertEqual(try snapshot(), overview, "Back/Save must return to the overview")
     }
 
+    func test_overviewHasOneNewTaskButton_becauseBotsAreChosenInRunAs() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        XCTAssertFalse(source.contains("New Bot Task"))
+        XCTAssertFalse(source.contains("scheduledTasks.newBot"))
+        XCTAssertTrue(source.contains("botsProvider:"), "Run as must list Bots like the Agent App composer")
+    }
+
+    @MainActor
+    func test_choosingABotKeepsEverythingTyped_becauseOneEditorCreatesBothKinds() throws {
+        let directory = NSTemporaryDirectory() + "RC2SchedCarry-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let bot = try context.botStore.create(name: "Writer", title: "", description: "", handle: "writer")
+        let botsVM = BotsViewModel(context: context, router: router)
+        var draft = ScheduledTaskEditorDraft()
+        draft.title = "Digest"
+        draft.prompt = "Summarize"
+        draft.provider = .distill
+        draft.model = "auto"
+        draft.distillUltracode = true
+        draft.permissionMode = .autoAcceptEdits
+
+        botsVM.beginScheduleTask(botID: bot.id, carrying: draft)
+
+        let carried = try XCTUnwrap(botsVM.scheduleTaskDraft)
+        XCTAssertEqual(carried.botID, bot.id)
+        XCTAssertEqual(carried.name, "Digest")
+        XCTAssertEqual(carried.prompt, "Summarize")
+        XCTAssertEqual(carried.spec.model, "auto")
+        XCTAssertEqual(carried.spec.distillUltracode, true)
+        XCTAssertEqual(carried.spec.permissionMode, .autoAcceptEdits)
+        XCTAssertEqual(carried.spec.frequencyRules, draft.frequencyRules)
+    }
+
     func test_sidebarPlacesScheduleTasksAfterActivity_becauseNavigationOrderIsContractual() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         let newWorkspace = try XCTUnwrap(source.range(of: "accessibilityIdentifier(\"sidebar.new\")"))

@@ -157,7 +157,13 @@ final class ActivityViewModel: ObservableObject {
         case running, needsYou, finished
         var id: String { rawValue }
         var wireValue: String { self == .needsYou ? "needs_you" : rawValue }
-        var title: String { self == .needsYou ? "Needs you" : rawValue.capitalized }
+        var title: String {
+            switch self {
+            case .running: "Running"
+            case .needsYou: "Needs you"
+            case .finished: "Results"
+            }
+        }
     }
 
     enum Period: String, CaseIterable, Identifiable {
@@ -788,10 +794,10 @@ struct ActivityRootView: View {
     @State private var narrowDetail = false
     @State private var searchFocusRequest = false
     /// The one live conversation the detail pane holds; rebuilt only when the selected thread changes.
-    @State private var conversation: (threadID: String, viewModel: AgentAppViewModel)?
+    @State private var conversation: (threadID: String, host: ActivityConversation)?
     let openThread: (ActivityWireItem) -> Void
     let openEvidence: (ActivityWireItem, String?) -> Void
-    private let makeConversation: (ActivityWireItem) -> AgentAppViewModel?
+    private let makeConversation: (ActivityWireItem) -> ActivityConversation?
     private let workspaceOptions: () -> [(id: String, name: String)]
     /// Whether a workspace is still open in this Mac's layout; a thread outside one has nowhere to open.
     private let isWorkspaceOpen: (String) -> Bool
@@ -820,7 +826,7 @@ struct ActivityRootView: View {
     }
 
     /// Renders a prepared model without a router: offscreen layout proofs and worst-case data.
-    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }, isWorkspaceOpen: @escaping (String) -> Bool = { _ in true }, makeConversation: @escaping (ActivityWireItem) -> AgentAppViewModel? = { _ in nil }, botForItem: @escaping (ActivityWireItem) -> BotDefinition? = { _ in nil }) {
+    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }, isWorkspaceOpen: @escaping (String) -> Bool = { _ in true }, makeConversation: @escaping (ActivityWireItem) -> ActivityConversation? = { _ in nil }, botForItem: @escaping (ActivityWireItem) -> BotDefinition? = { _ in nil }) {
         _model = StateObject(wrappedValue: model)
         openThread = { _ in }
         openEvidence = { _, _ in }
@@ -835,7 +841,6 @@ struct ActivityRootView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            tabBar
             if let error = model.error { errorBanner(error) }
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             GeometryReader { proxy in
@@ -864,7 +869,7 @@ struct ActivityRootView: View {
             syncConversation()
         }
         .onDisappear {
-            conversation?.viewModel.dispose()
+            conversation?.host.close()
             conversation = nil
         }
         .onChange(of: route) { _, next in
@@ -878,7 +883,7 @@ struct ActivityRootView: View {
     private func syncConversation() {
         let threadID = model.detail?.thread_id
         guard conversation?.threadID != threadID else { return }
-        conversation?.viewModel.dispose()
+        conversation?.host.close()
         conversation = model.detail.flatMap { item in
             threadID.flatMap { id in makeConversation(item).map { (id, $0) } }
         }
@@ -891,30 +896,46 @@ struct ActivityRootView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
-            HStack(alignment: .firstTextBaseline, spacing: DS.Space.md) {
-                Text("Activity").font(DS.Font.title.weight(.semibold)).foregroundColor(DS.Palette.text)
-                if !model.hasSuccessfulSnapshot {
-                    Text("Activity counts unavailable").font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
+            HStack(alignment: .center, spacing: DS.Space.md) {
+                VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    Text("Activity").font(DS.Font.title.weight(.semibold)).foregroundColor(DS.Palette.text).lineLimit(1)
+                    Text(headerSummary).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                        .accessibilityIdentifier("activity.summary")
                 }
-                Spacer()
+                Spacer(minLength: DS.Space.md)
                 // Fixed slot: the spinner must not move the header when it appears.
                 ZStack {
                     if model.loading || model.batchRunning { DSBusySpinner(label: "Updating activity", identifier: "activity.busy") }
                 }.frame(width: 16, height: 16)
+                bulkActions
             }
-            // Wide panes keep one filter row; narrow ones put search on its own line and let the pickers share the next.
+            // Wide panes keep tabs and filters on one row; narrow ones stack them.
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: DS.Space.md) {
-                    searchField.frame(minWidth: 160, maxWidth: 420)
-                    filterPickers(fixedWidths: true)
-                    Spacer(minLength: 0)
+                    tabs
+                    Spacer(minLength: DS.Space.lg)
+                    searchField.frame(minWidth: 160, maxWidth: 260)
+                    filterMenus
                 }
-                VStack(alignment: .leading, spacing: DS.Space.sm) {
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    ScrollView(.horizontal, showsIndicators: false) { HStack(spacing: DS.Space.sm) { tabs } }
                     searchField.frame(maxWidth: .infinity)
-                    HStack(spacing: DS.Space.sm) { filterPickers(fixedWidths: false) }
+                    ScrollView(.horizontal, showsIndicators: false) { HStack(spacing: DS.Space.sm) { filterMenus } }
                 }
             }
         }.padding(.horizontal, DS.Space.xl).padding(.top, DS.Space.xl).padding(.bottom, DS.Space.lg)
+    }
+
+    /// One line that says what is going on, so the counts mean something before a tab is opened.
+    private var headerSummary: String {
+        guard model.hasSuccessfulSnapshot else { return "Counts unavailable" }
+        let counts = model.page.counts
+        let parts = [
+            counts.running > 0 ? "\(counts.running.formatted()) running" : nil,
+            counts.needs_you > 0 ? "\(counts.needs_you.formatted()) \(counts.needs_you == 1 ? "needs" : "need") you" : nil,
+            counts.new_results > 0 ? "\(counts.new_results.formatted()) new \(counts.new_results == 1 ? "result" : "results")" : nil,
+        ].compactMap { $0 }
+        return parts.isEmpty ? "All quiet. Nothing running or waiting on you." : parts.joined(separator: " · ")
     }
 
     private var searchField: some View {
@@ -922,37 +943,55 @@ struct ActivityRootView: View {
     }
 
     @ViewBuilder
-    private func filterPickers(fixedWidths: Bool) -> some View {
-        Picker("Workspace", selection: $model.workspaceID) {
-            Text("All workspaces").tag("")
-            ForEach(workspaces, id: \.id) { workspace in Text(workspace.name).tag(workspace.id) }
-        }.labelsHidden().frame(width: fixedWidths ? 170 : nil).frame(minWidth: 0, maxWidth: fixedWidths ? nil : .infinity)
-        Picker("Period", selection: $model.period) {
-            ForEach(ActivityViewModel.Period.allCases) { period in Text(period.title).tag(period) }
-        }.labelsHidden().frame(width: fixedWidths ? 145 : nil).frame(minWidth: 0, maxWidth: fixedWidths ? nil : .infinity)
+    private var filterMenus: some View {
+        filterMenu(
+            icon: "folder", title: workspaces.first { $0.id == model.workspaceID }?.name ?? "All workspaces",
+            active: !model.workspaceID.isEmpty, label: "Workspace", identifier: "activity.filter.workspace"
+        ) {
+            menuOption("All workspaces", selected: model.workspaceID.isEmpty) { model.workspaceID = "" }
+            Divider()
+            ForEach(workspaces, id: \.id) { workspace in
+                menuOption(workspace.name, selected: model.workspaceID == workspace.id) { model.workspaceID = workspace.id }
+            }
+        }
+        filterMenu(icon: "clock", title: model.period.title, active: model.period != .all, label: "Period", identifier: "activity.filter.period") {
+            ForEach(ActivityViewModel.Period.allCases) { period in
+                menuOption(period.title, selected: model.period == period) { model.period = period }
+            }
+        }
         if model.tab == .finished {
-            Picker("Outcome", selection: $model.outcome) {
-                Text("All outcomes").tag("")
-                Text("Completed").tag("completed")
-                Text("Failed").tag("failed")
-                Text("Interrupted").tag("interrupted")
-                Text("Stopped by you").tag("stopped")
-            }.labelsHidden().frame(width: fixedWidths ? 150 : nil).frame(minWidth: 0, maxWidth: fixedWidths ? nil : .infinity)
+            filterMenu(icon: "line.3.horizontal.decrease", title: Self.outcomeTitle(model.outcome), active: !model.outcome.isEmpty,
+                       label: "Outcome", identifier: "activity.filter.outcome") {
+                ForEach(Self.outcomes, id: \.value) { outcome in
+                    menuOption(outcome.title, selected: model.outcome == outcome.value) { model.outcome = outcome.value }
+                }
+            }
         }
     }
 
-    private var tabBar: some View {
-        // Wide windows keep one row; a narrow one stacks the bulk actions under the tabs instead of wrapping labels.
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: DS.Space.sm) { tabs; Spacer(minLength: DS.Space.lg); bulkActions }
-            VStack(alignment: .leading, spacing: DS.Space.md) {
-                // Narrowest panes scroll the tab chips instead of clipping them.
-                ScrollView(.horizontal, showsIndicators: false) { HStack(spacing: DS.Space.sm) { tabs } }
-                HStack(spacing: DS.Space.sm) { bulkActions }
+    private static let outcomes: [(value: String, title: String)] = [
+        ("", "All outcomes"), ("completed", "Completed"), ("failed", "Failed"), ("interrupted", "Interrupted"), ("stopped", "Stopped by you"),
+    ]
+    private static func outcomeTitle(_ value: String) -> String { outcomes.first { $0.value == value }?.title ?? "All outcomes" }
+
+    /// Composer-style capsule menu: an active filter is tinted so it is visible at a glance.
+    private func filterMenu<Content: View>(icon: String, title: String, active: Bool, label: String, identifier: String, @ViewBuilder content: () -> Content) -> some View {
+        Menu { content() } label: {
+            AgentComposerCapsule(style: active ? .tinted(DS.Palette.accent) : .raised, foreground: active ? DS.Palette.accent : DS.Palette.textSecondary) {
+                AgentComposerCapsuleLabel(icon: icon, title: title, chevron: true).frame(maxWidth: 180)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, DS.Space.xl).padding(.bottom, DS.Space.lg)
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+        .help("Filter by \(label.lowercased())")
+        .accessibilityLabel("\(label): \(title)")
+        .accessibilityIdentifier(identifier)
+    }
+
+    private func menuOption(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            if selected { Image(systemName: "checkmark") }
+            Text(title)
+        }
     }
 
     private var tabs: some View {
@@ -974,7 +1013,7 @@ struct ActivityRootView: View {
         if model.tab == .needsYou {
             Button("Clear all") { model.clearCurrentNeedsYou() }
                 .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning || model.page.counts.needs_you == 0).fixedSize()
-                .help("Clears every item in this filter from Needs you and marks results read. Results stay in Finished; a cleared approval or question still waits in its thread.")
+                .help("Clears every item in this filter from Needs you and marks results read. Results stay in Results; a cleared approval or question still waits in its thread.")
                 .accessibilityIdentifier("activity.clearAll")
         }
     }
@@ -1046,7 +1085,13 @@ struct ActivityRootView: View {
                             }
                         }
                     } else {
-                        ForEach(model.page.items) { item in activityRow(item) }
+                        ForEach(model.tab == .needsYou ? model.needsYouSections : model.resultSections, id: \.title) { section in
+                            Section {
+                                ForEach(section.items) { item in activityRow(item) }
+                            } header: {
+                                sectionHeader(section.title, count: model.tab == .needsYou ? section.items.count : nil)
+                            }
+                        }
                     }
                     if model.cursorAvailable { loadMoreRow }
                 }
@@ -1059,12 +1104,21 @@ struct ActivityRootView: View {
         }
     }
 
+    private func sectionHeader(_ title: String, count: Int?) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            Text(title)
+            if let count { Text("\(count)").monospacedDigit().foregroundColor(DS.Palette.textTertiary) }
+        }
+        .font(DS.Font.caption.weight(.semibold)).foregroundColor(DS.Palette.textSecondary)
+        .accessibilityElement(children: .combine)
+    }
+
     @ViewBuilder
     private var emptyState: some View {
         switch model.tab {
         case .running: DSEmptyState(icon: "moon.zzz", title: "Nothing running", subtitle: "Agent runs and project scripts in progress appear here.")
-        case .needsYou: DSEmptyState(icon: "checkmark.circle", title: "You're all caught up", subtitle: "Approvals, questions, and failures that need you appear here.")
-        case .finished: DSEmptyState(icon: "tray", title: "No results yet", subtitle: "Finished runs and their results appear here.")
+        case .needsYou: DSEmptyState(icon: "checkmark.circle", title: "Nothing needs you", subtitle: "Approvals, questions, and runs that failed and were not retried show up here.")
+        case .finished: DSEmptyState(icon: "tray", title: "No results yet", subtitle: "Each conversation's latest finished run shows up here.")
         }
     }
 
@@ -1113,8 +1167,8 @@ struct ActivityRootView: View {
                 conversationHeader(item)
                 Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
                 AgentAppView(
-                    vm: conversation.viewModel,
-                    layout: AgentAppViewLayout(showsThreadRail: false, showsHeader: false, showsPlanSidebar: false, showsComposer: false)
+                    vm: conversation.host.viewModel,
+                    layout: AgentAppViewLayout(showsThreadRail: false, showsHeader: false, showsPlanSidebar: false, showsComposer: conversation.host.showsComposer)
                 )
                 .id(conversation.threadID)
             }
@@ -1125,23 +1179,40 @@ struct ActivityRootView: View {
         }
     }
 
+    /// One compact bar: title and facts on the left, secondary actions on the right, so the
+    /// conversation and its composer get the height.
     private func conversationHeader(_ item: ActivityWireItem) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            Text(item.displayTitle).font(DS.Font.title3).foregroundColor(DS.Palette.text).lineLimit(2).help(item.displayTitle)
-            HStack(spacing: DS.Space.md) {
-                DSPill(item.statusLabel, tone: ActivityStatusStyle.tone(item.state))
-                if let date = item.occurredDate {
-                    Text(ActivityTimeLabel.full(date)).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
-                }
-                let facts = [item.workspace_name, item.provider, item.origin_label].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
-                if !facts.isEmpty {
-                    Text(facts).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).lineLimit(1).help(facts)
+        HStack(alignment: .center, spacing: DS.Space.lg) {
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text(item.displayTitle).font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text).lineLimit(1).help(item.displayTitle)
+                HStack(spacing: DS.Space.sm) {
+                    DSPill(item.statusLabel, tone: ActivityStatusStyle.tone(item.state))
+                    let facts = ([item.occurredDate.map(ActivityTimeLabel.full)] + [item.workspace_name, item.provider, item.origin_label])
+                        .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+                    if !facts.isEmpty {
+                        Text(facts).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).lineLimit(1).truncationMode(.tail).help(facts)
+                    }
                 }
             }
-            detailActions(item)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: DS.Space.sm) {
+                if canOpen(item) {
+                    Button(openLabel(item)) { openThread(item) }.buttonStyle(DSSecondaryButtonStyle())
+                }
+                if canOpen(item), canViewChanges(item) {
+                    Button("View changes") { openEvidence(item, nil) }.buttonStyle(DSSecondaryButtonStyle())
+                }
+                if item.isClearable {
+                    Button("Clear") { model.acknowledge(item) }.buttonStyle(DSSecondaryButtonStyle())
+                }
+                if item.isMarkable, !item.isNew {
+                    Button("Mark as unread") { model.markUnread(item) }.buttonStyle(DSSecondaryButtonStyle())
+                        .keyboardShortcut("u", modifiers: [.command, .shift])
+                }
+            }
+            .fixedSize()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, DS.Space.xl).padding(.vertical, DS.Space.lg)
+        .padding(.horizontal, DS.Space.xl).padding(.vertical, DS.Space.md)
     }
 
     private func detailView(_ item: ActivityWireItem) -> some View {
@@ -1211,7 +1282,7 @@ struct ActivityRootView: View {
                 }
                 if item.isClearable {
                     Button("Clear") { model.acknowledge(item) }.buttonStyle(DSSecondaryButtonStyle())
-                        .help(item.kind == "request" ? "Removes this from Needs you. The request stays in the bot's conversation." : "Removes this from Needs you. The result stays in Finished.")
+                        .help(item.kind == "request" ? "Removes this from Needs you. The request stays in the bot's conversation." : "Removes this from Needs you. The result stays in Results.")
                 }
                 if item.isMarkable, !item.isNew {
                     Button("Mark as unread") { model.markUnread(item) }.buttonStyle(DSSecondaryButtonStyle())
@@ -1325,6 +1396,7 @@ private enum ActivityStatusStyle {
     }
 }
 
+/// Resolves the Bot behind an Activity item: its own bot_id, else the Bot linked to its thread.
 enum ActivityBotResolver {
     /// The item's own bot_id, else the Bot linked to its thread (in-memory cache only).
     static func botID(for item: ActivityWireItem, store: BotStore) -> BotID? {
@@ -1434,6 +1506,43 @@ private extension DSIconButton {
 
 extension ActivityViewModel {
     var runningItems: [ActivityWireItem] { page.items.filter { $0.state != "queued" } }
+
+    struct ItemSection { let title: String; let items: [ActivityWireItem] }
+
+    /// What the user has to do decides the group: answer a paused run first, then decide on failures.
+    var needsYouSections: [ItemSection] {
+        let reply: Set<String> = ["waiting_approval", "waiting_answer", "needs_you"]
+        let groups: [(String, (ActivityWireItem) -> Bool)] = [
+            ("Waiting for your reply", { reply.contains($0.state) }),
+            ("Failed", { ["failed", "interrupted"].contains($0.state) }),
+            ("Expired requests", { $0.state == "expired" }),
+        ]
+        var sections = groups.map { title, match in ItemSection(title: title, items: page.items.filter(match)) }
+        let grouped = Set(sections.flatMap { $0.items.map(\.id) })
+        sections.append(ItemSection(title: "Other", items: page.items.filter { !grouped.contains($0.id) }))
+        return sections.filter { !$0.items.isEmpty }
+    }
+
+    /// Results read like a feed: newest day first.
+    func resultSections(now: Date = Date(), calendar: Calendar = .current) -> [ItemSection] {
+        var order: [String] = []
+        var buckets: [String: [ActivityWireItem]] = [:]
+        for item in page.items {
+            let title = Self.dayTitle(item.occurredDate, now: now, calendar: calendar)
+            if buckets[title] == nil { order.append(title) }
+            buckets[title, default: []].append(item)
+        }
+        return order.map { ItemSection(title: $0, items: buckets[$0] ?? []) }
+    }
+    var resultSections: [ItemSection] { resultSections() }
+
+    static func dayTitle(_ date: Date?, now: Date, calendar: Calendar) -> String {
+        guard let date else { return "Earlier" }
+        if calendar.isDate(date, inSameDayAs: now) { return "Today" }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(date, inSameDayAs: yesterday) { return "Yesterday" }
+        if let week = calendar.date(byAdding: .day, value: -7, to: now), date > week { return "Past 7 days" }
+        return "Earlier"
+    }
     var queuedItems: [ActivityWireItem] { page.items.filter { $0.state == "queued" } }
     var cursorAvailable: Bool { cursor != nil }
     /// The host count covers the whole filter; the loaded rows cover a result the count cannot see yet.

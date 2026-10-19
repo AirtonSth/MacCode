@@ -435,8 +435,8 @@ public struct AgentPermissionCapsule: View {
 
 public enum AgentRunAsUserPresentation {
     public static let noBotLabel = "No Bot"
-    public static let continueWithoutBotLabel = "Continuar sem bot"
-    public static let handoffToBotSection = "Nova thread com outro bot…"
+    public static let continueWithoutBotLabel = "Continue without bot"
+    public static let handoffToBotSection = "New thread with another bot…"
     public static let botActorIcon = "cpu"
 
     public static func isInteractive(userCount: Int, identityLocked: Bool, runLocked: Bool) -> Bool {

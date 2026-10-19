@@ -562,6 +562,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let runStarted: @MainActor (BotID, AgentRunID, AgentThreadID) -> Void
     }
     var botWorkspaceRunHooks: BotWorkspaceRunHooks?
+    /// The Bots model whose weak self the run hooks capture; nil once it is gone.
+    weak var botWorkspaceRunHooksOwner: AnyObject?
     var beforePullRequestThreadCommitForTesting: (() throws -> Void)?
     /// Fires after inbound attachments pass `validatedForRetry` on the managed store.
     var sendAgentMessageResolvedAttachmentsProbeForTesting: (([AgentAttachment]) -> Void)?
@@ -3306,6 +3308,164 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// layer must not infer or pre-dispatch a peer prompt from user prose.
     /// Serves `BotStore.listCached()` so transcript bodies and keystrokes never
     /// hit SQLite (perf audit AA-01).
+    /// Every host of a workspace's Agent App wires it here: workspace tabs and the
+    /// Activity conversation pane, so a reply from either runs exactly the same way.
+    func wireWorkspaceAgentSurface(_ agent: AgentAppSurface, workspace: WorkspaceID, ctx: AppContext) {
+        // Per-surface thread binding: persist this surface's selected
+        // thread into its descriptor metadata so app restart restores it.
+        agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
+            guard let self, let agent else { return }
+            self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
+        }
+        // Initial restore/create select may not re-fire onSelectedThreadChanged.
+        ctx.threadRepo.setLiveSurfaceBinding(
+            surfaceID: agent.descriptor.id,
+            threadID: agent.viewModel.selectedThreadId
+        )
+        agent.viewModel.markThreadRead = { [weak self] threadID in
+            guard let self else { throw LayoutError.workspaceNotFound }
+            try self.markAgentThreadRead(thread: threadID)
+        }
+        // Socket-driven thread mutations (create/rename/delete/read)
+        // refresh this already-open surface — fixes the stale-VM gap.
+        let queueSubscriptionToken = EventBus.shared.subscribe(
+            since: nil,
+            filter: .agentThreadAndQueue
+        ) { [weak agent] ev in
+            guard Self.shouldAdmitAgentLifecycleEvent(
+                payload: ev.payload,
+                workspaceID: workspace
+            ) else { return }
+            DispatchQueue.main.async {
+                guard let agent else { return }
+                agent.viewModel.handleThreadLifecycleEvent(
+                    kind: ev.kind,
+                    threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
+                    threadIds: ev.payload.objectValue?["thread_ids"]?.arrayValue?.compactMap(\.stringValue)
+                )
+                agent.viewModel.handleQueueLifecycleEvent(
+                    kind: ev.kind,
+                    threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
+                    message: ev.payload.objectValue?["message"]?.stringValue
+                )
+                AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(
+                    workspaceID: agent.viewModel.workspaceID
+                )
+                AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedQueueReload(
+                    workspaceID: agent.viewModel.workspaceID
+                )
+            }
+        }
+        agent.subscriptionToken = AnyHashable(queueSubscriptionToken)
+        agent.onClose = { EventBus.shared.unsubscribe(queueSubscriptionToken) }
+        agent.viewModel.providerSnapshotLoader = { [weak self, weak agent] in
+            await self?.listAgentProviderSnapshots(runAsUser: agent?.viewModel.runAsUser) ?? []
+        }
+        agent.viewModel.refreshProviderSnapshotsInBackground()
+        agent.viewModel.providerLaunchConfig = { [weak self] provider, instanceId in
+            (
+                self?.providerBinary(provider: provider, instanceId: instanceId),
+                self?.providerEnvironment(provider: provider, instanceId: instanceId) ?? [:]
+            )
+        }
+        agent.viewModel.providerRecoveryAction = { [weak self] provider, instanceId in
+            guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
+            let result = try await self.updateAgentProvider(provider: provider, providerInstanceId: instanceId)
+            return result.objectValue?["stdout"]?.stringValue ?? ""
+        }
+        agent.viewModel.providerSignInAction = { [weak self] provider in
+            guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
+            try self.openProviderSignInTerminal(workspace: workspace, provider: provider)
+        }
+        agent.viewModel.providerAuthenticationRefresher = { [weak self] provider in
+            await self?.refreshAgentProviderAuthentication(provider) ?? []
+        }
+        agent.viewModel.pullRequestThreadPreparer = { [weak self] url, provider, model, permission, reasoning, serviceTier, modelSelection, providerInstanceId in
+            guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
+            return try self.prepareAgentThreadForPullRequest(workspace: workspace, url: url, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
+        }
+        agent.viewModel.onReviewRequested = { [weak self] in
+            _ = try? self?.createSurface(workspace: workspace, type: .rightSidebarTool, paneID: nil, title: "Git")
+        }
+        // UX-MAC_AGENT-OPEN-SPLIT: clicked file mentions / links open
+        // (or reuse) a split panel to the right of this agent surface.
+        agent.viewModel.onOpenFileInSplit = { [weak self, weak agent] path in
+            guard let self, let agent else { return }
+            self.openFileInAdjacentSplit(workspace: workspace, sourceSurface: agent.descriptor.id, absolutePath: path)
+        }
+        agent.viewModel.onOpenURLInSplit = { [weak self, weak agent] url in
+            guard let self, let agent else { return }
+            self.openURLInAdjacentSplit(workspace: workspace, sourceSurface: agent.descriptor.id, url: url)
+        }
+        agent.viewModel.onForkInNewChat = { [weak self, weak agent] messageID in
+            guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+            Task { @MainActor in
+                do {
+                    let child = try await self.forkAgentThread(sourceThreadId: source, messageID: messageID)
+                    agent.viewModel.selectThread(child.id)
+                } catch {
+                    agent.viewModel.statusMessage = "Could not fork thread: \(error)"
+                }
+            }
+        }
+        agent.viewModel.onRequestSideChat = { [weak self, weak agent] text in
+            guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+            Task { @MainActor in
+                do {
+                    let child = try await self.sideAgentThread(sourceThreadId: source, text: text.isEmpty ? nil : text)
+                    self.openSideChatSplit(workspace: workspace, sourceSurface: agent.descriptor.id, threadId: child.id, seed: text.isEmpty ? nil : text)
+                } catch {
+                    agent.viewModel.statusMessage = "Could not open side chat: \(error)"
+                }
+            }
+        }
+        agent.viewModel.onRequestBtw = { [weak self, weak agent] question in
+            guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
+            Task { @MainActor in
+                do {
+                    let answer = try await self.btwAgentThread(threadId: source, question: question)
+                    agent.viewModel.appendBtwNote(question: question, answer: answer)
+                } catch {
+                    agent.viewModel.statusMessage = "Could not get side answer: \(error)"
+                }
+            }
+        }
+        agent.viewModel.onRunStateChange = { [weak self] in
+            guard let self else { return }
+            if !self.promoteWorkspaceIfBusy(workspace) {
+                self.windowController?.refreshSurfaceRuntimeState()
+            }
+        }
+        agent.viewModel.onRunCompleted = { [weak self] in
+            self?.promoteWorkspaceAfterCompletedRun(workspace)
+        }
+        agent.viewModel.onThreadConfigPersisted = { [weak self] thread in
+            self?.publishAgentThreadUpdated(thread)
+        }
+        agent.viewModel.onThreadLifecycle = { [weak self] event in
+            self?.publishAgentThreadLifecycle(event)
+        }
+        agent.viewModel.onThreadChromeWritten = { write in
+            write.publish()
+        }
+        agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
+            ctx?.retireDeletedAgentThreads(
+                ids,
+                coordinatorAlreadyRetired: coordinatorAlreadyRetired
+            )
+        }
+        Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
+        wireQueueDrainControl(on: agent.viewModel, context: ctx)
+        wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
+        configureAgentAppBotMentions(agent)
+        agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
+            self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
+        }
+        agent.viewModel.onQueuedMessageEvent = { [weak self] kind, message in
+            self?.publishQueuedMessage(kind: kind, message)
+        }
+    }
+
     func configureAgentAppBotMentions(_ agent: AgentAppSurface) {
         agent.viewModel.botComputerControl = botComputerControl
         agent.viewModel.manualActionStore = manualActionStore
@@ -3378,7 +3538,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private struct BotWorkspaceRunUnavailable: LocalizedError {
-        var errorDescription: String? { "Bot indisponível." }
+        var errorDescription: String? { "Bot unavailable." }
     }
 
     private var hostCatalogCreatedBots: [AgentRunID: Set<BotID>] = [:]
@@ -10190,159 +10350,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             case .agentApp:
                 guard let ctx = context else { return descriptor }
                 let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId, sideThreadId: sideThreadId, orchestrationRuntime: ctx.orchestrationRuntime, openAccountsSettings: openAccountsSettings)
-                // Per-surface thread binding: persist this surface's selected
-                // thread into its descriptor metadata so app restart restores it.
-                agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
-                    guard let self, let agent else { return }
-                    self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
-                }
-                // Initial restore/create select may not re-fire onSelectedThreadChanged.
-                ctx.threadRepo.setLiveSurfaceBinding(
-                    surfaceID: agent.descriptor.id,
-                    threadID: agent.viewModel.selectedThreadId
-                )
-                agent.viewModel.markThreadRead = { [weak self] threadID in
-                    guard let self else { throw LayoutError.workspaceNotFound }
-                    try self.markAgentThreadRead(thread: threadID)
-                }
-                // Socket-driven thread mutations (create/rename/delete/read)
-                // refresh this already-open surface — fixes the stale-VM gap.
-                let queueSubscriptionToken = EventBus.shared.subscribe(
-                    since: nil,
-                    filter: .agentThreadAndQueue
-                ) { [weak agent] ev in
-                    guard Self.shouldAdmitAgentLifecycleEvent(
-                        payload: ev.payload,
-                        workspaceID: workspace
-                    ) else { return }
-                    DispatchQueue.main.async {
-                        guard let agent else { return }
-                        agent.viewModel.handleThreadLifecycleEvent(
-                            kind: ev.kind,
-                            threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
-                            threadIds: ev.payload.objectValue?["thread_ids"]?.arrayValue?.compactMap(\.stringValue)
-                        )
-                        agent.viewModel.handleQueueLifecycleEvent(
-                            kind: ev.kind,
-                            threadId: ev.payload.objectValue?["thread_id"]?.stringValue,
-                            message: ev.payload.objectValue?["message"]?.stringValue
-                        )
-                        AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedReload(
-                            workspaceID: agent.viewModel.workspaceID
-                        )
-                        AgentWorkspaceRailReloadCoordinator.shared.requestCoalescedQueueReload(
-                            workspaceID: agent.viewModel.workspaceID
-                        )
-                    }
-                }
-                agent.subscriptionToken = AnyHashable(queueSubscriptionToken)
-                agent.onClose = { EventBus.shared.unsubscribe(queueSubscriptionToken) }
-                agent.viewModel.providerSnapshotLoader = { [weak self, weak agent] in
-                    await self?.listAgentProviderSnapshots(runAsUser: agent?.viewModel.runAsUser) ?? []
-                }
-                agent.viewModel.refreshProviderSnapshotsInBackground()
-                agent.viewModel.providerLaunchConfig = { [weak self] provider, instanceId in
-                    (
-                        self?.providerBinary(provider: provider, instanceId: instanceId),
-                        self?.providerEnvironment(provider: provider, instanceId: instanceId) ?? [:]
-                    )
-                }
-                agent.viewModel.providerRecoveryAction = { [weak self] provider, instanceId in
-                    guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
-                    let result = try await self.updateAgentProvider(provider: provider, providerInstanceId: instanceId)
-                    return result.objectValue?["stdout"]?.stringValue ?? ""
-                }
-                agent.viewModel.providerSignInAction = { [weak self] provider in
-                    guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
-                    try self.openProviderSignInTerminal(workspace: workspace, provider: provider)
-                }
-                agent.viewModel.providerAuthenticationRefresher = { [weak self] provider in
-                    await self?.refreshAgentProviderAuthentication(provider) ?? []
-                }
-                agent.viewModel.pullRequestThreadPreparer = { [weak self] url, provider, model, permission, reasoning, serviceTier, modelSelection, providerInstanceId in
-                    guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
-                    return try self.prepareAgentThreadForPullRequest(workspace: workspace, url: url, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
-                }
-                agent.viewModel.onReviewRequested = { [weak self] in
-                    _ = try? self?.createSurface(workspace: workspace, type: .rightSidebarTool, paneID: nil, title: "Git")
-                }
-                // UX-MAC_AGENT-OPEN-SPLIT: clicked file mentions / links open
-                // (or reuse) a split panel to the right of this agent surface.
-                agent.viewModel.onOpenFileInSplit = { [weak self, weak agent] path in
-                    guard let self, let agent else { return }
-                    self.openFileInAdjacentSplit(workspace: workspace, sourceSurface: agent.descriptor.id, absolutePath: path)
-                }
-                agent.viewModel.onOpenURLInSplit = { [weak self, weak agent] url in
-                    guard let self, let agent else { return }
-                    self.openURLInAdjacentSplit(workspace: workspace, sourceSurface: agent.descriptor.id, url: url)
-                }
-                agent.viewModel.onForkInNewChat = { [weak self, weak agent] messageID in
-                    guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
-                    Task { @MainActor in
-                        do {
-                            let child = try await self.forkAgentThread(sourceThreadId: source, messageID: messageID)
-                            agent.viewModel.selectThread(child.id)
-                        } catch {
-                            agent.viewModel.statusMessage = "Could not fork thread: \(error)"
-                        }
-                    }
-                }
-                agent.viewModel.onRequestSideChat = { [weak self, weak agent] text in
-                    guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
-                    Task { @MainActor in
-                        do {
-                            let child = try await self.sideAgentThread(sourceThreadId: source, text: text.isEmpty ? nil : text)
-                            self.openSideChatSplit(workspace: workspace, sourceSurface: agent.descriptor.id, threadId: child.id, seed: text.isEmpty ? nil : text)
-                        } catch {
-                            agent.viewModel.statusMessage = "Could not open side chat: \(error)"
-                        }
-                    }
-                }
-                agent.viewModel.onRequestBtw = { [weak self, weak agent] question in
-                    guard let self, let agent, let source = agent.viewModel.selectedThreadId else { return }
-                    Task { @MainActor in
-                        do {
-                            let answer = try await self.btwAgentThread(threadId: source, question: question)
-                            agent.viewModel.appendBtwNote(question: question, answer: answer)
-                        } catch {
-                            agent.viewModel.statusMessage = "Could not get side answer: \(error)"
-                        }
-                    }
-                }
-                agent.viewModel.onRunStateChange = { [weak self] in
-                    guard let self else { return }
-                    if !self.promoteWorkspaceIfBusy(workspace) {
-                        self.windowController?.refreshSurfaceRuntimeState()
-                    }
-                }
-                agent.viewModel.onRunCompleted = { [weak self] in
-                    self?.promoteWorkspaceAfterCompletedRun(workspace)
-                }
-                agent.viewModel.onThreadConfigPersisted = { [weak self] thread in
-                    self?.publishAgentThreadUpdated(thread)
-                }
-                agent.viewModel.onThreadLifecycle = { [weak self] event in
-                    self?.publishAgentThreadLifecycle(event)
-                }
-                agent.viewModel.onThreadChromeWritten = { write in
-                    write.publish()
-                }
-                agent.viewModel.retireDeletedThreadRuntime = { [weak ctx] ids, coordinatorAlreadyRetired in
-                    ctx?.retireDeletedAgentThreads(
-                        ids,
-                        coordinatorAlreadyRetired: coordinatorAlreadyRetired
-                    )
-                }
-                Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
-                wireQueueDrainControl(on: agent.viewModel, context: ctx)
-                wireBotPeerHandoffDeletion(on: agent.viewModel, context: ctx)
-                configureAgentAppBotMentions(agent)
-                agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
-                    self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
-                }
-                agent.viewModel.onQueuedMessageEvent = { [weak self] kind, message in
-                    self?.publishQueuedMessage(kind: kind, message)
-                }
+                wireWorkspaceAgentSurface(agent, workspace: workspace, ctx: ctx)
                 surface = agent
             case .files:
                 surface = FilesSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, initialState: restore?.metadata["files_state"], selectedPath: restore?.metadata["selected_path"] ?? restore?.metadata["selected_relative_path"])

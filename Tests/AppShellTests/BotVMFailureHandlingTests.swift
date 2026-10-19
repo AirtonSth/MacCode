@@ -17,6 +17,13 @@ final class BotVMFailureHandlingTests: XCTestCase {
         super.tearDown()
     }
 
+    func test_botFailureMessagesUseEnglishRegardlessOfUserConversationLanguage() {
+        XCTAssertEqual(DistillGuestLaunchError.unavailable("Docker is stopped").errorDescription,
+                       "VM unavailable: Docker is stopped")
+        XCTAssertEqual(ThreadActorAlreadyLockedError().errorDescription,
+                       "This conversation is already assigned to another actor. Review the actor and try sending again.")
+    }
+
     private struct Fixture {
         let ctx: AppContext
         let router: AppCommandRouter
@@ -175,6 +182,22 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertEqual(moved.executionTarget, .mac)
         XCTAssertEqual(moved.actor, .bot(f.bot.id))
         XCTAssertNil(f.vm.vmUnavailableBotID)
+    }
+
+    /// WHY: a detached Desk or Linux desktop window builds its own short-lived Bots
+    /// model. If it took over the router-wide run hooks, closing it left them pointing
+    /// at a dead model and every workspace bot send failed with "Bot unavailable.".
+    func test_closedDetachedBotsWindowDoesNotBreakWorkspaceBotRunHooks() throws {
+        let f = try makeFixture()
+        autoreleasepool {
+            let detached = BotsViewModel(context: f.ctx, router: f.router, loadImmediately: false)
+            detached.prepareDetachedDesk(botID: f.bot.id)
+        }
+        try XCTUnwrap(f.router.botWorkspaceRunHooks).link(f.bot.id, f.thread.id)
+        XCTAssertEqual(
+            try f.ctx.botStore.conversationLinked(to: f.thread.id)?.botID, f.bot.id,
+            "the hooks must still reach the live Bots model after the detached window closed"
+        )
     }
 
     // MARK: - Guest thread → Mac handoff (plan A M10)
@@ -351,7 +374,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         f.vm.setRunActor(.bot(f.bot.id))
         f.vm.prompt = "oi"
         await f.vm.send()
-        XCTAssertEqual(f.vm.statusMessage, "Workspace removido")
+        XCTAssertEqual(f.vm.statusMessage, "Workspace removed")
         try await Task.sleep(nanoseconds: 200_000_000)
         XCTAssertTrue(f.runner.requests.isEmpty)
     }
@@ -556,5 +579,14 @@ final class BotVMFailureHandlingTests: XCTestCase {
         XCTAssertEqual(docker.execs.first?.name, "busy")
         XCTAssertEqual(docker.execs.first?.command, ["pkill", "-f", "bash -lc"])
         XCTAssertEqual(docker.execs.first?.user, "root")
+    }
+
+    func test_deskHeaderHasNoContextMenu_becauseContextIsAutomatic() throws {
+        // WHY: the owner (2026-10-19) did not know what "Context: Legacy" did. A new
+        // conversation inherits its context and workspace bots get theirs at creation.
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/AppShell/BotsWindow.swift"), encoding: .utf8)
+        XCTAssertFalse(source.contains("Text(\"Context: \\(vm.selectedPinnedContextLabel)\")"))
+        XCTAssertFalse(source.contains("bots.desk.context\")"))
     }
 }

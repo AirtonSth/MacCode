@@ -169,7 +169,7 @@ public final class ScheduledTaskExecutor {
             title: task.title,
             provider: task.provider,
             model: task.model.isEmpty ? modelSelection.effectiveModel : task.model,
-            permissionMode: .fullAccess,
+            permissionMode: task.permissionMode,
             reasoningEffort: task.reasoningEffort,
             reasoningModel: task.provider == .distill ? task.reasoningModel : nil,
             modelSelection: modelSelection,
@@ -180,15 +180,22 @@ public final class ScheduledTaskExecutor {
             quiet: true
         )
         try onThreadCreated?(thread.id)
+        if task.executionMode != .local {
+            _ = try router.configureAgentThreadExecution(
+                thread: thread.id,
+                executionMode: task.executionMode,
+                baseBranch: task.baseBranch
+            )
+        }
 
         let sendResult = try await router.sendAgentMessage(
             thread: thread.id,
             text: dispatchPrompt,
             provider: task.provider,
             model: task.model.isEmpty ? nil : task.model,
-            permissionMode: .fullAccess,
+            permissionMode: task.permissionMode,
             reasoningEffort: task.reasoningEffort,
-            interactionMode: .default,
+            interactionMode: task.interactionMode,
             modelSelection: modelSelection,
             providerInstanceId: task.providerInstanceID,
             attachments: [],
@@ -411,7 +418,8 @@ public final class ScheduledTaskExecutor {
             distillMainEffortSelection: task.provider == .distill
                 ? (task.distillMainEffortSelection ?? .fixed(task.reasoningEffort)) : nil,
             distillReasoningEffortSelection: task.provider == .distill
-                ? (task.distillReasoningEffortSelection ?? .automatic) : nil
+                ? (task.distillReasoningEffortSelection ?? .automatic) : nil,
+            distillUltracode: task.provider == .distill && task.distillUltracode
         )
     }
 

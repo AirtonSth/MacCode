@@ -60,6 +60,10 @@ final class HostRestoreLegacySchemaTests: XCTestCase {
                                  provider: .distill, providerInstanceID: "distill-acp", model: "test", reasoningEffort: .high,
                                  recurrence: .daily(at: ScheduledLocalTime(hour: 8, minute: 15)!), timeZoneIdentifier: "UTC",
                                  isEnabled: true, nextRunAt: base, createdAt: base, updatedAt: base)
+        // The store writes v100 run-option columns; a v93 source gets them only while seeding.
+        let runOptionColumns = ["distill_ultracode INTEGER NOT NULL DEFAULT 0", "permission_mode TEXT NOT NULL DEFAULT 'full_access'",
+                                "interaction_mode TEXT NOT NULL DEFAULT 'default'", "execution_mode TEXT NOT NULL DEFAULT 'local'", "base_branch TEXT"]
+        for column in runOptionColumns { try source.execute("ALTER TABLE scheduled_tasks ADD COLUMN \(column);") }
         try ScheduledTaskStore(db: source).save(task)
         let stopped = AgentRun(threadId: agent.id, provider: .distill, model: "test", status: .running)
         let imported = AgentRun(threadId: botThread.id, provider: .distill, model: "test", status: .running)
@@ -69,6 +73,9 @@ final class HostRestoreLegacySchemaTests: XCTestCase {
         let scheduled = try XCTUnwrap(scheduleStore.claimDue(now: base, owner: "legacy-source").first)
         try scheduleStore.attachThread(runID: scheduled.run.id, threadID: agent.id)
         try scheduleStore.markStarted(runID: scheduled.run.id, threadID: agent.id, agentRunID: stopped.id)
+        for column in runOptionColumns.reversed() {
+            try source.execute("ALTER TABLE scheduled_tasks DROP COLUMN \(column.split(separator: " ")[0]);")
+        }
         let authority = BotRemoteControlAuthority(db: source, store: store, settings: SettingsStore(db: source), appSupportDirectory: root)
         _ = try authority.dispatch(method: "bot.routing.set", params: ["client_request_id": "legacy-main-route", "host_id": "legacy-host", "bot_id": b.id.value.uuidString.lowercased(), "provider": "distill", "provider_instance_id": "distill-acp", "model": "test"])
         let current = try SQLiteDB(path: root.appendingPathComponent("current.sqlite").path)

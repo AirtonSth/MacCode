@@ -63,6 +63,29 @@ final class ScheduledTaskTests: XCTestCase {
         XCTAssertEqual(decoded.effectiveRoutingMode, .manual)
     }
 
+    func test_missingRunOptionsDecodeAsNewMessageDefaults_becauseOlderTasksMustKeepRunningUnchanged() throws {
+        let task = ScheduledTask(
+            title: "Legacy", prompt: "Run", workspaceID: WorkspaceID(), workspacePathSnapshot: "/tmp",
+            runAsUser: "sam", runAsUID: 501, provider: .distill, providerInstanceID: "distill",
+            model: "auto", reasoningEffort: .high, distillUltracode: true, permissionMode: .supervised,
+            interactionMode: .plan, executionMode: .worktree, baseBranch: "main",
+            recurrence: .daily(at: ScheduledLocalTime(hour: 9, minute: 0)!), timeZoneIdentifier: "UTC"
+        )
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(task)) as? [String: Any])
+        for key in ["distillUltracode", "permissionMode", "interactionMode", "executionMode", "baseBranch"] {
+            object.removeValue(forKey: key)
+        }
+
+        let decoded = try JSONDecoder().decode(ScheduledTask.self, from: JSONSerialization.data(withJSONObject: object))
+
+        XCTAssertFalse(decoded.distillUltracode)
+        XCTAssertEqual(decoded.permissionMode, .fullAccess)
+        XCTAssertEqual(decoded.interactionMode, .default)
+        XCTAssertEqual(decoded.executionMode, .local)
+        XCTAssertNil(decoded.baseBranch)
+        XCTAssertEqual(try JSONDecoder().decode(ScheduledTask.self, from: JSONEncoder().encode(task)), task)
+    }
+
     func test_calculatedNextRun_usesStoredIANATimeZone_becauseSchedulesAreCivilTime() throws {
         let task = ScheduledTask(
             title: "Daily", prompt: "Run", workspaceID: WorkspaceID(), workspacePathSnapshot: "/tmp", runAsUser: "sam", runAsUID: 501,

@@ -34,7 +34,7 @@ public enum DistillGuestLaunchError: LocalizedError, CustomStringConvertible, Eq
 
     public var description: String {
         switch self {
-        case .unavailable(let reason): return "VM indisponível: \(reason)"
+        case .unavailable(let reason): return "VM unavailable: \(reason)"
         case .busy(let message): return message
         }
     }

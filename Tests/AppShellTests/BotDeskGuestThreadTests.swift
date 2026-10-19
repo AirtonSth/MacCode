@@ -256,7 +256,7 @@ final class BotDeskGuestThreadTests: XCTestCase {
         agent.prompt = "while down"
         await agent.send()
         XCTAssertEqual(agent.vmUnavailableBotID, bot.id, agent.statusMessage)
-        XCTAssertTrue(agent.statusMessage.hasPrefix("VM indisponível"), agent.statusMessage)
+        XCTAssertTrue(agent.statusMessage.hasPrefix("VM unavailable"), agent.statusMessage)
         try await Task.sleep(nanoseconds: 200_000_000)
         XCTAssertEqual(f.distill.requests.count, runsBefore, "no run while the VM is down")
         XCTAssertEqual(try f.ctx.threadRepo.get(id: thread.id)?.executionTarget, .vm, "no silent fallback")
@@ -312,7 +312,7 @@ final class BotDeskGuestThreadTests: XCTestCase {
         agent.prompt = "after docker stop"
         await agent.send()
         XCTAssertEqual(agent.vmUnavailableBotID, bot.id, agent.statusMessage)
-        XCTAssertTrue(agent.statusMessage.hasPrefix("VM indisponível"), agent.statusMessage)
+        XCTAssertTrue(agent.statusMessage.hasPrefix("VM unavailable"), agent.statusMessage)
         XCTAssertTrue(docker.calls.contains { $0.first == "inspect" }, "the gate must ask Docker: \(docker.calls)")
         XCTAssertFalse(f.vm.isGuestRunning(bot.id), "the desk stops claiming a desktop Docker says is down")
         try await Task.sleep(nanoseconds: 200_000_000)

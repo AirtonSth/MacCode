@@ -403,14 +403,14 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
 }
 
 private struct BotRunUnavailableError: LocalizedError {
-    var errorDescription: String? { "Bot indisponível." }
+    var errorDescription: String? { "Bot unavailable." }
 }
 
 /// `AgentAppViewModel.lockThreadToBot` found the thread's actor already
 /// locked (another device or window locked it first). Nothing was written.
 public struct ThreadActorAlreadyLockedError: LocalizedError {
     public var errorDescription: String? {
-        "Esta conversa já foi definida para outro ator. Revise o ator e envie de novo."
+        "This conversation is already assigned to another actor. Review the actor and try sending again."
     }
 }
 
@@ -589,7 +589,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Display name used in refusal messages; nil when unknown.
     public var botNameProvider: (BotID) -> String? = { _ in nil }
     /// Embedded desk only: opens the hand-off thread in the source thread's workspace
-    /// (the desk's synthetic workspace cannot hold it). Nil hides "Continuar sem bot".
+    /// (the desk's synthetic workspace cannot hold it). Nil hides "Continue without bot".
     public var handoffHost: ((AgentThreadID, RunActor) -> Void)?
     /// A hand-off needs a host when this VM is an embedded desk.
     public var canContinueWithoutBot: Bool { embedding == nil || handoffHost != nil }
@@ -619,7 +619,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var botVMPreflight: ((BotID, String?) async -> String?)?
     /// Starts (provisions) the bot VM; returns a user-facing error or nil. Wired by the host.
     public var botVMProvision: ((BotID) async -> String?)?
-    /// Set when the VM preflight failed; drives the "VM indisponível" banner.
+    /// Set when the VM preflight failed; drives the "VM unavailable" banner.
     @Published public var vmUnavailableBotID: BotID?
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
     @Published public var model: String = AgentDefaultModelSelection.builtInDefault(for: .defaultProvider)
@@ -6291,7 +6291,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
               let id = selectedThreadId,
               case .bot(let botID) = threads.first(where: { $0.id == id })?.actor else { return false }
         let label = botNameProvider(botID).map { "Bot \($0)" } ?? "Bot"
-        statusMessage = "\(label) foi apagado. Use \"Continuar sem bot\"."
+        statusMessage = "\(label) has been deleted. Use \"Continue without bot\"."
         return true
     }
 
@@ -6320,13 +6320,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             ? nil
             : thread?.worktreePath ?? cwd
         if let workspace, !FileManager.default.fileExists(atPath: workspace) {
-            statusMessage = "Workspace removido"
+            statusMessage = "Workspace removed"
             return true
         }
         guard executionTarget(for: botID) == .vm else { return false }
         guard let preflight = botVMPreflight else { return false }
         if let failure = await preflight(botID, workspace) {
-            statusMessage = "VM indisponível: \(failure)"
+            statusMessage = "VM unavailable: \(failure)"
             vmUnavailableBotID = botID
             return true
         }
@@ -6472,7 +6472,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let botID = vmUnavailableBotID, let provision = botVMProvision else { return }
         Task {
             if let failure = await provision(botID) {
-                statusMessage = "VM indisponível: \(failure)"
+                statusMessage = "VM unavailable: \(failure)"
             } else {
                 vmUnavailableBotID = nil
                 statusMessage = ""
@@ -12933,22 +12933,6 @@ public enum AgentUndoToastPlacement {
 }
 
 public struct AgentAppView: View {
-    static func choicesViewportHeight(availableHeight: CGFloat) -> CGFloat {
-        min(240, max(0, availableHeight * 0.32))
-    }
-
-    static func hasVisibleChoicesCards(ordinaryPending: Bool, openNoticeCount: Int) -> Bool {
-        ordinaryPending || openNoticeCount > 0
-    }
-
-    private var hasVisibleChoicesCards: Bool {
-        let ordinaryPending = vm.showsBotChoices
-            && AgentChatChoicesCard.Pending.latest(in: vm.messages, isRunning: vm.hasRunningWorkForChrome)
-                .map { !dismissedChoices.contains($0.messageID) } == true
-        let openNoticeCount = vm.embedding?.noticeChoiceHandler == nil ? 0
-            : AgentChatChoicesCard.Pending.openNotices(in: vm.messages, dismissed: dismissedChoices).count
-        return Self.hasVisibleChoicesCards(ordinaryPending: ordinaryPending, openNoticeCount: openNoticeCount)
-    }
     struct QueueStatusBannerPresentation: Equatable {
         let message: String
         let offersCopy: Bool
@@ -15672,23 +15656,6 @@ public struct AgentAppView: View {
             }
             backgroundAwaitBanner
             pendingCallbackRows
-            // The card reads the composer draft and the transcript, which
-            // publish on their own objects (not the VM): observe both here so
-            // typing a draft disables the card and new replies refresh it.
-            ComposerReactiveScope(composerState: vm.composerState) {
-                TranscriptReactiveScope(transcriptState: vm.transcriptState) {
-                    if hasVisibleChoicesCards {
-                        ScrollView(.vertical) {
-                            choicesCardRow
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .frame(height: Self.choicesViewportHeight(availableHeight: availableHeight))
-                        .clipped()
-                        .accessibilityIdentifier("agent.choices.scroll")
-                    }
-                }
-            }
             // A failed page read stays on screen with Retry; the transcript
             // above shows no "No messages" for it. No dismiss: without the
             // strip the unread thread would be a blank column with no Retry.
@@ -16219,6 +16186,15 @@ public struct AgentAppView: View {
                                 )
                                 .id(row.id)
                             }
+                            // Decisions live in the chat: each notice sits under its own
+                            // message (see transcriptEntryRow); the newest reply's answers
+                            // and any notice whose message is not painted follow the last row.
+                            choicesTimelineTail(
+                                paintedMessageIDs: Self.paintedMessageIDs(
+                                    visibleEntries,
+                                    hidden: hiddenPersistedAssistantMessageIDs
+                                )
+                            )
                             if Self.shouldRenderActivePlan(
                                 plan: vm.activePlan,
                                 status: vm.status,
@@ -16428,55 +16404,50 @@ public struct AgentAppView: View {
         }
     }
 
-    /// Ready-made answers from the newest reply, while the user still has to
-    /// answer it. Picking sends the answer like the composer would. In
-    /// Titio's inbox every open notice card stacks here too (hub spec §7).
-    @ViewBuilder
-    private var choicesCardRow: some View {
-        noticeCardStack
-        if vm.showsBotChoices,
-           let pending = AgentChatChoicesCard.Pending.latest(
-            in: vm.messages,
-            isRunning: vm.hasRunningWorkForChrome
-        ), !dismissedChoices.contains(pending.messageID) {
-            AgentChatChoicesCard(
-                choices: pending.choices,
-                identifier: "agent.choices.\(pending.messageID)",
-                // Answering goes through the composer's send; never replace a
-                // draft the user is writing.
-                isBlockedByDraft: !vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || !vm.attachments.isEmpty,
-                onAnswer: { answer in
-                    // Re-checked at tap time: never overwrite a draft.
-                    guard vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                          vm.attachments.isEmpty else { return }
-                    vm.prompt = answer
-                    Task { await vm.send() }
-                },
-                onDismiss: {
-                    dismissedChoices.insert(pending.messageID)
-                    AgentChatChoicesCard.DismissedStore.insert(pending.messageID)
-                }
-            )
-            .padding(.horizontal, 22)
-            .padding(.vertical, DS.Space.md)
-            .id(pending.messageID)
-        }
+    /// Message ids the timeline paints as rows, so a notice card is drawn once.
+    static func paintedMessageIDs(_ entries: [TranscriptEntry], hidden: Set<AgentMessageID>) -> Set<String> {
+        Set(entries.compactMap { entry in
+            guard case .message(let message) = entry, !hidden.contains(message.id) else { return nil }
+            return message.id.value.uuidString.lowercased()
+        })
     }
 
-    /// Every assistant message whose choices carry a `notice` key, newest
-    /// `TitioNoticeTiming.openNoticeCardsMax` shown oldest first, with
-    /// "+N open decisions" above them. They ignore `isRunning` (a Titio run
-    /// never hides a decision) and send (message id, option index) to the host,
-    /// never text, so they have no free-text field and no draft gate.
+    /// Ready-made answers from the newest reply, while the user still has to answer
+    /// it, then open notices whose message is outside the painted window. Picking an
+    /// ordinary answer sends it like the composer would.
     @ViewBuilder
-    private var noticeCardStack: some View {
-        if let handler = vm.embedding?.noticeChoiceHandler {
-            let stack = AgentChatChoicesCard.Pending.noticeStack(
-                AgentChatChoicesCard.Pending.openNotices(
-                    in: vm.messages,
-                    dismissed: dismissedChoices
+    private func choicesTimelineTail(paintedMessageIDs: Set<String>) -> some View {
+        // The card reads the composer draft, which publishes on its own object:
+        // observe it here so typing a draft disables the card.
+        ComposerReactiveScope(composerState: vm.composerState) {
+            if vm.showsBotChoices,
+           let pending = AgentChatChoicesCard.Pending.latest(
+                in: vm.messages,
+                isRunning: vm.hasRunningWorkForChrome
+            ), !dismissedChoices.contains(pending.messageID) {
+                AgentChatChoicesCard(
+                    choices: pending.choices,
+                    identifier: "agent.choices.\(pending.messageID)",
+                    // Answering goes through the composer's send; never replace a
+                    // draft the user is writing.
+                    isBlockedByDraft: !vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || !vm.attachments.isEmpty,
+                    onAnswer: { answer in
+                        // Re-checked at tap time: never overwrite a draft.
+                        guard vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                              vm.attachments.isEmpty else { return }
+                        vm.prompt = answer
+                        Task { await vm.send() }
+                    },
+                    onDismiss: { dismissChoices(pending.messageID) }
                 )
+                .id("agent.choices.\(pending.messageID)")
+            }
+        }
+        if vm.embedding?.noticeChoiceHandler != nil {
+            let stack = AgentChatChoicesCard.Pending.noticeStack(
+                AgentChatChoicesCard.Pending.openNotices(in: vm.messages, dismissed: dismissedChoices)
+                    .filter { !paintedMessageIDs.contains($0.messageID) }
             )
             if !stack.visible.isEmpty {
                 VStack(alignment: .leading, spacing: DS.Space.md) {
@@ -16486,30 +16457,44 @@ public struct AgentAppView: View {
                             .foregroundColor(DS.Palette.textSecondary)
                             .accessibilityIdentifier("agent.choices.notices.more")
                     }
-                    ForEach(stack.visible, id: \.messageID) { pending in
-                        AgentChatChoicesCard(
-                            choices: pending.choices,
-                            identifier: "agent.choices.\(pending.messageID)",
-                            allowsOwnAnswer: false,
-                            onAnswer: { answer in
-                                // The ledger claims atomically; a repeated tap
-                                // while the first runs is answered silently.
-                                guard let index = pending.choices.options.firstIndex(of: answer) else { return }
-                                handler(pending.messageID, index)
-                            },
-                            onDismiss: {
-                                dismissedChoices.insert(pending.messageID)
-                                AgentChatChoicesCard.DismissedStore.insert(pending.messageID)
-                            }
-                        )
-                        .id(pending.messageID)
-                    }
+                    ForEach(stack.visible, id: \.messageID) { pending in noticeCard(pending) }
                 }
-                .padding(.horizontal, 22)
-                .padding(.vertical, DS.Space.md)
                 .accessibilityIdentifier("agent.choices.notices")
             }
         }
+    }
+
+    /// A notice's decision right under the message that asked it. Notices ignore
+    /// `isRunning` (a Titio run never hides a decision) and send (message id, option
+    /// index) to the host, never text, so they have no free-text field and no draft gate.
+    @ViewBuilder
+    private func inlineNoticeCard(for message: AgentMessage) -> some View {
+        if vm.embedding?.noticeChoiceHandler != nil,
+           let pending = AgentChatChoicesCard.Pending.openNotices(in: [message], dismissed: dismissedChoices).first {
+            noticeCard(pending)
+        }
+    }
+
+    private func noticeCard(_ pending: AgentChatChoicesCard.Pending) -> some View {
+        AgentChatChoicesCard(
+            choices: pending.choices,
+            identifier: "agent.choices.\(pending.messageID)",
+            allowsOwnAnswer: false,
+            onAnswer: { answer in
+                // The ledger claims atomically; a repeated tap while the first
+                // runs is answered silently.
+                guard let index = pending.choices.options.firstIndex(of: answer),
+                      let handler = vm.embedding?.noticeChoiceHandler else { return }
+                handler(pending.messageID, index)
+            },
+            onDismiss: { dismissChoices(pending.messageID) }
+        )
+        .id("agent.choices.\(pending.messageID)")
+    }
+
+    private func dismissChoices(_ messageID: String) {
+        dismissedChoices.insert(messageID)
+        AgentChatChoicesCard.DismissedStore.insert(messageID)
     }
 
     @ViewBuilder
@@ -17513,6 +17498,9 @@ public struct AgentAppView: View {
                     mentionableBots: mentionableBots,
                     relativeNow: relativeNow
                 )
+                if message.role == .assistant, !hiddenPersistedAssistantMessageIDs.contains(message.id) {
+                    inlineNoticeCard(for: message)
+                }
             case .turn(let turn):
                 turnView(turn, hideAssistantOutput: hideAssistantOutput)
             }
@@ -18776,12 +18764,12 @@ public struct AgentAppView: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.textSecondary)
                 .frame(width: 14, height: 14, alignment: .center)
-            Text("Bot apagado. Esta conversa é somente leitura.")
+            Text("This bot has been deleted. This conversation is read-only.")
                 .font(.system(size: 11))
                 .foregroundColor(DS.Palette.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
             if vm.canContinueWithoutBot {
-                Button("Continuar sem bot") {
+                Button("Continue without bot") {
                     continueWithoutBot()
                 }
                 .buttonStyle(.bordered)

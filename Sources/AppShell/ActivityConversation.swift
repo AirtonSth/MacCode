@@ -3,16 +3,52 @@ import Foundation
 import Persistence
 import Surfaces
 
+/// The live conversation shown in Activity's detail pane.
+@MainActor
+final class ActivityConversation {
+    let viewModel: AgentAppViewModel
+    /// True when the pane shows the same composer a workspace tab would.
+    let showsComposer: Bool
+    private let onClose: () -> Void
+
+    init(viewModel: AgentAppViewModel, showsComposer: Bool, onClose: @escaping () -> Void) {
+        self.viewModel = viewModel
+        self.showsComposer = showsComposer
+        self.onClose = onClose
+    }
+
+    func close() { onClose() }
+}
+
 extension AppCommandRouter {
-    /// The live conversation behind an Activity item, pinned to its thread. It is shown
-    /// without a composer: replies still go through the thread's own chat, which owns
-    /// the provider, workspace and bot-desk wiring a send needs.
-    func makeActivityConversation(_ item: ActivityWireItem) -> AgentAppViewModel? {
+    /// A thread whose workspace is open gets a real Agent App wired exactly like a
+    /// workspace tab (composer, bot prompts, queue, providers), but never registered as
+    /// a tab. A thread with no open workspace (a General Bot's Desk thread) stays a
+    /// read-only pinned view: its replies need the Desk's own wiring.
+    func makeActivityConversation(_ item: ActivityWireItem) -> ActivityConversation? {
         guard let context, let threadID = item.thread_id.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init),
               let thread = try? context.threadRepo.get(id: threadID) else { return nil }
+        if let workspaceID = thread.workspaceId, let workspace = context.state.workspaces[workspaceID] {
+            let agent = AgentAppSurface(
+                workspaceID: workspaceID, cwd: workspace.cwd, coordinator: context.coordinator,
+                threadRepo: context.threadRepo, messageRepo: context.messageRepo,
+                draftRepo: AgentThreadDraftRepository(db: context.db),
+                attachmentStore: AgentAttachmentStore(root: context.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)),
+                queuedMessageRepo: context.queuedMessageRepo, providerSessionRepo: context.providerSessionRuntimeRepo,
+                pendingCallbackRepo: context.providerPendingCallbackRepo, proposedPlanRepo: context.proposedPlanRepo,
+                checkpointRepo: context.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: context.db),
+                customModelStore: AgentCustomModelStore(repo: context.settingsRepo), planNotesStore: PlanNotesStore(db: context.db),
+                initialThreadId: threadID, orchestrationRuntime: context.orchestrationRuntime
+            )
+            wireWorkspaceAgentSurface(agent, workspace: workspaceID, ctx: context)
+            return ActivityConversation(viewModel: agent.viewModel, showsComposer: true) { [weak context] in
+                agent.close()
+                context?.threadRepo.setLiveSurfaceBinding(surfaceID: agent.descriptor.id, threadID: nil)
+            }
+        }
         let viewModel = AgentAppViewModel(
             workspaceID: thread.workspaceId ?? BotsViewModel.botDeskWorkspaceID,
-            cwd: thread.workspaceId.flatMap { context.state.workspaces[$0]?.cwd } ?? context.appSupportDirectory.path,
+            cwd: context.appSupportDirectory.path,
             coordinator: context.coordinator,
             threadRepo: context.threadRepo,
             messageRepo: context.messageRepo,
@@ -39,6 +75,6 @@ extension AppCommandRouter {
         viewModel.markThreadRead = { [weak self] id in
             try self?.markAgentThreadRead(thread: id)
         }
-        return viewModel
+        return ActivityConversation(viewModel: viewModel, showsComposer: false) { viewModel.dispose() }
     }
 }

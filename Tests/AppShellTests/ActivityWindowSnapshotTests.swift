@@ -61,7 +61,7 @@ final class ActivityWindowSnapshotTests: XCTestCase {
     private func render(
         _ name: String, items: [ActivityWireItem], counts: ActivityWireCounts, cursor: String? = nil,
         size: CGSize, selecting selected: String? = nil, failing: Bool = false, clearAll: Bool = false,
-        makeConversation: @escaping (ActivityWireItem) -> AgentAppViewModel? = { _ in nil }
+        makeConversation: @escaping (ActivityWireItem) -> ActivityConversation? = { _ in nil }
     ) async throws -> NSBitmapImageRep {
         let defaults = UserDefaults(suiteName: "activity-snapshot-\(UUID())")!
         defaults.set("needsYou", forKey: "activity.tab")
@@ -159,11 +159,29 @@ final class ActivityWindowSnapshotTests: XCTestCase {
         XCTAssertNil(router.makeActivityConversation(threadless), "an item without a thread is not a chat")
 
         let conversation = try XCTUnwrap(router.makeActivityConversation(chat))
-        XCTAssertEqual(conversation.embedding?.pinnedThreadId, thread.id, "the pane must show exactly the item's thread")
-        XCTAssertEqual(conversation.selectedThreadId, thread.id)
-        conversation.dispose()
+        XCTAssertFalse(conversation.showsComposer, "a thread with no open workspace stays read-only")
+        XCTAssertEqual(conversation.viewModel.embedding?.pinnedThreadId, thread.id, "the pane must show exactly the item's thread")
+        XCTAssertEqual(conversation.viewModel.selectedThreadId, thread.id)
+        conversation.close()
         XCTAssertEqual(try drafts.get(threadId: thread.id, providerInstanceId: "codex")?.text, "unsent reply",
                        "closing the Activity pane must never replace the draft the real chat holds")
+
+        // A thread whose workspace is open replies from Activity exactly like its workspace tab.
+        let workspace = try router.createWorkspace(name: "star", cwd: NSTemporaryDirectory())
+        let live = AgentThread(workspaceId: workspace.id, title: "Live", provider: .codex, model: "gpt-5")
+        try context.threadRepo.upsert(live)
+        var liveItem = chat
+        liveItem.thread_id = live.id.value.uuidString
+        let tabCount = context.state.workspaces[workspace.id]?.layout.paneIDs().flatMap { context.state.workspaces[workspace.id]?.layout.find(paneID: $0)?.surfaces ?? [] }.count
+        let liveConversation = try XCTUnwrap(router.makeActivityConversation(liveItem))
+        XCTAssertTrue(liveConversation.showsComposer, "an open-workspace thread must get the composer")
+        XCTAssertNil(liveConversation.viewModel.embedding, "same unpinned Agent App a workspace tab runs")
+        XCTAssertEqual(liveConversation.viewModel.selectedThreadId, live.id)
+        XCTAssertNotNil(liveConversation.viewModel.botPromptTransform, "bot threads must compile the bot prompt like a tab")
+        XCTAssertNotNil(liveConversation.viewModel.providerLaunchConfig, "sends need the tab's provider launch wiring")
+        XCTAssertEqual(context.state.workspaces[workspace.id]?.layout.paneIDs().flatMap { context.state.workspaces[workspace.id]?.layout.find(paneID: $0)?.surfaces ?? [] }.count, tabCount,
+                       "Activity must not add a tab to the workspace")
+        liveConversation.close()
 
         var made: [String] = []
         let bitmap = try await render(

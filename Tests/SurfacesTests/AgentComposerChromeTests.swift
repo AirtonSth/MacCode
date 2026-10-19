@@ -97,7 +97,7 @@ final class AgentComposerChromeTests: XCTestCase {
 
     func test_actorChipOpensWhenBotsExistEvenWithOneUserAndLockedBotOnlyOffersHandoff() {
         // WHY: with a single macOS user the old chip was static; bots must still be pickable,
-        // and a locked bot thread must stay openable for "Continuar sem bot".
+        // and a locked bot thread must stay openable for "Continue without bot".
         let bot = RunActor.bot(BotID())
         XCTAssertTrue(AgentRunAsUserPresentation.isInteractive(
             userCount: 1, botsAvailable: true, actor: .none, identityLocked: false, runLocked: false))

@@ -250,7 +250,7 @@ public final class SidebarViewModel: ObservableObject {
     nonisolated static let untitledThreadTitle = "New thread"
 
     /// Rows shown under one expanded workspace; the workspace row itself opens the full layout.
-    nonisolated static let workspaceConversationLimit = 8
+    nonisolated static let workspaceConversationLimit = 3
     /// Rows loaded per expanded workspace so "Show more" knows the hidden count.
     nonisolated static let workspaceConversationLoadLimit = 50
 

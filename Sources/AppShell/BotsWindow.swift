@@ -3804,8 +3804,14 @@ public final class BotsViewModel: ObservableObject {
         context.botPeerHandoffAuthority.addObserver(self)
         titioInboxConversationID = ((try? TitioNoticeRepository(db: context.db).inboxState())?.conversationID)
             .flatMap(UUID.init(uuidString:)).map(BotConversationID.init)
-        // Queued bot-thread sends can drain before any desk is opened.
-        if let router { installBotQueueHooks(on: router) }
+        // Queued bot-thread sends can drain before any desk is opened. The hooks are
+        // router-wide and capture this model weakly, so only the first live model owns
+        // them: a detached Desk or Linux desktop window must not replace them and leave
+        // every workspace bot send failing with "Bot unavailable." once it closes.
+        if let router, router.botWorkspaceRunHooksOwner == nil {
+            router.botWorkspaceRunHooksOwner = self
+            installBotQueueHooks(on: router)
+        }
         restoreQueuedFollowUpsIfNeeded()
         restoreComposerDraftsIfNeeded()
         restoreInspectorDraftsIfNeeded()
@@ -4046,6 +4052,27 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         scheduleTaskDraft = BotScheduleTaskDraft(botID: bot.id)
+    }
+
+    /// Switches an in-progress workspace task to a Bot schedule, keeping what the user typed.
+    public func beginScheduleTask(botID: BotID, carrying draft: ScheduledTaskEditorDraft) {
+        var next = BotScheduleTaskDraft(botID: botID)
+        next.name = draft.title
+        next.prompt = draft.prompt
+        next.spec.provider = draft.provider
+        next.spec.providerInstanceID = draft.providerInstanceID
+        next.spec.model = draft.model
+        next.spec.reasoningEffort = draft.reasoningEffort
+        next.spec.reasoningModel = draft.reasoningModel
+        next.spec.distillMainEffortSelection = draft.distillMainEffortSelection
+        next.spec.distillReasoningEffortSelection = draft.distillReasoningEffortSelection
+        next.spec.routingMode = draft.routingMode
+        next.spec.distillUltracode = draft.distillUltracode
+        next.spec.permissionMode = draft.permissionMode
+        next.spec.frequencyRules = draft.frequencyRules
+        next.spec.timeZoneIdentifier = draft.timeZoneIdentifier
+        next.isEnabled = draft.isEnabled
+        scheduleTaskDraft = next
     }
 
     public func editScheduleTask(_ item: BotScheduleTaskItem) {
@@ -7454,6 +7481,8 @@ public final class BotsViewModel: ObservableObject {
             ? (spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)) : nil
         routing.distillReasoningEffortSelection = spec.provider == .distill
             ? (spec.distillReasoningEffortSelection ?? .automatic) : nil
+        routing.distillUltracode = spec.provider == .distill && (spec.distillUltracode ?? false)
+        if let permission = spec.permissionMode { routing.permissionMode = permission }
         return routing
     }
 
@@ -10779,14 +10808,14 @@ public final class BotsViewModel: ObservableObject {
         router.configureBotVMHooks(on: vm)
         vm.botVMPreflight = { [weak self, weak router] botID, workspace in
             if let workspace {
-                guard let router else { return "Bot indisponível." }
+                guard let router else { return "Bot unavailable." }
                 return await router.botVMPreflight(botID, workspace: workspace)
             }
-            guard let self else { return "Bot indisponível." }
+            guard let self else { return "Bot unavailable." }
             return await self.deskGuestDesktopPreflight(botID)
         }
         vm.botVMProvision = { [weak self] botID in
-            guard let self else { return "Bot indisponível." }
+            guard let self else { return "Bot unavailable." }
             return await self.deskGuestDesktopFailure(botID)
         }
         router.wireQueueDrainControl(on: vm, context: context)
@@ -10887,11 +10916,11 @@ public final class BotsViewModel: ObservableObject {
                 try self?.linkWorkspaceThread(threadID, toBot: botID)
             },
             promptTransform: { [weak self] botID, text, threadID, runID in
-                guard let self else { throw BotDeskSendRefused(reason: "Bot indisponível.") }
+                guard let self else { throw BotDeskSendRefused(reason: "Bot unavailable.") }
                 let bot = try self.liveBotForWorkspaceRun(botID)
                 guard let conversation = try self.botStore.conversationLinked(to: threadID),
                       conversation.botID == bot.id else {
-                    throw BotDeskSendRefused(reason: "Bot indisponível.")
+                    throw BotDeskSendRefused(reason: "Bot unavailable.")
                 }
                 // Carries the VM rules for a thread locked to the bot's VM.
                 return try self.compileDeskPrompt(
@@ -10922,7 +10951,7 @@ public final class BotsViewModel: ObservableObject {
                 ? try self.liveBotForWorkspaceRun(botID)
                 : (self.bots.first(where: { $0.id == botID }) ?? (try? self.botStore.get(id: botID)))
             guard let bot, let conversation, conversation.botID == bot.id else {
-                if actorBotID != nil { throw BotDeskSendRefused(reason: "Bot indisponível.") }
+                if actorBotID != nil { throw BotDeskSendRefused(reason: "Bot unavailable.") }
                 return nil
             }
             let prompt = try self.compileDeskPrompt(
@@ -10960,7 +10989,7 @@ public final class BotsViewModel: ObservableObject {
         let stored = try? botStore.get(id: botID)
         guard let bot = stored ?? nil, bot.deletedAt == nil else {
             let label = (stored ?? nil).map { "Bot \($0.name)" } ?? "Bot"
-            throw BotDeskSendRefused(reason: "\(label) foi apagado. Use \"Continuar sem bot\".")
+            throw BotDeskSendRefused(reason: "\(label) has been deleted. Use \"Continue without bot\".")
         }
         return bot
     }
@@ -10971,7 +11000,7 @@ public final class BotsViewModel: ObservableObject {
         let bot = try liveBotForWorkspaceRun(botID)
         if let existing = try botStore.conversationLinked(to: threadID) {
             guard existing.botID == bot.id else {
-                throw BotDeskSendRefused(reason: "Esta conversa já pertence a outro bot.")
+                throw BotDeskSendRefused(reason: "This conversation already belongs to another bot.")
             }
             return
         }
@@ -12957,8 +12986,6 @@ public struct BotsRootView: View {
     private var studioCompact: Bool { studioWidth < Self.studioCompactWidth }
     @State private var pendingDockerDataClear: BotID?
     @State private var isConfirmingTitioFactoryReset = false
-    @State private var pendingContextGrant: (botID: BotID, context: BotContext, contextName: String)?
-    @State private var contextExportModel: BotContextExportModel?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(vm: BotsViewModel) {
@@ -13889,40 +13916,6 @@ public struct BotsRootView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Open Studio for \(BotsViewModel.displayName(bot.name))")
             .accessibilityIdentifier("bots.desk.identity")
-            Menu {
-                Text(vm.selectedPinnedContextLabel)
-                Divider()
-                Button("Export selected excerpts…") {
-                    do { contextExportModel = try vm.makeContextExportModel() }
-                    catch { vm.errorMessage = error.localizedDescription }
-                }
-                .disabled(vm.selectedPinnedContextLabel == "Legacy")
-                .accessibilityIdentifier("bots.desk.export.open")
-                Divider()
-                Button("New conversation in General") { vm.createDeskThread(in: .general) }
-                ForEach(vm.existingWorkspaceContexts, id: \.id) { workspace in
-                    Button("New conversation in \(workspace.name)") { vm.createDeskThread(in: .workspace(workspace.id)) }
-                }
-                if let botID = vm.selectedBotID {
-                    Divider()
-                    Button("Allow read and send in General…") {
-                        pendingContextGrant = (botID, .general, "General")
-                    }
-                    ForEach(vm.existingWorkspaceContexts, id: \.id) { workspace in
-                        Button("Allow read and send in \(workspace.name)…") {
-                            pendingContextGrant = (botID, .workspace(workspace.id), workspace.name)
-                        }
-                    }
-                }
-            } label: {
-                Text("Context: \(vm.selectedPinnedContextLabel)")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .lineLimit(1)
-            }
-            .help("Contextual conversations keep a fixed context.")
-            .accessibilityLabel("Conversation context: \(vm.selectedPinnedContextLabel)")
-            .accessibilityIdentifier("bots.desk.context")
             Spacer(minLength: DS.Space.lg)
             HStack(spacing: Self.deskHeaderIconSpacing) {
                 DSIconButton("gearshape", help: "Studio") {
@@ -13956,20 +13949,6 @@ public struct BotsRootView: View {
         .padding(.trailing, DS.Space.xl)
         .frame(height: 44)
         .dsBar(edge: .bottom)
-        .sheet(item: $contextExportModel, onDismiss: { contextExportModel?.cancel(); contextExportModel = nil }) { model in
-            BotContextExportSheet(model: model)
-        }
-        .onChange(of: vm.selectedBotID) { _, _ in contextExportModel?.invalidate() }
-        .onChange(of: vm.selectedConversation?.id) { _, _ in contextExportModel?.invalidate() }
-        .confirmationDialog("Allow read and send in \(pendingContextGrant?.contextName ?? "context") for \(pendingContextGrant?.botID.description ?? "Bot")?", isPresented: Binding(get: { pendingContextGrant != nil }, set: { if !$0 { pendingContextGrant = nil } }), titleVisibility: .visible) {
-            Button("Allow read and send") {
-                if let target = pendingContextGrant { _ = vm.allowReadAndSend(botID: target.botID, context: target.context) }
-                pendingContextGrant = nil
-            }
-            Button("Cancel", role: .cancel) { pendingContextGrant = nil }
-        } message: {
-            Text("Grant only conversation read and send rights in \(pendingContextGrant?.contextName ?? "this context") for Bot \(pendingContextGrant?.botID.description ?? "unknown"). Execution remains unavailable.")
-        }
     }
 
     private func deskChat(_ bot: BotDefinition) -> some View {

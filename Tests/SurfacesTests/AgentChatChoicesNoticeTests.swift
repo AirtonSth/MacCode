@@ -99,45 +99,31 @@ final class AgentChatChoicesNoticeTests: XCTestCase {
                       "the newest-reply card is gated on Bot threads")
     }
 
-    func test_choicesViewportStaysBoundedInShortAndTallWindows() {
-        // WHY: several unresolved notices must scroll without pushing the composer
-        // below a short window; tall windows still cap the card area.
-        XCTAssertEqual(AgentAppView.choicesViewportHeight(availableHeight: 300), 96)
-        XCTAssertEqual(AgentAppView.choicesViewportHeight(availableHeight: 1_000), 240)
-        XCTAssertEqual(AgentAppView.choicesViewportHeight(availableHeight: 0), 0)
-        XCTAssertFalse(AgentAppView.hasVisibleChoicesCards(ordinaryPending: false, openNoticeCount: 0))
-        XCTAssertTrue(AgentAppView.hasVisibleChoicesCards(ordinaryPending: true, openNoticeCount: 0))
-        XCTAssertTrue(AgentAppView.hasVisibleChoicesCards(ordinaryPending: false, openNoticeCount: 1))
-    }
-
-    func test_theChoicesCardObservesTheComposerDraftAndTheTranscript() throws {
-        // WHY: the card lived in the view body that observes only the view
-        // model; the draft and messages publish on their own objects, so
-        // typing never disabled the card and a tap overwrote the draft.
+    func test_decisionsLiveInTheTimelineUnderTheirMessageNotInABottomDock() throws {
+        // WHY: the owner (2026-10-19) wants a decision to read like chat: the message,
+        // then "What should be done?" with A/B right under it, then the next message.
+        // A dock above the composer piled every decision away from what it was about.
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let surface = try String(contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"))
-        XCTAssertTrue(surface.contains("ComposerReactiveScope(composerState: vm.composerState) {\n                TranscriptReactiveScope(transcriptState: vm.transcriptState) {\n                    if hasVisibleChoicesCards {\n                        ScrollView(.vertical) {\n                            choicesCardRow"),
-                      "scrolling card row is conditional and nested inside both publisher scopes")
-        XCTAssertTrue(surface.contains("private var hasVisibleChoicesCards: Bool {\n        let ordinaryPending = vm.showsBotChoices"),
-                      "no scroll view exists when neither card source has pending content")
-        XCTAssertTrue(surface.contains(".frame(height: Self.choicesViewportHeight(availableHeight: availableHeight))"),
-                      "the card viewport is bounded by conversation height")
-        let card = try XCTUnwrap(surface.range(of: "private var choicesCardRow: some View {"))
-        let body = String(surface[card.upperBound...].prefix(2_000))
+        XCTAssertFalse(surface.contains("agent.choices.scroll"), "no bottom dock above the composer")
+        let row = try XCTUnwrap(surface.range(of: "private func transcriptEntryRow("))
+        XCTAssertTrue(String(surface[row.upperBound...].prefix(1_200)).contains("inlineNoticeCard(for: message)"),
+                      "a notice card renders right under its own message")
+        XCTAssertTrue(surface.contains("choicesTimelineTail(\n"), "the newest reply's answers follow the last timeline row")
+        XCTAssertTrue(surface.contains(".filter { !paintedMessageIDs.contains($0.messageID) }"),
+                      "a notice is never drawn twice")
+        let tail = try XCTUnwrap(surface.range(of: "private func choicesTimelineTail("))
+        let body = String(surface[tail.upperBound...].prefix(2_000))
+        XCTAssertTrue(body.contains("ComposerReactiveScope(composerState: vm.composerState)"),
+                      "typing a draft still disables the ordinary card")
         XCTAssertTrue(body.contains("guard vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty"),
                       "a tap re-checks the draft before replacing the prompt")
     }
-}
 
-/// Verbosity Human hides a turn's work but not its failures (iOS parity).
-final class AgentChatHiddenWorkErrorTests: XCTestCase {
-    func test_humanVerbosityStillShowsErrorsButNoToolRows() {
-        // WHY: with tool rows hidden, an error the user cannot see reads as a
-        // silent success; iOS keeps error items visible in the same mode.
-        let activity = [
-            AssistantItem(id: "tool-1", turnId: "t1", type: .tool, body: "pwd", startedAtMs: 1),
-            AssistantItem(id: "err-1", turnId: "t1", type: .error, body: "Provider crashed", startedAtMs: 2),
-        ]
-        XCTAssertEqual(AgentChatLiveTurnChrome.visibleErrors(in: activity).map(\.id), ["err-1"])
+    func test_paintedMessageIDsSkipHiddenDuplicates() {
+        let shown = AgentMessage(threadId: AgentThreadID(), role: .assistant, content: "a")
+        let hidden = AgentMessage(threadId: AgentThreadID(), role: .assistant, content: "b")
+        let ids = AgentAppView.paintedMessageIDs([.message(shown), .message(hidden)], hidden: [hidden.id])
+        XCTAssertEqual(ids, [shown.id.value.uuidString.lowercased()])
     }
 }

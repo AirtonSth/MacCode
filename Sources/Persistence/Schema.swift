@@ -74,7 +74,10 @@ public enum Schema {
     static let relayKeysSchemaVersion = 98
     /// v99 adds bots.sort_order (user drag order; NULL = never ordered).
     static let botSortOrderSchemaVersion = 99
-    public static let currentVersion: Int = botSortOrderSchemaVersion
+    /// v100 stores every new-message run option on scheduled tasks (Ultracode,
+    /// permission, plan mode, execution location and base branch).
+    static let scheduledTaskRunOptionsSchemaVersion = 100
+    public static let currentVersion: Int = scheduledTaskRunOptionsSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1957,6 +1960,13 @@ public enum Schema {
         SchemaStep(botSortOrderSchemaVersion, """
         ALTER TABLE bots ADD COLUMN sort_order INTEGER;
         """),
+        SchemaStep(scheduledTaskRunOptionsSchemaVersion, """
+        ALTER TABLE scheduled_tasks ADD COLUMN distill_ultracode INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE scheduled_tasks ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'full_access';
+        ALTER TABLE scheduled_tasks ADD COLUMN interaction_mode TEXT NOT NULL DEFAULT 'default';
+        ALTER TABLE scheduled_tasks ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'local';
+        ALTER TABLE scheduled_tasks ADD COLUMN base_branch TEXT;
+        """),
     ]
 
     /// Additive and idempotent. `key` reuses today's banner identifiers, so a
@@ -2158,7 +2168,7 @@ public enum Schema {
     private static let migrationAppliedAtFormatter = ISO8601DateFormatter()
 
     static func trustedRestoreSchema(version: Int) throws -> SQLiteDB {
-        guard [93, 96, hostRestoreQueueHoldsSchemaVersion, relayKeysSchemaVersion, currentVersion].contains(version) else {
+        guard [93, 96, hostRestoreQueueHoldsSchemaVersion, relayKeysSchemaVersion, botSortOrderSchemaVersion, currentVersion].contains(version) else {
             throw SQLiteError.execute("unsupported restore schema version")
         }
         let db = try SQLiteDB(path: ":memory:")

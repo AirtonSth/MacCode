@@ -223,6 +223,30 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertNoThrow(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot))
     }
 
+    func test_ultracodeReachesTheRunSelectionOnlyForDistill_becauseScheduledRunsMustMatchTheComposer() {
+        var task = makeHourly(nextRunAt: nil)
+        task.provider = .distill
+        task.model = "auto"
+        task.distillUltracode = true
+        XCTAssertTrue(ScheduledTaskExecutor.modelSelection(for: task).distillUltracode)
+        task.distillUltracode = false
+        XCTAssertFalse(ScheduledTaskExecutor.modelSelection(for: task).distillUltracode)
+    }
+
+    @MainActor
+    func test_botScheduleCarriesUltracodeAndPermission_becauseBotRunsMustMatchTheComposer() {
+        var spec = BotScheduleSpec(provider: .distill, providerInstanceID: "distill", model: "auto")
+        spec.distillUltracode = true
+        spec.permissionMode = .supervised
+        let routing = BotsViewModel.routineRouting(spec, base: BotDeskRouting())
+        XCTAssertTrue(routing.distillUltracode)
+        XCTAssertEqual(routing.permissionMode, .supervised)
+
+        let legacy = BotsViewModel.routineRouting(BotScheduleSpec(provider: .distill), base: BotDeskRouting())
+        XCTAssertFalse(legacy.distillUltracode)
+        XCTAssertEqual(legacy.permissionMode, BotDeskRouting().permissionMode, "Old specs keep the Bot default")
+    }
+
     func test_autoRoutingConfigurationCarriesScheduledFallbackAndEligibleProviders() {
         var task = makeHourly(nextRunAt: nil)
         task.routingMode = .auto
