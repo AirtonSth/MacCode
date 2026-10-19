@@ -104,6 +104,57 @@ final class FilesEditorIntelligenceTests: XCTestCase {
     }
 
     @MainActor
+    func test_editorConfiguresUndoAndNativeFindBar() {
+        let textView = CodeEditorTextView()
+        textView.configureForEditing()
+        XCTAssertTrue(textView.allowsUndo)
+        XCTAssertTrue(textView.usesFindBar, "Cmd+F must open the native find-in-file bar")
+        XCTAssertTrue(textView.isIncrementalSearchingEnabled)
+        XCTAssertFalse(textView.isRichText)
+        XCTAssertFalse(textView.isAutomaticQuoteSubstitutionEnabled,
+            "code must never turn straight quotes into smart quotes")
+    }
+
+    @MainActor
+    func test_externalTextUpdateKeepsCaretAndSelection() {
+        let textView = CodeEditorTextView()
+        textView.string = "let value = 1"
+        textView.selectedRange = NSRange(location: 4, length: 5)
+        let old = textView.replaceTextPreservingSelection("let other = 2")
+        XCTAssertEqual(old, "let value = 1")
+        XCTAssertEqual(textView.string, "let other = 2")
+        XCTAssertEqual(textView.selectedRange(), NSRange(location: 4, length: 5),
+            "a disk/remote update must not move the user's caret or selection")
+    }
+
+    @MainActor
+    func test_undoAndRedoRestoreTyping() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
+                              styleMask: [.titled], backing: .buffered, defer: true)
+        let textView = CodeEditorTextView()
+        textView.configureForEditing()
+        window.contentView = textView
+        textView.string = "let a = "
+        textView.setSelectedRange(NSRange(location: 8, length: 0))
+        textView.insertText("1", replacementRange: textView.selectedRange())
+        XCTAssertEqual(textView.string, "let a = 1")
+        textView.undoManager?.undo()
+        XCTAssertEqual(textView.string, "let a = ")
+        textView.undoManager?.redo()
+        XCTAssertEqual(textView.string, "let a = 1")
+    }
+
+    func test_lineNumberOffsetsMatchDocumentLines() {
+        let text = "one\ntwo\nthree"
+        let offsets = buildLineStartOffsets(text: text)
+        XCTAssertEqual(offsets, [0, 4, 8])
+        XCTAssertEqual(lineIndex(forCharOffset: 0, in: offsets), 0)
+        XCTAssertEqual(lineIndex(forCharOffset: 5, in: offsets), 1,
+            "a character in the second line must report line index 1 for the ruler")
+        XCTAssertEqual(lineIndex(forCharOffset: 9, in: offsets), 2)
+    }
+
+    @MainActor
     func test_acceptingWordCompletionIsOneUndoableEdit() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
                               styleMask: [.titled], backing: .buffered, defer: true)
@@ -134,6 +185,8 @@ final class FilesEditorIntelligenceTests: XCTestCase {
         XCTAssertTrue(prompt.contains("App.swift"))
         XCTAssertTrue(prompt.contains("swift"))
         XCTAssertTrue(prompt.contains("<cursor/>"))
+        XCTAssertTrue(prompt.contains(request.suffix),
+            "the prompt must carry the text after the caret so the model can complete in context")
     }
 
     func test_providerReturnsSanitizedCompletionAndRecordsPrompt() async throws {
@@ -168,6 +221,21 @@ final class FilesEditorIntelligenceTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? InlineCompletionError, .timedOut)
         }
+    }
+
+    @MainActor
+    func test_providerFailureLeavesTheEditorDocumentUnchanged() async {
+        let textView = CodeEditorTextView()
+        textView.string = "let x = "
+        let provider = DistillInlineCompletionProvider { _ in throw InlineCompletionError.timedOut }
+        let request = InlineCompletionRequest(
+            path: "/w/a.swift", language: "swift", text: textView.string,
+            caret: (textView.string as NSString).length
+        )
+        _ = try? await provider.complete(request)
+        XCTAssertEqual(textView.string, "let x = ",
+            "a failed or timed-out AI completion must leave the editor content untouched")
+        XCTAssertFalse(textView.hasGhost)
     }
 
     func test_providerErrorPropagatesWithoutMutatingAnything() async {

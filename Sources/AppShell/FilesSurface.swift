@@ -1495,7 +1495,7 @@ final class FilesViewModel: ObservableObject {
             loadDirectory(currentDirectory)
             if let created {
                 selectedEntry = created
-                loadFile(created)
+                openFileInTab(created)
             }
         } catch {
             errorText = String(describing: error)
@@ -3269,13 +3269,7 @@ private struct CodeTextEditor: NSViewRepresentable {
         scroll.autohidesScrollers = true
 
         let textView = CodeEditorTextView()
-        textView.isRichText = false
-        textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.isAutomaticDashSubstitutionEnabled = false
-        textView.isAutomaticTextReplacementEnabled = false
-        textView.allowsUndo = true
-        textView.usesFindBar = true
-        textView.isIncrementalSearchingEnabled = true
+        textView.configureForEditing()
         textView.delegate = context.coordinator
         textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         let palette = EditorColorPalette.resolve(isDark: NSApp.effectiveAppearance.isDark)
@@ -3330,11 +3324,14 @@ private struct CodeTextEditor: NSViewRepresentable {
         }
         if textView.string != text {
             (textView as? CodeEditorTextView)?.clearGhost()
-            let oldText = textView.string
-            let selectedRanges = textView.selectedRanges
-            textView.string = text
-            context.coordinator.applyHighlightIncremental(oldText: oldText, to: textView)
-            textView.selectedRanges = selectedRanges
+            if let editor = textView as? CodeEditorTextView {
+                if let oldText = editor.replaceTextPreservingSelection(text) {
+                    context.coordinator.applyHighlightIncremental(oldText: oldText, to: textView)
+                }
+            } else {
+                textView.string = text
+                context.coordinator.applyHighlight(to: textView)
+            }
             context.coordinator.lineNumberRuler?.invalidateLineStartCache()
             context.coordinator.lineNumberRuler?.needsDisplay = true
         }
@@ -3519,6 +3516,31 @@ final class CodeEditorTextView: NSTextView {
 
     private var ghostText: String?
     private var ghostCaret = 0
+
+    /// Code-editor behaviour shared by every mount: plain text, no smart
+    /// substitutions, undo, and the native incremental find bar.
+    func configureForEditing() {
+        isRichText = false
+        isAutomaticQuoteSubstitutionEnabled = false
+        isAutomaticDashSubstitutionEnabled = false
+        isAutomaticTextReplacementEnabled = false
+        allowsUndo = true
+        usesFindBar = true
+        isIncrementalSearchingEnabled = true
+    }
+
+    /// Replaces content from a remote/disk update without losing the caret or
+    /// selection. Returns the previous text so callers can re-highlight only
+    /// the changed lines; nil when the text was already equal.
+    @discardableResult
+    func replaceTextPreservingSelection(_ newText: String) -> String? {
+        guard string != newText else { return nil }
+        let old = string
+        let selection = selectedRanges
+        string = newText
+        selectedRanges = selection
+        return old
+    }
 
     func showGhost(_ text: String, at caret: Int) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -73,11 +73,14 @@ final class FilesOpenTabsTests: XCTestCase {
         }
 
         func fsWorkspaceCreateFile(workspace: WorkspaceID, path: String, content: String) throws -> JSONValue {
-            Self.fileEntry(path)
+            operations.append("create:\(path)")
+            contents[path] = content
+            return Self.fileEntry(path)
         }
 
         func fsWorkspaceCreateDirectory(workspace: WorkspaceID, path: String) throws -> JSONValue {
-            Self.fileEntry(path, isDirectory: true)
+            operations.append("create:\(path)")
+            return Self.fileEntry(path, isDirectory: true)
         }
 
         func fsWorkspaceMoveItem(workspace: WorkspaceID, sourcePath: String, destinationDirectoryPath: String) throws -> JSONValue {
@@ -85,9 +88,12 @@ final class FilesOpenTabsTests: XCTestCase {
         }
 
         func fsWorkspaceRename(workspace: WorkspaceID, path: String, newName: String) throws -> JSONValue {
-            Self.fileEntry((path as NSString).deletingLastPathComponent.isEmpty
+            let renamedPath = (path as NSString).deletingLastPathComponent.isEmpty
                 ? newName
-                : "\((path as NSString).deletingLastPathComponent)/\(newName)")
+                : "\((path as NSString).deletingLastPathComponent)/\(newName)"
+            operations.append("rename:\(path)->\(renamedPath)")
+            contents[renamedPath] = contents.removeValue(forKey: path)
+            return Self.fileEntry(renamedPath)
         }
 
         func filesOpenTab(workspace: WorkspaceID, sourceSurface: SurfaceID?, paneID: PaneID?, path: String) throws -> SurfaceDescriptor {
@@ -112,10 +118,14 @@ final class FilesOpenTabsTests: XCTestCase {
         }
 
         static func fileEntry(_ relativePath: String, isDirectory: Bool = false) -> JSONValue {
+            fileEntry(relativePath: relativePath, absolutePath: "/workspace/\(relativePath)", isDirectory: isDirectory)
+        }
+
+        static func fileEntry(relativePath: String, absolutePath: String, isDirectory: Bool = false) -> JSONValue {
             let name = (relativePath as NSString).lastPathComponent
             return .object([
                 "name": .string(name),
-                "path": .string("/workspace/\(relativePath)"),
+                "path": .string(absolutePath),
                 "relative_path": .string(relativePath),
                 "type": .string(isDirectory ? "directory" : "file"),
                 "size": .number(0),
@@ -184,6 +194,99 @@ final class FilesOpenTabsTests: XCTestCase {
         XCTAssertEqual(model.selectedPath, "a.swift")
         XCTAssertEqual(model.draftText, "let a = 1",
             "switching tabs must restore that file's content, not leave the other tab's text")
+    }
+
+    // MARK: Explorer actions on the shipped model
+
+    func test_createFileCreatesUnderCurrentDirectoryAndOpensIt() {
+        let router = FakeRouter()
+        _ = prepare(router)
+        let model = makeModel(router: router)
+        defer { model.close() }
+        model.loadDirectory("")
+
+        model.createFile(named: " New.swift ")
+
+        XCTAssertTrue(router.operations.contains("create:New.swift"),
+            "the explorer New File action must create the trimmed name in the current directory")
+        XCTAssertEqual(model.openTabs.map(\.relativePath), ["New.swift"],
+            "a newly created file opens in a tab like VS Code")
+        XCTAssertEqual(model.selectedPath, "New.swift")
+    }
+
+    func test_createFolderCreatesDirectoryWithoutOpeningATab() {
+        let router = FakeRouter()
+        _ = prepare(router)
+        let model = makeModel(router: router)
+        defer { model.close() }
+        model.loadDirectory("")
+
+        model.createFolder(named: "Sources")
+
+        XCTAssertTrue(router.operations.contains("create:Sources"),
+            "the explorer New Folder action must reach the directory RPC")
+        XCTAssertTrue(model.openTabs.isEmpty, "creating a folder must not open an editor tab")
+    }
+
+    func test_expandAndCollapseFetchesChildrenLazily() {
+        let router = FakeRouter()
+        router.listings[""] = [FakeRouter.fileEntry("src", isDirectory: true)]
+        router.listings["src"] = [FakeRouter.fileEntry("src/App.swift")]
+        let model = makeModel(router: router)
+        defer { model.close() }
+        model.loadDirectory("")
+        let directory = model.entries[0]
+
+        model.toggleExpand(directory)
+        XCTAssertTrue(model.isExpanded(directory))
+        XCTAssertEqual(model.childEntries(for: directory).map(\.relativePath), ["src/App.swift"],
+            "expanding a folder must show its children from the directory listing")
+
+        model.toggleExpand(directory)
+        XCTAssertFalse(model.isExpanded(directory),
+            "clicking the disclosure again must collapse the folder")
+    }
+
+    func test_renameOpenFileUpdatesItsTabAndSelection() {
+        let router = FakeRouter()
+        let entries = prepare(router)
+        let model = makeModel(router: router)
+        defer { model.close() }
+        model.loadDirectory("")
+        model.select(entries[0])
+
+        model.rename(entries[0], to: "renamed.swift")
+
+        XCTAssertTrue(router.operations.contains("rename:a.swift->renamed.swift"))
+        XCTAssertEqual(model.openTabs.map(\.relativePath), ["renamed.swift"],
+            "renaming the active file must rename its tab, not leave a stale path")
+        XCTAssertEqual(model.selectedPath, "renamed.swift")
+    }
+
+    func test_deleteOpenFileRemovesItsTabAndTheFileFromDisk() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("files-explorer-delete-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("gone.swift")
+        try "let gone = true".write(to: file, atomically: true, encoding: .utf8)
+
+        let router = FakeRouter()
+        router.listings[""] = [FakeRouter.fileEntry(relativePath: "gone.swift", absolutePath: file.path)]
+        router.contents["gone.swift"] = "let gone = true"
+        let model = FilesViewModel(surfaceID: SurfaceID(), workspaceID: WorkspaceID(), root: directory.path, router: router)
+        defer { model.close() }
+        model.loadDirectory("")
+        model.select(model.entries[0])
+
+        model.delete([model.entries[0]])
+        RunLoop.current.run(until: Date().addingTimeInterval(1.0))
+
+        XCTAssertTrue(model.openTabs.isEmpty,
+            "deleting the open file must close its editor tab")
+        XCTAssertNil(model.selectedEntry)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path),
+            "the explorer Delete action moves the file out of the workspace")
     }
 
     func test_editingAndSavingTheActiveTabWritesTheNewContentThroughTheSession() {
