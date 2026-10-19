@@ -5900,6 +5900,77 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.deskMessages.first?.text, "Scan this morning")
     }
 
+    func test_runNowFromScheduleTasksEnqueuesARun_becauseItMustMatchAScheduledFire() async throws {
+        // WHY: Run Now on a Schedule Tasks row did nothing visible. It must start the
+        // routine through the scheduled-fire executor, in place, with one new conversation.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let runner = ControlledBotHandoffRunner(provider: .claude)
+        context.coordinator.replaceProvider(.claude, runner: runner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "claude"
+            )
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.routineSpec.provider = .claude
+        vm.routineSpec.providerInstanceID = "claude"
+        vm.routineSpec.model = "opus"
+        vm.saveRoutine()
+        let routine = try XCTUnwrap(vm.routines.first)
+        vm.openScheduleTasks()
+        let before = try context.botStore.listConversations(botID: bot.id).count
+
+        vm.runRoutineNow(id: routine.definition.id)
+
+        XCTAssertNil(vm.errorMessage)
+        XCTAssertEqual(vm.screen, .scheduleTasks, "Run Now must not navigate to the desk")
+        let started = await waitUntil(timeout: 5) { !runner.requests.isEmpty }
+        XCTAssertTrue(started, "Run Now must reach the provider")
+        XCTAssertEqual(runner.requests.first?.model, "opus")
+        let conversations = try context.botStore.listConversations(botID: bot.id)
+        XCTAssertEqual(conversations.count, before + 1, "exactly one new conversation, no empty New thread")
+        XCTAssertTrue(vm.isRoutineRunning(id: routine.definition.id), "the row must show running")
+        XCTAssertNotNil(
+            try XCTUnwrap(context.botStore.listRoutines(botID: bot.id).first).activation.lastTestRunRequestedAt
+        )
+        if let runID = runner.requests.first?.runId {
+            _ = runner.finish(runID: runID, status: .cancelled, reply: nil)
+        }
+    }
+
+    func test_runNowSurfacesAFailedAdmission_becauseItMustNeverBeSilent() throws {
+        // WHY: with no runtime router the send cannot start; the user must see why.
+        let context = try makeContext()
+        let vm = BotsViewModel(context: context)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .claude)
+        vm.beginEdit(bot)
+        vm.routineName = "Morning scan"
+        vm.routinePrompt = "Scan overnight failures"
+        vm.saveRoutine()
+        let routine = try XCTUnwrap(vm.routines.first)
+        vm.openScheduleTasks()
+        vm.errorMessage = nil
+        vm.dockerGuestReadyOverrideForTesting = false
+        vm.desktopKindOverrideForTesting = .dockerDesktop
+
+        vm.runRoutineNow(id: routine.definition.id)
+
+        XCTAssertNotNil(vm.errorMessage, "a failed Run Now must be reported, not swallowed")
+        XCTAssertFalse(vm.isRoutineRunning(id: routine.definition.id))
+        XCTAssertEqual(vm.screen, .scheduleTasks)
+        XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, 0)
+    }
+
     func test_inspectorTabSurvivesRelaunch_becauseSelectedTabsAreUserWorkflowState() throws {
         let context = try makeContext()
         let vm = BotsViewModel(context: context)

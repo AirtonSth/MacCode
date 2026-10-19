@@ -7382,6 +7382,56 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// Run Now: the same executor as a scheduled fire and the paired
+    /// `bot.routine.run`. A new conversation sends the instruction on the
+    /// task's route; the user's screen and selection stay where they are.
+    /// Any failure lands in `errorMessage`, which the Schedule Tasks screen shows.
+    public func runRoutineNow(id: BotRoutineID) {
+        let botID = routines.first(where: { $0.definition.id == id })?.definition.botID
+            ?? scheduleTaskSource.first(where: { $0.id == id })?.botID
+        guard let botID else {
+            errorMessage = "Task bot is unavailable."
+            return
+        }
+        do {
+            guard let routine = try botStore.listRoutines(botID: botID)
+                .first(where: { $0.definition.id == id }) else {
+                errorMessage = "This scheduled task no longer exists."
+                return
+            }
+            guard !routine.definition.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                errorMessage = "Task instruction is required."
+                return
+            }
+            guard !isRoutineRunning(id: id) else {
+                errorMessage = "This scheduled task already has an active run."
+                return
+            }
+            let sent = try enqueueScheduledRoutine(routine)
+            if let raw = sent.objectValue?["thread_id"]?.stringValue, let uuid = UUID(uuidString: raw) {
+                runningRoutineThreads[id] = AgentThreadID(uuid)
+            }
+            try botStore.requestRoutineTestRun(id: id)
+            adoptTestRunRequested(id: id)
+            if let index = scheduleTaskSource.firstIndex(where: { $0.id == id }) {
+                scheduleTaskSource[index].lastTestRunRequestedAt = Date()
+                applyScheduleTaskFilters()
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// True while the run a Run Now started is still live.
+    public func isRoutineRunning(id: BotRoutineID) -> Bool {
+        guard let threadID = runningRoutineThreads[id] else { return false }
+        return context.coordinator.activeRunId(threadId: threadID) != nil
+            || context.coordinator.hasPendingProviderStart(threadId: threadID)
+            || context.coordinator.isPreparingProviderStart(threadId: threadID)
+    }
+
+    @Published private(set) var runningRoutineThreads: [BotRoutineID: AgentThreadID] = [:]
+
     /// The route a task execution runs: its schedule spec over `base`. Test
     /// run and the scheduled fire build the same route.
     static func routineRouting(_ spec: BotScheduleSpec, base: BotDeskRouting) -> BotDeskRouting {

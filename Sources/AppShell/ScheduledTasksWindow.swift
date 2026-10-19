@@ -761,6 +761,14 @@ public struct ScheduledTasksRootView: View {
         } message: {
             Text(vm.errorMessage ?? "")
         }
+        .alert("Bot schedules", isPresented: Binding(
+            get: { botsVM?.errorMessage != nil },
+            set: { if !$0 { botsVM?.errorMessage = nil } }
+        )) {
+            Button("OK") { botsVM?.errorMessage = nil }
+        } message: {
+            Text(botsVM?.errorMessage ?? "")
+        }
         .onAppear { vm.scheduleFreshnessPass() }
         .onChange(of: vm.editorDraft) { draft in
             // External create/edit still routes into the full-page editor.

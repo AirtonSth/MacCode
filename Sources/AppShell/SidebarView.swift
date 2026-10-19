@@ -272,6 +272,41 @@ public final class SidebarViewModel: ObservableObject {
         return DeskSelection(botID: botID, context: context, threadID: threadID)
     }
 
+    /// Pure: later rows beyond the cap still show when they are selected or running.
+    nonisolated static func admitsConversation(shown: Int, id: AgentThreadID, always: Set<AgentThreadID>) -> Bool {
+        shown < workspaceConversationLimit || always.contains(id)
+    }
+
+    /// Pure: the Bot behind the thread open in the Agent App; the listed row wins over the link cache.
+    nonisolated static func botID(
+        forSelectedThread threadID: AgentThreadID?,
+        rows: [WorkspaceConversationRow],
+        linkedBot: (AgentThreadID) -> BotID?
+    ) -> BotID? {
+        guard let threadID else { return nil }
+        return rows.first { $0.threadID == threadID }?.botID ?? linkedBot(threadID)
+    }
+
+    /// Pure: a workspace Bot row lights up for the Desk selection or for its own linked thread open in that workspace's Agent App.
+    nonisolated static func isWorkspaceBotHighlighted(
+        botID: BotID, context: BotContext, desk: DeskSelection?,
+        selectedWorkspace: WorkspaceID?, selectedThreadBot: BotID?
+    ) -> Bool {
+        if isBotConversationSelected(botID: botID, context: context, in: desk) { return true }
+        guard let selectedWorkspace, selectedThreadBot == botID else { return false }
+        return context == .workspace(selectedWorkspace)
+    }
+
+    /// Pure: a top-level Bot row also lights up while its linked thread is open in the Agent App.
+    nonisolated static func isGeneralBotHighlighted(_ botID: BotID, desk: DeskSelection?, selectedThreadBot: BotID?) -> Bool {
+        isGeneralBotSelected(botID, in: desk) || (desk == nil && selectedThreadBot == botID)
+    }
+
+    /// Pure: a Bot row spins while the Bot has a live run or its linked thread is running.
+    nonisolated static func isBotRunning(_ botID: BotID, running: Set<BotID>, runningLinked: Set<BotID>) -> Bool {
+        running.contains(botID) || runningLinked.contains(botID)
+    }
+
     /// A top-level Bot row is selected for the General context (or a legacy unpinned chat).
     nonisolated static func isGeneralBotSelected(_ botID: BotID, in selection: DeskSelection?) -> Bool {
         guard let selection, selection.botID == botID else { return false }
@@ -302,6 +337,11 @@ public final class SidebarViewModel: ObservableObject {
     @Published private(set) var deskSelection: DeskSelection?
     @Published private(set) var runningThreadIDs: Set<AgentThreadID> = []
     @Published private(set) var selectedThreadID: AgentThreadID?
+    /// Bots whose linked thread is running now, from the coordinator snapshot.
+    @Published private(set) var runningLinkedBotIDs: Set<BotID> = []
+    private var selectedThreadSink: AnyCancellable?
+    private weak var observedAgentSurface: AgentAppSurface?
+    private var runEventSubscription: UUID?
     public var draggingBotID: BotID?
     @Published public var dropTargetBotID: BotID?
     private var runningBotsSink: AnyCancellable?
@@ -516,6 +556,7 @@ public final class SidebarViewModel: ObservableObject {
         accountUsageReloadTask?.cancel()
         authorizedBotRowsTask?.cancel()
         if let botEventSubscription { EventBus.shared.unsubscribe(botEventSubscription) }
+        if let runEventSubscription { EventBus.shared.unsubscribe(runEventSubscription) }
         if let activityCountsObserver {
             Task { @MainActor in PetActivityCountsProjection.shared.removeObserver(activityCountsObserver) }
         }
@@ -564,12 +605,14 @@ public final class SidebarViewModel: ObservableObject {
             selectedThread = router?.preferredAgentAppSurface(in: wid)?.viewModel.selectedThreadId
         }
         if selectedThread != selectedThreadID { selectedThreadID = selectedThread }
+        bindSelectedThreadSurface()
         let keepUntitled = live.union(selectedThread.map { [$0] } ?? []).union(deskSelection?.threadID.map { [$0] } ?? [])
         authorizedBotRowsTask = Task { [weak self] in
-            let (result, tree) = await Task.detached {
+            let (result, tree, linkedRunning) = await Task.detached {
                 let rows = if let loader { loader(botStore, threadRepo, hostID, workspaceIDs) }
                 else { Self.loadAuthorizedBotConversationRows(botStore: botStore, threadRepo: threadRepo, hostID: hostID, workspaceIDs: workspaceIDs) }
-                return (rows, Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden, keepUntitled: keepUntitled))
+                let linkedRunning = Set(((try? botStore.conversationsLinked(to: live)) ?? [:]).values.map(\.botID))
+                return (rows, Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden, keepUntitled: keepUntitled), linkedRunning)
             }.value
             guard let self, !Task.isCancelled, self.authorizedBotRowsGeneration == generation else { return }
             if self.authorizedBotRowsNeedsRefresh {
@@ -593,6 +636,7 @@ public final class SidebarViewModel: ObservableObject {
                 }
                 return
             }
+            if self.runningLinkedBotIDs != linkedRunning { self.runningLinkedBotIDs = linkedRunning }
             if let rows = result {
                 if self.authorizedBotConversationRows != rows { self.authorizedBotConversationRows = rows }
             } else {
@@ -675,7 +719,8 @@ public final class SidebarViewModel: ObservableObject {
             for workspaceID in expanded {
                 var rows: [WorkspaceConversationRow] = []
                 for thread in try threadRepo.list(workspaceId: workspaceID)
-                where !thread.isEphemeral && thread.parentThreadId == nil && Self.showsThread(title: thread.title, id: thread.id, keep: keepUntitled) {
+                where !thread.isEphemeral && thread.parentThreadId == nil && Self.showsThread(title: thread.title, id: thread.id, keep: keepUntitled)
+                    && Self.admitsConversation(shown: rows.count, id: thread.id, always: keepUntitled) {
                     // A pinned Bot thread is listed only while this host may still read that exact context.
                     if let pin = try botStore.conversationContextPin(linkedTo: thread.id) {
                         guard pin.hostID == hostID, pin.context == .workspace(workspaceID),
@@ -684,7 +729,6 @@ public final class SidebarViewModel: ObservableObject {
                                                       action: .read, policyRevision: pin.policyRevision) else { continue }
                     }
                     rows.append(WorkspaceConversationRow(threadID: thread.id, workspaceID: workspaceID, title: thread.title, botID: thread.actor.botID, updatedAt: thread.updatedAt))
-                    if rows.count == workspaceConversationLimit { break }
                 }
                 conversations[workspaceID] = rows
             }
@@ -749,6 +793,41 @@ public final class SidebarViewModel: ObservableObject {
         expandedWorkspaceIDs.contains(id) && sidebarQuery.isEmpty
     }
 
+    /// Follows the Agent App rail of the selected workspace so the row highlight needs no persistence round-trip.
+    private func bindSelectedThreadSurface() {
+        guard !isBotsSelected, let wid = selectedWorkspaceID,
+              let surface = router?.preferredAgentAppSurface(in: wid) else {
+            selectedThreadSink = nil
+            observedAgentSurface = nil
+            return
+        }
+        guard surface !== observedAgentSurface else { return }
+        observedAgentSurface = surface
+        selectedThreadSink = surface.viewModel.$selectedThreadId.dropFirst().removeDuplicates().sink { [weak self] id in
+            self?.agentSelectedThreadChanged(id, in: wid)
+        }
+    }
+
+    private func agentSelectedThreadChanged(_ id: AgentThreadID?, in wid: WorkspaceID) {
+        guard !isBotsSelected, selectedWorkspaceID == wid else { return }
+        if id != selectedThreadID { selectedThreadID = id }
+        // $selectedThreadId publishes before the value lands; the reload reads the settled value.
+        if let id, workspaceConversations[wid]?.contains(where: { $0.threadID == id }) != true {
+            DispatchQueue.main.async { [weak self] in self?.reloadAuthorizedBotConversationRows() }
+        }
+    }
+
+    /// Bot behind the thread open in the selected workspace's Agent App.
+    var selectedThreadBotID: BotID? {
+        guard let wid = selectedWorkspaceID, !isBotsSelected else { return nil }
+        return Self.botID(forSelectedThread: selectedThreadID, rows: workspaceConversations[wid] ?? []) { [context] in
+            context?.botStore.cachedBotID(linkedTo: $0)
+        }
+    }
+
+    /// Run start/finish must flip spinners without waiting for another reload.
+    nonisolated static let runEventKinds = ["agent.run.started", "agent.run.finished", "agent.run.completed", "agent.run.failed", "agent.run.cancelled"]
+
     func observeActiveBots(_ botsViewModel: BotsViewModel) {
         activeBotCountSink = botsViewModel.$activeBotCount.removeDuplicates().sink { [weak self] count in
             self?.activeBotCount = count
@@ -773,6 +852,11 @@ public final class SidebarViewModel: ObservableObject {
             self?.reloadAuthorizedBotConversationRows()
         }
         // RPC changes (paired phone, Titio's rc_host_call, context grants) land on the event bus.
+        if runEventSubscription == nil {
+            runEventSubscription = EventBus.shared.subscribeFromCurrent(filter: .kindPrefixes(Self.runEventKinds)) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.reloadAuthorizedBotConversationRows() }
+            }.id
+        }
         if botEventSubscription == nil {
             botEventSubscription = EventBus.shared.subscribeFromCurrent(
                 filter: .kindPrefixes(["bot.created", "bot.deleted", "bot.updated", "bot.settings.updated", "bot.conversation.updated", "surface.updated"])
@@ -2844,8 +2928,8 @@ public struct SidebarRootView: View {
     }
 
     private func botConversationRow(_ row: SidebarViewModel.AuthorizedBotConversationRow) -> some View {
-        let selected = SidebarViewModel.isBotConversationSelected(botID: row.botID, context: row.context, in: vm.deskSelection)
-        let running = vm.runningBotIDs.contains(row.botID)
+        let selected = SidebarViewModel.isWorkspaceBotHighlighted(botID: row.botID, context: row.context, desk: vm.deskSelection, selectedWorkspace: vm.selectedWorkspaceID, selectedThreadBot: vm.selectedThreadBotID)
+        let running = SidebarViewModel.isBotRunning(row.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
         return Button {
             navigate { if row.conversationID == nil { vm.startBotConversation(row) } else { vm.openAuthorizedBotConversation(row) } }
         } label: {
@@ -2938,8 +3022,8 @@ public struct SidebarRootView: View {
     }
 
     private func generalBotRow(_ row: SidebarViewModel.GeneralBotRow) -> some View {
-        let selected = SidebarViewModel.isGeneralBotSelected(row.botID, in: vm.deskSelection)
-        let running = vm.runningBotIDs.contains(row.botID)
+        let selected = SidebarViewModel.isGeneralBotHighlighted(row.botID, desk: vm.deskSelection, selectedThreadBot: vm.selectedThreadBotID)
+        let running = SidebarViewModel.isBotRunning(row.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
         return Button { navigate { vm.openGeneralBot(row) } } label: {
             HStack(spacing: DS.Space.sm) {
                 BotsAvatarView(name: row.name, handle: row.handle, symbol: row.symbol, size: 20, attention: running ? .working : .none)

@@ -148,9 +148,10 @@ public struct BotScheduleTasksRootView: View {
                             BotScheduleTaskCard(
                                 item: item,
                                 isAutonomyActive: vm.isAutonomyActive,
+                                isRunning: vm.isRoutineRunning(id: item.id),
                                 onOpen: { vm.editScheduleTask(item) },
                                 onToggle: { vm.setRoutineEnabled(id: item.id, enabled: !item.isEnabled) },
-                                onRunNow: { vm.requestRoutineTestRun(id: item.id) },
+                                onRunNow: { vm.runRoutineNow(id: item.id) },
                                 onEdit: { vm.editScheduleTask(item) },
                                 onDelete: { vm.deleteScheduleTask(item) }
                             )
@@ -234,6 +235,7 @@ public struct BotScheduleTasksRootView: View {
 struct BotScheduleTaskCard: View {
     let item: BotScheduleTaskItem
     let isAutonomyActive: Bool
+    var isRunning = false
     let onOpen: () -> Void
     let onToggle: () -> Void
     let onRunNow: () -> Void
@@ -249,7 +251,13 @@ struct BotScheduleTaskCard: View {
             identifier: "bots.scheduleTasks.task.\(item.id.value.uuidString.lowercased())",
             onOpen: onOpen
         ) {
-            if item.isEnabled {
+            if isRunning {
+                HStack(spacing: DS.Space.xs) {
+                    ProgressView().controlSize(.small)
+                    DSPill("Running", tone: .success)
+                }
+                .accessibilityIdentifier("bots.scheduleTasks.running")
+            } else if item.isEnabled {
                 DSPill("Active", tone: .success)
             } else {
                 DSPill("Paused", tone: .neutral)
@@ -278,7 +286,7 @@ struct BotScheduleTaskCard: View {
         } trailing: {
             Menu {
                 Button(item.isEnabled ? "Pause" : "Resume", action: onToggle)
-                Button("Run Now", action: onRunNow)
+                Button("Run Now", action: onRunNow).disabled(isRunning)
                 Button("Edit", action: onEdit)
                 Divider()
                 Button("Delete", role: .destructive, action: onDelete)
@@ -703,9 +711,10 @@ struct BotScheduleTasksSection: View {
                         BotScheduleTaskCard(
                             item: item,
                             isAutonomyActive: vm.isAutonomyActive,
+                            isRunning: vm.isRoutineRunning(id: item.id),
                             onOpen: { vm.editScheduleTask(item) },
                             onToggle: { vm.setRoutineEnabled(id: item.id, enabled: !item.isEnabled) },
-                            onRunNow: { vm.requestRoutineTestRun(id: item.id) },
+                            onRunNow: { vm.runRoutineNow(id: item.id) },
                             onEdit: { vm.editScheduleTask(item) },
                             onDelete: { vm.deleteScheduleTask(item) }
                         )

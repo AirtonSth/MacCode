@@ -2,6 +2,7 @@ import XCTest
 @testable import AppShell
 @testable import CoreModel
 import Persistence
+import RemoteCodeTreaty
 
 @MainActor
 final class SidebarSelectionAndBotOrderTests: XCTestCase {
@@ -79,5 +80,51 @@ final class SidebarSelectionAndBotOrderTests: XCTestCase {
         let long = String(repeating: "x", count: 40)
         let e = row(long + "1", ago: 60), f = row(long + "2", ago: 120)
         XCTAssertEqual(SidebarViewModel.duplicateTitleAges([e, f], now: now).count, 2)
+    }
+
+    func test_selectedThreadBot_prefersListedRowThenLinkCache() {
+        // WHY: the "Developer" row must light up when its linked thread is open in the Agent App rail.
+        let t1 = AgentThreadID(UUID()), t2 = AgentThreadID(UUID())
+        let rows = [SidebarViewModel.WorkspaceConversationRow(threadID: t1, workspaceID: ws, title: "x", botID: a)]
+        XCTAssertEqual(SidebarViewModel.botID(forSelectedThread: t1, rows: rows) { _ in b }, a)
+        XCTAssertEqual(SidebarViewModel.botID(forSelectedThread: t2, rows: rows) { _ in b }, b, "thread beyond the listed rows still resolves through the link")
+        XCTAssertNil(SidebarViewModel.botID(forSelectedThread: nil, rows: rows) { _ in b })
+        XCTAssertNil(SidebarViewModel.botID(forSelectedThread: t2, rows: []) { _ in nil })
+    }
+
+    func test_workspaceBotHighlight_forLinkedThreadOnlyInItsWorkspace() {
+        let other = WorkspaceID(UUID())
+        XCTAssertTrue(SidebarViewModel.isWorkspaceBotHighlighted(botID: a, context: .workspace(ws), desk: nil, selectedWorkspace: ws, selectedThreadBot: a))
+        XCTAssertFalse(SidebarViewModel.isWorkspaceBotHighlighted(botID: a, context: .workspace(other), desk: nil, selectedWorkspace: ws, selectedThreadBot: a), "same Bot under another workspace stays plain")
+        XCTAssertFalse(SidebarViewModel.isWorkspaceBotHighlighted(botID: b, context: .workspace(ws), desk: nil, selectedWorkspace: ws, selectedThreadBot: a))
+        XCTAssertFalse(SidebarViewModel.isWorkspaceBotHighlighted(botID: a, context: .general, desk: nil, selectedWorkspace: ws, selectedThreadBot: a))
+        XCTAssertTrue(SidebarViewModel.isWorkspaceBotHighlighted(botID: a, context: .workspace(ws), desk: .init(botID: a, context: .workspace(ws), threadID: nil), selectedWorkspace: nil, selectedThreadBot: nil))
+    }
+
+    func test_generalBotHighlight_forLinkedThread_butDeskSelectionWins() {
+        XCTAssertTrue(SidebarViewModel.isGeneralBotHighlighted(a, desk: nil, selectedThreadBot: a))
+        XCTAssertFalse(SidebarViewModel.isGeneralBotHighlighted(b, desk: nil, selectedThreadBot: a))
+        XCTAssertFalse(SidebarViewModel.isGeneralBotHighlighted(a, desk: .init(botID: b, context: nil, threadID: nil), selectedThreadBot: a), "an open desk for another Bot owns the highlight")
+        XCTAssertTrue(SidebarViewModel.isGeneralBotHighlighted(a, desk: .init(botID: a, context: nil, threadID: nil), selectedThreadBot: nil))
+    }
+
+    func test_conversationCap_neverHidesSelectedOrRunningThreads() {
+        let sel = AgentThreadID(UUID()), other = AgentThreadID(UUID())
+        let cap = SidebarViewModel.workspaceConversationLimit
+        XCTAssertTrue(SidebarViewModel.admitsConversation(shown: cap - 1, id: other, always: []))
+        XCTAssertFalse(SidebarViewModel.admitsConversation(shown: cap, id: other, always: [sel]))
+        XCTAssertTrue(SidebarViewModel.admitsConversation(shown: cap + 3, id: sel, always: [sel]), "the open thread is listed even past the cap")
+    }
+
+    func test_botRunning_whenOwnRunOrLinkedThreadRuns() {
+        XCTAssertTrue(SidebarViewModel.isBotRunning(a, running: [a], runningLinked: []))
+        XCTAssertTrue(SidebarViewModel.isBotRunning(a, running: [], runningLinked: [a]))
+        XCTAssertFalse(SidebarViewModel.isBotRunning(a, running: [b], runningLinked: [c]))
+    }
+
+    func test_runEventKinds_matchPublishedKinds() {
+        // WHY: a typo here silently freezes spinners; kinds must equal the treaty raw values.
+        let published: Set<String> = [RemoteCodeEventKind.agentRunStarted, .agentRunFinished, .agentRunCompleted, .agentRunFailed, .agentRunCancelled].map(\.rawValue).reduce(into: []) { $0.insert($1) }
+        XCTAssertEqual(Set(SidebarViewModel.runEventKinds), published)
     }
 }
