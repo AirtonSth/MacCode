@@ -252,6 +252,8 @@ public extension Notification.Name {
 public enum ShellSidebarToggleMotion {
     public static let duration: TimeInterval = 0.22
     public static let minimumSidebarWidth: CGFloat = 180
+    /// Smallest main window: the narrowest sidebar beside a 360 pt content pane.
+    public static let minimumWindowWidth: CGFloat = minimumSidebarWidth + 380
     public static let maximumSidebarWidth: CGFloat = 560
 
     /// Leading offset of the constant-width sidebar panel.
@@ -427,7 +429,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         win.titleVisibility = .hidden
         win.isMovableByWindowBackground = false
         win.collectionBehavior.insert(.moveToActiveSpace)
-        win.minSize = NSSize(width: 900, height: 600)
+        // Narrowest sidebar (180 pt) plus a 360 pt content pane; every screen fits 360 pt.
+        win.minSize = NSSize(width: ShellSidebarToggleMotion.minimumWindowWidth, height: 480)
         RemoteCodeAppearance.apply(to: win)
         self.window = win
 

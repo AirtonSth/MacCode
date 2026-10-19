@@ -19,6 +19,20 @@ final class AppResponsiveMinimumWidthTests: XCTestCase {
         }
     }
 
+    func test_mainWindowCanShrinkToTheNarrowestSidebarPlusANarrowPane() throws {
+        // WHY: the screens fit 360 pt, but the window must also let the user resize down to that.
+        XCTAssertLessThanOrEqual(ShellSidebarToggleMotion.minimumWindowWidth, ShellSidebarToggleMotion.minimumSidebarWidth + 400)
+        let directory = NSTemporaryDirectory() + "RC2MinWindow-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        let controller = MainWindowController(context: context, router: router)
+        controller.window.isReleasedWhenClosed = false
+        defer { controller.window.close() }
+        XCTAssertEqual(controller.window.minSize.width, ShellSidebarToggleMotion.minimumWindowWidth,
+                       "the real main window uses the narrow minimum, not the old 900 pt")
+    }
+
     func test_noScreenRootDemandsMoreThanANarrowPane() throws {
         // Root/sheet minimum widths are read from the shipped sources; any regression back to
         // 540-980 pt minimums fails here.
