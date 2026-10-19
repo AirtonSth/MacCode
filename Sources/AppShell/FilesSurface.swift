@@ -2025,7 +2025,10 @@ struct FilesSurfaceRoot: View {
                 HStack(spacing: 8) {
                     Text("Files")
                         .font(DS.Font.title3)
-                    Spacer()
+                        .lineLimit(1)
+                        .fixedSize()
+                        .layoutPriority(1)
+                    Spacer(minLength: 4)
                     DSIconButton("sidebar.left", help: "Hide file sidebar") {
                         sidebarIntent = .forcedHidden
                         sidebarVisible = false
