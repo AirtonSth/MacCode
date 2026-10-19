@@ -879,8 +879,17 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     /// An expanded workspace always leads its Bots with "+ New bot"; a search hides it.
+    /// Open Tabs follow the workspace chevron like Bots and Conversations.
+    func openTabRows(_ id: WorkspaceID) -> [ActiveSurfaceItem] {
+        Self.openTabRows(activeSurfaceRows, id, expanded: expandedWorkspaceIDs)
+    }
+
+    nonisolated static func openTabRows(_ rows: [WorkspaceID: [ActiveSurfaceItem]], _ id: WorkspaceID, expanded: Set<WorkspaceID>) -> [ActiveSurfaceItem] {
+        expanded.contains(id) ? rows[id] ?? [] : []
+    }
+
     func hasWorkspaceChildren(_ id: WorkspaceID) -> Bool {
-        !(activeSurfaceRows[id] ?? []).isEmpty || showsAddBot(id) || !workspaceBotRows(id).isEmpty
+        !openTabRows(id).isEmpty || showsAddBot(id) || !workspaceBotRows(id).isEmpty
             || showsNewConversation(id) || !workspaceConversationRows(id).isEmpty
     }
 
@@ -3235,15 +3244,22 @@ public struct SidebarRootView: View {
     private func workspaceChildren(_ ws: Workspace) -> some View {
         if vm.hasWorkspaceChildren(ws.id) {
             VStack(alignment: .leading, spacing: DS.Space.xxs) { workspaceChildRows(ws) }
-                .padding(.vertical, DS.Space.xxs)
-                .background(WorkspaceChildrenGlass())
+                .padding(.vertical, DS.Space.xs)
+                .background(WorkspaceDropdownPanel())
+                .padding(.leading, DS.Space.md)
+                .padding(.top, 2)
+                .padding(.bottom, DS.Space.xs)
+                .transition(reduceMotion ? .opacity : .asymmetric(
+                    insertion: .scale(scale: 0.97, anchor: .top).combined(with: .opacity).combined(with: .offset(y: -6)),
+                    removal: .scale(scale: 0.98, anchor: .top).combined(with: .opacity)
+                ))
         }
     }
 
     /// Children of an expanded workspace: Open Tabs, Bots (+ New bot first), then Conversations (+ New conversation first).
     @ViewBuilder
     private func workspaceChildRows(_ ws: Workspace) -> some View {
-        if let tabs = vm.activeSurfaceRows[ws.id], !tabs.isEmpty {
+        if case let tabs = vm.openTabRows(ws.id), !tabs.isEmpty {
             workspaceSectionHeader("Open Tabs", id: "sidebar.workspaceOpenTabs.\(ws.id.value.uuidString)")
             let visible = vm.visibleTab(in: ws)?.id
             ForEach(tabs) { activeSurfaceRow($0, selected: $0.surfaceID == visible) }
@@ -3407,7 +3423,10 @@ public struct SidebarRootView: View {
         let highlightTone = SidebarSelectionHighlightResolver().resolve(workspace: ws, isSelected: selected, isChecked: checked)
         let expanded = vm.expandedWorkspaceIDs.contains(ws.id)
         HStack(spacing: 0) {
-        Button { vm.toggleWorkspaceExpanded(ws.id) } label: {
+        Button {
+            if reduceMotion { vm.toggleWorkspaceExpanded(ws.id) }
+            else { withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) { vm.toggleWorkspaceExpanded(ws.id) } }
+        } label: {
             Image(systemName: "chevron.right")
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundColor(DS.Palette.textTertiary)
@@ -3672,34 +3691,32 @@ private extension View {
     }
 }
 
-/// Recessed glass behind an expanded workspace's children: a thin material with a faint
-/// dark tint, a top-lit hairline edge and a guide line under the chevron. Reads one level
-/// deeper than the workspace row without a solid block of color. Materials fall back to
-/// an opaque fill on their own under Reduce Transparency.
-private struct WorkspaceChildrenGlass: View {
-    private let shape = RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+/// Dropdown card for an expanded workspace: a glass sheet that hangs off the workspace
+/// row, nested one indent in, lit from the top edge and floating on a soft shadow.
+/// The material turns opaque on its own under Reduce Transparency.
+private struct WorkspaceDropdownPanel: View {
+    private let shape = RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
 
     var body: some View {
         shape
-            .fill(.ultraThinMaterial)
-            .overlay(shape.fill(Color.black.opacity(0.12)))
+            .fill(.thinMaterial)
+            .overlay(
+                shape.fill(LinearGradient(
+                    colors: [Color.white.opacity(0.035), Color.black.opacity(0.10)],
+                    startPoint: .top, endPoint: .bottom
+                ))
+            )
             .overlay(
                 shape.strokeBorder(
                     LinearGradient(
-                        colors: [Color.white.opacity(0.07), Color.white.opacity(0.015)],
+                        colors: [Color.white.opacity(0.10), Color.white.opacity(0.03)],
                         startPoint: .top, endPoint: .bottom
                     ),
                     lineWidth: 0.5
                 )
             )
-            .overlay(alignment: .leading) {
-                Capsule()
-                    .fill(Color.white.opacity(0.06))
-                    .frame(width: 1)
-                    .padding(.vertical, DS.Space.md)
-                    .padding(.leading, DS.Space.sm + 1)
-            }
-            .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
+            .shadow(color: .black.opacity(0.28), radius: 10, y: 6)
+            .shadow(color: .black.opacity(0.12), radius: 1, y: 0.5)
             .accessibilityHidden(true)
     }
 }

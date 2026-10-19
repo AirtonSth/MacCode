@@ -58,3 +58,14 @@ final class SidebarVisibleTabTests: XCTestCase {
         XCTAssertEqual(SidebarViewModel.visibleTab(in: ws)?.id, files.id)
     }
 }
+
+/// Collapsing a workspace must hide its Open Tabs too, like Bots and Conversations.
+final class SidebarOpenTabsCollapseTests: XCTestCase {
+    func test_openTabsHiddenWhenWorkspaceCollapsed() {
+        let ws = WorkspaceID(UUID())
+        let id = SurfaceID(UUID())
+        let tab = ActiveSurfaceItem(id: id.value, workspaceID: ws, workspaceName: "T", surfaceID: id, title: "Files", type: .files)
+        XCTAssertEqual(SidebarViewModel.openTabRows([ws: [tab]], ws, expanded: [ws]).map(\.surfaceID), [id])
+        XCTAssertTrue(SidebarViewModel.openTabRows([ws: [tab]], ws, expanded: []).isEmpty)
+    }
+}
