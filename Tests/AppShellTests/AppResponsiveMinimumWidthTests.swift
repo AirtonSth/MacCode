@@ -36,4 +36,40 @@ final class AppResponsiveMinimumWidthTests: XCTestCase {
             }
         }
     }
+
+    func test_settingsScheduleAndBotsRenderAtNarrowMediumAndWideWidths() throws {
+        // WHY: these screens are the ones the user resizes into splits; each must lay out
+        // inside 360, 500 and 900 pt without demanding more width.
+        let directory = NSTemporaryDirectory() + "RC2ResponsiveRender-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let screens: [(String, AnyView)] = [
+            ("settings", AnyView(SettingsView(vm: SettingsViewModel(context: context)))),
+            ("schedule", AnyView(ScheduledTasksRootView(vm: ScheduledTasksViewModel(context: context, router: router, loadImmediately: false)))),
+            ("bots", AnyView(BotsRootView(vm: BotsViewModel(context: context)))),
+        ]
+        let artifacts = ProcessInfo.processInfo.environment["REMOTE_CODE_RESPONSIVE_ARTIFACT_DIR"]
+        for (name, view) in screens {
+            for width in [360.0, 500.0, 900.0] {
+                let controller = NSHostingController(rootView: view)
+                let fit = controller.sizeThatFits(in: CGSize(width: width, height: 800))
+                XCTAssertLessThanOrEqual(fit.width, width + 0.5, "\(name) must fit \(Int(width)) pt")
+                guard let artifacts else { continue }
+                let host = NSHostingView(rootView: view.frame(width: width, height: 700))
+                host.frame = NSRect(x: 0, y: 0, width: width, height: 700)
+                host.appearance = NSAppearance(named: .darkAqua)
+                let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+                window.contentView = host
+                host.layoutSubtreeIfNeeded()
+                RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+                let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                host.cacheDisplay(in: host.bounds, to: rep)
+                try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+                    .write(to: URL(fileURLWithPath: artifacts).appendingPathComponent("\(name)-\(Int(width)).png"))
+                window.contentView = nil
+            }
+        }
+    }
 }

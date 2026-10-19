@@ -821,49 +821,33 @@ public struct ScheduledTasksRootView: View {
 
     private var overviewScreen: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .center, spacing: DS.Space.lg) {
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    Text("Scheduled Tasks")
-                        .font(DS.Font.title.weight(.semibold))
-                        .foregroundColor(DS.Palette.text)
-                    Text(vm.schedulerActive
-                         ? "Automate recurring agent work"
-                         : "Automatic runs paused — turn Active on when you're back")
-                        .font(DS.Font.body)
-                        .foregroundColor(vm.schedulerActive ? DS.Palette.textSecondary : DS.Palette.warning)
-                        .animation(DS.Motion.micro, value: vm.schedulerActive)
+            // Wide panes keep title and actions on one row; narrow ones stack the actions below.
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: DS.Space.lg) {
+                    overviewTitle
+                    Spacer(minLength: DS.Space.lg)
+                    HStack(spacing: DS.Space.md) { overviewActions }
                 }
-                Spacer(minLength: DS.Space.lg)
-                HStack(spacing: DS.Space.md) {
-                    Button {
-                        vm.createTask()
-                        openEditor(returnTo: .overview)
-                    } label: {
-                        Label("New Task", systemImage: "plus")
-                    }
-                    .buttonStyle(DSPrimaryButtonStyle())
-                    .accessibilityIdentifier("scheduledTasks.new")
-
-                    if let botsVM {
-                        Button { botsVM.createScheduleTask() } label: {
-                            Label("New Bot Task", systemImage: "plus")
-                        }
-                        .buttonStyle(DSSecondaryButtonStyle())
-                        .accessibilityIdentifier("scheduledTasks.newBot")
-                    }
-
-                    schedulerActiveControl
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    overviewTitle
+                    HStack(spacing: DS.Space.md) { overviewActions }
                 }
             }
             .padding(.horizontal, DS.Space.xxl)
             .padding(.top, DS.Space.xxl)
             .padding(.bottom, DS.Space.xl)
 
-            HStack(spacing: DS.Space.md) {
-                filterChips
-                Spacer(minLength: DS.Space.lg)
-                searchField
-                    .frame(maxWidth: 280)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: DS.Space.md) {
+                    filterChips
+                    Spacer(minLength: DS.Space.lg)
+                    searchField
+                        .frame(maxWidth: 280)
+                }
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    ScrollView(.horizontal, showsIndicators: false) { filterChips }
+                    searchField
+                }
             }
             .padding(.horizontal, DS.Space.xxl)
             .padding(.bottom, DS.Space.xl)
@@ -911,6 +895,43 @@ public struct ScheduledTasksRootView: View {
         }
     }
 
+    private var overviewTitle: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            Text("Scheduled Tasks")
+                .font(DS.Font.title.weight(.semibold))
+                .foregroundColor(DS.Palette.text)
+                .lineLimit(1)
+            Text(vm.schedulerActive
+                 ? "Automate recurring agent work"
+                 : "Automatic runs paused — turn Active on when you're back")
+                .font(DS.Font.body)
+                .foregroundColor(vm.schedulerActive ? DS.Palette.textSecondary : DS.Palette.warning)
+                .animation(DS.Motion.micro, value: vm.schedulerActive)
+        }
+    }
+
+    @ViewBuilder
+    private var overviewActions: some View {
+        Button {
+            vm.createTask()
+            openEditor(returnTo: .overview)
+        } label: {
+            Label("New Task", systemImage: "plus").lineLimit(1).fixedSize()
+        }
+        .buttonStyle(DSPrimaryButtonStyle())
+        .accessibilityIdentifier("scheduledTasks.new")
+
+        if let botsVM {
+            Button { botsVM.createScheduleTask() } label: {
+                Label("New Bot Task", systemImage: "plus").lineLimit(1).fixedSize()
+            }
+            .buttonStyle(DSSecondaryButtonStyle())
+            .accessibilityIdentifier("scheduledTasks.newBot")
+        }
+
+        schedulerActiveControl
+    }
+
     /// Global kill-switch control: status chrome + switch.
     /// State is conveyed by icon + label + tint (not color alone — WCAG 1.4.1).
     private var schedulerActiveControl: some View {
@@ -943,6 +964,7 @@ public struct ScheduledTasksRootView: View {
                 identifier: "scheduledTasks.filter.paused"
             ) { vm.statusFilter = .paused }
         }
+        .fixedSize()
         .accessibilityIdentifier("scheduledTasks.statusFilter")
         .accessibilityLabel("Filter tasks by status")
     }
