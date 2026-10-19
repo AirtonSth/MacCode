@@ -114,6 +114,8 @@ public final class AppContext {
     public let readDB: SQLiteDB
     public let bootstrapReport: BootstrapReport
     public let appSupportDirectory: URL
+    public let distillAdapter: DistillACPAdapter
+    public let distillLoopStore: DistillLoopStore
     public let projectRepo: ProjectRepository
     public let threadRepo: AgentThreadRepository
     public let messageRepo: AgentMessageRepository
@@ -567,6 +569,42 @@ public final class AppContext {
         botGroupOrchestrator.reconcileAfterRelaunch()
     }
 
+    /// Reloads the Distill session of every thread with a paused loop (any reason), so the
+    /// scheduler re-announces its tasks. Failures leave the loop paused with the reason.
+    public func resumeDistillLoopsAfterLaunch() {
+        guard hostsBotGroupConversations else { return }
+        let waiting = distillLoopStore.resumableThreadIDs()
+        guard !waiting.isEmpty else { return }
+        Task(priority: .utility) { @MainActor [weak self] in
+            for threadId in waiting {
+                guard let self else { return }
+                await self.resumeDistillLoops(threadId: threadId)
+            }
+        }
+    }
+
+    /// Seeds the adapter with the stored history, reloads the session, and records a failed
+    /// resume as a visible paused reason. Throws so a UI caller can show the error inline.
+    @discardableResult
+    public func resumeDistillLoops(threadId: AgentThreadID) async -> Error? {
+        distillAdapter.seedLoops(threadId: threadId, loops: distillLoopStore.loops(for: threadId))
+        do {
+            try await coordinator.resumeSessionForScheduler(threadId: threadId)
+            return nil
+        } catch {
+            let message = "Couldn't resume: \(error.localizedDescription)"
+            let loops = distillLoopStore.loops(for: threadId).map { loop -> DistillLoopState in
+                guard DistillLoopStore.resumable(loop) else { return loop }
+                var failed = loop
+                failed.pausedReason = error is AgentRunCoordinator.SchedulerResumeError
+                    ? error.localizedDescription : message
+                return failed
+            }
+            distillLoopStore.update(thread: threadId, loops: loops)
+            return error
+        }
+    }
+
     private func drainRecoveredForkPrunedThreadIDsIfPossible() {
         guard let router, !pendingRecoveredForkPrunedThreadIDs.isEmpty else { return }
         let ids = pendingRecoveredForkPrunedThreadIDs.sorted {
@@ -736,6 +774,8 @@ public final class AppContext {
         let claude: AgentProviderAdapter = AppContext.makeClaudeAdapter(engine: claudeEngine, binary: configuredClaudeBinary)
         let grok = GrokACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.grok.path"))
         let distill = DistillACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.distill.path"))
+        self.distillAdapter = distill
+        self.distillLoopStore = DistillLoopStore(directory: self.appSupportDirectory)
         let contextReference = WeakReference()
         self.orchestrationRuntime = AgentOrchestrationRuntime(
             repository: AgentOrchestrationRepository(db: db),
@@ -770,6 +810,16 @@ public final class AppContext {
         let guestRunResolver = makeBotGuestRunResolver(hostsGuestRuns: performLaunchRunReconciliation)
         botGuestRunResolver = guestRunResolver
         distill.setGuestLaunchResolver(guestRunResolver)
+        let loopStore = self.distillLoopStore
+        distill.onLoopsChanged = { threadId, loops in
+            Task { @MainActor in loopStore.update(thread: threadId, loops: loops) }
+        }
+        distill.onProviderInitiatedTurn = { [weak contextReference] threadId, promptId, label in
+            Task { @MainActor in
+                await contextReference?.value?.router?.startProviderInitiatedTurn(
+                    threadId: threadId, promptId: promptId, label: label)
+            }
+        }
         let liveActivitySyncCoordinator = self.liveActivitySyncCoordinator
         coordinator.onActiveRunProjectionChanged = { [weak contextReference] projection, cause in
             let syncCause: LiveActivitySyncCause
@@ -1246,6 +1296,7 @@ public final class AppContext {
                 // message remains stranded with no later lifecycle callback.
                 self.cancelQueueDrainWaiter(threadId: tid)
                 self.ensureQueueDrainWaiterIfNeeded(threadId: tid)
+                if let router = self.router { await router.startPendingProviderWake(threadId: tid) }
                 // The host stopped a bot that asked the user to step in: the phone already
                 // has "Waiting for you", so the same pause sends no "Thread cancelled".
                 let pausedForUser = status == .cancelled && self.router?.botThreadAwaitsUser(tid) == true
@@ -1327,6 +1378,7 @@ public final class AppContext {
                 // after returning from the terminal callback.
                 await Task.yield()
                 await self.providerBecameIdle(threadId: threadId)
+                if let router = self.router { await router.startPendingProviderWake(threadId: threadId) }
             }
         }
 
@@ -3248,6 +3300,7 @@ public final class AppContext {
             providerSessionRuntimeRepo: providerSessionRuntimeRepo,
             providerPendingCallbackRepo: providerPendingCallbackRepo,
             coordinator: coordinator,
+            loopThreadIds: distillAdapter.threadIdsWithActiveLoops(),
             now: now,
             idleAge: idleAge
         )
@@ -3278,6 +3331,7 @@ public final class AppContext {
         let sessionRepo = providerSessionRuntimeRepo
         let pendingCallbackRepo = providerPendingCallbackRepo
         let coordinator = coordinator
+        let loopThreadIds = distillAdapter.threadIdsWithActiveLoops()
         providerSessionReaperQueue.async {
             let result = Result {
                 try Self.reapIdleProviderSessions(
@@ -3285,6 +3339,7 @@ public final class AppContext {
                     providerSessionRuntimeRepo: sessionRepo,
                     providerPendingCallbackRepo: pendingCallbackRepo,
                     coordinator: coordinator,
+                    loopThreadIds: loopThreadIds,
                     now: now,
                     idleAge: idleAge
                 )
@@ -3302,11 +3357,12 @@ public final class AppContext {
         providerSessionRuntimeRepo: ProviderSessionRuntimeRepository,
         providerPendingCallbackRepo: ProviderPendingCallbackRepository,
         coordinator: AgentRunCoordinator,
+        loopThreadIds: Set<AgentThreadID>,
         now: Date,
         idleAge: TimeInterval
     ) throws -> ProviderSessionReaperResult {
         let cutoff = now.addingTimeInterval(-idleAge)
-        let activeThreadIds = try threadRepo.runningThreadIds()
+        let activeThreadIds = try threadRepo.runningThreadIds().union(loopThreadIds)
         let liveSessions = coordinator.liveProviderSessions()
         let reaper = ProviderSessionReaper(
             sessionRepo: providerSessionRuntimeRepo,

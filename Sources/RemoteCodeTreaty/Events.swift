@@ -47,6 +47,7 @@ public enum RemoteCodeEventKind: String, Codable, CaseIterable, Sendable {
     case agentThreadCreated = "agent.thread.created"
     case agentThreadDeleted = "agent.thread.deleted"
     case agentThreadDeletedMany = "agent.thread.deleted_many"
+    case agentThreadLoopsUpdated = "agent.thread.loops.updated"
     case agentThreadRead = "agent.thread.read"
     case agentThreadRenamed = "agent.thread.renamed"
     case agentThreadReordered = "agent.thread.reordered"

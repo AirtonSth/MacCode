@@ -9,6 +9,15 @@ final class SidebarSelectionAndBotOrderTests: XCTestCase {
     private let a = BotID(UUID()), b = BotID(UUID()), c = BotID(UUID())
     private let ws = WorkspaceID(UUID())
 
+    func test_expandedConversationWorkspaces_roundTripsAndSkipsInvalidIDs() {
+        // WHY: expanded state must survive restart; a corrupt stored entry must not drop the valid ones.
+        let other = WorkspaceID(UUID())
+        let raw = SidebarViewModel.encodeExpandedConversationWorkspaces([ws, other])
+        XCTAssertEqual(SidebarViewModel.decodeExpandedConversationWorkspaces(raw), [ws, other])
+        XCTAssertEqual(SidebarViewModel.decodeExpandedConversationWorkspaces(raw + ["not-a-uuid"]), [ws, other])
+        XCTAssertEqual(SidebarViewModel.decodeExpandedConversationWorkspaces(nil), [])
+    }
+
     func test_deskSelection_onlyWhenBotsDeskIsActiveSurface() {
         // WHY: a stale selectedBotID must not highlight a row while a workspace owns the content.
         XCTAssertNil(SidebarViewModel.deskSelection(isBotsSelected: false, screen: .desk, botID: a, context: nil, threadID: nil))
@@ -114,6 +123,37 @@ final class SidebarSelectionAndBotOrderTests: XCTestCase {
         XCTAssertTrue(SidebarViewModel.admitsConversation(shown: cap - 1, id: other, always: []))
         XCTAssertFalse(SidebarViewModel.admitsConversation(shown: cap, id: other, always: [sel]))
         XCTAssertTrue(SidebarViewModel.admitsConversation(shown: cap + 3, id: sel, always: [sel]), "the open thread is listed even past the cap")
+    }
+
+    private func convRows(_ n: Int) -> [SidebarViewModel.WorkspaceConversationRow] {
+        (0..<n).map { SidebarViewModel.WorkspaceConversationRow(threadID: AgentThreadID(UUID()), workspaceID: ws, title: "T\($0)", botID: nil) }
+    }
+
+    func test_visibleConversations_noToggleWhenWithinCap() {
+        // WHY: a short list must not grow a pointless Show more row.
+        let rows = convRows(SidebarViewModel.workspaceConversationLimit)
+        let out = SidebarViewModel.visibleConversations(rows, expanded: false, always: [])
+        XCTAssertEqual(out.rows, rows)
+        XCTAssertFalse(out.showsToggle)
+        XCTAssertEqual(out.hidden, 0)
+    }
+
+    func test_visibleConversations_collapsedKeepsCapPlusAlwaysAndCountsHidden() {
+        // WHY: the open/running thread stays visible past the cap and the hidden count must exclude it.
+        let rows = convRows(12)
+        let always = rows[10].threadID
+        let out = SidebarViewModel.visibleConversations(rows, expanded: false, always: [always])
+        XCTAssertEqual(out.rows, Array(rows[0..<8]) + [rows[10]])
+        XCTAssertEqual(out.hidden, 3)
+        XCTAssertTrue(out.showsToggle)
+    }
+
+    func test_visibleConversations_expandedShowsAllAndKeepsToggle() {
+        // WHY: Show less must stay reachable after expanding.
+        let rows = convRows(12)
+        let out = SidebarViewModel.visibleConversations(rows, expanded: true, always: [])
+        XCTAssertEqual(out.rows, rows)
+        XCTAssertTrue(out.showsToggle)
     }
 
     func test_botRunning_whenOwnRunOrLinkedThreadRuns() {

@@ -14990,3 +14990,34 @@ private struct BotGuestDesktopRoot: View {
         .onAppear { vm.scheduleFreshnessPass() }
     }
 }
+
+extension AppCommandRouter {
+    /// Mirrors the selected thread's Distill `/loop` tasks into the view model and wires Stop/Dismiss.
+    func wireDistillLoops(on viewModel: AgentAppViewModel, context: AppContext) {
+        let store = context.distillLoopStore
+        viewModel.distillLoopSubscription = store.$snapshot
+            .combineLatest(viewModel.$selectedThreadId)
+            .map { snapshot, thread in thread.flatMap { snapshot[$0] } ?? [] }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak viewModel] loops in viewModel?.distillLoops = loops }
+        viewModel.stopDistillLoop = { [weak viewModel, weak context] taskID in
+            guard let threadID = viewModel?.selectedThreadId, let context else { return }
+            let deleted = try await context.distillAdapter.stopLoop(threadId: threadID, taskId: taskID)
+            if !deleted {
+                // Already gone on the provider side: drop the stale row instead of leaving "Stopping…".
+                let remaining = context.distillLoopStore.loops(for: threadID).filter { $0.taskID != taskID }
+                context.distillLoopStore.update(thread: threadID, loops: remaining)
+            }
+        }
+        viewModel.resumeDistillLoop = { [weak viewModel, weak context] _ in
+            guard let threadID = viewModel?.selectedThreadId, let context else { return }
+            if let error = await context.resumeDistillLoops(threadId: threadID) { throw error }
+        }
+        viewModel.dismissDistillLoop = { [weak viewModel, weak context] taskID in
+            guard let threadID = viewModel?.selectedThreadId, let context else { return }
+            let remaining = context.distillLoopStore.loops(for: threadID).filter { $0.taskID != taskID }
+            context.distillLoopStore.update(thread: threadID, loops: remaining)
+        }
+    }
+}

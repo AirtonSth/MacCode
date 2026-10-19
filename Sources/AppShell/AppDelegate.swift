@@ -271,6 +271,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // After the event log: the reconcile's events must be persisted and
         // sequenced after everything a client already saw.
         context.reconcileBotGroupsAfterLaunch()
+        context.resumeDistillLoopsAfterLaunch()
         updater = SparkleAppUpdater.defaultIfConfigured()
         updater?.onWillInstallUpdate = { [weak self] in
             self?.persistRestorableStateBeforeUpdate()

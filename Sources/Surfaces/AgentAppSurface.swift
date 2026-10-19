@@ -506,6 +506,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var hidesToolActivity = false
     @Published public var threads: [AgentThread] = [] { didSet { filteredThreadsCache = nil } }
     @Published public var selectedThreadId: AgentThreadID?
+    /// Distill `/loop` tasks of the selected thread; AppShell mirrors them from the loop store.
+    @Published public var distillLoops: [DistillLoopState] = []
+    public var stopDistillLoop: ((String) async throws -> Void)?
+    public var dismissDistillLoop: ((String) -> Void)?
+    public var resumeDistillLoop: ((String) async throws -> Void)?
+    public var distillLoopSubscription: AnyCancellable?
     /// True when the selected thread is an ephemeral side chat (hidden from the
     /// rail, so the row is not available through `threads`).
     @Published public private(set) var selectedThreadIsEphemeral = false
@@ -8410,8 +8416,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private var distillCommandSubtitles: [String: String] {
         guard provider == .distill else { return [:] }
+        // Static `/loop` subtitle until Distill advertises its own.
         return Dictionary(
-            distillSlashCommands.compactMap { cmd in cmd.subtitle.map { (cmd.name.lowercased(), $0) } },
+            distillSlashCommands.compactMap { cmd in cmd.subtitle.map { (cmd.name.lowercased(), $0) } }
+                + [("loop", "Run a prompt on a recurring interval · [interval] <prompt>")],
             uniquingKeysWith: { first, _ in first }
         )
     }
@@ -11625,7 +11633,7 @@ public enum AgentComposerSuggestions {
     /// Claude, Grok). Not RemoteCode-local handlers — `send` forwards them as the
     /// first user token. Always merged into autocomplete + `$`→`/` normalization so
     /// a stale/empty snapshot cannot hide `/goal`.
-    public static let passThroughSlashCommands = ["/goal"]
+    public static let passThroughSlashCommands = ["/goal", "/loop"]
 
     public static func suggestions(
         for text: String,
@@ -15692,6 +15700,14 @@ public struct AgentAppView: View {
             }
             // Unified system strip: severity-ordered, capped (replaces stacked banners).
             systemStatusStrip
+            if let stop = vm.stopDistillLoop, !vm.distillLoops.isEmpty {
+                DistillLoopStrip(
+                    loops: vm.distillLoops,
+                    onStop: stop,
+                    onDismissExpired: { vm.dismissDistillLoop?($0) },
+                    onResume: vm.resumeDistillLoop
+                )
+            }
             queuedMessagesSection
             if vm.selectedThreadIsEphemeral {
                 sideChatParentStatusStrip

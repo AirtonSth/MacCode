@@ -300,6 +300,77 @@ final class AgentRunCoordinatorBotSecretScopeTests: XCTestCase {
         }
     }
 
+    func test_providerWakeAttachKeepsLabelAndNeverRecyclesLiveSessionOnScopeChange() async throws {
+        // WHY: a /loop wake lives in the resident Distill process; stopping it for a scope
+        // change would kill the scheduler and lose the buffered wake it is adopting.
+        let tmp = NSTemporaryDirectory() + "rc2-wake-attach-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "loop", provider: .distill, model: "auto")
+        try threadRepo.upsert(thread)
+        let adapter = ScopeRefreshingAdapter(provider: .distill)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providerAdapters: [.distill: adapter], botSecretStore: InMemoryBotSecretStore()
+        )
+        let botIDs = CallLog()
+        coordinator.runEnvironmentProvider = { provider, _, _ in
+            botIDs.add("run")
+            return [
+                "REMOTE_CODE_AGENT_PROVIDER": provider.rawValue,
+                BotSecretEnvironment.botIDEnvironmentKey: UUID().uuidString,
+            ]
+        }
+        let first = AgentRunID()
+        _ = try await coordinator.startRun(.init(
+            runId: first, threadId: thread.id, provider: .distill, model: "auto", cwd: tmp, prompt: "/loop 1m x"
+        ))
+        try await waitForRun(first, in: runRepo)
+
+        let label = "Loop · every 1 minute · iteration 1"
+        let second = AgentRunID()
+        var wake = AgentRunRequest(
+            runId: second, threadId: thread.id, provider: .distill, model: "auto", cwd: tmp,
+            prompt: label, permissionMode: .supervised
+        )
+        wake.attachToProviderPromptId = "subagent-completed-x"
+        _ = try await coordinator.startRun(wake)
+        try await waitForRun(second, in: runRepo)
+
+        XCTAssertEqual(adapter.requests.count, 2)
+        XCTAssertEqual(adapter.requests.last?.attachToProviderPromptId, "subagent-completed-x")
+        XCTAssertNil(adapter.requests.first?.attachToProviderPromptId)
+        XCTAssertEqual(adapter.stopSessionCalls, 0, "wake adoption must not recycle the live process")
+        let labelRows = try messageRepo.list(threadId: thread.id).filter { $0.role == .user && $0.content == label }
+        XCTAssertEqual(labelRows.count, 1)
+    }
+
+    func test_providerWakeAttachWithoutLiveSessionFailsClosed() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-wake-nosession-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let thread = AgentThread(title: "loop", provider: .distill, model: "auto")
+        try threadRepo.upsert(thread)
+        let adapter = ScopeRefreshingAdapter(provider: .distill)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db), messageRepo: AgentMessageRepository(db: db),
+            threadRepo: threadRepo, providerAdapters: [.distill: adapter],
+            botSecretStore: InMemoryBotSecretStore()
+        )
+        var wake = AgentRunRequest(
+            threadId: thread.id, provider: .distill, model: "auto", cwd: tmp, prompt: "Loop"
+        )
+        wake.attachToProviderPromptId = "subagent-completed-x"
+        do {
+            _ = try await coordinator.startRun(wake)
+            XCTFail("attach without a live session must fail")
+        } catch {
+            XCTAssertTrue(adapter.requests.isEmpty)
+        }
+    }
+
     func test_startRunFailsClosedOnProtectedSecretStorageFailureBeforeProviderAdmission() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-bot-secret-failure-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

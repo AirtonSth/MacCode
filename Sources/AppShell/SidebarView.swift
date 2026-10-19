@@ -251,6 +251,8 @@ public final class SidebarViewModel: ObservableObject {
 
     /// Rows shown under one expanded workspace; the workspace row itself opens the full layout.
     nonisolated static let workspaceConversationLimit = 8
+    /// Rows loaded per expanded workspace so "Show more" knows the hidden count.
+    nonisolated static let workspaceConversationLoadLimit = 50
 
     /// What the Bots desk shows right now; nil unless the desk is the active surface.
     public struct DeskSelection: Equatable, Sendable {
@@ -273,8 +275,20 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     /// Pure: later rows beyond the cap still show when they are selected or running.
-    nonisolated static func admitsConversation(shown: Int, id: AgentThreadID, always: Set<AgentThreadID>) -> Bool {
-        shown < workspaceConversationLimit || always.contains(id)
+    nonisolated static func admitsConversation(shown: Int, id: AgentThreadID, always: Set<AgentThreadID>, limit: Int = workspaceConversationLimit) -> Bool {
+        shown < limit || always.contains(id)
+    }
+
+    /// Pure: collapsed keeps the first rows up to the cap plus selected/running ones; expanded keeps all.
+    nonisolated static func visibleConversations(
+        _ rows: [WorkspaceConversationRow], expanded: Bool, always: Set<AgentThreadID>
+    ) -> (rows: [WorkspaceConversationRow], hidden: Int, showsToggle: Bool) {
+        let limit = workspaceConversationLimit
+        guard !expanded else { return (rows, 0, rows.count > limit) }
+        var visible: [WorkspaceConversationRow] = []
+        for row in rows where admitsConversation(shown: visible.count, id: row.threadID, always: always) { visible.append(row) }
+        let hidden = rows.count - visible.count
+        return (visible, hidden, hidden > 0)
     }
 
     /// Pure: the Bot behind the thread open in the Agent App; the listed row wins over the link cache.
@@ -339,6 +353,10 @@ public final class SidebarViewModel: ObservableObject {
     @Published private(set) var selectedThreadID: AgentThreadID?
     /// Bots whose linked thread is running now, from the coordinator snapshot.
     @Published private(set) var runningLinkedBotIDs: Set<BotID> = []
+    /// Accessibility labels of threads / bots with an active Distill `/loop`.
+    @Published private(set) var loopLabelsByThread: [AgentThreadID: String] = [:]
+    @Published private(set) var loopLabelsByBot: [BotID: String] = [:]
+    private var loopSink: AnyCancellable?
     private var selectedThreadSink: AnyCancellable?
     private weak var observedAgentSurface: AgentAppSurface?
     private var runEventSubscription: UUID?
@@ -349,6 +367,17 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var workspaceConversations: [WorkspaceID: [WorkspaceConversationRow]] = [:]
     /// Disclosure state only: expanding never selects or opens a workspace.
     @Published public private(set) var expandedWorkspaceIDs: Set<WorkspaceID> = []
+    /// Workspaces whose Conversations list shows every loaded row instead of the first few.
+    @Published public private(set) var expandedConversationWorkspaces: Set<WorkspaceID> = []
+    nonisolated static let expandedConversationWorkspacesKey = "sidebar.expandedConversationWorkspaces"
+
+    nonisolated static func decodeExpandedConversationWorkspaces(_ raw: [String]?) -> Set<WorkspaceID> {
+        Set((raw ?? []).compactMap { UUID(uuidString: $0).map(WorkspaceID.init) })
+    }
+
+    nonisolated static func encodeExpandedConversationWorkspaces(_ ids: Set<WorkspaceID>) -> [String] {
+        ids.map(\.value.uuidString).sorted()
+    }
     private var didSeedExpandedWorkspace = false
     /// Names the host in search results so equal names on different hosts stay distinguishable.
     public let hostDisplayName: String = Host.current().localizedName ?? "This Mac"
@@ -501,6 +530,8 @@ public final class SidebarViewModel: ObservableObject {
         self.insomniaBatteryPrompt = insomniaBatteryPrompt
         self.operationErrorPresenter = operationErrorPresenter
         self.lastPowerState = powerMonitor.currentPowerState
+        self.expandedConversationWorkspaces = Self.decodeExpandedConversationWorkspaces(
+            UserDefaults.standard.stringArray(forKey: Self.expandedConversationWorkspacesKey))
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
             object: nil,
@@ -529,6 +560,12 @@ public final class SidebarViewModel: ObservableObject {
             self?.handleExternalPowerStateChanged(state)
         }
         self.powerMonitor.start()
+        self.loopSink = context.distillLoopStore.$snapshot
+            .map { snapshot in
+                snapshot.compactMapValues { DistillLoopPresentation.sidebarAccessibilityLabel($0) }
+            }
+            .removeDuplicates()
+            .sink { [weak self] labels in self?.applyLoopLabels(labels) }
         // :95 -- Wire the default AppKit prompter after self is available.
         // Tests replace workspacePrompter with a fake before calling any prompt path.
         workspacePrompter = AppKitWorkspacePrompter(viewModel: self)
@@ -720,7 +757,7 @@ public final class SidebarViewModel: ObservableObject {
                 var rows: [WorkspaceConversationRow] = []
                 for thread in try threadRepo.list(workspaceId: workspaceID)
                 where !thread.isEphemeral && thread.parentThreadId == nil && Self.showsThread(title: thread.title, id: thread.id, keep: keepUntitled)
-                    && Self.admitsConversation(shown: rows.count, id: thread.id, always: keepUntitled) {
+                    && Self.admitsConversation(shown: rows.count, id: thread.id, always: keepUntitled, limit: Self.workspaceConversationLoadLimit) {
                     // A pinned Bot thread is listed only while this host may still read that exact context.
                     if let pin = try botStore.conversationContextPin(linkedTo: thread.id) {
                         guard pin.hostID == hostID, pin.context == .workspace(workspaceID),
@@ -784,8 +821,26 @@ public final class SidebarViewModel: ObservableObject {
         guard expandedWorkspaceIDs.contains(id) else { return [] }
         let rows = workspaceConversations[id] ?? []
         let query = sidebarQuery
-        guard !query.isEmpty else { return rows }
+        guard !query.isEmpty else { return conversationSlice(id, rows).rows }
         return rows.filter { $0.title.range(of: query, options: .caseInsensitive) != nil }
+    }
+
+    private func conversationSlice(_ id: WorkspaceID, _ rows: [WorkspaceConversationRow]) -> (rows: [WorkspaceConversationRow], hidden: Int, showsToggle: Bool) {
+        let always = runningThreadIDs.union(selectedThreadID.map { [$0] } ?? []).union(deskSelection?.threadID.map { [$0] } ?? [])
+        return Self.visibleConversations(rows, expanded: expandedConversationWorkspaces.contains(id), always: always)
+    }
+
+    /// Show more / Show less state for one workspace; nil while searching or when nothing is hidden.
+    public func conversationToggle(_ id: WorkspaceID) -> (hidden: Int, expanded: Bool)? {
+        guard expandedWorkspaceIDs.contains(id), sidebarQuery.isEmpty else { return nil }
+        let slice = conversationSlice(id, workspaceConversations[id] ?? [])
+        guard slice.showsToggle else { return nil }
+        return (slice.hidden, expandedConversationWorkspaces.contains(id))
+    }
+
+    public func toggleConversationsExpanded(_ id: WorkspaceID) {
+        if expandedConversationWorkspaces.contains(id) { expandedConversationWorkspaces.remove(id) } else { expandedConversationWorkspaces.insert(id) }
+        saveExpandedConversationWorkspaces()
     }
 
     /// An expanded workspace always leads its Bots with "+ New bot"; a search hides it.
@@ -827,6 +882,16 @@ public final class SidebarViewModel: ObservableObject {
 
     /// Run start/finish must flip spinners without waiting for another reload.
     nonisolated static let runEventKinds = ["agent.run.started", "agent.run.finished", "agent.run.completed", "agent.run.failed", "agent.run.cancelled"]
+
+    private func applyLoopLabels(_ labels: [AgentThreadID: String]) {
+        loopLabelsByThread = labels
+        var byBot: [BotID: String] = [:]
+        if let store = context?.botStore,
+           let linked = try? store.conversationsLinked(to: Set(labels.keys)) {
+            for (thread, conversation) in linked { byBot[conversation.botID] = labels[thread] }
+        }
+        loopLabelsByBot = byBot
+    }
 
     func observeActiveBots(_ botsViewModel: BotsViewModel) {
         activeBotCountSink = botsViewModel.$activeBotCount.removeDuplicates().sink { [weak self] count in
@@ -1032,6 +1097,12 @@ public final class SidebarViewModel: ObservableObject {
         }
     }
 
+    private func saveExpandedConversationWorkspaces() {
+        UserDefaults.standard.set(
+            Self.encodeExpandedConversationWorkspaces(expandedConversationWorkspaces),
+            forKey: Self.expandedConversationWorkspacesKey)
+    }
+
     public func reload() {
         guard let ctx = context else { return }
         let loaded = (try? router?.listWorkspaces()) ?? ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
@@ -1057,6 +1128,11 @@ public final class SidebarViewModel: ObservableObject {
         updateCompletedWorkspaces(from: ordered)
         if ordered != workspaces {
             workspaces = ordered
+        }
+        let liveExpanded = expandedConversationWorkspaces.intersection(Set(ordered.map(\.id)))
+        if liveExpanded != expandedConversationWorkspaces {
+            expandedConversationWorkspaces = liveExpanded
+            saveExpandedConversationWorkspaces()
         }
         if !shellDestinationSelected {
             let nextIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
@@ -2938,6 +3014,7 @@ public struct SidebarRootView: View {
                     .frame(width: 20, height: 20)
                 Text(BotsViewModel.displayName(row.botName)).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary).lineLimit(1)
                 Spacer(minLength: 0)
+                if let loop = vm.loopLabelsByBot[row.botID] { loopGlyph(loop) }
                 if running { DSBusySpinner(label: "Running") }
             }
             .padding(.leading, DS.Space.lg)
@@ -3138,6 +3215,38 @@ public struct SidebarRootView: View {
         let conversations = vm.workspaceConversationRows(ws.id)
         let ages = SidebarViewModel.duplicateTitleAges(conversations, now: Date())
         ForEach(conversations) { workspaceConversationRow($0, workspace: ws, age: ages[$0.id]) }
+        if let toggle = vm.conversationToggle(ws.id) {
+            let label = toggle.expanded ? "Show less" : "Show more (\(toggle.hidden))"
+            Button {
+                if reduceMotion { vm.toggleConversationsExpanded(ws.id) }
+                else { withAnimation(.easeOut(duration: 0.18)) { vm.toggleConversationsExpanded(ws.id) } }
+            } label: {
+                HStack(spacing: DS.Space.sm) {
+                    Image(systemName: toggle.expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 11, weight: .regular))
+                        .frame(width: 20, height: 20)
+                        .foregroundColor(DS.Palette.textTertiary)
+                    Text(label).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, DS.Space.lg)
+                .padding(.horizontal, DS.Space.sm)
+                .frame(height: 30)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(toggle.expanded ? "Show fewer conversations" : "Show \(toggle.hidden) more conversations")
+            .accessibilityIdentifier("sidebar.conversationsToggle.\(ws.id.value.uuidString)")
+        }
+    }
+
+    private func loopGlyph(_ label: String) -> some View {
+        Image(systemName: DistillLoopPresentation.sidebarSymbol)
+            .font(.system(size: 10, weight: .regular))
+            .foregroundColor(DS.Palette.textSecondary)
+            .help(label)
+            .accessibilityLabel(label)
+            .accessibilityIdentifier("sidebar.loopGlyph")
     }
 
     private func workspaceConversationRow(_ row: SidebarViewModel.WorkspaceConversationRow, workspace: Workspace, age: String?) -> some View {
@@ -3145,7 +3254,7 @@ public struct SidebarRootView: View {
         let running = vm.runningThreadIDs.contains(row.threadID)
         return Button { navigate { vm.openWorkspaceConversation(row) } } label: {
             HStack(spacing: DS.Space.sm) {
-                Image(systemName: row.botID == nil ? "bubble.left" : "sparkle")
+                Image(systemName: "bubble.left")
                     .font(.system(size: 11, weight: .regular))
                     .frame(width: 20, height: 20)
                     .foregroundColor(DS.Palette.textTertiary)
@@ -3154,6 +3263,7 @@ public struct SidebarRootView: View {
                     Text("· \(age)").font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1).fixedSize()
                 }
                 Spacer(minLength: 0)
+                if let loop = vm.loopLabelsByThread[row.threadID] { loopGlyph(loop) }
                 if running { DSBusySpinner(label: "Running") }
             }
             .padding(.leading, DS.Space.lg)

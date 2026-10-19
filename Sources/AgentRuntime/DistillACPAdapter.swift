@@ -215,6 +215,28 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         var heldThreadStarted = false
         /// Main model last reported in a session-state event for this session.
         var reportedAcceptedModel: String?
+        /// Distill `/loop` tasks folded from scheduler notifications.
+        var ledger = DistillLoopLedger()
+        var loops: [DistillLoopState] { ledger.loops }
+        /// Wake-turn (`subagent-completed-<id>`) updates seen while no turn adopts them, per prompt id.
+        var pendingWake: [String: [[String: Any]]] = [:]
+        var pendingWakeOrder: [String] = []
+        /// Wake prompt ids already announced through `onProviderInitiatedTurn` and not yet attached.
+        var wakeNotified: Set<String> = []
+        /// Terminal of a buffered wake turn that finished before it was attached.
+        var completedWake: [String: (stopReason: String, usage: [String: Any]?)] = [:]
+        /// Wake prompt ids already adopted by a run; later updates for them are dropped.
+        var handledWake: Set<String> = []
+        var attachedPromptId: String?
+        /// Attach bookkeeping + replay are running: live updates for `attachedPromptId`
+        /// queue in `replayBuffer` and its terminal waits in `replayTerminal`.
+        var attachReplaying = false
+        var replayBuffer: [[String: Any]] = []
+        var replayTerminal: (stopReason: String, usage: [String: Any]?)?
+        /// Wake prompts the host failed to adopt; skipped until the next turn ends.
+        var wakeFailed: Set<String> = []
+        /// Wake the watchdog closed with tools still open; its real terminal clears them.
+        var abandonedWake: (promptId: String, generation: UInt64)?
 
         init(
             threadId: AgentThreadID,
@@ -308,6 +330,21 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private static var sharedDiscoveryCache: [String: (result: DistillACPDiscoveryResult, fetchedAt: Date, scope: String)] = [:]
     private static var discoveryCacheGenerations: [String: UInt64] = [:]
     private var sessions: [AgentThreadID: Session] = [:]
+    /// Loops seeded before the thread's session exists.
+    private var pendingSeedLoops: [AgentThreadID: [DistillLoopState]] = [:]
+    private var onLoopsChangedStorage: (@Sendable (AgentThreadID, [DistillLoopState]) -> Void)?
+    private var onProviderInitiatedTurnStorage: (@Sendable (AgentThreadID, String, String) -> Void)?
+    /// Called with the thread's full loop list whenever a scheduler notification changes it.
+    public var onLoopsChanged: (@Sendable (AgentThreadID, [DistillLoopState]) -> Void)? {
+        get { synchronized { onLoopsChangedStorage } }
+        set { synchronized { onLoopsChangedStorage = newValue } }
+    }
+    /// Called once per provider-initiated (`/loop` wake) turn, after the previous turn ended.
+    /// The host answers by starting a run with `attachToProviderPromptId == promptId`.
+    public var onProviderInitiatedTurn: (@Sendable (_ threadId: AgentThreadID, _ promptId: String, _ label: String) -> Void)? {
+        get { synchronized { onProviderInitiatedTurnStorage } }
+        set { synchronized { onProviderInitiatedTurnStorage = newValue } }
+    }
     /// Set by AppShell after the adapter is built; nil runs everything on the Mac.
     private var guestLaunchResolver: DistillGuestLaunchResolving?
     /// Provider sessions whose history the model rejected. A Retry (or a resume
@@ -316,6 +353,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private var retiredProviderThreadIds: Set<String> = []
     private var promptWriteAcceptanceCountForTestingStorage = 0
     var beforePromptWriteForTesting: (() -> Void)?
+    /// Runs inside `attachWakeTurn` after adoption and before the replay; tests deliver live wake updates here.
+    var beforeAttachReplayForTesting: (() -> Void)?
     var beforePhysicalPromptWriteForTesting: (() -> Void)?
     var afterPromptWriteForTesting: (() -> Void)?
     /// Runs on the cancel-write queue before `session/cancel`. Tests block here
@@ -601,6 +640,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     ) async throws -> AgentRunHandle {
         guard !request.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AgentProviderAdapterError.unsupported("Select an explicit Distill Main model before running.")
+        }
+        if let promptId = request.attachToProviderPromptId {
+            return try attachWakeTurn(request, promptId: promptId, onEvent: onEvent)
         }
         let existing = synchronized { sessions[request.threadId] }
         guard let existing else {
@@ -906,6 +948,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         distillAcpLog.info(
             "distill.cancel.force.kill thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)"
         )
+        pauseLoopsForStoppedSession(session: session)
         session.client.stop()
     }
 
@@ -1000,6 +1043,11 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     public func hasSession(threadId: AgentThreadID) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return sessions[threadId] != nil
+    }
+
+    /// True when a provider session exists for the thread. A guest thread has none until its next turn.
+    public func hasLiveSession(threadId: AgentThreadID) -> Bool {
+        synchronized { sessions[threadId]?.isLive ?? false }
     }
 
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
@@ -1352,6 +1400,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 self.handleTermination(session: session, reason: reason, status: status, error: error)
             }
             let replaced = synchronized { () -> Session? in
+                if let seeded = pendingSeedLoops.removeValue(forKey: request.threadId), session.ledger.loops.isEmpty {
+                    session.ledger = DistillLoopLedger(loops: seeded)
+                }
                 let replaced = sessions.updateValue(session, forKey: request.threadId)
                 if let replaced {
                     replaced.isLive = false
@@ -1746,6 +1797,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     }
 
     private func handleNotification(method: String, params: Any?, session: Session) {
+        foldLoops(method: method, params: params, session: session)
+        if routeWakeNotification(method: method, params: params, session: session) { return }
         guard method == "session/update",
               let params = params as? [String: Any],
               params["sessionId"] as? String == session.providerThreadId,
@@ -1771,6 +1824,297 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         for event in session.mapper.consumeSessionUpdate(update) { emit(event, session: session) }
     }
 
+    private func foldLoops(method: String, params: Any?, session: Session) {
+        guard Self.isDistillExtNotificationMethod(method) else { return }
+        let (resolvedMethod, resolvedParams) = Self.unwrapDistillExtNotification(method: method, params: params)
+        guard let dict = resolvedParams as? [String: Any],
+              dict["sessionId"] as? String == session.providerThreadId else { return }
+        let changed: (loops: [DistillLoopState], callback: (@Sendable (AgentThreadID, [DistillLoopState]) -> Void)?)? = synchronized {
+            let next = DistillLoopReducer.apply(method: resolvedMethod, params: dict, to: session.ledger)
+            let loopsChanged = next.loops != session.ledger.loops
+            session.ledger = next
+            return loopsChanged ? (next.loops, onLoopsChangedStorage) : nil
+        }
+        if let changed { changed.callback?(session.threadId, changed.loops) }
+    }
+
+    /// The process is being killed for a stuck cancel: its scheduler dies with it, so loops
+    /// pause with a visible reason instead of staying "active" on a dead session.
+    private func pauseLoopsForStoppedSession(session: Session) {
+        let changed: (loops: [DistillLoopState], callback: (@Sendable (AgentThreadID, [DistillLoopState]) -> Void)?)? = synchronized {
+            var loops = session.ledger.loops
+            var touched = false
+            for index in loops.indices where loops[index].state == .active || loops[index].state == .paused {
+                loops[index].state = .paused
+                loops[index].pausedReason = Self.stoppedSessionPausedReason
+                loops[index].nextFireAt = nil
+                touched = true
+            }
+            guard touched else { return nil }
+            session.ledger.loops = loops
+            return (loops, onLoopsChangedStorage)
+        }
+        if let changed { changed.callback?(session.threadId, changed.loops) }
+    }
+
+    public static let stoppedSessionPausedReason = "Agent session stopped; resume to continue"
+
+    /// Parent-session wake turns (agent-initiated, no `session/prompt`). Returns true when consumed.
+    private func routeWakeNotification(method: String, params: Any?, session: Session) -> Bool {
+        let (resolvedMethod, resolvedParams) = Self.isDistillExtNotificationMethod(method)
+            ? Self.unwrapDistillExtNotification(method: method, params: params)
+            : (method, params)
+        guard let dict = resolvedParams as? [String: Any],
+              dict["sessionId"] as? String == session.providerThreadId,
+              let update = dict["update"] as? [String: Any] else { return false }
+        if resolvedMethod == "session/update" {
+            guard let promptId = (dict["_meta"] as? [String: Any])?["promptId"] as? String,
+                  DistillLoopReducer.isWakePromptID(promptId) != nil else { return false }
+            var dropped: [(promptId: String, reason: String)] = []
+            let consumed: Bool = synchronized {
+                if session.attachedPromptId == promptId {
+                    guard session.attachReplaying else { return false }
+                    session.replayBuffer.append(update)
+                    return true
+                }
+                if session.handledWake.contains(promptId) { return true }
+                if session.pendingWake[promptId] == nil {
+                    while session.pendingWakeOrder.count >= Self.maxPendingWakePrompts,
+                          let oldest = session.pendingWakeOrder.first(where: { !session.wakeNotified.contains($0) }) {
+                        dropPendingWakeLocked(session: session, promptId: oldest)
+                        dropped.append((oldest, "pending wake limit \(Self.maxPendingWakePrompts)"))
+                    }
+                    session.pendingWakeOrder.append(promptId)
+                }
+                while session.pendingWake.values.reduce(0, { $0 + $1.count }) >= Self.maxBufferedWakeUpdates {
+                    guard let oldest = session.pendingWakeOrder.first(where: { $0 != promptId && !session.wakeNotified.contains($0) }) else {
+                        dropped.append((promptId, "buffered update limit \(Self.maxBufferedWakeUpdates)"))
+                        return true
+                    }
+                    dropPendingWakeLocked(session: session, promptId: oldest)
+                    dropped.append((oldest, "buffered update limit \(Self.maxBufferedWakeUpdates)"))
+                }
+                session.pendingWake[promptId, default: []].append(update)
+                return true
+            }
+            for drop in dropped { reportWakeDropped(session: session, promptId: drop.promptId, reason: drop.reason) }
+            if consumed { notifyPendingWake(session: session) }
+            return consumed
+        }
+        let name = resolvedMethod.hasPrefix("_") ? String(resolvedMethod.dropFirst()) : resolvedMethod
+        guard name == "x.ai/session_notification",
+              update["sessionUpdate"] as? String == "turn_completed",
+              let promptId = update["prompt_id"] as? String,
+              DistillLoopReducer.isWakePromptID(promptId) != nil else { return false }
+        let stopReason = update["stop_reason"] as? String ?? "end_turn"
+        let usage = update["usage"] as? [String: Any]
+        let attached: Bool? = synchronized {
+            if let abandoned = session.abandonedWake, abandoned.promptId == promptId {
+                session.abandonedWake = nil
+                if session.abandonedOpenToolsGeneration == abandoned.generation {
+                    session.abandonedOpenToolsGeneration = nil
+                }
+                return false
+            }
+            if session.attachedPromptId == promptId {
+                if session.attachReplaying {
+                    session.replayTerminal = (stopReason, usage)
+                    return false
+                }
+                return true
+            }
+            if session.pendingWake[promptId] != nil {
+                session.completedWake[promptId] = (stopReason, usage)
+                return false
+            }
+            return nil
+        }
+        guard let attached else { return false }
+        if attached { completeWakeTurn(session: session, stopReason: stopReason, usage: usage) }
+        return true
+    }
+
+    private static let maxBufferedWakeUpdates = 20_000
+    private static let maxPendingWakePrompts = 8
+
+    private func dropPendingWakeLocked(session: Session, promptId: String) {
+        session.pendingWake.removeValue(forKey: promptId)
+        session.pendingWakeOrder.removeAll { $0 == promptId }
+        session.completedWake.removeValue(forKey: promptId)
+        session.wakeFailed.remove(promptId)
+        session.handledWake.insert(promptId)
+    }
+
+    /// Never silent: a dropped wake loses a loop iteration's output.
+    private func reportWakeDropped(session: Session, promptId: String, reason: String) {
+        distillAcpLog.error(
+            "distill.loop.wake.dropped thread=\(session.threadId.value.uuidString, privacy: .public) prompt=\(promptId, privacy: .public) reason=\(reason, privacy: .public)"
+        )
+        let event = Self.runtimeEvent(
+            method: "distill.loop.wake.dropped",
+            payload: ["sessionId": session.providerThreadId, "promptId": promptId, "reason": reason]
+        )
+        let inTurn = synchronized { session.inFlight && !session.turnTerminalEmitted }
+        if inTurn {
+            emit(event, session: session)
+        } else {
+            synchronized { session.history.append(event) }
+        }
+    }
+
+    /// The host could not adopt `promptId`: release the announcement so other wakes are not
+    /// blocked. The failed wake is retried after the next turn ends.
+    public func acknowledgeWakeFailed(threadId: AgentThreadID, promptId: String) {
+        let session: Session? = synchronized {
+            guard let session = sessions[threadId], session.wakeNotified.remove(promptId) != nil else { return nil }
+            if session.pendingWake[promptId] != nil {
+                session.wakeFailed.insert(promptId)
+                session.pendingWakeOrder.removeAll { $0 == promptId }
+                session.pendingWakeOrder.append(promptId)
+            }
+            return session
+        }
+        if let session { notifyPendingWake(session: session) }
+    }
+
+    private func completeWakeTurn(session: Session, stopReason: String, usage: [String: Any]?) {
+        let current = synchronized { session.inFlight && !session.turnTerminalEmitted }
+        guard current else { return }
+        for event in session.mapper.finishTurn(stopReason: stopReason, usage: usage) { emit(event, session: session) }
+        let status = DistillACPTerminalClassifier.status(stopReason: stopReason)
+        if status == .failed {
+            session.onEvent?(.error(DistillACPFailureTaxonomy.normalize(
+                diagnostic: "Distill ACP stopped: \(stopReason)",
+                context: .turn
+            ).message))
+        }
+        finishTurn(session: session, status: status)
+    }
+
+    /// Announces the next buffered wake turn once no turn is in flight and none awaits adoption.
+    private func notifyPendingWake(session: Session) {
+        let announcement: (callback: @Sendable (AgentThreadID, String, String) -> Void, promptId: String, label: String)? = synchronized {
+            guard let callback = onProviderInitiatedTurnStorage,
+                  session.isLive, !session.inFlight, session.wakeNotified.isEmpty,
+                  let promptId = session.pendingWakeOrder.first(where: {
+                      !session.wakeNotified.contains($0) && !session.wakeFailed.contains($0)
+                  }) else { return nil }
+            session.wakeNotified.insert(promptId)
+            let subagentId = DistillLoopReducer.isWakePromptID(promptId)
+            let loop = session.loops.first { $0.lastIteration?.subagentID == subagentId }
+            let label = loop.map { "Loop · \($0.humanSchedule) · iteration \($0.iterations)" } ?? "Loop iteration"
+            return (callback, promptId, label)
+        }
+        if let announcement { announcement.callback(session.threadId, announcement.promptId, announcement.label) }
+    }
+
+    /// Adopts a buffered wake turn as this run: same bookkeeping as `startPrompt`, no `session/prompt`.
+    private func attachWakeTurn(
+        _ request: AgentRunRequest,
+        promptId: String,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) throws -> AgentRunHandle {
+        let adopted: (session: Session, updates: [[String: Any]], generation: UInt64, completed: (stopReason: String, usage: [String: Any]?)?) = try synchronized {
+            guard let session = sessions[request.threadId], session.isLive else {
+                throw AgentProviderAdapterError.sessionNotFound(request.threadId)
+            }
+            guard !session.inFlight else {
+                throw AgentProviderAdapterError.unsupported("Distill ACP session already has an in-flight prompt")
+            }
+            guard let updates = session.pendingWake.removeValue(forKey: promptId) else {
+                throw AgentProviderAdapterError.unsupported("Distill loop turn is no longer pending")
+            }
+            session.pendingWakeOrder.removeAll { $0 == promptId }
+            session.wakeNotified.remove(promptId)
+            session.wakeFailed.remove(promptId)
+            session.handledWake.insert(promptId)
+            let completed = session.completedWake.removeValue(forKey: promptId)
+            session.inFlight = true
+            session.promptAccepted = true
+            session.status = .running
+            session.cancelRequested = false
+            session.forcedKillByUs = false
+            session.turnTerminalEmitted = false
+            session.turnWatchdogSynthesisInProgress = false
+            session.forceKillWorkItem?.cancel()
+            session.forceKillWorkItem = nil
+            session.promptGeneration &+= 1
+            session.promptFailureDetail = nil
+            session.attachedPromptId = promptId
+            session.attachReplaying = true
+            session.replayBuffer = []
+            session.replayTerminal = nil
+            session.onEvent = onEvent
+            cancelTurnWatchdogLocked(session: session)
+            return (session, updates, session.promptGeneration, completed)
+        }
+        let session = adopted.session
+        beforeAttachReplayForTesting?()
+        for event in session.mapper.beginTurn() { emit(event, session: session) }
+        onEvent(.status(.running))
+        refreshTurnWatchdog(session: session, generation: adopted.generation)
+        // Live updates for this prompt queue while we replay; drain in arrival order, then
+        // flip live and finish with the terminal that arrived first (buffered or deferred).
+        var batch = adopted.updates
+        var terminal = adopted.completed
+        while true {
+            for update in batch {
+                for event in session.mapper.consumeSessionUpdate(update) { emit(event, session: session) }
+            }
+            let next: (updates: [[String: Any]], terminal: (stopReason: String, usage: [String: Any]?)?) = synchronized {
+                if session.replayBuffer.isEmpty {
+                    session.attachReplaying = false
+                    let deferred = session.replayTerminal
+                    session.replayTerminal = nil
+                    return ([], deferred)
+                }
+                let updates = session.replayBuffer
+                session.replayBuffer = []
+                return (updates, nil)
+            }
+            batch = next.updates
+            if batch.isEmpty {
+                terminal = terminal ?? next.terminal
+                break
+            }
+        }
+        if let terminal {
+            completeWakeTurn(session: session, stopReason: terminal.stopReason, usage: terminal.usage)
+        }
+        return handle(for: request.runId, session: session)
+    }
+
+    public func loops(threadId: AgentThreadID) -> [DistillLoopState] {
+        synchronized { sessions[threadId]?.loops ?? [] }
+    }
+
+    /// Restores persisted loops so a restarted session keeps iteration history. No-op when the
+    /// session already has loops; applied at session creation when none exists yet.
+    public func seedLoops(threadId: AgentThreadID, loops: [DistillLoopState]) {
+        guard !loops.isEmpty else { return }
+        synchronized {
+            if let session = sessions[threadId] {
+                if session.ledger.loops.isEmpty { session.ledger = DistillLoopLedger(loops: loops) }
+            } else {
+                pendingSeedLoops[threadId] = loops
+            }
+        }
+    }
+
+    public func threadIdsWithActiveLoops() -> Set<AgentThreadID> {
+        synchronized {
+            Set(sessions.values.filter { $0.isLive && $0.loops.contains { $0.state == .active } }.map(\.threadId))
+        }
+    }
+
+    /// Deletes the scheduled task; the `scheduled_task_deleted` notification updates loop state.
+    public func stopLoop(threadId: AgentThreadID, taskId: String) async throws -> Bool {
+        guard let session = synchronized({ sessions[threadId] }), synchronized({ session.isLive }) else {
+            throw AgentProviderAdapterError.sessionNotFound(threadId)
+        }
+        return try await session.client.schedulerDelete(sessionId: session.providerThreadId, taskId: taskId)
+    }
+
     /// Live (`x.ai/…`) and legacy (`_x.ai/…`) distill ACP extension notifications.
     private static func isDistillExtNotificationMethod(_ method: String) -> Bool {
         method.hasPrefix("x.ai/") || method.hasPrefix("_x.ai/")
@@ -1793,6 +2137,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     /// Apply load-time `session/update` to mapper session state only.
     /// Does not publish timeline events onto the follow-up run's onEvent path.
     private func hydrateNotification(method: String, params: Any?, session: Session) {
+        foldLoops(method: method, params: params, session: session)
         guard method == "session/update",
               let params = params as? [String: Any],
               params["sessionId"] as? String == session.providerThreadId,
@@ -1813,6 +2158,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     /// without pushing into the live `onEvent` path (avoids durable stream
     /// pollution / wire re-rendering of historical text).
     private func recordHydratedTimeline(method: String, params: Any?, session: Session) {
+        foldLoops(method: method, params: params, session: session)
         guard method == "session/update",
               let params = params as? [String: Any],
               params["sessionId"] as? String == session.providerThreadId,
@@ -2041,11 +2387,19 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         session.turnTerminalEmitted = true
         session.turnWatchdogSynthesisInProgress = false
         session.inFlight = false
+        session.attachedPromptId = nil
+        session.attachReplaying = false
+        session.replayBuffer = []
+        session.replayTerminal = nil
+        session.wakeFailed.removeAll()
         session.status = status
         // A guest run ends with its turn: no idle guest process keeps the
         // bot's credentials. The next turn loads the session in a new one.
-        let endsGuestRun = session.guestPlan != nil
-        let stopRequested = status == .cancelled && session.cancelRequested
+        // A live /loop keeps the process (and the guest) alive between turns.
+        // A cancel ends the turn only; the force-kill path (isLive == false) already paused them.
+        let keepsLoopsAlive = session.isLive && session.loops.contains { $0.state == .active || $0.state == .paused }
+        let endsGuestRun = session.guestPlan != nil && !keepsLoopsAlive
+        let stopRequested = status == .cancelled && session.cancelRequested && !keepsLoopsAlive
         let shouldStopOwnedTree = stopRequested || endsGuestRun
         if shouldStopOwnedTree {
             if sessions[session.threadId] === session {
@@ -2087,7 +2441,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 }
                 client.stop()
             })
-        } else {
+        } else if !keepsLoopsAlive {
             session.guestPlan?.finish(status)
         }
         if shouldStopOwnedTree {
@@ -2098,6 +2452,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         }
         callback?(.status(status))
         callback?(.finished(status, finalMessage: final, providerThreadId: providerThreadId))
+        notifyPendingWake(session: session)
     }
 
     /// (Re)arm the in-flight turn inactivity bound. No-op when the turn is no
@@ -2158,7 +2513,12 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // Speakable text alone is only enough when no tool_call is still open.
         let hasOpenTools = session.mapper.hasOpenToolCalls
         if hasOpenTools {
-            synchronized { session.abandonedOpenToolsGeneration = generation }
+            synchronized {
+                session.abandonedOpenToolsGeneration = generation
+                if let promptId = session.attachedPromptId {
+                    session.abandonedWake = (promptId, generation)
+                }
+            }
         }
         let hasFinal = session.mapper.hasSpeakableFinalContent
         let status: AgentRunStatus

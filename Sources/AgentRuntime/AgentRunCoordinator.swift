@@ -1225,6 +1225,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 contextSnapshot: request.contextSnapshot,
                 preparedContextSeed: request.preparedContextSeed
             )
+            normalizedRequest.attachToProviderPromptId = request.attachToProviderPromptId
         }
         let forkRecoveryPending = try threadRepo.hasRecoverableForkIntent(sourceThreadId: request.threadId)
         guard !forkRecoveryPending else {
@@ -1403,8 +1404,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
         // One read serves the Mac handoff and the guest placement check below.
         let guestPlacement = try threadRepo.guestPlacement(of: admittedRequest.request.threadId)
-        let macHandoff = try pendingMacHandoff(admittedRequest.request, placement: guestPlacement)
-        let request = macHandoff ?? admittedRequest.request
+        var macHandoff = try pendingMacHandoff(admittedRequest.request, placement: guestPlacement)
+        // Rebuilt requests drop the runtime-only wake label; carry it through.
+        let attachPromptId = normalizedRequest.attachToProviderPromptId
+        macHandoff?.attachToProviderPromptId = attachPromptId
+        var routedRequest = admittedRequest.request
+        routedRequest.attachToProviderPromptId = attachPromptId
+        if attachPromptId != nil, routedRequest.provider != normalizedRequest.provider {
+            throw AgentProviderAdapterError.unsupported(
+                "Provider-initiated turn cannot be re-routed to another provider"
+            )
+        }
+        let request = macHandoff ?? routedRequest
         // A user-initiated run ends any background-await auto-continuation streak;
         // the auto-nudge path passes `isAutoContinuation: true` to preserve the bound.
         // F37: it must also invalidate any ALREADY-SCHEDULED continuation (same
@@ -1489,6 +1500,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runAsUser: request.runAsUser,
             acceptancePermit: pendingProviderStart.acceptancePermit
         )
+        effectiveRequest.attachToProviderPromptId = attachPromptId
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)
         }
@@ -1639,7 +1651,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
             pendingProviderStart.record(handle: handle)
             lock.lock()
-            providerTurnScopes[effectiveRequest.threadId] = ProviderTurnScope(environment: effectiveRequest.environment)
+            // An adopted wake turn keeps the live process's original scope.
+            if effectiveRequest.attachToProviderPromptId == nil {
+                providerTurnScopes[effectiveRequest.threadId] = ProviderTurnScope(environment: effectiveRequest.environment)
+            }
             lock.unlock()
         } catch {
             lock.lock()
@@ -5088,6 +5103,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         _ adapter: AgentProviderAdapter,
         request: AgentRunRequest
     ) throws {
+        if request.attachToProviderPromptId != nil {
+            // Adopting a wake turn must never recycle the process holding the
+            // scheduler and its buffered wake; no live session fails closed.
+            guard adapter.hasSession(threadId: request.threadId) else {
+                throw AgentProviderAdapterError.sessionNotFound(request.threadId)
+            }
+            return
+        }
         guard adapter.hasSession(threadId: request.threadId) else { return }
         let nextScope = ProviderTurnScope(environment: request.environment)
         lock.lock()
@@ -5107,7 +5130,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func recoverAdapterSessionIfNeeded(threadId: AgentThreadID, adapter: AgentProviderAdapter) async throws {
+    public enum SchedulerResumeError: LocalizedError {
+        case guestSessionNotLive
+        public var errorDescription: String? {
+            "Bot loops resume when the bot's next turn starts"
+        }
+    }
+
+    /// Reloads the provider session of a finished thread so its in-process scheduler (Distill `/loop`) re-arms.
+    public func resumeSessionForScheduler(threadId: AgentThreadID) async throws {
+        let adapter = try adapterForThread(threadId)
+        try await recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter, allowTerminalStatus: true)
+        // Guest (bot) recovery opens nothing, so success alone does not prove the scheduler re-armed.
+        if let distill = adapter as? DistillACPAdapter, !distill.hasLiveSession(threadId: threadId) {
+            throw SchedulerResumeError.guestSessionNotLive
+        }
+    }
+
+    private func recoverAdapterSessionIfNeeded(
+        threadId: AgentThreadID,
+        adapter: AgentProviderAdapter,
+        allowTerminalStatus: Bool = false
+    ) async throws {
         guard !adapter.hasSession(threadId: threadId) else { return }
         guard let thread = try threadRepo.adapterRecovery(of: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
@@ -5119,7 +5163,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // for the explicit Continue path.
         switch thread.status {
         case .completed, .failed, .cancelled:
-            return
+            if !allowTerminalStatus { return }
         case .pending, .running, .interrupted:
             break
         }

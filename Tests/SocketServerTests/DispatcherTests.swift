@@ -896,6 +896,15 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         return AgentRunID()
     }
     var threadStore: [AgentThread] = []
+    var loopsByThread: [AgentThreadID: [DistillLoopState]] = [:]
+    var stopLoopCalls: [(AgentThreadID, String)] = []
+    var stopLoopError: Error?
+    func threadLoops(thread: AgentThreadID) -> [DistillLoopState] { loopsByThread[thread] ?? [] }
+    func stopThreadLoop(thread: AgentThreadID, taskId: String) async throws -> Bool {
+        stopLoopCalls.append((thread, taskId))
+        if let stopLoopError { throw stopLoopError }
+        return true
+    }
     var deleteAgentThreadCallCount = 0
     var deleteAgentThreadsCallCount = 0
     var setAgentThreadPinnedCallCount = 0

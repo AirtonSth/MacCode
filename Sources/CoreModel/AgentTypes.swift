@@ -748,6 +748,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     /// session; unlike `contextSnapshot` it has no all-or-nothing size limit, so
     /// a long thread still hands its most recent context to the new session.
     public var priorConversationTail: [AgentMessage]?
+    /// Provider-initiated turn (Distill `/loop` wake) to adopt instead of sending a prompt. Runtime-only.
+    public var attachToProviderPromptId: String?
 
     public init(
         runId: AgentRunID = AgentRunID(),

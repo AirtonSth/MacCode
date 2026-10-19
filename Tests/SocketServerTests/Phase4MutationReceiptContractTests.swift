@@ -1262,8 +1262,9 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         // 175 + bot.notice.act and bot.notice.read (Titio notice cards, hub spec §7)
         // + bot.notice.clear (clear a Titio notification, voice contract §3),
         // + explicit context grant/revoke and existing activity viewed/acknowledge,
-        // + bot.reorder (persisted sidebar/home bot drag order).
-        XCTAssertEqual(canonical.count, 185)
+        // + bot.reorder (persisted sidebar/home bot drag order),
+        // + agent.thread.loop.stop and host.browser.screenshot.
+        XCTAssertEqual(canonical.count, 187)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -3764,7 +3765,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         let manifestKinds = Set(mutations.flatMap { $0["eventKinds"] as? [String] ?? [] })
         let treatyKinds = Set(RemoteCodeEventKind.allCases.map(\.rawValue))
 
-        XCTAssertEqual(treatyKinds.count, 151)
+        XCTAssertEqual(treatyKinds.count, 152)
         XCTAssertTrue(
             manifestKinds.isSubset(of: treatyKinds),
             "Treaty is missing manifest kinds: \(manifestKinds.subtracting(treatyKinds).sorted())"

@@ -288,6 +288,10 @@ public protocol CommandRouting: AnyObject {
     func deleteAgentThread(thread: AgentThreadID) async throws
     func deleteAgentThreads(_ threads: [AgentThreadID]) async throws
     func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread
+    /// Distill `/loop` state folded for a thread (empty when none).
+    func threadLoops(thread: AgentThreadID) -> [DistillLoopState]
+    /// `agent.thread.loop.stop`: deletes the scheduled task in the thread's live agent session.
+    func stopThreadLoop(thread: AgentThreadID, taskId: String) async throws -> Bool
     func setAgentThreadPinned(thread: AgentThreadID, pinned: Bool) throws -> AgentThread
     func setAgentThreadColor(thread: AgentThreadID, color: String) throws -> AgentThread
     func reorderAgentThread(thread: AgentThreadID, position: Int) throws -> [AgentThread]
@@ -409,6 +413,8 @@ public protocol CommandRouting: AnyObject {
 }
 
 public extension CommandRouting {
+    func threadLoops(thread: AgentThreadID) -> [DistillLoopState] { [] }
+    func stopThreadLoop(thread: AgentThreadID, taskId: String) async throws -> Bool { throw JSONRPCError.notSupported("agent.thread.loop.stop") }
     func activityList(params: [String: JSONValue]) throws -> JSONValue { throw JSONRPCError.notSupported("agent.activity.list") }
     func captureHostBrowserToChat(callerThread: AgentThreadID, surface: SurfaceID?, reason: String) throws -> JSONValue { throw JSONRPCError.notSupported("host.browser.screenshot") }
     func activityListOffMain(params: [String: JSONValue]) async throws -> JSONValue { try activityList(params: params) }
@@ -1058,6 +1064,7 @@ public final class JSONRPCDispatcher {
         "agent.thread.delete",
         "agent.thread.delete_many",
         "agent.thread.rename",
+        "agent.thread.loop.stop",
         "agent.thread.set_pinned",
         "agent.thread.set_color",
         "agent.thread.reorder",
@@ -4571,6 +4578,17 @@ public final class JSONRPCDispatcher {
                 let result = encodeThread(t)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
+            case "agent.thread.loop.stop":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let taskId = params["task_id"]?.stringValue, !taskId.isEmpty else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let deleted = try await router.stopThreadLoop(thread: tid, taskId: taskId)
+                let result = JSONValue.object(["deleted": .bool(deleted)])
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.thread.set_pinned":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let pinned = params["pinned"]?.boolValue else { throw JSONRPCError.invalidParams }
@@ -5677,6 +5695,7 @@ public final class JSONRPCDispatcher {
         appendActiveRun(to: &object, thread: thread.id)
         object["pending_manual_action"] = ManualActionWire.pendingRow(router.pendingManualActions(for: [thread])[thread.id])
         appendThreadActor(thread, guestRuntime: router.threadGuestRuntime(thread: thread.id), to: &object)
+        appendLoops(thread.id, to: &object)
         return .object(object)
     }
 
@@ -5709,7 +5728,16 @@ public final class JSONRPCDispatcher {
         appendActiveRun(to: &object, thread: thread.id)
         object["pending_manual_action"] = ManualActionWire.pendingRow(pendingManualActions[thread.id])
         appendThreadActor(thread, guestRuntime: guestRuntimes[thread.id], to: &object)
+        appendLoops(thread.id, to: &object)
         return .object(object)
+    }
+
+    private func appendLoops(_ thread: AgentThreadID, to object: inout [String: JSONValue]) {
+        let loops = router.threadLoops(thread: thread)
+        guard !loops.isEmpty,
+              let data = try? JSONEncoder().encode(loops),
+              let value = try? JSONDecoder().decode(JSONValue.self, from: data) else { return }
+        object["loops"] = value
     }
 
     /// `agent.thread.actor.set` / `agent.mac_execution.resolve` result: the

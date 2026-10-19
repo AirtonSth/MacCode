@@ -1261,6 +1261,19 @@ public final class DistillACPClient: @unchecked Sendable {
         )
         return response["enabled"] as? Bool ?? enabled
     }
+    /// Distill extension method that deletes a scheduled (`/loop`) task.
+    static let schedulerDeleteMethod = "_x.ai/scheduler/delete"
+    /// True when Distill deleted the task (`{"result":{"deleted":true}}` nested or flat).
+    func schedulerDelete(sessionId: String, taskId: String) async throws -> Bool {
+        let response = try await requestJSONObject(
+            method: Self.schedulerDeleteMethod,
+            params: ["sessionId": sessionId, "taskId": taskId],
+            timeout: 15
+        )
+        if let nested = response["result"] as? JSONObject, let deleted = nested["deleted"] as? Bool { return deleted }
+        return response["deleted"] as? Bool ?? false
+    }
+
     /// Distill extension method that binds this session's Worker model.
     static let workerModelSetMethod = "_x.ai/session/worker_model/set"
 

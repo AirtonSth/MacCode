@@ -548,6 +548,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let prompt: String
         let cwd: String?
     }
+    /// Distill loop wakes waiting for the thread's current run to finish.
+    var pendingProviderWakes: [AgentThreadID: [(promptId: String, label: String)]] = [:]
+    /// Wake prompt ids already adopted (or being adopted) per thread, oldest first, capped.
+    var startedProviderWakePromptIds: [AgentThreadID: [String]] = [:]
     var botThreadPromptTransform: (@MainActor (AgentThreadID, String, AgentRunID) async throws -> BotThreadQueuedPrompt?)?
     /// Fires after a queue-drained run starts on any thread; the bot desk records its receipt here.
     var botThreadRunStarted: (@MainActor (AgentRunID, AgentThreadID) -> Void)?
@@ -4896,6 +4900,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
+        wireDistillLoops(on: viewModel, context: context)
         viewModel.forceQueuedMessage = { [weak context] messageID in
             guard let router = context?.router else {
                 throw JSONRPCError(code: -32000, message: "App router is not ready.")
@@ -6044,6 +6049,70 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    struct ProviderWakeBusyError: Error {}
+
+    /// Distill `/loop` wake the provider started on its own: the host adopts it as a run whose
+    /// user row is `label`. A busy thread or busy bot VM keeps the wake pending until a run finishes.
+    func startProviderInitiatedTurn(threadId: AgentThreadID, promptId: String, label: String) async {
+        guard let ctx = context else { return }
+        if startedProviderWakePromptIds[threadId]?.contains(promptId) == true
+            || pendingProviderWakes[threadId]?.contains(where: { $0.promptId == promptId }) == true {
+            return
+        }
+        if ctx.coordinator.hasProviderSession(threadId: threadId) || ctx.coordinator.hasPendingProviderStart(threadId: threadId)
+            || (try? ctx.threadRepo.status(of: threadId)) == .running {
+            pendingProviderWakes[threadId, default: []].append((promptId, label))
+            return
+        }
+        markProviderWakeStarted(threadId: threadId, promptId: promptId)
+        do {
+            _ = try await sendAgentMessage(
+                thread: threadId, text: label, provider: nil, model: nil, permissionMode: nil,
+                reasoningEffort: nil, serviceTier: nil, interactionMode: nil, modelSelection: nil,
+                providerInstanceId: nil, attachments: [], queueMessageId: nil,
+                queueBehindBusyBotVM: false, attachToProviderPromptId: promptId
+            )
+        } catch is ProviderWakeBusyError {
+            unmarkProviderWakeStarted(threadId: threadId, promptId: promptId)
+            pendingProviderWakes[threadId, default: []].append((promptId, label))
+        } catch is BotVMBusyError {
+            unmarkProviderWakeStarted(threadId: threadId, promptId: promptId)
+            pendingProviderWakes[threadId, default: []].append((promptId, label))
+        } catch {
+            unmarkProviderWakeStarted(threadId: threadId, promptId: promptId)
+            appRouterLog.error("provider-initiated turn failed thread=\(threadId.value.uuidString, privacy: .public): \(String(describing: error), privacy: .public)")
+            ctx.distillAdapter.acknowledgeWakeFailed(threadId: threadId, promptId: promptId)
+            appRouterLog.info("provider wake released for re-announce thread=\(threadId.value.uuidString, privacy: .public) prompt=\(promptId, privacy: .public)")
+        }
+    }
+
+    private func markProviderWakeStarted(threadId: AgentThreadID, promptId: String) {
+        var ids = startedProviderWakePromptIds[threadId] ?? []
+        ids.append(promptId)
+        if ids.count > 200 { ids.removeFirst(ids.count - 200) }
+        startedProviderWakePromptIds[threadId] = ids
+    }
+
+    private func unmarkProviderWakeStarted(threadId: AgentThreadID, promptId: String) {
+        startedProviderWakePromptIds[threadId]?.removeAll { $0 == promptId }
+    }
+
+    /// Starts the oldest wake that waited behind a run on `threadId`, then gives every other
+    /// thread's pending wake one try: a finished run may have freed a bot VM they waited for.
+    func startPendingProviderWake(threadId: AgentThreadID) async {
+        await startOldestPendingProviderWake(threadId: threadId)
+        for other in pendingProviderWakes.keys where other != threadId {
+            await startOldestPendingProviderWake(threadId: other)
+        }
+    }
+
+    private func startOldestPendingProviderWake(threadId: AgentThreadID) async {
+        guard var wakes = pendingProviderWakes[threadId], !wakes.isEmpty else { return }
+        let next = wakes.removeFirst()
+        pendingProviderWakes[threadId] = wakes.isEmpty ? nil : wakes
+        await startProviderInitiatedTurn(threadId: threadId, promptId: next.promptId, label: next.label)
+    }
+
     /// A follow-up the host sends for the user (manual-action answers,
     /// Mac-execution approvals). On a bot thread it is a bot turn like the Mac
     /// card's: compiled brain, VM/guest rules, bot-home cwd and the desk's run
@@ -6190,7 +6259,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true, compilesBotPrompt: Bool = false) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true, compilesBotPrompt: Bool = false, attachToProviderPromptId: String? = nil) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         do {
             try Self.refuseContextPinnedGenericExecution(thread, context: ctx)
@@ -6265,6 +6334,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             if queueMessageId != nil {
                 throw JSONRPCError(code: -32000, message: "Thread became active before queued dispatch started.")
             }
+            if attachToProviderPromptId != nil {
+                throw ProviderWakeBusyError()
+            }
             return try enqueueBehindActiveRun()
         }
         // D12: one run per bot VM. A VM busy in another thread queues this send
@@ -6275,6 +6347,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let vmClaim, let holder = vmClaim.holder {
             // Nothing was written: the caller keeps its text and shows the notice.
             guard queueBehindBusyBotVM else { throw BotVMBusyError(holder: holder) }
+            if attachToProviderPromptId != nil { throw ProviderWakeBusyError() }
             let notice = waitForBotVM(botID: vmClaim.botID, thread: thread, holder: holder)
             if queueMessageId != nil { throw JSONRPCError(code: -32000, message: notice) }
             return try enqueueBehindActiveRun()
@@ -6467,14 +6540,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         var runPrompt = text
         var runCwd = cwd
         var botPromptApplied = false
-        if queueMessageId != nil || compilesBotPrompt,
+        if attachToProviderPromptId == nil, queueMessageId != nil || compilesBotPrompt,
            let transform = botThreadPromptTransform,
            let transformed = try await transform(thread, text, requestedRunID) {
             runPrompt = transformed.prompt
             if let botCwd = transformed.cwd { runCwd = GrokACPClient.resolvedSessionCwd(botCwd) }
             botPromptApplied = true
         }
-        let req = AgentRunRequest(
+        var req = AgentRunRequest(
             runId: requestedRunID,
             threadId: thread,
             provider: prov,
@@ -6501,6 +6574,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             runAsUser: t.runAsUser,
             acceptancePermit: acceptancePermit
         )
+        req.attachToProviderPromptId = attachToProviderPromptId
         let runId: AgentRunID
         do {
             runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
@@ -7446,6 +7520,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return result.runId
     }
 
+    public func threadLoops(thread: AgentThreadID) -> [DistillLoopState] {
+        context?.distillLoopStore.loops(for: thread) ?? []
+    }
+
+    public func stopThreadLoop(thread: AgentThreadID, taskId: String) async throws -> Bool {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        do {
+            return try await ctx.distillAdapter.stopLoop(threadId: thread, taskId: taskId)
+        } catch AgentProviderAdapterError.sessionNotFound {
+            throw JSONRPCError(code: -32000, message: "Loop's agent session is not running")
+        }
+    }
+
+    private func stopDistillLoops(threads: [AgentThreadID], ctx: AppContext) async {
+        for thread in threads {
+            for loop in ctx.distillAdapter.loops(threadId: thread) where loop.state == .active {
+                _ = try? await ctx.distillAdapter.stopLoop(threadId: thread, taskId: loop.taskID)
+            }
+        }
+    }
+
     public func deleteAgentThread(thread: AgentThreadID) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let handoffDeletion = ctx.botPeerHandoffAuthority.beginDeletion(threadIDs: [thread])
@@ -7457,6 +7552,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let suppressionLease = await ctx.acquireQueueDrainSuppression(threadId: thread)
         defer { ctx.releaseQueueDrainSuppression(threadId: thread, lease: suppressionLease) }
+        await stopDistillLoops(threads: [thread], ctx: ctx)
         try await ctx.coordinator.stopAndAwaitTermination(threadId: thread)
         try ctx.threadRepo.delete(id: thread)
         didDeleteSource = true
@@ -7478,6 +7574,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ctx.releaseQueueDrainSuppression(threadId: thread, lease: lease)
             }
         }
+        await stopDistillLoops(threads: threads, ctx: ctx)
         try await ctx.coordinator.stopAndAwaitTermination(threadIds: threads)
         try ctx.threadRepo.delete(ids: threads)
         didDeleteSource = true

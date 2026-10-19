@@ -41,6 +41,7 @@ public enum HostMutationContract {
     agent.thread.delete
     agent.thread.delete_many
     agent.thread.rename
+    agent.thread.loop.stop
     agent.thread.set_pinned
     agent.thread.set_color
     agent.thread.reorder
@@ -509,6 +510,7 @@ public enum HostMutationContract {
         case "agent.thread.delete", "agent.thread.reorder", "agent.thread.configure", "agent.thread.mark_read", "agent.thread.select", "agent.run.continue", "agent.run.stop": return [.uuid("thread_id")]
         case "agent.thread.delete_many": return [.uuidArrayWithAtLeastOne("thread_ids")]
         case "agent.thread.rename": return [.uuid("thread_id"), .string("title")]
+        case "agent.thread.loop.stop": return [.uuid("thread_id"), .string("task_id")]
         case "agent.thread.set_pinned": return [.uuid("thread_id"), .bool("pinned")]
         case "agent.thread.set_color": return [.uuid("thread_id"), .string("color")]
         case "agent.thread.execution.configure": return [.uuid("thread_id"), .stringEnum("execution_mode", ["local", "worktree"])]
