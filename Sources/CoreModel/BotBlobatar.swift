@@ -6,7 +6,7 @@ import Foundation
 /// (frozen previews, selected chip, circular hue swatches) follows
 /// jeremy-prt/bloub (MIT). No npm package, no animation engine.
 public enum BotBlobatarShape: String, CaseIterable, Sendable {
-    case auto, round, organic, boxy, nub, cloud, sun
+    case auto, round, organic, boxy, nub, cloud, sun, star, ghost, bean, drop
 
     public var displayName: String {
         switch self {
@@ -17,6 +17,21 @@ public enum BotBlobatarShape: String, CaseIterable, Sendable {
         case .nub: return "Nub"
         case .cloud: return "Cloud"
         case .sun: return "Sun"
+        case .star: return "Star"
+        case .ghost: return "Ghost"
+        case .bean: return "Bean"
+        case .drop: return "Drop"
+        }
+    }
+
+    /// Picked-only silhouettes: `auto` never resolves to them, so hashed avatars keep their look.
+    var extraShape: BotBlobatarResolvedShape? {
+        switch self {
+        case .star: return .star
+        case .ghost: return .ghost
+        case .bean: return .bean
+        case .drop: return .drop
+        default: return nil
         }
     }
 
@@ -30,6 +45,8 @@ public enum BotBlobatarShape: String, CaseIterable, Sendable {
         case .nub: return 0.78
         case .cloud: return 0.885
         case .sun: return 0.965
+        // Extra shapes reuse the round band for eyes and palette, then reshape the body.
+        case .star, .ghost, .bean, .drop: return 0.14
         }
     }
 }
@@ -261,7 +278,7 @@ public struct BotBlobatarPetal: Equatable, Sendable {
 }
 
 public enum BotBlobatarResolvedShape: String, Sendable {
-    case round, organic, boxy, nub, cloud, sun
+    case round, organic, boxy, nub, cloud, sun, star, ghost, bean, drop
 }
 
 public struct BotBlobatarFigure: Equatable, Sendable {
@@ -276,7 +293,9 @@ public struct BotBlobatarFigure: Equatable, Sendable {
 }
 
 public enum BotBlobatar {
-    public static let studioHues: [BotBlobatarHueSwatch] = [
+    public static let studioHues: [BotBlobatarHueSwatch] = baseHues + extraHues
+
+    private static let baseHues: [BotBlobatarHueSwatch] = [
         .init(id: "pink", degrees: 350, preview: 0xF472B6),
         .init(id: "coral", degrees: 20, preview: 0xFB923C),
         .init(id: "amber", degrees: 42, preview: 0xF59E0B),
@@ -287,10 +306,21 @@ public enum BotBlobatar {
         .init(id: "violet", degrees: 290, preview: 0xC084FC),
     ]
 
+    private static let extraHues: [BotBlobatarHueSwatch] = [
+        .init(id: "red", degrees: 0, preview: 0xF87171),
+        .init(id: "lime", degrees: 90, preview: 0xA3E635),
+        .init(id: "mint", degrees: 155, preview: 0x34D399),
+        .init(id: "cyan", degrees: 190, preview: 0x22D3EE),
+        .init(id: "blue", degrees: 225, preview: 0x60A5FA),
+        .init(id: "purple", degrees: 270, preview: 0xA78BFA),
+        .init(id: "magenta", degrees: 320, preview: 0xE879F9),
+    ]
+
     public static func figure(name: String, spec: BotBlobatarSpec, handle: String = "") -> BotBlobatarFigure {
         let seed = spec.renderSeed(liveName: name, handle: handle)
         let traits = Traits(seed: seed, overrides: overrides(for: spec))
         var layout = layout(traits)
+        if let extra = spec.shape.extraShape { layout = reshape(layout, as: extra, traits: traits) }
         let pose = Pose.forExpression(spec.expression)
         layout = pose.bake(layout)
         var palette = palette(hue: spec.hue.degrees ?? traits.num("hue", 0, 360), tone: traits("tone"))
@@ -328,6 +358,8 @@ public enum BotBlobatarMotionMode: String, Sendable {
     case frozen
     case always
     case hover
+    /// The Bot is running: a livelier hop-and-look loop.
+    case working
 }
 
 public struct BotBlobatarMotion: Equatable, Sendable {
@@ -399,6 +431,31 @@ public struct BotBlobatarMotion: Equatable, Sendable {
             glanceY: glance.1 * amp,
             shakeX: shake,
             shakeY: shake * 0.4
+        )
+    }
+}
+
+extension BotBlobatarMotion {
+    /// Working loop: hops about every 1.2 s with a squash on landing, eyes scan left and right,
+    /// quicker blinks. Pure in `time` so tests replay it.
+    public static func sampleWorking(name: String, time: TimeInterval) -> BotBlobatarMotion {
+        let seed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = Traits(seed: seed.isEmpty ? "bot" : seed, overrides: [:])
+        let phase = t.num("motion.phase", 0, 1.2)
+        let u = (time + phase).truncatingRemainder(dividingBy: 1.2) / 1.2
+        let hop = sin(Double.pi * min(1, u / 0.6))
+        let landing = u > 0.6 ? sin(Double.pi * (u - 0.6) / 0.4) : 0
+        let blinkPeriod = 2.4
+        let blink = blinkWindow((time + t.num("motion.blinkPhase", 0, blinkPeriod)).truncatingRemainder(dividingBy: blinkPeriod) / blinkPeriod)
+        return BotBlobatarMotion(
+            breatheX: 1 + 0.06 * landing,
+            breatheY: 1 - 0.07 * landing + 0.03 * hop,
+            bobY: -4.2 * hop,
+            blink: blink,
+            glanceX: 1.6 * sin(2 * .pi * time / 1.8),
+            glanceY: -0.4 * hop,
+            shakeX: 0,
+            shakeY: 0
         )
     }
 }
@@ -531,7 +588,49 @@ private func coreScale(_ shape: BotBlobatarResolvedShape) -> Double {
     case .cloud: return 0.78
     case .sun: return 0.7
     case .nub: return 0.88
+    case .star: return 0.72
+    case .ghost: return 0.95
+    case .bean: return 0.92
+    case .drop: return 0.9
     }
+}
+
+/// Builds a picked-only silhouette from the round layout; eyes keep their trait placement.
+private func reshape(_ base: Layout, as shape: BotBlobatarResolvedShape, traits t: Traits) -> Layout {
+    var out = base
+    out.shape = shape
+    let b = base.body
+    let r = b.rx
+    switch shape {
+    case .star:
+        let count = t.int("star.n", 5, 7)
+        let off = -Double.pi / 2
+        out.body.rx = r * 0.78
+        out.body.ry = r * 0.78
+        out.petals = (0..<count).map { i in
+            let a = off + 2 * .pi * Double(i) / Double(count)
+            return BotBlobatarPetal(cx: b.cx + cos(a) * r * 0.92, cy: b.cy + sin(a) * r * 0.92, r: r * 0.3)
+        }
+    case .ghost:
+        out.body.ry = b.ry * 0.92
+        out.body.cy = b.cy - r * 0.06
+        let count = t.int("ghost.n", 3, 4)
+        out.petals = (0..<count).map { i in
+            let x = b.cx - r * 0.7 + r * 1.4 * Double(i) / Double(max(1, count - 1))
+            return BotBlobatarPetal(cx: x, cy: b.cy + r * 0.72, r: r * 0.3)
+        }
+    case .bean:
+        out.body.rx = r * 1.12
+        out.body.ry = b.ry * 0.78
+        out.body.n = 2.3
+        out.petals = []
+    case .drop:
+        out.body.cy = b.cy + r * 0.08
+        out.petals = [BotBlobatarPetal(cx: b.cx, cy: b.cy - r * 0.86, r: r * 0.36)]
+    default:
+        break
+    }
+    return out
 }
 
 private func layout(_ t: Traits) -> Layout {

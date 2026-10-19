@@ -3006,7 +3006,7 @@ private struct SSHTransferSidebarView: View {
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
-        .frame(minWidth: 480)
+        .frame(minWidth: 240)
         .overlay(alignment: .leading) {
             Rectangle().fill(DS.Palette.line).frame(width: DS.Border.hairline)
         }

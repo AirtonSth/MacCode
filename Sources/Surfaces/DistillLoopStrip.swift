@@ -302,7 +302,7 @@ struct DistillLoopRow: View {
             }
         }
         .padding(DS.Space.lg)
-        .frame(width: 320, alignment: .leading)
+        .frame(minWidth: 240, idealWidth: 320, maxWidth: 320, alignment: .leading)
         .accessibilityIdentifier("agent.loop.detailsPopover")
     }
 

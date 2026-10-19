@@ -1,4 +1,6 @@
 import AppKit
+import CoreModel
+import Persistence
 import DesignSystemKit
 import SocketServer
 import Surfaces
@@ -793,6 +795,8 @@ struct ActivityRootView: View {
     private let workspaceOptions: () -> [(id: String, name: String)]
     /// Whether a workspace is still open in this Mac's layout; a thread outside one has nowhere to open.
     private let isWorkspaceOpen: (String) -> Bool
+    /// The Bot behind an item, so its row shows the Bot's avatar instead of the status icon.
+    private let botForItem: (ActivityWireItem) -> BotDefinition?
     let route: NotificationRouteIntent?
     let consumeRoute: () -> Void
 
@@ -808,10 +812,15 @@ struct ActivityRootView: View {
         self.consumeRoute = consumeRoute
         workspaceOptions = { router.activityWorkspaceOptions }
         isWorkspaceOpen = { [weak router] id in router?.activityWorkspaceIsOpen(id) ?? false }
+        // In-memory only (roster + linked-thread cache): rows re-render often and must not read SQLite.
+        botForItem = { [weak router] item in
+            guard let router, let store = router.context?.botStore else { return nil }
+            return ActivityBotResolver.botID(for: item, store: store).flatMap { id in router.botsViewModel?.bots.first { $0.id == id } }
+        }
     }
 
     /// Renders a prepared model without a router: offscreen layout proofs and worst-case data.
-    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }, isWorkspaceOpen: @escaping (String) -> Bool = { _ in true }, makeConversation: @escaping (ActivityWireItem) -> AgentAppViewModel? = { _ in nil }) {
+    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }, isWorkspaceOpen: @escaping (String) -> Bool = { _ in true }, makeConversation: @escaping (ActivityWireItem) -> AgentAppViewModel? = { _ in nil }, botForItem: @escaping (ActivityWireItem) -> BotDefinition? = { _ in nil }) {
         _model = StateObject(wrappedValue: model)
         openThread = { _ in }
         openEvidence = { _, _ in }
@@ -820,6 +829,7 @@ struct ActivityRootView: View {
         consumeRoute = {}
         self.workspaceOptions = workspaceOptions
         self.isWorkspaceOpen = isWorkspaceOpen
+        self.botForItem = botForItem
     }
 
     var body: some View {
@@ -1057,6 +1067,7 @@ struct ActivityRootView: View {
     private func activityRow(_ item: ActivityWireItem) -> some View {
         ActivityRow(
             item: item,
+            bot: botForItem(item),
             toggleRead: { item.isUnread ? model.markRead(item) : model.markUnread(item) },
             clear: { model.acknowledge(item) },
             open: canOpen(item) ? { openThread(item) } : nil,
@@ -1298,8 +1309,18 @@ private enum ActivityStatusStyle {
     }
 }
 
+enum ActivityBotResolver {
+    /// The item's own bot_id, else the Bot linked to its thread (in-memory cache only).
+    static func botID(for item: ActivityWireItem, store: BotStore) -> BotID? {
+        if let raw = item.bot_id, let uuid = UUID(uuidString: raw) { return BotID(uuid) }
+        guard let raw = item.thread_id, let uuid = UUID(uuidString: raw) else { return nil }
+        return store.cachedBotID(linkedTo: AgentThreadID(uuid))
+    }
+}
+
 private struct ActivityRow: View {
     let item: ActivityWireItem
+    var bot: BotDefinition? = nil
     let toggleRead: () -> Void
     let clear: () -> Void
     let open: (() -> Void)?
@@ -1319,8 +1340,16 @@ private struct ActivityRow: View {
         HStack(alignment: .top, spacing: DS.Space.md) {
             Circle().fill(item.isUnread ? DS.Palette.accent : Color.clear)
                 .frame(width: 7, height: 7).padding(.top, DS.Space.xs)
-            Image(systemName: ActivityStatusStyle.symbol(item.state))
-                .font(.system(size: 13, weight: .semibold)).foregroundColor(stateColor).frame(width: 16)
+            if let bot {
+                BotsAvatarView(name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol.isEmpty ? nil : bot.avatarSymbol, size: 16,
+                               attention: item.state == "running" ? .working : .none)
+                    .frame(width: 16, height: 16)
+                    .accessibilityLabel(bot.name)
+                    .accessibilityIdentifier("activity.row.botAvatar.\(item.id)")
+            } else {
+                Image(systemName: ActivityStatusStyle.symbol(item.state))
+                    .font(.system(size: 13, weight: .semibold)).foregroundColor(stateColor).frame(width: 16)
+            }
             VStack(alignment: .leading, spacing: DS.Space.xxs) {
                 HStack(alignment: .firstTextBaseline, spacing: DS.Space.md) {
                     Text(item.displayTitle).font(item.isUnread ? DS.Font.bodyStrong : DS.Font.body)

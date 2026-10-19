@@ -2006,7 +2006,7 @@ struct FilesSurfaceRoot: View {
                     }
                 }
                 reader
-                    .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 200, maxWidth: .infinity, maxHeight: .infinity)
             }
             .onAppear { applyAdaptiveSidebar(width: proxy.size.width, event: .structural) }
             .onChange(of: proxy.size.width) { width in

@@ -1130,8 +1130,8 @@ public struct DiffPanelView: View {
 
     public var body: some View {
         HSplitView {
-            leftColumn.frame(minWidth: 280, idealWidth: 320)
-            diffBody.frame(minWidth: 440)
+            leftColumn.frame(minWidth: 160, idealWidth: 320)
+            diffBody.frame(minWidth: 200)
         }
         .background(DS.Palette.bg)
         // UX-012: arrow keys move the selection through the active list;

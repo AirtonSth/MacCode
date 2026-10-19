@@ -28,6 +28,11 @@ public struct BotsAvatarView: View {
         self.attention = attention
     }
 
+    /// A working Bot hops; any other Bot breathes only while hovered.
+    public static func motionMode(for attention: BotAttentionState) -> BotBlobatarMotionMode {
+        attention == .working ? .working : .hover
+    }
+
     public var body: some View {
         Group {
             if let custom = Self.viewOverride(handle, size) {
@@ -37,7 +42,7 @@ public struct BotsAvatarView: View {
                     name: name.isEmpty ? handle : name,
                     spec: spec.liveFaced(attention: attention),
                     size: size,
-                    motion: .frozen,
+                    motion: Self.motionMode(for: attention),
                     handle: handle
                 )
             } else {

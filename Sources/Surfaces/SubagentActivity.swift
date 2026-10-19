@@ -920,7 +920,7 @@ public struct SubagentActivityBadge: View {
                 doneExpanded: $doneExpanded,
                 unknownExpanded: $unknownExpanded
             )
-            .frame(width: 320)
+            .frame(minWidth: 240, idealWidth: 320, maxWidth: 320)
             .padding(DS.Space.md)
             .background(DS.Palette.surfaceRaised)
         }

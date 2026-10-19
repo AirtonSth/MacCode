@@ -1349,6 +1349,7 @@ public struct AgentChatWorkingStatusStrip: View {
             }
         } label: {
             Text("Subagents \(distill.subagents.count)")
+                .lineLimit(1)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
         }

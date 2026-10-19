@@ -97,4 +97,76 @@ final class BotBlobatarTests: XCTestCase {
             .still
         )
     }
+
+    func test_existingAvatarsKeepTheirLook_becauseTheRebuildMustNotRedrawAnyonesBot() {
+        // WHY: users already know their Bots by face. Values captured from 9be26ace7 before the rebuild.
+        let expected: [(String, BotBlobatarShape, BotBlobatarResolvedShape, Int, Double, UInt32)] = [
+        ("Piper", .auto, .organic, 0, 35.818, 0x3E3345),
+        ("Piper", .round, .round, 0, 36.549, 0x3E3345),
+        ("Piper", .organic, .organic, 0, 35.818, 0x3E3345),
+        ("Piper", .boxy, .boxy, 0, 31.432, 0x3E3345),
+        ("Piper", .nub, .nub, 2, 32.163, 0x3E3345),
+        ("Piper", .cloud, .cloud, 6, 28.508, 0x3E3345),
+        ("Piper", .sun, .sun, 6, 25.584, 0x3E3345),
+        ("Scout", .auto, .boxy, 0, 27.606, 0xCBDDCE),
+        ("Scout", .round, .round, 0, 32.100, 0xCBDDCE),
+        ("Scout", .organic, .organic, 0, 31.458, 0xCBDDCE),
+        ("Scout", .boxy, .boxy, 0, 27.606, 0xCBDDCE),
+        ("Scout", .nub, .nub, 1, 28.248, 0xCBDDCE),
+        ("Scout", .cloud, .cloud, 4, 25.038, 0xCBDDCE),
+        ("Scout", .sun, .sun, 7, 22.470, 0xCBDDCE),
+        ("Titio", .auto, .organic, 0, 36.438, 0xBF5AAF),
+        ("Titio", .round, .round, 0, 37.182, 0xBF5AAF),
+        ("Titio", .organic, .organic, 0, 36.438, 0xBF5AAF),
+        ("Titio", .boxy, .boxy, 0, 31.977, 0xBF5AAF),
+        ("Titio", .nub, .nub, 2, 32.720, 0xBF5AAF),
+        ("Titio", .cloud, .cloud, 6, 29.002, 0xBF5AAF),
+        ("Titio", .sun, .sun, 6, 26.027, 0xBF5AAF),
+        ]
+        for (name, shape, resolved, petals, rx, head) in expected {
+            let f = BotBlobatar.figure(name: name, spec: BotBlobatarSpec(shape: shape))
+            XCTAssertEqual(f.resolvedShape, resolved, "\(name) \(shape)")
+            XCTAssertEqual(f.petals.count, petals, "\(name) \(shape)")
+            XCTAssertEqual(f.body.rx, rx, accuracy: 0.0006, "\(name) \(shape)")
+            XCTAssertEqual(f.palette.head, head, "\(name) \(shape)")
+        }
+    }
+
+    func test_newShapesAreDistinctAndRoundTrip_becausePickingOneMustStick() {
+        for shape in [BotBlobatarShape.star, .ghost, .bean, .drop] {
+            let spec = BotBlobatarSpec(shape: shape, hue: .named("lime"))
+            let f = BotBlobatar.figure(name: "Piper", spec: spec)
+            XCTAssertEqual(f.resolvedShape.rawValue, shape.rawValue, "a picked \(shape) must draw that silhouette")
+            XCTAssertEqual(BotBlobatarSpec.parse(spec.token), spec, "Studio must reload the picked \(shape)")
+            XCTAssertEqual(f.eyes.count, 2, "every new shape still has a face")
+        }
+        XCTAssertGreaterThanOrEqual(BotBlobatar.figure(name: "Piper", spec: BotBlobatarSpec(shape: .star)).petals.count, 5)
+        XCTAssertEqual(BotBlobatar.figure(name: "Piper", spec: BotBlobatarSpec(shape: .drop)).petals.count, 1)
+        XCTAssertEqual(BotBlobatar.figure(name: "Piper", spec: BotBlobatarSpec(shape: .bean)).petals.count, 0)
+    }
+
+    func test_autoNeverPicksANewShape_becauseHashedAvatarsMustNotChange() {
+        let extra: Set<BotBlobatarResolvedShape> = [.star, .ghost, .bean, .drop]
+        for i in 0..<200 {
+            XCTAssertFalse(extra.contains(BotBlobatar.figure(name: "seed-\(i)", spec: .default).resolvedShape))
+        }
+    }
+
+    func test_newHuesParse_becauseTheStudioOffersMoreColors() {
+        XCTAssertEqual(BotBlobatarSpec.parse("lime")?.hue, .named("lime"))
+        XCTAssertEqual(BotBlobatarHue.named("lime").degrees, 90)
+        XCTAssertGreaterThanOrEqual(BotBlobatar.studioHues.count, 15)
+        XCTAssertEqual(Array(BotBlobatar.studioHues.prefix(8).map(\.id)),
+                       ["pink", "coral", "amber", "green", "teal", "sky", "indigo", "violet"],
+                       "existing hues keep their order so old tokens and pickers stay put")
+    }
+
+    func test_workingMotionHopsHarderThanIdle_becauseAnActiveBotMustVisiblyMove() {
+        let frames = stride(from: 0.0, through: 2.0, by: 1.0 / 30.0)
+        let idle = frames.map { abs(BotBlobatarMotion.sample(name: "Piper", time: $0, expression: .happy, amplitude: 1).bobY) }.max() ?? 0
+        let working = frames.map { abs(BotBlobatarMotion.sampleWorking(name: "Piper", time: $0).bobY) }.max() ?? 0
+        XCTAssertGreaterThanOrEqual(working, idle * 2, "working must bounce at least twice as high as the idle breath")
+        let hop = stride(from: 0.0, through: 1.2, by: 1.0 / 30.0).contains { BotBlobatarMotion.sampleWorking(name: "Piper", time: $0).bobY < -2.5 }
+        XCTAssertTrue(hop, "a working avatar must hop within every 1.2 s cycle")
+    }
 }

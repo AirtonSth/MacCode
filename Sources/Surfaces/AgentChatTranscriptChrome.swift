@@ -769,7 +769,15 @@ public struct AgentChatComposerBar: View {
                     .accessibilityIdentifier("agent.attach")
                 }
                 if let leadingControls {
-                    leadingControls
+                    // Narrow panes: the chips scroll inside the card instead of
+                    // pushing past its edge; send and stop stay pinned right.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        leadingControls
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+                    .layoutPriority(-1)
+                    .accessibilityIdentifier("agent.composer.controls")
                 }
                 Spacer(minLength: 0)
                 if runActive {

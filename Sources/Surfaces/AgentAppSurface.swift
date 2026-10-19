@@ -15383,7 +15383,8 @@ public struct AgentAppView: View {
                 }
                 conversationColumn(availableHeight: proxy.size.height)
                     .frame(minWidth: 0, maxWidth: .infinity)
-                if vm.showPlanSidebar && layout.showsPlanSidebar {
+                // The plan sidebar steps aside in narrow panes so the conversation keeps its room.
+                if vm.showPlanSidebar && layout.showsPlanSidebar && proxy.size.width >= 560 {
                     planSidebar.frame(minWidth: 240, idealWidth: Self.planSidebarIdealWidth, maxWidth: 420)
                 }
             }
@@ -15798,12 +15799,14 @@ public struct AgentAppView: View {
                     .font(DS.Font.caption2)
                     .foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
+                    .layoutPriority(-1)
             }
             Text("·").foregroundColor(DS.Palette.textTertiary)
             Text(URL(fileURLWithPath: vm.cwd).lastPathComponent)
                 .font(DS.Font.caption2)
                 .foregroundColor(DS.Palette.textSecondary)
                 .lineLimit(1).truncationMode(.middle)
+                .layoutPriority(-1)
             Spacer(minLength: 0)
             botScreenControls
             // Unified working phase strip (replaces separate awaiting/shell/status pills).

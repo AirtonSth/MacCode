@@ -9,6 +9,8 @@ public struct BotBlobatarView: View {
     public var size: CGFloat
     public var motion: BotBlobatarMotionMode
     public var handle: String
+    /// Renders one fixed frame of the motion (snapshots and tests).
+    var fixedTime: TimeInterval? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovering = false
@@ -30,23 +32,36 @@ public struct BotBlobatarView: View {
     public var body: some View {
         let figure = BotBlobatar.figure(name: name, spec: spec, handle: handle)
         let motionSeed = spec.renderSeed(liveName: name, handle: handle)
-        let paused = reduceMotion || motion == .frozen || (motion == .hover && !hovering)
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: paused)) { timeline in
-            let pose = paused
-                ? BotBlobatarMotion.still
-                : BotBlobatar.motion(
-                    name: motionSeed,
-                    time: timeline.date.timeIntervalSinceReferenceDate,
-                    expression: spec.expression,
-                    amplitude: 1
-                )
-            Canvas { context, canvasSize in
-                draw(figure: figure, motion: pose, in: context, canvasSize: canvasSize)
+        Group {
+            if let fixedTime {
+                canvas(figure, Self.pose(motion: motion, seed: motionSeed, time: fixedTime, expression: spec.expression))
+            } else if reduceMotion || motion == .frozen || (motion == .hover && !hovering) {
+                // Still avatars draw once; only moving ones pay for a timeline.
+                canvas(figure, .still)
+            } else {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                    canvas(figure, Self.pose(motion: motion, seed: motionSeed, time: timeline.date.timeIntervalSinceReferenceDate, expression: spec.expression))
+                }
             }
         }
         .frame(width: size, height: size)
         .onHover { hovering = $0 }
         .accessibilityHidden(true)
+    }
+
+    /// Pose for one frame: `.working` hops, every other moving mode breathes.
+    static func pose(motion: BotBlobatarMotionMode, seed: String, time: TimeInterval, expression: BotBlobatarExpression) -> BotBlobatarMotion {
+        switch motion {
+        case .frozen: return .still
+        case .working: return BotBlobatarMotion.sampleWorking(name: seed, time: time)
+        case .always, .hover: return BotBlobatar.motion(name: seed, time: time, expression: expression, amplitude: 1)
+        }
+    }
+
+    private func canvas(_ figure: BotBlobatarFigure, _ pose: BotBlobatarMotion) -> some View {
+        Canvas { context, canvasSize in
+            draw(figure: figure, motion: pose, in: context, canvasSize: canvasSize)
+        }
     }
 
     private func draw(
