@@ -3236,10 +3236,7 @@ public struct SidebarRootView: View {
         if vm.hasWorkspaceChildren(ws.id) {
             VStack(alignment: .leading, spacing: DS.Space.xxs) { workspaceChildRows(ws) }
                 .padding(.vertical, DS.Space.xxs)
-                .background(
-                    RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                        .fill(DS.Palette.bg)
-                )
+                .background(WorkspaceChildrenGlass())
         }
     }
 
@@ -3672,6 +3669,38 @@ private struct SidebarRowChrome: ViewModifier {
 private extension View {
     func sidebarRowChrome(selected: Bool, tone: SidebarHighlightTone? = nil) -> some View {
         modifier(SidebarRowChrome(tone: tone ?? (selected ? .selection : .none), selected: selected))
+    }
+}
+
+/// Recessed glass behind an expanded workspace's children: a thin material with a faint
+/// dark tint, a top-lit hairline edge and a guide line under the chevron. Reads one level
+/// deeper than the workspace row without a solid block of color. Materials fall back to
+/// an opaque fill on their own under Reduce Transparency.
+private struct WorkspaceChildrenGlass: View {
+    private let shape = RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+
+    var body: some View {
+        shape
+            .fill(.ultraThinMaterial)
+            .overlay(shape.fill(Color.black.opacity(0.12)))
+            .overlay(
+                shape.strokeBorder(
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.07), Color.white.opacity(0.015)],
+                        startPoint: .top, endPoint: .bottom
+                    ),
+                    lineWidth: 0.5
+                )
+            )
+            .overlay(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.06))
+                    .frame(width: 1)
+                    .padding(.vertical, DS.Space.md)
+                    .padding(.leading, DS.Space.sm + 1)
+            }
+            .shadow(color: .black.opacity(0.18), radius: 2, y: 1)
+            .accessibilityHidden(true)
     }
 }
 
