@@ -1,6 +1,7 @@
 import CoreModel
 import DesignSystemKit
 import Persistence
+import SocketServer
 import SwiftUI
 
 /// The same destination choice in Bot Studio and Schedule Tasks.
@@ -77,6 +78,8 @@ struct BotExecutionDestinationPicker: View {
 struct BotVirtualMachinesView: View {
     let store: BotStore
     let workspaces: [Workspace]
+    var initialWorkspaceID: WorkspaceID? = nil
+    var initialMachine: BotVirtualMachine? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var machines: [BotVirtualMachine] = []
     @State private var name = ""
@@ -150,6 +153,9 @@ struct BotVirtualMachinesView: View {
         .padding(DS.Space.xl)
         .frame(width: 560, height: 490)
         .onAppear {
+            scope = initialMachine?.workspaceID ?? initialWorkspaceID
+            editingID = initialMachine?.id
+            name = initialMachine?.name ?? ""
             do { machines = try store.listVirtualMachines() }
             catch { self.error = String(describing: error) }
         }
@@ -165,7 +171,11 @@ struct BotVirtualMachinesView: View {
             if let scope, !workspaces.contains(where: { $0.id == scope }) {
                 throw BotStoreError.invalidInput("This workspace is no longer available.")
             }
-            _ = try store.saveVirtualMachine(id: editingID, name: name, workspaceID: scope)
+            let machine = try store.saveVirtualMachine(id: editingID, name: name, workspaceID: scope)
+            EventBus.shared.publish(kind: .botUpdated, payload: .object([
+                "method": .string("bot.vm.save"),
+                "vm_id": .string(machine.id.uuidString.lowercased())
+            ]))
             machines = try store.listVirtualMachines()
             editingID = nil
             name = ""

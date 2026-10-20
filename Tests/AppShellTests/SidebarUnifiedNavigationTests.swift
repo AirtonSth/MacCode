@@ -35,6 +35,34 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         await vm.reloadAuthorizedBotConversationRowsAndWait()
     }
 
+    func test_virtualMachinesStayInTheirScopeAndSearchKeepsTheirWorkspace() async throws {
+        let f = try make("virtual-machines")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let workspace = try f.router.createWorkspace(name: "Project", cwd: NSTemporaryDirectory())
+        let other = try f.router.createWorkspace(name: "Other", cwd: NSTemporaryDirectory())
+        let general = try f.context.botStore.saveVirtualMachine(name: "General Linux")
+        let scoped = try f.context.botStore.saveVirtualMachine(name: "Workspace Linux", workspaceID: workspace.id)
+        _ = try f.context.botStore.saveVirtualMachine(name: "Other Linux", workspaceID: other.id)
+        f.vm.reload()
+        await expand(f.vm, workspace.id)
+        if f.vm.expandedWorkspaceIDs.contains(other.id) { f.vm.toggleWorkspaceExpanded(other.id) }
+
+        XCTAssertEqual(f.vm.virtualMachineRows(in: nil).map(\.id), [general.id])
+        XCTAssertEqual(f.vm.workspaceVirtualMachineRows(workspace.id).map(\.id), [scoped.id])
+        XCTAssertTrue(f.vm.workspaceVirtualMachineRows(other.id).isEmpty)
+        f.vm.toggleWorkspaceExpanded(workspace.id)
+        XCTAssertTrue(f.vm.workspaceVirtualMachineRows(workspace.id).isEmpty)
+        f.vm.filterText = "workspace linux"
+        XCTAssertEqual(f.vm.treeWorkspaces.map(\.id), [workspace.id])
+        XCTAssertEqual(f.vm.workspaceVirtualMachineRows(workspace.id).map(\.id), [scoped.id])
+        XCTAssertTrue(f.vm.virtualMachineRows(in: nil).isEmpty)
+
+        _ = try f.context.botStore.saveVirtualMachine(id: scoped.id, name: "Renamed", workspaceID: workspace.id)
+        f.vm.filterText = ""
+        await expand(f.vm, workspace.id)
+        XCTAssertEqual(f.vm.workspaceVirtualMachineRows(workspace.id).map(\.name), ["Renamed"])
+    }
+
     func test_generalBotsPutTitioFirstAndKeepWorkspaceOnlyBotsInTheirWorkspace() async throws {
         let f = try make("general")
         defer { try? FileManager.default.removeItem(atPath: f.directory) }
@@ -268,7 +296,7 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         XCTAssertEqual(source.components(separatedBy: "SidebarSearchField(").count - 1, 1, "the sidebar mounts exactly one search field")
-        XCTAssertEqual(source.components(separatedBy: "SidebarSectionMoreMenu(help:").count - 1, 2, "Bots and Workspaces headers share one \"...\" menu component")
+        XCTAssertEqual(source.components(separatedBy: "SidebarSectionMoreMenu(help:").count - 1, 3, "Bots, Workspaces and VMs headers share one \"...\" menu component")
         XCTAssertTrue(source.contains("Text(\"Bots\")") && !source.contains("Text(\"General Bots\")"), "the section is titled Bots")
     }
 
