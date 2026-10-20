@@ -14,6 +14,7 @@ public struct TitioNoticePosting: Equatable, Sendable {
     public var preview: String
     /// False while the inbox is being viewed, so the post does not bump unread.
     public var countsAsUnread: Bool
+    public var notificationLine: String?
 
     public init(
         messageID: String,
@@ -21,7 +22,8 @@ public struct TitioNoticePosting: Equatable, Sendable {
         cardOwnerKey: String? = nil,
         cardOptions: [TitioNoticeCardOption]? = nil,
         preview: String,
-        countsAsUnread: Bool = true
+        countsAsUnread: Bool = true,
+        notificationLine: String? = nil
     ) {
         self.messageID = messageID
         self.batchID = batchID
@@ -29,6 +31,7 @@ public struct TitioNoticePosting: Equatable, Sendable {
         self.cardOptions = cardOptions
         self.preview = preview
         self.countsAsUnread = countsAsUnread
+        self.notificationLine = notificationLine
     }
 }
 
@@ -256,7 +259,7 @@ public final class TitioNoticeRepository: @unchecked Sendable {
                 let ownerActions = try posting.cardOptions.map { try Self.json($0) }
                 let update = try database.prepare("""
                     UPDATE titio_notices
-                    SET state = 'posted', message_id = ?, batch_id = ?, posted_at = ?, actions_json = ?
+                    SET state = 'posted', message_id = ?, batch_id = ?, posted_at = ?, actions_json = ?, facts_json = ?
                     WHERE key = ? AND state = 'pending';
                     """)
                 for row in pending {
@@ -264,7 +267,10 @@ public final class TitioNoticeRepository: @unchecked Sendable {
                     try update.bind(2, posting.batchID)
                     try update.bind(3, postedAt.timeIntervalSince1970)
                     try update.bind(4, row.key == owner ? ownerActions : nil)
-                    try update.bind(5, row.key)
+                    var facts = row.facts
+                    facts.generatedNotificationLine = posting.notificationLine
+                    try update.bind(5, Self.json(facts))
+                    try update.bind(6, row.key)
                     _ = try update.step()
                     update.reset()
                 }

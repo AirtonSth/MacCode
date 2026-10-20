@@ -68,16 +68,24 @@ final class BotContextQueuedMessageTests: XCTestCase {
         XCTAssertEqual(try runCount(f.context, threadID: f.thread.id), 0)
     }
 
-    func test_validPinnedThreadPublicGenericSendPassesTheAuthorityGate() async throws {
-        // WHY: an active pin must reach normal send admission, never the old isolation refusal.
+    func test_validPinnedLocalThreadPublicSendRepairsTheOldVMTarget() async throws {
         let f = try fixture("valid-send")
         defer { try? FileManager.default.removeItem(at: f.root) }
-        do {
-            _ = try await f.router.sendAgentMessage(thread: f.thread.id, text: "hello", provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)
-        } catch {
-            XCTAssertFalse(String(describing: error).contains("Contextual execution"), "\(error)")
-            XCTAssertFalse(String(describing: error).contains("authority is inactive"), "\(error)")
-        }
+        let runner = ControlledBotHandoffRunner(provider: .distill)
+        f.context.coordinator.replaceProvider(.distill, runner: runner)
+        f.router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(provider: .distill,
+                models: [AgentModelDescriptor(id: "test", label: "Test", provider: .distill)],
+                binaryPath: "/usr/bin/true", authenticated: true, id: "distill")
+        ])
+        let result = try await f.router.sendAgentMessage(thread: f.thread.id, text: "hello", provider: nil, model: nil,
+                                                        permissionMode: nil, reasoningEffort: nil)
+        let runID = try XCTUnwrap(result.runId)
+        XCTAssertEqual(runner.requests.count, 1)
+        XCTAssertEqual(try f.context.threadRepo.get(id: f.thread.id)?.executionTarget, .mac)
+        XCTAssertEqual(try f.context.threadRepo.guestPlacement(of: f.thread.id)?.runsInGuest, false)
+        XCTAssertNotNil(try f.context.botStore.conversationContextPin(linkedTo: f.thread.id))
+        runner.finish(runID: runID, status: .completed, reply: "ok")
     }
 
     func test_pinnedPlanImplementationRefusesBeforeCreatingOrMutatingForEitherThreadMode() async throws {

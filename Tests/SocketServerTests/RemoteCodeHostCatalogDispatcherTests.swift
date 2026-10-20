@@ -68,6 +68,38 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
         ])
     }
 
+    func test_hostHelpDiscoversRealControlsWithoutMutatingAndRejectsUnknownTopics() async throws {
+        let router = HostCatalogReceiptRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        var params: [String: JSONValue] = [
+            "thread_id": .string(UUID().uuidString),
+            "run_id": .string(router.fixedRunID),
+            BotPeerDelegation.capabilityRPCParameterKey: .string(router.activeCapability),
+        ]
+        let index = await dispatcher.dispatchUnixSocket(.init(jsonrpc: "2.0", id: .number(1), method: "host.help", params: params))
+        XCTAssertNil(index.error)
+        let topics = try XCTUnwrap(index.result?.objectValue?["topics"]?.arrayValue)
+        XCTAssertEqual(Set(topics.compactMap { $0.objectValue?["id"]?.stringValue }), Set(TitioCapabilities.topics.map(\.id)))
+        let methods = try XCTUnwrap(index.result?.objectValue?["methods"]?.arrayValue)
+        XCTAssertTrue(methods.contains { $0.objectValue?["method"]?.stringValue == "scheduled_task.run" })
+        XCTAssertTrue(methods.contains { $0.objectValue?["method"]?.stringValue == "bot.notice.act" })
+        XCTAssertTrue(methods.contains {
+            $0.objectValue?["method"]?.stringValue == "agent.thread.fork" && $0.objectValue?["mutation"]?.boolValue == true
+        })
+        XCTAssertFalse(methods.contains { $0.objectValue?["method"]?.stringValue?.hasPrefix("host.") == true })
+        params["topic"] = .string("schedules")
+        let schedules = await dispatcher.dispatchUnixSocket(.init(jsonrpc: "2.0", id: .number(2), method: "host.help", params: params))
+        XCTAssertNil(schedules.error)
+        XCTAssertTrue(schedules.result?.objectValue?["instructions"]?.stringValue?.contains("bot.routine.run") == true)
+        let spec = try XCTUnwrap(schedules.result?.objectValue?["bot_schedule_spec_example"]?.stringValue)
+        XCTAssertNotNil(BotScheduleSpec.decodeJSON(spec), "new Bot schedules get the real persisted format")
+        params["topic"] = .string("invented")
+        let invalid = await dispatcher.dispatchUnixSocket(.init(jsonrpc: "2.0", id: .number(3), method: "host.help", params: params))
+        XCTAssertEqual(invalid.error?.code, -32602)
+        XCTAssertEqual(router.authorizationMutations, [false, false, false])
+        XCTAssertTrue(router.pairedBotCalls.isEmpty)
+    }
+
     func test_hostCallRunsAnyUIMethodForTitioAsAFullAccessMutation() async throws {
         // WHY: Titio must be able to do anything the user can in RemoteCode,
         // e.g. rename a Bot, through the same paired-device mutation path.

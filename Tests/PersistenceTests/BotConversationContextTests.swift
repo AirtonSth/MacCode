@@ -64,6 +64,20 @@ final class BotConversationContextTests: XCTestCase {
         XCTAssertNil(stored.providerThreadId)
     }
 
+    func test_explicitLocalThreadKeepsItsMacTargetAndContextPin() throws {
+        let (db, store, bot) = try makeStore()
+        let grant = try store.grantContext(hostID: "host", botID: bot.id, context: .general,
+                                          actions: [.read, .send], expectedRevision: nil)
+        let thread = AgentThread(title: "Local", provider: .distill, model: "distill", executionTarget: .mac)
+        let conversation = BotConversation(botID: bot.id, title: "Local", linkedAgentThreadID: thread.id)
+        let pin = try store.createContextualConversation(conversation, newThread: thread, hostID: "host",
+                                                       context: .general, policyRevision: grant.policyRevision)
+        let repo = AgentThreadRepository(db: db)
+        XCTAssertEqual(try repo.get(id: thread.id)?.executionTarget, .mac)
+        XCTAssertNil(try repo.guestPlacement(of: thread.id)?.guestRuntime)
+        XCTAssertEqual(try store.conversationContextPin(linkedTo: thread.id), pin)
+    }
+
     func test_freshThreadValidationRejectsMismatchesAndStoredRows() throws {
         let (db, store, bot) = try makeStore()
         let workspace = WorkspaceID()

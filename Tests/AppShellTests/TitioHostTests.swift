@@ -94,17 +94,29 @@ final class TitioHostTests: XCTestCase {
         return task
     }
 
-    func test_delegateResolvesBotByNameAndEnqueuesOnItsConversation() async throws {
+    func test_delegateResolvesBotByNameAndPreservesItsAuthorizedWorkspaceConversation() async throws {
         // WHY: "peça para o bot developer ..." must reach that Bot's desk,
         // not a guess or a silent no-op.
         let f = try makeFixture()
         let developer = try f.vm.create(name: "Developer", title: "Builds things")
         _ = try f.vm.create(name: "Writer", title: "Docs")
+        let workspace = try f.router.createWorkspace(name: "elephant", cwd: directory)
+        let host = f.context.liveActivityHostIdentity.serverId
+        let grant = try f.context.botStore.grantContext(
+            hostID: host, botID: developer.id, context: .workspace(workspace.id),
+            actions: [.read, .send], expectedRevision: 0
+        )
+        let thread = AgentThread(workspaceId: workspace.id, title: "Repository cleanup", provider: .distill, model: "main-a")
+        let conversation = BotConversation(botID: developer.id, title: thread.title, linkedAgentThreadID: thread.id)
+        try f.context.botStore.createContextualConversation(
+            conversation, newThread: thread, hostID: host,
+            context: grant.context, policyRevision: grant.policyRevision
+        )
 
         let result = try await f.router.delegateHostBot(
             bot: "developer",
-            text: "crie o jogo da cobrinha na pasta /tmp/snake",
-            conversationID: nil,
+            text: "limpe o repositorio do elephant",
+            conversationID: conversation.id,
             callerThread: f.callerThread.id,
             callerRun: f.callerRun.id
         )
@@ -115,8 +127,22 @@ final class TitioHostTests: XCTestCase {
         let started = await waitUntil { !f.runner.requests.isEmpty }
         XCTAssertTrue(started)
         let request = try XCTUnwrap(f.runner.requests.first)
-        XCTAssertEqual(request.threadId, conversations.first?.linkedAgentThreadID)
-        XCTAssertTrue(request.prompt.contains("jogo da cobrinha"), request.prompt)
+        XCTAssertEqual(request.threadId, thread.id)
+        XCTAssertEqual(try f.context.threadRepo.get(id: request.threadId)?.workspaceId, workspace.id)
+        XCTAssertTrue(request.prompt.contains("repositorio do elephant"), request.prompt)
+        _ = try f.context.botStore.revokeContext(
+            hostID: host, botID: developer.id, context: grant.context, expectedRevision: grant.policyRevision
+        )
+        do {
+            _ = try await f.router.delegateHostBot(
+                bot: "developer", text: "continue", conversationID: conversation.id,
+                callerThread: f.callerThread.id, callerRun: f.callerRun.id
+            )
+            XCTFail("a revoked workspace grant must not enqueue another run")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("no longer authorized"), "\(error)")
+        }
+        XCTAssertTrue(try f.context.botStore.listQueuedFollowUps(botID: developer.id).isEmpty)
         f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
     }
 
@@ -135,6 +161,36 @@ final class TitioHostTests: XCTestCase {
             XCTAssertEqual(($0 as? JSONRPCError)?.code, -32044)
         }
         XCTAssertTrue(f.runner.requests.isEmpty)
+    }
+
+    func test_ambiguousBotAndWorkspaceNamesNeverStartTheFirstMatch() async throws {
+        let f = try makeFixture()
+        let first = try f.vm.create(name: "Worker", handle: "worker-one")
+        let second = try f.vm.create(name: "Worker", handle: "worker-two")
+        _ = try f.router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        _ = try f.router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        do {
+            _ = try await f.router.delegateHostBot(
+                bot: "Worker", text: "Clean the repository", conversationID: nil,
+                callerThread: f.callerThread.id, callerRun: f.callerRun.id
+            )
+            XCTFail("an ambiguous name must ask for a target")
+        } catch {
+            XCTAssertEqual((error as? JSONRPCError)?.code, -32602)
+        }
+        XCTAssertThrowsError(try f.router.runNextHostScheduledTask(workspace: "elephant", taskID: nil)) {
+            XCTAssertEqual(($0 as? JSONRPCError)?.code, -32602)
+        }
+        XCTAssertTrue(f.runner.requests.isEmpty)
+        let result = try await f.router.delegateHostBot(
+            bot: second.id.value.uuidString, text: "Inspect the repository", conversationID: nil,
+            callerThread: f.callerThread.id, callerRun: f.callerRun.id
+        )
+        XCTAssertEqual(result.objectValue?["bot_id"]?.stringValue, second.id.value.uuidString.lowercased())
+        XCTAssertTrue(try f.context.botStore.listConversations(botID: first.id).isEmpty)
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        if let request = f.runner.requests.first { f.runner.finish(runID: request.runId, status: .completed, reply: "ok") }
     }
 
     func test_runNextClaimsTheWorkspacesNextScheduledTaskThroughTheScheduler() throws {
@@ -158,6 +214,11 @@ final class TitioHostTests: XCTestCase {
         XCTAssertEqual(runs.first?.trigger, .manual)
         XCTAssertEqual(result.objectValue?["run_id"]?.stringValue, runs.first?.id.uuidString.lowercased())
         XCTAssertTrue(try store.listRuns(taskID: later.id).isEmpty)
+
+        let named = try f.router.runNextHostScheduledTask(workspace: "elephant", taskID: later.id)
+        XCTAssertEqual(named.objectValue?["task_id"]?.stringValue, later.id.uuidString.lowercased(),
+                       "an explicitly chosen routine must not be replaced by the next one")
+        XCTAssertEqual(try store.listRuns(taskID: later.id).count, 1)
     }
 
     func test_activityListReportsRunningThreadsBotsAndScheduledTasks() async throws {
@@ -173,6 +234,24 @@ final class TitioHostTests: XCTestCase {
         let started = await waitUntil { !f.runner.requests.isEmpty }
         XCTAssertTrue(started)
         let request = try XCTUnwrap(f.runner.requests.first)
+        let routine = BotRoutineDefinition(botID: developer.id, name: "Pick a Linear task", prompt: "Work in elephant")
+        try f.context.botStore.saveRoutine(routine)
+        let titio = try TitioBot.ensure(store: f.context.botStore, appSupportDirectory: f.context.appSupportDirectory)
+        let notices = TitioNoticeRepository(db: f.context.db)
+        let fact = TitioNoticeFact(
+            key: "thread.developer.attention.Q1", kind: .userInput,
+            source: TitioNoticeSource(threadId: request.threadId.value.uuidString, requestId: "Q1", botId: developer.id.value.uuidString),
+            facts: TitioNoticeFacts(botName: "Developer", prompt: "Which environment?"),
+            actions: [.providerOption(index: 0, text: "Staging"), .openThread]
+        )
+        _ = try notices.ingest(fact)
+        let noticeID = UUID().uuidString
+        _ = try notices.flush(keys: [fact.key], postedAt: Date()) { _ in
+            TitioNoticePosting(messageID: noticeID, cardOptions: [
+                TitioNoticeCardOption(label: "Staging", action: .providerOption(index: 0, text: "Staging")),
+                TitioNoticeCardOption(label: "Open", action: .openThread),
+            ], preview: "Which environment?")
+        }
 
         let snapshot = try await f.router.listHostActivity()
 
@@ -189,6 +268,20 @@ final class TitioHostTests: XCTestCase {
             $0.objectValue?["id"]?.stringValue == developer.id.value.uuidString.lowercased()
         })
         XCTAssertTrue((object["workspaces"]?.arrayValue ?? []).contains { $0.objectValue?["name"]?.stringValue == "elephant" })
+        let activity = try XCTUnwrap(object["activity"]?.objectValue)
+        XCTAssertNotNil(activity["counts"]?.objectValue)
+        XCTAssertNotNil(activity["generated_at"]?.stringValue)
+        XCTAssertTrue(activity["items"]?.arrayValue?.contains {
+            $0.objectValue?["thread_id"]?.stringValue?.lowercased() == request.threadId.value.uuidString.lowercased()
+        } == true, "the same Activity projection identifies the delegated work")
+        XCTAssertEqual(object["bot_schedules"]?.arrayValue?.first?.objectValue?["id"]?.stringValue,
+                       routine.id.value.uuidString.lowercased())
+        XCTAssertEqual(object["titio_bot_id"]?.stringValue, titio.id.value.uuidString.lowercased())
+        let decision = try XCTUnwrap(object["open_decisions"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(decision["message_id"]?.stringValue, noticeID)
+        XCTAssertEqual(decision["request_id"]?.stringValue, "Q1")
+        XCTAssertEqual(decision["options"]?.arrayValue?.first?.objectValue?["option_index"]?.intValue, 0)
+        XCTAssertEqual(decision["options"]?.arrayValue?.first?.objectValue?["action"]?.stringValue, "provider_option")
         f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
     }
 
@@ -250,8 +343,8 @@ final class TitioHostTests: XCTestCase {
         XCTAssertTrue(allowed.contains("mcp__\(BotSelfConfigMCPAdmit.serverName)__\(RemoteCodeHostCatalog.botDelegate)"))
         // An allowlist only auto-approves; Titio adds no tool restriction.
         XCTAssertFalse(allowed.contains { $0.hasPrefix("--disallowedTools") || $0 == "--tools" })
-        XCTAssertTrue(TitioBot.soul.contains(RemoteCodeHostCatalog.activityList))
-        XCTAssertTrue(TitioBot.soul.contains("normal tools"))
+        XCTAssertTrue(TitioIdentity.orchestrationDirective.contains(RemoteCodeHostCatalog.activityList))
+        XCTAssertTrue(TitioIdentity.orchestrationDirective.contains("available provider tools"))
     }
 
     func test_titioIsPinnedAndAlwaysFirstInTheRosterWithThePetAvatar() throws {
@@ -481,6 +574,8 @@ final class TitioHostTests: XCTestCase {
         XCTAssertTrue(started)
         let request = try XCTUnwrap(f.runner.requests.first)
         XCTAssertTrue(request.prompt.contains("quais tarefas"))
+        XCTAssertTrue(request.prompt.contains(TitioIdentity.orchestrationDirective),
+                      "chat uses the current control-center contract")
         f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
     }
 

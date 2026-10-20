@@ -9464,7 +9464,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let tid = selectedThreadId else { return nil }
         let runId = requestedRunId ?? AgentRunID()
         // A locked thread keeps its stored actor; the chip only decides the first send.
-        let actorThread = threads.first(where: { $0.id == tid })
+        let cachedActorThread = threads.first(where: { $0.id == tid })
+        let actorThread: AgentThread?
+        do {
+            actorThread = try cachedActorThread.map { try threadRepo.reconcileBotExecutionTarget($0, forUserSend: true) }
+        } catch {
+            statusMessage = error.localizedDescription
+            return nil
+        }
+        if let actorThread, actorThread.executionTarget != cachedActorThread?.executionTarget {
+            mirrorExecutionTarget(.mac, thread: tid)
+            onThreadConfigPersisted?(actorThread)
+        }
         let runActor: RunActor = actorThread?.actorLockedAt != nil ? (actorThread?.actor ?? .none) : selectedRunActor
         var botPrompt: String?
         // Agent App tabs gate every bot send; the embedded desk gates the threads
@@ -16205,15 +16216,9 @@ public struct AgentAppView: View {
                                 )
                                 .id(row.id)
                             }
-                            // Decisions live in the chat: each notice sits under its own
-                            // message (see transcriptEntryRow); the newest reply's answers
-                            // and any notice whose message is not painted follow the last row.
-                            choicesTimelineTail(
-                                paintedMessageIDs: Self.paintedMessageIDs(
-                                    visibleEntries,
-                                    hidden: hiddenPersistedAssistantMessageIDs
-                                )
-                            )
+                            // Notice questions belong to their message row, including
+                            // when that row is collapsed into the earlier history.
+                            choicesTimelineTail()
                             if Self.shouldRenderActivePlan(
                                 plan: vm.activePlan,
                                 status: vm.status,
@@ -16423,19 +16428,10 @@ public struct AgentAppView: View {
         }
     }
 
-    /// Message ids the timeline paints as rows, so a notice card is drawn once.
-    static func paintedMessageIDs(_ entries: [TranscriptEntry], hidden: Set<AgentMessageID>) -> Set<String> {
-        Set(entries.compactMap { entry in
-            guard case .message(let message) = entry, !hidden.contains(message.id) else { return nil }
-            return message.id.value.uuidString.lowercased()
-        })
-    }
-
-    /// Ready-made answers from the newest reply, while the user still has to answer
-    /// it, then open notices whose message is outside the painted window. Picking an
-    /// ordinary answer sends it like the composer would.
+    /// Ready-made answers from the newest reply. Notice questions are rendered
+    /// only by their own message row, never lifted out of collapsed history.
     @ViewBuilder
-    private func choicesTimelineTail(paintedMessageIDs: Set<String>) -> some View {
+    private func choicesTimelineTail() -> some View {
         // The card reads the composer draft, which publishes on its own object:
         // observe it here so typing a draft disables the card.
         ComposerReactiveScope(composerState: vm.composerState) {
@@ -16463,29 +16459,11 @@ public struct AgentAppView: View {
                 .id("agent.choices.\(pending.messageID)")
             }
         }
-        if vm.embedding?.noticeChoiceHandler != nil {
-            let stack = AgentChatChoicesCard.Pending.noticeStack(
-                AgentChatChoicesCard.Pending.openNotices(in: vm.messages, dismissed: dismissedChoices)
-                    .filter { !paintedMessageIDs.contains($0.messageID) }
-            )
-            if !stack.visible.isEmpty {
-                VStack(alignment: .leading, spacing: DS.Space.md) {
-                    if stack.hiddenCount > 0 {
-                        Text(TitioNoticeCopy.openDecisionsLabel(extra: stack.hiddenCount, language: stack.language))
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .accessibilityIdentifier("agent.choices.notices.more")
-                    }
-                    ForEach(stack.visible, id: \.messageID) { pending in noticeCard(pending) }
-                }
-                .accessibilityIdentifier("agent.choices.notices")
-            }
-        }
     }
 
-    /// A notice's decision right under the message that asked it. Notices ignore
-    /// `isRunning` (a Titio run never hides a decision) and send (message id, option
-    /// index) to the host, never text, so they have no free-text field and no draft gate.
+    /// A notice's decision right under the message that asked it. The message's
+    /// visibility controls the question too. Actions send the message id and option
+    /// index to the host, never the label as a new model prompt.
     @ViewBuilder
     private func inlineNoticeCard(for message: AgentMessage) -> some View {
         if vm.embedding?.noticeChoiceHandler != nil,

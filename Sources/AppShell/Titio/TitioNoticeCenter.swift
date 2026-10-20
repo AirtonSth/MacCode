@@ -366,11 +366,11 @@ public actor TitioNoticeCenter {
     }
 
     /// A finished voice call, applied on this actor in command order. A nil
-    /// text means the writer could not deliver: the factual fallback posts.
+    /// text means the writer could not deliver; it never becomes canned speech.
     enum VoiceCompletion: Sendable {
         case notice(VoicePlan, TitioVoiceReply?)
-        case resultLine(fallback: String, text: String?)
-        case statusLine(messageID: AgentMessageID, fallback: String, text: String?)
+        case resultLine(text: String?)
+        case statusLine(messageID: AgentMessageID, text: String?)
     }
 
     enum TimerID: Hashable {
@@ -396,7 +396,7 @@ public actor TitioNoticeCenter {
     private let botStore: BotStore
     private let hooks: TitioNoticeHooks
     private let scheduler: TitioNoticeScheduling
-    /// Titio's writer (nil: every text is the factual fallback).
+    /// Titio's writer (nil: notices stay pending).
     private let voice: TitioVoiceWriting?
     private let voiceTiming: TitioVoiceTiming
     private let now: @Sendable () -> Date
@@ -792,7 +792,7 @@ public actor TitioNoticeCenter {
         settingsStore.reload().titioLanguage
     }
 
-    /// pt-BR or en for the factual fallback and ids that need a language.
+    /// Locale for host metadata; conversational text comes from the writer.
     private func language() -> TitioNoticeLanguage {
         let inputs = hooks.languageInputs()
         return TitioLanguageSetting.fallbackLanguage(
@@ -852,8 +852,10 @@ public actor TitioNoticeCenter {
             return false
         }
         guard let writer = voice else {
-            titioNoticeLog.info("titio.voice.fallback purpose=notice reason=no_writer keys=\(keys.count, privacy: .public)")
-            return await commit(keys: keys, catchUp: catchUp, target: target, language: language, reply: nil)
+            titioNoticeLog.error("titio.voice.unavailable purpose=notice keys=\(keys.count, privacy: .public)")
+            armFallbacks(keys)
+            scheduleRetry()
+            return false
         }
         let rows: [TitioNoticeRecord]
         do {
@@ -893,9 +895,14 @@ public actor TitioNoticeCenter {
             expectsJSON: expectsJSON
         )
         let parse: @Sendable (String) -> TitioVoiceReply? = { raw in
-            expectsJSON
-                ? TitioVoiceOutput.parseCard(raw, optionCount: optionCount, forbidden: forbidden)
+            let reply = expectsJSON
+                ? TitioVoiceOutput.parseCard(raw, optionCount: optionCount, forbidden: forbidden, requiresNotification: sensitive)
                 : TitioVoiceOutput.sanitize(raw).map { TitioVoiceReply(message: $0) }
+            if let options = cardOptions, let labels = reply?.labels {
+                let merged = zip(options, labels).map { $0.action.keepsLabelVerbatim ? $0.label ?? $1 : $1 }
+                guard Set(merged).count == merged.count else { return nil }
+            }
+            return reply
         }
         let urgent = rows.contains { $0.urgency != .info }
         let plan = VoicePlan(keys: keys, catchUp: catchUp, language: language)
@@ -941,6 +948,11 @@ public actor TitioNoticeCenter {
         switch completion {
         case .notice(let plan, let reply):
             composing.subtract(plan.keys)
+            guard let reply else {
+                armFallbacks(plan.keys)
+                scheduleRetry()
+                return
+            }
             guard let target = await target(language: plan.language) else {
                 titioNoticeLog.info("titio.notice.inbox_unavailable keys=\(plan.keys.count, privacy: .public)")
                 armFallbacks(plan.keys)
@@ -948,17 +960,16 @@ public actor TitioNoticeCenter {
                 return
             }
             _ = await commit(keys: plan.keys, catchUp: plan.catchUp, target: target, language: plan.language,
-                             reply: reply, voicedKeys: reply == nil ? nil : Set(plan.keys))
-        case .resultLine(let fallback, let text):
-            await appendActMessage(role: .assistant, text: text ?? fallback)
-        case .statusLine(let messageID, let fallback, let text):
-            await applyStatusLine(messageID: messageID, line: text.map(Self.italicStatus) ?? fallback)
+                             reply: reply, voicedKeys: Set(plan.keys))
+        case .resultLine(let text):
+            if let text { await appendActMessage(role: .assistant, text: text) }
+        case .statusLine(let messageID, let text):
+            if let text { await applyStatusLine(messageID: messageID, line: Self.italicStatus(text)) }
         }
     }
 
     /// The one-transaction post (§3 step 3): re-reads which rows are still
-    /// pending, writes the message (Titio's text, or the fallback when
-    /// `reply` is nil) and marks them posted. When rows resolved while the
+    /// pending, writes the generated message and marks them posted. When rows resolved while the
     /// voice wrote (`voicedKeys` differs), nothing is written and the rest is
     /// written again: the text must not mention a notice that is gone.
     @discardableResult
@@ -967,7 +978,7 @@ public actor TitioNoticeCenter {
         catchUp: Bool,
         target: TitioInboxTarget,
         language: TitioNoticeLanguage,
-        reply: TitioVoiceReply?,
+        reply: TitioVoiceReply,
         voicedKeys: Set<String>? = nil
     ) async -> Bool {
         let viewing = await hooks.isInboxViewed(target)
@@ -999,14 +1010,15 @@ public actor TitioNoticeCenter {
                 )
                 try messageRepo.append(message)
                 written = message
-                bannerText = Self.bannerText(items: items, reply: reply, language: language, catchUp: catchUp, timeZone: timeZone)
+                bannerText = Self.bannerText(items: items, reply: reply)
                 return TitioNoticePosting(
                     messageID: uuid.uuidString,
                     batchID: rows.count > 1 ? uuid.uuidString : nil,
                     cardOwnerKey: composed.cardOwnerKey,
                     cardOptions: composed.cardOptions,
                     preview: composed.preview,
-                    countsAsUnread: !viewing
+                    countsAsUnread: !viewing,
+                    notificationLine: reply.notificationLine
                 )
             }
         } catch {
@@ -1033,10 +1045,9 @@ public actor TitioNoticeCenter {
     }
 
     /// Titio's text with the host's own card appended (labels may be the
-    /// writer's translation, but every action stays the ledger's), or the
-    /// fallback as is.
-    static func composed(fallback: TitioNoticeComposed, reply: TitioVoiceReply?) -> TitioNoticeComposed {
-        guard let reply else { return fallback }
+    /// writer's translation, but every action stays the ledger's). Template
+    /// prose is never displayed; the writer supplies every conversational field.
+    static func composed(fallback: TitioNoticeComposed, reply: TitioVoiceReply) -> TitioNoticeComposed {
         var text = reply.message
         var options = fallback.cardOptions
         if let defaults = fallback.cardOptions, let owner = fallback.cardOwnerKey {
@@ -1047,9 +1058,8 @@ public actor TitioNoticeCenter {
                 // Labels must stay distinct, or `option_index` would not map 1:1.
                 if Set(merged.compactMap(\.label)).count == merged.count { options = merged }
             }
-            let question = reply.question ?? BotChoicesBlock.parse(fallback.text).choices?.question
             text += "\n\n" + TitioNoticeCopy.choicesBlock(
-                question: question, options: (options ?? defaults).compactMap(\.label), notice: owner
+                question: reply.question, options: (options ?? defaults).compactMap(\.label), notice: owner
             )
         }
         return TitioNoticeComposed(
@@ -1062,21 +1072,15 @@ public actor TitioNoticeCenter {
 
     /// Banner / push body: the first sentence of Titio's text, except for
     /// approvals and questions, whose lock-screen line is the writer's
-    /// checked `notification` line or the redacted fallback.
+    /// checked `notification` line.
     static func bannerText(
         items: [TitioNoticeRenderItem],
-        reply: TitioVoiceReply?,
-        language: TitioNoticeLanguage,
-        catchUp: Bool,
-        timeZone: TimeZone
+        reply: TitioVoiceReply
     ) -> String {
-        let redacted = TitioNoticeCopy.bannerBody(items, language: language, catchUp: catchUp, timeZone: timeZone)
-        guard let reply else { return redacted }
         if items.contains(where: { $0.kind.isLockScreenSensitive }) {
-            return reply.notificationLine ?? redacted
+            return reply.notificationLine ?? ""
         }
-        let sentence = TitioVoiceOutput.firstSentence(reply.message)
-        return sentence.isEmpty ? redacted : sentence
+        return TitioVoiceOutput.firstSentence(reply.message)
     }
 
     static func italicStatus(_ line: String) -> String {
@@ -1342,14 +1346,13 @@ public actor TitioNoticeCenter {
             let allInBatch = (try? repo.notices(messageID: messageID)) ?? records
             let identifier = allInBatch.count == 1 ? allInBatch[0].key : TitioNoticeIDs.digestBannerIdentifier(messageID: uuid)
             let owner = allInBatch.first { $0.actions != nil }?.key ?? (allInBatch.count == 1 ? allInBatch[0].key : nil)
-            let bannerLanguage = TitioNoticeCopy.detectedLanguage(message.content) ?? language()
             let items = allInBatch.map(TitioNoticeRenderItem.init(record:))
-            let redacted = TitioNoticeCopy.bannerBody(items, language: bannerLanguage, timeZone: timeZone)
-            // The writer's lock-screen line is not stored: an approval or
-            // question re-posts the redacted line; anything else re-posts the
-            // first sentence of what Titio wrote.
             let sentence = TitioVoiceOutput.firstSentence(BotChoicesBlock.parse(message.content).text)
-            let text = items.contains(where: { $0.kind.isLockScreenSensitive }) || sentence.isEmpty ? redacted : sentence
+            let text = items.contains(where: { $0.kind.isLockScreenSensitive })
+                ? allInBatch.compactMap(\.facts.generatedNotificationLine).first : sentence
+            // Old notices without generated redacted copy remain in the inbox;
+            // never replace it with canned speech or expose their private text.
+            guard let text, !text.isEmpty else { continue }
             deliver(identifier: identifier, text: text, message: message, target: target,
                     noticeKey: owner, records: allInBatch)
         }
@@ -1418,12 +1421,17 @@ public actor TitioNoticeCenter {
             return
         }
         let messageLanguage = TitioNoticeCopy.detectedLanguage(original.content) ?? language()
-        let fallbackStatus = TitioNoticeCopy.statusLine(status, language: messageLanguage, at: date, timeZone: timeZone)
-        let text = TitioNoticeCopy.resolvedText(original: original.content, statusLine: voice == nil ? fallbackStatus : nil)
+        // Acknowledging a notice only closes its question. It must not call a
+        // model to write "Seen", or turn the tap into another conversation turn.
+        let writesStatus = resolution != .acknowledged
+        let text = TitioNoticeCopy.resolvedText(
+            original: original.content,
+            statusLine: nil
+        )
         if text != original.content {
             await writeRewrite(original, text: text, language: messageLanguage, key: record.key)
         }
-        guard let writer = voice else { return }
+        guard writesStatus, let writer = voice else { return }
         let request = TitioVoiceRequest(
             purpose: .status,
             prompt: TitioVoicePrompt.status(status, at: date, language: voiceLanguage(), timeZone: timeZone),
@@ -1434,7 +1442,7 @@ public actor TitioNoticeCenter {
             accept: { TitioVoiceOutput.sanitizeLine($0, max: Self.statusLineMaxCharacters) != nil }
         ) { raw in
             .statusLine(
-                messageID: id, fallback: fallbackStatus,
+                messageID: id,
                 text: raw.flatMap { TitioVoiceOutput.sanitizeLine($0, max: Self.statusLineMaxCharacters) }
             )
         }
@@ -1869,7 +1877,7 @@ public actor TitioNoticeCenter {
         guard claimed else {
             // A repeated tap while the first act runs (`acting`) is silent:
             // that act reports. A notice that already ended gets the honest line.
-            if (try? repo.get(key: record.key))?.state != .acting {
+            if option.action != .ack, (try? repo.get(key: record.key))?.state != .acting {
                 spawnAct { center in await center.reportAlreadyResolved(record) }
             }
             return .alreadyResolved
@@ -1938,17 +1946,12 @@ public actor TitioNoticeCenter {
     }
 
     private func reportAlreadyResolved(_ record: TitioNoticeRecord) async {
-        await speakResult(.alreadyResolved, language: messageLanguage(record))
+        await speakResult(.alreadyResolved)
     }
 
-    /// Titio's line after an act, written by the voice (the factual line
-    /// when no writer can run). The user's own tap row is already in.
-    private func speakResult(_ result: TitioNoticeResult, language: TitioNoticeLanguage) async {
-        let fallback = TitioNoticeCopy.resultLine(result, language: language)
-        guard let writer = voice else {
-            await appendActMessage(role: .assistant, text: fallback)
-            return
-        }
+    /// Titio's generated line after an act. The user's own tap row is already in.
+    private func speakResult(_ result: TitioNoticeResult) async {
+        guard let writer = voice else { return }
         let request = TitioVoiceRequest(
             purpose: .result,
             prompt: TitioVoicePrompt.result(result, language: voiceLanguage()),
@@ -1956,7 +1959,7 @@ public actor TitioNoticeCenter {
         )
         spawnVoice(request, writer: writer, deadline: voiceTiming.lineDeadline,
                    accept: { TitioVoiceOutput.sanitize($0) != nil }) { raw in
-            .resultLine(fallback: fallback, text: raw.flatMap(TitioVoiceOutput.sanitize))
+            .resultLine(text: raw.flatMap(TitioVoiceOutput.sanitize))
         }
     }
 
@@ -1964,7 +1967,9 @@ public actor TitioNoticeCenter {
     private func runClaimedAct(_ record: TitioNoticeRecord, option: TitioNoticeCardOption, actions: TitioNoticeActionHooks) async {
         let language = messageLanguage(record)
         let label = option.label ?? TitioNoticeCopy.label(for: option.action, language: language, botName: record.facts.botName)
-        await appendActMessage(role: .user, text: label)
+        if option.action != .ack {
+            await appendActMessage(role: .user, text: label)
+        }
         let facts = record.facts
         let source = record.source
         switch option.action {
@@ -1978,12 +1983,12 @@ public actor TitioNoticeCenter {
             default: decision = .decline; resolution = .declined; result = .declined(workspace: facts.workspaceName)
             }
             guard let request = requestTarget(record) else {
-                return await finish(record, .failed, result: .failed(error: missingSourceReason(language)), language: language)
+                return await finish(record, .failed, result: .failed(error: missingSourceReason(language)))
             }
             guard actions.isRequestOpen(request.thread, request.id, .approval) else {
-                return await finish(record, .expired, result: .alreadyResolved, language: language)
+                return await finish(record, .expired, result: .alreadyResolved)
             }
-            await perform(record, resolution: resolution, result: result, language: language) {
+            await perform(record, resolution: resolution, result: result) {
                 try await actions.respondRequest(request.thread, request.id, decision)
             }
         case .providerOption(_, let text):
@@ -1992,16 +1997,16 @@ public actor TitioNoticeCenter {
             await forwardToBot(record, text: text, actions: actions, language: language)
         case .continue:
             guard let thread = source.threadId.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init) else {
-                return await finish(record, .failed, result: .failed(error: missingSourceReason(language)), language: language)
+                return await finish(record, .failed, result: .failed(error: missingSourceReason(language)))
             }
-            await perform(record, resolution: .retried, result: .continued(title: facts.title), language: language) {
+            await perform(record, resolution: .retried, result: .continued(title: facts.title)) {
                 try await actions.continueRun(thread)
             }
         case .rerun:
             guard let task = source.scheduledTaskId.flatMap(UUID.init(uuidString:)) else {
-                return await finish(record, .failed, result: .failed(error: missingSourceReason(language)), language: language)
+                return await finish(record, .failed, result: .failed(error: missingSourceReason(language)))
             }
-            await perform(record, resolution: .retried, result: .rerun(task: facts.title), language: language) {
+            await perform(record, resolution: .retried, result: .rerun(task: facts.title)) {
                 try await actions.rerunScheduledTask(task)
             }
         case .ack:
@@ -2016,7 +2021,7 @@ public actor TitioNoticeCenter {
             } catch {
                 titioNoticeLog.info("titio.notice.ack_source_failed key=\(record.key, privacy: .public) error=\(String(describing: error), privacy: .public)")
             }
-            await finish(record, .acknowledged, result: nil, language: language)
+            await finish(record, .acknowledged, result: nil)
         case .replyHere:
             let armedAt = now()
             guard (try? repo.setAwaitingReply(key: record.key, at: armedAt)) == true else {
@@ -2027,7 +2032,7 @@ public actor TitioNoticeCenter {
             }
             takenArmKeys.mutate { _ = $0.remove(record.key) }
             refreshMirrors()
-            await speakResult(.armed(target: replyTarget(record)), language: language)
+            await speakResult(.armed(target: replyTarget(record)))
         case .openThread, .openBot, .openActivity, .openAllActivity:
             // Navigation never claims; `actNow` answers it before the claim.
             _ = try? repo.reopen(key: record.key)
@@ -2043,8 +2048,7 @@ public actor TitioNoticeCenter {
         await appendActMessage(role: .user, text: text)
         guard let record, (try? repo.claim(key: key)) == true else {
             refreshMirrors()
-            let language = record.map(messageLanguage) ?? self.language()
-            await speakResult(.alreadyResolved, language: language)
+            await speakResult(.alreadyResolved)
             return
         }
         let language = messageLanguage(record)
@@ -2058,14 +2062,13 @@ public actor TitioNoticeCenter {
 
     private func answerRequest(_ record: TitioNoticeRecord, text: String, actions: TitioNoticeActionHooks, language: TitioNoticeLanguage) async {
         guard let request = requestTarget(record) else {
-            return await finish(record, .failed, result: .failed(error: missingSourceReason(language)), language: language)
+            return await finish(record, .failed, result: .failed(error: missingSourceReason(language)))
         }
         guard actions.isRequestOpen(request.thread, request.id, .userInput) else {
-            return await finish(record, .expired, result: .alreadyResolved, language: language)
+            return await finish(record, .expired, result: .alreadyResolved)
         }
         await perform(record, resolution: .answered,
-                      result: .answered(answer: text, target: .agent(workspace: record.facts.workspaceName)),
-                      language: language) {
+                      result: .answered(answer: text, target: .agent(workspace: record.facts.workspaceName))) {
             try await actions.respondUserInput(request.thread, request.id, text)
         }
     }
@@ -2075,11 +2078,10 @@ public actor TitioNoticeCenter {
     private func forwardToBot(_ record: TitioNoticeRecord, text: String, actions: TitioNoticeActionHooks, language: TitioNoticeLanguage) async {
         guard let bot = record.source.botId.flatMap(UUID.init(uuidString:)).map(BotID.init),
               let conversation = record.source.conversationId.flatMap(UUID.init(uuidString:)).map(BotConversationID.init) else {
-            return await finish(record, .failed, result: .failed(error: missingSourceReason(language)), language: language)
+            return await finish(record, .failed, result: .failed(error: missingSourceReason(language)))
         }
         await perform(record, resolution: .forwarded,
-                      result: .answered(answer: text, target: .bot(name: record.facts.botName)),
-                      language: language) {
+                      result: .answered(answer: text, target: .bot(name: record.facts.botName))) {
             try await actions.sendBotMessage(bot, conversation, text)
             if let item = record.source.attentionItemId.flatMap(UUID.init(uuidString:)).map(BotAttentionItemID.init) {
                 do {
@@ -2096,21 +2098,20 @@ public actor TitioNoticeCenter {
         _ record: TitioNoticeRecord,
         resolution: TitioNoticeResolution,
         result: TitioNoticeResult,
-        language: TitioNoticeLanguage,
         _ action: () async throws -> Void
     ) async {
         do {
             try await action()
         } catch {
             titioNoticeLog.error("titio.notice.act_failed key=\(record.key, privacy: .public) error=\(String(describing: error), privacy: .public)")
-            return await finish(record, .failed, result: .failed(error: Self.reason(error)), language: language)
+            return await finish(record, .failed, result: .failed(error: Self.reason(error)))
         }
-        await finish(record, resolution, result: result, language: language)
+        await finish(record, resolution, result: result)
     }
 
     /// `acting → resolved`, the original message rewritten (choices stripped,
     /// status line), then the result line.
-    private func finish(_ record: TitioNoticeRecord, _ resolution: TitioNoticeResolution, result: TitioNoticeResult?, language: TitioNoticeLanguage) async {
+    private func finish(_ record: TitioNoticeRecord, _ resolution: TitioNoticeResolution, result: TitioNoticeResult?) async {
         let at = now()
         do {
             if let resolved = try repo.resolve(key: record.key, resolution: resolution, at: at) {
@@ -2123,7 +2124,7 @@ public actor TitioNoticeCenter {
         }
         refreshMirrors()
         if let result {
-            await speakResult(result, language: language)
+            await speakResult(result)
         }
     }
 

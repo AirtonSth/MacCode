@@ -63,12 +63,15 @@ public extension BotStore {
                     let repository = AgentThreadRepository(db: db)
                     try repository.upsert(newThread)
                     insertedThread = true
+                    // Native/paired creation carries the Bot's selected desktop.
+                    // Internal contextual workers retain their isolated VM route.
+                    let target = newThread.executionTarget ?? .vm
                     guard try repository.lockActorIfUnlocked(
                         id: threadID,
                         actor: .bot(conversation.botID),
                         lockedAt: Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down)),
-                        executionTarget: .vm
-                    ), try repository.setGuestRuntime(id: threadID, BotGuestRuntime.distillV1) else {
+                        executionTarget: target
+                    ), try repository.setGuestRuntime(id: threadID, target == .vm ? BotGuestRuntime.distillV1 : nil) else {
                         throw BotStoreError.invalidInput("could not lock contextual thread")
                     }
                 }

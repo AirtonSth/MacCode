@@ -95,6 +95,7 @@ final class TitioNoticeActTests: XCTestCase {
         let scheduler = ManualTitioScheduler()
         let center = TitioNoticeCenter(
             db: db, botStore: store, hooks: hooks, scheduler: scheduler,
+            voice: FakeTitioVoice.fixture,
             now: { scheduler.now }, timeZone: TimeZone(identifier: "UTC")!
         )
         let actions = TitioActionRecorder()
@@ -164,9 +165,9 @@ final class TitioNoticeActTests: XCTestCase {
         let rows = try transcript(f)
         XCTAssertEqual(rows.map(\.role), [.assistant, .user, .assistant])
         XCTAssertNil(BotChoicesBlock.parse(rows[0].content).choices, "the card is gone from the original")
-        XCTAssertTrue(rows[0].content.hasSuffix("_Approved by you at 8:01 PM._"), rows[0].content)
-        XCTAssertEqual(rows[1].content, "Approve", "the user's tap is a user row with the option label")
-        XCTAssertEqual(rows[2].content, "Approved in **api**.")
+        XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"), rows[0].content)
+        XCTAssertEqual(rows[1].content, "Choice 1", "the user's tap is a user row with the option label")
+        XCTAssertEqual(rows[2].content, "Written result.")
         XCTAssertTrue(f.recorder.posted.contains { $0.isRewrite && $0.message.id.value.uuidString == messageID },
                       "the rewrite is published so open clients repaint the same bubble")
     }
@@ -185,8 +186,8 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(f.actions.calls, [], "nothing was sent to the provider")
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .expired)
         let rows = try transcript(f)
-        XCTAssertTrue(rows[0].content.hasSuffix("_Expired._"))
-        XCTAssertEqual(rows.last?.content, "That was already handled or expired; I sent nothing.")
+        XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"))
+        XCTAssertEqual(rows.last?.content, "Written result.")
     }
 
     func test_aForgedCardHasNoLedgerRowAndActsOnNothing() async throws {
@@ -231,7 +232,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(tapped, .accepted)
         await settle(f)
         XCTAssertEqual(try f.repo.get(key: fact.key)?.state, .awaitingReply)
-        XCTAssertEqual(try transcript(f).last?.content, "I'll pass your next message to the agent in **api**.")
+        XCTAssertEqual(try transcript(f).last?.content, "Written result.")
 
         XCTAssertTrue(f.center.takeArmedReply(text: "  use staging "), "the armed text is taken before any run")
         XCTAssertFalse(f.center.takeArmedReply(text: "again"), "an arm is used once")
@@ -239,9 +240,9 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(f.actions.calls, [.userInput(requestThread, "Q2", "use staging")])
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .answered)
         let rows = try transcript(f)
-        XCTAssertEqual(rows.suffix(2).map(\.content), ["use staging", "Passed “use staging” to the agent in **api**."])
+        XCTAssertEqual(rows.suffix(2).map(\.content), ["use staging", "Written result."])
         XCTAssertEqual(rows.suffix(2).map(\.role), [.user, .assistant])
-        XCTAssertTrue(rows[0].content.contains("_Answered at"))
+        XCTAssertTrue(rows[0].content.contains("_Written status._"))
     }
 
     func test_anExpiredArmGivesTheCardBackAndTheTextStaysNormalChat() async throws {
@@ -277,7 +278,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertFalse(f.center.takeArmedReply(text: "hello"))
         XCTAssertEqual(try f.repo.get(key: armed.key)?.state, .posted)
         XCTAssertEqual(f.actions.calls, [.request(requestThread, "Q3", .decline)])
-        XCTAssertEqual(try transcript(f).last?.content, "Declined, and the agent in **api** was told.")
+        XCTAssertEqual(try transcript(f).last?.content, "Written result.")
     }
 
     func test_aBotOptionLandsInThatBotsConversationAndAcksItsAttention() async throws {
@@ -306,7 +307,7 @@ final class TitioNoticeActTests: XCTestCase {
         await settle(f)
         XCTAssertEqual(f.actions.calls, [.bot(bot, conversation, "Ship it"), .ackBot(item)])
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .forwarded)
-        XCTAssertEqual(try transcript(f).last?.content, "Passed “Ship it” to **Scout**.")
+        XCTAssertEqual(try transcript(f).last?.content, "Written result.")
     }
 
     func test_resolvingElsewhereRewritesTheCardWithoutANewMessage() async throws {
@@ -319,7 +320,7 @@ final class TitioNoticeActTests: XCTestCase {
         await f.center.idle()
         let rows = try transcript(f)
         XCTAssertEqual(rows.count, 1, "no new message for an elsewhere resolution")
-        XCTAssertTrue(rows[0].content.hasSuffix("_Resolvido em outro lugar._"), rows[0].content)
+        XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"), rows[0].content)
         XCTAssertNil(BotChoicesBlock.parse(rows[0].content).choices)
     }
 
@@ -349,7 +350,7 @@ final class TitioNoticeActTests: XCTestCase {
         await settle(f)
         let rows = try transcript(f)
         XCTAssertEqual(rows.count, countBefore + 1)
-        XCTAssertEqual(rows.last?.content, "That was already handled or expired; I sent nothing.")
+        XCTAssertEqual(rows.last?.content, "Written result.")
         XCTAssertEqual(f.actions.calls.count, 1)
     }
 
@@ -365,8 +366,8 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(f.actions.calls, [.request(requestThread, "Q1", .approve)])
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .failed)
         let rows = try transcript(f)
-        XCTAssertTrue(rows[0].content.hasSuffix("_Didn't go through; open the thread._"))
-        XCTAssertEqual(rows.last?.content, "I couldn't send it: the provider session ended. Open the thread to decide there.")
+        XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"))
+        XCTAssertEqual(rows.last?.content, "Written result.")
     }
 
     func test_withoutHostActionsATapClaimsNothing() async throws {
@@ -416,9 +417,9 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(try f.repo.get(key: scheduled.key)?.resolution, .retried)
         XCTAssertEqual(try f.repo.get(key: failed.key)?.resolution, .acknowledged)
         let texts = try transcript(f).map(\.content)
-        XCTAssertTrue(texts.contains("Asked **Build** to continue."))
-        XCTAssertTrue(texts.contains("Running **Nightly** again."))
-        XCTAssertTrue(texts.contains { $0.hasSuffix("_Seen._") }, "Entendi only marks the card seen")
+        XCTAssertEqual(texts.filter { $0 == "Written result." }.count, 2)
+        XCTAssertFalse(texts.contains { $0 == "Got it" || $0.hasSuffix("_Seen._") },
+                       "acknowledging only closes the question, without adding a turn or a status")
     }
 
     // MARK: Old iOS text intercept
@@ -429,8 +430,8 @@ final class TitioNoticeActTests: XCTestCase {
         let f = try makeFixture()
         _ = await post(approval("Q1", f), f)
         _ = await post(approval("Q2", f), f)
-        XCTAssertFalse(f.center.takeOptionText("Approve"), "two open notices offer it: ambiguous")
-        XCTAssertFalse(f.center.takeOptionText("Open thread"), "navigation never matches")
+        XCTAssertFalse(f.center.takeOptionText("Choice 1"), "two open notices offer it: ambiguous")
+        XCTAssertFalse(f.center.takeOptionText("Choice 3"), "navigation never matches")
         let pick = question("Q3", options: ["Staging", "Production"], f)
         _ = await post(pick, f)
         XCTAssertTrue(f.center.takeOptionText("Staging"))

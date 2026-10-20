@@ -122,4 +122,37 @@ final class AgentChoicesRenderedLayoutTests: XCTestCase {
             XCTAssertGreaterThan(filledRows.count, 4, "real card backgrounds must span the available chat width")
         }
     }
+
+    func testCollapsedQuestionsDoNotPaintBelowTheReplyWhileRunning() async throws {
+        let harness = try makeHarness()
+        defer { try? FileManager.default.removeItem(atPath: harness.directory) }
+        await harness.vm.waitForSelectThreadHydrationForTesting()
+        harness.vm.messages.append(AgentMessage(
+            threadId: harness.thread.id, role: .user, content: "Staging",
+            createdAt: Date(timeIntervalSince1970: 1_792_094_470)
+        ))
+        harness.vm.status = .running
+        let size = NSSize(width: 1_000, height: 700)
+        let (actual, actualWindow) = try render(harness.vm, size: size, name: "collapsed-running")
+        defer { actualWindow.contentView = nil }
+        harness.vm.messages = harness.vm.messages.map { message in
+            var message = message
+            message.content = BotChoicesBlock.parse(message.content).text
+            return message
+        }
+        let (withoutQuestions, expectedWindow) = try render(harness.vm, size: size, name: "collapsed-running-without-questions")
+        defer { expectedWindow.contentView = nil }
+        let scale = CGFloat(actual.pixelsWide) / size.width
+        // The lower timeline must be unchanged when hidden questions are removed.
+        // The old orphan stack painted three cards here during the current turn.
+        for y in stride(from: Int(200 * scale), to: Int(560 * scale), by: 16) {
+            for x in stride(from: Int(30 * scale), to: actual.pixelsWide - Int(30 * scale), by: 24) {
+                let a = try XCTUnwrap(actual.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
+                let b = try XCTUnwrap(withoutQuestions.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
+                let difference = abs(a.redComponent - b.redComponent)
+                    + abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent)
+                XCTAssertLessThan(difference, 0.04, "a collapsed question painted at \(x),\(y)")
+            }
+        }
+    }
 }

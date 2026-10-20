@@ -233,6 +233,65 @@ final class BotDeskGuestThreadTests: XCTestCase {
         await finishAll(f)
     }
 
+    func test_removingADockerDesktopReusesTheConversationOnTheMacWithItsHistory() async throws {
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: true)
+        let thread = try await firstSend(f, bot: bot, provider: .distill, text: "Remember the release checklist")
+        await finishAll(f)
+        try f.ctx.threadRepo.updateProviderThreadId(id: thread.id, providerThreadId: "guest-only-session")
+
+        f.vm.openStudio(bot)
+        f.vm.studioDraft.desktopKind = .logicalExecutionSpace
+        let local = try f.vm.saveStudio()
+        f.vm.openDesk(local)
+        XCTAssertTrue(f.vm.send("Continue the checklist"), f.vm.errorMessage ?? "")
+        let started = await waitUntil { f.distill.requests.count == 2 }
+        XCTAssertTrue(started, f.vm.errorMessage ?? "")
+        let request = try XCTUnwrap(f.distill.requests.last)
+        XCTAssertEqual(request.threadId, thread.id, "the conversation is preserved")
+        XCTAssertNil(request.providerThreadId, "a Linux session cannot resume on the Mac")
+        XCTAssertTrue(request.prompt.contains("Remember the release checklist"))
+        XCTAssertFalse(request.prompt.contains(BotStandingInstructions.guestThreadRules))
+        XCTAssertEqual(try f.ctx.threadRepo.get(id: thread.id)?.executionTarget, .mac)
+        await finishAll(f)
+    }
+
+    func test_contextualLocalBotStartsOnTheMacAndRepairsPreviouslyForcedVMThreads() async throws {
+        let f = try makeFixture()
+        let bot = try makeBot(f, docker: false)
+        let host = f.ctx.liveActivityHostIdentity.serverId
+        let grant = try f.ctx.botStore.grantContext(
+            hostID: host, botID: bot.id, context: .general, actions: [.read, .send], expectedRevision: nil
+        )
+        f.vm.openDesk(bot)
+        f.vm.setDeskProvider(.distill)
+        XCTAssertTrue(f.vm.createDeskThread(in: .general), f.vm.errorMessage ?? "")
+        let conversation = try XCTUnwrap(f.vm.selectedConversation)
+        let id = try XCTUnwrap(conversation.linkedAgentThreadID)
+        var thread = try XCTUnwrap(f.ctx.threadRepo.get(id: id))
+        XCTAssertEqual(thread.executionTarget, .mac)
+        XCTAssertEqual(try f.ctx.threadRepo.guestPlacement(of: id)?.runsInGuest, false)
+        let pin = try f.ctx.botStore.conversationContextPin(linkedTo: id)
+
+        // Reproduce the old creation bug: every context forced a VM, even
+        // when this Bot had never had a Docker desktop.
+        try f.ctx.threadRepo.setActor(id: id, actor: thread.actor, lockedAt: thread.actorLockedAt, executionTarget: .vm)
+        try f.ctx.threadRepo.setGuestRuntime(id: id, BotGuestRuntime.distillV1)
+        f.vm.deskAgentVM?.reloadThreads()
+        XCTAssertTrue(f.vm.send("Run on my Mac"), f.vm.errorMessage ?? "")
+        let started = await waitUntil { !f.distill.requests.isEmpty }
+        XCTAssertTrue(started, f.vm.errorMessage ?? "")
+        XCTAssertFalse(try XCTUnwrap(f.distill.requests.first).prompt.contains(BotStandingInstructions.guestThreadRules))
+        thread = try XCTUnwrap(f.ctx.threadRepo.get(id: id))
+        XCTAssertEqual(thread.executionTarget, .mac)
+        XCTAssertEqual(try f.ctx.botStore.conversationContextPin(linkedTo: id), pin, "scope remains pinned")
+        await finishAll(f)
+
+        _ = try f.ctx.botStore.revokeContext(hostID: host, botID: bot.id, context: .general, expectedRevision: grant.policyRevision)
+        XCTAssertFalse(f.vm.send("This is no longer authorized"))
+        XCTAssertEqual(f.distill.requests.count, 1)
+    }
+
     func test_embeddedDeskSendOnAGuestThreadIsGatedOnTheVMWithoutAWorkspace() async throws {
         // B5 + D11: the desk gate must not try to mount BotHome (it always failed),
         // must start no run while the VM is down (no Mac fallback), and must let the

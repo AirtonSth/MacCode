@@ -36,24 +36,6 @@ final class AgentChatChoicesNoticeTests: XCTestCase {
         XCTAssertEqual(dismissed.map(\.messageID), [second.id.value.uuidString.lowercased()], "a closed card stays closed")
     }
 
-    func test_noticeStackShowsTheNewestThreeAndCountsTheRest() {
-        // WHY: a pile of decisions must not bury the transcript; the label says
-        // how many more are open, in the notices' own language.
-        let notices = (0..<5).map { AgentChatChoicesCard.Pending.openNotices(
-            in: [notice("k\($0)", question: "O que deseja fazer?", at: Double($0))], dismissed: []
-        )[0] }
-        let stack = AgentChatChoicesCard.Pending.noticeStack(notices, preferredLanguages: ["pt-BR"])
-        XCTAssertEqual(stack.visible.map(\.choices.notice), ["k2", "k3", "k4"])
-        XCTAssertEqual(stack.hiddenCount, 2)
-        XCTAssertEqual(TitioNoticeCopy.openDecisionsLabel(extra: stack.hiddenCount, language: stack.language),
-                       "+2 decisões abertas")
-        let english = AgentChatChoicesCard.Pending.noticeStack(Array(notices.prefix(4)), preferredLanguages: ["en-US"])
-        XCTAssertEqual(english.hiddenCount, 1)
-        let small = AgentChatChoicesCard.Pending.noticeStack(Array(notices.prefix(2)))
-        XCTAssertEqual(small.hiddenCount, 0)
-        XCTAssertEqual(small.visible.count, 2)
-    }
-
     func test_newestCardIsUnchangedButNeverDrawsANoticeAsAChatCard() {
         // WHY: ordinary Bot cards keep their newest-only, idle-only rule. A
         // notice block is never the newest-message card on any surface: its
@@ -109,9 +91,7 @@ final class AgentChatChoicesNoticeTests: XCTestCase {
         let row = try XCTUnwrap(surface.range(of: "private func transcriptEntryRow("))
         XCTAssertTrue(String(surface[row.upperBound...].prefix(1_200)).contains("inlineNoticeCard(for: message)"),
                       "a notice card renders right under its own message")
-        XCTAssertTrue(surface.contains("choicesTimelineTail(\n"), "the newest reply's answers follow the last timeline row")
-        XCTAssertTrue(surface.contains(".filter { !paintedMessageIDs.contains($0.messageID) }"),
-                      "a notice is never drawn twice")
+        XCTAssertTrue(surface.contains("choicesTimelineTail()"), "the newest reply's answers follow the last timeline row")
         let tail = try XCTUnwrap(surface.range(of: "private func choicesTimelineTail("))
         let body = String(surface[tail.upperBound...].prefix(2_000))
         XCTAssertTrue(body.contains("ComposerReactiveScope(composerState: vm.composerState)"),
@@ -120,10 +100,15 @@ final class AgentChatChoicesNoticeTests: XCTestCase {
                       "a tap re-checks the draft before replacing the prompt")
     }
 
-    func test_paintedMessageIDsSkipHiddenDuplicates() {
-        let shown = AgentMessage(threadId: AgentThreadID(), role: .assistant, content: "a")
-        let hidden = AgentMessage(threadId: AgentThreadID(), role: .assistant, content: "b")
-        let ids = AgentAppView.paintedMessageIDs([.message(shown), .message(hidden)], hidden: [hidden.id])
-        XCTAssertEqual(ids, [shown.id.value.uuidString.lowercased()])
+    func test_collapsedNoticeQuestionsAreNotResurrectedAfterTheNewestMessage() throws {
+        // The screenshot's three orphaned questions came from a second rendering
+        // of notices whose parent messages were folded into "Earlier in this thread".
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let surface = try String(contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"))
+        let start = try XCTUnwrap(surface.range(of: "private func choicesTimelineTail()"))
+        let end = try XCTUnwrap(surface.range(of: "private func inlineNoticeCard", range: start.upperBound..<surface.endIndex))
+        let tail = surface[start.upperBound..<end.lowerBound]
+        XCTAssertFalse(tail.contains("openNotices"), "collapsed questions follow their parent messages")
+        XCTAssertFalse(tail.contains("noticeCard("), "questions are never copied to the live turn")
     }
 }

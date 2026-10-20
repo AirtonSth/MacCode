@@ -42,7 +42,7 @@ final class BotContextInternalAdmissionTests: XCTestCase {
         let storageID = try BotContextRuntimeIdentity(binding: grant).storageBotID
 
         func makeThread(model: String) throws -> AgentThread {
-            let thread = AgentThread(workspaceId: workspace.id, title: "Admission", provider: .distill, model: model)
+            let thread = AgentThread(workspaceId: workspace.id, title: "Admission", provider: .distill, model: model, permissionMode: .supervised)
             try context.botStore.createContextualConversation(BotConversation(botID: bot.id, title: thread.title, linkedAgentThreadID: thread.id), newThread: thread, hostID: host, context: grant.context, policyRevision: grant.policyRevision)
             return thread
         }

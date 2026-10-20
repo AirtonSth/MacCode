@@ -626,7 +626,8 @@ public final class AppContext {
         /// must NOT flip every live interactive run to `interrupted`.
         performLaunchRunReconciliation: Bool = true,
         contextualSecretStore: any BotSecretStore = BotKeychainSecretStore(),
-        guestDocker: any BotComputerDockerClienting = BotComputerDockerCLI()
+        guestDocker: any BotComputerDockerClienting = BotComputerDockerCLI(),
+        titioVoice: (any TitioVoiceWriting)? = nil
     ) throws {
         self.channel = channel
         self.guestDocker = guestDocker
@@ -684,8 +685,8 @@ public final class AppContext {
                 bridge: privateNotificationBridge,
                 hostID: liveActivityIdentity.serverId
             ),
-            // Unit tests never spawn a real provider CLI: the factual fallback posts.
-            voice: AppContext.isRunningUnitTests ? nil : Self.makeTitioVoiceWriter(box: titioNoticeBox, db: db)
+            // Unit tests never spawn a real provider CLI.
+            voice: titioVoice ?? (AppContext.isRunningUnitTests ? nil : Self.makeTitioVoiceWriter(box: titioNoticeBox, db: db))
         )
         titioNoticeCenter.installActions(Self.makeTitioNoticeActionHooks(
             box: titioNoticeBox,

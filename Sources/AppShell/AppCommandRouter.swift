@@ -6544,6 +6544,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             modelSelection: autoRoutingActive ? nil : modelSelection,
             providerInstanceId: autoRoutingActive || alreadyStarted ? nil : providerInstanceId
         )
+        let reconciled = try ctx.threadRepo.reconcileBotExecutionTarget(t, forUserSend: true)
+        if reconciled.executionTarget != t.executionTarget {
+            t = reconciled
+            publishAgentThreadUpdated(t)
+        }
         if AgentThreadTitle.isPlaceholder(t.title),
            !alreadyStarted {
             t.title = AgentThreadTitle.titleFromFirstMessage(text)

@@ -658,11 +658,6 @@ public enum TitioNoticeCopy {
         language == .ptBR ? "Notificações" : "Notifications"
     }
 
-    /// Label under the stacked notice cards when more than `openNoticeCardsMax` are open.
-    public static func openDecisionsLabel(extra: Int, language: TitioNoticeLanguage) -> String {
-        language == .ptBR ? "+\(extra) decisões abertas" : "+\(extra) open decisions"
-    }
-
     /// Titio's own replies get only this banner: title "Titio", body = first line of the reply.
     public static func directReplyBanner(replyText: String) -> (title: String, body: String) {
         (bannerTitle, preview(replyText))

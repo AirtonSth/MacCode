@@ -267,6 +267,39 @@ final class BotGuestRunResolverTests: XCTestCase {
 
     // MARK: - Routing
 
+    func test_localBotRepairsStalePlacementButContextIsolationAndDockerFailuresStayClosed() async throws {
+        let f = try await makeFixture()
+        let ordinary = try makeThread(f)
+        let pinned = try makeThread(f)
+        let grant = try f.ctx.botStore.grantContext(
+            hostID: f.ctx.liveActivityHostIdentity.serverId, botID: f.bot.id,
+            context: .general, actions: [.read, .send], expectedRevision: nil
+        )
+        try f.ctx.botStore.createContextualConversation(
+            BotConversation(botID: f.bot.id, title: "Pinned", linkedAgentThreadID: pinned.id),
+            hostID: f.ctx.liveActivityHostIdentity.serverId, context: .general, policyRevision: grant.policyRevision
+        )
+        _ = try f.ctx.botStore.publish(
+            botID: f.bot.id, expectedCurrentRevisionID: f.bot.currentRevisionID,
+            draft: BotRevisionDraft(name: f.bot.name, title: "", description: "", soul: "", desktopKind: .logicalExecutionSpace)
+        )
+        let repaired = try f.ctx.threadRepo.reconcileBotExecutionTarget(try XCTUnwrap(f.ctx.threadRepo.get(id: ordinary.id)))
+        XCTAssertEqual(repaired.executionTarget, .mac)
+        XCTAssertEqual(try f.ctx.threadRepo.guestPlacement(of: ordinary.id)?.macHandoffPending, true)
+        let mac = try await f.resolver.prepare(request(repaired)) { _ in }
+        XCTAssertNil(mac)
+        XCTAssertTrue(f.vm.calls.isEmpty, "local execution must never provision Docker")
+
+        let isolated = try f.ctx.threadRepo.reconcileBotExecutionTarget(try XCTUnwrap(f.ctx.threadRepo.get(id: pinned.id)))
+        XCTAssertEqual(isolated.executionTarget, .vm)
+        do {
+            _ = try await f.resolver.prepare(request(isolated)) { _ in }
+            XCTFail("a contextual thread must not silently execute on the Mac")
+        } catch {
+            XCTAssertTrue(error is DistillGuestLaunchError)
+        }
+    }
+
     func test_legacyVMThreadWithoutTheMarker_andAMarkedThreadMovedToTheMac_stayOnTheMac() async throws {
         // WHY (B3, D5): a `.vm` thread from before plan A has its Distill
         // session on the Mac; loading it in the guest would fail. And a thread

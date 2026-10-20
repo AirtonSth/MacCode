@@ -417,7 +417,6 @@ final class TitioNoticeCopyTests: XCTestCase {
         XCTAssertEqual(TitioNoticeCopy.preview(String(repeating: "a", count: 400)).count, 178)
         XCTAssertEqual(TitioNoticeCopy.directReplyBanner(replyText: "Pronto, abri o **Deploy**.\nDetalhes…").body, "Pronto, abri o Deploy.")
         XCTAssertEqual(TitioNoticeCopy.inboxTitle(language: .ptBR), "Notificações")
-        XCTAssertEqual(TitioNoticeCopy.openDecisionsLabel(extra: 2, language: .en), "+2 open decisions")
     }
 
     // MARK: Language rule (§16)
@@ -578,7 +577,7 @@ final class TitioNoticeDirectiveTests: XCTestCase {
         )
     }
 
-    func test_listsNewestTwelveOldestFirstAndEndsWithTheNoActionRule() throws {
+    func test_listsNewestTwelveOldestFirstAndRequiresTheUsersDecision() throws {
         let rows = (0..<15).map { record("run.\($0).completed", .runCompleted, title: "T\($0)", at: TimeInterval(1_000 + $0)) }
         let text = try XCTUnwrap(TitioNoticeDirective.text(rows: rows.shuffled(), language: .en, timeZone: TimeZone(identifier: "UTC")!))
         let lines = text.components(separatedBy: "\n")
@@ -588,7 +587,23 @@ final class TitioNoticeDirectiveTests: XCTestCase {
         XCTAssertTrue(items.last?.contains("**T14**") == true)
         XCTAssertTrue(items.first?.hasPrefix("- [runCompleted · posted] ") == true)
         XCTAssertTrue(items.first?.contains("key: run.3.completed, message: M-run.3.completed, thread: T-run.3.completed") == true)
-        XCTAssertEqual(lines.last, "You cannot approve or answer requests yourself; tell the user to tap the card or open the thread.")
+        XCTAssertEqual(lines.last, TitioNoticeDirective.closingRule)
+        XCTAssertTrue(text.contains("When the user explicitly chooses"))
+        XCTAssertTrue(text.contains("Never decide for the user"))
+    }
+
+    func test_anOlderOpenDecisionKeepsItsExactOptionsAfterNewerNoticesArrive() throws {
+        var decision = record("question.1", .approval, title: "Deploy", at: 1)
+        decision.actions = [
+            TitioNoticeCardOption(label: "Aprovar", action: .approve),
+            TitioNoticeCardOption(label: "Recusar", action: .decline),
+        ]
+        let newer = (0..<15).map { record("run.\($0).completed", .runCompleted, title: "T\($0)", at: TimeInterval(1_000 + $0)) }
+        let text = try XCTUnwrap(TitioNoticeDirective.text(rows: [decision] + newer))
+        XCTAssertTrue(text.contains("message: M-question.1"))
+        XCTAssertTrue(text.contains("option_index 0: approve — Aprovar"))
+        XCTAssertTrue(text.contains("option_index 1: decline — Recusar"))
+        XCTAssertTrue(text.contains("Showing 12 of 16"))
     }
 
     func test_eachLineIsClippedAndNothingIsListedWhenEmpty() throws {

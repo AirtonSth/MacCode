@@ -133,9 +133,10 @@ final class TitioVoiceTests: XCTestCase {
         XCTAssertEqual(reply?.question, "Aprova?")
         XCTAssertEqual(reply?.labels, ["Aprovar", "Recusar", "Abrir"])
         XCTAssertEqual(reply?.notificationLine, "O agente do api precisa da sua aprovação")
-        XCTAssertNil(TitioVoiceOutput.parseCard(raw, optionCount: 2, forbidden: [])?.labels, "count mismatch keeps the defaults")
+        XCTAssertNil(TitioVoiceOutput.parseCard(raw, optionCount: 2, forbidden: []), "count mismatch must not display fixed labels")
         let dup = #"{"message":"x y z","options":["Sim","Sim"]}"#
-        XCTAssertNil(TitioVoiceOutput.parseCard(dup, optionCount: 2, forbidden: [])?.labels)
+        XCTAssertNil(TitioVoiceOutput.parseCard(dup, optionCount: 2, forbidden: []))
+        XCTAssertNil(TitioVoiceOutput.parseCard(#"{"message":"Hola."}"#, optionCount: 2, forbidden: []))
         XCTAssertNil(TitioVoiceOutput.parseCard("not json at all", optionCount: 2, forbidden: []))
     }
 
@@ -149,6 +150,7 @@ final class TitioVoiceTests: XCTestCase {
         XCTAssertTrue(TitioVoiceOutput.isLockScreenSafe("O agente do api precisa da sua aprovação", forbidden: forbidden))
         let raw = #"{"message":"m","notification":"Aprovar sk-live-123?"}"#
         XCTAssertNil(TitioVoiceOutput.parseCard(raw, optionCount: nil, forbidden: forbidden)?.notificationLine)
+        XCTAssertNil(TitioVoiceOutput.parseCard(raw, optionCount: nil, forbidden: forbidden, requiresNotification: true))
     }
 
     func test_firstSentenceIsPlainAndShort() {

@@ -221,30 +221,6 @@ extension AgentChatChoicesCard {
             }
         }
 
-        /// What the notice stack draws.
-        public struct NoticeStack: Equatable {
-            /// The newest open notices, oldest first.
-            public let visible: [Pending]
-            /// Older open notices behind the "+N open decisions" label.
-            public let hiddenCount: Int
-            /// The label's language: the notices' own (pt-BR or en).
-            public let language: TitioNoticeLanguage
-        }
-
-        public static func noticeStack(
-            _ notices: [Pending],
-            limit: Int = TitioNoticeTiming.openNoticeCardsMax,
-            preferredLanguages: [String] = Locale.preferredLanguages
-        ) -> NoticeStack {
-            let visible = Array(notices.suffix(max(0, limit)))
-            let hidden = notices.count - visible.count
-            // Only the label needs a language, so detection runs only then.
-            let language: TitioNoticeLanguage = hidden > 0
-                ? (TitioNoticeCopy.detectedLanguage(visible.compactMap(\.choices.question).joined(separator: " "))
-                    ?? TitioNoticeCopy.language(lastUserText: nil, preferredLanguages: preferredLanguages))
-                : .en
-            return NoticeStack(visible: visible, hiddenCount: hidden, language: language)
-        }
     }
 
     /// Cards the user closed stay closed after RemoteCode reopens.

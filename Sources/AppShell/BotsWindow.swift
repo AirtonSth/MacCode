@@ -5273,6 +5273,7 @@ public final class BotsViewModel: ObservableObject {
                 runAsUser: route.runAsUser
             )
             thread.reasoningModel = route.reasoningModel
+            thread.executionTarget = BotExecutionDefault.target(for: try currentRevision(for: bot))
             let conversation = BotConversation(botID: bot.id, title: "New thread", linkedAgentThreadID: thread.id)
             try botStore.createContextualConversation(
                 conversation, newThread: thread, hostID: hostID,
@@ -11091,7 +11092,11 @@ public final class BotsViewModel: ObservableObject {
                 throw BotDeskSendRefused(reason: "Docker desktop is not ready.")
             }
         }
-        let thread = try context.threadRepo.get(id: threadID)
+        let storedThread = try context.threadRepo.get(id: threadID)
+        let thread = try storedThread.map { try context.threadRepo.reconcileBotExecutionTarget($0, forUserSend: true) }
+        if let thread, thread.executionTarget != storedThread?.executionTarget {
+            resolvedRouter()?.publishAgentThreadUpdated(thread)
+        }
         let routing = thread.map { BotDeskRouting(thread: $0) } ?? deskRouting
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
         let inGuest = runsInGuest(threadID: threadID, provider: routing.provider)
@@ -11144,8 +11149,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     /// Titio's inbox only (hub spec §7): the notices the host posted since the
-    /// user's last message, which the provider session never saw, plus the
-    /// rule that Titio cannot approve or answer them itself. Nil elsewhere.
+    /// user's last message plus still-open decisions, which the provider session
+    /// never saw. Decisions can only follow an explicit user instruction.
     func titioNoticeTurnDirective(conversationID: BotConversationID, threadID: AgentThreadID, userText: String) -> String? {
         guard conversationID == titioInboxConversationID else { return nil }
         let request = userText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -11153,11 +11158,16 @@ public final class BotsViewModel: ObservableObject {
         // The desk may already have stored this turn's own line.
         if users.last?.content.trimmingCharacters(in: .whitespacesAndNewlines) == request { users.removeLast() }
         let since = users.last?.createdAt ?? .distantPast
-        let rows = (try? TitioNoticeRepository(db: context.db).recentPosted(since: since)) ?? []
-        return TitioNoticeDirective.text(
-            rows: rows,
+        let repo = TitioNoticeRepository(db: context.db)
+        let recent = (try? repo.recentPosted(since: since)) ?? []
+        let open = (try? repo.openCards()) ?? []
+        let rows = Dictionary((recent + open).map { ($0.key, $0) }, uniquingKeysWith: { _, latest in latest })
+        guard let directive = TitioNoticeDirective.text(
+            rows: Array(rows.values),
             language: TitioNoticeCopy.language(lastUserText: request, preferredLanguages: Locale.preferredLanguages)
-        )
+        ) else { return nil }
+        guard let botID = (try? context.botStore.conversation(id: conversationID))?.botID else { return directive }
+        return "Titio inbox bot_id: \(botID.value.uuidString.lowercased())\n" + directive
     }
 
     /// The peer directive and the inbox directive, in that order.
@@ -11454,7 +11464,7 @@ public final class BotsViewModel: ObservableObject {
                   existingRunAsUser.shortName == routing.runAsUser.shortName else { return nil }
             // 1.3: model/reasoning/permission drift updates the existing thread
             // in place instead of forking a new thread and losing history.
-            var updated = existing
+            var updated = try context.threadRepo.reconcileBotExecutionTarget(existing, forUserSend: true)
             var didUpdate = false
             if updated.model != model { updated.model = model; didUpdate = true }
             if updated.reasoningEffort != routing.reasoningEffort { updated.reasoningEffort = routing.reasoningEffort; didUpdate = true }
@@ -11474,6 +11484,9 @@ public final class BotsViewModel: ObservableObject {
                     distillUltracode: routing.provider == .distill && routing.distillUltracode
                 )
                 try context.threadRepo.upsert(updated)
+            }
+            if updated.executionTarget != existing.executionTarget {
+                router.publishAgentThreadUpdated(updated)
             }
             return updated
         }

@@ -2477,6 +2477,34 @@ public final class AgentThreadRepository {
         return try changes.step() && changes.columnInt64(0) == 1
     }
 
+    /// An ordinary conversation follows a Bot that no longer has a Docker
+    /// desktop. Keep the guest marker and cursor: the coordinator's existing
+    /// Mac handoff carries the transcript before accepting a new Mac session.
+    /// Public sends of an authorized context follow the same desktop choice;
+    /// internal contextual admissions retain their explicitly isolated runtime.
+    public func reconcileBotExecutionTarget(_ thread: AgentThread, forUserSend: Bool = false) throws -> AgentThread {
+        guard thread.executionTarget == .vm else { return thread }
+        if let runtime = try guestPlacement(of: thread.id)?.guestRuntime,
+           !runtime.isEmpty, runtime != BotGuestRuntime.distillV1 { return thread }
+        let store = BotStore(db: db)
+        if let pin = try store.conversationContextPin(linkedTo: thread.id) {
+            guard forUserSend,
+                  try store.authorizes(hostID: pin.hostID, botID: pin.botID, context: pin.context,
+                                       action: .send, policyRevision: pin.policyRevision) else { return thread }
+        }
+        guard let botID = try thread.actor.botID ?? store.conversationLinked(to: thread.id)?.botID,
+              let bot = try store.get(id: botID), bot.deletedAt == nil,
+              let revisionID = bot.currentRevisionID,
+              let revision = try store.getRevision(id: revisionID),
+              BotExecutionDefault.target(for: revision) == .mac else { return thread }
+        guard try setActor(
+            id: thread.id, actor: thread.actor, lockedAt: thread.actorLockedAt, executionTarget: .mac
+        ) else { throw BotStoreError.notFound }
+        var updated = thread
+        updated.executionTarget = .mac
+        return updated
+    }
+
     /// Guest runtime marker only (`BotGuestRuntime`); nil clears it. Neither
     /// `upsert` nor `setActor` writes this column. Missing rows return false.
     @discardableResult
