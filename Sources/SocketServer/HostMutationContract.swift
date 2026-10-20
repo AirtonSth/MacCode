@@ -418,6 +418,10 @@ public enum HostMutationContract {
                 return []
             case "bot.settings.set":
                 return [.string("key")]
+            case "bot.vm.save":
+                return [.string("name", nonempty: true)]
+            case "bot.execution.set":
+                return [.uuid("bot_id"), .string("execution_destination", nonempty: true)]
             case "bot.reorder":
                 return [.uuidArray("ordered_bot_ids")]
             case "bot.queue.remove", "bot.queue.force_now":

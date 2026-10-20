@@ -225,6 +225,8 @@
     {"method": "bot.notice.read", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
     {"method": "bot.notice.clear", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated", "agent.messages.removed"], "readbackMethods": ["bot.list"]},
     {"method": "bot.desktop.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
+    {"method": "bot.vm.save", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.vm.list"]},
+    {"method": "bot.execution.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.get"]},
     {"method": "bot.avatar.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
     {"method": "bot.handle.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
     {"method": "bot.soul.set", "family": "bot-remote", "risk": "lowMutation", "eventKinds": ["bot.updated"], "readbackMethods": ["bot.list"]},
