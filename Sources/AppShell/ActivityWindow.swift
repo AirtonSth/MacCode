@@ -789,6 +789,48 @@ final class ActivityViewModel: ObservableObject {
     private static func timestamp(_ date: Date) -> String { fractionalDateFormatter.string(from: date) }
 }
 
+/// Message footer for a Bot conversation whose transcript has no open workspace.
+private struct ActivityBotComposer: View {
+    let target: ActivityBotTarget
+    @State private var text = ""
+    @State private var error: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let error {
+                Text(error).font(DS.Font.caption).foregroundColor(DS.Palette.danger)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, DS.Space.xl)
+            }
+            AgentChatComposerBar(
+                text: $text,
+                placeholder: "Message the Bot",
+                sendEnabled: !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                runActive: target.isRunActive(),
+                onSend: send,
+                onStop: stop,
+                composerIdentifier: "activity.composer.input",
+                sendIdentifier: "activity.composer.send",
+                showsAttach: false
+            )
+        }
+    }
+
+    private func send() {
+        do {
+            try target.send(text)
+            text = ""
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func stop() {
+        do { try target.stop() } catch { self.error = error.localizedDescription }
+    }
+}
+
 struct ActivityRootView: View {
     @StateObject private var model: ActivityViewModel
     @State private var narrowDetail = false
@@ -897,11 +939,7 @@ struct ActivityRootView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
             HStack(alignment: .center, spacing: DS.Space.md) {
-                VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                    Text("Activity").font(DS.Font.title.weight(.semibold)).foregroundColor(DS.Palette.text).lineLimit(1)
-                    Text(headerSummary).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
-                        .accessibilityIdentifier("activity.summary")
-                }
+                Text("Activity").font(DS.Font.title.weight(.semibold)).foregroundColor(DS.Palette.text).lineLimit(1)
                 Spacer(minLength: DS.Space.md)
                 // Fixed slot: the spinner must not move the header when it appears.
                 ZStack {
@@ -924,18 +962,6 @@ struct ActivityRootView: View {
                 }
             }
         }.padding(.horizontal, DS.Space.xl).padding(.top, DS.Space.xl).padding(.bottom, DS.Space.lg)
-    }
-
-    /// One line that says what is going on, so the counts mean something before a tab is opened.
-    private var headerSummary: String {
-        guard model.hasSuccessfulSnapshot else { return "Counts unavailable" }
-        let counts = model.page.counts
-        let parts = [
-            counts.running > 0 ? "\(counts.running.formatted()) running" : nil,
-            counts.needs_you > 0 ? "\(counts.needs_you.formatted()) \(counts.needs_you == 1 ? "needs" : "need") you" : nil,
-            counts.new_results > 0 ? "\(counts.new_results.formatted()) new \(counts.new_results == 1 ? "result" : "results")" : nil,
-        ].compactMap { $0 }
-        return parts.isEmpty ? "All quiet. Nothing running or waiting on you." : parts.joined(separator: " · ")
     }
 
     private var searchField: some View {
@@ -1171,6 +1197,9 @@ struct ActivityRootView: View {
                     layout: AgentAppViewLayout(showsThreadRail: false, showsHeader: false, showsPlanSidebar: false, showsComposer: conversation.host.showsComposer)
                 )
                 .id(conversation.threadID)
+                if !conversation.host.showsComposer, let target = conversation.host.botTarget {
+                    ActivityBotComposer(target: target)
+                }
             }
             .task(id: item.id) { model.detailPresented(item) }
             .accessibilityIdentifier("activity.conversation")

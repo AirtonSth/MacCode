@@ -206,6 +206,37 @@ final class BotRoutineSchedulerTests: XCTestCase {
         f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
     }
 
+    func test_workspaceBotScheduledRunIsPinnedToItsWorkspace_becauseItMustListInThatWorkspace() async throws {
+        // WHY: the workspace Conversations list shows only threads with a workspace and a
+        // context pin. A workspace-exclusive Bot's scheduled run must land there, not as an
+        // unpinned, workspace-less thread that no workspace can show.
+        let f = try makeFixture()
+        let cwd = NSTemporaryDirectory() + "rc-bot-routine-ws-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: cwd) }
+        let workspace = try f.router.createWorkspace(name: "Routine WS", cwd: cwd)
+        let bot = try f.vm.create(name: "Elephant", title: "Developer", workspaceID: workspace.id)
+        _ = try f.context.botStore.grantContext(
+            hostID: f.context.liveActivityHostIdentity.serverId, botID: bot.id,
+            context: .workspace(workspace.id), actions: [.read, .send], expectedRevision: nil
+        )
+        let (routine, slot) = try saveActiveRoutine(f, bot: bot, base: Date())
+
+        f.scheduler.tick(now: slot.addingTimeInterval(5))
+        await f.scheduler.settleForTesting()
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started, "the slot must reach the provider")
+        let conversation = try XCTUnwrap(try f.context.botStore.listConversations(botID: bot.id).first)
+        let pin = try XCTUnwrap(try f.context.botStore.conversationContextPin(conversationID: conversation.id))
+        XCTAssertEqual(pin.context, .workspace(workspace.id))
+        XCTAssertEqual(conversation.title, routine.name)
+        let thread = try XCTUnwrap(try f.context.threadRepo.get(id: try XCTUnwrap(conversation.linkedAgentThreadID)))
+        XCTAssertEqual(thread.workspaceId, workspace.id)
+        XCTAssertEqual(thread.actor, .bot(bot.id))
+        let request = try XCTUnwrap(f.runner.requests.first)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
     func test_pausedSchedulerOrDisabledTaskNeverRuns() async throws {
         // WHY: "Scheduler paused" and a Paused task are promises not to run.
         let f = try makeFixture()

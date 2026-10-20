@@ -536,7 +536,6 @@ public struct ActiveThreadsRootView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
-            ActivityActiveBotsStrip(botsVM: botsVM) { vm.openBotDesk($0) }
             ActivityRootView(router: vm.activityRouter, route: vm.pendingActivityRoute, consumeRoute: {
                 vm.pendingActivityRoute = nil
             }, openThread: { item in

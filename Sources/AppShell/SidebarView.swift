@@ -1174,6 +1174,21 @@ public final class SidebarViewModel: ObservableObject {
     public func startBotConversation(_ row: AuthorizedBotConversationRow) {
         finishedBotIDs.remove(row.botID)
         do {
+            // A busy Bot reopens its live run; a second click must not spawn a duplicate.
+            if let context, let router,
+               let running = try Self.runningConversation(
+                   try context.botStore.listConversations(botID: row.botID),
+                   live: context.coordinator.activeThreadIdsSnapshot(),
+                   pinContext: { try context.botStore.conversationContextPin(conversationID: $0)?.context },
+                   context: row.context) {
+                guard try router.openBotsDesk(botID: row.botID, conversationID: running.id) else {
+                    showOperationError("Could not open Bot conversation", detail: "This Bot context is no longer available.")
+                    return reloadAuthorizedBotConversationRows()
+                }
+                newBotConversationThreadID = nil
+                reloadAuthorizedBotConversationRows()
+                return
+            }
             guard let router, try router.openBotsDesk(botID: row.botID),
                   let botsViewModel = router.botsViewModel,
                   botsViewModel.createDeskThread(in: row.context) else {
@@ -1185,6 +1200,21 @@ public final class SidebarViewModel: ObservableObject {
         } catch {
             showOperationError("Could not start conversation", detail: error.localizedDescription)
         }
+    }
+
+    /// First visible, ungrouped conversation whose run is live and whose pin (if any) matches `context`.
+    nonisolated static func runningConversation(
+        _ conversations: [BotConversation],
+        live: Set<AgentThreadID>,
+        pinContext: (BotConversationID) throws -> BotContext?,
+        context: BotContext
+    ) rethrows -> BotConversation? {
+        for conversation in conversations where !conversation.hidden && conversation.groupID == nil {
+            guard let threadID = conversation.linkedAgentThreadID, live.contains(threadID) else { continue }
+            let pin = try pinContext(conversation.id)
+            if pin == nil || pin == context { return conversation }
+        }
+        return nil
     }
 
     /// First row of a workspace's Conversations: starts an Agent App thread there and opens it.

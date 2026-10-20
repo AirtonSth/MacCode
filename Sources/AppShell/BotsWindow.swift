@@ -5227,63 +5227,74 @@ public final class BotsViewModel: ObservableObject {
     @discardableResult
     public func createDeskThread(in context: BotContext) -> Bool {
         guard let bot = selectedBot else { return false }
-        if case .workspace(let id) = context, self.context.state.workspaces[id] == nil {
-            errorMessage = "This workspace no longer exists."
-            return false
-        }
-        let hostID = self.context.liveActivityHostIdentity.serverId
         do {
-            guard let binding = try botStore.getContextBinding(hostID: hostID, botID: bot.id, context: context),
-                  binding.state == .active,
-                  binding.actions.isSuperset(of: [.read, .send]) else {
-                errorMessage = "This Bot has no active read and send grant for this context."
-                return false
-            }
-            let route = deskRouting
-            guard route.provider == .distill,
-                  route.runAsUser.isCurrentAccount else {
-                errorMessage = "Contextual threads require the current Distill account."
-                return false
-            }
-            let model = Self.resolvedUnlinkedDeskModel(
-                route,
-                snapshot: selectedDeskSnapshot,
-                lastUsed: lastModelStore.model(for: route.provider)
+            let made = try makeContextualConversation(
+                bot: bot, context: context, route: deskRouting,
+                snapshot: selectedDeskSnapshot, title: "New thread"
             )
-            guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                errorMessage = "Select a Main model before creating a contextual thread."
-                return false
-            }
-            var routing = route
-            routing.provider = .distill
-            routing.model = model
-            let workspaceID: WorkspaceID? = if case .workspace(let id) = context { id } else { nil }
-            var thread = AgentThread(
-                workspaceId: workspaceID, title: "New thread", provider: .distill,
-                providerInstanceId: route.providerInstanceID, model: model,
-                permissionMode: route.permissionMode, reasoningEffort: route.reasoningEffort,
-                serviceTier: route.serviceTier,
-                modelSelection: AgentModelSelection(
-                    provider: .distill, modelId: model,
-                    reasoningEffort: route.reasoningEffort, serviceTier: route.serviceTier,
-                    distillMainEffortSelection: route.distillMainEffortSelection ?? .fixed(route.reasoningEffort),
-                    distillReasoningEffortSelection: route.distillReasoningEffortSelection ?? .automatic,
-                    distillUltracode: route.distillUltracode
-                ),
-                runAsUser: route.runAsUser
-            )
-            thread.reasoningModel = route.reasoningModel
-            thread.executionTarget = BotExecutionDefault.target(for: try currentRevision(for: bot))
-            let conversation = BotConversation(botID: bot.id, title: "New thread", linkedAgentThreadID: thread.id)
-            try botStore.createContextualConversation(
-                conversation, newThread: thread, hostID: hostID,
-                context: context, policyRevision: binding.policyRevision
-            )
-            return insertDeskConversation(conversation, botID: bot.id, routing: routing)
+            return insertDeskConversation(made.conversation, botID: bot.id, routing: made.routing)
         } catch {
             errorMessage = error.localizedDescription
             return false
         }
+    }
+
+    /// Creates the contextual thread and its conversation in the store. Throws the
+    /// user-facing reason when the context, grant, or route cannot host a thread.
+    private func makeContextualConversation(
+        bot: BotDefinition,
+        context: BotContext,
+        route: BotDeskRouting,
+        snapshot: AgentProviderSnapshot?,
+        title: String
+    ) throws -> (conversation: BotConversation, routing: BotDeskRouting) {
+        if case .workspace(let id) = context, self.context.state.workspaces[id] == nil {
+            throw BotStoreError.invalidInput("This workspace no longer exists.")
+        }
+        let hostID = self.context.liveActivityHostIdentity.serverId
+        guard let binding = try botStore.getContextBinding(hostID: hostID, botID: bot.id, context: context),
+              binding.state == .active,
+              binding.actions.isSuperset(of: [.read, .send]) else {
+            throw BotStoreError.invalidInput("This Bot has no active read and send grant for this context.")
+        }
+        guard route.provider == .distill,
+              route.runAsUser.isCurrentAccount else {
+            throw BotStoreError.invalidInput("Contextual threads require the current Distill account.")
+        }
+        let model = Self.resolvedUnlinkedDeskModel(
+            route,
+            snapshot: snapshot,
+            lastUsed: lastModelStore.model(for: route.provider)
+        )
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw BotStoreError.invalidInput("Select a Main model before creating a contextual thread.")
+        }
+        var routing = route
+        routing.provider = .distill
+        routing.model = model
+        let workspaceID: WorkspaceID? = if case .workspace(let id) = context { id } else { nil }
+        var thread = AgentThread(
+            workspaceId: workspaceID, title: title, provider: .distill,
+            providerInstanceId: route.providerInstanceID, model: model,
+            permissionMode: route.permissionMode, reasoningEffort: route.reasoningEffort,
+            serviceTier: route.serviceTier,
+            modelSelection: AgentModelSelection(
+                provider: .distill, modelId: model,
+                reasoningEffort: route.reasoningEffort, serviceTier: route.serviceTier,
+                distillMainEffortSelection: route.distillMainEffortSelection ?? .fixed(route.reasoningEffort),
+                distillReasoningEffortSelection: route.distillReasoningEffortSelection ?? .automatic,
+                distillUltracode: route.distillUltracode
+            ),
+            runAsUser: route.runAsUser
+        )
+        thread.reasoningModel = route.reasoningModel
+        thread.executionTarget = BotExecutionDefault.target(for: try currentRevision(for: bot))
+        let conversation = BotConversation(botID: bot.id, title: title, linkedAgentThreadID: thread.id)
+        try botStore.createContextualConversation(
+            conversation, newThread: thread, hostID: hostID,
+            context: context, policyRevision: binding.policyRevision
+        )
+        return (conversation, routing)
     }
 
     @discardableResult
@@ -7491,13 +7502,38 @@ public final class BotsViewModel: ObservableObject {
     /// Instruction on the task's route, kept as that conversation's desk
     /// route for follow-ups. The user's selection and panels stay as they are.
     func enqueueScheduledRoutine(_ routine: BotRoutine) throws -> JSONValue {
-        try enqueueHostMessage(
+        let route = routine.definition.scheduleSpec.map { Self.routineRouting($0, base: BotDeskRouting()) }
+        let pinned = try? contextualRoutineConversation(
+            botID: routine.definition.botID,
+            route: route ?? BotDeskRouting(),
+            title: routine.definition.name
+        )
+        return try enqueueHostMessage(
             botID: routine.definition.botID,
             text: routine.definition.prompt,
-            conversationID: nil,
-            routing: routine.definition.scheduleSpec.map { Self.routineRouting($0, base: BotDeskRouting()) },
+            conversationID: pinned?.conversation.id,
+            routing: pinned?.routing ?? route,
             adoptAsDeskRoute: true
         )
+    }
+
+    /// A workspace-exclusive Bot's scheduled run is pinned to its workspace so it
+    /// lists in that workspace's Conversations. Nil when the Bot has no workspace
+    /// or the grant or route cannot host a contextual thread; the run then stays unpinned.
+    private func contextualRoutineConversation(
+        botID: BotID,
+        route: BotDeskRouting,
+        title: String
+    ) throws -> (conversation: BotConversation, routing: BotDeskRouting)? {
+        guard let bot = try botStore.get(id: botID), bot.deletedAt == nil,
+              let workspaceID = bot.workspaceID else { return nil }
+        let snapshot = providers.first(where: { $0.id == route.providerInstanceID })
+            ?? providers.first(where: { $0.provider == route.provider })
+        let made = try makeContextualConversation(
+            bot: bot, context: .workspace(workspaceID), route: route, snapshot: snapshot, title: title
+        )
+        adoptFollowThroughConversation(made.conversation)
+        return made
     }
 
     /// Before a scheduled send, a Docker bot whose computer is stopped waits

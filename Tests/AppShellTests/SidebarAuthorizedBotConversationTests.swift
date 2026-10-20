@@ -14,6 +14,30 @@ final class SidebarAuthorizedBotConversationTests: XCTestCase {
         return (context, router, SidebarViewModel(context: context, router: router, operationErrorPresenter: operationErrorPresenter))
     }
 
+    /// Clicking a busy Bot must reopen its live run, not spawn a duplicate; another context's run is never reused.
+    func test_runningConversationReusesOnlyLiveSameContextRun() {
+        let bot = BotID()
+        let workspaceContext = BotContext.workspace(WorkspaceID())
+        let liveThread = AgentThreadID()
+        let foreignThread = AgentThreadID()
+        let idleThread = AgentThreadID()
+        let foreign = BotConversation(botID: bot, title: "Foreign", linkedAgentThreadID: foreignThread)
+        let idle = BotConversation(botID: bot, title: "Idle", linkedAgentThreadID: idleThread)
+        let running = BotConversation(botID: bot, title: "Running", linkedAgentThreadID: liveThread)
+        let pins: [BotConversationID: BotContext] = [foreign.id: .general, running.id: workspaceContext]
+        let live: Set<AgentThreadID> = [liveThread, foreignThread]
+
+        XCTAssertEqual(
+            SidebarViewModel.runningConversation([idle, running], live: live, pinContext: { pins[$0] }, context: workspaceContext)?.id,
+            running.id, "a live run pinned to the same context is reopened")
+        XCTAssertEqual(
+            SidebarViewModel.runningConversation([foreign, idle], live: live, pinContext: { pins[$0] }, context: workspaceContext),
+            nil, "a live run pinned to another context is never reused")
+        XCTAssertNil(
+            SidebarViewModel.runningConversation([idle], live: live, pinContext: { pins[$0] }, context: workspaceContext),
+            "with nothing running a new conversation is started")
+    }
+
     func test_projectionRequiresExplicitCurrentHostReadBindingAndGroupsExistingExactConversation() async throws {
         let (context, router, viewModel) = try make()
         let workspace = try router.createWorkspace(name: "Grouped workspace", cwd: NSTemporaryDirectory())

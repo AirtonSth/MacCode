@@ -9,15 +9,32 @@ final class ActivityConversation {
     let viewModel: AgentAppViewModel
     /// True when the pane shows the same composer a workspace tab would.
     let showsComposer: Bool
+    /// Set for a Bot conversation without an open workspace: replies go through the Bot runtime.
+    let botTarget: ActivityBotTarget?
     private let onClose: () -> Void
 
-    init(viewModel: AgentAppViewModel, showsComposer: Bool, onClose: @escaping () -> Void) {
+    init(viewModel: AgentAppViewModel, showsComposer: Bool, botTarget: ActivityBotTarget? = nil, onClose: @escaping () -> Void) {
         self.viewModel = viewModel
         self.showsComposer = showsComposer
+        self.botTarget = botTarget
         self.onClose = onClose
     }
 
     func close() { onClose() }
+}
+
+@MainActor
+struct ActivityBotTarget {
+    let botID: BotID
+    let conversationID: BotConversationID
+    let send: (String) throws -> Void
+    let stop: () throws -> Void
+    let isRunActive: () -> Bool
+}
+
+enum ActivityBotSendError: LocalizedError {
+    case runtimeUnavailable
+    var errorDescription: String? { "Bot runtime is unavailable." }
 }
 
 extension AppCommandRouter {
@@ -75,6 +92,22 @@ extension AppCommandRouter {
         viewModel.markThreadRead = { [weak self] id in
             try self?.markAgentThreadRead(thread: id)
         }
-        return ActivityConversation(viewModel: viewModel, showsComposer: false) { viewModel.dispose() }
+        var botTarget: ActivityBotTarget?
+        if let linked = (try? context.botStore.conversationsLinked(to: [threadID]))?[threadID] {
+            botTarget = ActivityBotTarget(
+                botID: linked.botID,
+                conversationID: linked.id,
+                send: { [weak self] text in
+                    guard let bots = self?.botsViewModel else { throw ActivityBotSendError.runtimeUnavailable }
+                    _ = try bots.enqueueHostMessage(botID: linked.botID, text: text, conversationID: linked.id)
+                },
+                stop: { [weak self] in
+                    guard let self else { return }
+                    try self.stopAgentRun(thread: threadID)
+                },
+                isRunActive: { [weak self] in self?.context?.coordinator.activeRunId(threadId: threadID) != nil }
+            )
+        }
+        return ActivityConversation(viewModel: viewModel, showsComposer: false, botTarget: botTarget) { viewModel.dispose() }
     }
 }
