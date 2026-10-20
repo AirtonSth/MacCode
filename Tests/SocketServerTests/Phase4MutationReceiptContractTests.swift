@@ -1237,6 +1237,18 @@ private final class Phase4LiveServer {
 
 @MainActor
 final class Phase4MutationReceiptContractTests: XCTestCase {
+    func test_sharedVMCreationDoesNotRequireABot() throws {
+        XCTAssertNoThrow(try HostMutationContract.preflight(method: "bot.vm.save", params: [
+            "name": .string("Team Linux"), "workspace_id": .null,
+        ]))
+        XCTAssertThrowsError(try HostMutationContract.preflight(method: "bot.vm.save", params: [
+            "name": .string(""),
+        ]))
+        XCTAssertNoThrow(try HostMutationContract.preflight(method: "bot.execution.set", params: [
+            "bot_id": .string(UUID().uuidString), "execution_destination": .string("own_vm"),
+        ]))
+    }
+
     private let commandInProgress = -32096
     private let commandOutcomeUnknown = -32095
     private let idempotencyOwnerMismatch = -32094
@@ -1264,8 +1276,9 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         // + explicit context grant/revoke and existing activity viewed/acknowledge,
         // + bot.reorder (persisted sidebar/home bot drag order),
         // + agent.thread.loop.stop and host.browser.screenshot,
-        // + scheduled_task.save/delete/enable/run (Schedule Tasks on iPhone).
-        XCTAssertEqual(canonical.count, 190)
+        // + scheduled_task.save/delete/enable/run (Schedule Tasks on iPhone),
+        // + bot.vm.save and bot.execution.set (shared virtual machines).
+        XCTAssertEqual(canonical.count, 192)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }

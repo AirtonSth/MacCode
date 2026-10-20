@@ -11,9 +11,11 @@ public struct BotContextRuntimeIdentity: Equatable, Sendable {
     public let context: BotContext
     public let policyRevision: Int64
     public let storageBotID: BotID
+    public let credentialBotID: BotID
+    public let virtualMachineID: UUID?
     public let schemaVersion: Int
 
-    public init(hostID: String, botID: BotID, context: BotContext, policyRevision: Int64) throws {
+    public init(hostID: String, botID: BotID, context: BotContext, policyRevision: Int64, virtualMachineID: UUID? = nil) throws {
         guard !hostID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               policyRevision > 0 else {
             throw BotContextRuntimeIdentityError.invalidBinding
@@ -32,10 +34,12 @@ public struct BotContextRuntimeIdentity: Equatable, Sendable {
         let opaqueID = digest.map { String(format: "%02x", $0) }.joined()
         let uuidText = opaqueID.prefix(32)
         let formattedUUID = "\(uuidText.prefix(8))-\(uuidText.dropFirst(8).prefix(4))-\(uuidText.dropFirst(12).prefix(4))-\(uuidText.dropFirst(16).prefix(4))-\(uuidText.dropFirst(20).prefix(12))"
-        self.storageBotID = BotID(UUID(uuidString: formattedUUID)!)
+        self.credentialBotID = BotID(UUID(uuidString: formattedUUID)!)
+        self.virtualMachineID = virtualMachineID
+        self.storageBotID = virtualMachineID.map(BotID.init) ?? credentialBotID
     }
 
-    public init(binding: BotContextBinding) throws {
+    public init(binding: BotContextBinding, virtualMachineID: UUID? = nil) throws {
         guard binding.state == .active, binding.actions.contains(.send) else {
             throw BotContextRuntimeIdentityError.invalidBinding
         }
@@ -43,7 +47,8 @@ public struct BotContextRuntimeIdentity: Equatable, Sendable {
             hostID: binding.hostID,
             botID: binding.botID,
             context: binding.context,
-            policyRevision: binding.policyRevision
+            policyRevision: binding.policyRevision,
+            virtualMachineID: virtualMachineID
         )
     }
 

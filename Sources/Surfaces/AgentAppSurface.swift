@@ -616,7 +616,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var botMacExecutionResolver: (@MainActor (AgentThreadID, Bool) async -> Void)?
     /// Returns a user-facing error when the bot VM cannot run; nil when ready. Wired by the host.
     /// The workspace is nil for a workspace-less (Bots Desk) thread: the VM only has to be up.
-    public var botVMPreflight: ((BotID, String?) async -> String?)?
+    public var botVMPreflight: ((BotID, String?, AgentThreadID?) async -> String?)?
     /// Starts (provisions) the bot VM; returns a user-facing error or nil. Wired by the host.
     public var botVMProvision: ((BotID) async -> String?)?
     /// Set when the VM preflight failed; drives the "VM unavailable" banner.
@@ -6323,9 +6323,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             statusMessage = "Workspace removed"
             return true
         }
-        guard executionTarget(for: botID) == .vm else { return false }
+        guard (thread?.executionTarget ?? executionTarget(for: botID)) == .vm else { return false }
         guard let preflight = botVMPreflight else { return false }
-        if let failure = await preflight(botID, workspace) {
+        if let failure = await preflight(botID, workspace, thread?.id) {
             statusMessage = "VM unavailable: \(failure)"
             vmUnavailableBotID = botID
             return true
@@ -9520,7 +9520,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     workspace: actorThread?.worktreePath ?? embedding?.executionCwd ?? cwd
                 )
                 if let holder = claimVM(botID, entry) {
-                    let notice = "The bot is busy in \(holder.title)"
+                    let notice = "The VM is busy in \(holder.title)"
                     botVMClaimRefusal = (botID, notice, tid)
                     if selectedThreadId == tid { statusMessage = notice }
                     return nil

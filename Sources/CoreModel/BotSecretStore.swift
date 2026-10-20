@@ -59,31 +59,31 @@ public struct BotContextSecretStore: BotSecretStore {
 
     public func list(botID: BotID) throws -> [BotSecretMetadata] {
         try authorize(botID)
-        let result = try store.list(botID: identity.storageBotID)
+        let result = try store.list(botID: identity.credentialBotID)
         try authorize(botID)
         return result
     }
 
     public func save(botID: BotID, name: String, value: String) throws {
         try authorize(botID)
-        try store.save(botID: identity.storageBotID, name: name, value: value)
+        try store.save(botID: identity.credentialBotID, name: name, value: value)
     }
 
     public func load(botID: BotID, name: String) throws -> String? {
         try authorize(botID)
-        let result = try store.load(botID: identity.storageBotID, name: name)
+        let result = try store.load(botID: identity.credentialBotID, name: name)
         try authorize(botID)
         return result
     }
 
     public func delete(botID: BotID, name: String) throws {
         try authorize(botID)
-        try store.delete(botID: identity.storageBotID, name: name)
+        try store.delete(botID: identity.credentialBotID, name: name)
     }
 
     public func deleteAll(botID: BotID) throws {
         try authorize(botID)
-        try store.deleteAll(botID: identity.storageBotID)
+        try store.deleteAll(botID: identity.credentialBotID)
     }
 
     private func authorize(_ botID: BotID) throws {

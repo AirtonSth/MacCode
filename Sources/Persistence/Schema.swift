@@ -77,7 +77,8 @@ public enum Schema {
     /// v100 stores every new-message run option on scheduled tasks (Ultracode,
     /// permission, plan mode, execution location and base branch).
     static let scheduledTaskRunOptionsSchemaVersion = 100
-    public static let currentVersion: Int = scheduledTaskRunOptionsSchemaVersion
+    static let virtualMachinesSchemaVersion = 101
+    public static let currentVersion: Int = virtualMachinesSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1967,6 +1968,18 @@ public enum Schema {
         ALTER TABLE scheduled_tasks ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'local';
         ALTER TABLE scheduled_tasks ADD COLUMN base_branch TEXT;
         """),
+        SchemaStep(virtualMachinesSchemaVersion, """
+        CREATE TABLE virtual_machines (
+            id TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+            name TEXT NOT NULL,
+            workspace_id TEXT COLLATE NOCASE,
+            created_at REAL NOT NULL
+        );
+        ALTER TABLE bots ADD COLUMN execution_destination TEXT;
+        ALTER TABLE agent_threads ADD COLUMN execution_destination TEXT;
+        UPDATE agent_threads SET execution_destination='own_vm'
+            WHERE execution_target='vm' AND guest_runtime='guest-v1';
+        """),
     ]
 
     /// Additive and idempotent. `key` reuses today's banner identifiers, so a
@@ -2168,7 +2181,7 @@ public enum Schema {
     private static let migrationAppliedAtFormatter = ISO8601DateFormatter()
 
     static func trustedRestoreSchema(version: Int) throws -> SQLiteDB {
-        guard [93, 96, hostRestoreQueueHoldsSchemaVersion, relayKeysSchemaVersion, botSortOrderSchemaVersion, currentVersion].contains(version) else {
+        guard [93, 96, hostRestoreQueueHoldsSchemaVersion, relayKeysSchemaVersion, botSortOrderSchemaVersion, scheduledTaskRunOptionsSchemaVersion, currentVersion].contains(version) else {
             throw SQLiteError.execute("unsupported restore schema version")
         }
         let db = try SQLiteDB(path: ":memory:")

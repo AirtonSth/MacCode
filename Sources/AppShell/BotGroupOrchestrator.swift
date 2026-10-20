@@ -485,7 +485,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
             if let vmPreflight {
                 failure = await vmPreflight(bot.id)
             } else {
-                failure = await router.botVMPreflight(bot.id, workspace: nil)
+                failure = await router.botVMPreflight(bot.id, workspace: nil, threadID: threadID)
             }
             if let failure { return fail(failure, runID: runID) }
         }

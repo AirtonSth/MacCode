@@ -129,6 +129,31 @@ extension AppCommandRouter {
     /// Same validation and preflight as the Mac editor's Save.
     public func saveScheduledTaskRemote(params: [String: JSONValue]) async throws -> JSONValue {
         guard let context else { throw JSONRPCError.internalError }
+        if params["bot_id"] != nil {
+            guard let json = params["schedule_spec_json"]?.stringValue,
+                  var spec = BotScheduleSpec.decodeJSON(json) else {
+                throw JSONRPCError(code: -32602, message: "Provide a valid Bot schedule.")
+            }
+            if let value = params["execution_destination"] {
+                if value == .null {
+                    spec.executionDestination = nil
+                } else {
+                    guard let raw = value.stringValue, let destination = BotExecutionDestination(storageValue: raw) else {
+                        throw JSONRPCError(code: -32602, message: "Choose a valid execution destination.")
+                    }
+                    spec.executionDestination = destination
+                }
+            }
+            var routine = params
+            routine["name"] = params["title"] ?? params["name"]
+            routine["routine_id"] = params["task_id"]
+            routine["schedule_spec_json"] = .string(spec.encodedJSON())
+            return try await dispatchPairedBotRemote(
+                method: params["task_id"] == nil ? "bot.routine.create" : "bot.routine.update", params: routine)
+        }
+        if let raw = params["execution_destination"]?.stringValue, raw != "mac" {
+            throw JSONRPCError(code: -32602, message: "Choose a Bot in Run as to schedule a VM run.")
+        }
         guard let rawWorkspace = params["workspace_id"]?.stringValue, let workspaceUUID = UUID(uuidString: rawWorkspace),
               let workspace = context.state.workspaces[WorkspaceID(workspaceUUID)] else {
             throw JSONRPCError(code: -32602, message: "Select a workspace.")

@@ -70,6 +70,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private let attentionBindings: BotAttentionPushBindingStore
     private let attentionNotificationMetadata: BotAttentionNotificationMetadataStore
 
+    public var onVMWorkspaceExists: ((WorkspaceID) -> Bool)?
     public var onHasLiveRun: ((BotID) -> Bool)?
     public var onStopRun: ((BotID, String?, String?, String?, Bool, String) -> Void)?
     public var onContextBindingChanged: ((BotContextBinding) -> Bool)?
@@ -284,6 +285,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             }
         }
         switch name {
+        case "vm.list":
+            let bot = params["bot_id"] == nil ? nil : try requireBot(params)
+            let machines = try store.listVirtualMachines().filter { bot.map($0.allows) ?? true }
+            return ["virtual_machines": machines.map(encodeVirtualMachine)]
         case "context.list":
             return try contextList(params: params)
         case "context.grant", "context.revoke":
@@ -1129,6 +1134,12 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             } else if let threadID = conversation.linkedAgentThreadID {
                 row["linked_agent_thread_id"] = threadID.value.uuidString.lowercased()
             }
+            if let threadID = conversation.linkedAgentThreadID {
+                let placement = try AgentThreadRepository(db: db).guestPlacement(of: threadID)
+                let destination = try placement?.executionTarget == .mac ? BotExecutionDestination.mac
+                    : (store.threadExecutionDestination(threadID) ?? store.executionDestination(botID: bot.id))
+                row["execution_destination"] = destination.storageValue
+            }
             if let routing = onConversationRouting?(conversation) {
                 row["desk_routing"] = routing
             }
@@ -1177,7 +1188,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let botID = id(bot)
         let hostID = try requireGuestHost(params)
         var state: [String: Any]
-        if let existing = guest[botID] {
+        let destination = try store.executionDestination(botID: bot.id).storageValue
+        if let existing = guest[botID], existing["execution_destination"] as? String == destination {
             guard existing["host_id"] as? String == hostID else { throw Error.guestConflict }
             state = existing
         } else {
@@ -1299,6 +1311,32 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func perform(name: String, params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         switch name {
+        case "vm.save":
+            try requireControlPlane()
+            let workspaceID = try virtualMachineWorkspace(params)
+            let machineID: UUID?
+            if let raw = string(params, "vm_id") {
+                guard let id = UUID(uuidString: raw) else { throw Error.invalidParams }
+                machineID = id
+            } else { machineID = nil }
+            guard let name = string(params, "name") else { throw Error.invalidParams }
+            do {
+                let machine = try store.saveVirtualMachine(id: machineID, name: name, workspaceID: workspaceID)
+                return receipt(requestID: requestID, status: .completed, botID: nil, readback: encodeVirtualMachine(machine))
+            } catch let error as BotStoreError { throw Error(code: -32602, message: error.description) }
+        case "execution.set":
+            let bot = try requireBot(params)
+            guard let value = string(params, "execution_destination"),
+                  let destination = BotExecutionDestination(storageValue: value) else { throw Error.invalidParams }
+            if let id = destination.virtualMachineID, let workspace = try store.virtualMachine(id: id)?.workspaceID,
+               onVMWorkspaceExists?(workspace) != true {
+                throw Error(code: -32602, message: "This VM's workspace is no longer available.")
+            }
+            do {
+                _ = try store.setExecutionDestination(destination, botID: bot.id)
+                return receipt(requestID: requestID, status: .completed, botID: id(bot),
+                    readback: try encodeBot(store.get(id: bot.id) ?? bot))
+            } catch let error as BotStoreError { throw Error(code: -32602, message: error.description) }
         case "context.grant", "context.revoke":
             let (hostID, botID, context) = try contextTarget(params)
             guard let revision = integer(params["policy_revision"]) else { throw Error.invalidParams }
@@ -1435,6 +1473,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             description: string(params, "description") ?? "",
             handle: string(params, "handle"),
             soul: string(params, "soul") ?? "",
+            workspaceID: try virtualMachineWorkspace(params),
             now: now
         )
         unpublished.insert(id(bot))
@@ -2390,7 +2429,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               expectedCAS == currentCAS else { throw Error.crossTarget }
         let path = entry["path"] as? String ?? ""
         let rootURL = root == "docker_home"
-            ? BotGuestHome.url(appSupport: appSupport, botID: bot.id)
+            ? BotGuestHome.url(appSupport: appSupport, botID: try store.guestResourceID(botID: bot.id))
             : botHome(bot).root
         let url = try secureContainedURL(root: rootURL, path: path)
         guard FileManager.default.isReadableFile(atPath: url.path),
@@ -2711,7 +2750,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                 expectedCAS: expectedCAS
             )
         }
-        if root == "docker_home" { _ = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id) }
+        if root == "docker_home" { _ = try BotGuestHome.ensure(appSupport: appSupport, botID: try store.guestResourceID(botID: bot.id)) }
         if root != previousRoot {
             fileGenerations[fileGenerationKey(botID: botID, root: previousRoot)] = currentGeneration + 1
             _ = rotateFileCAS(botID: botID, root: previousRoot)
@@ -2930,9 +2969,10 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let bot = try requireBot(params)
         let botID = id(bot)
         let hostID = try requireGuestHost(params)
-        _ = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id)
+        _ = try BotGuestHome.ensure(appSupport: appSupport, botID: try store.guestResourceID(botID: bot.id))
         var state = guest[botID] ?? makeStoppedGuestState(botID: botID, hostID: hostID)
-        guard state["host_id"] as? String == hostID,
+        guard state["execution_destination"] as? String == (try store.executionDestination(botID: bot.id).storageValue),
+              state["host_id"] as? String == hostID,
               let taskID = string(params, "task_id"),
               let task = guestTask(id: taskID, state: state),
               task["operation"] as? String == "bot.\(name)" else {
@@ -3213,6 +3253,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         [
             "host_id": hostID,
             "bot_id": botID,
+            "execution_destination": (try? store.executionDestination(botID: BotID(UUID(uuidString: botID)!)).storageValue) ?? "own_vm",
             "status": "stopped",
             "viewer": "/vnc.html",
             "viewer_path": "/vnc.html",
@@ -3230,7 +3271,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "id": recipeID,
             "immutable": true,
             "image_reference": BotComputerGuestSpec.imageTag,
-            "container_id": BotComputerGuestSpec.containerName(botID: BotID(UUID(uuidString: botID)!)),
+            "container_id": BotComputerGuestSpec.containerName(botID: (try? store.guestResourceID(botID: BotID(UUID(uuidString: botID)!))) ?? BotID(UUID(uuidString: botID)!)),
             "viewer_path": "/vnc.html",
         ]
         func task(
@@ -3294,7 +3335,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         return [
             "host_id": hostID,
             "bot_id": botID,
-            "container_id": BotComputerGuestSpec.containerName(botID: BotID(UUID(uuidString: botID)!)),
+            "container_id": BotComputerGuestSpec.containerName(botID: (try? store.guestResourceID(botID: BotID(UUID(uuidString: botID)!))) ?? BotID(UUID(uuidString: botID)!)),
             "app_run_id": UUID().uuidString.lowercased(),
             "viewer_id": UUID().uuidString.lowercased(),
             "viewer_path": "/vnc.html",
@@ -3423,6 +3464,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return receipt(requestID: requestID, status: .accepted, botID: string(params, "bot_id"), readback: ["confirm_required": true])
         }
         let bot = try requireBot(params)
+        guard try store.executionDestination(botID: bot.id).virtualMachineID == nil else {
+            throw Error(code: -32602, message: "Shared VM files cannot be cleared from one bot.")
+        }
         let botID = id(bot)
         let removedPaths: [String]
         do {
@@ -3596,7 +3640,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             permissionMode: current.permissionMode,
             desktopKind: kind
         )
-        let published = try store.publish(botID: bot.id, expectedCurrentRevisionID: revisionID, draft: draft)
+        let published = try store.publish(botID: bot.id, expectedCurrentRevisionID: revisionID, draft: draft,
+            beforeCommit: { _ in try self.store.writeExecutionDestination(kind == .dockerDesktop ? .ownVM : .mac, botID: bot.id) })
         return receipt(
             requestID: requestID,
             status: .completed,
@@ -3880,6 +3925,21 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         bot.id.value.uuidString.lowercased()
     }
 
+    private func virtualMachineWorkspace(_ params: [String: Any]) throws -> WorkspaceID? {
+        guard params["workspace_id"] != nil, !(params["workspace_id"] is NSNull) else { return nil }
+        guard let raw = string(params, "workspace_id"), let uuid = UUID(uuidString: raw),
+              onVMWorkspaceExists?(WorkspaceID(uuid)) == true else {
+            throw Error(code: -32602, message: "Choose an available workspace.")
+        }
+        return WorkspaceID(uuid)
+    }
+
+    private func encodeVirtualMachine(_ machine: BotVirtualMachine) -> [String: Any] {
+        ["id": machine.id.uuidString.lowercased(), "name": machine.name,
+         "workspace_id": machine.workspaceID.map { $0.value.uuidString.lowercased() as Any } ?? NSNull(),
+         "scope": machine.workspaceID == nil ? "general" : "workspace"]
+    }
+
     private func encodeBot(_ bot: BotDefinition, extra: [String: Any] = [:]) throws -> [String: Any] {
         guard let revisionID = bot.currentRevisionID,
               let revision = try store.getRevision(id: revisionID),
@@ -3901,7 +3961,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "soul": revision.soul,
             "desktop_kind": revision.desktopKind.advertisedOrLogical.rawValue,
             "current_revision_id": revision.id.value.uuidString.lowercased(),
-            "workspace_id": NSNull(),
+            "workspace_id": bot.workspaceID.map { $0.value.uuidString.lowercased() as Any } ?? NSNull(),
+            "execution_destination": try store.executionDestination(botID: bot.id).storageValue,
             "sort_order": bot.sortOrder.map { $0 as Any } ?? NSNull(),
         ]
         if let routing = routingPref[id(bot)] {
@@ -4225,14 +4286,18 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func diskFileExists(bot: BotDefinition, root: String, path: String) throws -> Bool {
         if root == "docker_home" {
-            let url = try secureContainedURL(root: BotGuestHome.url(appSupport: appSupport, botID: bot.id), path: path)
+            let url = try secureContainedURL(root: BotGuestHome.url(appSupport: appSupport, botID: try store.guestResourceID(botID: bot.id)), path: path)
             return FileManager.default.fileExists(atPath: url.path)
         }
         return FileManager.default.fileExists(atPath: try secureContainedURL(root: botHome(bot).root, path: path).path)
     }
 
     private func fileGenerationKey(botID: String, root: String) -> String {
-        "\(botID)|\(root)"
+        if root == "docker_home", let uuid = UUID(uuidString: botID),
+           let resource = try? store.guestResourceID(botID: BotID(uuid)) {
+            return "\(resource.value.uuidString.lowercased())|\(root)"
+        }
+        return "\(botID)|\(root)"
     }
 
     private func fileGeneration(botID: String, root: String) -> Int {
@@ -4363,7 +4428,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     ) throws {
         let rootURL: URL
         if root == "docker_home" {
-            rootURL = try BotGuestHome.ensure(appSupport: appSupport, botID: bot.id)
+            rootURL = try BotGuestHome.ensure(appSupport: appSupport, botID: try store.guestResourceID(botID: bot.id))
         } else {
             let home = botHome(bot)
             try home.ensure(
@@ -4391,7 +4456,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func listDiskPaths(bot: BotDefinition, root: String) throws -> [String] {
         if root == "docker_home" {
-            return try enumerateRegularFiles(root: BotGuestHome.url(appSupport: appSupport, botID: bot.id))
+            return try enumerateRegularFiles(root: BotGuestHome.url(appSupport: appSupport, botID: try store.guestResourceID(botID: bot.id)))
         }
         return try enumerateRegularFiles(root: botHome(bot).root)
     }

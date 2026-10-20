@@ -25,12 +25,17 @@ public final class BotVMRunRegistry: @unchecked Sendable {
     /// free the VM under the run that did start.
     private var claims: [BotID: [Entry]] = [:]
 
-    private var waiting: [BotID: [AgentThreadID]] = [:]
+    private struct Waiter {
+        let botID: BotID
+        let threadID: AgentThreadID
+    }
+    private var waiting: [BotID: [Waiter]] = [:]
     public init() {}
 
     /// Claims the bot for `entry.threadID`; returns the other thread's entry when it holds the bot.
-    public func tryBegin(botID: BotID, entry: Entry) -> Entry? {
-        lock.withLock {
+    public func tryBegin(botID: BotID, entry: Entry, resourceID: BotID? = nil) -> Entry? {
+        let botID = resourceID ?? botID
+        return lock.withLock {
             guard let held = claims[botID], let holder = held.first else {
                 claims[botID] = [entry]
                 return nil
@@ -44,32 +49,37 @@ public final class BotVMRunRegistry: @unchecked Sendable {
             return nil
         }
     }
-    public func addWaiting(botID: BotID, threadID: AgentThreadID) {
+    public func addWaiting(botID: BotID, threadID: AgentThreadID, resourceID: BotID? = nil) {
         lock.withLock {
-            if waiting[botID]?.contains(threadID) != true { waiting[botID, default: []].append(threadID) }
+            let key = resourceID ?? botID
+            if waiting[key]?.contains(where: { $0.threadID == threadID }) != true {
+                waiting[key, default: []].append(Waiter(botID: botID, threadID: threadID))
+            }
         }
     }
-    public func waitingThreads(botID: BotID) -> [AgentThreadID] {
-        lock.withLock { waiting[botID] ?? [] }
+    public func waitingThreads(botID: BotID, resourceID: BotID? = nil) -> [AgentThreadID] {
+        lock.withLock { waiting[resourceID ?? botID]?.map(\.threadID) ?? [] }
     }
     /// The bot `threadID` waits for and the other thread's run holding it; nil
     /// when the thread is not waiting or the bot is free.
     public func waitingHolder(threadID: AgentThreadID) -> (botID: BotID, holder: Entry)? {
         lock.withLock {
-            for (botID, queue) in waiting where queue.contains(threadID) {
-                if let holder = claims[botID]?.first, holder.threadID != threadID { return (botID, holder) }
+            for (key, queue) in waiting {
+                if let waiter = queue.first(where: { $0.threadID == threadID }),
+                   let holder = claims[key]?.first, holder.threadID != threadID { return (waiter.botID, holder) }
             }
             return nil
         }
     }
     /// Pops the first thread queued for a free bot (nil while a run holds it):
     /// a hand-off whose thread did not take the VM passes it on.
-    public func popWaitingIfFree(botID: BotID) -> AgentThreadID? {
-        lock.withLock {
+    public func popWaitingIfFree(botID: BotID, resourceID: BotID? = nil) -> AgentThreadID? {
+        let botID = resourceID ?? botID
+        return lock.withLock {
             guard claims[botID] == nil, var queue = waiting[botID], !queue.isEmpty else { return nil }
             let next = queue.removeFirst()
             waiting[botID] = queue.isEmpty ? nil : queue
-            return next
+            return next.threadID
         }
     }
     /// Frees the bot held by `runID` and pops the first thread queued for it.
@@ -86,7 +96,7 @@ public final class BotVMRunRegistry: @unchecked Sendable {
             guard var queue = waiting[botID], !queue.isEmpty else { return nil }
             let next = queue.removeFirst()
             waiting[botID] = queue.isEmpty ? nil : queue
-            return (botID, next)
+            return (next.botID, next.threadID)
         }
     }
 
@@ -113,12 +123,12 @@ public final class BotVMRunRegistry: @unchecked Sendable {
         }
     }
 
-    public func active(botID: BotID) -> Entry? {
-        lock.withLock { claims[botID]?.first }
+    public func active(botID: BotID, resourceID: BotID? = nil) -> Entry? {
+        lock.withLock { claims[resourceID ?? botID]?.first }
     }
 
-    public func busyMessage(botID: BotID, threadID: AgentThreadID) -> String? {
-        guard let entry = active(botID: botID), entry.threadID != threadID else { return nil }
-        return "The bot is busy in \(entry.title)"
+    public func busyMessage(botID: BotID, threadID: AgentThreadID, resourceID: BotID? = nil) -> String? {
+        guard let entry = active(botID: botID, resourceID: resourceID), entry.threadID != threadID else { return nil }
+        return "The VM is busy in \(entry.title)"
     }
 }

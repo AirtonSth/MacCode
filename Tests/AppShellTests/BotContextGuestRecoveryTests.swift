@@ -60,6 +60,18 @@ final class BotContextGuestRecoveryTests: XCTestCase {
         XCTAssertNoThrow(try BotContextGuestRecovery.begin(identity: f.identity, runID: AgentRunID(), appSupport: f.support))
     }
 
+    func testCompletedSharedRunDoesNotStopAReusedVMOnRecovery() throws {
+        let f = try Fixture()
+        defer { try? FileManager.default.removeItem(at: f.support) }
+        let identity = try BotContextRuntimeIdentity(hostID: "host", botID: BotID(),
+            context: .general, policyRevision: 1, virtualMachineID: UUID())
+        try BotContextGuestRecovery.begin(identity: identity, runID: f.runID, appSupport: f.support)
+        try BotContextGuestRecovery.end(identity: identity, runID: f.runID, appSupport: f.support)
+        let report = BotContextGuestRecovery.reconcile(docker: nil, appSupport: f.support)
+        XCTAssertTrue(report.failures.isEmpty)
+        XCTAssertEqual(report.reconciled, [identity.storageBotID.value.uuidString.lowercased()])
+    }
+
     func testReconcileWithoutDockerRetainsPendingRecordAndMatchingEnvironment() throws {
         let f = try Fixture()
         defer { try? FileManager.default.removeItem(at: f.support) }

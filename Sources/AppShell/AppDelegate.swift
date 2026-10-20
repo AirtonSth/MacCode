@@ -99,7 +99,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     public private(set) var bonjourPublicationState: BonjourPublicationState = .stopped
     private var directAccessSupervisor: DirectAccessLifecycleSupervisor?
     private var relayHostClient: RelayHostClient?
-    private let relayHostKeyStore: RelayHostKeyStoring = KeychainRelayHostKeyStore()
+    private let relayHostKeyStore: RelayHostKeyStoring =
+        LocalAuthAdapter.isE2EPairingAutoApproveEnabled
+        ? InMemoryRelayHostKeyStore()
+        : KeychainRelayHostKeyStore()
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
     public private(set) var petController: PetController?

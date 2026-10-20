@@ -54,9 +54,11 @@ public struct BotDeskRouting: Equatable, Codable {
     public var distillReasoningEffortSelection: AgentEffortSelection?
     public var distillUltracode: Bool
     public var serviceTier: AgentServiceTier
+    public var executionDestination: BotExecutionDestination?
     public var runAsUser: AgentRunAsUser
 
     private enum CodingKeys: String, CodingKey {
+        case executionDestination
         case provider, providerInstanceID, model, routingMode, permissionMode, reasoningEffort, reasoningModel
         case distillMainEffortSelection, distillReasoningEffortSelection, distillUltracode, serviceTier, runAsUser
     }
@@ -106,6 +108,7 @@ public struct BotDeskRouting: Equatable, Codable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        executionDestination = try container.decodeIfPresent(BotExecutionDestination.self, forKey: .executionDestination)
         provider = try container.decode(AgentProvider.self, forKey: .provider)
         providerInstanceID = try container.decode(String.self, forKey: .providerInstanceID)
         model = try container.decode(String.self, forKey: .model)
@@ -277,6 +280,7 @@ public struct BotStudioDraft: Equatable, Codable {
     public var avatarSymbol: String
     public var soul: String
     public var notificationsEnabled: Bool
+    public var executionDestination: BotExecutionDestination?
     public var desktopKind: BotDesktopKind
     public var expectedRevisionID: BotRevisionID?
     /// nil means infer from handle vs name (legacy drafts).
@@ -3667,6 +3671,20 @@ public final class BotsViewModel: ObservableObject {
         displayedDesktopKind.statusPill
     }
 
+    var executionDestinationStore: BotStore { botStore }
+    var executionWorkspaces: [Workspace] { context.state.workspaces.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending } }
+    var studioExecutionDestination: BotExecutionDestination {
+        get { studioDraft.executionDestination ?? (studioDraft.desktopKind == .dockerDesktop ? .ownVM : .mac) }
+        set {
+            studioDraft.executionDestination = newValue
+            studioDraft.desktopKind = newValue.target == .vm ? .dockerDesktop : .logicalExecutionSpace
+        }
+    }
+    var studioDestinationIsSaved: Bool {
+        guard let id = studioDraft.botID else { return false }
+        return (try? botStore.executionDestination(botID: id)) == studioExecutionDestination
+    }
+
     private let context: AppContext
     private let router: AppCommandRouter?
     private let botStore: BotStore
@@ -4809,6 +4827,7 @@ public final class BotsViewModel: ObservableObject {
             verbosity: bot.verbosity,
             cavemanEnabled: bot.cavemanEnabled
         )
+        studioDraft.executionDestination = try? botStore.executionDestination(botID: bot.id)
         applyPersistedStudioDraftIfMatching(bot.id)
         isApplyingStudioDraft = false
         adoptSelectedBot(bot.id)
@@ -5756,7 +5775,7 @@ public final class BotsViewModel: ObservableObject {
             throw BotPublishError.handleEmpty
         }
         let publishedDesktop = selectedRevision?.desktopKind
-        if studioDraft.desktopKind == .dockerDesktop,
+        if studioDraft.executionDestination == nil, studioDraft.desktopKind == .dockerDesktop,
            publishedDesktop != .dockerDesktop,
            !BotDesktopKind.dockerDesktop.isSelectable(
             flags: settingsStore.load().botControlPlaneFlags,
@@ -5765,7 +5784,10 @@ public final class BotsViewModel: ObservableObject {
             errorMessage = "Docker desktop is not ready."
             throw BotComputerGuestError.notReady
         }
-        let desktop = resolvedDesktopKind(studioDraft.desktopKind)
+        let destination = studioDraft.executionDestination
+            ?? (studioDraft.desktopKind == .dockerDesktop ? .ownVM : .mac)
+        let desktop: BotDesktopKind = destination.target == .vm ? .dockerDesktop
+            : (studioDraft.desktopKind == .botOwnedBrowser ? .botOwnedBrowser : .logicalExecutionSpace)
         let startsDockerGuest = desktop == .dockerDesktop
             && publishedDesktop != .dockerDesktop
         let soul = BotStandingInstructions.resolved(
@@ -5803,7 +5825,8 @@ public final class BotsViewModel: ObservableObject {
                 expectedCurrentRevisionID: studioDraft.expectedRevisionID ?? renamed.currentRevisionID,
                 draft: draft,
                 avatarSymbol: studioDraft.avatarSymbol,
-                notificationsEnabled: studioDraft.notificationsEnabled
+                notificationsEnabled: studioDraft.notificationsEnabled,
+                beforeCommit: { _ in try self.botStore.writeExecutionDestination(destination, botID: botID) }
             )
             studioDraft.expectedRevisionID = published.id
             studioDraft.desktopKind = desktop
@@ -5842,6 +5865,7 @@ public final class BotsViewModel: ObservableObject {
             notificationsEnabled: studioDraft.notificationsEnabled,
             desktopKind: desktop
         )
+        try botStore.writeExecutionDestination(destination, botID: created.id)
         if desktop == .dockerDesktop {
             presentGuestDesktop(botID: created.id)
         }
@@ -6451,7 +6475,7 @@ public final class BotsViewModel: ObservableObject {
             throw BotStoreError.invalidInput("Restored queued outcome requires reconciliation before another send.")
         }
         if try HostDatabaseRestore.requiresQueueReview(kind: .bot, id: id, db: context.db) {
-            try admitDesktopSend(bot: bot)
+            try admitDesktopSend(bot: bot, threadID: threadID)
             try HostDatabaseRestore.approveQueue(kind: .bot, id: id, db: context.db)
         }
         if try liveThreadIDs(for: botID).contains(threadID) {
@@ -6567,7 +6591,7 @@ public final class BotsViewModel: ObservableObject {
             return false
         }
         do {
-            try admitDesktopSend(bot: bot)
+            try admitDesktopSend(bot: bot, threadID: selectedConversation?.linkedAgentThreadID)
         } catch {
             switch guestLaunchState(for: bot.id) {
             case .starting:
@@ -6673,7 +6697,12 @@ public final class BotsViewModel: ObservableObject {
             try requireContextualSendAuthority(existing)
             return existing
         }
-        try admitDesktopSend(bot: bot)
+        if let destination = explicitRouting?.executionDestination {
+            guard conversationID == nil else { throw BotStoreError.invalidInput("Choose a destination when starting a new conversation.") }
+            try botStore.validateExecutionDestination(destination, botID: bot.id)
+        } else {
+            try admitDesktopSend(bot: bot, threadID: existingConversation?.linkedAgentThreadID)
+        }
 
         if let existing = existingConversation {
             if existing.id == titioInboxConversationID {
@@ -7026,11 +7055,9 @@ public final class BotsViewModel: ObservableObject {
             root = home.root
         case .dockerHome:
             do {
-                try computerGuestService?.prepareHome(botID: bot.id)
-                root = try BotGuestHome.ensure(
-                    appSupport: context.appSupportDirectory,
-                    botID: bot.id
-                )
+                let resourceID = try botStore.guestResourceID(botID: bot.id)
+                try computerGuestService?.prepareHome(botID: resourceID)
+                root = try BotGuestHome.ensure(appSupport: context.appSupportDirectory, botID: resourceID)
             } catch {
                 errorMessage = String(describing: error)
                 return
@@ -7085,6 +7112,10 @@ public final class BotsViewModel: ObservableObject {
     }
 
     public func confirmClearDockerData(for bot: BotDefinition) {
+        guard (try? botStore.executionDestination(botID: bot.id))?.virtualMachineID == nil else {
+            errorMessage = "Shared VM files belong to every bot using it and cannot be cleared from one bot."
+            return
+        }
         guard supportsDockerHomeFiles(for: bot),
               resolvedStudioFilesLocation(for: bot) == .dockerHome else { return }
         homeFilesModel?.close()
@@ -7286,6 +7317,7 @@ public final class BotsViewModel: ObservableObject {
             || studioDraft.description != revision.description
             || studioDraft.soul != revision.soul
             || resolvedDesktopKind(studioDraft.desktopKind) != resolvedDesktopKind(revision.desktopKind)
+            || (studioDraft.executionDestination != nil && !studioDestinationIsSaved)
             || studioDraft.notificationsEnabled != (bot?.notificationsEnabled ?? true)
             || studioDraftReplyStyle.verbosity != (bot?.verbosity ?? .human)
             || studioDraftReplyStyle.caveman
@@ -7483,6 +7515,7 @@ public final class BotsViewModel: ObservableObject {
     /// run and the scheduled fire build the same route.
     static func routineRouting(_ spec: BotScheduleSpec, base: BotDeskRouting) -> BotDeskRouting {
         var routing = base
+        routing.executionDestination = spec.executionDestination
         routing.provider = spec.provider
         routing.providerInstanceID = spec.providerInstanceID
         routing.model = spec.model
@@ -8594,6 +8627,11 @@ public final class BotsViewModel: ObservableObject {
         deskRouting.distillUltracode = enabled
     }
     public var selectedBotExecutionTarget: ExecutionTarget {
+        if let conversation = selectedConversation, conversation.botID == selectedBotID,
+           let threadID = conversation.linkedAgentThreadID,
+           let target = try? context.threadRepo.get(id: threadID)?.executionTarget {
+            return target
+        }
         guard let bot = selectedBotID.flatMap({ id in bots.first(where: { $0.id == id }) }),
               let revision = try? currentRevision(for: bot) else { return .mac }
         return BotExecutionDefault.target(for: revision)
@@ -10844,13 +10882,9 @@ public final class BotsViewModel: ObservableObject {
         // the banner); "Start VM" starts the desktop through the desk's own
         // launch, so the desktop pane and the send admission see that VM.
         router.configureBotVMHooks(on: vm)
-        vm.botVMPreflight = { [weak self, weak router] botID, workspace in
-            if let workspace {
-                guard let router else { return "Bot unavailable." }
-                return await router.botVMPreflight(botID, workspace: workspace)
-            }
-            guard let self else { return "Bot unavailable." }
-            return await self.deskGuestDesktopPreflight(botID)
+        vm.botVMPreflight = { [weak router] botID, workspace, threadID in
+            guard let router else { return "Bot unavailable." }
+            return await router.botVMPreflight(botID, workspace: workspace, threadID: threadID)
         }
         vm.botVMProvision = { [weak self] botID in
             guard let self else { return "Bot unavailable." }
@@ -11132,7 +11166,7 @@ public final class BotsViewModel: ObservableObject {
             throw BotDeskSendRefused(reason: message)
         }
         do {
-            try admitDesktopSend(bot: bot)
+            try admitDesktopSend(bot: bot, threadID: pinnedConversation.linkedAgentThreadID)
         } catch {
             switch guestLaunchState(for: bot.id) {
             case .starting:
@@ -11596,9 +11630,13 @@ public final class BotsViewModel: ObservableObject {
         bot: BotDefinition,
         routing: BotDeskRouting
     ) throws {
-        guard routing.provider == .distill,
-              routing.runAsUser.uid == getuid(),
-              BotExecutionDefault.target(for: try currentRevision(for: bot)) == .vm else { return }
+        let destination = try routing.executionDestination ?? botStore.executionDestination(botID: bot.id)
+        try botStore.validateExecutionDestination(destination, botID: bot.id)
+        try botStore.pinExecutionDestination(threadID: thread.id, botID: bot.id, destination: destination)
+        guard destination.target == .vm else { return }
+        guard routing.provider == .distill, routing.runAsUser.uid == getuid() else {
+            throw BotStoreError.invalidInput("VM conversations use Distill with your current Mac account.")
+        }
         let lockedAt = Date()
         // Marker first: on its own (no `.vm` target yet) it routes nothing.
         try context.threadRepo.setGuestRuntime(id: thread.id, BotGuestRuntime.distillV1)
@@ -12139,7 +12177,7 @@ public final class BotsViewModel: ObservableObject {
             guard queuedFollowUpMayDrain(next, botID: bot.id),
                   let record = try botStore.listQueuedFollowUps(botID: bot.id).first(where: { $0.id.lowercased() == next.id.uuidString.lowercased() }),
                   decodeQueuedFollowUp(record) == next else { return }
-            try admitDesktopSend(bot: bot)
+            try admitDesktopSend(bot: bot, threadID: conversation.linkedAgentThreadID)
             let display = AgentChatTranscriptChrome.displayUserLine(
                 text: next.text,
                 attachments: next.attachments
@@ -12299,61 +12337,73 @@ public final class BotsViewModel: ObservableObject {
     @Published private var guestRebuildingByBot: [UUID: Bool] = [:]
     @Published private(set) var guestLaunchStateByBot: [UUID: BotComputerGuestLaunchState] = [:]
 
+    func guestDisplayResourceID(_ botID: BotID) throws -> BotID {
+        let threadID = screen == .desk && selectedBotID == botID ? selectedConversation?.linkedAgentThreadID : nil
+        return try botStore.guestResourceID(botID: botID, threadID: threadID)
+    }
+
     func guestScreenURL(for botID: BotID) -> URL? {
-        guestScreenURLByBot[botID.value]
+        guestScreenURLByBot[(try? guestDisplayResourceID(botID))?.value ?? botID.value]
     }
 
     func isGuestRunning(_ botID: BotID) -> Bool {
-        guestRunningByBot[botID.value] == true
+        guestRunningByBot[(try? guestDisplayResourceID(botID))?.value ?? botID.value] == true
     }
 
     func isGuestRebuilding(_ botID: BotID) -> Bool {
-        guestRebuildingByBot[botID.value] == true
+        guestRebuildingByBot[(try? guestDisplayResourceID(botID))?.value ?? botID.value] == true
     }
 
     func guestLaunchState(for botID: BotID) -> BotComputerGuestLaunchState {
-        guestLaunchStateByBot[botID.value] ?? .idle
+        guestLaunchStateByBot[(try? guestDisplayResourceID(botID))?.value ?? botID.value] ?? .idle
     }
 
-    func rememberGuestScreen(url: URL, botID: BotID, running: Bool) {
-        guestScreenURLByBot[botID.value] = url
-        guestRunningByBot[botID.value] = running
+    func rememberGuestScreen(url: URL, botID: BotID, running: Bool, resourceID: BotID? = nil) {
+        let resourceID = resourceID ?? (try? guestDisplayResourceID(botID)) ?? botID
+        guestScreenURLByBot[resourceID.value] = url
+        guestRunningByBot[resourceID.value] = running
         if running {
-            guestLaunchStateByBot[botID.value] = .idle
+            guestLaunchStateByBot[resourceID.value] = .idle
         }
-        if selectedBotID == botID {
+        if selectedBotID == botID, (try? guestDisplayResourceID(botID)) == resourceID {
             lastGuestScreenURL = url
         }
         objectWillChange.send()
     }
 
-    func presentGuestDesktop(botID: BotID, onSettled: ((BotComputerGuestReady?) -> Void)? = nil) {
+    func presentGuestDesktop(botID: BotID, threadID: AgentThreadID? = nil, onSettled: ((BotComputerGuestReady?) -> Void)? = nil) {
+        let resourceID: BotID
+        do {
+            resourceID = try threadID.map { try botStore.guestResourceID(botID: botID, threadID: $0) }
+                ?? guestDisplayResourceID(botID)
+        }
+        catch { errorMessage = String(describing: error); onSettled?(nil); return }
         guard guestLaunchState(for: botID) != .starting else {
             DispatchQueue.main.async { onSettled?(nil) }
             return
         }
         guard dockerGuestReadyOverrideForTesting == nil,
               let service = computerGuestService else {
-            guestLaunchStateByBot[botID.value] = .failed(
+            guestLaunchStateByBot[resourceID.value] = .failed(
                 BotComputerDockerError.cliMissing.description
             )
             DispatchQueue.main.async { onSettled?(nil) }
             return
         }
-        guestLaunchStateByBot[botID.value] = .starting
+        guestLaunchStateByBot[resourceID.value] = .starting
         Task.detached {
             do {
-                let ready = try await BotsViewModel.runDockerBlocking { try service.provision(botID: botID) }
+                let ready = try await BotsViewModel.runDockerBlocking { try service.provision(botID: resourceID) }
                 let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
                 await MainActor.run {
-                    self.rememberGuestScreen(url: url, botID: botID, running: true)
+                    self.rememberGuestScreen(url: url, botID: botID, running: true, resourceID: resourceID)
                     onSettled?(ready)
                 }
             } catch {
                 await MainActor.run {
                     self.dockerGuestProbeReason = String(describing: error)
-                    self.guestRunningByBot[botID.value] = false
-                    self.guestLaunchStateByBot[botID.value] = .failed(
+                    self.guestRunningByBot[resourceID.value] = false
+                    self.guestLaunchStateByBot[resourceID.value] = .failed(
                         (error as? BotComputerDockerError)?.description
                             ?? BotComputerDockerError.provisioningFailed.description
                     )
@@ -12365,16 +12415,19 @@ public final class BotsViewModel: ObservableObject {
     }
 
     func stopDockerGuest(botID: BotID, onSettled: ((Bool) -> Void)? = nil) {
+        let resourceID: BotID
+        do { resourceID = try guestDisplayResourceID(botID) }
+        catch { errorMessage = String(describing: error); onSettled?(false); return }
         guard let service = computerGuestService else {
             DispatchQueue.main.async { onSettled?(false) }
             return
         }
         Task.detached { [service] in
             do {
-                try await BotsViewModel.runDockerBlocking { try service.stop(botID: botID) }
+                try await BotsViewModel.runDockerBlocking { try service.stop(botID: resourceID) }
                 await MainActor.run {
-                    self.guestRunningByBot[botID.value] = false
-                    self.guestLaunchStateByBot[botID.value] = .idle
+                    self.guestRunningByBot[resourceID.value] = false
+                    self.guestLaunchStateByBot[resourceID.value] = .idle
                     self.objectWillChange.send()
                     onSettled?(true)
                 }
@@ -12388,6 +12441,9 @@ public final class BotsViewModel: ObservableObject {
     }
 
     func rebuildDockerGuest(botID: BotID, onSettled: ((BotComputerGuestReady?) -> Void)? = nil) {
+        let resourceID: BotID
+        do { resourceID = try guestDisplayResourceID(botID) }
+        catch { errorMessage = String(describing: error); onSettled?(nil); return }
         guard !isGuestRebuilding(botID) else {
             DispatchQueue.main.async { onSettled?(nil) }
             return
@@ -12398,19 +12454,19 @@ public final class BotsViewModel: ObservableObject {
             return
         }
         let wasRunning = isGuestRunning(botID)
-        guestRebuildingByBot[botID.value] = true
+        guestRebuildingByBot[resourceID.value] = true
         Task.detached {
             do {
-                let ready = try await BotsViewModel.runDockerBlocking { try service.rebuild(botID: botID) }
+                let ready = try await BotsViewModel.runDockerBlocking { try service.rebuild(botID: resourceID) }
                 let url = try BotComputerGuestSpec.viewerURL(ready.screenURL)
                 await MainActor.run {
-                    self.guestRebuildingByBot[botID.value] = false
-                    self.rememberGuestScreen(url: url, botID: botID, running: true)
+                    self.guestRebuildingByBot[resourceID.value] = false
+                    self.rememberGuestScreen(url: url, botID: botID, running: true, resourceID: resourceID)
                     onSettled?(ready)
                 }
             } catch {
                 await MainActor.run {
-                    self.guestRebuildingByBot[botID.value] = false
+                    self.guestRebuildingByBot[resourceID.value] = false
                     if case .rebuildWhileRunActive? = error as? BotComputerGuestServiceError {
                         self.errorMessage = String(describing: error)
                     } else {
@@ -12429,18 +12485,26 @@ public final class BotsViewModel: ObservableObject {
         return computerGuestService?.lastReady != nil
     }
 
-    public func admitDesktopSend(bot: BotDefinition) throws {
+    public func admitDesktopSend(bot: BotDefinition, threadID: AgentThreadID? = nil) throws {
         guard settingsStore.reload().isBotControlPlaneActive else { throw BotPublishError.controlPlaneDisabled }
+        let destination = try threadID.flatMap { try botStore.threadExecutionDestination($0) }
+            ?? botStore.executionDestination(botID: bot.id)
+        try botStore.validateExecutionDestination(destination, botID: bot.id)
+        if let threadID, try context.threadRepo.guestPlacement(of: threadID)?.executionTarget == .mac { return }
+        // Named VMs are provisioned by the send's asynchronous preflight and use
+        // the shared queue; opening a conversation never starts a competing VM.
+        if destination.virtualMachineID != nil { return }
         let revision = try currentRevision(for: bot)
         let kind = desktopKindOverrideForTesting
-            ?? resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace)
+            ?? (destination.target == .vm ? .dockerDesktop : resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace))
         let ready: Bool
         if let dockerGuestReadyOverrideForTesting {
             ready = dockerGuestReadyOverrideForTesting
         } else if kind == .dockerDesktop {
-            ready = isGuestRunning(bot.id)
+            let resourceID = try botStore.guestResourceID(botID: bot.id, threadID: threadID)
+            ready = guestRunningByBot[resourceID.value] == true
             if !ready {
-                presentGuestDesktop(botID: bot.id)
+                presentGuestDesktop(botID: bot.id, threadID: threadID)
             }
         } else {
             ready = dockerGuestReady
@@ -13590,34 +13654,24 @@ public struct BotsRootView: View {
 
     private var studioDesktop: some View {
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            studioSectionHeader(BotsChrome.Label.desktop)
-            desktopOption(
-                kind: .logicalExecutionSpace,
-                title: BotDesktopKind.logicalExecutionSpace.displayTitle,
-                enabled: true,
-                identifier: "bots.studio.desktop.logical"
+            studioSectionHeader("Run on", caption: "The default for new conversations. Existing conversations keep their destination.")
+            BotExecutionDestinationPicker(
+                selection: Binding(get: { vm.studioExecutionDestination }, set: { vm.studioExecutionDestination = $0 }),
+                bot: vm.selectedBot, store: vm.executionDestinationStore, workspaces: vm.executionWorkspaces
             )
-            desktopOption(
-                kind: .botOwnedBrowser,
-                title: BotDesktopKind.botOwnedBrowser.displayTitle,
-                enabled: true,
-                identifier: "bots.studio.desktop.botBrowser"
-            )
-            desktopOption(
-                kind: .dockerDesktop,
-                title: BotDesktopKind.dockerDesktop.displayTitle,
-                enabled: vm.dockerDesktopSelectable,
-                status: vm.dockerDesktopStatus,
-                identifier: "bots.studio.desktop.docker"
-            )
-            Text(vm.desktopHonestyLabel)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.warning)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityIdentifier("bots.studio.desktop.honesty")
-            if vm.displayedDesktopKind == .dockerDesktop {
+            if vm.studioExecutionDestination == .mac {
+                Toggle("Use a separate browser for this bot", isOn: Binding(
+                    get: { vm.studioDraft.desktopKind == .botOwnedBrowser },
+                    set: { vm.studioDraft.desktopKind = $0 ? .botOwnedBrowser : .logicalExecutionSpace }
+                ))
+            }
+            if !vm.studioDestinationIsSaved {
+                Text("Save the bot to apply this destination.")
+                    .font(DS.Font.caption).foregroundStyle(DS.Palette.textSecondary)
+            }
+            if vm.displayedDesktopKind == .dockerDesktop, vm.studioDestinationIsSaved {
                 BotComputerGuestCanvas(
-                    url: (vm.studioDraft.botID.flatMap { vm.guestScreenURL(for: $0) }) ?? vm.lastGuestScreenURL,
+                    url: vm.studioDraft.botID.flatMap { vm.guestScreenURL(for: $0) },
                     running: vm.studioDraft.botID.map { vm.isGuestRunning($0) } ?? false,
                     rebuilding: vm.studioDraft.botID.map { vm.isGuestRebuilding($0) } ?? false,
                     launchState: vm.studioDraft.botID.map { vm.guestLaunchState(for: $0) } ?? .idle,
@@ -13635,49 +13689,10 @@ public struct BotsRootView: View {
                         if let id = vm.studioDraft.botID { vm.stopDockerGuest(botID: id) }
                     }
                 )
+                .disabled(!vm.studioDestinationIsSaved)
             }
         }
         .accessibilityIdentifier("bots.studio.desktop")
-    }
-
-    private func desktopOption(
-        kind: BotDesktopKind,
-        title: String,
-        enabled: Bool,
-        status: String? = nil,
-        identifier: String
-    ) -> some View {
-        Button {
-            guard enabled else { return }
-            vm.studioDraft.desktopKind = kind
-        } label: {
-            HStack(alignment: .top, spacing: DS.Space.md) {
-                Image(systemName: vm.displayedDesktopKind == kind ? "largecircle.fill.circle" : "circle")
-                    .foregroundColor(enabled ? DS.Palette.accent : DS.Palette.textTertiary)
-                    .padding(.top, 1)
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: DS.Space.sm) {
-                        Text(title)
-                            .font(DS.Font.bodyStrong)
-                            .foregroundColor(enabled ? DS.Palette.text : DS.Palette.textTertiary)
-                        if let status, !status.isEmpty {
-                            DSPill(status, tone: .neutral)
-                        }
-                    }
-                    Text(kind.honestyLabel)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .frame(minHeight: BotsChrome.hitTarget)
-        .disabled(!enabled)
-        .accessibilityIdentifier(identifier)
-        .accessibilityAddTraits(vm.displayedDesktopKind == kind ? .isSelected : [])
     }
 
     private var studioSecurity: some View {
@@ -14766,6 +14781,16 @@ public struct BotsRootView: View {
                     providersLoading: false
                 )
                 .accessibilityIdentifier("bots.routines.when")
+                Toggle("Use bot default", isOn: Binding(
+                    get: { vm.routineSpec.executionDestination == nil },
+                    set: { vm.routineSpec.executionDestination = $0 ? nil : vm.studioExecutionDestination }
+                ))
+                if vm.routineSpec.executionDestination != nil {
+                    BotExecutionDestinationPicker(selection: Binding(
+                        get: { vm.routineSpec.executionDestination ?? .mac },
+                        set: { vm.routineSpec.executionDestination = $0 }
+                    ), bot: vm.selectedBot, store: vm.executionDestinationStore, workspaces: vm.executionWorkspaces)
+                }
                 Button("Save task") { vm.saveRoutine() }
                     .buttonStyle(BotsPrimaryButtonStyle())
                     .accessibilityIdentifier("bots.routines.save")

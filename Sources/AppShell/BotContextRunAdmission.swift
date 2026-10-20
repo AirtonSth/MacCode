@@ -155,8 +155,7 @@ extension AppContext {
         let runs = runRepo
         let hostID = liveActivityHostIdentity.serverId
         let secretStore = contextualSecretStore
-        let identity = try BotContextRuntimeIdentity(hostID: pin.hostID, botID: pin.botID,
-            context: pin.context, policyRevision: pin.policyRevision)
+        let identity = try store.contextRuntimeIdentity(pin: pin, threadID: request.threadId)
         let authorizes: @Sendable () -> Bool = {
             BotContextRunAdmissions.authorizes(pin: pin, threadID: request.threadId, runID: request.runId,
                 parentRunID: parentRunID, hostID: hostID, store: store, threadRepo: threads, runRepo: runs)
@@ -183,13 +182,13 @@ extension AppContext {
                   !key.contains("\n"), !key.contains("\r") else { return false }
             return (try? BotContextSessionStore.validate(pin: pin, threadID: request.threadId,
                 parentRunID: parentRunID, cwd: request.cwd, resumeCursor: resumeCursor,
-                appSupport: support, authorizes: authorizes)) != nil
+                appSupport: support, authorizes: authorizes, virtualMachineID: identity.virtualMachineID)) != nil
         }
         let recordOpened: @Sendable (String) throws -> Void = { sessionID in
             guard validates() else { throw BotStoreError.notFound }
             try BotContextSessionStore.recordOpened(sessionID: sessionID, pin: pin,
                 threadID: request.threadId, parentRunID: parentRunID, cwd: request.cwd,
-                expectedResumeCursor: resumeCursor, appSupport: support, authorizes: authorizes)
+                expectedResumeCursor: resumeCursor, appSupport: support, authorizes: authorizes, virtualMachineID: identity.virtualMachineID)
         }
         guard validates() else { throw BotStoreError.notFound }
         let permit = AgentRunAcceptancePermit()
@@ -245,6 +244,10 @@ extension AppContext {
         case .workspace(let workspaceID):
             guard let workspace = state.workspaces[workspaceID] else { throw BotStoreError.notFound }
             cwd = workspace.cwd
+        }
+        if let machineID = try botStore.executionDestination(botID: peerBotID).virtualMachineID,
+           try botStore.contextRuntimeIdentity(pin: parentPin, threadID: parent.threadId).virtualMachineID == machineID {
+            throw DistillGuestLaunchError.unavailable("A bot cannot delegate to another bot while both use the same VM. Choose a different VM for the other bot.")
         }
         let peerIdentity = try BotContextRuntimeIdentity(binding: binding)
         let scopedStore = BotContextSecretStore(identity: peerIdentity, store: contextualSecretStore, authorizes: { [botStore] in

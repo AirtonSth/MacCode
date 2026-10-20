@@ -54,6 +54,7 @@ public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStri
 }
 
 public final class BotComputerGuestService: @unchecked Sendable {
+    private static let sharedVMLabel = "remotecode.shared-vm"
     public static let pngMagicHex = "89504e47"
     public static let maxScreenshotBytes = 8 * 1_024 * 1_024
     public static let maxScreenshotBase64Bytes = ((maxScreenshotBytes + 2) / 3) * 4
@@ -205,12 +206,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
         contextBinding: BotContextBinding,
         workspace: Workspace?,
         registeredWorkspaces: Set<String>,
-        requestingThreadID: AgentThreadID? = nil
+        requestingThreadID: AgentThreadID? = nil,
+        virtualMachineID: UUID? = nil
     ) throws -> BotComputerGuestReady {
         guard contextBinding.state == .active, contextBinding.actions.contains(.send) else {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
         }
-        let identity = try BotContextRuntimeIdentity(binding: contextBinding)
+        let identity = try BotContextRuntimeIdentity(binding: contextBinding, virtualMachineID: virtualMachineID)
         let desired: Set<String>
         switch contextBinding.context {
         case .general:
@@ -243,20 +245,26 @@ public final class BotComputerGuestService: @unchecked Sendable {
         } else {
             existing = []
         }
-        guard existing.isSubset(of: desired) else {
+        if virtualMachineID != nil, existing != desired {
+            guard !heldByAnotherRun(botID: identity.storageBotID, requestingThreadID: requestingThreadID) else {
+                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            }
+            try saveWorkspaces(Array(desired), botID: identity.storageBotID)
+        } else if !existing.isSubset(of: desired) {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
         }
         if let path = desired.first {
-            try ensureWorkspaceMounted(botID: identity.storageBotID, workspace: path, registered: registeredWorkspaces, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true)
+            try ensureWorkspaceMounted(botID: identity.storageBotID, workspace: path, registered: registeredWorkspaces, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true, sharedVirtualMachine: virtualMachineID != nil)
         }
-        return try provision(botID: identity.storageBotID, keeping: desired, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true)
+        return try provision(botID: identity.storageBotID, keeping: desired, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true, sharedVirtualMachine: virtualMachineID != nil)
     }
 
     private func provision(
         botID: BotID,
         keeping: Set<String>,
         requestingThreadID: AgentThreadID?,
-        contextualNetworkPolicy: Bool = false
+        contextualNetworkPolicy: Bool = false,
+        sharedVirtualMachine: Bool = false
     ) throws -> BotComputerGuestReady {
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
         // A reused container sees the current kit through its bind too.
@@ -267,12 +275,15 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let network = try availableNetwork(botID: botID)
         let image = try resolvedImage(botID: botID)
         let workspaces = prunedWorkspaces(botID: botID, keeping: keeping)
+        var shared = sharedVirtualMachine
         if let existing = try? docker.inspect(name: name) {
+            shared = shared || existing.labels[Self.sharedVMLabel] == "1"
             let policyLabel = existing.labels["remotecode.context.network"] == "private-egress-v1"
-            guard contextualNetworkPolicy == policyLabel else {
+            guard contextualNetworkPolicy == policyLabel
+                    || (shared && !heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID)) else {
                 throw BotComputerGuestServiceError.contextualRuntimeUnavailable
             }
-            if networkMatches(existing, network: network),
+            if contextualNetworkPolicy == policyLabel, networkMatches(existing, network: network),
                currentWorkspacesLabel(existing) == BotComputerGuestSpec.workspacesLabel(workspaces),
                heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID)
                 || (imageMatches(existing, tag: image) && runtimeIsCurrent(existing)) {
@@ -289,6 +300,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 }
                 return try readyState(name: name, botID: botID, resumed: true, contextualNetworkPolicy: contextualNetworkPolicy)
             }
+            guard !heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID) else {
+                throw BotStoreError.invalidInput("The VM is busy. Wait for the current conversation before changing its runtime.")
+            }
             try? docker.remove(name: name)
         }
         let viewerToken = try viewerToken(botID: botID)
@@ -301,6 +315,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             workspaces: workspaces,
             contextualNetworkPolicy: contextualNetworkPolicy
         )
+        if shared { options.labels[Self.sharedVMLabel] = "1" }
         options.network = network
         _ = try createContainer(options)
         // Unproven until `readyState` has its screenshot.
@@ -320,7 +335,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
         botID: BotID,
         workspace: String?,
         registered: Set<String>,
-        requestingThreadID: AgentThreadID?
+        requestingThreadID: AgentThreadID?,
+        contextualNetworkPolicy: Bool? = nil
     ) throws -> BotComputerContainerInspect? {
         let name = BotComputerGuestSpec.containerName(botID: botID)
         // Started with no screenshot of it yet: `provision` proves it.
@@ -361,6 +377,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
         guard let existing = try? docker.inspect(name: name), existing.running,
               existing.networkNames == [BotComputerGuestSpec.networkName(botID: botID)]
         else { return nil }
+        if let contextualNetworkPolicy,
+           contextualNetworkPolicy != (existing.labels["remotecode.context.network"] == "private-egress-v1") { return nil }
         let held = heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID)
         if let mountedLabel {
             guard existing.labels[BotComputerGuestSpec.workspacesLabelKey] == mountedLabel,
@@ -380,15 +398,24 @@ public final class BotComputerGuestService: @unchecked Sendable {
         workspace: String,
         registered: Set<String>,
         requestingThreadID: AgentThreadID? = nil,
-        contextualNetworkPolicy: Bool = false
+        contextualNetworkPolicy: Bool = false,
+        sharedVirtualMachine: Bool = false
     ) throws {
         try BotComputerGuestSpec.assertWorkspaceMountPath(workspace, registeredWorkspaces: registered)
         let canonical = BotComputerGuestSpec.containerName(botID: botID)
         let existing = try? docker.inspect(name: canonical)
         if let existing {
             let policyLabel = existing.labels["remotecode.context.network"] == "private-egress-v1"
-            guard contextualNetworkPolicy == policyLabel else {
-                throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+            if contextualNetworkPolicy != policyLabel {
+                guard sharedVirtualMachine || existing.labels[Self.sharedVMLabel] == "1",
+                      !heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID) else {
+                    throw BotComputerGuestServiceError.contextualRuntimeUnavailable
+                }
+                _ = try provision(botID: botID, keeping: [workspace], requestingThreadID: requestingThreadID,
+                                  contextualNetworkPolicy: contextualNetworkPolicy, sharedVirtualMachine: sharedVirtualMachine)
+                try ensureWorkspaceMounted(botID: botID, workspace: workspace, registered: registered,
+                    requestingThreadID: requestingThreadID, contextualNetworkPolicy: contextualNetworkPolicy, sharedVirtualMachine: sharedVirtualMachine)
+                return
             }
         }
         try BotGuestAgentKit.materialize(appSupport: appSupport)
@@ -406,6 +433,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
            runtimeIsCurrent(existing) || heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID) {
             return
         }
+        guard !heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID) else {
+            throw BotStoreError.invalidInput("The VM is busy. Wait for the current conversation before changing its workspace.")
+        }
         let backup = canonical + "-backup"
         let network = try availableNetwork(botID: botID)
         var options = try BotComputerGuestSpec.containerCreateOptions(
@@ -418,6 +448,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
             registeredWorkspaces: registered.union(stored),
             contextualNetworkPolicy: contextualNetworkPolicy
         )
+        if sharedVirtualMachine || existing.labels[Self.sharedVMLabel] == "1" {
+            options.labels[Self.sharedVMLabel] = "1"
+        }
         options.network = network
         if (try? docker.containerExists(name: backup)) == true {
             try? docker.remove(name: backup)
@@ -515,6 +548,16 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public func stop(botID: BotID) throws {
+        let claim = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Stopping VM", workspace: "")
+        if let holder = vmRuns.tryBegin(botID: botID, entry: claim) {
+            throw BotStoreError.invalidInput("The VM is busy in \(holder.title). Stop that conversation first.")
+        }
+        defer {
+            if let next = vmRuns.releaseAndNextWaiter(runID: claim.runID) {
+                notificationCenter.post(name: .botVMRebuildReleased, object: nil,
+                    userInfo: [BotHostNotificationKey.botID: next.botID, BotHostNotificationKey.threadID: next.threadID])
+            }
+        }
         try docker.stop(name: BotComputerGuestSpec.containerName(botID: botID))
     }
 
@@ -658,11 +701,18 @@ public final class BotComputerGuestService: @unchecked Sendable {
         (try? docker.inspect(name: BotComputerGuestSpec.containerName(botID: botID)))?.running == true
     }
 
+    /// An admitted run already prepared its mounts and network policy.
+    /// Tool calls must use that runtime without replacing its container.
+    private func ensureToolRuntime(botID: BotID) throws {
+        if vmRuns.active(botID: botID) != nil, isContainerRunning(botID: botID) { return }
+        _ = try provision(botID: botID)
+    }
+
     /// `deadline` is when the MCP caller stops waiting; the guest limit is sized
     /// from what is left of it after provisioning (see `execGuestBudgetSeconds`).
     public func exec(botID: BotID, command: String, deadline: Date? = nil) throws -> Data {
         let trimmed = try BotComputerGuestSpec.assertExecCommand(command)
-        _ = try provision(botID: botID)
+        try ensureToolRuntime(botID: botID)
         let guestSeconds = try Self.execGuestSeconds(deadline: deadline)
         let name = BotComputerGuestSpec.containerName(botID: botID)
         let user = BotComputerGuestSpec.execUsesRoot(trimmed) ? "0" : nil
@@ -688,7 +738,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
     ) throws -> Data {
         let trimmed = try BotComputerGuestSpec.assertExecCommand(command)
         try BotComputerGuestSpec.assertWorkspaceMountPath(workspace)
-        _ = try provision(botID: botID)
+        try ensureToolRuntime(botID: botID)
         let guestSeconds = try Self.execGuestSeconds(deadline: deadline)
         var environment: [String: String] = [:]
         if let gitIdentity {
@@ -748,7 +798,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public func openTerminal(botID: BotID) throws {
-        _ = try provision(botID: botID)
+        try ensureToolRuntime(botID: botID)
         let name = BotComputerGuestSpec.containerName(botID: botID)
         _ = try docker.exec(
             name: name,
@@ -767,9 +817,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
     /// made during the build queues instead of starting on the old container.
     public func rebuild(botID: BotID, requestingThreadID: AgentThreadID? = nil) throws -> BotComputerGuestReady {
         let container = BotComputerGuestSpec.containerName(botID: botID)
+        var sharedVirtualMachine = false
+        var contextualNetworkPolicy = false
         if try docker.containerExists(name: container) {
             let existing = try docker.inspect(name: container)
-            guard existing.labels["remotecode.context.network"] != "private-egress-v1" else {
+            sharedVirtualMachine = existing.labels[Self.sharedVMLabel] == "1"
+            contextualNetworkPolicy = existing.labels["remotecode.context.network"] == "private-egress-v1"
+            guard !contextualNetworkPolicy || sharedVirtualMachine else {
                 throw BotComputerGuestServiceError.contextualRuntimeUnavailable
             }
         }
@@ -778,10 +832,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
         )
         var claimed = false
         defer {
-            if claimed, let next = vmRuns.releaseAndNextWaiting(runID: claim.runID) {
+            if claimed, let next = vmRuns.releaseAndNextWaiter(runID: claim.runID) {
                 notificationCenter.post(
                     name: .botVMRebuildReleased, object: nil,
-                    userInfo: [BotHostNotificationKey.botID: botID, BotHostNotificationKey.threadID: next]
+                    userInfo: [BotHostNotificationKey.botID: next.botID, BotHostNotificationKey.threadID: next.threadID]
                 )
             }
         }
@@ -811,8 +865,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
             viewerToken: viewerToken,
             image: tag,
             name: next,
-            workspaces: loadWorkspaces(botID: botID)
+            workspaces: loadWorkspaces(botID: botID),
+            contextualNetworkPolicy: contextualNetworkPolicy
         )
+        if sharedVirtualMachine { options.labels[Self.sharedVMLabel] = "1" }
         options.network = network
         _ = try createContainer(options)
         let canonicalWasRunning = (try? docker.inspect(name: canonical))?.running == true
@@ -852,20 +908,26 @@ public final class BotComputerGuestService: @unchecked Sendable {
         }
     }
 
-    public func apply(_ action: BotComputerPendingAction) throws -> [String: Any] {
+    public func apply(_ action: BotComputerPendingAction, resourceID: BotID? = nil) throws -> [String: Any] {
         guard let uuid = UUID(uuidString: action.botID) else {
             throw BotComputerError.invalid("Invalid bot id.")
         }
         let botID = BotID(uuid)
+        let resource = resourceID ?? botID
+        let callerThread = action.threadID.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
+        if let holder = vmRuns.active(botID: resource), holder.threadID != callerThread,
+           resource != botID || callerThread != nil {
+            throw BotComputerError.invalid("The VM is busy in \(holder.title)")
+        }
         // Refused, never queued: nothing below runs while the user drives.
         if action.kind == BotComputerCatalog.act || action.kind == BotComputerCatalog.exec,
-           control.isControlledByUser(botID) {
+           control.isControlledByUser(botID, resourceID: resource) {
             return ["refusal": ManualActionRequest.refusalPhrase]
         }
         let threadID = action.threadID.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
         switch action.kind {
         case BotComputerCatalog.observe:
-            let shot = try observe(botID: botID)
+            let shot = try observe(botID: resource)
             let base64 = try Self.boundedBase64(shot.png)
             return [
                 "png_magic": shot.magic,
@@ -875,13 +937,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
                 "image": BotComputerGuestSpec.imageTag,
             ]
         case BotComputerCatalog.act:
-            try act(botID: botID, steps: action.steps)
+            try act(botID: resource, steps: action.steps)
             return ["ok": true, "steps": action.steps.count]
         case BotComputerCatalog.exec:
             let output: Data
-            if let run = vmRuns.active(botID: botID) {
+            if let run = vmRuns.active(botID: resource) {
                 output = try exec(
-                    botID: botID,
+                    botID: resource,
                     command: action.command,
                     workspace: run.workspace,
                     user: "\(getuid()):\(getgid())",
@@ -889,21 +951,21 @@ public final class BotComputerGuestService: @unchecked Sendable {
                     deadline: action.deadline
                 )
             } else {
-                output = try exec(botID: botID, command: action.command, deadline: action.deadline)
+                output = try exec(botID: resource, command: action.command, deadline: action.deadline)
             }
             return [
                 "ok": true,
                 "output": String(data: output, encoding: .utf8) ?? "",
             ]
         case BotComputerCatalog.rebuild:
-            let ready = try rebuild(botID: botID, requestingThreadID: threadID)
+            let ready = try rebuild(botID: resource, requestingThreadID: threadID)
             return [
                 "ok": true,
                 "host": ready.screenURL.host ?? "127.0.0.1",
-                "image": BotComputerGuestSpec.botImageTag(botID: botID),
+                "image": BotComputerGuestSpec.botImageTag(botID: resource),
             ]
         case BotComputerCatalog.requestUserAction:
-            let shot = try observe(botID: botID)
+            let shot = try observe(botID: resource)
             let base64 = try Self.boundedBase64(shot.png)
             let kind = ManualActionKind(rawValue: action.subkind) ?? .other
             let id = ManualActionHost.request(
@@ -925,7 +987,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             if let blocked = screenshotLimiter.acquire(botID: botID, kind: kind).message {
                 throw BotComputerError.invalid(blocked)
             }
-            let shot = try observe(botID: botID)
+            let shot = try observe(botID: resource)
             let jpeg = try BotScreenshotEncoder.jpeg(fromPNG: shot.png)
             var userInfo: [String: Any] = [
                 BotHostNotificationKey.botID: botID,
@@ -1214,7 +1276,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public func observe(botID: BotID) throws -> (png: Data, hash: String, magic: String) {
-        _ = try provision(botID: botID)
+        try ensureToolRuntime(botID: botID)
         let name = BotComputerGuestSpec.containerName(botID: botID)
         let png = try waitForPNG(name: name)
         let hash = try BotComputerGuestObserve.validatePNG(png)
@@ -1258,7 +1320,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     public func act(botID: BotID, steps: [BotComputerActStep]) throws {
         try BotComputerGuestObserve.assertActStepCount(steps.count)
-        _ = try provision(botID: botID)
+        try ensureToolRuntime(botID: botID)
         let name = BotComputerGuestSpec.containerName(botID: botID)
         for step in steps {
             _ = try docker.exec(

@@ -4,13 +4,14 @@ import CoreModel
 
 struct BotContextGuestRecovery {
     struct Record: Codable {
-        var identity: BotContextRuntimeIdentity? { try? BotContextRuntimeIdentity(hostID: hostID, botID: botID, context: context, policyRevision: policyRevision) }
+        var identity: BotContextRuntimeIdentity? { try? BotContextRuntimeIdentity(hostID: hostID, botID: botID, context: context, policyRevision: policyRevision, virtualMachineID: virtualMachineID) }
         let version: Int
         let hostID: String
         let botID: BotID
         let context: BotContext
         let policyRevision: Int64
         let runID: AgentRunID
+        var virtualMachineID: UUID? = nil
         var conversationID: BotConversationID? = nil
         var state: State
         enum State: String, Codable { case pending, ended }
@@ -34,7 +35,7 @@ struct BotContextGuestRecovery {
         guard !entries.contains(where: { $0.hasSuffix(".env") }) else {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
         }
-        let record = Record(version: 1, hostID: identity.hostID, botID: identity.botID, context: identity.context, policyRevision: identity.policyRevision, runID: runID, conversationID: conversationID, state: .pending)
+        let record = Record(version: 1, hostID: identity.hostID, botID: identity.botID, context: identity.context, policyRevision: identity.policyRevision, runID: runID, virtualMachineID: identity.virtualMachineID, conversationID: conversationID, state: .pending)
         try directory.writeAtomically(JSONEncoder().encode(record), to: name)
         try directory.synchronize()
     }
@@ -101,6 +102,13 @@ struct BotContextGuestRecovery {
                 let expectedEnv = Set(records.map { $0.1.runID.value.uuidString.lowercased() + ".env" })
                 let unexpectedEnv = entries.filter { $0.hasSuffix(".env") && !expectedEnv.contains($0) }
                 guard unexpectedEnv.isEmpty else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
+                // Completed shared runs have already removed their credentials.
+                // The VM may since have been reused with an ordinary network policy.
+                if records.allSatisfy({ $0.1.state == .ended && $0.2.virtualMachineID != nil }),
+                   !entries.contains(where: { $0.hasSuffix(".env") }) {
+                    reconciled.append(scopeName)
+                    continue
+                }
                 guard let docker else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                 let service = BotComputerGuestService(appSupport: appSupport, docker: docker, recipeContext: nil)
                 try service.stopForContextRecovery(identity: records[0].2)

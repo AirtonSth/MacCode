@@ -557,7 +557,7 @@ final class ThreadActorRemoteTests: XCTestCase {
         let f = try makeFixture()
         let vm = macSurface(f)
         var phoneResponse: JSONRPCResponse?
-        vm.botVMPreflight = { _, _ in
+        vm.botVMPreflight = { _, _, _ in
             phoneResponse = await self.setActor(f, bot: f.macBot.id)
             return nil
         }
@@ -602,7 +602,7 @@ final class ThreadActorRemoteTests: XCTestCase {
         let vm = macSurface(f)
         let (log, subscription) = recordEvents()
         defer { EventBus.shared.unsubscribe(subscription) }
-        vm.botVMPreflight = { _, _ in "Docker parado" }
+        vm.botVMPreflight = { _, _, _ in "Docker parado" }
         vm.setRunActor(.bot(f.vmBot.id))
         vm.prompt = "primeira"
         await vm.send()

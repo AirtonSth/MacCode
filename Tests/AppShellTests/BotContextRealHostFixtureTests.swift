@@ -119,6 +119,24 @@ final class BotContextRealHostFixtureTests: XCTestCase {
         try JSONEncoder().encode(navigation).write(to: root.appendingPathComponent("navigation.json"), options: .atomic)
     }
 
+    func test_exportSharedVMFixture() throws {
+        guard let rootPath = ProcessInfo.processInfo.environment[Self.rootKey] else {
+            throw XCTSkip("set RC_CONTEXT_REAL_HOST_FIXTURE_ROOT to export the shared VM fixture")
+        }
+        try test_exportRealHostFixture()
+        let root = try Self.validatedRoot(rootPath)
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: root.appendingPathComponent("fixture.json")))
+        let db = try SQLiteDB(path: root.appendingPathComponent("app-support/remotecode.sqlite").path)
+        let store = BotStore(db: db)
+        let general = try store.saveVirtualMachine(name: "Team Linux")
+        let scoped = try store.saveVirtualMachine(name: "Workspace Linux", workspaceID: fixture.workspaceID)
+        let exclusive = try store.create(name: "Workspace Developer", title: "Developer", description: "",
+            handle: "workspace-developer", soul: "", workspaceID: fixture.workspaceID)
+        try store.setExecutionDestination(.virtualMachine(general.id), botID: fixture.botID)
+        try store.setExecutionDestination(.virtualMachine(general.id), botID: fixture.bBotID)
+        try store.setExecutionDestination(.virtualMachine(scoped.id), botID: exclusive.id)
+    }
+
     func test_verifyOfflineQueueRevocationAfterHostRestart() throws {
         guard ProcessInfo.processInfo.environment[Self.verifyKey] == "1" else {
             throw XCTSkip("set RC_CONTEXT_REAL_HOST_VERIFY=1 to verify the exported fixture")

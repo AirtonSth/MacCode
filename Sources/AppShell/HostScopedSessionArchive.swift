@@ -75,7 +75,7 @@ internal enum HostScopedSessionArchive {
                     let binding = try JSONDecoder().decode(BotContextSessionStore.Binding.self, from: bytes)
                     guard binding.version == 1,
                           binding.pin.conversationID.value == conversationUUID,
-                          try storageID(for: binding.pin) == BotID(storageUUID) else {
+                          try storageID(for: binding.pin, virtualMachineID: binding.virtualMachineID) == BotID(storageUUID) else {
                         throw failure("scoped binding identity mismatch: \(filename)")
                     }
                     try requireQuiescent(Manifest(databaseFingerprint: fingerprint, sessions: [
@@ -155,7 +155,7 @@ internal enum HostScopedSessionArchive {
             let cid = session.conversationID.value.uuidString.lowercased()
             guard cid == session.binding.pin.conversationID.value.uuidString.lowercased(),
                   session.binding.pin.conversationID == session.conversationID,
-                  try storageID(for: session.binding.pin) == session.storageBotID,
+                  try storageID(for: session.binding.pin, virtualMachineID: session.binding.virtualMachineID) == session.storageBotID,
                   session.binding.version == 1,
                   session.binding.cwd.hasPrefix("/"),
                   URL(fileURLWithPath: session.binding.cwd).standardizedFileURL.path == session.binding.cwd,
@@ -214,9 +214,18 @@ internal enum HostScopedSessionArchive {
         let db = try SQLiteDB(path: databaseURL.path, readonly: true)
         let botStore = BotStore(db: db)
         let threads = AgentThreadRepository(db: db)
+        let columns = try db.prepare("PRAGMA table_info(agent_threads);")
+        defer { columns.reset() }
+        var hasDestination = false
+        while try columns.step() {
+            if columns.columnText(1) == "execution_destination" { hasDestination = true }
+        }
         for session in manifest.sessions {
             let binding = session.binding
             let pin = binding.pin
+            let resourceID = try hasDestination
+                ? botStore.contextRuntimeIdentity(pin: pin, threadID: binding.threadID).storageBotID
+                : storageID(for: pin, virtualMachineID: nil)
             guard try botStore.conversationContextPin(conversationID: session.conversationID) == pin,
                   let conversation = try botStore.conversation(id: session.conversationID),
                   conversation.botID == pin.botID,
@@ -228,7 +237,7 @@ internal enum HostScopedSessionArchive {
                   thread.executionTarget == .vm,
                   thread.workspaceId == workspaceID(for: pin.context),
                   try threads.guestPlacement(of: binding.threadID)?.guestRuntime == BotGuestRuntime.distillV1,
-                  try storageID(for: pin) == session.storageBotID,
+                  resourceID == session.storageBotID,
                   pin.conversationID == session.conversationID else {
                 throw failure("scoped binding does not match canonical database conversation/thread/pin")
             }
@@ -314,8 +323,8 @@ internal enum HostScopedSessionArchive {
         }
     }
 
-    private static func storageID(for pin: BotConversationContextPin) throws -> BotID {
-        try BotContextRuntimeIdentity(hostID: pin.hostID, botID: pin.botID, context: pin.context, policyRevision: pin.policyRevision).storageBotID
+    private static func storageID(for pin: BotConversationContextPin, virtualMachineID: UUID?) throws -> BotID {
+        try BotContextRuntimeIdentity(hostID: pin.hostID, botID: pin.botID, context: pin.context, policyRevision: pin.policyRevision, virtualMachineID: virtualMachineID).storageBotID
     }
 
     private static func workspaceID(for context: BotContext) -> WorkspaceID? {

@@ -47,4 +47,31 @@ final class ScheduledTaskRemoteTests: XCTestCase {
         XCTAssertEqual(JSONRPCDispatcher.requiredCapability(for: "scheduled_task.list"), "read")
         XCTAssertEqual(JSONRPCDispatcher.requiredCapability(for: "scheduled_task.save"), "write")
     }
+
+    @MainActor
+    func test_saveBotSchedulePinsTheRequestedDestinationAndReplaysWithoutDuplication() async throws {
+        let directory = NSTemporaryDirectory() + "RC2SharedVMSchedule-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        SettingsStore(db: context.db).update { $0.botsControlPlaneEnabled = true }
+        let bot = try context.botStore.create(name: "Writer", title: "", description: "")
+        let machine = try context.botStore.saveVirtualMachine(name: "Research")
+        let spec = BotScheduleSpec(model: "auto")
+        let params: [String: JSONValue] = [
+            "client_request_id": .string(UUID().uuidString),
+            "bot_id": .string(bot.id.value.uuidString.lowercased()),
+            "title": .string("Research"), "prompt": .string("Summarize"),
+            "schedule_spec_json": .string(spec.encodedJSON()),
+            "execution_destination": .string(BotExecutionDestination.virtualMachine(machine.id).storageValue),
+        ]
+        _ = try await router.saveScheduledTaskRemote(params: params)
+        _ = try await router.saveScheduledTaskRemote(params: params)
+        let routines = try context.botStore.listRoutines(botID: bot.id)
+        XCTAssertEqual(routines.count, 1)
+        let saved = try XCTUnwrap(routines.first?.definition.scheduleSpec)
+        XCTAssertEqual(saved.executionDestination, .virtualMachine(machine.id))
+        XCTAssertEqual(BotsViewModel.routineRouting(saved, base: BotDeskRouting()).executionDestination, saved.executionDestination)
+    }
 }
