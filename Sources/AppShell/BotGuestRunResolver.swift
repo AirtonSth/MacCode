@@ -749,7 +749,7 @@ final class BotGuestDockerVM: BotGuestVMPreparing, @unchecked Sendable {
         let recreated: Bool
         if let running = try? service.runningCurrentContainer(
             botID: botID, workspace: workspace,
-            registered: registeredWorkspaces, requestingThreadID: threadID
+            registered: registeredWorkspaces, requestingThreadID: threadID, contextualNetworkPolicy: false
         ) {
             container = BotComputerGuestSpec.containerName(botID: botID)
             image = running.imageID

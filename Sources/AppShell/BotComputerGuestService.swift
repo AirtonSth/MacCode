@@ -54,6 +54,7 @@ public enum BotComputerGuestServiceError: Error, Equatable, Sendable, CustomStri
 }
 
 public final class BotComputerGuestService: @unchecked Sendable {
+    private static let sharedVMLabel = "remotecode.shared-vm"
     public static let pngMagicHex = "89504e47"
     public static let maxScreenshotBytes = 8 * 1_024 * 1_024
     public static let maxScreenshotBase64Bytes = ((maxScreenshotBytes + 2) / 3) * 4
@@ -253,16 +254,17 @@ public final class BotComputerGuestService: @unchecked Sendable {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
         }
         if let path = desired.first {
-            try ensureWorkspaceMounted(botID: identity.storageBotID, workspace: path, registered: registeredWorkspaces, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true)
+            try ensureWorkspaceMounted(botID: identity.storageBotID, workspace: path, registered: registeredWorkspaces, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true, sharedVirtualMachine: virtualMachineID != nil)
         }
-        return try provision(botID: identity.storageBotID, keeping: desired, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true)
+        return try provision(botID: identity.storageBotID, keeping: desired, requestingThreadID: requestingThreadID, contextualNetworkPolicy: true, sharedVirtualMachine: virtualMachineID != nil)
     }
 
     private func provision(
         botID: BotID,
         keeping: Set<String>,
         requestingThreadID: AgentThreadID?,
-        contextualNetworkPolicy: Bool = false
+        contextualNetworkPolicy: Bool = false,
+        sharedVirtualMachine: Bool = false
     ) throws -> BotComputerGuestReady {
         let home = try BotGuestHome.ensure(appSupport: appSupport, botID: botID)
         // A reused container sees the current kit through its bind too.
@@ -273,9 +275,12 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let network = try availableNetwork(botID: botID)
         let image = try resolvedImage(botID: botID)
         let workspaces = prunedWorkspaces(botID: botID, keeping: keeping)
+        var shared = sharedVirtualMachine
         if let existing = try? docker.inspect(name: name) {
+            shared = shared || existing.labels[Self.sharedVMLabel] == "1"
             let policyLabel = existing.labels["remotecode.context.network"] == "private-egress-v1"
-            guard contextualNetworkPolicy == policyLabel || !heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID) else {
+            guard contextualNetworkPolicy == policyLabel
+                    || (shared && !heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID)) else {
                 throw BotComputerGuestServiceError.contextualRuntimeUnavailable
             }
             if contextualNetworkPolicy == policyLabel, networkMatches(existing, network: network),
@@ -310,6 +315,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             workspaces: workspaces,
             contextualNetworkPolicy: contextualNetworkPolicy
         )
+        if shared { options.labels[Self.sharedVMLabel] = "1" }
         options.network = network
         _ = try createContainer(options)
         // Unproven until `readyState` has its screenshot.
@@ -329,7 +335,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
         botID: BotID,
         workspace: String?,
         registered: Set<String>,
-        requestingThreadID: AgentThreadID?
+        requestingThreadID: AgentThreadID?,
+        contextualNetworkPolicy: Bool? = nil
     ) throws -> BotComputerContainerInspect? {
         let name = BotComputerGuestSpec.containerName(botID: botID)
         // Started with no screenshot of it yet: `provision` proves it.
@@ -368,9 +375,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
         // `provision`'s, after `ensureWorkspaceMounted` has read it.
         let workspaces = loadWorkspaces(botID: botID).filter { FileManager.default.fileExists(atPath: $0) }
         guard let existing = try? docker.inspect(name: name), existing.running,
-              existing.labels["remotecode.context.network"] != "private-egress-v1",
               existing.networkNames == [BotComputerGuestSpec.networkName(botID: botID)]
         else { return nil }
+        if let contextualNetworkPolicy,
+           contextualNetworkPolicy != (existing.labels["remotecode.context.network"] == "private-egress-v1") { return nil }
         let held = heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID)
         if let mountedLabel {
             guard existing.labels[BotComputerGuestSpec.workspacesLabelKey] == mountedLabel,
@@ -390,7 +398,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
         workspace: String,
         registered: Set<String>,
         requestingThreadID: AgentThreadID? = nil,
-        contextualNetworkPolicy: Bool = false
+        contextualNetworkPolicy: Bool = false,
+        sharedVirtualMachine: Bool = false
     ) throws {
         try BotComputerGuestSpec.assertWorkspaceMountPath(workspace, registeredWorkspaces: registered)
         let canonical = BotComputerGuestSpec.containerName(botID: botID)
@@ -398,13 +407,14 @@ public final class BotComputerGuestService: @unchecked Sendable {
         if let existing {
             let policyLabel = existing.labels["remotecode.context.network"] == "private-egress-v1"
             if contextualNetworkPolicy != policyLabel {
-                guard !heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID) else {
+                guard sharedVirtualMachine || existing.labels[Self.sharedVMLabel] == "1",
+                      !heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID) else {
                     throw BotComputerGuestServiceError.contextualRuntimeUnavailable
                 }
                 _ = try provision(botID: botID, keeping: [workspace], requestingThreadID: requestingThreadID,
-                                  contextualNetworkPolicy: contextualNetworkPolicy)
+                                  contextualNetworkPolicy: contextualNetworkPolicy, sharedVirtualMachine: sharedVirtualMachine)
                 try ensureWorkspaceMounted(botID: botID, workspace: workspace, registered: registered,
-                    requestingThreadID: requestingThreadID, contextualNetworkPolicy: contextualNetworkPolicy)
+                    requestingThreadID: requestingThreadID, contextualNetworkPolicy: contextualNetworkPolicy, sharedVirtualMachine: sharedVirtualMachine)
                 return
             }
         }
@@ -438,6 +448,9 @@ public final class BotComputerGuestService: @unchecked Sendable {
             registeredWorkspaces: registered.union(stored),
             contextualNetworkPolicy: contextualNetworkPolicy
         )
+        if sharedVirtualMachine || existing.labels[Self.sharedVMLabel] == "1" {
+            options.labels[Self.sharedVMLabel] = "1"
+        }
         options.network = network
         if (try? docker.containerExists(name: backup)) == true {
             try? docker.remove(name: backup)
@@ -804,9 +817,13 @@ public final class BotComputerGuestService: @unchecked Sendable {
     /// made during the build queues instead of starting on the old container.
     public func rebuild(botID: BotID, requestingThreadID: AgentThreadID? = nil) throws -> BotComputerGuestReady {
         let container = BotComputerGuestSpec.containerName(botID: botID)
+        var sharedVirtualMachine = false
+        var contextualNetworkPolicy = false
         if try docker.containerExists(name: container) {
             let existing = try docker.inspect(name: container)
-            guard existing.labels["remotecode.context.network"] != "private-egress-v1" else {
+            sharedVirtualMachine = existing.labels[Self.sharedVMLabel] == "1"
+            contextualNetworkPolicy = existing.labels["remotecode.context.network"] == "private-egress-v1"
+            guard !contextualNetworkPolicy || sharedVirtualMachine else {
                 throw BotComputerGuestServiceError.contextualRuntimeUnavailable
             }
         }
@@ -848,8 +865,10 @@ public final class BotComputerGuestService: @unchecked Sendable {
             viewerToken: viewerToken,
             image: tag,
             name: next,
-            workspaces: loadWorkspaces(botID: botID)
+            workspaces: loadWorkspaces(botID: botID),
+            contextualNetworkPolicy: contextualNetworkPolicy
         )
+        if sharedVirtualMachine { options.labels[Self.sharedVMLabel] = "1" }
         options.network = network
         _ = try createContainer(options)
         let canonicalWasRunning = (try? docker.inspect(name: canonical))?.running == true

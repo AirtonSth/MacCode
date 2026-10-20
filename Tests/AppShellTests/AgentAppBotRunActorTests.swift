@@ -58,6 +58,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         ]
         router.rememberProviderSnapshotsForSend(snapshots)
         let botsVM = BotsViewModel(context: ctx, router: router)
+        botsVM.dockerGuestReadyOverrideForTesting = true
         router.botsViewModel = botsVM
         let bot = try botsVM.create(name: "Quinn", title: "Scout", soul: Self.soulMarker)
         let workspace = try router.createWorkspace(name: "actor-ws", cwd: workspaceDir.path)

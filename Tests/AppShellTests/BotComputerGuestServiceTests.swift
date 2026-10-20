@@ -556,6 +556,38 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(service.lastReason.contains("unconfirmed"))
     }
 
+    func test_sharedVMChangesNetworkPolicyOnlyWhenIdleAndKeepsItsHome() throws {
+        let support = makeSupport("rc-shared-context-policy")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(appSupport: support, docker: fake,
+            observeAttempts: 1, observeDelay: 0, vmRuns: registry)
+        let vmID = UUID()
+        let resource = BotID(vmID)
+        let binding = BotContextBinding(hostID: "host", botID: BotID(), context: .general,
+            state: .active, policyRevision: 1, actions: [.send])
+        _ = try service.provision(contextBinding: binding, workspace: nil,
+            registeredWorkspaces: [], virtualMachineID: vmID)
+        let marker = BotComputerGuestSpec.guestHomeURL(appSupport: support, botID: resource)
+            .appendingPathComponent("shared-marker")
+        try Data("keep".utf8).write(to: marker)
+        let run = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Running", workspace: "")
+        XCTAssertNil(registry.tryBegin(botID: resource, entry: run))
+        XCTAssertThrowsError(try service.provision(botID: resource))
+        registry.endRun(runID: run.runID)
+        _ = try service.provision(botID: resource)
+        let name = BotComputerGuestSpec.containerName(botID: resource)
+        XCTAssertNil(fake.containers[name]?.labels["remotecode.context.network"])
+        XCTAssertEqual(try Data(contentsOf: marker), Data("keep".utf8))
+        _ = try service.provision(contextBinding: binding, workspace: nil,
+            registeredWorkspaces: [], virtualMachineID: vmID)
+        XCTAssertEqual(fake.containers[name]?.labels["remotecode.context.network"], "private-egress-v1")
+        _ = try service.rebuild(botID: resource)
+        XCTAssertEqual(fake.containers[name]?.labels["remotecode.context.network"], "private-egress-v1")
+        XCTAssertEqual(try Data(contentsOf: marker), Data("keep".utf8))
+    }
+
     func test_legacyOperationsCannotDowngradeContextualRuntime() throws {
         let support = makeSupport("rc-context-legacy-downgrade")
         defer { try? FileManager.default.removeItem(at: support) }

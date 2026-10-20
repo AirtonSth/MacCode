@@ -415,7 +415,7 @@ final class BotBrowserRouterTests: XCTestCase {
         )
         await router.reconcileBotBrowserActions()
         let result = try XCTUnwrap(try store.takeActionResult(id: "act-ctl"))
-        XCTAssertTrue(result.payload.contains("NÃO foi executada"))
+        XCTAssertTrue(result.payload.contains(ManualActionRequest.refusalPhrase))
         XCTAssertTrue(fake.recorded().isEmpty)
     }
 
@@ -446,7 +446,7 @@ final class BotBrowserRouterTests: XCTestCase {
         )
         await router.reconcileBotBrowserActions()
         let result = try XCTUnwrap(try store.takeActionResult(id: "act-race"))
-        XCTAssertTrue(result.payload.contains("NÃO foi executada"))
+        XCTAssertTrue(result.payload.contains(ManualActionRequest.refusalPhrase))
         XCTAssertTrue(fake.recorded().isEmpty)
     }
 }
