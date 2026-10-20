@@ -89,6 +89,7 @@ public protocol BotComputerDockerClienting: Sendable {
     func create(options: BotComputerContainerCreateOptions) throws -> String
     func start(name: String) throws
     func stop(name: String) throws
+    func update(name: String, restartPolicy: String) throws
     func inspect(name: String) throws -> BotComputerContainerInspect
     func containerExists(name: String) throws -> Bool
     func exec(
@@ -110,6 +111,8 @@ public protocol BotComputerDockerClienting: Sendable {
 
 public extension BotComputerDockerClienting {
     func removeNetwork(name: String) throws {}
+
+    func update(name: String, restartPolicy: String) throws {}
 
     func networkExists(name: String) throws -> Bool {
         throw BotComputerDockerError.provisioningFailed
@@ -274,6 +277,7 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
             "--name", options.name,
             "--shm-size", "\(options.shmSize)",
             "-p", "\(options.hostIP):\(options.hostPort):\(options.containerPort)",
+            "--restart", "unless-stopped",
         ]
         if let network = options.network, !network.isEmpty {
             args += ["--network", network]
@@ -308,6 +312,10 @@ public struct BotComputerDockerCLI: BotComputerDockerClienting {
 
     public func stop(name: String) throws {
         _ = try run(["stop", name])
+    }
+
+    public func update(name: String, restartPolicy: String) throws {
+        _ = try run(["update", "--restart", restartPolicy, name])
     }
 
     public func rename(from: String, to: String) throws {

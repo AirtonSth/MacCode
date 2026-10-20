@@ -1,7 +1,10 @@
 import Foundation
 import CryptoKit
+import os
 import CoreModel
 import Persistence
+
+private let guestServiceLog = Logger(subsystem: "io.remotecode.agent", category: "bot.guest")
 
 public struct BotComputerGuestReady: Equatable, Sendable {
     public var screenURL: URL
@@ -273,6 +276,12 @@ public final class BotComputerGuestService: @unchecked Sendable {
                currentWorkspacesLabel(existing) == BotComputerGuestSpec.workspacesLabel(workspaces),
                heldByAnotherRun(botID: botID, requestingThreadID: requestingThreadID)
                 || (imageMatches(existing, tag: image) && runtimeIsCurrent(existing)) {
+                // Containers made before `--restart unless-stopped` keep Docker's default policy.
+                do {
+                    try docker.update(name: name, restartPolicy: "unless-stopped")
+                } catch {
+                    guestServiceLog.error("bot.guest.restart_policy_update_failed container=\(name, privacy: .public) error=\(String(describing: error), privacy: .public)")
+                }
                 if existing.running == false {
                     // Unproven until `readyState` has its screenshot.
                     Self.unprovenLock.withLock { _ = Self.unprovenContainers.insert(name) }

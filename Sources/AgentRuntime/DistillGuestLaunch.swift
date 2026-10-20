@@ -161,6 +161,8 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
     /// hung cleanup must not block every later run of the bot, and the guest's
     /// lease reaper and the launch sweep still end anything left behind.
     public static let teardownTimeout: TimeInterval = 30
+    /// The in-guest Distill fetches its model catalog before answering `initialize` (~16 s in a bot VM).
+    public static let initializeTimeout: TimeInterval = 60
 
     /// - Parameters:
     ///   - teardown: the resolver's cleanup after the guest process is gone

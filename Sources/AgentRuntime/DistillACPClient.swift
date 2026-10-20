@@ -780,8 +780,8 @@ public final class DistillACPClient: @unchecked Sendable {
         ]
     }
 
-    public func initialize(clientVersion: String = "0.0.0") async throws -> DistillACPInitializeResult {
-        let result = try await requestJSONObject(method: "initialize", params: Self.initializeParams(clientVersion: clientVersion), timeout: 15)
+    public func initialize(clientVersion: String = "0.0.0", timeout: TimeInterval = 15) async throws -> DistillACPInitializeResult {
+        let result = try await requestJSONObject(method: "initialize", params: Self.initializeParams(clientVersion: clientVersion), timeout: timeout)
         let initialized = try DistillACPInitializeResult.parse(result)
         lock.withLock {
             modelCatalog = initialized.models

@@ -1297,7 +1297,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // initialize/session/new/set_model; the coordinator records the Stop.
         request.acceptancePermit?.onInvalidate { [weak client] in client?.stop() }
         do {
-            let capabilities = try await client.initialize()
+            let capabilities = try await client.initialize(
+                timeout: guestPlan == nil ? 15 : DistillGuestLaunchPlan.initializeTimeout
+            )
             if let guestPlan {
                 // The docker CLI read it before the guest could answer.
                 unlink(guestPlan.envFileURL.path)

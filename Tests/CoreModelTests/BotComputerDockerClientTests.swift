@@ -2,6 +2,35 @@ import XCTest
 @testable import CoreModel
 
 final class BotComputerDockerClientTests: XCTestCase {
+    func test_createKeepsTheBotDesktopRestartingAcrossDockerRestarts() throws {
+        // WHY: the bot VM is always on; without this policy a Docker or Mac
+        // restart leaves the desktop stopped until the next run.
+        var captured: [String] = []
+        let cli = BotComputerDockerCLI { args in
+            captured = args
+            return Data("container-id\n".utf8)
+        }
+        let options = BotComputerContainerCreateOptions(
+            name: "remotecode-bot-restart",
+            image: "remotecode-computer:test",
+            labels: [:],
+            environment: [:],
+            binds: [],
+            hostIP: "127.0.0.1",
+            hostPort: 0,
+            containerPort: 6080,
+            shmSize: 1_024,
+            network: nil
+        )
+
+        _ = try cli.create(options: options)
+
+        let flag = try XCTUnwrap(captured.firstIndex(of: "--restart"))
+        XCTAssertEqual(captured[flag + 1], "unless-stopped")
+        XCTAssertEqual(captured.first, "create")
+        XCTAssertEqual(captured.last, "remotecode-computer:test")
+    }
+
     func test_networkExistsRequiresReadableExactCensus() throws {
         let present = BotComputerDockerCLI { args in
             XCTAssertEqual(args, ["network", "ls", "-q", "--filter", "name=^context-network$"])

@@ -833,6 +833,9 @@ extension AppContext {
                     docker: sweepDocker, appSupport: appSupport, botIDs: botIDs, barrier: barrier,
                     contextStore: store, beforeOpening: trimGuestCache
                 )
+                if let sweepDocker {
+                    BotGuestLaunchSweep.startStoppedDesktops(docker: sweepDocker, store: store)
+                }
             }
         }
         let contextStore = botStore
@@ -1061,6 +1064,30 @@ enum BotGuestLaunchSweep {
             URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
         }
         return canonical(a) == canonical(b)
+    }
+
+    /// Starts the Docker desktop of each live bot whose container exists but is
+    /// stopped, so the bot's desktop is up without a run. Creates nothing;
+    /// best-effort, a failure is logged and skipped.
+    static func startStoppedDesktops(docker: any BotComputerDockerClienting, store: BotStore) {
+        let bots: [BotDefinition]
+        do {
+            bots = try store.list(includeHidden: true)
+        } catch {
+            guestResolverLog.error("bot.guest.desktop_start skipped=bot_list_failed error=\(String(describing: error), privacy: .public)")
+            return
+        }
+        for bot in bots {
+            guard let revisionID = bot.currentRevisionID,
+                  (try? store.getRevision(id: revisionID))??.desktopKind == .dockerDesktop else { continue }
+            let name = BotComputerGuestSpec.containerName(botID: bot.id)
+            guard let container = try? docker.inspect(name: name), !container.running else { continue }
+            do {
+                try docker.start(name: name)
+            } catch {
+                guestResolverLog.error("bot.guest.desktop_start_failed container=\(name, privacy: .public) error=\(String(describing: error), privacy: .public)")
+            }
+        }
     }
 
     static func removeLeftovers(appSupport: URL, fileManager: FileManager = .default) {
