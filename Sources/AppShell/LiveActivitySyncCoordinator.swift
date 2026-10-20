@@ -46,6 +46,16 @@ public enum PrivateLiveActivityProjectionPhase: String, Codable, Equatable, Send
     case failed
 }
 
+/// A canonical inbox card to review in the authenticated foreground app.
+/// Contains no question text and grants no authority to execute an action.
+public struct TitioLiveActivityFocus: Codable, Equatable, Sendable {
+    public let botId: String
+    public let conversationId: String
+    public let messageId: String
+    public let actionId: String
+    public let questionRevision: Int
+}
+
 /// Versioned ActivityKit content-state shared by the Mac host, backend, and iOS.
 /// Dates stay integer Unix seconds on the wire; clients construct `Date` locally.
 public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
@@ -53,6 +63,7 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
     public let statusLine: String
     public let preview: String
     public let petState: String?
+    public let titioFocus: TitioLiveActivityFocus?
     public let phase: PrivateLiveActivityProjectionPhase
     public let activeThreadCount: Int
     public let updatedAt: Double
@@ -71,6 +82,7 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
         statusLine: String,
         preview: String = "MacCode",
         petState: String? = nil,
+        titioFocus: TitioLiveActivityFocus? = nil,
         phase: PrivateLiveActivityProjectionPhase,
         activeThreadCount: Int,
         updatedAt: Double,
@@ -88,6 +100,7 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
         self.statusLine = statusLine
         self.preview = preview
         self.petState = petState
+        self.titioFocus = titioFocus
         self.phase = phase
         self.activeThreadCount = activeThreadCount
         self.updatedAt = updatedAt
@@ -113,7 +126,8 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
             runStartDate: runStartDate,
             workspaceId: workspaceId,
             threadId: threadId,
-            petState: petState
+            petState: petState,
+            titioFocus: titioFocus
         )
     }
 }
@@ -627,6 +641,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
             statusLine: statusLine,
             preview: preview,
             petState: titio.map { $0.openDecisions > 0 ? "question" : count > 0 ? "coding" : "success" },
+            titioFocus: event != .end && phase == .running ? titio?.focus : nil,
             phase: phase,
             activeThreadCount: count,
             updatedAt: Double(Int64(now.timeIntervalSince1970)),

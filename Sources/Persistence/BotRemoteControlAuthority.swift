@@ -108,7 +108,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// `bot.notice.act` (hub spec §7): Titio's notice hub claims the row and
     /// answers `{"outcome", "route"?}`. Runs off the MainActor under the
     /// authority lock, so it must not call back into this authority.
-    public var onNoticeReply: ((BotID, String, String) throws -> [String: Any])?
+    public var onNoticeReply: ((BotID, String, String, Int?) throws -> [String: Any])?
     public var onNoticeContextualAct: ((BotID, String, Int) throws -> [String: Any]?)?
     public var onNoticeAct: ((BotID, String, Int) throws -> [String: Any])?
     /// `bot.notice.read`: the inbox unread count goes to 0.
@@ -3573,7 +3573,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               let text = string(params, "text"), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               text.utf8.count <= 65_536 else { throw Error.invalidParams }
         guard let onNoticeReply else { throw Error(code: -32091, message: "Bot runtime is unavailable.") }
-        let answer = try onNoticeReply(bot.id, messageID, text)
+        let revision = int(params, "question_revision")
+        if params["question_revision"] != nil && (revision == nil || revision! < 0) { throw Error.invalidParams }
+        let answer = try onNoticeReply(bot.id, messageID, text, revision)
         let outcome = answer["outcome"] ?? "not_found"
         var result = receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
             "message_id": messageID.lowercased(), "outcome": outcome, "route": "bot",

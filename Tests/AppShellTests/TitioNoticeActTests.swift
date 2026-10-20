@@ -149,13 +149,18 @@ final class TitioNoticeActTests: XCTestCase {
         let a = question("A", f)
         let aID = await post(a, f)
         let capturedQuestion = try XCTUnwrap(BotChoicesBlock.parse(transcript(f)[0].content).choices?.question)
+        let focus = try XCTUnwrap(f.recorder.inbox.last?.focus)
+        XCTAssertEqual(focus.messageId, aID.lowercased())
+        XCTAssertEqual(focus.actionId, "reply")
+        XCTAssertEqual(f.center.replyNow(messageID: aID, text: "stale answer", expectedQuestionRevision: focus.questionRevision + 1), .alreadyResolved)
+        XCTAssertTrue(f.actions.calls.isEmpty)
         XCTAssertEqual(f.center.contextualReply(messageID: aID, optionIndex: 0)?["outcome"] as? String, "reply_required")
         XCTAssertNil(try f.repo.inboxState().armedReplyKey, "opening a capable composer is device-local")
         let b = question("B", f)
         let bID = await post(b, f)
         _ = f.center.contextualReply(messageID: bID, optionIndex: 0)
-        async let first = Task.detached { f.center.replyNow(messageID: aID, text: "staging") }.value
-        async let second = Task.detached { f.center.replyNow(messageID: aID, text: "production") }.value
+        async let first = Task.detached { f.center.replyNow(messageID: aID, text: "staging", expectedQuestionRevision: focus.questionRevision) }.value
+        async let second = Task.detached { f.center.replyNow(messageID: aID, text: "production", expectedQuestionRevision: focus.questionRevision) }.value
         let outcomes = await [first, second]
         XCTAssertEqual(outcomes.filter { $0 == .accepted }.count, 1)
         XCTAssertEqual(outcomes.filter { $0 == .alreadyResolved }.count, 1)
@@ -163,6 +168,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(f.actions.calls.count, 1)
         XCTAssertEqual(try f.repo.get(key: a.key)?.resolution, .answered)
         XCTAssertEqual(try f.repo.get(key: b.key)?.state, .posted)
+        XCTAssertEqual(f.recorder.inbox.last?.focus?.messageId, bID.lowercased())
         let user = try XCTUnwrap(transcript(f).first { $0.role == .user })
         XCTAssertEqual(AgentReplyQuote.parse(user.content)?.excerpt, capturedQuestion)
     }

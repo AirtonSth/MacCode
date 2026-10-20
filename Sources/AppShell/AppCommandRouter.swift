@@ -4438,8 +4438,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // touch the hub's thread-safe ledger and in-memory mirrors.
         let noticeCenter = ctx.titioNoticeCenter
         let noticeHostID = ctx.liveActivityHostIdentity.serverId
-        created.onNoticeReply = { botID, messageID, text in
-            ["outcome": noticeCenter.replyNow(messageID: messageID, text: text).wireName,
+        created.onNoticeReply = { botID, messageID, text, revision in
+            ["outcome": noticeCenter.replyNow(messageID: messageID, text: text, expectedQuestionRevision: revision).wireName,
              "host_id": noticeHostID, "bot_id": botID.value.uuidString.lowercased()]
         }
         created.onNoticeContextualAct = { _, messageID, optionIndex in

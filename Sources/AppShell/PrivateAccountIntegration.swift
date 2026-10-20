@@ -77,6 +77,7 @@ public struct PrivateLiveActivityContentState: Codable, Equatable, Sendable {
     public let threadId: String?
     public let petState: String?
     public let petFrame: Int?
+    public let titioFocus: TitioLiveActivityFocus?
 
     public init(
         title: String,
@@ -89,7 +90,8 @@ public struct PrivateLiveActivityContentState: Codable, Equatable, Sendable {
         workspaceId: String? = nil,
         threadId: String? = nil,
         petState: String? = nil,
-        petFrame: Int? = nil
+        petFrame: Int? = nil,
+        titioFocus: TitioLiveActivityFocus? = nil
     ) {
         self.title = title
         self.statusLine = statusLine
@@ -102,6 +104,7 @@ public struct PrivateLiveActivityContentState: Codable, Equatable, Sendable {
         self.threadId = threadId
         self.petState = petState
         self.petFrame = petFrame
+        self.titioFocus = titioFocus
     }
 }
 
@@ -402,6 +405,8 @@ public struct PrivateLiveActivityV2DeliveryRequest: Codable, Equatable, Sendable
     public let runStartEpochSeconds: Int64?
     public let workspaceId: String?
     public let threadId: String?
+    public let petState: String?
+    public let titioFocus: TitioLiveActivityFocus?
 
     public init(delivery: LiveActivitySyncDelivery, target: PrivatePushTargetRecord) {
         protocolVersion = 2
@@ -423,6 +428,8 @@ public struct PrivateLiveActivityV2DeliveryRequest: Codable, Equatable, Sendable
         runStartEpochSeconds = delivery.projection.runStartDate.map(Int64.init)
         workspaceId = delivery.projection.workspaceId
         threadId = delivery.projection.threadId
+        petState = delivery.projection.petState
+        titioFocus = delivery.projection.titioFocus
     }
 }
 

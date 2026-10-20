@@ -111,6 +111,7 @@ public struct TitioInboxSnapshot: Equatable, Sendable {
     public var openDecisions: Int
     public var lastPreview: String?
     public var lastAt: Date?
+    public var focus: TitioLiveActivityFocus? = nil
 
     /// The `titio_inbox` wire object (`bot.updated`, later `bot.list`).
     public var wireObject: JSONValue {
@@ -1252,7 +1253,7 @@ public actor TitioNoticeCenter {
     }
 
     private func snapshot(target: TitioInboxTarget, inbox: TitioInboxState, openDecisions: Int) -> TitioInboxSnapshot {
-        TitioInboxSnapshot(
+        var value = TitioInboxSnapshot(
             botID: target.botID,
             conversationID: target.conversationID,
             threadID: target.threadID,
@@ -1261,6 +1262,23 @@ public actor TitioNoticeCenter {
             lastPreview: inbox.lastPreview,
             lastAt: inbox.lastAt
         )
+        if openDecisions > 0 {
+            for row in (try? repo.openCards()) ?? [] where row.urgency == .decision {
+                if let actions = actionsBox.value, !isSourceRequestOpen(row, actions: actions) { continue }
+                guard let raw = row.messageID, let uuid = UUID(uuidString: raw),
+                      let message = try? messageRepo.get(id: AgentMessageID(uuid)),
+                      message.threadId == target.threadID,
+                      let revision = try? messageRepo.bodyRevision(id: message.id) else { continue }
+                value.focus = TitioLiveActivityFocus(
+                    botId: target.botID.value.uuidString.lowercased(),
+                    conversationId: target.conversationID.value.uuidString.lowercased(),
+                    messageId: uuid.uuidString.lowercased(),
+                    actionId: row.actions?.contains(where: { $0.action == .replyHere }) == true ? "reply" : "review",
+                    questionRevision: revision)
+                break
+            }
+        }
+        return value
     }
 
     // MARK: Failure handling (§3 step 6)
@@ -2071,11 +2089,15 @@ public actor TitioNoticeCenter {
 
     /// The card identity, not the latest global arm, owns this reply. Claim
     /// before returning acceptance; a concurrent device cannot send it twice.
-    public nonisolated func replyNow(messageID: String, text: String) -> TitioNoticeActOutcome {
+    public nonisolated func replyNow(messageID: String, text: String, expectedQuestionRevision: Int? = nil) -> TitioNoticeActOutcome {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.utf8.count <= 65_536 else { return .invalidOption }
         guard let record = try? repo.notice(messageID: messageID.uppercased()),
               record.actions?.contains(where: { $0.action == .replyHere }) == true else { return .notFound }
+        if let expectedQuestionRevision {
+            guard let uuid = UUID(uuidString: messageID),
+                  (try? messageRepo.bodyRevision(id: AgentMessageID(uuid))) == expectedQuestionRevision else { return .alreadyResolved }
+        }
         guard let actions = actionsBox.value else { return .unsupported }
         guard isSourceRequestOpen(record, actions: actions) else {
             continuation.yield(.sourceResolved(record.key, .expired))
