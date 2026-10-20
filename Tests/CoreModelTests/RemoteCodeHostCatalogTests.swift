@@ -19,6 +19,7 @@ final class RemoteCodeHostCatalogTests: XCTestCase {
             RemoteCodeHostCatalog.botSkillCreate,
             RemoteCodeHostCatalog.botSkillView,
             RemoteCodeHostCatalog.activityList,
+            RemoteCodeHostCatalog.hostHelp,
             RemoteCodeHostCatalog.botDelegate,
             RemoteCodeHostCatalog.scheduledTaskRunNext,
             RemoteCodeHostCatalog.browserScreenshot,
@@ -28,6 +29,8 @@ final class RemoteCodeHostCatalogTests: XCTestCase {
         XCTAssertEqual(Set(names).count, names.count)
         XCTAssertEqual(RemoteCodeHostCatalog.rpcMethod(for: RemoteCodeHostCatalog.genericHostCallTool), RemoteCodeHostCatalog.hostCallRPC)
         XCTAssertTrue(RemoteCodeHostCatalog.isMutation(RemoteCodeHostCatalog.genericHostCallTool), "host.call needs operation_id and fullAccess")
+        XCTAssertFalse(RemoteCodeHostCatalog.isMutation(RemoteCodeHostCatalog.hostHelp))
+        XCTAssertEqual(RemoteCodeHostCatalog.rpcMethod(for: RemoteCodeHostCatalog.hostHelp), "host.help")
     }
 
     func test_mutationsRequireOperationIDAndMapOntoPrivateHostRPC() {

@@ -383,6 +383,9 @@ public enum BotBrainCompiler {
         lines.append("Approval mode: \(approvalModeText(for: effectiveRunMode(revision: revision, liveRunMode: liveRunMode)))")
         lines.append("Notifications: \(notificationsLine(enabled: bot.notificationsEnabled))")
         lines.append(BotStandingInstructions.admittedToolsText(for: revision.desktopKind, inGuest: runsInGuest))
+        if bot.handle.lowercased() == TitioIdentity.handle {
+            lines.append(TitioIdentity.orchestrationDirective)
+        }
         if let browser = browserLine(browser) {
             lines.append(browser)
         }
@@ -773,6 +776,16 @@ public enum BotBrainCompiler {
                 reason: "Desk-admitted tools. Custom soul must not hide them."
             )
         )
+        if bot.handle.lowercased() == TitioIdentity.handle {
+            layers.append(BotContextLayer(
+                id: "titio-control-center",
+                kind: .tools,
+                title: "MacCode control center",
+                text: TitioIdentity.orchestrationDirective,
+                included: true,
+                reason: "Current host capabilities for Titio chats and scheduled runs."
+            ))
+        }
 
         if let browser = browserLine(browser) {
             layers.append(

@@ -543,8 +543,6 @@ public enum TitioNoticeTiming {
     public static let bannerRepostWindow: TimeInterval = 10 * 60
     /// Resolved/dropped rows older than this are pruned at startup.
     public static let retention: TimeInterval = 30 * 24 * 60 * 60
-    /// Open notice cards stacked at the bottom of the transcript before "+N open decisions".
-    public static let openNoticeCardsMax = 3
     /// Bot attention items older than this never become a notice: the first
     /// pass after an upgrade must not turn a weeks-old backlog into a burst of
     /// messages, banners and pushes (those items stay in Activity).

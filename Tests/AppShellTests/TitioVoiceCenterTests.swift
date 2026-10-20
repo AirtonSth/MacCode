@@ -235,6 +235,39 @@ final class TitioVoiceCenterTests: XCTestCase {
         XCTAssertEqual(f.actions.calls, [.request(requestThread, "Q1", .decline)], "option 1 is the ledger's decline")
     }
 
+    func test_acknowledgingOnlyClosesThatQuestionWithoutAMessageOrModelCall() async throws {
+        let voice = FakeTitioVoice { _ in
+            #"{"message":"O trabalho falhou.","question":"O que deseja fazer?","options":["Abrir a conversa","Entendi"]}"#
+        }
+        let f = try makeFixture(voice: voice)
+        let first = failure("R1", f)
+        let second = failure("R2", f)
+        f.center.ingest(first)
+        f.center.ingest(second)
+        await f.center.idle()
+        await waitForPushes(f, count: 2)
+        let before = try transcript(f)
+        let writerCalls = voice.requests.count
+        let firstID = TitioNoticeIDs.messageID(forKey: first.key).uuidString
+
+        XCTAssertEqual(f.center.actNow(messageID: firstID, optionIndex: 1), .accepted)
+        await f.center.settleActs()
+        await f.center.idle()
+        XCTAssertEqual(f.center.actNow(messageID: firstID, optionIndex: 1), .alreadyResolved)
+        await f.center.settleActs()
+        await f.center.idle()
+
+        let after = try transcript(f)
+        XCTAssertEqual(after.map(\.id), before.map(\.id), "Entendi is not a new user turn")
+        XCTAssertEqual(voice.requests.count, writerCalls, "no model is needed to dismiss a question")
+        XCTAssertEqual(f.actions.calls, [.ackActivity("run:r1")], "no run, answer or Bot message was sent")
+        XCTAssertEqual(try f.repo.get(key: first.key)?.resolution, .acknowledged)
+        XCTAssertEqual(try f.repo.get(key: second.key)?.state, .posted)
+        let acknowledged = try XCTUnwrap(after.first { $0.id.value.uuidString == firstID })
+        XCTAssertEqual(acknowledged.content, "O trabalho falhou.")
+        XCTAssertEqual(after.filter { BotChoicesBlock.parse($0.content).choices != nil }.count, 1)
+    }
+
     func test_providerOptionLabelsStayVerbatim() async throws {
         // WHY: a provider option's text is the answer itself; a translated
         // label would confuse the user about what is sent.

@@ -1419,11 +1419,17 @@ public actor TitioNoticeCenter {
         }
         let messageLanguage = TitioNoticeCopy.detectedLanguage(original.content) ?? language()
         let fallbackStatus = TitioNoticeCopy.statusLine(status, language: messageLanguage, at: date, timeZone: timeZone)
-        let text = TitioNoticeCopy.resolvedText(original: original.content, statusLine: voice == nil ? fallbackStatus : nil)
+        // Acknowledging a notice only closes its question. It must not call a
+        // model to write "Seen", or turn the tap into another conversation turn.
+        let writesStatus = resolution != .acknowledged
+        let text = TitioNoticeCopy.resolvedText(
+            original: original.content,
+            statusLine: writesStatus && voice == nil ? fallbackStatus : nil
+        )
         if text != original.content {
             await writeRewrite(original, text: text, language: messageLanguage, key: record.key)
         }
-        guard let writer = voice else { return }
+        guard writesStatus, let writer = voice else { return }
         let request = TitioVoiceRequest(
             purpose: .status,
             prompt: TitioVoicePrompt.status(status, at: date, language: voiceLanguage(), timeZone: timeZone),
@@ -1869,7 +1875,7 @@ public actor TitioNoticeCenter {
         guard claimed else {
             // A repeated tap while the first act runs (`acting`) is silent:
             // that act reports. A notice that already ended gets the honest line.
-            if (try? repo.get(key: record.key))?.state != .acting {
+            if option.action != .ack, (try? repo.get(key: record.key))?.state != .acting {
                 spawnAct { center in await center.reportAlreadyResolved(record) }
             }
             return .alreadyResolved
@@ -1964,7 +1970,9 @@ public actor TitioNoticeCenter {
     private func runClaimedAct(_ record: TitioNoticeRecord, option: TitioNoticeCardOption, actions: TitioNoticeActionHooks) async {
         let language = messageLanguage(record)
         let label = option.label ?? TitioNoticeCopy.label(for: option.action, language: language, botName: record.facts.botName)
-        await appendActMessage(role: .user, text: label)
+        if option.action != .ack {
+            await appendActMessage(role: .user, text: label)
+        }
         let facts = record.facts
         let source = record.source
         switch option.action {

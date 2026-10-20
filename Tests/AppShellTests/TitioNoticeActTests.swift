@@ -418,7 +418,8 @@ final class TitioNoticeActTests: XCTestCase {
         let texts = try transcript(f).map(\.content)
         XCTAssertTrue(texts.contains("Asked **Build** to continue."))
         XCTAssertTrue(texts.contains("Running **Nightly** again."))
-        XCTAssertTrue(texts.contains { $0.hasSuffix("_Seen._") }, "Entendi only marks the card seen")
+        XCTAssertFalse(texts.contains { $0 == "Got it" || $0.hasSuffix("_Seen._") },
+                       "acknowledging only closes the question, without adding a turn or a status")
     }
 
     // MARK: Old iOS text intercept

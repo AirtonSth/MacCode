@@ -3609,6 +3609,45 @@ public final class JSONRPCDispatcher {
                 )
             case "host.activity.list":
                 return .init(id: id, result: try await router.listHostActivity())
+            case "host.help":
+                let topic = params["topic"]?.stringValue
+                if params["topic"] != nil && topic == nil { throw JSONRPCError.invalidParams }
+                if let topic {
+                    guard let guide = TitioCapabilities.topics.first(where: { $0.id == topic }) else {
+                        throw JSONRPCError(code: -32602, message: "Unknown topic. Call rc_host_help without topic to list supported interactions.")
+                    }
+                    var result: [String: JSONValue] = [
+                        "topic": .string(guide.id),
+                        "title": .string(guide.title),
+                        "instructions": .string(guide.instructions),
+                    ]
+                    if topic == "schedules" {
+                        result["bot_schedule_spec_example"] = .string(BotScheduleSpec().encodedJSON())
+                    }
+                    return .init(id: id, result: .object(result))
+                }
+                let threadCommands: Set<String> = [
+                    "agent.thread.fork", "agent.thread.side", "agent.thread.side.close", "agent.thread.btw",
+                ]
+                let mutations = HostMutationContract.methods.union(threadCommands)
+                let methods = Self.readOnlyBatchMethods.union(mutations)
+                    .union(["agent.activity.list"])
+                    .filter {
+                        Self.titioHostCallAdmits($0)
+                            && !["private.", "sync.", "events.", "token_saver.", "command."].contains(where: $0.hasPrefix)
+                    }.sorted()
+                return .init(id: id, result: .object([
+                    "topics": .array(TitioCapabilities.topics.map { topic in
+                        .object([
+                            "id": .string(topic.id), "title": .string(topic.title),
+                            "examples": .array(topic.examples.map(JSONValue.string)),
+                        ])
+                    }),
+                    "methods": .array(methods.map { method in
+                        .object(["method": .string(method), "mutation": .bool(mutations.contains(method))])
+                    }),
+                    "usage": .string("Read the relevant topic before calling rc_host_call. Resolve ids from live reads, preserve scope, supply operation_id, then verify the returned outcome. Methods still enforce their normal permissions and availability."),
+                ]))
             case "host.bot.delegate":
                 guard let bot = params["bot"]?.stringValue,
                       let text = params["text"]?.stringValue,

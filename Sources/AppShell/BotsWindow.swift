@@ -11144,8 +11144,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     /// Titio's inbox only (hub spec §7): the notices the host posted since the
-    /// user's last message, which the provider session never saw, plus the
-    /// rule that Titio cannot approve or answer them itself. Nil elsewhere.
+    /// user's last message plus still-open decisions, which the provider session
+    /// never saw. Decisions can only follow an explicit user instruction.
     func titioNoticeTurnDirective(conversationID: BotConversationID, threadID: AgentThreadID, userText: String) -> String? {
         guard conversationID == titioInboxConversationID else { return nil }
         let request = userText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -11153,11 +11153,16 @@ public final class BotsViewModel: ObservableObject {
         // The desk may already have stored this turn's own line.
         if users.last?.content.trimmingCharacters(in: .whitespacesAndNewlines) == request { users.removeLast() }
         let since = users.last?.createdAt ?? .distantPast
-        let rows = (try? TitioNoticeRepository(db: context.db).recentPosted(since: since)) ?? []
-        return TitioNoticeDirective.text(
-            rows: rows,
+        let repo = TitioNoticeRepository(db: context.db)
+        let recent = (try? repo.recentPosted(since: since)) ?? []
+        let open = (try? repo.openCards()) ?? []
+        let rows = Dictionary((recent + open).map { ($0.key, $0) }, uniquingKeysWith: { _, latest in latest })
+        guard let directive = TitioNoticeDirective.text(
+            rows: Array(rows.values),
             language: TitioNoticeCopy.language(lastUserText: request, preferredLanguages: Locale.preferredLanguages)
-        )
+        ) else { return nil }
+        guard let botID = (try? context.botStore.conversation(id: conversationID))?.botID else { return directive }
+        return "Titio inbox bot_id: \(botID.value.uuidString.lowercased())\n" + directive
     }
 
     /// The peer directive and the inbox directive, in that order.

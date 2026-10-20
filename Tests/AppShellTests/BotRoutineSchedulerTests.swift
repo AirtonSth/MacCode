@@ -112,6 +112,22 @@ final class BotRoutineSchedulerTests: XCTestCase {
         return try XCTUnwrap(listed.objectValue?["routines"]?.arrayValue?.first?.objectValue)
     }
 
+    func test_scheduledTitioUsesTheCurrentControlCenterWithoutReplacingCustomInstructions() async throws {
+        let f = try makeFixture()
+        let titio = try f.vm.create(name: "Titio", handle: "titio", soul: "Always summarize in Portuguese.")
+        let (_, slot) = try saveActiveRoutine(f, bot: titio, base: Date())
+
+        f.scheduler.tick(now: slot.addingTimeInterval(5))
+        await f.scheduler.settleForTesting()
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertTrue(request.prompt.contains(TitioIdentity.orchestrationDirective))
+        XCTAssertTrue(request.prompt.contains("Always summarize in Portuguese."))
+        XCTAssertTrue(request.prompt.contains("Review the open PRs and report"))
+        f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
     func test_dueSlotAfterContextRevocationRunsLegacyAndNeverCreatesAPinOrGrant() async throws {
         // WHY: a routine has no contextual contract. Revoking a Bot's context grant
         // before the slot drains must neither block the legacy run nor let the
