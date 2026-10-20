@@ -138,6 +138,30 @@ final class AgentThreadDeletionUndoTests: XCTestCase {
     // WHY: deleting a thread must remain instant and persisted — but an accidental
     // delete is destructive, so the snapshot must be available to undo. This proves
     // BOTH at once: the row is gone from the store immediately, AND an undo handle exists.
+    func test_clearAllAcknowledgesNotificationsWithoutDeletingHistoryOrChangingStatus() async throws {
+        let vm = try makeVM()
+        vm.createThread(title: "Keep history")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        let message = AgentMessage(threadId: id, role: .user, content: "Keep this")
+        try vm.messageRepo.append(message)
+        var thread = try XCTUnwrap(vm.threadRepo.get(id: id))
+        thread.status = .failed
+        thread.hasUnread = true
+        try vm.threadRepo.upsert(thread)
+        vm.markThreadRead = { _ = try vm.threadRepo.markReadPreservingActivity(of: $0) }
+        vm.reloadThreads()
+        let cleared = await vm.clearAllThreads()
+        XCTAssertTrue(cleared)
+        let kept = try XCTUnwrap(vm.threadRepo.get(id: id))
+        XCTAssertEqual(kept.status, .failed, "acknowledging an error must preserve its history")
+        XCTAssertFalse(kept.hasUnread)
+        XCTAssertTrue(try vm.messageRepo.hasAny(threadId: id))
+        XCTAssertEqual(vm.selectedThreadId, id)
+        XCTAssertTrue(vm.threadNotificationDismissed(kept))
+        thread.updatedAt = thread.updatedAt.addingTimeInterval(1)
+        XCTAssertFalse(vm.threadNotificationDismissed(thread), "new activity must notify again")
+    }
+
     func test_deleteThread_removesImmediatelyButOffersUndo() async throws {
         let vm = try makeVM()
         vm.createThread(title: "keep")

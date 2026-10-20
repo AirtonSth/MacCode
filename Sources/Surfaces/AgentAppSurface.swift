@@ -7492,10 +7492,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// Delete every thread in this workspace (stops active providers first).
-    @discardableResult
+    @Published private var dismissedThreadActivity: [String: Double] = UserDefaults.standard.dictionary(forKey: "agent.dismissedThreadActivity") as? [String: Double] ?? [:]
+
+    public func threadNotificationDismissed(_ thread: AgentThread) -> Bool {
+        dismissedThreadActivity[thread.id.value.uuidString] == thread.updatedAt.timeIntervalSince1970
+    }
+
     public func clearAllThreads() async -> Bool {
-        let ids = Set(threads.map(\.id))
-        return await deleteThreads(ids)
+        for thread in threads {
+            if thread.hasUnread {
+                guard let markThreadRead else { return false }
+                do { try markThreadRead(thread.id) }
+                catch { reloadThreads(); return false }
+            }
+            dismissedThreadActivity[thread.id.value.uuidString] = thread.updatedAt.timeIntervalSince1970
+            if let index = threads.firstIndex(where: { $0.id == thread.id }) { threads[index].hasUnread = false }
+        }
+        UserDefaults.standard.set(dismissedThreadActivity, forKey: "agent.dismissedThreadActivity")
+        return true
     }
 
     private func restoreNewThreadDefaults(_ saved: AgentNewThreadDefaults) {
@@ -15427,14 +15441,14 @@ public struct AgentAppView: View {
             Text(Self.threadDeletionConfirmationDescription)
         }
         .confirmationDialog(
-            "Clear all threads?",
+            "Clear all notifications?",
             isPresented: $pendingClearAllThreads,
             titleVisibility: .visible
         ) {
-            Button("Clear All", role: .destructive) { commitClearAllThreads() }
+            Button("Clear All") { commitClearAllThreads() }
             Button("Cancel", role: .cancel) { pendingClearAllThreads = false }
         } message: {
-            Text("Deletes every thread in this workspace and its history. Running agents will be stopped first. This cannot be undone after the undo window expires.")
+            Text("Clears notification indicators. Conversations, messages, and running agents are kept.")
         }
     }
 
@@ -15508,11 +15522,11 @@ public struct AgentAppView: View {
             let selected = vm.selectedThreadId == t.id
             let multiSelected = selectedThreadIds.contains(t.id)
             let markColor = TabColor.from(t.color).map { Color(hex: $0.hex) }
-                ?? (t.status == .failed ? DS.Palette.danger : DS.Palette.textTertiary)
+                ?? (t.status == .failed && !vm.threadNotificationDismissed(t) ? DS.Palette.danger : DS.Palette.textTertiary)
             let status: AgentChatThreadStatusMark = {
                 if running { return .running }
                 if t.pinned { return .symbol(name: "pin.fill", color: markColor, size: 9) }
-                if t.status == .failed { return .symbol(name: "circle.fill", color: DS.Palette.danger, size: 7) }
+                if t.status == .failed && !vm.threadNotificationDismissed(t) { return .symbol(name: "circle.fill", color: DS.Palette.danger, size: 7) }
                 if !t.hasUnread { return .symbol(name: "circle.fill", color: markColor, size: 7) }
                 return .hidden
             }()
@@ -15534,7 +15548,12 @@ public struct AgentAppView: View {
                 onSelect: { selectThreadRow(t) },
                 onStop: running ? { vm.stopThread(t.id) } : nil,
                 leading: {
-                    AgentThreadProviderMonogram(provider: t.provider)
+                    if case .bot(let botID) = t.actor,
+                       let bot = vm.mentionableBotsProvider().first(where: { $0.id == botID }) {
+                        BotsAvatarView(name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol, size: 20)
+                    } else {
+                        AgentThreadProviderMonogram(provider: t.provider)
+                    }
                 },
                 trailing: {
                     if AgentThreadRowPresentation.showsSelectionCheck(
@@ -19516,9 +19535,7 @@ public struct AgentAppView: View {
     private func commitClearAllThreads() {
         pendingClearAllThreads = false
         Task {
-            guard await vm.clearAllThreads() else { return }
-            selectedThreadIds = []
-            lastSelectedThreadId = nil
+            _ = await vm.clearAllThreads()
         }
     }
 

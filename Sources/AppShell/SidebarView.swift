@@ -351,6 +351,8 @@ public final class SidebarViewModel: ObservableObject {
         didSet { noteBotsSettled(was: oldValue.union(runningLinkedBotIDs)) }
     }
     @Published private(set) var deskSelection: DeskSelection?
+    @Published private(set) var newBotConversationThreadID: AgentThreadID?
+    private var draftMessageSink: AnyCancellable?
     @Published private(set) var runningThreadIDs: Set<AgentThreadID> = [] {
         didSet {
             let next = Self.finishedAfterTransition(previous: oldValue, now: runningThreadIDs, current: finishedThreadIDs,
@@ -1005,7 +1007,21 @@ public final class SidebarViewModel: ObservableObject {
         loopLabelsByBot = byBot
     }
 
+    nonisolated static func shouldActivateBotConversation(
+        draft: AgentThreadID?, selected: AgentThreadID?, hasMessages: Bool
+    ) -> Bool {
+        draft != nil && draft == selected && hasMessages
+    }
+
     func observeActiveBots(_ botsViewModel: BotsViewModel) {
+        draftMessageSink = botsViewModel.$deskMessages.sink { [weak self, weak botsViewModel] messages in
+            guard let self, Self.shouldActivateBotConversation(
+                draft: self.newBotConversationThreadID,
+                selected: botsViewModel?.selectedConversation?.linkedAgentThreadID,
+                hasMessages: !messages.isEmpty
+            ) else { return }
+            self.newBotConversationThreadID = nil
+        }
         activeBotCountSink = botsViewModel.$activeBotCount.removeDuplicates().sink { [weak self] count in
             self?.activeBotCount = count
         }
@@ -1128,7 +1144,7 @@ public final class SidebarViewModel: ObservableObject {
         finishedBotIDs.remove(row.botID)
         if let authorized = authorizedBotConversationRows.first(where: { $0.botID == row.botID && $0.context == .general }) {
             // General context: resume its conversation, or start one there; never a workspace transcript.
-            return authorized.conversationID == nil ? startBotConversation(authorized) : openAuthorizedBotConversation(authorized)
+            return startBotConversation(authorized)
         }
         // A Bot without contextual General access opens its Desk exactly like the Bots roster does.
         do {
@@ -1151,6 +1167,7 @@ public final class SidebarViewModel: ObservableObject {
                 showOperationError("Could not start conversation", detail: router?.botsViewModel?.errorMessage ?? "This Bot context is no longer available.")
                 return reloadAuthorizedBotConversationRows()
             }
+            newBotConversationThreadID = botsViewModel.selectedConversation?.linkedAgentThreadID
             reloadAuthorizedBotConversationRows()
         } catch {
             showOperationError("Could not start conversation", detail: error.localizedDescription)
@@ -1169,7 +1186,42 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     /// Same canonical route as Activity: a Bot thread opens its Desk, any other thread its Agent App.
+    public func renameConversation(_ row: WorkspaceConversationRow) {
+        presentPromptSheet(title: "Rename conversation", message: "Enter a new conversation title.", initial: row.title) { [weak self] title in
+            guard let self, let title else { return }
+            do {
+                _ = try self.router?.renameAgentThread(thread: row.threadID, title: title)
+                self.reloadAuthorizedBotConversationRows()
+            } catch {
+                self.showOperationError("Could not rename conversation", detail: error.localizedDescription)
+            }
+        }
+    }
+
+    public func deleteConversation(_ row: WorkspaceConversationRow) {
+        let alert = NSAlert()
+        alert.messageText = "Delete conversation?"
+        alert.informativeText = "This permanently deletes “\(row.title)” and its messages. Any active run will stop."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        let complete: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self, let router = self.router else { return }
+            Task { @MainActor in
+                do {
+                    try await router.deleteAgentThread(thread: row.threadID)
+                    if self.newBotConversationThreadID == row.threadID { self.newBotConversationThreadID = nil }
+                    self.reloadAuthorizedBotConversationRows()
+                } catch {
+                    self.showOperationError("Could not delete conversation", detail: error.localizedDescription)
+                }
+            }
+        }
+        if let window = NSApp.keyWindow { alert.beginSheetModal(for: window, completionHandler: complete) }
+        else { complete(alert.runModal()) }
+    }
+
     public func openWorkspaceConversation(_ row: WorkspaceConversationRow) {
+        newBotConversationThreadID = nil
         finishedThreadIDs.remove(row.threadID)
         guard let router else { return }
         do {
@@ -1194,6 +1246,7 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func openAuthorizedBotConversation(_ row: AuthorizedBotConversationRow) {
+        newBotConversationThreadID = nil
         finishedBotIDs.remove(row.botID)
         guard let conversationID = row.conversationID, let context, let router else { return }
         do {
@@ -3093,10 +3146,10 @@ public struct SidebarRootView: View {
     }
 
     private func botConversationRow(_ row: SidebarViewModel.AuthorizedBotConversationRow) -> some View {
-        let selected = SidebarViewModel.isWorkspaceBotHighlighted(botID: row.botID, context: row.context, desk: vm.deskSelection, selectedWorkspace: vm.selectedWorkspaceID, selectedThreadBot: vm.selectedThreadBotID)
+        let selected = vm.newBotConversationThreadID != nil && vm.deskSelection?.threadID == vm.newBotConversationThreadID && vm.deskSelection?.botID == row.botID && vm.deskSelection?.context == row.context
         let running = SidebarViewModel.isBotRunning(row.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
         return Button {
-            navigate { if row.conversationID == nil { vm.startBotConversation(row) } else { vm.openAuthorizedBotConversation(row) } }
+            navigate { vm.startBotConversation(row) }
         } label: {
             HStack(spacing: DS.Space.sm) {
                 BotsAvatarView(name: row.botName, handle: row.handle, symbol: row.symbol.isEmpty ? nil : row.symbol, size: 20, attention: running ? .working : .none)
@@ -3190,7 +3243,7 @@ public struct SidebarRootView: View {
     }
 
     private func generalBotRow(_ row: SidebarViewModel.GeneralBotRow) -> some View {
-        let selected = SidebarViewModel.isGeneralBotHighlighted(row.botID, desk: vm.deskSelection, selectedThreadBot: vm.selectedThreadBotID)
+        let selected = vm.newBotConversationThreadID != nil && vm.deskSelection?.threadID == vm.newBotConversationThreadID && vm.deskSelection?.botID == row.botID && vm.deskSelection?.context == .general
         let running = SidebarViewModel.isBotRunning(row.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
         return Button { navigate { vm.openGeneralBot(row) } } label: {
             HStack(spacing: DS.Space.sm) {
@@ -3419,7 +3472,7 @@ public struct SidebarRootView: View {
     private func workspaceConversationRow(_ row: SidebarViewModel.WorkspaceConversationRow, workspace: Workspace, age: String?) -> some View {
         // A non-Agent tab on screen (Files, Terminal, ...) owns the selection, not the Agent App's thread.
         let tabOnScreen = vm.visibleTab(in: workspace).map { $0.type != .agentApp } ?? false
-        let selected = (!tabOnScreen && vm.selectedThreadID == row.threadID) || vm.deskSelection?.threadID == row.threadID
+        let selected = vm.newBotConversationThreadID != row.threadID && (vm.isBotsSelected ? vm.deskSelection?.threadID == row.threadID : (!tabOnScreen && vm.selectedThreadID == row.threadID))
         let running = vm.runningThreadIDs.contains(row.threadID)
         return Button { navigate { vm.openWorkspaceConversation(row) } } label: {
             HStack(spacing: DS.Space.sm) {
@@ -3451,6 +3504,16 @@ public struct SidebarRootView: View {
         .accessibilityLabel("\(workspace.name), \(row.title)\(age.map { ", updated \($0)" } ?? "")")
         .accessibilityValue(running ? "Running" : "")
         .accessibilityIdentifier("sidebar.conversation.\(row.id)")
+        .contextMenu {
+            Button("Open") { navigate { vm.openWorkspaceConversation(row) } }
+            Button("Rename…") { vm.renameConversation(row) }
+            Button("Copy title") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(row.title, forType: .string)
+            }
+            Divider()
+            Button("Delete…", role: .destructive) { vm.deleteConversation(row) }
+        }
     }
 
     @ViewBuilder

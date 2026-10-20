@@ -282,7 +282,7 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         }
         let plain = try f.router.createAgentThread(workspace: workspace.id, title: "Plain", provider: .codex, model: "fake", permissionMode: .supervised, reasoningEffort: .medium)
         let bot = try f.context.botStore.create(name: "Piper", title: "", description: "", provider: .distill)
-        let grant = try f.context.botStore.grantContext(hostID: f.host, botID: bot.id, context: .workspace(workspace.id), actions: [.read], expectedRevision: 0)
+        let grant = try f.context.botStore.grantContext(hostID: f.host, botID: bot.id, context: .workspace(workspace.id), actions: [.read, .send], expectedRevision: 0)
         var botThread = AgentThread(workspaceId: workspace.id, title: "Bot work", provider: .distill, model: "fixture")
         botThread.status = .completed
         let conversation = BotConversation(botID: bot.id, title: "Bot work", linkedAgentThreadID: botThread.id)
@@ -313,6 +313,15 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
 
         let botLink = try XCTUnwrap(vm.workspaceBotRows(workspace.id).first)
         XCTAssertEqual(botLink.conversationID, conversation.id, "the Bot row resumes its recent contextual conversation")
+
+        vm.startBotConversation(botLink)
+        let draft = try XCTUnwrap(controller.sidebarBotsViewModelForTesting.selectedConversation)
+        XCTAssertNotEqual(draft.id, conversation.id, "clicking the Bot starts a new conversation instead of resuming")
+        XCTAssertEqual(vm.newBotConversationThreadID, draft.linkedAgentThreadID, "only the Bot owns selection before the first message")
+        vm.openWorkspaceConversation(botRow)
+        XCTAssertNil(vm.newBotConversationThreadID, "opening an existing conversation clears the Bot draft highlight")
+        XCTAssertEqual(controller.sidebarBotsViewModelForTesting.selectedConversation?.id, conversation.id)
+
     }
 
     func test_renderedSidebarShowsRegionsInOrderWithoutTheModeToggle() async throws {

@@ -9,6 +9,15 @@ final class SidebarSelectionAndBotOrderTests: XCTestCase {
     private let a = BotID(UUID()), b = BotID(UUID()), c = BotID(UUID())
     private let ws = WorkspaceID(UUID())
 
+    func test_firstMessageTransfersSelectionOnlyForTheCurrentBotDraft() {
+        let draft = AgentThreadID(UUID())
+        let other = AgentThreadID(UUID())
+        XCTAssertFalse(SidebarViewModel.shouldActivateBotConversation(draft: draft, selected: draft, hasMessages: false))
+        XCTAssertTrue(SidebarViewModel.shouldActivateBotConversation(draft: draft, selected: draft, hasMessages: true))
+        XCTAssertFalse(SidebarViewModel.shouldActivateBotConversation(draft: draft, selected: other, hasMessages: true), "messages from another conversation must not clear the draft selection")
+        XCTAssertFalse(SidebarViewModel.shouldActivateBotConversation(draft: nil, selected: draft, hasMessages: true))
+    }
+
     func test_expandedConversationWorkspaces_roundTripsAndSkipsInvalidIDs() {
         // WHY: expanded state must survive restart; a corrupt stored entry must not drop the valid ones.
         let other = WorkspaceID(UUID())
