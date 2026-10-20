@@ -585,7 +585,7 @@ public struct BotDefinition: Codable, Sendable, Equatable {
         name: String,
         title: String,
         description: String,
-        avatarSymbol: String = "person.crop.circle",
+        avatarSymbol: String = BotBlobatarSpec.default.token,
         pinned: Bool = false,
         hidden: Bool = false,
         currentRevisionID: BotRevisionID? = nil,

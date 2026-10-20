@@ -3255,7 +3255,7 @@ final class BotSelfConfigTests: XCTestCase {
             soul: "Be brief.",
             provider: .claude
         )
-        XCTAssertEqual(bot.avatarSymbol, "person.crop.circle")
+        XCTAssertEqual(bot.avatarSymbol, BotBlobatarSpec.default.token)
         let service = BotSelfConfigService(callerBotID: bot.id, store: store)
 
         let fromName = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [

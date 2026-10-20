@@ -16684,6 +16684,27 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertTrue(vm.desktopHonestyLabel.localizedCaseInsensitiveContains("not isolated"))
     }
 
+    func test_sharedVMDestinationShowsVMDesktopEvenWhenRevisionSnapshotIsLogical() throws {
+        // WHY: the host-owned shared VM destination must drive the Desk pane even
+        // when the cached revision snapshot still says logical (out-of-process publish).
+        let context = try makeContext()
+        let bot = try context.botStore.create(
+            name: "Piper",
+            title: "Scout",
+            description: "",
+            provider: .claude,
+            desktopKind: .logicalExecutionSpace
+        )
+        let machine = try context.botStore.saveVirtualMachine(name: "Research")
+        try context.botStore.writeExecutionDestination(.virtualMachine(machine.id), botID: bot.id)
+
+        let vm = BotsViewModel(context: context)
+        vm.openDesk(bot)
+        XCTAssertEqual(vm.selectedRevision?.desktopKind, .logicalExecutionSpace)
+        XCTAssertEqual(vm.displayedDesktopKind, .dockerDesktop)
+        XCTAssertEqual(vm.desktopStatusPill, BotDesktopKind.dockerDesktop.statusPill)
+    }
+
     func test_leftoverStoredDedicatedLocalVMDisplaysAndPublishesAsLogical() throws {
         // WHY: Existing revisions may still store dedicatedLocalVM. Opening and
         // saving must not keep that kind as the live desktop.

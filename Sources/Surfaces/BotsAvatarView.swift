@@ -37,7 +37,7 @@ public struct BotsAvatarView: View {
         Group {
             if let custom = Self.viewOverride(handle, size) {
                 custom.frame(width: size, height: size)
-            } else if let symbol, let spec = BotBlobatarSpec.parse(symbol) {
+            } else if let spec = blobatarSpec {
                 BotBlobatarView(
                     name: name.isEmpty ? handle : name,
                     spec: spec.liveFaced(attention: attention, name: name, handle: handle),
@@ -50,6 +50,13 @@ public struct BotsAvatarView: View {
             }
         }
         .accessibilityHidden(true)
+    }
+
+    /// Legacy default symbol means the auto blobatar, so older bots render like new ones.
+    private var blobatarSpec: BotBlobatarSpec? {
+        if symbol == "person.crop.circle" { return .default }
+        guard let symbol else { return nil }
+        return BotBlobatarSpec.parse(symbol)
     }
 
     @ViewBuilder

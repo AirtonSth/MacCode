@@ -22,6 +22,11 @@ final class BotStoreTests: XCTestCase {
         XCTAssertEqual(try restored.executionDestination(botID: copy.id), .virtualMachine(scoped.id))
     }
 
+    func test_createWithoutAvatarDefaultsToAutoBlobatar_becauseNewBotsMustNotRenderAsPlainPerson() throws {
+        let bot = try store.create(name: "Piper", title: "", description: "")
+        XCTAssertEqual(bot.avatarSymbol, BotBlobatarSpec.default.token)
+    }
+
     func test_conversationKeepsItsVMWhenTheDefaultChangesAndSchedulesKeepTheirOverride() throws {
         let bot = try store.create(name: "Builder", title: "", description: "")
         let machine = try store.saveVirtualMachine(name: "Build")

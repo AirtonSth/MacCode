@@ -3621,6 +3621,8 @@ public final class BotsViewModel: ObservableObject {
         if screen == .studio {
             return resolvedDesktopKind(studioDraft.desktopKind)
         }
+        // WHY: the shared VM destination is host-owned; selectedRevision can be a stale snapshot.
+        if selectedBotExecutionTarget == .vm { return .dockerDesktop }
         return resolvedDesktopKind(selectedRevision?.desktopKind ?? .logicalExecutionSpace)
     }
 
@@ -5685,7 +5687,7 @@ public final class BotsViewModel: ObservableObject {
         description: String = "",
         handle: String? = nil,
         soul: String = "",
-        avatarSymbol: String = "person.crop.circle",
+        avatarSymbol: String = BotBlobatarSpec.default.token,
         notificationsEnabled: Bool = true,
         desktopKind: BotDesktopKind = .logicalExecutionSpace,
         workspaceID: WorkspaceID? = nil
@@ -5723,7 +5725,7 @@ public final class BotsViewModel: ObservableObject {
         provider _: AgentProvider,
         providerInstanceID _: String? = nil,
         model _: String = "",
-        avatarSymbol: String = "person.crop.circle",
+        avatarSymbol: String = BotBlobatarSpec.default.token,
         notificationsEnabled: Bool = true,
         desktopKind: BotDesktopKind = .logicalExecutionSpace
     ) throws -> BotDefinition {
@@ -7322,7 +7324,7 @@ public final class BotsViewModel: ObservableObject {
             || studioDraftReplyStyle.verbosity != (bot?.verbosity ?? .human)
             || studioDraftReplyStyle.caveman
                 != (bot?.cavemanEnabled ?? BotDefinition.defaultCavemanEnabled(handle: studioDraft.handle))
-            || studioDraft.avatarSymbol != (bot?.avatarSymbol ?? "person.crop.circle")
+            || studioDraft.avatarSymbol != (bot?.avatarSymbol ?? BotBlobatarSpec.default.token)
             || BotHandle.normalize(studioDraft.handle) != bot?.handle
     }
 
@@ -8632,8 +8634,9 @@ public final class BotsViewModel: ObservableObject {
            let target = try? context.threadRepo.get(id: threadID)?.executionTarget {
             return target
         }
-        guard let bot = selectedBotID.flatMap({ id in bots.first(where: { $0.id == id }) }),
-              let revision = try? currentRevision(for: bot) else { return .mac }
+        guard let bot = selectedBotID.flatMap({ id in bots.first(where: { $0.id == id }) }) else { return .mac }
+        if let destination = try? botStore.executionDestination(botID: bot.id) { return destination.target }
+        guard let revision = try? currentRevision(for: bot) else { return .mac }
         return BotExecutionDefault.target(for: revision)
     }
     public var effectiveDeskPermissionMode: AgentPermissionMode {
