@@ -69,6 +69,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
     /// Host action pinned to the bottom-trailing corner, above the composer
     /// (Bots Desk new-thread +). Scroll-to-latest stacks above it.
     private let trailingAccessory: AnyView?
+    private let onReadingHistoryChanged: (Bool) -> Void
     private let content: (CGFloat) -> Content
     private let followOverlay: (@escaping () -> Void) -> FollowOverlay
 
@@ -88,6 +89,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
         verticalPadding: CGFloat = 32,
         columnGutter: CGFloat = 44,
         trailingAccessory: AnyView? = nil,
+        onReadingHistoryChanged: @escaping (Bool) -> Void = { _ in },
         @ViewBuilder content: @escaping (CGFloat) -> Content,
         @ViewBuilder followOverlay: @escaping (@escaping () -> Void) -> FollowOverlay
     ) {
@@ -100,6 +102,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
         self.verticalPadding = verticalPadding
         self.columnGutter = columnGutter
         self.trailingAccessory = trailingAccessory
+        self.onReadingHistoryChanged = onReadingHistoryChanged
         self.content = content
         self.followOverlay = followOverlay
     }
@@ -186,6 +189,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
     }
 
     private func rejoin(_ proxy: ScrollViewProxy) {
+        onReadingHistoryChanged(false)
         sticksToBottom = true
         showScrollDownButton = false
         pinForceToken &+= 1
@@ -219,6 +223,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
         guard !sticksToBottom || showScrollDownButton else { return }
         sticksToBottom = true
         showScrollDownButton = false
+        onReadingHistoryChanged(false)
     }
 
     private func onScrolledAway() {
@@ -226,6 +231,7 @@ public struct AgentChatTimelineScrollContainer<Content: View, FollowOverlay: Vie
         guard sticksToBottom || !showScrollDownButton else { return }
         sticksToBottom = false
         showScrollDownButton = true
+        onReadingHistoryChanged(true)
     }
 }
 

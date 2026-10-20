@@ -36,6 +36,18 @@ final class AgentChatChoicesNoticeTests: XCTestCase {
         XCTAssertEqual(dismissed.map(\.messageID), [second.id.value.uuidString.lowercased()], "a closed card stays closed")
     }
 
+    func test_noticeKeepsSeparateProvenanceAndExactQuestion() throws {
+        let question = String(repeating: "Which release should be deployed? ", count: 8)
+        let raw = TitioNoticeCopy.choicesBlock(question: question, options: ["Staging", "Production"], notice: "notice-A",
+            source: ["workspace": "MacCode", "bot": "Developer", "conversation": "Release"])
+        let choices = try XCTUnwrap(BotChoicesBlock.parse(raw).choices)
+        XCTAssertEqual(choices.source["workspace"], "MacCode")
+        XCTAssertEqual(choices.source["bot"], "Developer")
+        let reply = AgentReplyQuote.compose(excerpt: try XCTUnwrap(choices.question), text: "Staging")
+        XCTAssertEqual(AgentReplyQuote.parse(reply)?.excerpt, question.trimmingCharacters(in: .whitespacesAndNewlines))
+        XCTAssertEqual(AgentReplyQuote.parse(reply)?.body, "Staging")
+    }
+
     func test_newestCardIsUnchangedButNeverDrawsANoticeAsAChatCard() {
         // WHY: ordinary Bot cards keep their newest-only, idle-only rule. A
         // notice block is never the newest-message card on any surface: its
@@ -53,7 +65,7 @@ final class AgentChatChoicesNoticeTests: XCTestCase {
     func test_inboxSourcePinsTheNoticeStackAndHostHooks() throws {
         // WHY: the Mac card must send (message id, option index) to the host,
         // never the label as chat text, ignore isRunning, and an armed reply
-        // must be checked right after the send interceptor, before any run.
+        // must preserve context before ordinary quote composition or any run.
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let surface = try String(contentsOf: root.appendingPathComponent("Sources/Surfaces/AgentAppSurface.swift"))
         XCTAssertTrue(surface.contains("handler(pending.messageID, index)"))

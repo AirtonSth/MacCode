@@ -91,10 +91,12 @@ public final class AgentComposerState: ObservableObject {
 public struct AgentReplyTarget: Equatable, Sendable {
     public let threadId: AgentThreadID
     public let excerpt: String
+    public let noticeMessageID: String?
 
-    public init(threadId: AgentThreadID, excerpt: String) {
+    public init(threadId: AgentThreadID, excerpt: String, noticeMessageID: String? = nil) {
         self.threadId = threadId
         self.excerpt = excerpt
+        self.noticeMessageID = noticeMessageID
     }
 }
 
@@ -444,7 +446,7 @@ public struct AgentAppEmbedding {
     /// Titio's inbox only: checked in `send()` right after `sendInterceptor`.
     /// True means the host took the text (an armed "Reply here"): the prompt
     /// clears and no run starts.
-    public let hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) -> Bool)?
+    public let hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) throws -> Bool)?
     /// Titio's inbox only: the trailing clear button on an assistant message.
     /// The host removes it (`bot.notice.clear` semantics); false means it did
     /// not, and the row comes back.
@@ -463,7 +465,7 @@ public struct AgentAppEmbedding {
         pinnedThread: AgentThread? = nil,
         ownsComposerDraft: Bool = true,
         noticeChoiceHandler: (@MainActor (_ messageID: String, _ optionIndex: Int) -> Void)? = nil,
-        hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) -> Bool)? = nil,
+        hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) throws -> Bool)? = nil,
         noticeClearHandler: (@MainActor (_ messageID: AgentMessageID) async -> Bool)? = nil
     ) {
         self.ownsComposerDraft = ownsComposerDraft
@@ -548,9 +550,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         get { composerState.focusTick }
         set { composerState.focusTick = newValue }
     }
-    /// P1/F4: number of hidden pre-run transcript items revealed read-only.
-    /// Reset to zero on each new run and paged so one tap cannot render a huge history.
+    /// Number of older transcript items explicitly revealed by the reader.
+    /// Reset only on conversation changes; sending preserves the reading context.
     @Published public var transcriptHistoryRevealCount: Int = 0
+    @Published public var transcriptReadingStartID: String?
     /// F1: composer text lives on `composerState` so keystrokes don't republish the
     /// transcript-bearing view model. This proxy keeps every existing `vm.prompt`
     /// read/write working unchanged; because it is a computed (non-@Published)
@@ -6863,7 +6866,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         for event in events {
             timeline.apply(event)
         }
-        timeline.enforceAggregateHotTextBudget()
+        timeline.enforceAggregateHotTextBudget(protectedTurnIDs: protectedTranscriptTurnIDs)
     }
 
     public var executionLocked: Bool { providerLocked || selectedThreadRunIsStartingOrRunning }
@@ -7872,6 +7875,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         userInputSelections = [:]
         userInputDrafts = [:]
         transcriptHistoryRevealCount = 0
+        transcriptReadingStartID = nil
         planNotes = ""
         subagentActivity = .empty
         reloadQueuedMessages()
@@ -8687,6 +8691,49 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         focusTick += 1
     }
 
+    public func beginReply(to message: AgentMessage) {
+        let parsed = BotChoicesBlock.parse(message.content)
+        if supportsReplies, embedding?.hostReplyHandler != nil,
+           let choices = parsed.choices, choices.notice != nil, choices.canReply,
+           let threadID = selectedThreadId {
+            composerState.replyTarget = AgentReplyTarget(
+                threadId: threadID,
+                excerpt: choices.question ?? parsed.text,
+                noticeMessageID: message.id.value.uuidString.lowercased()
+            )
+            focusTick += 1
+            return
+        }
+        beginReply(to: parsed.text)
+    }
+
+    private var protectedTranscriptTurnIDs: Set<String> {
+        guard !isHiddenFromSurface else { return [] }
+        let entries = AgentAppView.mergeTranscriptEntries(messages: messages, turns: timeline.turns)
+        let paint = AgentAppView.transcriptColumnPaint(
+            mergedEntries: entries, status: status, runStartedAt: runStartedAt,
+            revealCount: transcriptHistoryRevealCount,
+            readingStartID: transcriptReadingStartID
+        ).paint
+        return Set(paint.compactMap {
+            if case .turn(let turn) = $0 { return turn.turnId }
+            return nil
+        })
+    }
+
+    public func setTranscriptReadingHistory(_ reading: Bool) {
+        guard reading else {
+            transcriptReadingStartID = nil
+            return
+        }
+        guard transcriptReadingStartID == nil else { return }
+        transcriptReadingStartID = AgentAppView.transcriptColumnPaint(
+            mergedEntries: AgentAppView.mergeTranscriptEntries(messages: messages, turns: timeline.turns),
+            status: status, runStartedAt: runStartedAt,
+            revealCount: transcriptHistoryRevealCount
+        ).paint.first?.id
+    }
+
     public func cancelReply() {
         composerState.replyTarget = nil
     }
@@ -8699,6 +8746,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func send() async {
+        if embedding?.sendInterceptor == nil,
+           let hostReply = embedding?.hostReplyHandler,
+           attachments.isEmpty, let threadId = selectedThreadId,
+           !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            do {
+                if try hostReply(prompt.trimmingCharacters(in: .whitespacesAndNewlines), threadId) {
+                    prompt = ""
+                    composerState.replyTarget = nil
+                    statusMessage = ""
+                    return
+                }
+            } catch {
+                statusMessage = error.localizedDescription
+                return
+            }
+        }
         // A reply sends the quote line first; text-less sends (attachments
         // only) keep no quote.
         if let reply = activeReplyTarget,
@@ -8715,13 +8778,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         if let interceptor = embedding?.sendInterceptor {
             sendThroughInterceptor(interceptor, text: trimmed)
-            return
-        }
-        if let hostReply = embedding?.hostReplyHandler,
-           attachments.isEmpty, !trimmed.isEmpty,
-           let sendThreadId,
-           hostReply(trimmed, sendThreadId) {
-            prompt = ""
             return
         }
         if refuseLegacyProviderThreadRun() { return }
@@ -10801,7 +10857,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         timeline = reduced.timeline
         if budget.runsWalk {
-            timeline.enforceAggregateHotTextBudget(byteLimit: activeAggregateHotTextByteLimit)
+            timeline.enforceAggregateHotTextBudget(byteLimit: activeAggregateHotTextByteLimit, protectedTurnIDs: protectedTranscriptTurnIDs)
             aggregateHotTextBudgetGeneration &+= 1
         }
         scheduleTimelineUpdateTick()
@@ -10863,7 +10919,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if status != .running { status = .running }
         }
         timeline.apply(event)
-        timeline.enforceAggregateHotTextBudget()
+        timeline.enforceAggregateHotTextBudget(protectedTurnIDs: protectedTranscriptTurnIDs)
         if case let .error(_, recoverable) = event {
             lastErrorRecoverable = recoverable
         }
@@ -10913,7 +10969,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             rebuilt.apply(event)
         }
-        rebuilt.enforceAggregateHotTextBudget()
+        let protectedIDs = protectedTranscriptTurnIDs
+        rebuilt.retainMissingTurns(from: timeline, protectedTurnIDs: protectedIDs)
+        rebuilt.enforceAggregateHotTextBudget(protectedTurnIDs: protectedIDs)
         timeline = rebuilt
         rehydrateDurableActiveState(threadId: threadId)
         lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: events)
@@ -13803,9 +13861,6 @@ public struct AgentAppView: View {
     nonisolated static let eagerTranscriptHistoryEntryLimit =
         AgentChatTimelineHistoryLayout.eagerEntryLimit
     nonisolated static let hiddenTranscriptRevealPageCount = 50
-    /// Entries kept *before* the newest user message during a follow-up.
-    /// 0 = start clean at the user's bubble (prior history via reveal row).
-    nonisolated static let followUpPrecedingContextCount = 0
     static let liveTurnRenderableItemLimit = 48
     /// How many trailing items stay expanded while a turn is still running.
     /// Everything older folds into the "Work so far" disclosure so Thought-
@@ -14339,7 +14394,8 @@ public struct AgentAppView: View {
         status: AgentRunStatus,
         runStartedAt: Date?,
         revealCount: Int,
-        alreadyPaintOrdered: Bool = false
+        alreadyPaintOrdered: Bool = false,
+        readingStartID: String? = nil
     ) -> (
         all: [TranscriptEntry],
         visible: [TranscriptEntry],
@@ -14349,7 +14405,8 @@ public struct AgentAppView: View {
         let visible = visibleTranscriptWindow(
             entries: allEntries,
             status: status,
-            runStartedAt: runStartedAt
+            runStartedAt: runStartedAt,
+            readingStartID: readingStartID
         )
         let hiddenCount = hiddenTranscriptCount(
             totalCount: allEntries.count,
@@ -14724,52 +14781,21 @@ public struct AgentAppView: View {
         return newestPeerReply.name
     }
 
-    /// Pure seam: which transcript entries the eager VStack renders.
-    ///
-    /// - Running / pending: prefer the slice from the newest user message
-    ///   (optional short preceding context) so a follow-up starts clean under
-    ///   the user's bubble instead of re-expanding prior turns. Fallbacks:
-    ///   time-cutoff live window when no user message exists and `runStartedAt`
-    ///   is set; otherwise the recent idle tail — never the full thread.
-    /// - Idle/completed: the most recent `idleWindowCount` entries when the thread
-    ///   is longer than that, so a huge thread no longer re-renders in full on
-    ///   every invalidation. The pre-window slice is surfaced by the existing
-    ///   `hiddenTranscriptSlice` + reveal row, so no history is dropped.
+    /// Keep the same recent history during pending, running and completed states.
+    /// A new answer must not hide the question or the preceding conversation.
     nonisolated static func visibleTranscriptWindow(
         entries: [TranscriptEntry],
         status: AgentRunStatus,
         runStartedAt: Date?,
         idleWindowCount: Int = idleTranscriptWindowCount,
-        runningSlack: TimeInterval = runningTranscriptContextSlack,
-        precedingContextCount: Int = followUpPrecedingContextCount
+        readingStartID: String? = nil
     ) -> [TranscriptEntry] {
         #if DEBUG
         VisibleTranscriptWindowProbe.increment()
         #endif
-        // Pending is part of the active follow-up lifecycle (composer send →
-        // provider start). Treat it like a live turn so we never flash the
-        // idle "last 30" history between send and running.
-        if status == .running || status == .pending {
-            // Anchor first so k=0 is not bypassed by the tiny-thread early return
-            // (e.g. [old assistant, new user] must not re-show the prior answer).
-            if let anchored = followUpAnchoredWindow(
-                entries: entries,
-                precedingContextCount: precedingContextCount
-            ) {
-                return anchored
-            }
-            guard entries.count > 2 else { return entries }
-            guard status == .running, let startedAt = runStartedAt else {
-                // Pending, or running before runStartedAt is assigned: keep the
-                // chat focused on the newest segment, not the whole thread.
-                return Array(entries.suffix(min(idleWindowCount, entries.count)))
-            }
-            let cutoff = startedAt.addingTimeInterval(-runningSlack).timeIntervalSince1970
-            let liveEntries = entries.filter { $0.sortTime >= cutoff }
-            return liveEntries.isEmpty ? Array(entries.suffix(2)) : liveEntries
-        }
-        guard entries.count > idleWindowCount else { return entries }
-        return Array(entries.suffix(idleWindowCount))
+        let start = max(0, entries.count - max(1, idleWindowCount))
+        let readingStart = readingStartID.flatMap { id in entries.firstIndex { $0.id == id } }
+        return Array(entries.dropFirst(min(start, readingStart ?? start)))
     }
 
     nonisolated static func usesLazyTranscriptHistoryLayout(
@@ -14780,23 +14806,6 @@ public struct AgentAppView: View {
             entryCount: entryCount,
             liveTurnActive: liveTurnActive
         )
-    }
-
-    /// Entries from the last user message (minus optional preceding context) to end.
-    /// Returns nil when no user message is present so callers keep their fallback.
-    nonisolated static func followUpAnchoredWindow(
-        entries: [TranscriptEntry],
-        precedingContextCount: Int = followUpPrecedingContextCount
-    ) -> [TranscriptEntry]? {
-        guard let anchor = entries.lastIndex(where: {
-            if case .message(let message) = $0 {
-                return message.role == .user && !isInternalPeerHopUserMessage(message)
-            }
-            return false
-        }) else { return nil }
-        let start = max(0, anchor - max(0, precedingContextCount))
-        let window = Array(entries[start...])
-        return window.isEmpty ? nil : window
     }
 
     /// Whether an Active plan belongs to the current follow-up (not a prior turn).
@@ -15737,9 +15746,6 @@ public struct AgentAppView: View {
                 ComposerReactiveScope(composerState: vm.composerState) {
                     composer
                         .disabled(vm.isLegacyProviderThread || vm.selectedThreadBotUnavailable)
-                        .onChange(of: vm.composerState.focusTick) { _ in
-                            collapseTranscriptForNewTurn()
-                        }
                 }
             }
         }
@@ -16105,7 +16111,8 @@ public struct AgentAppView: View {
             scrollToBottomIdentifier: "agent.timeline.scrollToBottom",
             accessibilityIdentifier: "agent.timeline",
             scrollTarget: vm.messageScrollTarget,
-            trailingAccessory: timelineAccessory ?? standaloneNewThreadFAB
+            trailingAccessory: timelineAccessory ?? standaloneNewThreadFAB,
+            onReadingHistoryChanged: vm.setTranscriptReadingHistory
         ) { timelineColumnWidth in
                         // AA-25: materialize the merged entries ONCE per body; the
                         // property rebuilt two whole-thread dictionaries each read
@@ -16116,7 +16123,8 @@ public struct AgentAppView: View {
                             status: vm.status,
                             runStartedAt: vm.runStartedAt,
                             revealCount: vm.transcriptHistoryRevealCount,
-                            alreadyPaintOrdered: true
+                            alreadyPaintOrdered: true,
+                            readingStartID: vm.transcriptReadingStartID
                         )
                         let allEntries = columnPaint.all
                         let entries = columnPaint.visible
@@ -16295,18 +16303,9 @@ public struct AgentAppView: View {
                 pruneExpandedItemIds()
             }
         }
-        .onChange(of: vm.status) { newStatus in
-            if newStatus == .pending || newStatus == .running {
-                collapseTranscriptForNewTurn()
-            }
-        }
-        .onChange(of: vm.runStartedAt) { newValue in
-            if newValue != nil {
-                collapseTranscriptForNewTurn()
-            }
-        }
         .onChange(of: vm.selectedThreadId) { _ in
             vm.transcriptHistoryRevealCount = 0
+            vm.transcriptReadingStartID = nil
             pendingSessionApproval = nil
             collapseAllWorkDisclosures()
             knownFinishedWorkTurnIds = []
@@ -16451,13 +16450,26 @@ public struct AgentAppView: View {
                     // Answering goes through the composer's send; never replace a
                     // draft the user is writing.
                     isBlockedByDraft: !vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || !vm.attachments.isEmpty,
+                        || !vm.attachments.isEmpty || vm.activeReplyTarget != nil,
                     onAnswer: { answer in
                         // Re-checked at tap time: never overwrite a draft.
                         guard vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                              vm.attachments.isEmpty else { return }
-                        vm.prompt = answer
-                        Task { await vm.send() }
+                              vm.attachments.isEmpty, vm.activeReplyTarget == nil,
+                              let threadID = vm.selectedThreadId,
+                              AgentChatChoicesCard.Pending.latest(
+                                in: vm.messages, isRunning: vm.hasRunningWorkForChrome
+                              ) == pending,
+                              let source = vm.messages.first(where: {
+                                $0.id.value.uuidString.lowercased() == pending.messageID
+                              }) else { return }
+                        let question = pending.choices.question
+                            ?? BotChoicesBlock.parse(source.content).text
+                        let reply = AgentReplyQuote.compose(excerpt: question, text: answer)
+                        vm.prompt = reply
+                        Task {
+                            guard vm.selectedThreadId == threadID, vm.prompt == reply else { return }
+                            await vm.send()
+                        }
                     },
                     onDismiss: { dismissChoices(pending.messageID) }
                 )
@@ -17337,16 +17349,6 @@ public struct AgentAppView: View {
         AgentChatLiveTurnChrome.completedWorkLabel(turn, live: live, workBlockCount: workBlockCount)
     }
 
-    /// Collapse reveal + open disclosures so a new follow-up paints like a
-    /// fresh chat turn. Atomically resets both model and view state.
-    private func collapseTranscriptForNewTurn() {
-        vm.transcriptHistoryRevealCount = 0
-        collapseAllWorkDisclosures()
-        expandedTools = []
-        expandedToolGroups = []
-        expandedReasoning = []
-    }
-
     private func collapseAllWorkDisclosures() {
         let cleared = AgentCompletedWorkExpandPolicy.clearedExpansionState()
         expandedCompletedWorkTurns = cleared.expanded
@@ -17462,7 +17464,7 @@ public struct AgentAppView: View {
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
                         onBranch: vm.onForkInNewChat == nil ? nil : { vm.onForkInNewChat?(msg.id.value.uuidString) },
-                        onReply: vm.supportsReplies ? { vm.beginReply(to: msg.content) } : nil,
+                        onReply: vm.supportsReplies ? { vm.beginReply(to: msg) } : nil,
                         stripsChoices: vm.showsBotChoices,
                         attachments: msg.attachments,
                         onClear: vm.embedding?.noticeClearHandler == nil ? nil : { vm.clearHostMessage(msg.id) }

@@ -2,12 +2,7 @@ import XCTest
 import CoreModel
 @testable import Surfaces
 
-/// Pure-seam tests for follow-up UX: clean transcript window from the newest
-/// user message, Active plan paint gate, and reveal/work labels.
-///
-/// WHY: after a long thread, sending the next message re-painted prior history
-/// and a completed Active plan under the new bubble, and live turns paid full
-/// work-block derivation while the disclosure stayed collapsed.
+/// Follow-up keeps conversation context while stale plan chrome stays hidden.
 final class AgentAppFollowUpUXSeamTests: XCTestCase {
 
     private static let threadID = AgentThreadID()
@@ -42,9 +37,8 @@ final class AgentAppFollowUpUXSeamTests: XCTestCase {
 
     // MARK: Follow-up window anchor
 
-    func test_pendingFollowUp_anchorsAtNewestUserMessage() {
-        // WHY: pending must not flash the last 30 historical entries between
-        // send and running — the new user bubble is the start of the turn.
+    func test_pendingFollowUp_preservesRecentHistory() {
+        // The same bounded history remains mounted across send states.
         var entries: [AgentAppView.TranscriptEntry] = (0..<40).map {
             assistantMessage(seconds: TimeInterval($0))
         }
@@ -55,17 +49,14 @@ final class AgentAppFollowUpUXSeamTests: XCTestCase {
             entries: entries, status: .pending, runStartedAt: nil
         )
 
-        XCTAssertEqual(visible.first?.id, entries[40].id,
-                       "pending follow-up must start at the newest user message")
-        XCTAssertEqual(visible.count, 2,
-                       "only the user bubble and subsequent live turn stay in the default window")
+        XCTAssertEqual(visible.map(\.id), Array(entries.suffix(AgentAppView.idleTranscriptWindowCount)).map(\.id))
+        XCTAssertEqual(visible.count, AgentAppView.idleTranscriptWindowCount)
         XCTAssertFalse(visible.contains { $0.id == entries[0].id },
                        "historical assistant messages stay behind the reveal row")
     }
 
-    func test_runningFollowUp_anchorsAtNewestUserMessage_evenWithRunStartedAt() {
-        // WHY: time-cutoff alone still left prior turns near the run start in
-        // view; anchoring at the user message is the clean-follow-up contract.
+    func test_runningFollowUp_preservesPriorTurns() {
+        // Starting a provider run must not hide previous answers.
         let started = Date(timeIntervalSince1970: 1_000)
         var entries: [AgentAppView.TranscriptEntry] = (0..<10).map {
             turnEntry(turnId: "old-\($0)", startMs: Int64(($0 + 990) * 1_000))
@@ -77,12 +68,11 @@ final class AgentAppFollowUpUXSeamTests: XCTestCase {
             entries: entries, status: .running, runStartedAt: started
         )
 
-        XCTAssertEqual(visible.map(\.id).first, entries[10].id,
-                       "running follow-up starts at the user message")
-        XCTAssertFalse(visible.contains { $0.id == entries[0].id })
+        XCTAssertEqual(visible.map(\.id), entries.map(\.id),
+                       "sending must preserve the preceding conversation")
     }
 
-    func test_runningWithoutUserMessage_keepsTimeCutoffFallback() {
+    func test_runningWithoutUserMessage_preservesHistory() {
         // WHY: regression guard for threads that only have turns (tests/fixtures).
         let started = Date(timeIntervalSince1970: 1_000)
         let old = (0..<3).map { turnEntry(turnId: "old-\($0)", startMs: Int64(($0 + 1) * 1_000)) }
@@ -94,12 +84,11 @@ final class AgentAppFollowUpUXSeamTests: XCTestCase {
         let visible = AgentAppView.visibleTranscriptWindow(
             entries: entries, status: .running, runStartedAt: started
         )
-        XCTAssertEqual(visible.map(\.id), live.map(\.id))
+        XCTAssertEqual(visible.map(\.id), entries.map(\.id))
     }
 
-    func test_twoEntryPending_anchorsAtUserMessage_notPriorAssistant() {
-        // WHY: the old count<=2 early-return bypassed k=0 and re-showed the
-        // prior assistant answer next to the new user bubble.
+    func test_twoEntryPending_keepsQuestionAndAnswer() {
+        // The ready answer must remain next to the question it answers.
         let entries = [
             assistantMessage(seconds: 1),
             userMessage(seconds: 2, text: "follow up"),
@@ -107,8 +96,8 @@ final class AgentAppFollowUpUXSeamTests: XCTestCase {
         let visible = AgentAppView.visibleTranscriptWindow(
             entries: entries, status: .pending, runStartedAt: nil
         )
-        XCTAssertEqual(visible.map(\.id), [entries[1].id],
-                       "two-entry pending follow-up must show only the new user bubble")
+        XCTAssertEqual(visible.map(\.id), entries.map(\.id),
+                       "the original question stays beside its answer")
     }
 
     // MARK: Active plan paint gate

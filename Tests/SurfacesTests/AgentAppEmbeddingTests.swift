@@ -206,6 +206,34 @@ final class AgentAppEmbeddingTests: XCTestCase {
 
         XCTAssertTrue(h.runner.requests.isEmpty, "a local command must not start a provider run")
     }
+    func test_contextualReplyFailurePreservesDraftAndNeverStartsProvider() async throws {
+        var reject = true
+        var sent: [String] = []
+        let h = try makeHarness(threadWorkspace: nil) { threadID in
+            AgentAppEmbedding(pinnedThreadId: threadID, hostReplyHandler: { text, _ in
+                if reject { throw NSError(domain: "Notice", code: 1, userInfo: [NSLocalizedDescriptionKey: "Question is already resolved"] ) }
+                sent.append(text)
+                return true
+            })
+        }
+        h.vm.selectThread(h.thread.id)
+        await h.vm.waitForSelectThreadHydrationForTesting()
+        let target = AgentReplyTarget(threadId: h.thread.id, excerpt: "Deploy which workspace?", noticeMessageID: "notice-A")
+        h.vm.composerState.replyTarget = target
+        h.vm.prompt = "Use staging"
+        await h.vm.send()
+        XCTAssertEqual(h.vm.prompt, "Use staging")
+        XCTAssertEqual(h.vm.activeReplyTarget, target)
+        XCTAssertEqual(h.vm.statusMessage, "Question is already resolved")
+        XCTAssertTrue(h.runner.requests.isEmpty)
+        reject = false
+        await h.vm.send()
+        XCTAssertEqual(sent, ["Use staging"])
+        XCTAssertTrue(h.vm.prompt.isEmpty)
+        XCTAssertNil(h.vm.activeReplyTarget)
+        XCTAssertTrue(h.runner.requests.isEmpty)
+    }
+
 }
 
 private final class EmbeddingCapturingRunner: AgentProviderRunner, @unchecked Sendable {

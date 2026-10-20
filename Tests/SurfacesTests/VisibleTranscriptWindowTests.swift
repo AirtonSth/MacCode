@@ -114,11 +114,9 @@ final class VisibleTranscriptWindowTests: XCTestCase {
         XCTAssertEqual(visibleOverCap.first?.id, overCap[1].id, "cap+1 trims exactly the oldest entry")
     }
 
-    // MARK: Running path is unchanged (regression guard)
+    // MARK: Sending preserves conversation context
 
-    func test_runningThread_keepsTimeCutoffLiveWindow_unchanged() {
-        // WHY (c): the running-state window is the time cutoff (entries at/after
-        // runStartedAt - slack); old turns are hidden. This must not regress.
+    func test_runningThread_preservesPriorTurns() {
         let started = Date(timeIntervalSince1970: 1_000)
         // Three "old" entries well before the run, two "live" entries after start.
         let old = (0..<3).map { turnEntry(turnId: "old-\($0)", startMs: Int64(($0 + 1) * 1_000)) }
@@ -132,13 +130,11 @@ final class VisibleTranscriptWindowTests: XCTestCase {
             entries: entries, status: .running, runStartedAt: started
         )
 
-        XCTAssertEqual(visible.map(\.id), live.map(\.id),
-                       "running window must keep only entries at/after the run-start cutoff")
+        XCTAssertEqual(visible.map(\.id), entries.map(\.id),
+                       "run start must not remove the preceding conversation")
     }
 
-    func test_runningThread_allEntriesBeforeCutoff_fallsBackToLastTwo() {
-        // WHY (c): the running fallback (no live entries yet) is the last two
-        // entries so the view is never empty at run start. Must not regress.
+    func test_runningThread_beforeOutput_preservesPriorTurns() {
         let started = Date(timeIntervalSince1970: 10_000)
         let entries = (0..<5).map { turnEntry(turnId: "t-\($0)", startMs: Int64(($0 + 1) * 1_000)) }
 
@@ -146,8 +142,8 @@ final class VisibleTranscriptWindowTests: XCTestCase {
             entries: entries, status: .running, runStartedAt: started
         )
 
-        XCTAssertEqual(visible.map(\.id), Array(entries.suffix(2)).map(\.id),
-                       "running with no post-cutoff entries falls back to the last two")
+        XCTAssertEqual(visible.map(\.id), entries.map(\.id),
+                       "waiting for provider output keeps existing history")
     }
 
     func test_runningThread_withoutRunStartedAt_usesRecentTailNotFullHistory() {
@@ -197,10 +193,8 @@ final class VisibleTranscriptWindowTests: XCTestCase {
                        "a 1-entry running thread renders in full, unchanged")
     }
 
-    /// WHY: running / no-user / time-cutoff uses `filter`, so visible need not be
-    /// a suffix after `placingMatchingFinalsAfterTurns` moves a durable final
-    /// below its Work so far turn. Reveal must keep that full-list order.
-    func test_transcriptColumnPaint_runningNoUserTimeCutoffReveal_keepsFinalAfterTurn() {
+    /// A durable final stays after its work turn when a new run starts.
+    func test_transcriptColumnPaint_running_keepsFinalAfterTurn() {
         let answer = "matching durable final"
         let old1 = assistantMessage(content: "old-1", seconds: 1)
         let old2 = assistantMessage(content: "old-2", seconds: 2)
@@ -244,38 +238,9 @@ final class VisibleTranscriptWindowTests: XCTestCase {
         let allIDs = column.all.map(\.id)
         let visibleIDs = column.visible.map(\.id)
         XCTAssertGreaterThan(allIDs.count, 2)
-        XCTAssertFalse(
-            Array(allIDs.suffix(visibleIDs.count)) == visibleIDs,
-            "running/no-user cutoff visible must be a non-suffix after the final moves after its turn"
-        )
+        XCTAssertEqual(visibleIDs, allIDs)
         XCTAssertTrue(visibleIDs.contains(turnID))
-        XCTAssertFalse(visibleIDs.contains(finalID), "the older-time final stays outside the cutoff window")
-
-        let allTurnIndex = allIDs.firstIndex(of: turnID)
-        let allFinalIndex = allIDs.firstIndex(of: finalID)
-        XCTAssertNotNil(allTurnIndex)
-        XCTAssertNotNil(allFinalIndex)
-        if let allTurnIndex, let allFinalIndex {
-            XCTAssertLessThan(allTurnIndex, allFinalIndex, "full-list paint order is Work so far then matching final")
-        }
-
-        let older = AgentAppView.hiddenTranscriptRevealWindow(
-            allItems: column.all,
-            visibleWindow: column.visible,
-            revealCount: 1
-        )
-        XCTAssertEqual(older.map(\.id), [finalID], "one-row reveal must pull the hidden matching final")
-        let concatIDs = (older + column.visible).map(\.id)
-        if let concatTurn = concatIDs.firstIndex(of: turnID),
-           let concatFinal = concatIDs.firstIndex(of: finalID) {
-            XCTAssertGreaterThan(
-                concatTurn,
-                concatFinal,
-                "precondition: older+visible concat is the mis-order this paint path must not use"
-            )
-        } else {
-            XCTFail("concat window must contain both the turn and its matching final")
-        }
+        XCTAssertTrue(visibleIDs.contains(finalID))
 
         let paintIDs = column.paint.map(\.id)
         let paintTurn = paintIDs.firstIndex(of: turnID)
@@ -355,6 +320,18 @@ final class VisibleTranscriptWindowTests: XCTestCase {
             true,
             "hide-assistant-output must walk the same ordered window the column paints"
         )
+    }
+
+    func test_readingHistoryKeepsAnchorWhileNewAnswersAppend() {
+        let before = (0..<40).map { messageEntry(secondsSinceEpoch: TimeInterval($0)) }
+        let visible = AgentAppView.visibleTranscriptWindow(entries: before, status: .completed, runStartedAt: nil)
+        let after = before + [messageEntry(secondsSinceEpoch: 50)]
+        let reading = AgentAppView.visibleTranscriptWindow(
+            entries: after, status: .running, runStartedAt: Date(), readingStartID: visible.first!.id
+        )
+        XCTAssertEqual(reading.first?.id, visible.first?.id)
+        XCTAssertEqual(reading.count, visible.count + 1)
+        XCTAssertEqual(reading.last?.id, after.last?.id)
     }
 
     private func assistantMessage(content: String, seconds: TimeInterval) -> AgentMessage {

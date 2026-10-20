@@ -20,13 +20,18 @@ public struct BotChoicesBlock: Equatable, Sendable {
     /// writes for a ledger notice: a tap then acts through the host ledger
     /// instead of sending the option text. Blocks without it parse as before.
     public let notice: String?
+    /// Host-authored provenance labels for a notice card.
+    public let source: [String: String]
+    public let canReply: Bool
 
-    public init(question: String?, hint: String?, multiple: Bool, options: [String], notice: String? = nil) {
+    public init(question: String?, hint: String?, multiple: Bool, options: [String], notice: String? = nil, source: [String: String] = [:], canReply: Bool = false) {
         self.question = question
         self.hint = hint
         self.multiple = multiple
         self.options = options
         self.notice = notice
+        self.source = source
+        self.canReply = canReply
     }
 
     public struct Parsed: Equatable, Sendable {
@@ -95,7 +100,9 @@ public struct BotChoicesBlock: Equatable, Sendable {
             hint: nonEmpty(object["hint"]),
             multiple: object["multiple"] as? Bool ?? false,
             options: options,
-            notice: nonEmpty(object["notice"])
+            notice: nonEmpty(object["notice"]),
+            source: (object["source"] as? [String: Any] ?? [:]).compactMapValues(nonEmpty),
+            canReply: object["can_reply"] as? Bool ?? false
         )
     }
 
