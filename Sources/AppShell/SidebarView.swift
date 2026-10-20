@@ -396,6 +396,7 @@ public final class SidebarViewModel: ObservableObject {
     private var runningBotsSink: AnyCancellable?
     private var deskSelectionSink: AnyCancellable?
     @Published public private(set) var workspaceConversations: [WorkspaceID: [WorkspaceConversationRow]] = [:]
+    @Published private(set) var workspaceConversationBots: [BotID: BotDefinition] = [:]
     /// Disclosure state only: expanding never selects or opens a workspace.
     @Published public private(set) var expandedWorkspaceIDs: Set<WorkspaceID> = []
     /// Workspaces whose Conversations list shows every loaded row instead of the first few.
@@ -731,11 +732,18 @@ public final class SidebarViewModel: ObservableObject {
         bindSelectedThreadSurface()
         let keepUntitled = live.union(selectedThread.map { [$0] } ?? []).union(deskSelection?.threadID.map { [$0] } ?? [])
         authorizedBotRowsTask = Task { [weak self] in
-            let (result, tree, linkedRunning) = await Task.detached {
+            let (result, tree, linkedRunning, conversationBots) = await Task.detached {
                 let rows = if let loader { loader(botStore, threadRepo, hostID, workspaceIDs) }
                 else { Self.loadAuthorizedBotConversationRows(botStore: botStore, threadRepo: threadRepo, hostID: hostID, workspaceIDs: workspaceIDs) }
                 let linkedRunning = Set(((try? botStore.conversationsLinked(to: live)) ?? [:]).values.map(\.botID))
-                return (rows, Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden, keepUntitled: keepUntitled), linkedRunning)
+                let tree = Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden, keepUntitled: keepUntitled)
+                var conversationBots: [BotID: BotDefinition] = [:]
+                if let tree {
+                    for id in Set(tree.conversations.values.flatMap { $0.compactMap(\.botID) }) {
+                        if let bot = try? botStore.get(id: id) { conversationBots[id] = bot }
+                    }
+                }
+                return (rows, tree, linkedRunning, conversationBots)
             }.value
             guard let self, !Task.isCancelled, self.authorizedBotRowsGeneration == generation else { return }
             if self.authorizedBotRowsNeedsRefresh {
@@ -769,6 +777,7 @@ public final class SidebarViewModel: ObservableObject {
             let general = tree?.general ?? [], conversations = tree?.conversations ?? [:]
             if self.generalBots != general { self.generalBots = general }
             if self.workspaceConversations != conversations { self.workspaceConversations = conversations }
+            if self.workspaceConversationBots != conversationBots { self.workspaceConversationBots = conversationBots }
             self.authorizedBotRowsTask = nil
             if self.authorizedBotRowsNeedsRefresh { self.reloadAuthorizedBotConversationRows() }
         }
@@ -842,14 +851,18 @@ public final class SidebarViewModel: ObservableObject {
             for workspaceID in expanded {
                 var rows: [WorkspaceConversationRow] = []
                 for thread in try threadRepo.list(workspaceId: workspaceID)
-                where !thread.isEphemeral && thread.parentThreadId == nil && Self.showsThread(title: thread.title, id: thread.id, keep: keepUntitled)
-                    && Self.admitsConversation(shown: rows.count, id: thread.id, always: keepUntitled, limit: Self.workspaceConversationLoadLimit) {
-                    // A pinned Bot thread is listed only while this host may still read that exact context.
-                    if let pin = try botStore.conversationContextPin(linkedTo: thread.id) {
+                where !thread.isEphemeral && thread.parentThreadId == nil {
+                    guard rows.count < Self.workspaceConversationLoadLimit || keepUntitled.contains(thread.id) else { continue }
+                    // Pinned Bot threads stay visible even when their generated title looks untitled.
+                    let pin = try botStore.conversationContextPin(linkedTo: thread.id)
+                    if let pin {
                         guard pin.hostID == hostID, pin.context == .workspace(workspaceID),
+                              thread.actor == .bot(pin.botID), thread.actorLockedAt != nil,
                               let conversation = try botStore.conversation(id: pin.conversationID), !conversation.hidden,
-                              try botStore.authorizes(hostID: hostID, botID: pin.botID, context: pin.context,
-                                                      action: .read, policyRevision: pin.policyRevision) else { continue }
+                              conversation.botID == pin.botID, conversation.linkedAgentThreadID == thread.id,
+                              try botStore.authorizesConversation(conversation, hostID: hostID, action: .read) else { continue }
+                    } else if !Self.showsThread(title: thread.title, id: thread.id, keep: keepUntitled) {
+                        continue
                     }
                     rows.append(WorkspaceConversationRow(threadID: thread.id, workspaceID: workspaceID, title: thread.title, botID: thread.actor.botID, updatedAt: thread.updatedAt))
                 }
@@ -955,7 +968,7 @@ public final class SidebarViewModel: ObservableObject {
     /// The Bot that made this conversation, so its row shows the Bot's avatar instead of the chat icon.
     func conversationBot(_ row: WorkspaceConversationRow) -> BotDefinition? {
         guard let id = row.botID else { return nil }
-        return router?.botsViewModel?.bots.first { $0.id == id }
+        return router?.botsViewModel?.bots.first { $0.id == id } ?? workspaceConversationBots[id]
     }
 
     public func showsAddBot(_ id: WorkspaceID) -> Bool {

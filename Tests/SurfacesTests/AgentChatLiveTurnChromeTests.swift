@@ -665,9 +665,65 @@ final class AgentChatLiveTurnChromeTests: XCTestCase {
     }
 
     func test_liveThought_nilWithoutReasoningOrText() {
-        // WHY: no reasoning means no thinking line; "Working…" stays the only signal.
+        // WHY: no provider reasoning means Simple mode must not invent thoughts.
         XCTAssertNil(AgentChatLiveTurnChrome.liveThought(AssistantTurnSnapshot(turnId: "t", items: [tool("c1", state: .streaming)])))
         XCTAssertNil(AgentChatLiveTurnChrome.liveThought(AssistantTurnSnapshot(turnId: "t", items: [reasoning("r1", "  \n ")])))
+    }
+
+    func test_simpleLiveActivityShowsThinkingAndSafeToolStatusWithoutWorkingDuplicate() {
+        // WHY: Simple users need actual thought and tool progress, but must not see command inputs or duplicate placeholders.
+        let toolItem = tool("c1", state: .streaming)
+        let turn = AssistantTurnSnapshot(turnId: "t", items: [reasoning("r1", "Checking the fix"), toolItem])
+        XCTAssertEqual(AgentChatLiveTurnChrome.liveThought(turn), "Checking the fix")
+        XCTAssertEqual(AgentChatLiveTurnChrome.liveToolActivity(turn), "Command activity")
+        XCTAssertNotEqual(AgentChatLiveTurnChrome.liveToolActivity(turn), "ls")
+        let privateInput = AssistantItem(id: "private", turnId: "t", type: .commandExecution, state: .streaming,
+                                         body: #"{"command":"cat /Users/private/secret.txt"}"#, startedAtMs: 4)
+        XCTAssertEqual(AgentChatLiveTurnChrome.liveToolActivity(
+            AssistantTurnSnapshot(turnId: "t", items: [privateInput])
+        ), "Command activity")
+
+        var completed = turn
+        completed.finished = true
+        XCTAssertNil(AgentChatLiveTurnChrome.liveThought(completed))
+        XCTAssertNil(AgentChatLiveTurnChrome.liveToolActivity(completed), "finished turn must not show stale streaming item")
+
+        let answering = AssistantTurnSnapshot(turnId: "t", items: [
+            toolItem,
+            AssistantItem(id: "a", turnId: "t", type: .assistantMessage, state: .streaming, body: "Answer", startedAtMs: 3)
+        ])
+        XCTAssertNil(AgentChatLiveTurnChrome.liveThought(answering), "assistant response replaces thinking")
+        XCTAssertNil(AgentChatLiveTurnChrome.liveToolActivity(answering), "assistant response replaces prior tool activity")
+    }
+
+    @MainActor
+    func test_simpleToolStatusRendersOffscreenAsNativeSwiftUIView() throws {
+        // WHY: behavior tests must verify the actual SwiftUI status view renders without launching a GUI.
+        let view = AgentChatHiddenWorkStatus(
+            turn: AssistantTurnSnapshot(turnId: "render"),
+            label: "Image activity"
+        ).frame(width: 280, height: 36)
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 1
+        let image = try XCTUnwrap(renderer.nsImage)
+        XCTAssertGreaterThan(image.size.width, 0)
+        XCTAssertGreaterThan(image.size.height, 0)
+    }
+
+    func test_liveTurnEquatableTracksCurrentSimpleToolActivityAndTransitions() {
+        let first = AssistantTurnSnapshot(turnId: "t", items: [tool("c1", state: .streaming)])
+        var changed = first
+        changed.items[0].type = .webSearch
+        let firstView = AgentChatLiveTurnView(turn: first, live: true, hidesWork: true)
+        let changedView = AgentChatLiveTurnView(turn: changed, live: true, hidesWork: true)
+        XCTAssertEqual(AgentChatLiveTurnChrome.liveToolActivity(first), "Command activity")
+        XCTAssertEqual(AgentChatLiveTurnChrome.liveToolActivity(changed), "Web search activity")
+        XCTAssertNotEqual(firstView, changedView, "changed visible activity must invalidate Equatable row")
+
+        var completed = first
+        completed.items[0].state = .completed
+        XCTAssertNotEqual(firstView, AgentChatLiveTurnView(turn: completed, live: true, hidesWork: true))
+        XCTAssertNil(AgentChatLiveTurnChrome.liveToolActivity(completed))
     }
 
     private func reasoning(_ id: String, _ body: String) -> AssistantItem {

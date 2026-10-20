@@ -104,7 +104,8 @@ public enum AgentChatLiveTurnChrome {
     /// The thought the model is on right now: the latest reasoning item, until
     /// the answer starts. Tail only, so the line stays one fixed-height box.
     public static func liveThought(_ turn: AssistantTurnSnapshot) -> String? {
-        guard let index = turn.items.lastIndex(where: { $0.type == .reasoning }) else { return nil }
+        guard !turn.finished,
+              let index = turn.items.lastIndex(where: { $0.type == .reasoning }) else { return nil }
         guard !turn.items[(index + 1)...].contains(where: { $0.type == .assistantMessage }) else { return nil }
         let text = reasoningText(turn.items[index])
             .replacingOccurrences(of: "**", with: "")
@@ -132,6 +133,24 @@ public enum AgentChatLiveTurnChrome {
             !turn.finished && turn.items.contains {
                 $0.state == .streaming && isGroupableTool($0.type)
             }
+        }
+    }
+
+    /// Concise, real activity for Simple mode while a provider tool is running.
+    public static func liveToolActivity(_ turn: AssistantTurnSnapshot) -> String? {
+        guard !turn.finished,
+              let index = turn.items.lastIndex(where: { $0.state == .streaming && isGroupableTool($0.type) }),
+              !turn.items[(index + 1)...].contains(where: { $0.type == .assistantMessage })
+        else { return nil }
+        let item = turn.items[index]
+        switch item.type {
+        case .commandExecution: return "Command activity"
+        case .webSearch: return "Web search activity"
+        case .fileChange: return "File activity"
+        case .imageView: return "Image activity"
+        case .tool, .mcpToolCall, .dynamicToolCall, .collabToolCall: return "Tool activity"
+        case .reasoning, .plan, .assistantMessage, .review, .contextCompaction, .error:
+            return nil
         }
     }
 
@@ -954,7 +973,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
     /// Used after an interleaved bot message so the chat keeps appending
     /// instead of stacking headers.
     public var showsWorkHeader: Bool
-    /// Verbosity Human: no work rows; a live turn shows only its "Working" line.
+    /// Simple verbosity hides work rows but keeps available live status.
     public var hidesWork: Bool
     public var renderFinal: ((String) -> AnyView)?
     public var afterWork: AnyView?
@@ -998,6 +1017,7 @@ public struct AgentChatLiveTurnView: View, Equatable {
             && lhs.turn.items.last.map { AgentChatLiveTurnChrome.liveTextFingerprint($0.output) }
                 == rhs.turn.items.last.map { AgentChatLiveTurnChrome.liveTextFingerprint($0.output) }
             && liveThoughtFingerprint(lhs.turn) == liveThoughtFingerprint(rhs.turn)
+            && liveToolActivityFingerprint(lhs.turn) == liveToolActivityFingerprint(rhs.turn)
             && (lhs.renderFinal == nil) == (rhs.renderFinal == nil)
             && (lhs.afterWork == nil) == (rhs.afterWork == nil)
     }
@@ -1091,15 +1111,22 @@ public struct AgentChatLiveTurnView: View, Equatable {
         AgentChatLiveTurnChrome.liveThought(turn).map { AgentChatLiveTurnChrome.liveTextFingerprint($0) }
     }
 
-    /// Verbosity Human: a "Working" line while live, and the turn's errors.
+    static func liveToolActivityFingerprint(_ turn: AssistantTurnSnapshot) -> UInt64? {
+        AgentChatLiveTurnChrome.liveToolActivity(turn).map { AgentChatLiveTurnChrome.liveTextFingerprint($0) }
+    }
+
+    /// Simple verbosity keeps live status and the turn's errors, not work rows.
     /// Hidden work still owns up to its failures (iOS parity): an error the
     /// user cannot see would read as a silent success.
     @ViewBuilder
     private func hiddenWorkSection(activity: [AssistantItem]) -> some View {
-        if live && showsWorkHeader {
+        if live && !turn.finished && showsWorkHeader {
             if let thought = AgentChatLiveTurnChrome.liveThought(turn) {
                 AgentChatLiveThinkingLine(turnId: turn.turnId, text: thought)
-            } else {
+            }
+            if let activity = AgentChatLiveTurnChrome.liveToolActivity(turn) {
+                AgentChatHiddenWorkStatus(turn: turn, label: activity)
+            } else if AgentChatLiveTurnChrome.liveThought(turn) == nil {
                 AgentChatHiddenWorkStatus(turn: turn)
             }
         }
@@ -1152,6 +1179,7 @@ public struct AgentChatLiveThinkingLine: View {
 /// with no command, edit or tool detail.
 struct AgentChatHiddenWorkStatus: View {
     let turn: AssistantTurnSnapshot
+    var label = "Working…"
 
     var body: some View {
         HStack(spacing: DS.Space.sm) {
@@ -1159,7 +1187,7 @@ struct AgentChatHiddenWorkStatus: View {
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.textTertiary)
                 .accessibilityHidden(true)
-            Text("Working…")
+            Text(label)
                 .font(DS.Font.body.weight(.medium))
                 .foregroundColor(DS.Palette.textTertiary)
             Spacer(minLength: 0)

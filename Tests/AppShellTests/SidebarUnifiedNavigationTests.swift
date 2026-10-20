@@ -88,6 +88,58 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
                        "a revoked Bot conversation's title must disappear while plain work stays")
     }
 
+    func test_conversationProjectionKeepsSelectedOldestBeyondLoadCap() throws {
+        let f = try make("conversation-cap")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let ids = (0...SidebarViewModel.workspaceConversationLoadLimit).map { _ in AgentThreadID(UUID()) }
+        let selectedOldest = try XCTUnwrap(ids.last)
+        var shown = 0
+        var admitted: [AgentThreadID] = []
+        for id in ids where SidebarViewModel.admitsConversation(shown: shown, id: id, always: [selectedOldest], limit: SidebarViewModel.workspaceConversationLoadLimit) {
+            shown += 1
+            admitted.append(id)
+        }
+        XCTAssertEqual(admitted.count, SidebarViewModel.workspaceConversationLoadLimit + 1)
+        XCTAssertTrue(admitted.contains(selectedOldest), "selected oldest thread survives load cap")
+    }
+
+    func test_authorizedUntitledBotConversationSurvivesProjectionAndSelection() async throws {
+        let f = try make("untitled-bot-conversation")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let workspace = try f.router.createWorkspace(name: "elephant", cwd: NSTemporaryDirectory())
+        let botsVM = BotsViewModel(context: f.context, router: f.router)
+        f.router.botsViewModel = botsVM
+        f.vm.observeActiveBots(botsVM)
+        let bot = try f.context.botStore.create(name: "Developer", title: "", description: "", handle: "developer")
+        let grant = try f.context.botStore.grantContext(hostID: f.host, botID: bot.id, context: .workspace(workspace.id), actions: [.read], expectedRevision: 0)
+        let foreignWorkspace = try f.router.createWorkspace(name: "other", cwd: NSTemporaryDirectory())
+        let foreignBot = try f.context.botStore.create(name: "Foreign", title: "", description: "", handle: "foreign")
+        let foreignGrant = try f.context.botStore.grantContext(hostID: f.host, botID: foreignBot.id, context: .workspace(foreignWorkspace.id), actions: [.read], expectedRevision: 0)
+        var foreignThread = AgentThread(workspaceId: foreignWorkspace.id, title: "Foreign", provider: .distill, model: "fixture")
+        foreignThread.status = .completed
+        try f.context.botStore.createContextualConversation(BotConversation(botID: foreignBot.id, title: "Foreign", linkedAgentThreadID: foreignThread.id), newThread: foreignThread, hostID: f.host, context: .workspace(foreignWorkspace.id), policyRevision: foreignGrant.policyRevision)
+
+        f.vm.reload()
+        await expand(f.vm, workspace.id)
+        var thread = AgentThread(workspaceId: workspace.id, title: "", provider: .distill, model: "fixture")
+        thread.status = .completed
+        let conversation = BotConversation(botID: bot.id, title: "", linkedAgentThreadID: thread.id)
+        try f.context.botStore.createContextualConversation(conversation, newThread: thread, hostID: f.host, context: .workspace(workspace.id), policyRevision: grant.policyRevision)
+        XCTAssertFalse(f.vm.workspaceConversationRows(workspace.id).contains { $0.threadID == thread.id })
+        EventBus.shared.publish(kind: .botConversationUpdated, payload: .object(["bot_id": .string(bot.id.value.uuidString)]))
+        for _ in 0..<50 where !f.vm.workspaceConversationRows(workspace.id).contains(where: { $0.threadID == thread.id }) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        let row = try XCTUnwrap(f.vm.workspaceConversationRows(workspace.id).first { $0.threadID == thread.id }, "fresh conversation event must refresh untitled authorized Bot row")
+        XCTAssertEqual(f.vm.conversationBot(row)?.id, bot.id, "Bot identity drives the existing avatar")
+        XCTAssertFalse(f.vm.workspaceConversationRows(workspace.id).contains { $0.threadID == foreignThread.id }, "other workspace conversation must not leak")
+        f.vm.openWorkspaceConversation(row)
+        XCTAssertEqual(botsVM.selectedBotID, bot.id, "sidebar row routes to the exact Bot")
+        XCTAssertEqual(botsVM.selectedConversation?.id, conversation.id, "sidebar row opens the exact pinned conversation")
+        XCTAssertEqual(f.vm.workspaceConversationRows(foreignWorkspace.id).map(\.threadID), [foreignThread.id])
+    }
+
     func test_botMadeConversationRowShowsTheBotAvatarAndPlainWorkKeepsTheChatIcon() async throws {
         // WHY: the user must tell at a glance which conversations a Bot made; plain work keeps bubble.left.
         let f = try make("conversation-avatar")
@@ -102,13 +154,15 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         thread.status = .completed
         try f.context.botStore.createContextualConversation(BotConversation(botID: bot.id, title: "Bot work", linkedAgentThreadID: thread.id),
             newThread: thread, hostID: f.host, context: .workspace(workspace.id), policyRevision: grant.policyRevision)
-        botsVM.reload()
         f.vm.reload()
         await expand(f.vm, workspace.id)
         let rows = f.vm.workspaceConversationRows(workspace.id)
         let botRow = try XCTUnwrap(rows.first { $0.threadID == thread.id })
         let plainRow = try XCTUnwrap(rows.first { $0.threadID == plain.id })
-        XCTAssertEqual(f.vm.conversationBot(botRow)?.id, bot.id, "a Bot-made conversation row resolves its Bot for the avatar")
+        XCTAssertTrue(botsVM.bots.isEmpty, "projection supplies avatar identity without loading the Bots roster")
+        for _ in 0..<20 {
+            XCTAssertEqual(f.vm.conversationBot(botRow)?.id, bot.id, "repeated avatar lookup uses the published projection cache")
+        }
         XCTAssertNil(f.vm.conversationBot(plainRow), "plain work has no Bot, so the row keeps the chat icon")
         let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
