@@ -49,7 +49,8 @@ private func splitKeyboardTargetPane(
         .flatMap { id in controller.pane.surfaces.first(where: { $0.id == id }) }
         ?? controller.pane.surfaces.first
     let splitType = selectedSurface?.type ?? .terminal
-    let splitTitle = PaneTabsView.surfaceChoices.first(where: { $0.1 == splitType })?.0 ?? "Terminal"
+    let splitTitle = selectedSurface.flatMap { WorkspaceTool.from(metadata: $0.metadata, title: $0.title)?.title }
+        ?? PaneTabsView.surfaceChoices.first(where: { $0.1 == splitType })?.0 ?? "Terminal"
     return controller.performSplit(direction, type: splitType, title: splitTitle) != nil
 }
 

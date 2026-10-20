@@ -324,9 +324,12 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 )
             }
             try Task.checkCancellation()
+            // A workspace-pinned Bot conversation runs in the Bot's Mac home like a
+            // desk one; that path is never mounted, so it runs in the guest home.
             let guestCwd = try Self.guestCwd(
                 requestCwd: thread.workspaceId == nil ? (workspace ?? request.cwd) : request.cwd,
-                workspace: workspace, mounted: vm.mountedWorkspaces
+                workspace: Self.isBotHome(request.cwd, appSupport: deps.appSupport) ? nil : workspace,
+                mounted: vm.mountedWorkspaces
             )
 
             progress(.preparingAgent)
@@ -537,6 +540,12 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             )
         }
         return cwd
+    }
+
+    static func isBotHome(_ cwd: String, appSupport: URL) -> Bool {
+        let root = BotHome.botsRootURL(appSupportDirectory: appSupport).resolvingSymlinksInPath().standardizedFileURL.path
+        let path = URL(fileURLWithPath: cwd).resolvingSymlinksInPath().standardizedFileURL.path
+        return mountContaining(path, [root]) != nil
     }
 
     private static func mountContaining(_ path: String, _ mounted: [String]) -> String? {

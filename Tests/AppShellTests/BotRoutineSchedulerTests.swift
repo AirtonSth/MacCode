@@ -326,6 +326,34 @@ final class BotRoutineSchedulerTests: XCTestCase {
         XCTAssertEqual(attention.kind, .blocked, "the Mac Activity shows the failed task")
         XCTAssertEqual(attention.title, "Scheduled task did not start")
     }
+
+    func test_runNowOnAStoppedDockerBotStartsItsComputerThenRuns() async throws {
+        // WHY: Run Now in Schedule Tasks failed at once with "Docker desktop is
+        // not ready." while a scheduled fire of the same task waits for the computer.
+        let f = try makeFixture()
+        let bot = try f.vm.create(name: "Star", title: "Developer")
+        f.vm.desktopKindOverrideForTesting = .dockerDesktop
+        f.vm.dockerGuestReadyOverrideForTesting = nil
+        f.vm.computerGuestService = BotComputerGuestService(
+            appSupport: f.context.appSupportDirectory,
+            docker: ScheduledDocker(),
+            observeAttempts: 1,
+            observeDelay: 0
+        )
+        let (routine, _) = try saveActiveRoutine(f, bot: bot, base: Date())
+        f.vm.openScheduleTasks()
+
+        f.vm.runRoutineNow(id: routine.id)
+
+        XCTAssertNil(f.vm.errorMessage)
+        XCTAssertTrue(f.vm.isRoutineRunning(id: routine.id), "the row shows the start right away")
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started, f.vm.errorMessage ?? "Run Now never reached the provider")
+        XCTAssertNil(f.vm.errorMessage)
+        XCTAssertTrue(f.vm.isGuestRunning(bot.id))
+        let request = try XCTUnwrap(f.runner.requests.first)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
 }
 
 private final class ScheduledDocker: BotComputerDockerClienting, @unchecked Sendable {

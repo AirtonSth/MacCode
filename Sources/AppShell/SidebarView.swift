@@ -411,6 +411,37 @@ public final class SidebarViewModel: ObservableObject {
     nonisolated static func encodeExpandedConversationWorkspaces(_ ids: Set<WorkspaceID>) -> [String] {
         ids.map(\.value.uuidString).sorted()
     }
+
+    /// A workspace submenu section the user can hide.
+    public enum WorkspaceSection: String, CaseIterable, Sendable {
+        case conversations, bots, vms
+        var title: String {
+            switch self {
+            case .conversations: return "Conversations"
+            case .bots: return "Bots"
+            case .vms: return "VMs"
+            }
+        }
+    }
+
+    /// Hidden submenu sections, keyed "<workspace uuid>:<section>"; persisted across relaunch.
+    @Published public private(set) var collapsedWorkspaceSections: Set<String> = []
+    nonisolated static let collapsedWorkspaceSectionsKey = "sidebar.collapsedWorkspaceSections"
+
+    nonisolated static func workspaceSectionKey(_ id: WorkspaceID, _ section: WorkspaceSection) -> String {
+        "\(id.value.uuidString):\(section.rawValue)"
+    }
+
+    public func isWorkspaceSectionCollapsed(_ id: WorkspaceID, _ section: WorkspaceSection) -> Bool {
+        // A search shows every match, even in a hidden section.
+        sidebarQuery.isEmpty && collapsedWorkspaceSections.contains(Self.workspaceSectionKey(id, section))
+    }
+
+    public func toggleWorkspaceSection(_ id: WorkspaceID, _ section: WorkspaceSection) {
+        let key = Self.workspaceSectionKey(id, section)
+        if collapsedWorkspaceSections.contains(key) { collapsedWorkspaceSections.remove(key) } else { collapsedWorkspaceSections.insert(key) }
+        UserDefaults.standard.set(collapsedWorkspaceSections.sorted(), forKey: Self.collapsedWorkspaceSectionsKey)
+    }
     private var didSeedExpandedWorkspace = false
     /// Names the host in search results so equal names on different hosts stay distinguishable.
     public let hostDisplayName: String = Host.current().localizedName ?? "This Mac"
@@ -609,6 +640,8 @@ public final class SidebarViewModel: ObservableObject {
         self.lastPowerState = powerMonitor.currentPowerState
         self.expandedConversationWorkspaces = Self.decodeExpandedConversationWorkspaces(
             UserDefaults.standard.stringArray(forKey: Self.expandedConversationWorkspacesKey))
+        self.collapsedWorkspaceSections = Set(
+            UserDefaults.standard.stringArray(forKey: Self.collapsedWorkspaceSectionsKey) ?? [])
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
             object: nil,
@@ -878,7 +911,8 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func toggleWorkspaceExpanded(_ id: WorkspaceID) {
-        if expandedWorkspaceIDs.contains(id) { expandedWorkspaceIDs.remove(id) } else { expandedWorkspaceIDs.insert(id) }
+        // One workspace open at a time: expanding one collapses the rest.
+        expandedWorkspaceIDs = expandedWorkspaceIDs.contains(id) ? [] : [id]
         reloadAuthorizedBotConversationRows()
     }
 
@@ -1358,7 +1392,7 @@ public final class SidebarViewModel: ObservableObject {
         }
         if !didSeedExpandedWorkspace, let selected = ctx.state.window.selectedWorkspaceID {
             didSeedExpandedWorkspace = true
-            expandedWorkspaceIDs.insert(selected)
+            expandedWorkspaceIDs = [selected]
         }
         updateCompletedWorkspaces(from: ordered)
         if ordered != workspaces {
@@ -1635,7 +1669,7 @@ public final class SidebarViewModel: ObservableObject {
         // UX-SIDEBAR-COMPLETED-DOT: opening a workspace clears its completed dot.
         completedWorkspaces.remove(wid)
         if !expandedWorkspaceIDs.contains(wid) {
-            expandedWorkspaceIDs.insert(wid)
+            expandedWorkspaceIDs = [wid]
             reloadAuthorizedBotConversationRows()
         }
         do {
@@ -3461,6 +3495,37 @@ public struct SidebarRootView: View {
             .accessibilityIdentifier(id)
     }
 
+    /// A section header that hides or shows its rows; the choice persists per workspace.
+    private func collapsibleSectionHeader(_ section: SidebarViewModel.WorkspaceSection, workspace ws: Workspace, id: String) -> some View {
+        let collapsed = vm.isWorkspaceSectionCollapsed(ws.id, section)
+        return Button {
+            if reduceMotion { vm.toggleWorkspaceSection(ws.id, section) }
+            else { withAnimation(.easeOut(duration: 0.18)) { vm.toggleWorkspaceSection(ws.id, section) } }
+        } label: {
+            HStack(spacing: DS.Space.xs) {
+                Text(section.title)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .rotationEffect(.degrees(collapsed ? 0 : 90))
+                    .accessibilityHidden(true)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, DS.Space.sm)
+            .padding(.top, DS.Space.xxs)
+            .frame(minHeight: 18)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(collapsed ? "Show \(section.title)" : "Hide \(section.title)")
+        .accessibilityLabel(section.title)
+        .accessibilityValue(collapsed ? "Hidden" : "Shown")
+        .accessibilityHint(collapsed ? "Shows this section" : "Hides this section")
+        .accessibilityIdentifier(id)
+    }
+
     /// Children sit on a darker inset panel so the workspace level reads apart from its contents.
     @ViewBuilder
     private func workspaceChildren(_ ws: Workspace) -> some View {
@@ -3488,8 +3553,9 @@ public struct SidebarRootView: View {
             }
         }
         if vm.showsNewConversation(ws.id) || !vm.workspaceConversationRows(ws.id).isEmpty {
-            workspaceSectionHeader("Conversations", id: "sidebar.workspaceConversations.\(ws.id.value.uuidString)")
+            collapsibleSectionHeader(.conversations, workspace: ws, id: "sidebar.workspaceConversations.\(ws.id.value.uuidString)")
         }
+        if !vm.isWorkspaceSectionCollapsed(ws.id, .conversations) {
         if vm.showsNewConversation(ws.id) {
             Button { navigate { vm.newWorkspaceConversation(in: ws.id) } } label: {
                 HStack(spacing: DS.Space.sm) {
@@ -3535,9 +3601,11 @@ public struct SidebarRootView: View {
             .accessibilityLabel(toggle.expanded ? "Show fewer conversations" : "Show \(toggle.hidden) more conversations")
             .accessibilityIdentifier("sidebar.conversationsToggle.\(ws.id.value.uuidString)")
         }
-        if vm.showsAddBot(ws.id) || !vm.workspaceBotRows(ws.id).isEmpty {
-            workspaceSectionHeader("Bots", id: "sidebar.workspaceBots.\(ws.id.value.uuidString)")
         }
+        if vm.showsAddBot(ws.id) || !vm.workspaceBotRows(ws.id).isEmpty {
+            collapsibleSectionHeader(.bots, workspace: ws, id: "sidebar.workspaceBots.\(ws.id.value.uuidString)")
+        }
+        if !vm.isWorkspaceSectionCollapsed(ws.id, .bots) {
         if vm.showsAddBot(ws.id) {
             Button { navigate { vm.addBot(inWorkspace: ws.id) } } label: {
                 HStack(spacing: DS.Space.sm) {
@@ -3560,13 +3628,16 @@ public struct SidebarRootView: View {
         ForEach(SidebarViewModel.runningFirst(vm.workspaceBotRows(ws.id)) {
             SidebarViewModel.isBotRunning($0.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
         }) { botConversationRow($0) }
-        if vm.showsNewConversation(ws.id) || !vm.workspaceVirtualMachineRows(ws.id).isEmpty {
-            workspaceSectionHeader("VMs", id: "sidebar.workspaceVMs.\(ws.id.value.uuidString)")
         }
+        if vm.showsNewConversation(ws.id) || !vm.workspaceVirtualMachineRows(ws.id).isEmpty {
+            collapsibleSectionHeader(.vms, workspace: ws, id: "sidebar.workspaceVMs.\(ws.id.value.uuidString)")
+        }
+        if !vm.isWorkspaceSectionCollapsed(ws.id, .vms) {
         if vm.showsNewConversation(ws.id) {
             newVirtualMachineRow(workspaceID: ws.id)
         }
         ForEach(vm.workspaceVirtualMachineRows(ws.id)) { virtualMachineRow($0) }
+        }
 
     }
 

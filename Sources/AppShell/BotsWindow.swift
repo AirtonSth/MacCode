@@ -7488,6 +7488,33 @@ public final class BotsViewModel: ObservableObject {
                 errorMessage = "This scheduled task already has an active run."
                 return
             }
+            // Like a scheduled fire, a stopped bot computer is started and awaited
+            // instead of failing at once with "Docker desktop is not ready".
+            if scheduledSendNeedsGuestStart(botID: botID) {
+                startingRoutineIDs.insert(id)
+                Task { [weak self] in
+                    guard let self else { return }
+                    let notReady = await self.awaitGuestForScheduledSend(
+                        botID: botID, timeout: BotRoutineScheduler.guestStartTimeout
+                    )
+                    self.startingRoutineIDs.remove(id)
+                    if let notReady {
+                        self.errorMessage = notReady
+                    } else {
+                        self.startRoutineNow(routine)
+                    }
+                }
+                return
+            }
+            startRoutineNow(routine)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func startRoutineNow(_ routine: BotRoutine) {
+        let id = routine.definition.id
+        do {
             let sent = try enqueueScheduledRoutine(routine)
             if let raw = sent.objectValue?["thread_id"]?.stringValue, let uuid = UUID(uuidString: raw) {
                 runningRoutineThreads[id] = AgentThreadID(uuid)
@@ -7505,6 +7532,7 @@ public final class BotsViewModel: ObservableObject {
 
     /// True while the run a Run Now started is still live.
     public func isRoutineRunning(id: BotRoutineID) -> Bool {
+        if startingRoutineIDs.contains(id) { return true }
         guard let threadID = runningRoutineThreads[id] else { return false }
         return context.coordinator.activeRunId(threadId: threadID) != nil
             || context.coordinator.hasPendingProviderStart(threadId: threadID)
@@ -7512,6 +7540,8 @@ public final class BotsViewModel: ObservableObject {
     }
 
     @Published private(set) var runningRoutineThreads: [BotRoutineID: AgentThreadID] = [:]
+    /// Run Now waiting for its stopped bot computer to come up.
+    @Published private(set) var startingRoutineIDs: Set<BotRoutineID> = []
 
     /// The route a task execution runs: its schedule spec over `base`. Test
     /// run and the scheduled fire build the same route.
@@ -7571,15 +7601,19 @@ public final class BotsViewModel: ObservableObject {
         return made
     }
 
+    private func scheduledSendNeedsGuestStart(botID: BotID) -> Bool {
+        guard dockerGuestReadyOverrideForTesting == nil,
+              let bot = try? botStore.get(id: botID),
+              let revision = try? currentRevision(for: bot) else { return false }
+        return (desktopKindOverrideForTesting ?? resolvedDesktopKind(revision.desktopKind)) == .dockerDesktop
+            && !isGuestRunning(botID)
+    }
+
     /// Before a scheduled send, a Docker bot whose computer is stopped waits
     /// (bounded) for it to come up, instead of losing the slot to "not ready".
     /// Nil when the send can go ahead; otherwise why the computer is not up.
     func awaitGuestForScheduledSend(botID: BotID, timeout: TimeInterval) async -> String? {
-        guard dockerGuestReadyOverrideForTesting == nil,
-              let bot = try? botStore.get(id: botID),
-              let revision = try? currentRevision(for: bot),
-              (desktopKindOverrideForTesting ?? resolvedDesktopKind(revision.desktopKind)) == .dockerDesktop,
-              !isGuestRunning(botID) else { return nil }
+        guard scheduledSendNeedsGuestStart(botID: botID) else { return nil }
         if guestLaunchState(for: botID) != .starting {
             presentGuestDesktop(botID: botID)
         }

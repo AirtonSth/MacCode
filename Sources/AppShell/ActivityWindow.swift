@@ -154,13 +154,20 @@ private enum ActivityBatchError: LocalizedError {
 @MainActor
 final class ActivityViewModel: ObservableObject {
     enum Tab: String, CaseIterable, Identifiable {
-        case running, needsYou, finished
+        case running, needsYou, justFinished, finished
         var id: String { rawValue }
-        var wireValue: String { self == .needsYou ? "needs_you" : rawValue }
+        var wireValue: String {
+            switch self {
+            case .needsYou: "needs_you"
+            case .justFinished: "just_finished"
+            default: rawValue
+            }
+        }
         var title: String {
             switch self {
             case .running: "Running"
             case .needsYou: "Needs you"
+            case .justFinished: "Just finished"
             case .finished: "Results"
             }
         }
@@ -376,10 +383,19 @@ final class ActivityViewModel: ObservableObject {
                 let params = Self.listParams(tab: self.tab, search: self.search, outcome: self.outcome, workspaceID: self.workspaceID, since: self.activeSince, limit: depth)
                 let next = try Self.decodePage(try await self.service.list(params))
                 guard !Task.isCancelled, self.generation == request else { return }
+                let previous = self.page.items
+                let openedDetail = self.detail
                 self.page = next
                 self.hasSuccessfulSnapshot = true
                 if let selectedID = self.selectedID {
                     self.detail = next.items.first(where: { $0.id == selectedID })
+                    // Opening a row marks it read, which drops it from Just finished;
+                    // the open row stays in place until the user leaves it.
+                    if self.detail == nil, self.tab == .justFinished, let openedDetail, openedDetail.id == selectedID {
+                        let keptBefore = previous.prefix { $0.id != selectedID }.filter { kept in next.items.contains { $0.id == kept.id } }.count
+                        self.page.items.insert(openedDetail, at: min(keptBefore, self.page.items.count))
+                        self.detail = openedDetail
+                    }
                 } else {
                     self.detail = nil
                 }
@@ -1030,7 +1046,7 @@ struct ActivityRootView: View {
     @ViewBuilder
     private var bulkActions: some View {
         // One bulk action per tab: reading never empties Needs you, so offering it there only misleads.
-        if model.tab == .finished {
+        if model.tab == .finished || model.tab == .justFinished {
             Button("Mark all as read") { model.markCurrentResultsSeen() }
                 .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning || !model.hasUnreadResults).fixedSize()
                 .help(model.hasUnreadResults ? "Marks every result in this filter as read. Nothing is removed." : "Every result in this filter is already read.")
@@ -1144,6 +1160,7 @@ struct ActivityRootView: View {
         switch model.tab {
         case .running: DSEmptyState(icon: "moon.zzz", title: "Nothing running", subtitle: "Agent runs and project scripts in progress appear here.")
         case .needsYou: DSEmptyState(icon: "checkmark.circle", title: "Nothing needs you", subtitle: "Approvals, questions, and runs that failed and were not retried show up here.")
+        case .justFinished: DSEmptyState(icon: "checkmark.seal", title: "You're caught up", subtitle: "Runs that finish show up here until you open them.")
         case .finished: DSEmptyState(icon: "tray", title: "No results yet", subtitle: "Each conversation's latest finished run shows up here.")
         }
     }
@@ -1383,6 +1400,7 @@ struct ActivityRootView: View {
         switch tab {
         case .running: model.page.counts.running
         case .needsYou: model.page.counts.needs_you
+        case .justFinished: model.page.counts.new_results
         case .finished: model.page.counts.finished
         }
     }

@@ -994,7 +994,8 @@ public struct ScheduledTasksRootView: View {
         if task.effectiveRoutingMode == .auto {
             return "\(task.provider.rawValue.capitalized) · Auto"
         }
-        return "\(task.provider.rawValue.capitalized) · \(task.model) · \(task.reasoningEffort.displayName)"
+        let model = task.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(task.provider.rawValue.capitalized) · \(model.isEmpty ? "Default model" : model) · \(task.reasoningEffort.displayName)"
     }
 
     // MARK: Detail / history (plan: scheduled-task-history)

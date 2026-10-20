@@ -165,6 +165,8 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         f.vm.openWorkspaceConversation(row)
         XCTAssertEqual(botsVM.selectedBotID, bot.id, "sidebar row routes to the exact Bot")
         XCTAssertEqual(botsVM.selectedConversation?.id, conversation.id, "sidebar row opens the exact pinned conversation")
+        // Only one workspace is expanded at a time; open the foreign one to read its rows.
+        await expand(f.vm, foreignWorkspace.id)
         XCTAssertEqual(f.vm.workspaceConversationRows(foreignWorkspace.id).map(\.threadID), [foreignThread.id])
     }
 
@@ -265,8 +267,9 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         XCTAssertTrue(f.vm.workspaceBotRows(empty.id).isEmpty)
         XCTAssertTrue(f.vm.showsAddBot(empty.id), "a workspace without Bots still offers + New bot")
 
-        f.vm.toggleWorkspaceExpanded(elephant.id)
-        XCTAssertTrue(f.vm.workspaceBotRows(elephant.id).isEmpty, "collapsing hides the children")
+        XCTAssertTrue(f.vm.workspaceBotRows(elephant.id).isEmpty, "expanding another workspace collapses this one")
+        f.vm.toggleWorkspaceExpanded(empty.id)
+        XCTAssertTrue(f.vm.expandedWorkspaceIDs.isEmpty, "collapsing the open workspace leaves none expanded")
 
         f.vm.select(star.id)
         XCTAssertEqual(f.context.state.window.selectedWorkspaceID, star.id, "clicking the name opens the workspace layout")

@@ -2793,7 +2793,9 @@ public final class JSONRPCDispatcher {
                     "account_usage_get_v1": .bool(true),
                     "agent_activity": .object(["protocol_version": .number(1)]),
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
-                    "scheduled_tasks_v1": .bool(true)
+                    "scheduled_tasks_v1": .bool(true),
+                    // agent.activity.list section "just_finished".
+                    "activity_just_finished_v1": .bool(true)
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {

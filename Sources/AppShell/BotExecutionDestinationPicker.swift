@@ -80,6 +80,8 @@ struct BotVirtualMachinesView: View {
     let workspaces: [Workspace]
     var initialWorkspaceID: WorkspaceID? = nil
     var initialMachine: BotVirtualMachine? = nil
+    /// Set when mounted as a workspace's VMs tab: lists and creates only that workspace's VMs.
+    var lockedWorkspaceID: WorkspaceID? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var machines: [BotVirtualMachine] = []
     @State private var name = ""
@@ -92,9 +94,13 @@ struct BotVirtualMachinesView: View {
             HStack {
                 Text("Virtual machines").font(DS.Font.title)
                 Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+                if lockedWorkspaceID == nil {
+                    Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+                }
             }
-            Text("General VMs can be shared by any bot. Workspace VMs are available only to bots exclusive to that workspace.")
+            Text(lockedWorkspaceID == nil
+                 ? "General VMs can be shared by any bot. Workspace VMs are available only to bots exclusive to that workspace."
+                 : "These VMs are available only to bots exclusive to this workspace.")
                 .font(DS.Font.body).foregroundStyle(DS.Palette.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             List(machines) { machine in
@@ -116,7 +122,7 @@ struct BotVirtualMachinesView: View {
             }
             .overlay {
                 if machines.isEmpty {
-                    Text("No shared VMs yet. Create one below.")
+                    Text(lockedWorkspaceID == nil ? "No shared VMs yet. Create one below." : "No VMs in this workspace yet. Create one below.")
                         .foregroundStyle(DS.Palette.textSecondary)
                 }
             }
@@ -124,14 +130,16 @@ struct BotVirtualMachinesView: View {
                 TextField("Name", text: $name)
                     .onSubmit(save)
                     .accessibilityIdentifier("bots.vm.name")
-                Picker("Available to", selection: $scope) {
-                    Text("All bots (General)").tag(WorkspaceID?.none)
-                    ForEach(workspaces) { workspace in
-                        Text(workspace.name).tag(Optional(workspace.id))
+                if lockedWorkspaceID == nil {
+                    Picker("Available to", selection: $scope) {
+                        Text("All bots (General)").tag(WorkspaceID?.none)
+                        ForEach(workspaces) { workspace in
+                            Text(workspace.name).tag(Optional(workspace.id))
+                        }
                     }
+                    .disabled(editingID != nil)
+                    .accessibilityIdentifier("bots.vm.scope")
                 }
-                .disabled(editingID != nil)
-                .accessibilityIdentifier("bots.vm.scope")
             }
             if let error {
                 Text(error).font(DS.Font.caption).foregroundStyle(DS.Palette.danger)
@@ -142,7 +150,7 @@ struct BotVirtualMachinesView: View {
                     .font(DS.Font.caption).foregroundStyle(DS.Palette.textSecondary)
                 Spacer()
                 if editingID != nil {
-                    Button("Cancel") { editingID = nil; name = ""; error = nil }
+                    Button("Cancel") { editingID = nil; name = ""; scope = lockedWorkspaceID; error = nil }
                 }
                 Button(editingID == nil ? "Create VM" : "Save name", action: save)
                     .buttonStyle(.borderedProminent)
@@ -151,13 +159,16 @@ struct BotVirtualMachinesView: View {
             }
         }
         .padding(DS.Space.xl)
-        .frame(width: 560, height: 490)
+        .frame(
+            minWidth: lockedWorkspaceID == nil ? 560 : 320, maxWidth: lockedWorkspaceID == nil ? 560 : .infinity,
+            minHeight: lockedWorkspaceID == nil ? 490 : 320, maxHeight: lockedWorkspaceID == nil ? 490 : .infinity,
+            alignment: .topLeading
+        )
         .onAppear {
-            scope = initialMachine?.workspaceID ?? initialWorkspaceID
+            scope = lockedWorkspaceID ?? initialMachine?.workspaceID ?? initialWorkspaceID
             editingID = initialMachine?.id
             name = initialMachine?.name ?? ""
-            do { machines = try store.listVirtualMachines() }
-            catch { self.error = String(describing: error) }
+            reloadMachines()
         }
     }
 
@@ -176,10 +187,15 @@ struct BotVirtualMachinesView: View {
                 "method": .string("bot.vm.save"),
                 "vm_id": .string(machine.id.uuidString.lowercased())
             ]))
-            machines = try store.listVirtualMachines()
+            reloadMachines()
             editingID = nil
             name = ""
             error = nil
         } catch { self.error = String(describing: error) }
+    }
+
+    private func reloadMachines() {
+        do { machines = try store.listVirtualMachines().filter { lockedWorkspaceID == nil || $0.workspaceID == lockedWorkspaceID } }
+        catch { self.error = String(describing: error) }
     }
 }

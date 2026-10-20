@@ -182,6 +182,21 @@ final class AgentActivityServiceTests: XCTestCase {
         XCTAssertNotEqual(next.items.first?.id, first.items.first?.id)
     }
 
+    func test_justFinishedListsOnlyUnopenedFinishedRunsAndMatchesItsCount() throws {
+        // WHY: the Just finished tab lets the user see what recently finished; a run
+        // leaves it once opened, and the tab count must equal what it lists.
+        let context = try makeContext()
+        let seen = try makeRun(context, thread: try makeThread(context), status: .completed, at: 100)
+        let unseen = try makeRun(context, thread: try makeThread(context), status: .failed, at: 200)
+        _ = try makeRun(context, thread: try makeThread(context), status: .running, at: 300)
+        _ = try service(context).setViewed(["item_ids": .array([.string("run:\(seen.id.description)")]), "viewed": .bool(true)])
+
+        let page = try decodePage(service(context).list(["section": .string("just_finished")]))
+        XCTAssertEqual(page.items.map(\.id), ["run:\(unseen.id.description)"], "not the opened run, not the running one")
+        XCTAssertEqual(page.counts.newResults, page.items.count)
+        XCTAssertEqual(try decodePage(service(context).list(["section": .string("finished")])).items.count, 2, "Results still keeps both")
+    }
+
     func test_legacyTerminalRunViewedCreatesResultWithoutSummaryAndRestoreCanClear() throws {
         let context = try makeContext()
         let thread = try makeThread(context)

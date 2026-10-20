@@ -81,6 +81,7 @@ final class ActivityService: @unchecked Sendable {
         case "running": selected = items.filter { $0.state == .queued || ($0.state == .running && !$0.blocking) }
         case "needs_you": selected = items.filter(\.needsAction)
         case "finished": selected = items.filter { Self.isTerminal($0.state) }
+        case "just_finished": selected = items.filter(Self.isJustFinished)
         default: selected = items
         }
         let page = selected.filter { item in
@@ -579,7 +580,7 @@ final class ActivityService: @unchecked Sendable {
             queued: items.filter { $0.state == .queued }.count,
             needsYou: items.filter(\.needsAction).count,
             finished: items.filter { Self.isTerminal($0.state) }.count,
-            newResults: items.filter { $0.finishedAt != nil && $0.viewedAt == nil }.count
+            newResults: items.filter(Self.isJustFinished).count
         )
     }
     private static func workspaceCounts(for items: [AgentActivityItem]) -> [String: AgentActivityCounts] {
@@ -589,6 +590,11 @@ final class ActivityService: @unchecked Sendable {
     }
 
     private static let terminalRunStatuses: Set<String> = ["completed", "failed", "interrupted", "cancelled"]
+    /// Finished and not opened yet: the Just finished tab and the `new_results` count.
+    private static func isJustFinished(_ item: AgentActivityItem) -> Bool {
+        item.finishedAt != nil && item.viewedAt == nil
+    }
+
     private static func isTerminal(_ state: AgentActivityState) -> Bool {
         [.completed, .failed, .interrupted, .stopped].contains(state)
     }
@@ -637,7 +643,7 @@ private struct ActivityFilter {
         else if params["workspace_id"] != nil { throw JSONRPCError.invalidParams }
         else { workspaceID = nil }
         section = params["section"]?.stringValue ?? "all"
-        guard ["all", "running", "needs_you", "finished"].contains(section) else { throw JSONRPCError.invalidParams }
+        guard ["all", "running", "needs_you", "just_finished", "finished"].contains(section) else { throw JSONRPCError.invalidParams }
         search = params["search"]?.stringValue?.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current) ?? ""
         outcome = params["outcome"]?.stringValue
         guard outcome == nil || ["completed", "failed", "interrupted", "stopped"].contains(outcome!) else { throw JSONRPCError.invalidParams }

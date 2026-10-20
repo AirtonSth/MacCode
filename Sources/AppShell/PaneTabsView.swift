@@ -400,7 +400,7 @@ public final class PaneTabsView: NSObject {
         let btn = PaneTabButton(
             surfaceID: sid,
             title: desc.title,
-            symbol: Self.symbol(for: desc.type),
+            symbol: Self.symbol(for: desc),
             selected: desc.id == selectedID,
             busy: busy,
             dirty: surfaceIsUnsaved(sid),
@@ -423,7 +423,8 @@ public final class PaneTabsView: NSObject {
             }
         )
         btn.setUnread(desc.type == .terminal && desc.hasUnreadActivity)
-        btn.toolTip = Self.tabTooltipString(title: desc.title, type: desc.type)
+        btn.toolTip = WorkspaceTool.from(metadata: desc.metadata, title: desc.title).map { "\(desc.title) -- \($0.title)" }
+            ?? Self.tabTooltipString(title: desc.title, type: desc.type)
         return btn
     }
 
@@ -506,7 +507,7 @@ public final class PaneTabsView: NSObject {
             pane.surfaces.first(where: { $0.id == id })
         } ?? pane.surfaces.first
         let icon = NSImageView()
-        icon.image = NSImage(systemSymbolName: selected.map { Self.symbol(for: $0.type) } ?? "rectangle.dashed",
+        icon.image = NSImage(systemSymbolName: selected.map { Self.symbol(for: $0) } ?? "rectangle.dashed",
                              accessibilityDescription: selected?.title ?? "Minimized pane")
         icon.symbolConfiguration = .init(pointSize: 13, weight: .regular)
         icon.contentTintColor = DS.NS.textSecondary
@@ -767,6 +768,10 @@ public final class PaneTabsView: NSObject {
         }
     }
 
+    static func symbol(for desc: SurfaceDescriptor) -> String {
+        WorkspaceTool.from(metadata: desc.metadata, title: desc.title)?.symbol ?? symbol(for: desc.type)
+    }
+
     static func symbol(for type: SurfaceType) -> String {
         switch type {
         case .terminal: return "terminal"
@@ -816,7 +821,9 @@ public final class PaneTabsView: NSObject {
         ("Browser", .browser),
         ("Agent App", .agentApp),
         ("Files", .files),
-        ("Git", .rightSidebarTool)
+        ("Git", .rightSidebarTool),
+        ("Bots", .rightSidebarTool),
+        ("VMs", .rightSidebarTool)
     ]
 
     private static func title(for type: SurfaceType) -> String {
@@ -856,8 +863,10 @@ public final class PaneTabsView: NSObject {
         for (label, type) in surfaceChoices {
             let item = NSMenuItem(title: label, action: action, keyEquivalent: "")
             item.target = target
-            item.representedObject = direction.map { "\($0.rawValue)|\(type.rawValue)" } ?? type.rawValue
-            let image = NSImage(systemSymbolName: symbol(for: type), accessibilityDescription: label)
+            // Bots and VMs share Git's surface type; the label picks the tool.
+            let choice = "\(type.rawValue)#\(label)"
+            item.representedObject = direction.map { "\($0.rawValue)|\(choice)" } ?? choice
+            let image = NSImage(systemSymbolName: WorkspaceTool.allCases.first { $0.title == label }?.symbol ?? symbol(for: type), accessibilityDescription: label)
             image?.isTemplate = true
             item.image = image?.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
             menu.addItem(item)
@@ -895,7 +904,7 @@ public final class PaneTabsView: NSObject {
             item.target = target
             item.representedObject = desc.id
             item.state = desc.id == selectedID ? .on : .off
-            let img = NSImage(systemSymbolName: PaneTabsView.symbol(for: desc.type),
+            let img = NSImage(systemSymbolName: PaneTabsView.symbol(for: desc),
                               accessibilityDescription: desc.title)
             img?.isTemplate = true
             item.image = img?.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
@@ -939,8 +948,15 @@ public final class PaneTabsView: NSObject {
 
     @objc private func addFromMenu(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
-              let type = SurfaceType(rawValue: raw) else { return }
-        performAdd(type, title: Self.title(for: type))
+              let (type, title) = Self.menuChoice(raw) else { return }
+        performAdd(type, title: title)
+    }
+
+    /// "<type>#<label>" from the surface menus.
+    static func menuChoice(_ raw: String) -> (SurfaceType, String)? {
+        let parts = raw.split(separator: "#", maxSplits: 1).map(String.init)
+        guard let type = SurfaceType(rawValue: parts[0]) else { return nil }
+        return (type, parts.count == 2 ? parts[1] : title(for: type))
     }
 
     @objc private func splitFromMenu(_ sender: NSMenuItem) {
@@ -948,8 +964,8 @@ public final class PaneTabsView: NSObject {
         let parts = raw.split(separator: "|", maxSplits: 1).map(String.init)
         guard parts.count == 2,
               let direction = SplitDirection(rawValue: parts[0]),
-              let type = SurfaceType(rawValue: parts[1]) else { return }
-        performSplit(direction, type: type, title: Self.title(for: type))
+              let (type, title) = Self.menuChoice(parts[1]) else { return }
+        performSplit(direction, type: type, title: title)
     }
 
     /// Testable seam shared by the @objc button handlers.

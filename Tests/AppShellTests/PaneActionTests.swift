@@ -784,8 +784,9 @@ final class PaneActionTests: XCTestCase {
 
     func test_surfaceChoices_haveSixDistinctTypes() {
         let types = PaneTabsView.surfaceChoices.map { $0.1 }
-        XCTAssertEqual(Set(types).count, types.count)
-        XCTAssertEqual(PaneTabsView.surfaceChoices.map(\.0), ["Terminal", "SSH", "Browser", "Agent App", "Files", "Git"],
+        let labels = PaneTabsView.surfaceChoices.map(\.0)
+        XCTAssertEqual(Set(labels).count, labels.count)
+        XCTAssertEqual(labels, ["Terminal", "SSH", "Browser", "Agent App", "Files", "Git", "Bots", "VMs"],
                        "split-panel menus must expose the same choices as the tab + menu instead of defaulting straight to Terminal")
         XCTAssertTrue(types.contains(.terminal))
         XCTAssertTrue(types.contains(.ssh))

@@ -398,6 +398,19 @@ final class BotGuestRunResolverTests: XCTestCase {
         await plan.finish(.completed).value
     }
 
+    func test_workspacePinnedBotConversationInTheBotHomeRunsInTheGuestHome() async throws {
+        // WHY: a workspace Bot's scheduled run is pinned to its workspace but runs
+        // in the Bot's Mac home, which is never mounted. It failed every time with
+        // "this conversation's folder …/bots/<id>/e1 is not inside a folder mounted".
+        let f = try await makeFixture()
+        let thread = try makeThread(f, workspace: true)
+        let botHome = BotHome(appSupportDirectory: f.appSupport, bot: f.bot).root
+        try FileManager.default.createDirectory(at: botHome, withIntermediateDirectories: true)
+        let plan = try unwrapPlan(try await f.resolver.prepare(request(thread, cwd: botHome.path)) { _ in })
+        XCTAssertEqual(plan.guestCwd, BotComputerGuestSpec.guestUserHome)
+        await plan.finish(.completed).value
+    }
+
     // MARK: - ChatGPT catalog parity
 
     func test_theGuestAsksChatGPTAsTheMacsCodexClientVersion_resolvedWhileTheVMComesUp() async throws {

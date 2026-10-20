@@ -1281,6 +1281,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         surface = MarkdownSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
                     case .filePreview:
                         surface = FilePreviewSurface(workspaceID: wid, filePath: desc.metadata["path"], title: title)
+                    case .rightSidebarTool where WorkspaceTool.from(metadata: desc.metadata, title: title) != nil:
+                        surface = WorkspaceToolSurface(tool: WorkspaceTool.from(metadata: desc.metadata, title: title)!, workspaceID: wid, title: title, router: self)
                     case .rightSidebarTool:
                         let diff = DiffPanelSurface(workspaceID: wid, cwd: cwd, title: title, settings: SettingsStore(db: ctx.db))
                         diff.onBusyStateChanged = { [weak self, weak diff] busy in
@@ -10423,7 +10425,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 // Tool selection is encoded in the title for V1 — keeps
                 // the JSON-RPC payload simple. Default is the diff panel.
                 let tool = baseTitle.lowercased()
-                if tool.contains("feed") {
+                if let workspaceTool = WorkspaceTool.from(metadata: restore?.metadata ?? [:], title: baseTitle) {
+                    surface = WorkspaceToolSurface(tool: workspaceTool, workspaceID: workspace, title: baseTitle, router: self)
+                } else if tool.contains("feed") {
                     let feed = FeedPanelSurface(workspaceID: workspace, title: baseTitle)
                     // Wire the in-process EventBus to the feed VM so any
                     // dispatcher mutation lights up the panel in real time.
