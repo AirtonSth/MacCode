@@ -105,8 +105,8 @@ final class BotSelfConfigTests: XCTestCase {
         ])
         XCTAssertEqual(afterSet.name, "Piper Prime")
         XCTAssertEqual(afterSet.soul, "Speak plainly.")
-        // leftover full_access is not live — Desk launches supervised
-        XCTAssertEqual(afterSet.permissionMode, AgentPermissionMode.supervised.rawValue)
+        // Bots default to Full access; set_settings must not change the mode
+        XCTAssertEqual(afterSet.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(afterSet.desktopKind, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertFalse(afterSet.notificationsEnabled)
         XCTAssertEqual(try store.get(id: bot.id)?.name, "Piper Prime")
@@ -490,14 +490,14 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "approval_mode": "full_access",
+                "approval_mode": "supervised",
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "Approval mode": "full_access",
+                "Approval mode": "supervised",
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
@@ -505,31 +505,31 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
                 "name": "Piper Prime",
-                "permission": "full_access",
+                "permission": "supervised",
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Approval mode reject must not persist a name")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
 
         let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
     }
 
     func test_setSettingsRejectsAdvertisedDesktop_becauseStudioSaysItIsNotASelfConfigWrite() throws {
@@ -641,24 +641,24 @@ final class BotSelfConfigTests: XCTestCase {
         }
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Approvals reject must not persist a name")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
 
         let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
     }
 
     func test_setSettingsRejectsAdvertisedHostBrokeredWrites_becauseStudioSaysTheyStayOff() throws {
@@ -709,24 +709,24 @@ final class BotSelfConfigTests: XCTestCase {
         }
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Host-brokered writes reject must not persist a name")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
 
         let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
     }
 
     func test_setSettingsRejectsAdvertisedTestRun_becauseStudioSaysDoTheInstructionNow() throws {
@@ -777,24 +777,24 @@ final class BotSelfConfigTests: XCTestCase {
         }
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Test run reject must not persist a name")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
 
         let renamed = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
     }
 
     func test_setSettingsRejectsAdvertisedMemory_becauseStudioSaysRememberAFact() throws {
@@ -849,7 +849,7 @@ final class BotSelfConfigTests: XCTestCase {
             still.memory.contains(where: { $0.content.contains("Prefers dark mode") }),
             "Memory reject must not persist a fact"
         )
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         let remembered = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
             "path": "MEMORY.md",
@@ -859,13 +859,13 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
         XCTAssertTrue(leftover.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
 
@@ -873,7 +873,7 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertTrue(renamed.memory.contains(where: { $0.content.contains("Prefers dark mode") }))
     }
 
@@ -1112,7 +1112,7 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Skills reject must not persist a name")
         XCTAssertEqual(still.skills.count, 0, "Skills reject must not persist a binding")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         let added = try service.call(name: BotSelfConfigCatalog.writeHomeFile, arguments: [
             "path": "skills/weekly-account-health/SKILL.md",
@@ -1123,13 +1123,13 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
         XCTAssertEqual(leftover.skills.first?.skillID, "weekly-account-health")
 
@@ -1137,7 +1137,7 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(renamed.skills.first?.skillID, "weekly-account-health")
     }
 
@@ -1356,7 +1356,7 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Routines reject must not persist a name")
         XCTAssertEqual(still.routines.count, 0, "Routines reject must not persist a schedule")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         let saved = try service.call(name: BotSelfConfigCatalog.saveRoutine, arguments: [
             "name": "Morning",
@@ -1376,13 +1376,13 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
         XCTAssertEqual(leftover.routines.first?.name, "Morning")
         XCTAssertEqual(leftover.routines.first?.enabled, true)
@@ -1391,7 +1391,7 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(renamed.routines.first?.name, "Morning")
         XCTAssertEqual(renamed.routines.first?.enabled, true)
     }
@@ -1434,7 +1434,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(still.name, "Piper", "Instruction reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "Instruction reject must not persist soul")
         XCTAssertEqual(still.routines.count, 0, "Instruction reject must not persist a schedule")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "instructions": "Own the inbox.",
@@ -1459,13 +1459,13 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
         XCTAssertEqual(leftover.soul, "Own the inbox.")
         XCTAssertEqual(leftover.routines.first?.name, "Morning")
@@ -1475,7 +1475,7 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(renamed.soul, "Own the inbox.")
         XCTAssertEqual(renamed.routines.first?.name, "Morning")
         XCTAssertEqual(renamed.routines.first?.enabled, true)
@@ -1518,7 +1518,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(still.name, "Piper", "When reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "When reject must not persist soul")
         XCTAssertEqual(still.routines.count, 0, "When reject must not persist a schedule")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "instructions": "Own the inbox.",
@@ -1543,13 +1543,13 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
         XCTAssertEqual(leftover.soul, "Own the inbox.")
         XCTAssertEqual(leftover.routines.first?.name, "Morning")
@@ -1560,7 +1560,7 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(renamed.soul, "Own the inbox.")
         XCTAssertEqual(renamed.routines.first?.name, "Morning")
         XCTAssertEqual(renamed.routines.first?.scheduleNote, "Weekdays 9:00")
@@ -1619,7 +1619,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertEqual(still.name, "Piper", "Active reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "Active reject must not persist soul")
         XCTAssertEqual(still.routines.count, 0, "Active reject must not persist a schedule")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "instructions": "Own the inbox.",
@@ -1644,13 +1644,13 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
         XCTAssertEqual(leftover.soul, "Own the inbox.")
         XCTAssertEqual(leftover.routines.first?.name, "Morning")
@@ -1661,7 +1661,7 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(renamed.soul, "Own the inbox.")
         XCTAssertEqual(renamed.routines.first?.name, "Morning")
         XCTAssertEqual(renamed.routines.first?.scheduleNote, "Weekdays 9:00")
@@ -1718,7 +1718,7 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Website reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "Website reject must not persist soul")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
 
         let fromInstructions = try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
             "instructions": "Own the inbox.",
@@ -1727,13 +1727,13 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let leftover = try service.call(name: BotSelfConfigCatalog.getSettings)
-        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(leftover.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(leftover.name, "Piper")
         XCTAssertEqual(leftover.soul, "Own the inbox.")
 
@@ -1741,7 +1741,7 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(renamed.soul, "Own the inbox.")
     }
 
@@ -1911,7 +1911,7 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
@@ -1926,14 +1926,14 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
                 "name": "Piper Prime",
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
         }
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "permission_mode reject must not persist a name")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
         XCTAssertThrowsError(
@@ -1951,7 +1951,7 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
     }
 
     func test_setSettingsRejectsSnapshotPermissionMode_becauseStudioSaysItIsHostAssigned() throws {
@@ -1981,7 +1981,7 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permissionMode": AgentPermissionMode.fullAccess.rawValue,
+                "permissionMode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
@@ -1996,12 +1996,12 @@ final class BotSelfConfigTests: XCTestCase {
         }
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "permissionMode reject must not persist a name")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
@@ -2011,7 +2011,7 @@ final class BotSelfConfigTests: XCTestCase {
             "name": "Piper Prime",
         ])
         XCTAssertEqual(renamed.name, "Piper Prime")
-        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(renamed.permissionMode, AgentPermissionMode.fullAccess.rawValue)
     }
 
     func test_setSettingsRejectsLeftoverDesktopKind_becauseStudioSaysItIsNotASelfConfigWrite() throws {
@@ -2269,7 +2269,7 @@ final class BotSelfConfigTests: XCTestCase {
 
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permissionMode": AgentPermissionMode.fullAccess.rawValue,
+                "permissionMode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
@@ -2526,7 +2526,7 @@ final class BotSelfConfigTests: XCTestCase {
         }
         XCTAssertThrowsError(
             try service.call(name: BotSelfConfigCatalog.setSettings, arguments: [
-                "permission_mode": AgentPermissionMode.fullAccess.rawValue,
+                "permission_mode": AgentPermissionMode.supervised.rawValue,
             ])
         ) { error in
             XCTAssertEqual(error as? BotSelfConfigError, .invalid(BotBrainCompiler.approvalModeHostAssignedHonesty))
@@ -2541,7 +2541,7 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Supervised reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "Supervised reject must not persist soul")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
@@ -2626,7 +2626,7 @@ final class BotSelfConfigTests: XCTestCase {
         let still = try service.call(name: BotSelfConfigCatalog.getSettings)
         XCTAssertEqual(still.name, "Piper", "Ask before reject must not persist a name")
         XCTAssertEqual(still.soul, "Be brief.", "Ask before reject must not persist soul")
-        XCTAssertEqual(still.permissionMode, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(still.permissionMode, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertEqual(still.id, bot.id.value.uuidString.lowercased())
         XCTAssertEqual(try store.get(id: bot.id)?.currentRevisionID, beforeID)
 
@@ -3802,7 +3802,7 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertNil(object["provider_instance_id"], "provider account belongs to the calling thread")
         XCTAssertNil(object["providerInstanceID"])
         XCTAssertNil(object["model"], "model belongs to the calling thread")
-        XCTAssertEqual(object["permissionMode"] as? String, AgentPermissionMode.supervised.rawValue)
+        XCTAssertEqual(object["permissionMode"] as? String, AgentPermissionMode.fullAccess.rawValue)
         XCTAssertNil(object["permission_mode"], "leftover permission stays unnamed")
         XCTAssertEqual(object["desktopKind"] as? String, BotDesktopKind.logicalExecutionSpace.rawValue)
         XCTAssertNil(object["desktop_kind"], "leftover desktop stays unnamed")

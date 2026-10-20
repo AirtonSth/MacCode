@@ -397,10 +397,12 @@ final class BotTypesTests: XCTestCase {
         XCTAssertFalse(BotRoutineCopy.testRunHonestyCaption.contains("App-closed"))
     }
 
-    func test_permissionAdvertisedOrSupervised_becauseLeftoverFullAccessIsNotLivePower() {
-        XCTAssertEqual(BotPermission.advertisedModes, [.supervised])
+    func test_permissionAdvertisedOrSupervised_keepsFullAccessAndClampsUnadvertisedModes() {
+        // WHY: Bots default to Full access, so a stored full_access must run as
+        // Full access. Modes the Desk does not advertise still fall back to supervised.
+        XCTAssertEqual(BotPermission.advertisedModes, [.supervised, .fullAccess])
         XCTAssertEqual(BotPermission.advertisedOrSupervised(.supervised), .supervised)
-        XCTAssertEqual(BotPermission.advertisedOrSupervised(.fullAccess), .supervised)
+        XCTAssertEqual(BotPermission.advertisedOrSupervised(.fullAccess), .fullAccess)
         XCTAssertEqual(BotPermission.advertisedOrSupervised(.autoAcceptEdits), .supervised)
         XCTAssertTrue(BotPermission.honestyLabel.contains("Supervised"))
         XCTAssertTrue(BotPermission.honestyLabel.contains("Host-brokered writes stay off"))

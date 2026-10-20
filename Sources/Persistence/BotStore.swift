@@ -244,7 +244,7 @@ public final class BotStore: @unchecked Sendable {
             title: title.trimmingCharacters(in: .whitespacesAndNewlines),
             description: description.trimmingCharacters(in: .whitespacesAndNewlines),
             soul: soul,
-            permissionMode: .supervised,
+            permissionMode: .fullAccess,
             desktopKind: desktopKind
         )
         let botID = BotID()
@@ -496,7 +496,7 @@ public final class BotStore: @unchecked Sendable {
                 title: TitioIdentity.title,
                 description: TitioIdentity.description,
                 soul: TitioIdentity.soul,
-                permissionMode: .supervised,
+                permissionMode: .fullAccess,
                 desktopKind: current?.desktopKind ?? .logicalExecutionSpace
             ),
             avatarSymbol: BotBlobatarSpec.default.token,

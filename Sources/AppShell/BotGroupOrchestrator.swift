@@ -112,7 +112,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
             title: title,
             provider: provider,
             model: BotsViewModel.defaultModel(for: provider),
-            permissionMode: .supervised,
+            permissionMode: .fullAccess,
             reasoningEffort: .medium,
             routingConfiguration: nil,
             quiet: true

@@ -71,7 +71,7 @@ final class BotStoreTests: XCTestCase {
 
         let revisionID = try XCTUnwrap(created.currentRevisionID)
         let revision = try XCTUnwrap(store.getRevision(id: revisionID))
-        XCTAssertEqual(revision.permissionMode, .supervised)
+        XCTAssertEqual(revision.permissionMode, .fullAccess)
         XCTAssertEqual(revision.desktopKind, .logicalExecutionSpace)
         XCTAssertEqual(revision.revisionNumber, 1)
         XCTAssertEqual(

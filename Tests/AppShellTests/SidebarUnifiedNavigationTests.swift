@@ -307,8 +307,9 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         let botLinkRow = try XCTUnwrap(vm.workspaceBotRows(workspace.id).first)
         vm.openWorkspaceConversation(plainRow)
         vm.openAuthorizedBotConversation(botLinkRow)
-        XCTAssertFalse(controller.isShowingBotsContent, "the workspace Bot row opens as a workspace tab, not the Bots Desk")
-        XCTAssertEqual(surface.viewModel.selectedThreadId, botThread.id)
+        XCTAssertTrue(controller.isShowingBotsContent, "the workspace Bot row opens the Bots Desk")
+        XCTAssertEqual(controller.sidebarBotsViewModelForTesting.selectedBotID, bot.id)
+        XCTAssertEqual(controller.sidebarBotsViewModelForTesting.selectedConversation?.id, conversation.id, "the Bot row opens its exact Desk conversation")
 
         let botLink = try XCTUnwrap(vm.workspaceBotRows(workspace.id).first)
         XCTAssertEqual(botLink.conversationID, conversation.id, "the Bot row resumes its recent contextual conversation")

@@ -5783,7 +5783,7 @@ public final class BotsViewModel: ObservableObject {
                 title: studioDraft.title,
                 description: studioDraft.description,
                 soul: soul,
-                permissionMode: .supervised,
+                permissionMode: .fullAccess,
                 desktopKind: desktop
             )
             let published = try botStore.publish(
@@ -9573,7 +9573,7 @@ public final class BotsViewModel: ObservableObject {
             title: studioDraft.title,
             description: studioDraft.description,
             soul: studioDraft.soul,
-            permissionMode: .supervised,
+            permissionMode: .fullAccess,
             desktopKind: resolvedDesktopKind(studioDraft.desktopKind)
         )
         if screen != .studio, let selectedRevision { return selectedRevision }

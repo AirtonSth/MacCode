@@ -3671,7 +3671,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             "provider_instance_id": providerInstanceID,
             "model": string(params, "model") ?? "",
             "routing_mode": string(params, "routing_mode") ?? "auto",
-            "permission_mode": string(params, "permission_mode") ?? "supervised",
+            "permission_mode": string(params, "permission_mode") ?? "full_access",
             "reasoning_effort": string(params, "reasoning_effort") ?? "medium",
             "service_tier": string(params, "service_tier") ?? "auto",
             "run_as_user": runAsUser,

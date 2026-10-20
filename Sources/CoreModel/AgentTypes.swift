@@ -1591,7 +1591,7 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         color: String? = nil,
         pinned: Bool = false,
         sortOrder: Int = 0,
-        permissionMode: AgentPermissionMode = .supervised,
+        permissionMode: AgentPermissionMode = .fullAccess,
         reasoningEffort: AgentReasoningEffort = .medium,
         reasoningModel: String? = nil,
         executionMode: AgentExecutionMode = .local,

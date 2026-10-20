@@ -509,11 +509,10 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertFalse(BotStandingInstructions.looksGenerated("Speak plainly."))
     }
 
-    func test_leftoverFullAccessReceiptResolvesToSupervised_becauseDeskNeverLaunchesIt() {
-        // WHY: Studio/Desk advertise Supervised. Self-config can persist
-        // leftover full_access. Brain header used to show that leftover as
-        // live power, and the model never saw the advertised route, so
-        // "just write the file" invented unsupervised access.
+    func test_fullAccessReceiptResolvesToFullAccess_becauseBotsDefaultToIt() {
+        // WHY: Bots default to Full access. The compiled Approval mode must
+        // match the mode the run really uses, or the model would be told it
+        // cannot act while it can, or the reverse.
         let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
         let leftover = BotRevision(
             botID: bot.id,
@@ -532,8 +531,8 @@ final class BotBrainCompilerTests: XCTestCase {
             digest: "x"
         )
         let receipt = BotBrainCompiler.assemble(bot: bot, revision: leftover, userText: "Just write the file")
-        XCTAssertEqual(receipt.permissionMode, .supervised)
-        XCTAssertTrue(receipt.compiledPayload.contains("Approval mode: \(BotBrainCompiler.approvalModeText())"))
+        XCTAssertEqual(receipt.permissionMode, .fullAccess)
+        XCTAssertTrue(receipt.compiledPayload.contains("Approval mode: \(BotBrainCompiler.approvalModeText(for: .fullAccess))"))
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.approvalModeHostAssignedHonesty))
         XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.approvalsHonesty))
         XCTAssertFalse(receipt.compiledPayload.contains("Permission:"))
@@ -542,7 +541,7 @@ final class BotBrainCompilerTests: XCTestCase {
         XCTAssertFalse(receipt.compiledPayload.contains(BotStandingInstructions.generatedSignature))
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.included, true)
         XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.title, "Permission")
-        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.text, BotBrainCompiler.approvalModeText())
+        XCTAssertEqual(receipt.layers.first(where: { $0.kind == .permission })?.text, BotBrainCompiler.approvalModeText(for: .fullAccess))
         XCTAssertEqual(
             receipt.layers.first(where: { $0.kind == .permission })?.reason,
             "Advertised supervised route. Leftover full-access kinds compile as supervised."

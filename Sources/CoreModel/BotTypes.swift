@@ -258,10 +258,11 @@ public enum BotRoutineCopy {
         "Test runs are real work. Active tasks run on schedule only while MacCode is open."
 }
 
-/// Desk always launches supervised. Self-config can persist leftover
-/// `full_access` / `auto_accept_edits`. Those must not compile as live power.
+/// Bots default to Full access; the user may pick Supervised per Bot or per
+/// Desk thread. Modes outside `advertisedModes` (auto_accept_edits) still
+/// fall back to supervised.
 public enum BotPermission {
-    public static let advertisedModes: [AgentPermissionMode] = [.supervised]
+    public static let advertisedModes: [AgentPermissionMode] = [.supervised, .fullAccess]
 
     public static let honestyLabel =
         "Supervised. Ask before tool actions. Host-brokered writes stay off."
@@ -673,7 +674,7 @@ public struct BotRevisionDraft: Codable, Sendable, Equatable {
         title: String,
         description: String,
         soul: String = "",
-        permissionMode: AgentPermissionMode = .supervised,
+        permissionMode: AgentPermissionMode = .fullAccess,
         desktopKind: BotDesktopKind = .logicalExecutionSpace
     ) {
         self.name = name
@@ -695,7 +696,7 @@ public struct BotRevisionDraft: Codable, Sendable, Equatable {
         model _: String,
         reasoningEffort _: AgentReasoningEffort = .medium,
         compatibleRouteSet _: [String] = ["default"],
-        permissionMode: AgentPermissionMode = .supervised,
+        permissionMode: AgentPermissionMode = .fullAccess,
         desktopKind: BotDesktopKind = .logicalExecutionSpace
     ) {
         self.init(

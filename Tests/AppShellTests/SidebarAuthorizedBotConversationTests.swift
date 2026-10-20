@@ -44,7 +44,7 @@ final class SidebarAuthorizedBotConversationTests: XCTestCase {
         XCTAssertEqual(try AppCommandRouter.contextPinnedThreadDestination(thread.id, context: context), .bot(linked.id, conversation.id), "the row must resolve to its exact pinned Bot conversation")
         let botsViewModel = BotsViewModel(context: context, router: router)
         router.botsViewModel = botsViewModel
-        // Only a General Bot opens its Desk; a workspace Bot opens as a workspace tab (SidebarUnifiedNavigationTests).
+        // Bot rows, General or workspace, open the Bots Desk (workspace row: SidebarUnifiedNavigationTests).
         let generalRow = try XCTUnwrap(viewModel.authorizedBotConversationRows.first(where: { $0.context == .general }))
         viewModel.openAuthorizedBotConversation(generalRow)
         XCTAssertEqual(botsViewModel.selectedBotID, linked.id)
