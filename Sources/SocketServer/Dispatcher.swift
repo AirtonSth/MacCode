@@ -146,6 +146,12 @@ public protocol CommandRouting: AnyObject {
     func activityListOffMain(params: [String: JSONValue]) async throws -> JSONValue
     func activitySetViewed(params: [String: JSONValue]) throws -> JSONValue
     func activityAcknowledge(params: [String: JSONValue]) throws -> JSONValue
+    /// `scheduled_task.*`: Schedule Tasks for the paired iPhone (capability `agent.scheduled_tasks_v1`).
+    func listScheduledTasksRemote() throws -> JSONValue
+    func saveScheduledTaskRemote(params: [String: JSONValue]) async throws -> JSONValue
+    func deleteScheduledTaskRemote(id: UUID) throws -> JSONValue
+    func enableScheduledTaskRemote(id: UUID, enabled: Bool) async throws -> JSONValue
+    func runScheduledTaskRemote(id: UUID) throws -> JSONValue
     /// Sticky account usage digest for deterministic iOS pull (deprecated
     /// `token_saver.digest.get` name kept until iOS bumps its treaty pin).
     func tokenSaverDigest() -> JSONValue?
@@ -420,6 +426,11 @@ public extension CommandRouting {
     func activityListOffMain(params: [String: JSONValue]) async throws -> JSONValue { try activityList(params: params) }
     func activitySetViewed(params: [String: JSONValue]) throws -> JSONValue { throw JSONRPCError.notSupported("agent.activity.viewed.set") }
     func activityAcknowledge(params: [String: JSONValue]) throws -> JSONValue { throw JSONRPCError.notSupported("agent.activity.acknowledge") }
+    func listScheduledTasksRemote() throws -> JSONValue { throw JSONRPCError.notSupported("scheduled_task.list") }
+    func saveScheduledTaskRemote(params: [String: JSONValue]) async throws -> JSONValue { throw JSONRPCError.notSupported("scheduled_task.save") }
+    func deleteScheduledTaskRemote(id: UUID) throws -> JSONValue { throw JSONRPCError.notSupported("scheduled_task.delete") }
+    func enableScheduledTaskRemote(id: UUID, enabled: Bool) async throws -> JSONValue { throw JSONRPCError.notSupported("scheduled_task.enable") }
+    func runScheduledTaskRemote(id: UUID) throws -> JSONValue { throw JSONRPCError.notSupported("scheduled_task.run") }
     func listManualActions(thread: AgentThreadID) throws -> [ManualActionSnapshot] { [] }
     func pendingManualActions(for threads: [AgentThread]) -> [AgentThreadID: ManualActionSnapshot] { [:] }
     func resolveManualAction(thread: AgentThreadID, id: UUID, resolution: ManualActionResolution, note: String?) async throws -> ManualActionResolveOutcome {
@@ -2778,7 +2789,9 @@ public final class JSONRPCDispatcher {
                     "message_image_get_v1": .bool(true),
                     // Same flag as DirectHTTPServer.capabilitiesProjection.
                     "account_usage_get_v1": .bool(true),
-                    "agent_activity": .object(["protocol_version": .number(1)])
+                    "agent_activity": .object(["protocol_version": .number(1)]),
+                    // Same flag as DirectHTTPServer.capabilitiesProjection.
+                    "scheduled_tasks_v1": .bool(true)
                 ]
                 if let attachmentUpload =
                     agentAttachmentUploadCapability {
@@ -4280,6 +4293,20 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: try router.activitySetViewed(params: params))
             case "agent.activity.acknowledge":
                 return .init(id: id, result: try router.activityAcknowledge(params: params))
+            case "scheduled_task.list":
+                return .init(id: id, result: try router.listScheduledTasksRemote())
+            case "scheduled_task.save":
+                return .init(id: id, result: try await router.saveScheduledTaskRemote(params: params))
+            case "scheduled_task.delete":
+                guard let taskID = params["task_id"]?.stringValue.flatMap(UUID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.deleteScheduledTaskRemote(id: taskID))
+            case "scheduled_task.enable":
+                guard let taskID = params["task_id"]?.stringValue.flatMap(UUID.init),
+                      let enabled = params["enabled"]?.boolValue else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try await router.enableScheduledTaskRemote(id: taskID, enabled: enabled))
+            case "scheduled_task.run":
+                guard let taskID = params["task_id"]?.stringValue.flatMap(UUID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: try router.runScheduledTaskRemote(id: taskID))
             case "agent.manual_action.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let actions = try router.listManualActions(thread: tid)
@@ -5370,6 +5397,7 @@ public final class JSONRPCDispatcher {
         "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
         "agent.message.list", "agent.message.get", "agent.pending_callbacks.list", "agent.manual_action.list",
         "agent.attachment.get", "agent.message.image.get", "agent.account.usage.get",
+        "scheduled_task.list",
         // Legacy agent.checkpoint.list remains batch-admitted. Explicit
         // response_version 1 is rejected by preflightTransport before execution.
         "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
@@ -5402,7 +5430,7 @@ public final class JSONRPCDispatcher {
         "ssh", "fs", "files",
         "workspace", "window", "surface", "pane",
         "agent", "git", "project", "browser", "mirror",
-        "notification", "private", "sync", "token_saver", "bot"
+        "notification", "private", "sync", "token_saver", "bot", "scheduled_task"
     ]
     // PERF: nested-run RPC params validate subagent_node_id on every nested
     // agent.create/send; `"-_.".unicodeScalars.contains` built a temporary

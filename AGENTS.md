@@ -59,6 +59,7 @@ The user's running MacCode (`io.remotecode.desktop`) is off-limits. A git worktr
 
 - Every change to the Agent App or to Bots must also land in Schedule Tasks in the same change. If a new message can set it (run as user/Bot, model, efforts, Auto profile, Ultracode, permission, plan mode, Local/Worktree execution, and anything added later), the scheduled task editor must be able to set it, persist it, and apply it when the run fires — for both workspace tasks and Bot schedules.
 - Schedule Tasks has one "New Task" entry point; choosing a Bot in "Run as" turns the draft into a Bot schedule. Do not add a second creation button.
+- iOS mirrors it through `scheduled_task.*` (capability `agent.scheduled_tasks_v1`): a new run option needs a `scheduled_task.save` param and the iOS editor field in the same change.
 
 ## Token Saver removed (2026-10-06)
 

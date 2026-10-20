@@ -63,6 +63,7 @@ public enum AccountUsageWidgetDigest {
     public static func publish(
         subscribed: Bool,
         snapshot: ProviderUsageSnapshot,
+        accounts: [AccountUsageEntry] = [],
         isRefreshing: Bool,
         updatedAt: Date = Date()
     ) {
@@ -93,6 +94,7 @@ public enum AccountUsageWidgetDigest {
         )
 
         var body = todayPayload
+        body["accounts"] = accountsJSON(accounts)
         body["today"] = .object(todayPayload)
         body["week"] = .object(weekPayload)
         cacheAndPublish(body)
@@ -105,12 +107,14 @@ public enum AccountUsageWidgetDigest {
     public static func publishFromDisk(
         appSupportDirectory: URL,
         subscribed: Bool,
+        accounts: [AccountUsageEntry] = [],
         isRefreshing: Bool = false,
         updatedAt: Date = Date()
     ) {
         publish(
             subscribed: subscribed,
             snapshot: ProviderUsageStore(appSupportDirectory: appSupportDirectory).load(),
+            accounts: accounts,
             isRefreshing: isRefreshing,
             updatedAt: updatedAt
         )
@@ -183,6 +187,23 @@ public enum AccountUsageWidgetDigest {
     ) -> ProviderTokenUsage {
         snapshot.providers.first { $0.provider == provider }
             ?? ProviderTokenUsage(provider: provider)
+    }
+
+    /// Every logged-in account, in ring order, for the iPhone rings and widget.
+    static func accountsJSON(_ accounts: [AccountUsageEntry]) -> JSONValue {
+        .array(accounts.map { entry in
+            var row: [String: JSONValue] = [
+                "id": .string(entry.id),
+                "provider": .string(entry.provider.rawValue),
+                "label": .string(entry.label),
+            ]
+            if let email = entry.email { row["email"] = .string(email) }
+            if let session = entry.usage?.sessionUsedPercent { row["session_used_percent"] = .number(session) }
+            if let weekly = entry.usage?.weeklyUsedPercent { row["weekly_used_percent"] = .number(weekly) }
+            if let reset = entry.usage?.weeklyResetsAt { row["weekly_resets_at_ms"] = .number((reset.timeIntervalSince1970 * 1000).rounded()) }
+            if let reset = entry.usage?.sessionResetsAt { row["session_resets_at_ms"] = .number((reset.timeIntervalSince1970 * 1000).rounded()) }
+            return .object(row)
+        })
     }
 
     private static func clampedPercent(_ value: Double) -> Double {

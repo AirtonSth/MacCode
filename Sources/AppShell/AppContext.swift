@@ -2670,11 +2670,13 @@ public final class AppContext {
         // both inputs are thread-safe.
         let settingsRepo = settingsRepo
         let appSupportDirectory = appSupportDirectory
+        let accounts = AccountUsageEntry.entries(distillAccountsController.statuses)
         Task.detached(priority: .utility) {
             let subscribed = PrivateAccountSessionStore(repo: settingsRepo).load()?.user.subscribed == true
             AccountUsageWidgetDigest.publishFromDisk(
                 appSupportDirectory: appSupportDirectory,
                 subscribed: subscribed,
+                accounts: accounts,
                 isRefreshing: isRefreshing,
                 updatedAt: Date()
             )

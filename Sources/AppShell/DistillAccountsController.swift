@@ -164,6 +164,14 @@ public final class DistillAccountsController: ObservableObject {
     public func refreshUsage(accountID: String) {
         perform(accountID: accountID) { _ = try await $0.refreshUsage(id: accountID) }
     }
+    /// Re-reads every connected account's quota, then the account list, without
+    /// taking the busy slot the Accounts settings use for sign-in and edits.
+    public func refreshAllUsage() async {
+        guard !isBusy else { return }
+        let ids = statuses.filter(\.connected).map(\.id)
+        for id in ids { _ = try? await accounts.refreshUsage(id: id) }
+        await refreshAndWait()
+    }
     public func saveRouting(_ draft: DistillAutoRouting) {
         if let error = DistillRoutingValidation.error(draft, saved: routing, accounts: statuses, models: models) {
             lastError = error

@@ -1263,8 +1263,9 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         // + bot.notice.clear (clear a Titio notification, voice contract §3),
         // + explicit context grant/revoke and existing activity viewed/acknowledge,
         // + bot.reorder (persisted sidebar/home bot drag order),
-        // + agent.thread.loop.stop and host.browser.screenshot.
-        XCTAssertEqual(canonical.count, 187)
+        // + agent.thread.loop.stop and host.browser.screenshot,
+        // + scheduled_task.save/delete/enable/run (Schedule Tasks on iPhone).
+        XCTAssertEqual(canonical.count, 190)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }

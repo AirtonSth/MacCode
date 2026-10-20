@@ -4,87 +4,73 @@ import CoreModel
 import AgentRuntime
 import DesignSystemKit
 
-/// Pure copy for the sidebar's provider account-usage control
-/// (Claude + Codex + Grok quota). No UI state.
+/// One logged-in Distill account as a ring: every account counts, so two
+/// Claude logins show two rings.
+public struct AccountUsageEntry: Equatable, Identifiable, Sendable {
+    public let id: String
+    public let provider: DistillAccountProvider
+    public let label: String
+    public let email: String?
+    public let usage: DistillAccountUsage?
+
+    public init(id: String, provider: DistillAccountProvider, label: String, email: String? = nil, usage: DistillAccountUsage?) {
+        self.id = id; self.provider = provider; self.label = label; self.email = email; self.usage = usage
+    }
+
+    /// Connected accounts only, in the order Distill lists them.
+    public static func entries(_ statuses: [DistillAccountStatus]) -> [AccountUsageEntry] {
+        statuses.filter(\.connected).map {
+            AccountUsageEntry(id: $0.id, provider: $0.provider, label: displayLabel($0), email: $0.email,
+                              usage: DistillAccountUsage(quota: $0.quota))
+        }
+    }
+
+    /// "claude (default)" reads as "Claude"; a named account keeps its name with the provider.
+    static func displayLabel(_ status: DistillAccountStatus) -> String {
+        let provider = status.provider.displayName
+        let label = status.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        if status.legacy || label.isEmpty || label.lowercased().hasPrefix(status.provider.rawValue) { return provider }
+        return "\(provider) · \(label)"
+    }
+}
+
+/// Pure copy for the sidebar's account-usage control. No UI state.
 public enum AccountUsageDisplay {
-    public static let providers: [AgentProvider] = [.claude, .codex, .grok]
+    static let signedOutPrompt = "Sign in to track account usage"
+    static let noAccountsPrompt = "Log in to an account in Settings › Accounts & Auto"
 
-    static let signedOutPrompt = "Sign in to track Claude, Codex and Grok usage"
-
-    public static func usage(for provider: AgentProvider, in snapshot: ProviderUsageSnapshot) -> ProviderTokenUsage {
-        snapshot.providers.first { $0.provider == provider } ?? ProviderTokenUsage(provider: provider)
+    /// Ring fill (0...1); nil means not loaded and must never draw as 0%.
+    public static func ringProgress(_ entry: AccountUsageEntry) -> Double? {
+        entry.usage?.ringPercent.map { min(max($0 / 100.0, 0), 1) }
     }
 
-    /// Ring fill (0...1): the live session percent, else the weekly percent —
-    /// the same rule as the iOS rings (AccountUsageWidgetDigest "today").
-    /// nil means not loaded; the ring must never draw it as 0%.
-    public static func ringProgress(_ usage: ProviderTokenUsage, now: Date = Date()) -> Double? {
-        (usage.effectiveSessionUsedPercent(now: now) ?? usage.effectiveWeeklyUsedPercent(now: now))
-            .map { min(max($0 / 100.0, 0), 1) }
+    /// "Claude session 12%", "ChatGPT week 42%" or "Grok no usage data".
+    static func ringCaption(_ entry: AccountUsageEntry) -> String {
+        if let session = entry.usage?.sessionUsedPercent { return "\(entry.label) session \(formatPercent(session / 100))" }
+        if let weekly = entry.usage?.weeklyUsedPercent { return "\(entry.label) week \(formatPercent(weekly / 100))" }
+        return "\(entry.label) no usage data"
     }
 
-    /// "Claude session 12%", "Codex week 42%" or "Grok not loaded".
-    static func ringCaption(_ usage: ProviderTokenUsage, now: Date = Date()) -> String {
-        let title = providerTitle(usage.provider)
-        if let session = usage.effectiveSessionUsedPercent(now: now) {
-            return "\(title) session \(formatPercent(session / 100.0))"
-        }
-        if let weekly = usage.effectiveWeeklyUsedPercent(now: now) {
-            return "\(title) week \(formatPercent(weekly / 100.0))"
-        }
-        return "\(title) not loaded"
-    }
-
-    /// VoiceOver value for the rings: every listed provider (never Distill).
-    public static func ringsAccessibilityValue(
-        signedIn: Bool,
-        snapshot: ProviderUsageSnapshot,
-        now: Date = Date()
-    ) -> String {
+    public static func ringsAccessibilityValue(signedIn: Bool, entries: [AccountUsageEntry]) -> String {
         guard signedIn else { return signedOutPrompt }
-        return providers.map { ringCaption(usage(for: $0, in: snapshot), now: now) }.joined(separator: ", ")
+        guard !entries.isEmpty else { return noAccountsPrompt }
+        return entries.map(ringCaption).joined(separator: ", ")
     }
 
-    /// Hover tooltip for the rings: one line per provider, outer ring first.
-    public static func ringsHelp(
-        signedIn: Bool,
-        snapshot: ProviderUsageSnapshot,
-        now: Date = Date()
-    ) -> String {
+    public static func ringsHelp(signedIn: Bool, entries: [AccountUsageEntry]) -> String {
         guard signedIn else { return signedOutPrompt }
-        let lines = providers.map { ringCaption(usage(for: $0, in: snapshot), now: now) }
-        return (["Account usage"] + lines + ["Click for details"]).joined(separator: "\n")
+        guard !entries.isEmpty else { return noAccountsPrompt }
+        return (["Account usage"] + entries.map(ringCaption) + ["Click for details"]).joined(separator: "\n")
     }
 
-    /// Session caption. When the provider reported no live session window,
-    /// the weekly figure is shown under an explained label instead of a bare
-    /// "Session used 0%". A local run's context-window fill is not the
-    /// provider's session limit, so it is never shown under that label.
-    public static func sessionCaption(
-        effectiveSessionUsedPercent: Double?,
-        effectiveWeeklyUsedPercent: Double?
-    ) -> String {
-        if let sessionPercent = effectiveSessionUsedPercent {
-            return "Session used \(formatPercent(sessionPercent / 100.0))"
-        }
-        if let weeklyPercent = effectiveWeeklyUsedPercent {
-            return "Week used \(formatPercent(weeklyPercent / 100.0)) (no session data)"
-        }
-        return "Session usage not loaded"
+    public static func sessionCaption(_ usage: DistillAccountUsage?) -> String {
+        guard let session = usage?.sessionUsedPercent else { return "Session: no data" }
+        return "Session used \(formatPercent(session / 100))"
     }
 
-    public static func weeklyCaption(effectiveWeeklyUsedPercent: Double?) -> String {
-        guard let weeklyPercent = effectiveWeeklyUsedPercent else { return "Weekly usage not loaded" }
-        return "Weekly used \(formatPercent(weeklyPercent / 100.0))"
-    }
-
-    public static func providerTitle(_ provider: AgentProvider) -> String {
-        switch provider {
-        case .claude: return "Claude"
-        case .codex: return "Codex"
-        case .grok: return "Grok"
-        case .distill: return "Distill"
-        }
+    public static func weeklyCaption(_ usage: DistillAccountUsage?) -> String {
+        guard let weekly = usage?.weeklyUsedPercent else { return "Week: no data" }
+        return "Week used \(formatPercent(weekly / 100))"
     }
 
     static func formatPercent(_ progress: Double) -> String {
@@ -92,10 +78,8 @@ public enum AccountUsageDisplay {
     }
 }
 
-/// Sidebar header control for provider account usage: compact concentric rings
-/// left of the account avatar. Signed out, it opens the account window; signed
-/// in, it shows the cached figures at once and asks the host to refresh them
-/// while the details popover is open.
+/// Sidebar header control for account usage: one concentric ring per logged-in
+/// account, left of the account avatar. Opening the details refreshes quotas.
 struct AccountUsageSidebarControl: View {
     @ObservedObject var vm: SidebarViewModel
     let onOpenAccount: () -> Void
@@ -103,42 +87,26 @@ struct AccountUsageSidebarControl: View {
 
     var body: some View {
         let signedIn = vm.privateAccountUser != nil
-        let snapshot = vm.accountUsageSnapshot
+        let entries = vm.accountUsageEntries
         Button {
             guard signedIn else {
                 onOpenAccount()
                 return
             }
-            if !showsDetails {
-                vm.refreshAccountUsageForDetails()
-            }
+            if !showsDetails { vm.refreshAccountUsageForDetails() }
             showsDetails.toggle()
         } label: {
-            // A coarse tick lets an expired session/week window drop out of the
-            // ring even when no new snapshot arrives.
-            TimelineView(.periodic(from: .now, by: 60)) { timeline in
-                AccountUsageRings(progress: AccountUsageDisplay.providers.map { provider in
-                    signedIn
-                        ? AccountUsageDisplay.ringProgress(
-                            AccountUsageDisplay.usage(for: provider, in: snapshot),
-                            now: timeline.date
-                        )
-                        : nil
-                })
-            }
-            .frame(width: 20, height: 20)
-            .frame(width: 28, height: 32)
-            .contentShape(Rectangle())
+            AccountUsageRings(rings: signedIn ? entries.map { ($0.provider, AccountUsageDisplay.ringProgress($0)) } : [])
+                .frame(width: 20, height: 20)
+                .frame(width: 28, height: 32)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(AccountUsageDisplay.ringsHelp(signedIn: signedIn, snapshot: snapshot))
-        // .bottom opens down over the sidebar list; the header sits at the window top.
-        .popover(isPresented: $showsDetails, arrowEdge: .bottom) {
-            details
-        }
+        .help(AccountUsageDisplay.ringsHelp(signedIn: signedIn, entries: entries))
+        .popover(isPresented: $showsDetails, arrowEdge: .bottom) { details }
         .accessibilityLabel("Account usage")
-        .accessibilityValue(AccountUsageDisplay.ringsAccessibilityValue(signedIn: signedIn, snapshot: snapshot))
-        .accessibilityHint(signedIn ? "Shows session and weekly limits" : "Opens your account")
+        .accessibilityValue(AccountUsageDisplay.ringsAccessibilityValue(signedIn: signedIn, entries: entries))
+        .accessibilityHint(signedIn ? "Shows session and weekly limits for every account" : "Opens your account")
         .accessibilityIdentifier("sidebar.accountUsage")
     }
 
@@ -158,22 +126,24 @@ struct AccountUsageSidebarControl: View {
                         .accessibilityIdentifier("sidebar.accountUsage.refreshSpinner")
                 }
                 TimelineView(.periodic(from: .now, by: 60)) { timeline in
-                    Text(SidebarRootView.accountUsageLastUpdatedLabel(
-                        vm.accountUsageLastUpdated,
-                        now: timeline.date
-                    ))
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
+                    Text(SidebarRootView.accountUsageLastUpdatedLabel(vm.accountUsageLastUpdated, now: timeline.date))
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
                 }
                 .accessibilityIdentifier("sidebar.accountUsage.lastUpdated")
             }
-            Text("Each ring shows the session limit used, or the weekly limit when no session is live. Outer to inner: Claude, Codex, Grok. A faint ring has no data yet.")
+            Text("One ring per logged-in account, outer to inner in this order. A ring shows the session limit used, or the weekly limit when no session is live. A faint ring has no data yet.")
                 .font(DS.Font.caption2)
                 .foregroundColor(DS.Palette.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
-            ForEach(AccountUsageDisplay.providers, id: \.self) { provider in
-                providerRow(provider)
+            if vm.accountUsageEntries.isEmpty {
+                Text(AccountUsageDisplay.noAccountsPrompt)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            ForEach(Array(vm.accountUsageEntries.enumerated()), id: \.element.id) { index, entry in
+                accountRow(entry, index: index)
             }
         }
         .padding(DS.Space.md)
@@ -182,76 +152,70 @@ struct AccountUsageSidebarControl: View {
         .accessibilityIdentifier("sidebar.accountUsage.details")
     }
 
-    private func providerRow(_ provider: AgentProvider) -> some View {
-        let usage = AccountUsageDisplay.usage(for: provider, in: vm.accountUsageSnapshot)
-        return VStack(alignment: .leading, spacing: 2) {
+    private func accountRow(_ entry: AccountUsageEntry, index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: DS.Space.xs) {
                 Circle()
-                    .fill(AccountUsageRings.color(for: provider))
+                    .fill(AccountUsageRings.color(for: entry.provider, index: index, in: vm.accountUsageEntries.map(\.provider)))
                     .frame(width: 8, height: 8)
                     .accessibilityHidden(true)
-                Text(AccountUsageDisplay.providerTitle(provider))
+                Text(entry.label)
                     .font(DS.Font.captionStrong)
                     .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                if let email = entry.email {
+                    Text(email).font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary).lineLimit(1).truncationMode(.middle)
+                }
             }
-            Text(AccountUsageDisplay.sessionCaption(
-                effectiveSessionUsedPercent: usage.effectiveSessionUsedPercent(),
-                effectiveWeeklyUsedPercent: usage.effectiveWeeklyUsedPercent()
-            ))
-            .font(DS.Font.caption)
-            .foregroundColor(DS.Palette.textSecondary)
-            .monospacedDigit()
-            Text(AccountUsageDisplay.weeklyCaption(
-                effectiveWeeklyUsedPercent: usage.effectiveWeeklyUsedPercent()
-            ))
-            .font(DS.Font.caption)
-            .foregroundColor(DS.Palette.textSecondary)
-            .monospacedDigit()
+            Text(AccountUsageDisplay.sessionCaption(entry.usage))
+                .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).monospacedDigit()
+            Text(AccountUsageDisplay.weeklyCaption(entry.usage))
+                .font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).monospacedDigit()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("sidebar.accountUsage.provider.\(provider.rawValue)")
+        .accessibilityIdentifier("sidebar.accountUsage.account.\(entry.id)")
     }
 }
 
-/// Concentric provider quota rings, restored from the removed Token Saver rings
-/// without the Token Saver slot. Fixed order outer → inner (Claude, Codex, Grok)
-/// so a color never changes position; same colors as the iOS rings.
+/// Concentric account rings, outer to inner in account order. Ring width shrinks
+/// as accounts are added so every ring fits; same colors as the iOS rings.
 struct AccountUsageRings: View {
-    /// Fill per ring in `AccountUsageDisplay.providers` order; nil = not loaded.
-    let progress: [Double?]
+    let rings: [(provider: DistillAccountProvider, progress: Double?)]
 
-    /// Geometry slots outer → inner at a 34pt reference side. Line widths taper
-    /// inward so the outer ring stays dominant.
-    private static let ringSlots: [(inset: CGFloat, lineWidth: CGFloat)] = [
-        (2.0, 4.0),
-        (7.4, 3.0),
-        (12.2, 2.2)
-    ]
-
-    static func color(for provider: AgentProvider) -> Color {
+    static func baseColor(for provider: DistillAccountProvider) -> Color {
         switch provider {
         case .claude: return Color(nsColor: .systemOrange)
-        case .codex: return Color(nsColor: .systemBlue)
+        case .chatgpt: return Color(nsColor: .systemBlue)
         case .grok: return Color(nsColor: .systemPurple)
-        case .distill: return Color(hex: 0x6E56CF)
+        case .openrouter: return Color(nsColor: .systemTeal)
         }
+    }
+
+    /// A second account of the same provider gets a lighter shade so rings stay distinct.
+    static func color(for provider: DistillAccountProvider, index: Int, in providers: [DistillAccountProvider]) -> Color {
+        let repeatIndex = providers.prefix(index).filter { $0 == provider }.count
+        return baseColor(for: provider).opacity(max(1 - Double(repeatIndex) * 0.3, 0.4))
     }
 
     var body: some View {
         GeometryReader { proxy in
             let side = max(min(proxy.size.width, proxy.size.height), 1)
-            let scale = max(side / 34.0, 0.1)
+            let count = max(rings.count, 1)
+            let available = side / 2 - 1
+            let lineWidth = max(min(available / CGFloat(count) * 0.62, side * 0.12), 1)
+            let step = available / CGFloat(count)
             ZStack {
-                ForEach(Array(AccountUsageDisplay.providers.enumerated()), id: \.element) { index, provider in
-                    let slot = Self.ringSlots[min(index, Self.ringSlots.count - 1)]
-                    let value = index < progress.count ? progress[index] : nil
+                if rings.isEmpty {
+                    AccountUsageRing(progress: 0, color: DS.Palette.textTertiary, inset: 1 + lineWidth / 2, lineWidth: lineWidth, dimmed: true)
+                }
+                ForEach(Array(rings.enumerated()), id: \.offset) { index, ring in
                     AccountUsageRing(
-                        progress: value ?? 0,
-                        color: Self.color(for: provider),
-                        inset: slot.inset * scale,
-                        lineWidth: slot.lineWidth * scale,
-                        dimmed: value == nil
+                        progress: ring.progress ?? 0,
+                        color: Self.color(for: ring.provider, index: index, in: rings.map(\.provider)),
+                        inset: 1 + CGFloat(index) * step + lineWidth / 2,
+                        lineWidth: lineWidth,
+                        dimmed: ring.progress == nil
                     )
                 }
             }
@@ -259,7 +223,6 @@ struct AccountUsageRings: View {
             .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
         }
         .aspectRatio(1, contentMode: .fit)
-        // The owning Button carries the label and per-provider value.
         .accessibilityHidden(true)
     }
 }

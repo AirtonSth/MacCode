@@ -347,12 +347,41 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     @Published public private(set) var generalBots: [GeneralBotRow] = []
-    @Published private(set) var runningBotIDs: Set<BotID> = []
+    @Published private(set) var runningBotIDs: Set<BotID> = [] {
+        didSet { noteBotsSettled(was: oldValue.union(runningLinkedBotIDs)) }
+    }
     @Published private(set) var deskSelection: DeskSelection?
-    @Published private(set) var runningThreadIDs: Set<AgentThreadID> = []
+    @Published private(set) var runningThreadIDs: Set<AgentThreadID> = [] {
+        didSet {
+            let next = Self.finishedAfterTransition(previous: oldValue, now: runningThreadIDs, current: finishedThreadIDs,
+                                                    except: selectedThreadID)
+            if next != finishedThreadIDs { finishedThreadIDs = next }
+        }
+    }
     @Published private(set) var selectedThreadID: AgentThreadID?
     /// Bots whose linked thread is running now, from the coordinator snapshot.
-    @Published private(set) var runningLinkedBotIDs: Set<BotID> = []
+    @Published private(set) var runningLinkedBotIDs: Set<BotID> = [] {
+        didSet { noteBotsSettled(was: oldValue.union(runningBotIDs)) }
+    }
+    /// Child rows whose work just finished: a green dot until the user opens them,
+    /// like the workspace row's completed dot.
+    @Published private(set) var finishedThreadIDs: Set<AgentThreadID> = []
+    @Published private(set) var finishedBotIDs: Set<BotID> = []
+    @Published private(set) var finishedSurfaceIDs: Set<SurfaceID> = []
+
+    /// Pure: what left the running set since the last snapshot gains a dot; what
+    /// runs again loses it; the row on screen never gets one.
+    nonisolated static func finishedAfterTransition<ID: Hashable>(previous: Set<ID>, now: Set<ID>, current: Set<ID>, except: ID?) -> Set<ID> {
+        var result = current.union(previous.subtracting(now)).subtracting(now)
+        if let except { result.remove(except) }
+        return result
+    }
+
+    private func noteBotsSettled(was previous: Set<BotID>) {
+        let next = Self.finishedAfterTransition(previous: previous, now: runningBotIDs.union(runningLinkedBotIDs),
+                                                current: finishedBotIDs, except: deskSelection?.botID)
+        if next != finishedBotIDs { finishedBotIDs = next }
+    }
     /// Accessibility labels of threads / bots with an active Distill `/loop`.
     @Published private(set) var loopLabelsByThread: [AgentThreadID: String] = [:]
     @Published private(set) var loopLabelsByBot: [BotID: String] = [:]
@@ -394,7 +423,12 @@ public final class SidebarViewModel: ObservableObject {
     /// Open tabs per workspace, listed under "Open Tabs" above Bots in an expanded workspace.
     @Published private(set) var activeSurfaceRows: [WorkspaceID: [ActiveSurfaceItem]] = [:]
     /// Tabs among `activeSurfaceRows` with work in flight; they get the spinner.
-    @Published private(set) var busySurfaceIDs: Set<SurfaceID> = []
+    @Published private(set) var busySurfaceIDs: Set<SurfaceID> = [] {
+        didSet {
+            let next = Self.finishedAfterTransition(previous: oldValue, now: busySurfaceIDs, current: finishedSurfaceIDs, except: nil)
+            if next != finishedSurfaceIDs { finishedSurfaceIDs = next }
+        }
+    }
     /// PERF-MAC_SHELL_WINDOW-003: memoize per-workspace busy state for the
     /// lifetime of one `workspaces` snapshot so repeated SwiftUI `body`
     /// evaluations don't re-walk panes/surfaces (and the registry) on
@@ -439,6 +473,7 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     func openActiveSurface(_ item: ActiveSurfaceItem) {
+        finishedSurfaceIDs.remove(item.surfaceID)
         router?.windowController?.presentWorkspaceContent()
         try? router?.selectWorkspace(item.workspaceID)
         try? router?.focusSurface(workspace: item.workspaceID, surface: item.surfaceID)
@@ -488,6 +523,9 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true
     /// Provider account usage (Claude + Codex + Grok) for the sidebar card.
     @Published public private(set) var accountUsageSnapshot: ProviderUsageSnapshot = .empty()
+    /// One entry per logged-in Distill account (several Claude logins are several rings).
+    @Published public private(set) var accountUsageEntries: [AccountUsageEntry] = []
+    private var accountStatusesSink: AnyCancellable?
     /// True while a background account-usage refresh (CLI probe) is in flight.
     @Published public private(set) var accountUsageIsRefreshing: Bool = false
     /// Timestamp of the last completed account-usage refresh, or nil when never refreshed.
@@ -613,6 +651,17 @@ public final class SidebarViewModel: ObservableObject {
         reload()
         reloadInsomnia()
         reloadAccountUsage()
+        let accountsController = context.distillAccountsController
+        accountStatusesSink = accountsController.$statuses
+            .map(AccountUsageEntry.entries)
+            .removeDuplicates()
+            .sink { [weak self] entries in
+                guard let self, self.accountUsageEntries != entries else { return }
+                self.accountUsageEntries = entries
+                // The iPhone rings and widget read the same account list.
+                self.context?.publishAccountUsageDigestFromDisk()
+            }
+        if !accountsController.hasLoadedState { accountsController.refresh() }
     }
 
     deinit {
@@ -833,6 +882,14 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     /// Workspaces in the tree: name matches, or, while searching, a linked Bot matches.
+    /// Display order: pinned rows stay first; among the rest, anything with a
+    /// spinner moves up. Stable, so the user's order holds inside each group.
+    nonisolated static func runningFirst<T>(_ items: [T], isPinned: (T) -> Bool = { _ in false }, isRunning: (T) -> Bool) -> [T] {
+        let pinned = items.filter(isPinned)
+        let rest = items.filter { !isPinned($0) }
+        return pinned + rest.filter(isRunning) + rest.filter { !isRunning($0) }
+    }
+
     public var treeWorkspaces: [Workspace] {
         guard !sidebarQuery.isEmpty else { return workspaces }
         let byName = Set(filteredWorkspaces.map(\.id))
@@ -1068,6 +1125,7 @@ public final class SidebarViewModel: ObservableObject {
 
     /// A General Bot opens its recent general conversation, or its Desk when it has none.
     public func openGeneralBot(_ row: GeneralBotRow) {
+        finishedBotIDs.remove(row.botID)
         if let authorized = authorizedBotConversationRows.first(where: { $0.botID == row.botID && $0.context == .general }) {
             // General context: resume its conversation, or start one there; never a workspace transcript.
             return authorized.conversationID == nil ? startBotConversation(authorized) : openAuthorizedBotConversation(authorized)
@@ -1085,6 +1143,7 @@ public final class SidebarViewModel: ObservableObject {
 
     /// The empty state of a linked Bot: start a conversation pinned to that workspace.
     public func startBotConversation(_ row: AuthorizedBotConversationRow) {
+        finishedBotIDs.remove(row.botID)
         if case .workspace = row.context { return startWorkspaceBotConversation(row) }
         do {
             guard let router, try router.openBotsDesk(botID: row.botID),
@@ -1133,6 +1192,7 @@ public final class SidebarViewModel: ObservableObject {
 
     /// Same canonical route as Activity: a Bot thread opens its Desk, any other thread its Agent App.
     public func openWorkspaceConversation(_ row: WorkspaceConversationRow) {
+        finishedThreadIDs.remove(row.threadID)
         guard let router else { return }
         do {
             switch try router.agentThreadOpenDestination(row.threadID) {
@@ -1154,6 +1214,7 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func openAuthorizedBotConversation(_ row: AuthorizedBotConversationRow) {
+        finishedBotIDs.remove(row.botID)
         guard let conversationID = row.conversationID, let context, let router else { return }
         do {
             guard let conversation = try context.botStore.conversation(id: conversationID),
@@ -1372,49 +1433,16 @@ public final class SidebarViewModel: ObservableObject {
 
     public func refreshAccountUsageForDetails() {
         guard !accountUsageIsRefreshing else { return }
-        guard privateAccountUser != nil else { return }
+        guard privateAccountUser != nil, let controller = context?.distillAccountsController else { return }
         accountUsageIsRefreshing = true
-        context?.publishAccountUsageDigestFromDisk(isRefreshing: true)
-        // Fire-and-forget: kick the refresh, then observe the settle
-        // notification to detect completion.  A 90-second timeout ensures the
-        // spinner stops even when the CLI probe hangs or the notification is
-        // never posted (e.g. signed-out race).
         Task { @MainActor [weak self] in
+            await controller.refreshAllUsage()
             guard let self else { return }
-            var observer: NSObjectProtocol?
-            let done = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-                // One-shot notification observer -- resumes with true on completion.
-                observer = NotificationCenter.default.addObserver(
-                    forName: .rc2AccountUsageRefreshSettled,
-                    object: nil,
-                    queue: .main
-                ) { note in
-                    // A timer tick that skipped the Claude CLI did not refresh
-                    // Claude; the details refresh queued behind it does.
-                    guard note.userInfo?["claudeProbed"] as? Bool != false else { return }
-                    if let o = observer { NotificationCenter.default.removeObserver(o) }
-                    observer = nil
-                    continuation.resume(returning: true)
-                }
-                self.context?.refreshAccountUsage(reason: "details")
-                // Schedule a timeout: if no notification arrives within 90 s,
-                // resume with false so the spinner stops.
-                Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 90_000_000_000)
-                    guard let o = observer else { return }
-                    NotificationCenter.default.removeObserver(o)
-                    observer = nil
-                    continuation.resume(returning: false)
-                }
-            }
             self.accountUsageIsRefreshing = false
-            if done { self.accountUsageLastUpdated = Date() }
-            // The settle path already publishes isRefreshing: false; the
-            // timeout path does not, so clear the iOS refreshing state here.
-            if !done { self.context?.publishAccountUsageDigestFromDisk(isRefreshing: false) }
+            self.accountUsageLastUpdated = Date()
+            self.context?.publishAccountUsageDigestFromDisk(isRefreshing: false)
         }
     }
-
 
     public func setInsomniaEnabled(_ enabled: Bool) {
         insomniaEnabled = enabled
@@ -2586,7 +2614,9 @@ public struct SidebarRootView: View {
             // the top or bottom edge of the list.
             ScrollViewReader { scrollProxy in
                 ScrollView {
-                    let rows = vm.treeWorkspaces
+                    let rows = SidebarViewModel.runningFirst(vm.treeWorkspaces,
+                                                             isPinned: { $0.metadata["pinned"] == "true" },
+                                                             isRunning: vm.isWorkspaceBusy)
                     LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
                         if vm.workspaces.isEmpty {
                             Text("No workspaces")
@@ -3100,7 +3130,7 @@ public struct SidebarRootView: View {
                 Text(BotsViewModel.displayName(row.botName)).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary).lineLimit(1)
                 Spacer(minLength: 0)
                 if let loop = vm.loopLabelsByBot[row.botID] { loopGlyph(loop) }
-                if running { DSBusySpinner(label: "Running") }
+                if running { DSBusySpinner(label: "Running") } else if vm.finishedBotIDs.contains(row.botID) { finishedDot }
             }
             .padding(.leading, Self.workspaceChildIndent)
             .padding(.horizontal, DS.Space.sm)
@@ -3136,7 +3166,9 @@ public struct SidebarRootView: View {
     /// Bots: Titio pinned first, then general and unlinked Bots, in roster order.
     @ViewBuilder
     private var generalBotsSection: some View {
-        let bots = vm.visibleGeneralBots
+        let bots = SidebarViewModel.runningFirst(vm.visibleGeneralBots, isPinned: \.pinned) {
+            SidebarViewModel.isBotRunning($0.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
+        }
         VStack(alignment: .leading, spacing: DS.Space.xxs) {
             HStack(spacing: DS.Space.sm) {
                 Text("Bots")
@@ -3192,7 +3224,7 @@ public struct SidebarRootView: View {
                     .frame(width: 20, height: 20)
                 Text(BotsViewModel.displayName(row.name)).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
                 Spacer(minLength: 0)
-                if running { DSBusySpinner(label: "Running") }
+                if running { DSBusySpinner(label: "Running") } else if vm.finishedBotIDs.contains(row.botID) { finishedDot }
                 if row.hidden {
                     Image(systemName: "eye.slash")
                         .font(.system(size: 9, weight: .semibold))
@@ -3275,7 +3307,9 @@ public struct SidebarRootView: View {
         if case let tabs = vm.openTabRows(ws.id), !tabs.isEmpty {
             workspaceSectionHeader("Open Tabs", id: "sidebar.workspaceOpenTabs.\(ws.id.value.uuidString)")
             let visible = vm.visibleTab(in: ws)?.id
-            ForEach(tabs) { activeSurfaceRow($0, selected: $0.surfaceID == visible) }
+            ForEach(SidebarViewModel.runningFirst(tabs) { vm.busySurfaceIDs.contains($0.surfaceID) }) {
+                activeSurfaceRow($0, selected: $0.surfaceID == visible)
+            }
         }
         if vm.showsAddBot(ws.id) || !vm.workspaceBotRows(ws.id).isEmpty {
             workspaceSectionHeader("Bots", id: "sidebar.workspaceBots.\(ws.id.value.uuidString)")
@@ -3299,7 +3333,9 @@ public struct SidebarRootView: View {
             .help("Create a Bot exclusive to \(ws.name)")
             .accessibilityIdentifier("sidebar.addBot.\(ws.id.value.uuidString)")
         }
-        ForEach(vm.workspaceBotRows(ws.id)) { botConversationRow($0) }
+        ForEach(SidebarViewModel.runningFirst(vm.workspaceBotRows(ws.id)) {
+            SidebarViewModel.isBotRunning($0.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
+        }) { botConversationRow($0) }
         if vm.showsNewConversation(ws.id) || !vm.workspaceConversationRows(ws.id).isEmpty {
             workspaceSectionHeader("Conversations", id: "sidebar.workspaceConversations.\(ws.id.value.uuidString)")
         }
@@ -3322,7 +3358,7 @@ public struct SidebarRootView: View {
             .help("Start a new conversation in \(ws.name)")
             .accessibilityIdentifier("sidebar.newConversation.\(ws.id.value.uuidString)")
         }
-        let conversations = vm.workspaceConversationRows(ws.id)
+        let conversations = SidebarViewModel.runningFirst(vm.workspaceConversationRows(ws.id)) { vm.runningThreadIDs.contains($0.threadID) }
         let ages = SidebarViewModel.duplicateTitleAges(conversations, now: Date())
         ForEach(conversations) { workspaceConversationRow($0, workspace: ws, age: ages[$0.id]) }
         if let toggle = vm.conversationToggle(ws.id) {
@@ -3360,7 +3396,7 @@ public struct SidebarRootView: View {
                     .foregroundColor(DS.Palette.textTertiary)
                 Text(item.title).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(selected ? DS.Palette.text : DS.Palette.textSecondary).lineLimit(1)
                 Spacer(minLength: 0)
-                if busy { DSBusySpinner(label: "Running") }
+                if busy { DSBusySpinner(label: "Running") } else if vm.finishedSurfaceIDs.contains(item.surfaceID) { finishedDot }
             }
             .padding(.leading, Self.workspaceChildIndent)
             .padding(.horizontal, DS.Space.sm)
@@ -3384,6 +3420,17 @@ public struct SidebarRootView: View {
         case .rightSidebarTool: return "doc.text.magnifyingglass"
         case .agentApp: return "bubble.left"
         }
+    }
+
+    /// Same success dot as the workspace row: this item just finished.
+    private var finishedDot: some View {
+        Circle()
+            .fill(DS.Palette.success)
+            .frame(width: 7, height: 7)
+            .frame(width: 16, height: 16)
+            .help("Just finished")
+            .accessibilityLabel("Just finished")
+            .accessibilityIdentifier("sidebar.finishedDot")
     }
 
     private func loopGlyph(_ label: String) -> some View {
@@ -3418,7 +3465,7 @@ public struct SidebarRootView: View {
                 }
                 Spacer(minLength: 0)
                 if let loop = vm.loopLabelsByThread[row.threadID] { loopGlyph(loop) }
-                if running { DSBusySpinner(label: "Running") }
+                if running { DSBusySpinner(label: "Running") } else if vm.finishedThreadIDs.contains(row.threadID) { finishedDot }
             }
             .padding(.leading, Self.workspaceChildIndent)
             .padding(.horizontal, DS.Space.sm)

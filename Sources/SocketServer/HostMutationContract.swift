@@ -50,6 +50,10 @@ public enum HostMutationContract {
     agent.thread.mark_read
     agent.activity.viewed.set
     agent.activity.acknowledge
+    scheduled_task.save
+    scheduled_task.delete
+    scheduled_task.enable
+    scheduled_task.run
     agent.thread.prepare_pr
     agent.thread.rollback
     agent.thread.select
@@ -516,6 +520,9 @@ public enum HostMutationContract {
         case "agent.thread.execution.configure": return [.uuid("thread_id"), .stringEnum("execution_mode", ["local", "worktree"])]
         case "agent.activity.viewed.set": return [.activityItemIDs(allowSingle: false), .bool("viewed")]
         case "agent.activity.acknowledge": return [.activityItemIDs(allowSingle: true), .optionalBool("acknowledged")]
+        case "scheduled_task.save": return [.uuid("workspace_id"), .optionalUUID("task_id")]
+        case "scheduled_task.delete", "scheduled_task.run": return [.uuid("task_id")]
+        case "scheduled_task.enable": return [.uuid("task_id"), .bool("enabled")]
         case "agent.thread.prepare_pr": return [.uuid("workspace_id"), .string("url")]
         case "agent.thread.rollback": return [.uuid("thread_id"), .string("turn_id")]
         case "agent.message.send": return [.uuid("thread_id"), .string("text")]

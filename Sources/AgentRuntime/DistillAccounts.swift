@@ -542,3 +542,72 @@ private final class CLIOutput: @unchecked Sendable {
     }
     var data: Data? { lock.withLock { overflow ? nil : bytes } }
 }
+
+/// Session (short window) and weekly limit used, read from one account's quota.
+/// Claude reports `five_hour` / `seven_day`; ChatGPT reports rate-limit windows
+/// by length; anything else falls back to `100 - remaining_percent` as weekly.
+public struct DistillAccountUsage: Equatable, Sendable {
+    public var sessionUsedPercent: Double?
+    public var sessionResetsAt: Date?
+    public var weeklyUsedPercent: Double?
+    public var weeklyResetsAt: Date?
+
+    public init(sessionUsedPercent: Double? = nil, sessionResetsAt: Date? = nil,
+                weeklyUsedPercent: Double? = nil, weeklyResetsAt: Date? = nil) {
+        self.sessionUsedPercent = sessionUsedPercent.map(Self.clamp)
+        self.sessionResetsAt = sessionResetsAt
+        self.weeklyUsedPercent = weeklyUsedPercent.map(Self.clamp)
+        self.weeklyResetsAt = weeklyResetsAt
+    }
+
+    /// Ring fill: the live session window, else the weekly one; nil = no data.
+    public var ringPercent: Double? { sessionUsedPercent ?? weeklyUsedPercent }
+
+    public init?(quota: DistillAccountQuota?) {
+        guard let quota else { return nil }
+        var usage = DistillAccountUsage()
+        if case .object(let detail)? = quota.detail {
+            if case .object(let five)? = detail["five_hour"] {
+                usage.sessionUsedPercent = Self.number(five["utilization"]).map(Self.clamp)
+                usage.sessionResetsAt = Self.date(five["resets_at"])
+            }
+            if case .object(let week)? = detail["seven_day"] {
+                usage.weeklyUsedPercent = Self.number(week["utilization"]).map(Self.clamp)
+                usage.weeklyResetsAt = Self.date(week["resets_at"])
+            }
+            if case .object(let limit)? = detail["rate_limit"] {
+                for key in ["primary_window", "secondary_window"] {
+                    guard case .object(let window)? = limit[key], let used = Self.number(window["used_percent"]) else { continue }
+                    let reset = Self.number(window["reset_at"]).map(Date.init(timeIntervalSince1970:))
+                    if (Self.number(window["limit_window_seconds"]) ?? 0) >= 86_400 {
+                        usage.weeklyUsedPercent = Self.clamp(used); usage.weeklyResetsAt = reset
+                    } else {
+                        usage.sessionUsedPercent = Self.clamp(used); usage.sessionResetsAt = reset
+                    }
+                }
+            }
+        }
+        if usage.sessionUsedPercent == nil, usage.weeklyUsedPercent == nil,
+           let remaining = quota.remainingPercent, remaining.isFinite {
+            usage.weeklyUsedPercent = Self.clamp(100 - remaining)
+        }
+        guard usage.ringPercent != nil else { return nil }
+        self = usage
+    }
+
+    private static func clamp(_ value: Double) -> Double { min(max(value, 0), 100) }
+
+    private static func number(_ value: DistillAccountQuota.Detail?) -> Double? {
+        if case .number(let n)? = value, n.isFinite { return n }
+        return nil
+    }
+
+    private static func date(_ value: DistillAccountQuota.Detail?) -> Date? {
+        guard case .string(let raw)? = value else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: raw) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: raw)
+    }
+}

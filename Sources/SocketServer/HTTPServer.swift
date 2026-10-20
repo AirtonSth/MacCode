@@ -1404,6 +1404,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             "account_usage_get_v1": true,
             // agent.activity protocol_version 1.
             "agent_activity": ["protocol_version": 1],
+            // scheduled_task.list/save/delete/enable/run (Schedule Tasks on iPhone).
+            "scheduled_tasks_v1": true,
         ]
         if let attachmentUpload {
             agent["attachment_upload"] = attachmentUpload.foundationObject
