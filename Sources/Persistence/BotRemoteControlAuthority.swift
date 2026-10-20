@@ -3612,7 +3612,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         let shape = string(params, "shape") ?? "auto"
         let hue = string(params, "hue") ?? "auto"
         guard Self.blobatarShapes.contains(shape), Self.blobatarHues.contains(hue) else { throw Error.invalidParams }
-        let token = "blobatar:\(shape):\(hue)"
+        let base: BotBlobatarSpec
+        if let symbol = string(params, "avatar_symbol") {
+            guard let spec = BotBlobatarSpec.parse(symbol),
+                  spec.shape.rawValue == shape, spec.hue.token == hue else { throw Error.invalidParams }
+            base = spec
+        } else {
+            base = BotBlobatarSpec.parse(bot.avatarSymbol) ?? .default
+        }
+        let token = base.selecting(
+            shape: BotBlobatarShape(rawValue: shape) ?? .auto,
+            hue: hue == "auto" ? .auto : .named(hue),
+            name: bot.name, handle: bot.handle
+        ).token
         _ = try store.updateProfile(id: bot.id, avatarSymbol: token, now: now)
         return receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
             "shape": shape,

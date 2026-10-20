@@ -275,6 +275,14 @@ public enum BotPermission {
 /// Studio Avatar is a blobatar composer. Leftover SF chips still parse
 /// so published bots and tools keep working.
 public enum BotAvatar {
+    public static func fallbackHex(for handle: String) -> UInt32 {
+        let palette: [UInt32] = [
+            0x7B5CFF, 0x3B82F6, 0xF59E0B, 0x22C55E, 0xEC4899, 0x06B6D4,
+        ]
+        let hash = handle.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
+        return palette[Int(hash.magnitude % UInt(palette.count))]
+    }
+
     public static let advertisedSymbols: [String] = [
         "person.crop.circle",
         "brain.head.profile",

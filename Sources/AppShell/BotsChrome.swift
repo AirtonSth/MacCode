@@ -97,16 +97,7 @@ public enum BotsChrome {
     ]
 
     public static func avatarHex(for handle: String) -> UInt32 {
-        let palette: [UInt32] = [
-            0x7B5CFF,
-            0x3B82F6,
-            0xF59E0B,
-            0x22C55E,
-            0xEC4899,
-            0x06B6D4,
-        ]
-        let index = abs(handle.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }) % palette.count
-        return palette[index]
+        BotAvatar.fallbackHex(for: handle)
     }
 
     public static func avatarColor(for handle: String) -> Color {

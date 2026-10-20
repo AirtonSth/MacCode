@@ -2,6 +2,49 @@ import XCTest
 @testable import CoreModel
 
 final class BotBlobatarTests: XCTestCase {
+    func test_attentionKeepsTheSameIdentity() {
+        let name = "Developer"
+        let handle = "elephant-developer"
+        let baseline = BotBlobatar.figure(name: name, spec: .default, handle: handle)
+        for attention: BotAttentionState in [.none, .working, .unreadActivity, .needsAttention] {
+            let live = BotBlobatarSpec.default.liveFaced(attention: attention, name: name, handle: handle)
+            let figure = BotBlobatar.figure(name: name, spec: live, handle: handle)
+            XCTAssertEqual(figure.resolvedShape, baseline.resolvedShape)
+            XCTAssertEqual(figure.body, baseline.body, "activity must not regenerate the Bot")
+            XCTAssertEqual(figure.petals, baseline.petals)
+            XCTAssertEqual(figure.radii, baseline.radii)
+            XCTAssertEqual(figure.palette, baseline.palette, "activity must not recolor the Bot")
+            XCTAssertEqual(live.expression, .live(for: attention))
+        }
+    }
+
+    func test_pickedColorsMatchTheirSwatchesAcrossNamesAndAttention() {
+        for swatch in BotBlobatar.studioHues {
+            let spec = BotBlobatarSpec(hue: .named(swatch.id))
+            let idle = BotBlobatar.figure(name: "Piper", spec: spec)
+            let needsYou = BotBlobatar.figure(
+                name: "Developer", spec: spec.liveFaced(attention: .needsAttention, name: "Developer", handle: "elephant-developer"),
+                handle: "elephant-developer"
+            )
+            XCTAssertEqual(idle.palette.head, swatch.preview, swatch.id)
+            XCTAssertEqual(needsYou.palette.head, swatch.preview, swatch.id)
+        }
+    }
+
+    func test_previewSaveAndRenameKeepTheSelectedCreature() throws {
+        let original = BotBlobatarSpec.default
+        let selected = original.selecting(shape: .cloud, hue: .auto, name: "Developer", handle: "elephant-developer")
+        let reloaded = try XCTUnwrap(BotBlobatarSpec.parse(selected.token))
+        XCTAssertEqual(
+            BotBlobatar.figure(name: "Developer", spec: selected, handle: "elephant-developer"),
+            BotBlobatar.figure(name: "Renamed Developer", spec: reloaded, handle: "new-handle")
+        )
+        let recolored = reloaded.selecting(shape: .cloud, hue: .named("cyan"), name: "Renamed Developer")
+        XCTAssertEqual(recolored.frozenSeed, reloaded.frozenSeed)
+        XCTAssertEqual(recolored.selecting(shape: .auto, hue: .auto, name: "Renamed Developer"), .default)
+        XCTAssertEqual(BotBlobatarSpec.parse("blobatar:cloud:cyan"), BotBlobatarSpec(shape: .cloud, hue: .named("cyan")))
+    }
+
     func test_sameNameAndSpecIsDeterministic_becauseAnAvatarMustStayTheSameCreature() {
         // WHY: A roster of the same bot must not flicker. blobatar's
         // contract is same name + spec => same figure.

@@ -13,6 +13,7 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
     public var isEnabled: Bool
     public var botName: String
     public var botHandle: String
+    public var botAvatarSymbol: String
     public var lastTestRunRequestedAt: Date?
 
     public init(routine: BotRoutine, bot: BotDefinition) {
@@ -25,6 +26,7 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
         self.isEnabled = routine.activation.isEnabled
         self.botName = bot.name
         self.botHandle = bot.handle
+        self.botAvatarSymbol = bot.avatarSymbol
         self.lastTestRunRequestedAt = routine.activation.lastTestRunRequestedAt
     }
 
@@ -249,6 +251,10 @@ struct BotScheduleTaskCard: View {
             title: item.name,
             subtitle: "\(item.botName) · @\(item.botHandle)",
             identifier: "bots.scheduleTasks.task.\(item.id.value.uuidString.lowercased())",
+            avatar: BotsAvatarView(
+                name: item.botName, handle: item.botHandle, symbol: item.botAvatarSymbol,
+                size: 36, attention: isRunning ? .working : .none
+            ),
             onOpen: onOpen
         ) {
             if isRunning {

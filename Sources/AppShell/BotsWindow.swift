@@ -13788,17 +13788,15 @@ public struct BotsRootView: View {
 
     private var studioAvatarPane: some View {
         let seed = vm.studioDraft.name.isEmpty ? vm.studioDraft.handle : vm.studioDraft.name
-        let base = BotBlobatarSpec.parse(vm.studioDraft.avatarSymbol) ?? .default
-        let live = base.liveFaced(attention: studioAvatarAttention)
         let mood = BotsChrome.statusTitle(for: studioAvatarAttention)
         return VStack(spacing: DS.Space.xxl) {
             VStack(spacing: DS.Space.md) {
-                BotBlobatarView(
+                BotsAvatarView(
                     name: seed,
-                    spec: live,
+                    handle: vm.studioDraft.handle,
+                    symbol: vm.studioDraft.avatarSymbol,
                     size: 188,
-                    motion: .always,
-                    handle: vm.studioDraft.handle
+                    attention: studioAvatarAttention
                 )
                 .accessibilityHidden(false)
                 .accessibilityLabel("Avatar, \(mood)")
@@ -13810,9 +13808,9 @@ public struct BotsRootView: View {
             BotBlobatarEditor(
                 token: $vm.studioDraft.avatarSymbol,
                 seed: seed,
-                handle: vm.studioDraft.handle,
-                columns: 2
+                handle: vm.studioDraft.handle
             )
+            .frame(maxWidth: 320)
         }
         .frame(maxWidth: .infinity, alignment: .top)
         .accessibilityIdentifier("bots.studio.avatar.pane")

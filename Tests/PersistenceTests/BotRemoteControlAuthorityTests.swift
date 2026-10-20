@@ -2317,8 +2317,8 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
-        XCTAssertEqual(BotRemoteControlAuthority.blobatarShapes.count, 7)
-        XCTAssertEqual(BotRemoteControlAuthority.blobatarHues.count, 9)
+        XCTAssertEqual(BotRemoteControlAuthority.blobatarShapes, BotBlobatarShape.allCases.map(\.rawValue))
+        XCTAssertEqual(BotRemoteControlAuthority.blobatarHues, ["auto"] + BotBlobatar.studioHues.map(\.id))
         for shape in BotRemoteControlAuthority.blobatarShapes {
             for hue in BotRemoteControlAuthority.blobatarHues {
                 let result = try authority.dispatch(method: "bot.avatar.set", params: [
@@ -2330,6 +2330,12 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
                 let readback = result["readback"] as? [String: Any]
                 XCTAssertEqual(readback?["shape"] as? String, shape)
                 XCTAssertEqual(readback?["hue"] as? String, hue)
+                let token = try XCTUnwrap(readback?["avatar_symbol"] as? String)
+                let spec = try XCTUnwrap(BotBlobatarSpec.parse(token), "remote saves must render on the host")
+                XCTAssertEqual(spec.shape.rawValue, shape)
+                XCTAssertEqual(spec.hue.token, hue)
+                let stored = try XCTUnwrap(store.get(id: BotID(UUID(uuidString: botID)!)))
+                XCTAssertEqual(stored.avatarSymbol, token)
             }
         }
         XCTAssertThrowsError(
@@ -2340,6 +2346,23 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
                 "hue": "auto",
             ])
         )
+    }
+
+    func test_avatar_remoteSavePreservesThePreviewSeedAfterRename() throws {
+        let bot = try store.create(name: "Renamed Developer", title: "", description: "", handle: "elephant-developer")
+        let preview = BotBlobatarSpec.default.selecting(shape: .ghost, hue: .named("cyan"), name: "Developer")
+        let params: [String: Any] = [
+            "client_request_id": "avatar-preview",
+            "bot_id": bot.id.value.uuidString, "shape": "ghost", "hue": "cyan", "avatar_symbol": preview.token,
+        ]
+        _ = try authority.dispatch(method: "bot.avatar.set", params: params)
+        let stored = try XCTUnwrap(store.get(id: bot.id))
+        XCTAssertEqual(stored.avatarSymbol, preview.token)
+        var invalid = params
+        invalid["client_request_id"] = "avatar-invalid"
+        invalid["hue"] = "red"
+        XCTAssertThrowsError(try authority.dispatch(method: "bot.avatar.set", params: invalid))
+        XCTAssertEqual(try store.get(id: bot.id)?.avatarSymbol, preview.token)
     }
 
     /// WHY: a transcript URL is untrusted prose until it is bound to the exact
