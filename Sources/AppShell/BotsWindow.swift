@@ -11380,10 +11380,17 @@ public final class BotsViewModel: ObservableObject {
                 deskAgentVM?.statusMessage = "This question is no longer awaiting a reply."
                 return
             }
+            if let current = vm.activeReplyTarget,
+               current.threadId != threadID || current.noticeMessageID?.caseInsensitiveCompare(messageID) != .orderedSame {
+                vm.statusMessage = "Finish or cancel your current reply before replying to another question. Your draft was kept."
+                return
+            }
             vm.composerState.replyTarget = AgentReplyTarget(
                 threadId: threadID, excerpt: reply["question"] as? String ?? "",
                 noticeMessageID: messageID
             )
+            vm.statusMessage = ""
+            vm.focusTick &+= 1
             return
         }
         Task { @MainActor [weak self] in
