@@ -9464,7 +9464,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let tid = selectedThreadId else { return nil }
         let runId = requestedRunId ?? AgentRunID()
         // A locked thread keeps its stored actor; the chip only decides the first send.
-        let actorThread = threads.first(where: { $0.id == tid })
+        let cachedActorThread = threads.first(where: { $0.id == tid })
+        let actorThread: AgentThread?
+        do {
+            actorThread = try cachedActorThread.map { try threadRepo.reconcileBotExecutionTarget($0, forUserSend: true) }
+        } catch {
+            statusMessage = error.localizedDescription
+            return nil
+        }
+        if let actorThread, actorThread.executionTarget != cachedActorThread?.executionTarget {
+            mirrorExecutionTarget(.mac, thread: tid)
+            onThreadConfigPersisted?(actorThread)
+        }
         let runActor: RunActor = actorThread?.actorLockedAt != nil ? (actorThread?.actor ?? .none) : selectedRunActor
         var botPrompt: String?
         // Agent App tabs gate every bot send; the embedded desk gates the threads

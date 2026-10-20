@@ -617,7 +617,11 @@ final class BotGroupOrchestrator: AgentRunObserver {
             throw BotStoreError.invalidInput("\(bot.name) is not in this group.")
         }
         if let linked = conversation.linkedAgentThreadID, let thread = try threadRepo.get(id: linked) {
-            return (conversation, thread)
+            let updated = try threadRepo.reconcileBotExecutionTarget(thread)
+            if updated.executionTarget != thread.executionTarget {
+                router.publishAgentThreadUpdated(updated)
+            }
+            return (conversation, updated)
         }
         // Same default as a new desk conversation: an empty Distill model
         // resolves to the last-used, then the first listed model.

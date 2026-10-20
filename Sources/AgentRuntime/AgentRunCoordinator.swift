@@ -1194,7 +1194,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         recordUserMessage: Bool = true
     ) async throws -> AgentRunID {
         var normalizedRequest = request
-        if let thread = try threadRepo.get(id: request.threadId),
+        if let thread = try threadRepo.get(id: request.threadId).map({ try threadRepo.reconcileBotExecutionTarget($0) }),
            thread.actor.botID != nil,
            thread.executionTarget == .vm,
            request.permissionMode != .fullAccess {

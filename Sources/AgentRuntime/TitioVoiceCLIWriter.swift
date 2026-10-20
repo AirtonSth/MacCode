@@ -12,7 +12,7 @@ public struct TitioVoiceRoute: Sendable, Equatable {
     public var environment: [String: String]
     /// A foreign run-as-user runs through the installed root helper only
     /// (`RunAsUserProcessBootstrap.plan`, non-interactive): when the helper
-    /// is missing the call fails closed and the notice uses the fallback.
+    /// is missing the call fails closed and the notice stays pending.
     public var runAsUser: AgentRunAsUser?
 
     public init(provider: AgentProvider, binaryPath: String, model: String, environment: [String: String], runAsUser: AgentRunAsUser?) {

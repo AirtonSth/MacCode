@@ -171,7 +171,7 @@ public protocol TitioVoiceWriting: Sendable {
 public struct TitioVoiceTiming: Sendable, Equatable {
     public var retryDelays: [TimeInterval]
     public var callTimeout: TimeInterval
-    /// Decisions and alerts: the fallback posts by then.
+    /// Decisions and alerts: return control to the notice retry queue by then.
     public var urgentDeadline: TimeInterval
     /// Info notices and digests.
     public var infoDeadline: TimeInterval
@@ -561,7 +561,7 @@ public enum TitioVoiceOutput {
     /// The JSON shape of a card / lock-screen reply. `optionCount` is the
     /// ledger's option count (labels are kept only when the count matches);
     /// `forbidden` are texts the lock-screen line must not contain.
-    public static func parseCard(_ raw: String, optionCount: Int?, forbidden: [String]) -> TitioVoiceReply? {
+    public static func parseCard(_ raw: String, optionCount: Int?, forbidden: [String], requiresNotification: Bool = false) -> TitioVoiceReply? {
         guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}"), start < end,
               let object = (try? JSONSerialization.jsonObject(with: Data(raw[start...end].utf8))) as? [String: Any],
               let rawMessage = object["message"] as? String,
@@ -578,6 +578,8 @@ public enum TitioVoiceOutput {
            isLockScreenSafe(line, forbidden: forbidden) {
             reply.notificationLine = line
         }
+        if optionCount != nil, reply.question == nil || reply.labels == nil { return nil }
+        if requiresNotification, reply.notificationLine == nil { return nil }
         return reply
     }
 

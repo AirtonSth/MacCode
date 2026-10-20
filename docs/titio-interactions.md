@@ -61,6 +61,17 @@ the source IDs and exact indexed options. Titio can relay a decision the user
 already made; it must never invent an approval or treat notification text as
 authorization.
 
+Titio's replies, notices, questions, labels and action results are generated in
+the client's current language. A failed or incomplete generation never inserts
+canned dialogue: notices remain pending for retry, with their original source
+alerts retained. Generated redacted push text survives a restart.
+
+New contextual conversations honor the Bot's Mac/Docker desktop selection.
+Ordinary user sends repair older conversations incorrectly marked for a VM
+when the Bot is local, retaining the context grant and transferring transcript
+history through the existing Mac handoff. Explicit internal isolated admissions
+keep their VM contract; revoked context grants still reject sends.
+
 ## Operational boundaries
 
 - Real names, IDs, options and current state come from host reads. Duplicate

@@ -2122,7 +2122,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             case .general: workspaceID = nil
             case .workspace(let workspace): workspaceID = workspace
             }
-            let thread = AgentThread(workspaceId: workspaceID, title: title, provider: .distill, model: model)
+            let currentRevision = try bot.currentRevisionID.flatMap { try store.getRevision(id: $0) }
+            let thread = AgentThread(workspaceId: workspaceID, title: title, provider: .distill, model: model,
+                                     executionTarget: BotExecutionDefault.target(for: currentRevision))
             let conversation = BotConversation(botID: bot.id, title: title, linkedAgentThreadID: thread.id)
             let pin = try store.createContextualConversation(conversation, newThread: thread, hostID: hostID, context: context, policyRevision: revision)
             selectedConversation[id(bot)] = conversation.id.value.uuidString.lowercased()

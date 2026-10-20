@@ -27,7 +27,7 @@ final class TitioInboxThreadTests: XCTestCase {
     }
 
     private func makeFixture() throws -> (AppContext, AppCommandRouter, BotsViewModel) {
-        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let context = try AppContext(channel: .debug, appSupportOverride: directory, titioVoice: FakeTitioVoice.fixture)
         let router = AppCommandRouter(context: context)
         context.router = router
         let snapshot = AgentProviderSnapshotFactory.snapshot(

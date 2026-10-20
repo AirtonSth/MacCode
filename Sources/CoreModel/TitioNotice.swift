@@ -188,6 +188,8 @@ public struct TitioNoticeFacts: Codable, Equatable, Sendable {
     public var options: [String]?
     public var isSecret: Bool?
     public var questionCount: Int?
+    /// Generated, checked lock-screen copy, retained for crash recovery.
+    public var generatedNotificationLine: String?
 
     public init(
         title: String? = nil,
@@ -239,6 +241,7 @@ public struct TitioNoticeFacts: Codable, Equatable, Sendable {
         case options
         case isSecret = "is_secret"
         case questionCount = "question_count"
+        case generatedNotificationLine = "generated_notification_line"
     }
 
     /// Which user-input card applies (§2): secret or multi-question → no card,

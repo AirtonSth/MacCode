@@ -5273,6 +5273,7 @@ public final class BotsViewModel: ObservableObject {
                 runAsUser: route.runAsUser
             )
             thread.reasoningModel = route.reasoningModel
+            thread.executionTarget = BotExecutionDefault.target(for: try currentRevision(for: bot))
             let conversation = BotConversation(botID: bot.id, title: "New thread", linkedAgentThreadID: thread.id)
             try botStore.createContextualConversation(
                 conversation, newThread: thread, hostID: hostID,
@@ -11091,7 +11092,11 @@ public final class BotsViewModel: ObservableObject {
                 throw BotDeskSendRefused(reason: "Docker desktop is not ready.")
             }
         }
-        let thread = try context.threadRepo.get(id: threadID)
+        let storedThread = try context.threadRepo.get(id: threadID)
+        let thread = try storedThread.map { try context.threadRepo.reconcileBotExecutionTarget($0, forUserSend: true) }
+        if let thread, thread.executionTarget != storedThread?.executionTarget {
+            resolvedRouter()?.publishAgentThreadUpdated(thread)
+        }
         let routing = thread.map { BotDeskRouting(thread: $0) } ?? deskRouting
         let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
         let inGuest = runsInGuest(threadID: threadID, provider: routing.provider)
@@ -11459,7 +11464,7 @@ public final class BotsViewModel: ObservableObject {
                   existingRunAsUser.shortName == routing.runAsUser.shortName else { return nil }
             // 1.3: model/reasoning/permission drift updates the existing thread
             // in place instead of forking a new thread and losing history.
-            var updated = existing
+            var updated = try context.threadRepo.reconcileBotExecutionTarget(existing, forUserSend: true)
             var didUpdate = false
             if updated.model != model { updated.model = model; didUpdate = true }
             if updated.reasoningEffort != routing.reasoningEffort { updated.reasoningEffort = routing.reasoningEffort; didUpdate = true }
@@ -11479,6 +11484,9 @@ public final class BotsViewModel: ObservableObject {
                     distillUltracode: routing.provider == .distill && routing.distillUltracode
                 )
                 try context.threadRepo.upsert(updated)
+            }
+            if updated.executionTarget != existing.executionTarget {
+                router.publishAgentThreadUpdated(updated)
             }
             return updated
         }

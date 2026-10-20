@@ -60,6 +60,7 @@ final class TitioNoticeRecoveryTests: XCTestCase {
         let scheduler = ManualTitioScheduler()
         let center = TitioNoticeCenter(
             db: db, botStore: store, hooks: hooks, scheduler: scheduler,
+            voice: FakeTitioVoice.fixture,
             now: { scheduler.now }, timeZone: TimeZone(identifier: "UTC")!
         )
         let actions = TitioActionRecorder()
@@ -275,7 +276,7 @@ final class TitioNoticeRecoveryTests: XCTestCase {
         XCTAssertEqual(try after.repo.get(key: fact.key)?.resolution, .expired)
         XCTAssertEqual(try after.repo.openDecisionCount(), 0)
         let message = try XCTUnwrap(after.messages.get(id: AgentMessageID(TitioNoticeIDs.messageID(forKey: fact.key))))
-        XCTAssertTrue(message.content.hasSuffix("_Expired._"), message.content)
+        XCTAssertTrue(message.content.hasSuffix("_Written status._"), message.content)
     }
 
     // MARK: 5 / 30 / 40. Transcript retention
@@ -342,7 +343,7 @@ final class TitioNoticeRecoveryTests: XCTestCase {
         XCTAssertEqual(interrupted.actions?.first?.action, .continue)
         let messages = try transcript(f)
         XCTAssertEqual(messages.count, 2)
-        XCTAssertTrue(messages.contains { $0.content.hasPrefix("• ") }, "the catch-up digest, with no canned opener")
+        XCTAssertTrue(messages.contains { $0.content == "Written digest." })
     }
 
     // MARK: 8. Fail-loud fallback, then recovery

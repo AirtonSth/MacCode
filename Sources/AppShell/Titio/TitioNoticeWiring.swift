@@ -20,13 +20,10 @@ final class TitioNoticeContextBox: @unchecked Sendable {
 
 /// The §16 language inputs: the user's recent messages in any Titio
 /// conversation (newest first) and recent card labels (a card tap is stored
-/// as a user row with its label), read off the MainActor and cached briefly.
-final class TitioLanguageInputCache: @unchecked Sendable {
-    static let lifetime: TimeInterval = 30
+/// as a user row with its label), read off the MainActor for each voice call.
+final class TitioLanguageInputSource: @unchecked Sendable {
     /// How many recent user messages the walk-back may look at.
     static let recentLimit = 12
-    private let lock = NSLock()
-    private var cached: (texts: [String], labels: Set<String>, at: Date)?
     private let botStore: BotStore
     private let messageRepo: AgentMessageRepository
     private let notices: TitioNoticeRepository?
@@ -37,17 +34,9 @@ final class TitioLanguageInputCache: @unchecked Sendable {
         self.notices = notices
     }
 
-    func invalidate() {
-        lock.withLock { cached = nil }
-    }
-
-    func recentUserTexts(now: Date = Date()) -> (texts: [String], labels: Set<String>) {
-        if let cached = lock.withLock({ cached }), now.timeIntervalSince(cached.at) < Self.lifetime {
-            return (cached.texts, cached.labels)
-        }
+    func recentUserTexts() -> (texts: [String], labels: Set<String>) {
         let texts = readRecentUserTexts()
         let labels = (try? notices?.recentCardLabels()) ?? []
-        lock.withLock { cached = (texts, labels, now) }
         return (texts, labels)
     }
 
@@ -77,7 +66,7 @@ extension AppContext {
         bridge: PrivateNotificationBridge,
         hostID: String
     ) -> TitioNoticeHooks {
-        let language = TitioLanguageInputCache(botStore: botStore, messageRepo: messageRepo, notices: TitioNoticeRepository(db: db))
+        let language = TitioLanguageInputSource(botStore: botStore, messageRepo: messageRepo, notices: TitioNoticeRepository(db: db))
         let bindings = BotAttentionPushBindingStore(db: db)
         let settings = SettingsStore(db: db)
         return TitioNoticeHooks(

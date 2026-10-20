@@ -140,6 +140,7 @@ final class TitioNoticeCenterTests: XCTestCase {
             botStore: store,
             hooks: recorder.hooks(profileID: profileID),
             scheduler: scheduler,
+            voice: FakeTitioVoice.fixture,
             now: { scheduler.now },
             timeZone: TimeZone(identifier: "UTC")!
         )
@@ -208,7 +209,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(messages.count, 1)
         XCTAssertEqual(messages[0].id.value, TitioNoticeIDs.messageID(forKey: "run.R1.completed"))
         XCTAssertEqual(messages[0].role, .assistant)
-        XCTAssertTrue(messages[0].content.contains("**Build** in **api** is done"), messages[0].content)
+        XCTAssertEqual(messages[0].content, "Written notice.")
         XCTAssertEqual(f.recorder.banners.map(\.identifier), ["run.R1.completed"])
         XCTAssertEqual(f.recorder.pushes.map(\.identifier), ["run.R1.completed"])
         let banner = try XCTUnwrap(f.recorder.banners.first)
@@ -245,7 +246,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(messages.count, 1)
         let keys = ["run.R1.completed", "run.R2.completed", "run.R3.completed"]
         XCTAssertEqual(messages[0].id.value, TitioNoticeIDs.digestMessageID(forKeys: keys))
-        XCTAssertTrue(messages[0].content.hasPrefix("• "), "the fallback digest has no canned opener: \(messages[0].content)")
+        XCTAssertEqual(messages[0].content, "Written digest.")
         let digestID = TitioNoticeIDs.digestBannerIdentifier(messageID: messages[0].id.value)
         XCTAssertEqual(f.recorder.banners.map(\.identifier), [digestID])
         XCTAssertEqual(f.recorder.pushes.map(\.identifier), [digestID], "one push per flushed message")
@@ -283,7 +284,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         ])
         let decision = try XCTUnwrap(try f.repo.get(key: "thread.T.attention.Q1"))
         XCTAssertEqual(decision.state, .posted)
-        XCTAssertEqual(decision.actions?.compactMap(\.label), ["Approve", "Decline", "Open thread"])
+        XCTAssertEqual(decision.actions?.compactMap(\.label), ["Choice 1", "Choice 2", "Choice 3"])
         let text = try XCTUnwrap(f.messages.get(id: AgentMessageID(TitioNoticeIDs.messageID(forKey: "thread.T.attention.Q1"))))
         XCTAssertEqual(BotChoicesBlock.parse(text.content).choices?.notice, "thread.T.attention.Q1")
         XCTAssertEqual(f.recorder.posted.last?.conversation?.attentionState, .needsAttention)
@@ -399,7 +400,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(rows.count, 25)
         XCTAssertEqual(Set(rows.compactMap(\.messageID)).count, 1, "all in one digest")
         XCTAssertEqual(try threadMessages(f).count, 1)
-        XCTAssertTrue(try threadMessages(f)[0].content.contains("+17 more in Activity"))
+        XCTAssertEqual(try threadMessages(f)[0].content, "Written digest.")
     }
 
     func test_postedDecisionResolvedElsewhereIsRewrittenInPlaceWithoutANewMessage() async throws {
@@ -415,10 +416,10 @@ final class TitioNoticeCenterTests: XCTestCase {
         let messages = try threadMessages(f)
         XCTAssertEqual(messages.count, 1)
         XCTAssertNil(BotChoicesBlock.parse(messages[0].content).choices, "the card is gone")
-        XCTAssertTrue(messages[0].content.hasSuffix("_Handled elsewhere._"), messages[0].content)
-        XCTAssertEqual(try f.messages.bodyRevision(id: messages[0].id), 2)
+        XCTAssertTrue(messages[0].content.hasSuffix("_Written status._"), messages[0].content)
+        XCTAssertEqual(try f.messages.bodyRevision(id: messages[0].id), 3)
         XCTAssertEqual(f.recorder.posted.last?.isRewrite, true)
-        XCTAssertEqual(f.recorder.posted.last?.bodyRevision, 2)
+        XCTAssertEqual(f.recorder.posted.last?.bodyRevision, 3)
         XCTAssertEqual(f.recorder.banners.count, 1, "no banner for a resolution")
         XCTAssertEqual(try f.repo.get(key: key)?.state, .resolved)
         XCTAssertEqual(f.recorder.inbox.last?.openDecisions, 0)
@@ -530,7 +531,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertNil(try f.repo.get(key: "run.OLD.completed"), "pruned after 30 days")
         let messages = try threadMessages(f)
         XCTAssertEqual(messages.count, 2)
-        XCTAssertTrue(messages.contains { $0.content.hasPrefix("• ") }, "the catch-up digest, with no canned opener")
+        XCTAssertTrue(messages.contains { $0.content == "Written digest." })
         XCTAssertTrue(messages.contains { BotChoicesBlock.parse($0.content).choices?.notice == "thread.T.attention.Q1" })
     }
 
