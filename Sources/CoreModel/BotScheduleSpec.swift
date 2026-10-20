@@ -14,6 +14,7 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     /// Optional so specs saved before these options decode unchanged.
     public var distillUltracode: Bool?
     public var permissionMode: AgentPermissionMode?
+    public var executionDestination: BotExecutionDestination?
     public var frequency: ScheduledTaskFrequency
     public var scheduledDate: Date
     public var intervalHours: Int
@@ -145,6 +146,7 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     private static let sharedEncoder: JSONEncoder = {
         let e = JSONEncoder()
         e.dateEncodingStrategy = .iso8601
+        e.outputFormatting = [.sortedKeys]
         return e
     }()
     private static let sharedDecoder: JSONDecoder = {

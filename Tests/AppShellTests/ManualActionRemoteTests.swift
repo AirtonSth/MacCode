@@ -495,7 +495,7 @@ final class ManualActionRemoteTests: XCTestCase {
         let vm = surface.viewModel
         vm.providerSnapshots = f.snapshots
         vm.providerLaunchConfig = { _, _ in ("/usr/bin/true", [:]) }
-        vm.botVMPreflight = { _, _ in nil }
+        vm.botVMPreflight = { _, _, _ in nil }
         vm.botComputerControl = f.control
         vm.selectThread(f.thread.id)
         _ = await openRequest(f)

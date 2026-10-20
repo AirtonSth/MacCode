@@ -182,6 +182,8 @@ public enum HostMutationContract {
     bot.notice.read
     bot.notice.clear
     bot.desktop.set
+    bot.vm.save
+    bot.execution.set
     bot.avatar.set
     bot.handle.set
     bot.soul.set

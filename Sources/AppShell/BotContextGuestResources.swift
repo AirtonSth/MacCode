@@ -82,7 +82,7 @@ final class BotContextGuestResources {
                   binding.policyRevision == pin.policyRevision else {
                 throw BotComputerGuestServiceError.contextualRuntimeUnavailable
             }
-            let identity = try BotContextRuntimeIdentity(binding: binding)
+            let identity = try store.contextRuntimeIdentity(pin: pin, threadID: thread.id)
             let authorize: @Sendable () -> Bool = {
                 let actions: [BotContextAction] = workspace == nil ? [.read, .send, .configure] : [.read, .send, .configure, .files]
                 return actions.allSatisfy {
@@ -108,7 +108,7 @@ final class BotContextGuestResources {
             if persistentSession {
                 try BotContextSessionStore.validate(pin: pin, threadID: request.threadId,
                     parentRunID: parentRunID, cwd: request.cwd, resumeCursor: request.providerThreadId,
-                    appSupport: appSupport, authorizes: authorize)
+                    appSupport: appSupport, authorizes: authorize, virtualMachineID: identity.virtualMachineID)
             }
             let context = BotGuestMCPGateway.ContextBinding(pin: pin, threadID: request.threadId)
             let gateway = secretStore.map { BotGuestMCPGateway(context: context, contextStore: store, secretStore: $0) }
@@ -150,7 +150,7 @@ final class BotContextGuestResources {
                         BotSecretEnvironment.botIDEnvironmentKey: pin.botID.value.uuidString,
                         BotPeerDelegation.threadEnvironmentKey: thread.id.value.uuidString,
                     ], store: adapter)
-                    resources.container = try service.provision(contextBinding: binding, workspace: workspace, registeredWorkspaces: registeredWorkspaces, requestingThreadID: request.threadId).containerID
+                    resources.container = try service.provision(contextBinding: binding, workspace: workspace, registeredWorkspaces: registeredWorkspaces, requestingThreadID: request.threadId, virtualMachineID: identity.virtualMachineID).containerID
                     guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                     let run = request.runId.value.uuidString.lowercased()
                     let issued = try gateway.issue(.init(runID: run, hostEnvironment: [:], context: context))
@@ -163,7 +163,7 @@ final class BotContextGuestResources {
                         directory = try BotContextSessionStore.prepare(
                             pin: pin, threadID: request.threadId, parentRunID: parentRunID,
                             cwd: request.cwd, resumeCursor: request.providerThreadId,
-                            appSupport: appSupport, authorizes: authorize
+                            appSupport: appSupport, authorizes: authorize, virtualMachineID: identity.virtualMachineID
                         )
                     } else {
                         directory = home.appendingPathComponent(resources.directoryName, isDirectory: true)
@@ -188,7 +188,7 @@ final class BotContextGuestResources {
                     )
                     guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                 } else {
-                    resources.container = try service.provision(contextBinding: binding, workspace: workspace, registeredWorkspaces: registeredWorkspaces, requestingThreadID: request.threadId).containerID
+                    resources.container = try service.provision(contextBinding: binding, workspace: workspace, registeredWorkspaces: registeredWorkspaces, requestingThreadID: request.threadId, virtualMachineID: identity.virtualMachineID).containerID
                     guard authorize() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
                 }
                 return resources
@@ -220,7 +220,7 @@ final class BotContextGuestResources {
                             && ((resource.runID == runID && resource.threadID == threadID)
                                 || edges.contains { edge in
                                     edge.childRunID == resource.runID && edge.childThreadID == resource.threadID
-                                        && (try? BotContextRuntimeIdentity(hostID: edge.childPin.hostID, botID: edge.childPin.botID, context: edge.childPin.context, policyRevision: edge.childPin.policyRevision).storageBotID) == resource.identity.storageBotID
+                                        && edge.childPin.botID == resource.identity.botID && edge.childPin.context == resource.identity.context
                                 })
                     }
                 }
@@ -270,7 +270,7 @@ final class BotContextGuestResources {
                         && ((allRunIDs.contains(resource.runID) && roots.contains(resource.runID))
                             || allEdges.contains { edge in
                                 edge.childRunID == resource.runID && edge.childThreadID == resource.threadID
-                                    && (try? BotContextRuntimeIdentity(hostID: edge.childPin.hostID, botID: edge.childPin.botID, context: edge.childPin.context, policyRevision: edge.childPin.policyRevision).storageBotID) == resource.identity.storageBotID
+                                    && edge.childPin.botID == resource.identity.botID && edge.childPin.context == resource.identity.context
                             })
                 }
             }
@@ -284,6 +284,8 @@ final class BotContextGuestResources {
     private func finishLocked(stopRuntime: Bool) throws {
         stopRequired = stopRequired || stopRuntime
         if finished {
+            // A shared VM may already belong to another bot after this cleanup.
+            guard identity.virtualMachineID == nil else { return }
             guard stopRequired else { return }
             let ownsScope = Self.lock.withLock {
                 guard Self.live[identity.storageBotID] == nil || Self.live[identity.storageBotID] === self else { return false }
@@ -311,7 +313,7 @@ final class BotContextGuestResources {
                 guard edge.childRunID != runID,
                       let child = Self.live.values.first(where: {
                           $0.runID == edge.childRunID && $0.threadID == edge.childThreadID
-                              && (try? BotContextRuntimeIdentity(hostID: edge.childPin.hostID, botID: edge.childPin.botID, context: edge.childPin.context, policyRevision: edge.childPin.policyRevision).storageBotID) == $0.identity.storageBotID
+                              && edge.childPin.botID == $0.identity.botID && edge.childPin.context == $0.identity.context
                               && $0.appSupport.resolvingSymlinksInPath().standardizedFileURL == appSupport.resolvingSymlinksInPath().standardizedFileURL
                       }) else { return nil }
                 return child

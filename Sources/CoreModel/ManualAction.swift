@@ -88,15 +88,22 @@ public final class BotComputerControl: @unchecked Sendable {
 
     private let lock = NSLock()
     private let now: @Sendable () -> Date
-    private var controlled: Set<BotID> = []
+    private var controlled: [BotID: BotID] = [:]
+    private var resourceLookup: @Sendable (BotID, AgentThreadID?) -> BotID = { bot, _ in bot }
     private var requests: [BotID: ManualActionRequest] = [:]
 
     public init(now: @escaping @Sendable () -> Date = { Date() }) {
         self.now = now
     }
 
-    public func isControlledByUser(_ bot: BotID) -> Bool {
-        lock.withLock { controlled.contains(bot) }
+    public func configureResourceLookup(_ lookup: @escaping @Sendable (BotID, AgentThreadID?) -> BotID) {
+        lock.withLock { resourceLookup = lookup }
+    }
+
+    public func isControlledByUser(_ bot: BotID, resourceID: BotID? = nil) -> Bool {
+        let lookup = lock.withLock { resourceLookup }
+        let resource = resourceID ?? lookup(bot, nil)
+        return lock.withLock { controlled[bot] != nil || controlled.values.contains(resource) }
     }
 
     public func openRequest(_ bot: BotID) -> ManualActionRequest? {
@@ -104,9 +111,12 @@ public final class BotComputerControl: @unchecked Sendable {
     }
 
     /// The user starts driving. An open request becomes `taken`.
-    public func take(_ bot: BotID) {
+    public func take(_ bot: BotID, threadID: AgentThreadID? = nil) {
+        let lookup = lock.withLock { resourceLookup }
+        let resource = lookup(bot, threadID ?? openRequest(bot)?.threadID)
         let changed = lock.withLock {
-            let inserted = controlled.insert(bot).inserted
+            let inserted = controlled[bot] != resource
+            controlled[bot] = resource
             if var request = requests[bot], request.state == .open {
                 request.state = .taken
                 requests[bot] = request
@@ -118,7 +128,15 @@ public final class BotComputerControl: @unchecked Sendable {
 
     /// Hands control back to the bot. The request stays until `dismiss`.
     public func release(_ bot: BotID) {
-        if lock.withLock({ controlled.remove(bot) != nil }) { postChanged(bot) }
+        let lookup = lock.withLock { resourceLookup }
+        let current = lookup(bot, nil)
+        let released = lock.withLock { () -> [BotID] in
+            let resource = controlled[bot] ?? current
+            let owners = controlled.filter { $0.value == resource }.map(\.key)
+            owners.forEach { controlled[$0] = nil }
+            return owners
+        }
+        released.forEach(postChanged)
     }
 
     /// `.botComputerControlChanged` after the lock is released, so observers may read this control.
@@ -162,7 +180,7 @@ public final class BotComputerControl: @unchecked Sendable {
     public func forget(_ bot: BotID) {
         let wasControlled = lock.withLock {
             requests[bot] = nil
-            return controlled.remove(bot) != nil
+            return controlled.removeValue(forKey: bot) != nil
         }
         if wasControlled { postChanged(bot) }
     }

@@ -67,7 +67,7 @@ final class BotContextResolverCleanupFailureDockerTests: XCTestCase {
             let childGrant = try context.botStore.grantContext(hostID: host, botID: child.id, context: .workspace(workspace.id), actions: [.read, .send, .configure, .files], expectedRevision: 0)
             let unrelated = try context.botStore.create(name: "Unrelated", title: "Unrelated", description: "", handle: "unrelated-\(UUID().uuidString.prefix(8))", soul: "", provider: .distill, model: "test")
             let unrelatedGrant = try context.botStore.grantContext(hostID: host, botID: unrelated.id, context: .workspace(workspace.id), actions: [.read, .send, .configure, .files], expectedRevision: 0)
-            identities = try [grant, childGrant, unrelatedGrant].map(BotContextRuntimeIdentity.init(binding:))
+            identities = try [grant, childGrant, unrelatedGrant].map { try BotContextRuntimeIdentity(binding: $0) }
             dockerGate.childName = BotComputerGuestSpec.containerName(botID: identities[0].storageBotID)
             try JSONSerialization.data(withJSONObject: ["ownedIDs": identities.map { $0.storageBotID.value.uuidString.lowercased() }]).write(to: manifest, options: .atomic)
             let marker = root.appendingPathComponent("provider-marker")

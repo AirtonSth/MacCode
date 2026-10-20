@@ -52,7 +52,8 @@ extension AppCommandRouter {
             botID: botID,
             entry: BotVMRunRegistry.Entry(
                 threadID: thread, runID: runID, title: title, workspace: row.worktreePath ?? ""
-            )
+            ),
+            resourceID: try? ctx.botStore.guestResourceID(botID: botID, threadID: thread)
         )
         return (botID, holder)
     }
@@ -82,19 +83,22 @@ extension AppCommandRouter {
             if await context?.botGroupOrchestrator.resumeWaitingTurn(memberThreadID: current) != true {
                 try? await drainNextQueuedAgentMessage(thread: current, botVMHandOff: true)
             }
-            next = BotVMRunRegistry.shared.popWaitingIfFree(botID: botID)
+            let currentBotID = ((try? context?.threadRepo.get(id: current)) ?? nil)?.actor.botID ?? botID
+            next = BotVMRunRegistry.shared.popWaitingIfFree(botID: currentBotID,
+                resourceID: try? context?.botStore.guestResourceID(botID: currentBotID, threadID: current))
         }
     }
 
     nonisolated static func botVMBusyNotice(holderTitle: String) -> String {
-        "The bot is busy in \(holderTitle)"
+        "The VM is busy in \(holderTitle)"
     }
 
     /// Queues `thread` behind the run holding the bot's VM and shows the
     /// notice on the surfaces showing it. Returns the notice.
     @discardableResult
     func waitForBotVM(botID: BotID, thread: AgentThreadID, holder: BotVMRunRegistry.Entry) -> String {
-        BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: thread)
+        BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: thread,
+            resourceID: try? context?.botStore.guestResourceID(botID: botID, threadID: thread))
         let notice = Self.botVMBusyNotice(holderTitle: holder.title)
         for viewModel in botThreadViewModels where viewModel.selectedThreadId == thread {
             viewModel.statusMessage = notice
@@ -195,20 +199,35 @@ extension AppCommandRouter {
     /// A workspace-less thread (`workspace` nil, a Bots Desk thread) only needs the container up:
     /// its agent runs in the guest user's home, and BotHome is never a mountable workspace.
     /// A bot already running elsewhere keeps its container: the send queues instead of remounting.
-    func botVMPreflight(_ botID: BotID, workspace: String?) async -> String? {
+    func botVMPreflight(_ botID: BotID, workspace: String?, threadID: AgentThreadID? = nil) async -> String? {
         guard let ctx = context else { return "MacCode is not ready." }
         let docker = botVMDocker
         let service = botVMService(appSupport: ctx.appSupportDirectory)
         let registered = Set(ctx.state.workspaces.values.map(\.cwd))
         let prefetch = guestDistillPrefetch()
+        let store = ctx.botStore
+        let workspaces = ctx.state.workspaces
         return await Task.detached(priority: .userInitiated) { () -> String? in
             do {
+                let destination = try threadID.flatMap { try store.threadExecutionDestination($0) } ?? store.executionDestination(botID: botID)
+                let machine = try destination.virtualMachineID.flatMap { try store.virtualMachine(id: $0) }
+                if let owner = machine?.workspaceID {
+                    guard let ownerWorkspace = workspaces[owner], workspace == nil || workspace == ownerWorkspace.cwd else {
+                        return "This VM belongs to another workspace or its workspace is no longer available."
+                    }
+                }
+                let resourceID = try store.guestResourceID(botID: botID, threadID: threadID)
+                if BotComputerControl.shared.isControlledByUser(botID, resourceID: resourceID) {
+                    return "You are controlling this VM. Return control before starting a conversation."
+                }
                 prefetch(try docker.info())
-                if BotVMRunRegistry.shared.active(botID: botID) == nil {
+                if machine != nil { return nil }
+                if let threadID, try store.conversationContextPin(linkedTo: threadID) != nil { return nil }
+                if BotVMRunRegistry.shared.active(botID: resourceID) == nil {
                     if let workspace {
-                        try service.ensureWorkspaceMounted(botID: botID, workspace: workspace, registered: registered)
+                        try service.ensureWorkspaceMounted(botID: resourceID, workspace: workspace, registered: registered)
                     } else {
-                        _ = try service.provision(botID: botID)
+                        _ = try service.provision(botID: resourceID)
                     }
                 }
                 return nil
@@ -262,9 +281,11 @@ extension AppCommandRouter {
         let service = botVMService(appSupport: appSupport)
         let docker = botVMDocker
         let prefetch = guestDistillPrefetch()
+        let store = context?.botStore
         return await Task.detached(priority: .userInitiated) { () -> String? in
             do {
-                _ = try service.provision(botID: botID)
+                let resourceID = try store?.guestResourceID(botID: botID) ?? botID
+                _ = try service.provision(botID: resourceID)
                 Task.detached(priority: .utility) {
                     if let info = try? docker.info() { prefetch(info) }
                 }

@@ -42,6 +42,16 @@ final class BotContextRuntimeTests: XCTestCase {
         }
     }
 
+    func test_sharedMachineDoesNotShareCredentialIdentity() throws {
+        let machine = UUID()
+        let first = try BotContextRuntimeIdentity(hostID: "host", botID: BotID(), context: .general,
+            policyRevision: 1, virtualMachineID: machine)
+        let second = try BotContextRuntimeIdentity(hostID: "host", botID: BotID(), context: .general,
+            policyRevision: 1, virtualMachineID: machine)
+        XCTAssertEqual(first.storageBotID, second.storageBotID)
+        XCTAssertNotEqual(first.credentialBotID, second.credentialBotID)
+    }
+
     func test_gatewayLeaseEqualityIncludesRunAndContext() throws {
         let bot = BotID()
         let workspace = BotContext.workspace(WorkspaceID())

@@ -2435,17 +2435,25 @@ public final class AgentThreadRepository {
         executionTarget: ExecutionTarget?
     ) throws -> Bool {
         Self.bumpIdentityRevision()
+        var destination: BotExecutionDestination?
+        if lockedAt != nil, let botID = actor.botID, let target = executionTarget,
+           try BotStore(db: db).get(id: botID) != nil {
+            let selected = try BotStore(db: db).executionDestination(botID: botID)
+            destination = target == .mac ? .mac : (selected == .mac ? .ownVM : selected)
+        }
         let st = try db.prepare("""
             UPDATE agent_threads
             SET actor_json = ?,
                 actor_locked_at = ?,
-                execution_target = ?
+                execution_target = ?,
+                execution_destination = COALESCE(execution_destination, ?)
             WHERE id = ?;
             """)
         try st.bind(1, encodeRunActor(actor))
         try st.bind(2, lockedAt.map { iso.string(from: $0) })
         try st.bind(3, executionTarget?.rawValue)
-        try st.bind(4, id.value.uuidString)
+        try st.bind(4, destination?.storageValue)
+        try st.bind(5, id.value.uuidString)
         _ = try st.step()
         let changes = try db.prepare("SELECT changes();")
         return try changes.step() && changes.columnInt64(0) == 1
@@ -2461,17 +2469,24 @@ public final class AgentThreadRepository {
         executionTarget: ExecutionTarget?
     ) throws -> Bool {
         Self.bumpIdentityRevision()
+        var destination: BotExecutionDestination?
+        if let botID = actor.botID, let target = executionTarget {
+            let selected = try BotStore(db: db).executionDestination(botID: botID)
+            destination = target == .mac ? .mac : (selected == .mac ? .ownVM : selected)
+        }
         let st = try db.prepare("""
             UPDATE agent_threads
             SET actor_json = ?,
                 actor_locked_at = ?,
-                execution_target = ?
+                execution_target = ?,
+                execution_destination = COALESCE(execution_destination, ?)
             WHERE id = ? AND actor_locked_at IS NULL;
             """)
         try st.bind(1, encodeRunActor(actor))
         try st.bind(2, iso.string(from: lockedAt))
         try st.bind(3, executionTarget?.rawValue)
-        try st.bind(4, id.value.uuidString)
+        try st.bind(4, destination?.storageValue)
+        try st.bind(5, id.value.uuidString)
         _ = try st.step()
         let changes = try db.prepare("SELECT changes();")
         return try changes.step() && changes.columnInt64(0) == 1
@@ -2484,6 +2499,7 @@ public final class AgentThreadRepository {
     /// internal contextual admissions retain their explicitly isolated runtime.
     public func reconcileBotExecutionTarget(_ thread: AgentThread, forUserSend: Bool = false) throws -> AgentThread {
         guard thread.executionTarget == .vm else { return thread }
+        if try BotStore(db: db).threadExecutionDestination(thread.id) != nil { return thread }
         if let runtime = try guestPlacement(of: thread.id)?.guestRuntime,
            !runtime.isEmpty, runtime != BotGuestRuntime.distillV1 { return thread }
         let store = BotStore(db: db)
@@ -2509,6 +2525,14 @@ public final class AgentThreadRepository {
     /// `upsert` nor `setActor` writes this column. Missing rows return false.
     @discardableResult
     public func setGuestRuntime(id: AgentThreadID, _ runtime: String?) throws -> Bool {
+        if runtime == BotGuestRuntime.distillV1,
+           let botID = try lockedBotActor(of: id),
+           let bot = try BotStore(db: db).get(id: botID), bot.deletedAt == nil {
+            let store = BotStore(db: db)
+            let selected = try store.executionDestination(botID: botID)
+            try store.pinExecutionDestination(threadID: id, botID: botID,
+                destination: selected == .mac ? .ownVM : selected)
+        }
         let st = try db.prepare("UPDATE agent_threads SET guest_runtime = ? WHERE id = ?;")
         try st.bind(1, runtime)
         try st.bind(2, id.value.uuidString)

@@ -627,6 +627,7 @@ public final class BotStore: @unchecked Sendable {
                 database: db
             )
             try insertLiveHandle(handle, botID: botID, at: now, database: db)
+            try writeExecutionDestination(executionDestination(botID: source.id), botID: botID)
             for binding in try loadSkillBindings(botID: source.id, database: db) {
                 try upsertSkillBinding(
                     BotSkillBinding(
@@ -1551,6 +1552,9 @@ public final class BotStore: @unchecked Sendable {
     }
 
     public func saveRoutine(_ definition: BotRoutineDefinition, now: Date = Date()) throws {
+        if let destination = definition.scheduleSpec?.executionDestination {
+            try validateExecutionDestination(destination, botID: definition.botID)
+        }
         try db.transaction {
             guard let bot = try loadBot(id: definition.botID, database: db), bot.deletedAt == nil else {
                 throw BotStoreError.notFound
@@ -1907,6 +1911,7 @@ public final class BotStore: @unchecked Sendable {
         if bot.currentRevisionID != expectedCurrentRevisionID {
             throw BotPublishError.revisionConflict
         }
+        let previous = try bot.currentRevisionID.flatMap { try loadRevision(id: $0, database: database) }
         let trimmedName = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { throw BotPublishError.invalidRevision }
         let nextNumber = try nextRevisionNumber(botID: bot.id, database: database)
@@ -1939,6 +1944,9 @@ public final class BotStore: @unchecked Sendable {
             updatedAt: now,
             database: database
         )
+        if previous.map({ BotExecutionDefault.target(for: $0) }) != BotExecutionDefault.target(for: revision) {
+            try writeExecutionDestination(revision.desktopKind == .dockerDesktop ? .ownVM : .mac, botID: bot.id)
+        }
         return revision
     }
 

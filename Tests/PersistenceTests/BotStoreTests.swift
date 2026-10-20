@@ -3,6 +3,44 @@ import CoreModel
 @testable import Persistence
 
 final class BotStoreTests: XCTestCase {
+    func test_sharedVMScopesPersistAndOnlyExclusiveWorkspaceBotsCanUseThem() throws {
+        let workspace = WorkspaceID()
+        let general = try store.create(name: "General", title: "", description: "")
+        let exclusive = try store.create(name: "Exclusive", title: "", description: "", workspaceID: workspace)
+        let other = try store.create(name: "Other", title: "", description: "", workspaceID: WorkspaceID())
+        let shared = try store.saveVirtualMachine(name: "Research")
+        let scoped = try store.saveVirtualMachine(name: "Build", workspaceID: workspace)
+        XCTAssertNoThrow(try store.setExecutionDestination(.virtualMachine(shared.id), botID: general.id))
+        XCTAssertNoThrow(try store.setExecutionDestination(.virtualMachine(scoped.id), botID: exclusive.id))
+        XCTAssertThrowsError(try store.setExecutionDestination(.virtualMachine(scoped.id), botID: general.id))
+        XCTAssertThrowsError(try store.setExecutionDestination(.virtualMachine(scoped.id), botID: other.id))
+        XCTAssertThrowsError(try store.saveVirtualMachine(name: " research "))
+        XCTAssertThrowsError(try store.saveVirtualMachine(id: scoped.id, name: "Moved", workspaceID: nil))
+        let restored = BotStore(db: db)
+        XCTAssertEqual(try restored.executionDestination(botID: exclusive.id), .virtualMachine(scoped.id))
+        let copy = try restored.duplicate(id: exclusive.id)
+        XCTAssertEqual(try restored.executionDestination(botID: copy.id), .virtualMachine(scoped.id))
+    }
+
+    func test_conversationKeepsItsVMWhenTheDefaultChangesAndSchedulesKeepTheirOverride() throws {
+        let bot = try store.create(name: "Builder", title: "", description: "")
+        let machine = try store.saveVirtualMachine(name: "Build")
+        try store.setExecutionDestination(.virtualMachine(machine.id), botID: bot.id)
+        let threads = AgentThreadRepository(db: db)
+        let thread = AgentThread(title: "Pinned", provider: .distill, model: "auto")
+        try threads.upsert(thread)
+        try store.pinExecutionDestination(threadID: thread.id, botID: bot.id, destination: .virtualMachine(machine.id))
+        try store.setExecutionDestination(.mac, botID: bot.id)
+        XCTAssertEqual(try store.guestResourceID(botID: bot.id, threadID: thread.id), machine.storageID)
+        XCTAssertEqual(try store.executionDestination(botID: bot.id), .mac)
+        var spec = BotScheduleSpec(model: "auto")
+        spec.executionDestination = .virtualMachine(machine.id)
+        try store.saveRoutine(BotRoutineDefinition(botID: bot.id, name: "Build", prompt: "Build",
+            scheduleNote: spec.displayNote(), scheduleSpecJSON: spec.encodedJSON()))
+        XCTAssertEqual(try store.listRoutines(botID: bot.id).first?.definition.scheduleSpec?.executionDestination,
+            .virtualMachine(machine.id))
+    }
+
     // Legacy-provider machinery is still exercised here; Distill-only rules run with the seam cleared.
     override class func setUp() {
         super.setUp()

@@ -105,6 +105,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
     /// Linked and locked the way the app stores a VM-bot thread: the follow-ups
     /// after an approval run as bot turns, which need the linked conversation.
     private func lockOnVM(_ f: Fixture) throws {
+        f.botsVM.dockerGuestReadyOverrideForTesting = true
         try XCTUnwrap(f.vm.botThreadLinker)(f.bot.id, f.thread.id)
         XCTAssertTrue(try f.ctx.threadRepo.setActor(
             id: f.thread.id, actor: .bot(f.bot.id), lockedAt: Date(), executionTarget: .vm
@@ -165,7 +166,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
 
     func test_preflightFailureBlocksSendWithoutFallbackThenRunOnMacSwitches() async throws {
         let f = try makeFixture()
-        f.vm.botVMPreflight = { _, _ in "docker parado" }
+        f.vm.botVMPreflight = { _, _, _ in "docker parado" }
         f.vm.setRunActor(.bot(f.bot.id))
         f.vm.prompt = "oi"
         await f.vm.send()
@@ -302,7 +303,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         // transcript, not try to load the guest session.
         let f = try makeFixture()
         try makeGuestThreadWithHistory(f, guestSession: "guest-session-1")
-        f.vm.botVMPreflight = { _, _ in "docker parado" }
+        f.vm.botVMPreflight = { _, _, _ in "docker parado" }
         f.vm.prompt = "continua"
         await f.vm.send()
         XCTAssertEqual(f.vm.vmUnavailableBotID, f.bot.id, f.vm.statusMessage)
@@ -327,7 +328,7 @@ final class BotVMFailureHandlingTests: XCTestCase {
         // send would open a Mac session with none of the guest conversation.
         let f = try makeFixture()
         try makeGuestThreadWithHistory(f, guestSession: "guest-session-1")
-        f.vm.botVMPreflight = { _, _ in "docker parado" }
+        f.vm.botVMPreflight = { _, _, _ in "docker parado" }
         f.vm.prompt = "continua"
         await f.vm.send()
         f.vm.runSelectedThreadOnMac()

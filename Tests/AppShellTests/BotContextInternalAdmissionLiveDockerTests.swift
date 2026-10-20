@@ -66,7 +66,7 @@ final class BotContextInternalAdmissionLiveDockerTests: XCTestCase {
             let peer = try context.botStore.create(name: "Live peer", title: "Live peer", description: "", handle: "live-peer", soul: "", provider: .distill, model: model)
             let parentGrant = try context.botStore.grantContext(hostID: hostID, botID: parent.id, context: .workspace(workspace.id), actions: [.read, .send, .configure, .files, .delegate], expectedRevision: 0)
             let peerGrant = try context.botStore.grantContext(hostID: hostID, botID: peer.id, context: parentGrant.context, actions: [.read, .send, .configure, .files], expectedRevision: 0)
-            identities = try [parentGrant, peerGrant].map(BotContextRuntimeIdentity.init(binding:))
+            identities = try [parentGrant, peerGrant].map { try BotContextRuntimeIdentity(binding: $0) }
             try JSONSerialization.data(withJSONObject: ["ownedIDs": identities.map { $0.storageBotID.value.uuidString.lowercased() }]).write(to: root.appendingPathComponent("fixture-manifest.json"))
             for (identity, key) in zip(identities, [parentKey, childKey]) {
                 try secrets.save(botID: identity.storageBotID, name: "OPENROUTER_API_KEY", value: key)

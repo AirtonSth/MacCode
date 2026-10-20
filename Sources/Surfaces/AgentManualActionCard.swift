@@ -96,7 +96,7 @@ extension AgentAppViewModel {
         } else if let request = openManualAction, request.botID == botID {
             takeManualControl()
         } else {
-            botComputerControl.take(botID)
+            botComputerControl.take(botID, threadID: selectedThreadId)
         }
         botScreenControlled = botComputerControl.isControlledByUser(botID)
     }

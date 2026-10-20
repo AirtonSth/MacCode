@@ -271,6 +271,7 @@ final class BotGuestRunResolverTests: XCTestCase {
         let f = try await makeFixture()
         let ordinary = try makeThread(f)
         let pinned = try makeThread(f)
+        try f.ctx.db.execute("UPDATE agent_threads SET execution_destination=NULL;")
         let grant = try f.ctx.botStore.grantContext(
             hostID: f.ctx.liveActivityHostIdentity.serverId, botID: f.bot.id,
             context: .general, actions: [.read, .send], expectedRevision: nil
@@ -749,12 +750,45 @@ final class BotGuestRunResolverTests: XCTestCase {
             _ = try await f.resolver.prepare(request(second)) { _ in }
             XCTFail("the second conversation must not get the bot")
         } catch {
-            XCTAssertEqual(error as? DistillGuestLaunchError, .busy("The bot is busy in First chat"))
+            XCTAssertEqual(error as? DistillGuestLaunchError, .busy("The VM is busy in First chat"))
         }
         gate.signal()
         let plan = try unwrapPlan(try await firstRun.value)
         XCTAssertEqual(f.vm.calls.count, 1)
         await plan.finish(.completed).value
+    }
+
+    func test_twoBotsShareOneVMAndTheQueueRetainsTheWaitingBotsIdentity() async throws {
+        let f = try await makeFixture()
+        let machine = try f.ctx.botStore.saveVirtualMachine(name: "Shared")
+        let peer = try f.ctx.botStore.create(name: "Peer", title: "", description: "", desktopKind: .dockerDesktop)
+        try f.ctx.botStore.setExecutionDestination(.virtualMachine(machine.id), botID: f.bot.id)
+        try f.ctx.botStore.setExecutionDestination(.virtualMachine(machine.id), botID: peer.id)
+        try FileManager.default.createDirectory(
+            at: BotComputerGuestSpec.guestHomeURL(appSupport: f.appSupport, botID: machine.storageID),
+            withIntermediateDirectories: true)
+        let first = try makeThread(f, title: "First")
+        let second = AgentThread(title: "Second", provider: .distill, model: "claude/claude-sonnet-4-5")
+        try f.ctx.threadRepo.upsert(second)
+        try f.ctx.threadRepo.setActor(id: second.id, actor: .bot(peer.id), lockedAt: Date(), executionTarget: .vm)
+        try f.ctx.threadRepo.setGuestRuntime(id: second.id, BotGuestRuntime.distillV1)
+        let firstRequest = request(first)
+        let plan = try unwrapPlan(try await f.resolver.prepare(firstRequest) { _ in })
+        XCTAssertEqual(f.vm.calls.first?.botID, machine.storageID)
+        do {
+            _ = try await f.resolver.prepare(request(second)) { _ in }
+            XCTFail("Two bots must not run in the shared VM together.")
+        } catch {
+            XCTAssertEqual(error as? DistillGuestLaunchError, .busy("The VM is busy in First"))
+        }
+        f.registry.addWaiting(botID: peer.id, threadID: second.id, resourceID: machine.storageID)
+        await plan.finish(.completed).value
+        let next = f.registry.releaseAndNextWaiter(runID: firstRequest.runId)
+        XCTAssertEqual(next?.botID, peer.id)
+        XCTAssertEqual(next?.threadID, second.id)
+        let peerPlan = try unwrapPlan(try await f.resolver.prepare(request(second)) { _ in })
+        XCTAssertEqual(f.vm.calls.last?.botID, machine.storageID)
+        await peerPlan.finish(.completed).value
     }
 
     func test_stopThenQueuedSend_waitsForTheStoppedRunsTeardownBeforeTouchingTheGuest() async throws {

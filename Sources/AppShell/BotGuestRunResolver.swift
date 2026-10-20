@@ -172,6 +172,16 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             try await Self.blocking { try resources.cancel() }
             throw unavailable
         }
+        let identity = try deps.botStore.contextRuntimeIdentity(pin: admission.pin, threadID: request.threadId)
+        guard !BotComputerControl.shared.isControlledByUser(admission.pin.botID, resourceID: identity.storageBotID) else {
+            throw DistillGuestLaunchError.unavailable("You are controlling this VM. Return control before starting a conversation.")
+        }
+        let claim = BotVMRunRegistry.Entry(threadID: request.threadId, runID: request.runId,
+            title: (try deps.threadRepo.get(id: request.threadId))?.title ?? "Conversation", workspace: request.cwd)
+        if let holder = deps.registry.tryBegin(botID: admission.pin.botID, entry: claim, resourceID: identity.storageBotID) {
+            throw DistillGuestLaunchError.busy("The VM is busy in \(holder.title)")
+        }
+        let lease = try await deps.leases.acquire(identity.storageBotID.value.uuidString.lowercased())
         var resources: BotContextGuestResources?
         var heartbeat: BotGuestLeaseHeartbeat?
         do {
@@ -212,7 +222,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             try validate()
             let plan = DistillGuestLaunchPlan(
                 runID: runID, dockerExecutable: dockerExecutable, container: prepared.container,
-                guestCwd: guestCwd, guestCommand: guestCommand, envFileURL: envFile, lease: nil,
+                guestCwd: guestCwd, guestCommand: guestCommand, envFileURL: envFile, lease: lease,
                 teardown: { [weak self] _ in
                     leaseHeartbeat.stop()
                     do { try await Self.blocking { try prepared.cancel() } }
@@ -229,6 +239,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 do { try await Self.blocking { try resources.cancel() } }
                 catch { guestResolverLog.error("bot.context.prepare_cleanup_failed run=\(request.runId.value.uuidString.lowercased(), privacy: .public)") }
             }
+            await lease.release()
             throw Self.launchError(error)
         }
     }
@@ -257,18 +268,29 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             throw DistillGuestLaunchError.unavailable("the conversation no longer exists.")
         }
         let botID = try dockerBot(of: thread)
+        let destination = try deps.botStore.threadExecutionDestination(thread.id)
+            ?? deps.botStore.executionDestination(botID: botID)
+        try deps.botStore.validateExecutionDestination(destination, botID: botID, workspaceID: thread.workspaceId)
+        let machine = try destination.virtualMachineID.flatMap { try deps.botStore.virtualMachine(id: $0) }
+        if let workspaceID = machine?.workspaceID, await deps.workspaces()[workspaceID] == nil {
+            throw DistillGuestLaunchError.unavailable("This VM's workspace is no longer available.")
+        }
+        let resourceID = try deps.botStore.guestResourceID(botID: botID, threadID: thread.id)
+        guard !BotComputerControl.shared.isControlledByUser(botID, resourceID: resourceID) else {
+            throw DistillGuestLaunchError.unavailable("You are controlling this VM. Return control before starting a conversation.")
+        }
         try await deps.barrier.wait()
 
         let claim = BotVMRunRegistry.Entry(
             threadID: request.threadId, runID: request.runId, title: thread.title, workspace: request.cwd
         )
-        if let holder = deps.registry.tryBegin(botID: botID, entry: claim) {
-            throw DistillGuestLaunchError.busy("The bot is busy in \(holder.title)")
+        if let holder = deps.registry.tryBegin(botID: botID, entry: claim, resourceID: resourceID) {
+            throw DistillGuestLaunchError.busy("The VM is busy in \(holder.title)")
         }
         // From here the claim is the coordinator's to free (run finished,
         // which also fires for a failed start): freeing it here would skip
         // the queued send that run-finished hands to the next thread.
-        let leaseKey = botID.value.uuidString.lowercased()
+        let leaseKey = resourceID.value.uuidString.lowercased()
         if await deps.leases.isHeld(leaseKey) { progress(.waitingForBot) }
         let lease = try await deps.leases.acquire(leaseKey)
         let runID = request.runId.value.uuidString.lowercased()
@@ -277,7 +299,11 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             // A lease handed over just before a Stop is this run's to free.
             try Task.checkCancellation()
             progress(.startingVM)
-            let workspace = try await workspaceRoot(of: thread)
+            var workspace = try await workspaceRoot(of: thread)
+            if workspace == nil, let workspaceID = machine?.workspaceID {
+                workspace = await deps.workspaces()[workspaceID]
+            }
+            let mount = workspace
             let registered = Set(await deps.workspaces().values)
             let vmPreparer = deps.vm
             // Runs while the VM comes up: it needs nothing from the VM. Not
@@ -293,13 +319,14 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             let codexClientVersionProbe = Task { await resolveCodexClientVersion(hostEnvironment) }
             let vm = try await Self.blocking {
                 try vmPreparer.prepare(
-                    botID: botID, threadID: request.threadId,
-                    workspace: workspace, registeredWorkspaces: registered
+                    botID: resourceID, threadID: request.threadId,
+                    workspace: mount, registeredWorkspaces: registered
                 )
             }
             try Task.checkCancellation()
             let guestCwd = try Self.guestCwd(
-                requestCwd: request.cwd, workspace: workspace, mounted: vm.mountedWorkspaces
+                requestCwd: thread.workspaceId == nil ? (workspace ?? request.cwd) : request.cwd,
+                workspace: workspace, mounted: vm.mountedWorkspaces
             )
 
             progress(.preparingAgent)
@@ -365,7 +392,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 deadline.cancel()
             }
             try Task.checkCancellation()
-            let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: botID)
+            let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: resourceID)
             let guestDistillHome = DistillGuestCredentials.distillHome(guestHome: guestHome)
             let mirror = mirror(hostHome: hostHome, binary: hostBinary, environment: hostEnvironment)
             try mirror.begin(runID: runID, guestDistillHome: guestDistillHome, provider: provider, accounts: accounts)
@@ -474,7 +501,8 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             throw DistillGuestLaunchError.unavailable("the bot of this conversation no longer exists.")
         }
         let revision = try bot.currentRevisionID.flatMap { try deps.botStore.getRevision(id: $0) }
-        guard revision?.desktopKind == .dockerDesktop else {
+        let pinned = try deps.botStore.threadExecutionDestination(thread.id)
+        guard pinned?.target == .vm || revision?.desktopKind == .dockerDesktop else {
             throw DistillGuestLaunchError.unavailable("this bot no longer has a Docker desktop.")
         }
         return botID
@@ -821,6 +849,7 @@ extension AppContext {
                 if sweepDocker != nil {
                     do {
                         botIDs = try store.list(includeHidden: true, includeDeleted: true).map(\.id)
+                            + store.listVirtualMachines().map(\.storageID)
                     } catch {
                         // Fail open: the barrier still opens; a leftover
                         // agent then ends only by its lease reaper (~50 s).

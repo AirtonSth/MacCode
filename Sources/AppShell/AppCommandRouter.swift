@@ -638,6 +638,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         self.sshCommandRunner = sshCommandRunner
         self.botSecretStore = secretStore
         self.agentAppReadGateway = AgentAppReadGateway(db: context.db, readDB: context.readDB)
+        botComputerControl.configureResourceLookup { [store = context.botStore] botID, threadID in
+            (try? store.guestResourceID(botID: botID, threadID: threadID)) ?? botID
+        }
         installBotHostObservers()
     }
 
@@ -3510,15 +3513,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let revision = (try? store.get(id: botID))?.currentRevisionID.flatMap { try? store.getRevision(id: $0) }
             return BotExecutionDefault.target(for: revision ?? nil)
         }
-        viewModel.botBusyMessage = { botID, threadID in
-            BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID)
+        viewModel.botBusyMessage = { [weak self] botID, threadID in
+            do {
+                let resource = try self?.context?.botStore.guestResourceID(botID: botID, threadID: threadID)
+                return BotVMRunRegistry.shared.busyMessage(botID: botID, threadID: threadID, resourceID: resource)
+            } catch { return String(describing: error) }
         }
         viewModel.botWaitForVM = { [weak self] botID, threadID in
-            BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: threadID)
+            let resource = try? self?.context?.botStore.guestResourceID(botID: botID, threadID: threadID)
+            BotVMRunRegistry.shared.addWaiting(botID: botID, threadID: threadID, resourceID: resource)
             self?.publishBotVMWait(thread: threadID)
         }
-        viewModel.botClaimVM = { botID, entry in
-            BotVMRunRegistry.shared.tryBegin(botID: botID, entry: entry)
+        viewModel.botClaimVM = { [weak self] botID, entry in
+            do {
+                let resource = try self?.context?.botStore.guestResourceID(botID: botID, threadID: entry.threadID)
+                return BotVMRunRegistry.shared.tryBegin(botID: botID, entry: entry, resourceID: resource)
+            } catch {
+                return BotVMRunRegistry.Entry(threadID: entry.threadID, runID: entry.runID,
+                    title: String(describing: error), workspace: entry.workspace)
+            }
         }
         viewModel.botReleaseVM = { [weak self] runID in self?.releaseBotVMRun(runID) }
         // iOS parity: the composer's bot lock and "Run this thread on the Mac"
@@ -3530,8 +3543,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             // A store failure keeps the request open and puts the banner back.
             _ = try? await self?.resolveMacExecution(thread: threadID, approve: approve)
         }
-        viewModel.botVMPreflight = { [weak self] botID, workspace in
-            await self?.botVMPreflight(botID, workspace: workspace)
+        viewModel.botVMPreflight = { [weak self] botID, workspace, threadID in
+            await self?.botVMPreflight(botID, workspace: workspace, threadID: threadID)
         }
         viewModel.botVMProvision = { [weak self] botID in await self?.provisionBotVM(botID) }
         viewModel.pendingMacExecutionByThread = pendingMacExecution
@@ -4248,6 +4261,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             settings: SettingsStore(db: ctx.db),
             appSupportDirectory: ctx.appSupportDirectory
         )
+        created.onVMWorkspaceExists = { [weak self] id in self?.context?.state.workspaces[id] != nil }
         created.onHasLiveRun = { [weak self] id in
             self?.botsViewModel?.hasLiveRun(botID: id) ?? false
         }
@@ -4346,11 +4360,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
             }
             let steps = try Self.guestInputSteps(params)
+            guard let store = self?.context?.botStore else { throw BotStoreError.notFound }
+            let resourceID = try store.guestResourceID(botID: id)
             Task { @MainActor [weak self, service] in
                 do {
                     let evidence = try await Task.detached { [service] in
-                        try service.act(botID: id, steps: steps)
-                        return try service.remoteFrame(botID: id)
+                        try service.act(botID: resourceID, steps: steps)
+                        return try service.remoteFrame(botID: resourceID)
                     }.value
                     var readback = Self.guestFrameReadback(context: context, evidence: evidence)
                     readback["last_request_id"] = requestID
@@ -4517,9 +4533,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 guard let service = self?.botsViewModel?.computerGuestService else {
                     throw BotRemoteControlAuthority.Error(code: -32091, message: "Bot guest is unavailable.")
                 }
+                guard let store = self?.context?.botStore else { throw BotStoreError.notFound }
+                let resourceID = try store.guestResourceID(botID: botID)
                 // One screenshot attempt: an observing viewer must not wait out the start retries.
                 return try await Task.detached(priority: .userInitiated) { [service] in
-                    let evidence = try service.remoteFrame(botID: botID, attempts: 1)
+                    let evidence = try service.remoteFrame(botID: resourceID, attempts: 1)
                     return BotRemoteControlAuthority.ObservedGuestFrame(
                         containerID: evidence.containerID,
                         viewerPath: evidence.viewerPath,
@@ -4532,8 +4550,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             },
             isContainerRunning: { [weak self] botID in
                 guard let service = self?.botsViewModel?.computerGuestService else { return false }
+                guard let resourceID = try? self?.context?.botStore.guestResourceID(botID: botID) else { return false }
                 return await Task.detached(priority: .userInitiated) { [service] in
-                    service.isContainerRunning(botID: botID)
+                    service.isContainerRunning(botID: resourceID)
                 }.value
             },
             onStopped: { [weak self] botID, hostID in
@@ -4705,8 +4724,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         Task { @MainActor [weak self, service] in
             do {
+                guard let resourceID = try self?.context?.botStore.guestResourceID(botID: botID) else { throw BotStoreError.notFound }
                 let evidence = try await Task.detached { [service] in
-                    try service.remoteFrame(botID: botID, ready: ready)
+                    try service.remoteFrame(botID: resourceID, ready: ready)
                 }.value
                 var readback = Self.guestFrameReadback(context: context, evidence: evidence)
                 readback["last_request_id"] = requestID
@@ -9280,12 +9300,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     /// Which executor serves this bot's browser. Same desktop-kind lookup as
     /// reconcileBotComputerActions; no published revision resolves to refused.
-    private func botBrowserRoute(botID: BotID) throws -> BotBrowserRoute {
+    private func botBrowserRoute(botID: BotID, threadID: AgentThreadID? = nil) throws -> BotBrowserRoute {
         guard let ctx = context,
               let bot = try ctx.botStore.get(id: botID),
               let revisionID = bot.currentRevisionID,
               let revision = try ctx.botStore.getRevision(id: revisionID) else {
             return .refused(BotBrowserRoute.refusedMessage)
+        }
+        if let threadID, let destination = try ctx.botStore.threadExecutionDestination(threadID) {
+            if destination.target == .vm { return .playwrightGuest }
+            if revision.desktopKind == .dockerDesktop { return .refused(BotBrowserRoute.refusedMessage) }
         }
         return BotBrowserRoute.forPublished(revision.desktopKind)
     }
@@ -9293,7 +9317,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Docker route only: resume-or-create the bot's guest before the bridge
     /// spawns `docker exec`. Built like reconcileBotComputerActions builds it.
     /// Returned closure runs OFF-main (docker CLI work must never block MainActor).
-    private func botBrowserGuestEnsure(route: BotBrowserRoute, botID: BotID, appSupport: URL) -> (@Sendable () throws -> Void)? {
+    private func botBrowserGuestEnsure(route: BotBrowserRoute, botID: BotID, appSupport: URL, resourceID: BotID? = nil, threadID: AgentThreadID? = nil) -> (@Sendable () throws -> Void)? {
         guard route == .playwrightGuest else { return nil }
         if let fake = botBrowserGuestEnsureForTesting {
             return { try fake(botID) }
@@ -9303,19 +9327,33 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             docker: BotComputerDockerCLI(),
             recipeContext: AppShellResourceBundle.computerGuestRecipeURL()
         )
-        return { _ = try service.provision(botID: botID) }
+        return {
+            let resource = resourceID ?? botID
+            if let holder = BotVMRunRegistry.shared.active(botID: resource) {
+                guard holder.threadID == threadID else {
+                    throw BotComputerError.invalid("The VM is busy in \(holder.title)")
+                }
+                if service.isContainerRunning(botID: resource) { return }
+            }
+            _ = try service.provision(botID: resource, requestingThreadID: threadID)
+        }
     }
 
     private func scheduleBotBrowserBridgeNavigate(botID: BotID, route: BotBrowserRoute, target: BotBrowserTarget) {
         guard let ctx = context else { return }
         let appSupport = ctx.appSupportDirectory
         let bridge = botBrowserBridge
-        let ensureGuest = botBrowserGuestEnsure(route: route, botID: botID, appSupport: appSupport)
+        let resourceID: BotID
+        do { resourceID = route == .playwrightGuest ? try ctx.botStore.guestResourceID(botID: botID) : botID }
+        catch { return }
+        let mirroredBots = route == .playwrightGuest
+            ? ((try? ctx.botStore.list()) ?? []).filter { (try? ctx.botStore.guestResourceID(botID: $0.id)) == resourceID }.map(\.id) : []
+        let ensureGuest = botBrowserGuestEnsure(route: route, botID: botID, appSupport: appSupport, resourceID: resourceID)
         Task.detached(priority: .utility) {
             do {
                 try ensureGuest?()
                 let payload = try bridge.perform(
-                    botID: botID,
+                    botID: resourceID,
                     route: route,
                     kind: BotBrowserCatalog.open,
                     action: "",
@@ -9324,7 +9362,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     url: target.url,
                     appSupport: appSupport
                 )
-                Self.persistBotBrowserBridgePageState(payload: payload, botID: botID, appSupport: appSupport)
+                Self.persistBotBrowserBridgePageState(payload: payload, botID: botID, appSupport: appSupport, mirroredBots: mirroredBots)
             } catch {
                 NSLog(
                     "RemoteCode bot browser navigate failed bot=%@ error=%@",
@@ -9341,14 +9379,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     nonisolated private static func persistBotBrowserBridgePageState(
         payload: [String: Any],
         botID: BotID,
-        appSupport: URL
+        appSupport: URL,
+        mirroredBots: [BotID] = []
     ) {
         let url = payload["url"] as? String ?? ""
         guard !url.isEmpty else { return }
         let title = payload["title"] as? String ?? ""
         let store = BotBrowserStore(appSupportDirectory: appSupport)
-        try? store.persistTarget(BotBrowserTarget(url: url, title: title), botID: botID)
-        let cookies = (try? store.readWebsiteData(botID: botID)) ?? [:]
+        for destinationBot in Set(mirroredBots + [botID]) {
+        try? store.persistTarget(BotBrowserTarget(url: url, title: title), botID: destinationBot)
+        let cookies = (try? store.readWebsiteData(botID: destinationBot)) ?? [:]
         try? store.persistPageState(
             BotBrowserPageState(
                 url: url,
@@ -9356,8 +9396,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 cookies: cookies,
                 loading: payload["loading"] as? Bool
             ),
-            botID: botID
+            botID: destinationBot
         )
+        EventBus.shared.publish(kind: .botBrowserUpdated, payload: .object([
+            "bot_id": .string(destinationBot.value.uuidString.lowercased()),
+            "url": .string(url), "title": .string(title), "method": .string("browser.state")
+        ]))
+        }
     }
 
     /// Drain MCP pending open/snapshot/act/state commands onto this bot's
@@ -9399,10 +9444,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context else {
             throw BotBrowserError.invalid("Bot browser is not available. Keep the MacCode app running and try again.")
         }
-        if action.kind == BotBrowserCatalog.act, botComputerControl.isControlledByUser(botID) {
+        let threadID = action.threadID.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
+        let resourceID = try ctx.botStore.guestResourceID(botID: botID, threadID: threadID)
+        if let holder = BotVMRunRegistry.shared.active(botID: resourceID), holder.threadID != threadID {
+            throw BotBrowserError.invalid("The VM is busy in \(holder.title)")
+        }
+        if action.kind == BotBrowserCatalog.act, botComputerControl.isControlledByUser(botID, resourceID: resourceID) {
             return Self.botBrowserRefusalPayload
         }
-        let route = try botBrowserRoute(botID: botID)
+        let route = try botBrowserRoute(botID: botID, threadID: threadID)
         if case .refused(let message) = route {
             throw BotBrowserError.invalid(message)
         }
@@ -9438,7 +9488,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 .persistNavigation(url: action.url, title: action.title.isEmpty ? nil : action.title)
         }
         let bridge = botBrowserBridge
-        let ensureGuest = botBrowserGuestEnsure(route: route, botID: botID, appSupport: appSupport)
+        let mirroredBots = route == .playwrightGuest
+            ? ((try? ctx.botStore.list()) ?? []).filter { (try? ctx.botStore.guestResourceID(botID: $0.id)) == resourceID }.map(\.id) : []
+        let ensureGuest = botBrowserGuestEnsure(route: route, botID: botID, appSupport: appSupport, resourceID: resourceID, threadID: threadID)
         let control = botComputerControl
         let beforeAct = botBrowserBeforeBridgeActForTesting
         // Guest provisioning (docker CLI) and child-process IO must never run
@@ -9449,12 +9501,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     try ensureGuest?()
                     beforeAct?()
                     // Provisioning can take seconds; the user may have taken control meanwhile.
-                    if action.kind == BotBrowserCatalog.act, control.isControlledByUser(botID) {
+                    if action.kind == BotBrowserCatalog.act, control.isControlledByUser(botID, resourceID: resourceID) {
                         continuation.resume(returning: Self.botBrowserRefusalPayload)
                         return
                     }
                     let payload = try bridge.perform(
-                        botID: botID,
+                        botID: route == .playwrightGuest ? resourceID : botID,
                         route: route,
                         kind: action.kind,
                         action: action.action,
@@ -9463,7 +9515,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         url: action.url,
                         appSupport: appSupport
                     )
-                    Self.persistBotBrowserBridgePageState(payload: payload, botID: botID, appSupport: appSupport)
+                    Self.persistBotBrowserBridgePageState(payload: payload, botID: botID, appSupport: appSupport, mirroredBots: mirroredBots)
                     let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
                     continuation.resume(returning: String(data: data, encoding: .utf8) ?? "{}")
                 } catch {
@@ -9525,13 +9577,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     throw BotComputerError.invalid("Invalid bot id.")
                 }
                 let botID = BotID(uuid)
+                let threadID = action.threadID.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
+                let pinnedVM = try threadID.flatMap { try botStore.threadExecutionDestination($0) }?.target == .vm
                 guard let bot = try botStore.get(id: botID),
                       let revisionID = bot.currentRevisionID,
                       let revision = try botStore.getRevision(id: revisionID),
-                      BotDesktopAdmission.forPublished(revision.desktopKind).allowsGuestComputer else {
+                      pinnedVM || BotDesktopAdmission.forPublished(revision.desktopKind).allowsGuestComputer else {
                     throw BotComputerError.notDockerDesktop
                 }
-                let result = try service.apply(action)
+                let resourceID = try botStore.guestResourceID(botID: botID, threadID: threadID)
+                let result = try service.apply(action, resourceID: resourceID)
                 if result["refusal"] == nil {
                     switch action.kind {
                     case BotComputerCatalog.act: onGuestStep(botID, "act")

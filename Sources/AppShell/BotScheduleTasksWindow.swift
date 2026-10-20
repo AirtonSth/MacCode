@@ -1,5 +1,6 @@
 import CoreModel
 import DesignSystemKit
+import Persistence
 import Surfaces
 import SwiftUI
 
@@ -227,6 +228,8 @@ public struct BotScheduleTasksRootView: View {
                 bots: vm.fleet,
                 providers: vm.providers,
                 providersLoading: false,
+                destinationStore: vm.executionDestinationStore,
+                workspaces: vm.executionWorkspaces,
                 onBack: { vm.scheduleTaskDraft = nil },
                 onSave: { vm.saveScheduleTask($0) }
             )
@@ -314,6 +317,8 @@ struct BotScheduleTaskEditorView: View {
     let bots: [BotDefinition]
     let providers: [AgentProviderSnapshot]
     let providersLoading: Bool
+    let destinationStore: BotStore
+    let workspaces: [Workspace]
     let onBack: () -> Void
     let onSave: (BotScheduleTaskDraft) -> Void
 
@@ -322,6 +327,8 @@ struct BotScheduleTaskEditorView: View {
         bots: [BotDefinition],
         providers: [AgentProviderSnapshot],
         providersLoading: Bool,
+        destinationStore: BotStore,
+        workspaces: [Workspace],
         onBack: @escaping () -> Void,
         onSave: @escaping (BotScheduleTaskDraft) -> Void
     ) {
@@ -329,6 +336,8 @@ struct BotScheduleTaskEditorView: View {
         self.bots = bots
         self.providers = providers
         self.providersLoading = providersLoading
+        self.destinationStore = destinationStore
+        self.workspaces = workspaces
         self.onBack = onBack
         self.onSave = onSave
     }
@@ -399,6 +408,18 @@ struct BotScheduleTaskEditorView: View {
                             ),
                             identifierPrefix: "bots.scheduleTasks.editor"
                         )
+                    }
+                    labeled("Execution") {
+                        Toggle("Use bot default", isOn: Binding(
+                            get: { draft.spec.executionDestination == nil },
+                            set: { draft.spec.executionDestination = $0 ? nil : ((try? destinationStore.executionDestination(botID: draft.botID)) ?? .mac) }
+                        ))
+                        if draft.spec.executionDestination != nil {
+                            BotExecutionDestinationPicker(selection: Binding(
+                                get: { draft.spec.executionDestination ?? .mac },
+                                set: { draft.spec.executionDestination = $0 }
+                            ), bot: bots.first { $0.id == draft.botID }, store: destinationStore, workspaces: workspaces)
+                        }
                     }
                     Toggle("Active", isOn: $draft.isEnabled)
                         .accessibilityIdentifier("bots.scheduleTasks.editor.active")
@@ -757,6 +778,8 @@ struct BotScheduleTaskEditorScreen: View {
                 bots: vm.fleet,
                 providers: vm.providers,
                 providersLoading: false,
+                destinationStore: vm.executionDestinationStore,
+                workspaces: vm.executionWorkspaces,
                 onBack: { vm.scheduleTaskDraft = nil },
                 onSave: { vm.saveScheduleTask($0) }
             )

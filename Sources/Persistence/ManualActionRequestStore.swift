@@ -92,7 +92,7 @@ public final class ManualActionRequestStore: @unchecked Sendable {
     @discardableResult
     public func take(id: UUID, control: BotComputerControl) throws -> ManualActionRequest? {
         guard let taken = try take(id: id) else { return nil }
-        control.take(taken.botID)
+        control.take(taken.botID, threadID: taken.threadID)
         return taken
     }
 

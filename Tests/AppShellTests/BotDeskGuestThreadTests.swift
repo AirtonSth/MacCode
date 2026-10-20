@@ -322,9 +322,9 @@ final class BotDeskGuestThreadTests: XCTestCase {
 
         var workspaces: [String?] = []
         let gate = agent.botVMPreflight
-        agent.botVMPreflight = { botID, workspace in
+        agent.botVMPreflight = { botID, workspace, threadID in
             workspaces.append(workspace)
-            return await gate?(botID, workspace)
+            return await gate?(botID, workspace, threadID)
         }
         f.vm.dockerGuestReadyOverrideForTesting = true
         agent.prompt = "while up"

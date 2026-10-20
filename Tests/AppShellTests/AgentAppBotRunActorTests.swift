@@ -144,7 +144,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         f.vm.prompt = "second task"
         await f.vm.send()
         XCTAssertTrue(f.runner.requests.isEmpty, "no run while another thread holds the VM")
-        XCTAssertTrue(f.vm.statusMessage.contains("The bot is busy in Tarefa A"), f.vm.statusMessage)
+        XCTAssertTrue(f.vm.statusMessage.contains("The VM is busy in Tarefa A"), f.vm.statusMessage)
         XCTAssertEqual(BotVMRunRegistry.shared.waitingThreads(botID: f.bot.id), [f.thread.id])
         XCTAssertEqual(try f.ctx.queuedMessageRepo.list(threadId: f.thread.id).count, 1)
     }
@@ -430,7 +430,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         // the bot "busy" forever.
         let f = try makeFixture()
         f.vm.botExecutionTargetProvider = { _ in .vm }
-        f.vm.botVMPreflight = { _, _ in nil }
+        f.vm.botVMPreflight = { _, _, _ in nil }
         let compile = try XCTUnwrap(f.vm.botPromptTransform)
         var claimBeforeStart: BotVMRunRegistry.Entry?
         f.vm.botPromptTransform = { botID, text, threadID, runID in
@@ -460,7 +460,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         f.vm.botExecutionTargetProvider = { _ in .vm }
         let holder = otherThreadHolder(f, title: "Tarefa B")
         defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
-        f.vm.botVMPreflight = { botID, _ in
+        f.vm.botVMPreflight = { botID, _, _ in
             XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: botID, entry: holder))
             return nil
         }
@@ -468,7 +468,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         f.vm.prompt = "racing task"
         await f.vm.send()
         XCTAssertTrue(f.runner.requests.isEmpty, "no overlapping run on the VM")
-        XCTAssertTrue(f.vm.statusMessage.contains("The bot is busy in Tarefa B"), f.vm.statusMessage)
+        XCTAssertTrue(f.vm.statusMessage.contains("The VM is busy in Tarefa B"), f.vm.statusMessage)
         XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, holder.runID, "holder keeps the VM")
         XCTAssertEqual(BotVMRunRegistry.shared.waitingThreads(botID: f.bot.id), [f.thread.id])
         let queued = try f.ctx.queuedMessageRepo.list(threadId: f.thread.id)
@@ -495,7 +495,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         // the VM, or every other thread of the bot queues behind a run that never ran.
         let f = try makeFixture()
         f.vm.botExecutionTargetProvider = { _ in .vm }
-        f.vm.botVMPreflight = { _, _ in nil }
+        f.vm.botVMPreflight = { _, _, _ in nil }
         var claimDuringStart: BotVMRunRegistry.Entry?
         f.vm.botPromptTransform = { botID, _, _, _ in
             claimDuringStart = BotVMRunRegistry.shared.active(botID: botID)
@@ -531,7 +531,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertTrue(f.runner.requests.isEmpty, "no overlapping run on the VM")
         XCTAssertEqual(BotVMRunRegistry.shared.waitingThreads(botID: f.bot.id), [f.thread.id])
         XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id)?.runID, holder.runID)
-        XCTAssertTrue(f.vm.statusMessage.contains("The bot is busy in Tarefa A"), f.vm.statusMessage)
+        XCTAssertTrue(f.vm.statusMessage.contains("The VM is busy in Tarefa A"), f.vm.statusMessage)
         let queued = try f.ctx.queuedMessageRepo.list(threadId: f.thread.id)
         XCTAssertEqual(queued.map(\.text), ["router task"])
         XCTAssertEqual(queued.first?.durableState, .queued, "the drain left it queued, not prepared")
@@ -591,7 +591,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
             )
             XCTFail("a compiled send to a busy VM must be refused")
         } catch {
-            XCTAssertEqual(String(describing: error), "The bot is busy in Tarefa A", "the desk shows the notice")
+            XCTAssertEqual(String(describing: error), "The VM is busy in Tarefa A", "the desk shows the notice")
         }
         try await Task.sleep(nanoseconds: 200_000_000)
         XCTAssertTrue(f.runner.requests.isEmpty, "no overlapping run on the VM")
@@ -646,7 +646,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         let holder = otherThreadHolder(f, title: "Tarefa B")
         defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
         let vm = f.vm
-        vm.botVMPreflight = { botID, _ in
+        vm.botVMPreflight = { botID, _, _ in
             XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: botID, entry: holder))
             vm.selectThread(other.id)
             vm.prompt = "draft on the other thread"
@@ -663,7 +663,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertNil(storedOther.actorLockedAt, "the other thread is not locked to the bot")
         XCTAssertEqual(vm.prompt, "draft on the other thread", "the other thread's draft is untouched")
         XCTAssertEqual(BotVMRunRegistry.shared.waitingThreads(botID: f.bot.id), [f.thread.id])
-        XCTAssertFalse(vm.statusMessage.contains("The bot is busy"), "the notice is not painted on the other thread")
+        XCTAssertFalse(vm.statusMessage.contains("The VM is busy"), "the notice is not painted on the other thread")
         let storedSent = try XCTUnwrap(try f.ctx.threadRepo.get(id: f.thread.id))
         XCTAssertEqual(storedSent.actor, .bot(f.bot.id), "the sent thread is the one locked to the bot")
     }
@@ -698,7 +698,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertEqual(wait["bot_id"]?.stringValue, f.bot.id.value.uuidString)
         XCTAssertEqual(wait["holder_thread_id"]?.stringValue, holder.threadID.value.uuidString)
         XCTAssertEqual(wait["holder_title"]?.stringValue, "Tarefa A")
-        XCTAssertEqual(wait["notice"]?.stringValue, "The bot is busy in Tarefa A")
+        XCTAssertEqual(wait["notice"]?.stringValue, "The VM is busy in Tarefa A")
 
         f.router.releaseBotVMRun(holder.runID)
         let started = await waitUntil { f.runner.requests.count == 1 }

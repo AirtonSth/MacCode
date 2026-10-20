@@ -4,6 +4,54 @@ import Persistence
 @testable import AppShell
 
 final class BotContextDockerProbeTests: XCTestCase {
+    func test_liveSharedVMKeepsFilesAcrossBotsAndRejectsStopDuringRun() throws {
+        guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {
+            throw XCTSkip("set RC_LIVE_DOCKER=1 for the shared VM probe")
+        }
+        let docker = BotComputerDockerCLI()
+        guard try docker.imageExists(tag: BotComputerGuestSpec.imageTag),
+              try docker.imageLabel(tag: BotComputerGuestSpec.imageTag, key: BotComputerGuestSpec.recipeLabelKey) == BotComputerGuestSpec.recipeRevision else {
+            throw XCTSkip("the existing matching guest image is required")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("shared-vm-probe-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let db = try SQLiteDB(path: root.appendingPathComponent("probe.sqlite").path)
+        try Schema.migrate(db)
+        let store = BotStore(db: db)
+        let a = try store.create(name: "A", title: "A", description: "", handle: "probe-a", soul: "")
+        let b = try store.create(name: "B", title: "B", description: "", handle: "probe-b", soul: "")
+        let machine = try store.saveVirtualMachine(name: "Shared probe")
+        for bot in [a, b] { try store.setExecutionDestination(.virtualMachine(machine.id), botID: bot.id) }
+        let resourceA = try store.guestResourceID(botID: a.id)
+        let resourceB = try store.guestResourceID(botID: b.id)
+        XCTAssertEqual(resourceA, resourceB)
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(appSupport: root, docker: docker, vmRuns: registry)
+        let name = BotComputerGuestSpec.containerName(botID: resourceA)
+        print("Shared VM probe owns \(name)")
+        defer {
+            do {
+                try service.removeGuestRuntime(botID: resourceA)
+                XCTAssertFalse(try docker.containerExists(name: name))
+                XCTAssertFalse(try docker.networkExists(name: BotComputerGuestSpec.networkName(botID: resourceA)))
+                try FileManager.default.removeItem(at: root)
+            } catch { XCTFail("Shared VM probe cleanup failed: \(error)") }
+        }
+        let ready = try service.provision(botID: resourceA)
+        XCTAssertFalse(ready.capturedPNG.isEmpty)
+        _ = try service.exec(botID: resourceA, command: "printf shared-proof > /home/remotecode/shared-proof.txt")
+        let resumed = try service.provision(botID: resourceB)
+        XCTAssertEqual(ready.containerID, resumed.containerID)
+        XCTAssertEqual(String(decoding: try service.exec(botID: resourceB, command: "cat /home/remotecode/shared-proof.txt"), as: UTF8.self), "shared-proof")
+        let run = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Bot A", workspace: "/home/remotecode")
+        XCTAssertNil(registry.tryBegin(botID: a.id, entry: run, resourceID: resourceA))
+        XCTAssertThrowsError(try service.stop(botID: resourceB))
+        XCTAssertTrue(service.isContainerRunning(botID: resourceA))
+        _ = registry.releaseAndNextWaiter(runID: run.runID)
+        try service.stop(botID: resourceB)
+        XCTAssertFalse(service.isContainerRunning(botID: resourceA))
+    }
+
     func test_liveContextualRuntimesSeparateFilesAndHomes() async throws {
         guard ProcessInfo.processInfo.environment["RC_LIVE_DOCKER"] == "1" else {
             throw XCTSkip("set RC_LIVE_DOCKER=1 for the real contextual runtime probe")

@@ -10,6 +10,7 @@ enum BotContextSessionStore {
         let threadID: AgentThreadID
         let parentRunID: AgentRunID?
         let cwd: String
+        var virtualMachineID: UUID? = nil
         var providerSessionID: String?
     }
 
@@ -17,8 +18,8 @@ enum BotContextSessionStore {
         ".distill-context-session-\(pin.conversationID.value.uuidString.lowercased())"
     }
 
-    private static func identity(for pin: BotConversationContextPin) throws -> BotContextRuntimeIdentity {
-        try BotContextRuntimeIdentity(hostID: pin.hostID, botID: pin.botID, context: pin.context, policyRevision: pin.policyRevision)
+    private static func identity(for pin: BotConversationContextPin, virtualMachineID: UUID?) throws -> BotContextRuntimeIdentity {
+        try BotContextRuntimeIdentity(hostID: pin.hostID, botID: pin.botID, context: pin.context, policyRevision: pin.policyRevision, virtualMachineID: virtualMachineID)
     }
 
     private static func isMissing(_ error: Error) -> Bool {
@@ -33,10 +34,11 @@ enum BotContextSessionStore {
         cwd: String,
         resumeCursor: String?,
         appSupport: URL,
-        authorizes: @Sendable () -> Bool
+        authorizes: @Sendable () -> Bool,
+        virtualMachineID: UUID? = nil
     ) throws {
         guard authorizes() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
-        let storageBotID = try identity(for: pin).storageBotID
+        let storageBotID = try identity(for: pin, virtualMachineID: virtualMachineID).storageBotID
         let name = directoryName(pin: pin)
         let homeURL = BotComputerGuestSpec.guestHomeURL(appSupport: appSupport, botID: storageBotID)
         let home: PrivateDirectory?
@@ -70,7 +72,7 @@ enum BotContextSessionStore {
         }
         guard let data = scope?.read(filename),
               let binding = try? JSONDecoder().decode(Binding.self, from: data),
-              binding.version == 1, binding.pin == pin,
+              binding.version == 1, binding.virtualMachineID == virtualMachineID, binding.pin == pin,
               binding.threadID == threadID, binding.parentRunID == parentRunID,
               binding.cwd == cwd, binding.providerSessionID == resumeCursor,
               homeExists || (resumeCursor == nil && binding.providerSessionID == nil) else {
@@ -86,11 +88,12 @@ enum BotContextSessionStore {
         cwd: String,
         resumeCursor: String?,
         appSupport: URL,
-        authorizes: @Sendable () -> Bool
+        authorizes: @Sendable () -> Bool,
+        virtualMachineID: UUID? = nil
     ) throws -> URL {
-        try validate(pin: pin, threadID: threadID, parentRunID: parentRunID, cwd: cwd, resumeCursor: resumeCursor, appSupport: appSupport, authorizes: authorizes)
+        try validate(pin: pin, threadID: threadID, parentRunID: parentRunID, cwd: cwd, resumeCursor: resumeCursor, appSupport: appSupport, authorizes: authorizes, virtualMachineID: virtualMachineID)
         guard authorizes() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
-        let storageBotID = try identity(for: pin).storageBotID
+        let storageBotID = try identity(for: pin, virtualMachineID: virtualMachineID).storageBotID
         let support = try PrivateDirectory(appSupport, create: false)
         defer { support.close() }
         let root = try support.child("bot-context-sessions", create: true)
@@ -104,13 +107,13 @@ enum BotContextSessionStore {
         if !metadataExists {
             guard resumeCursor == nil else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
             guard authorizes() else { throw BotComputerGuestServiceError.contextualRuntimeUnavailable }
-            let binding = Binding(version: 1, pin: pin, threadID: threadID, parentRunID: parentRunID, cwd: cwd, providerSessionID: nil)
+            let binding = Binding(version: 1, pin: pin, threadID: threadID, parentRunID: parentRunID, cwd: cwd, virtualMachineID: virtualMachineID, providerSessionID: nil)
             try scope.writeAtomically(JSONEncoder().encode(binding), to: filename)
             try scope.synchronize()
         } else {
             guard let data = scope.read(filename),
                   let binding = try? JSONDecoder().decode(Binding.self, from: data),
-                  binding.version == 1, binding.pin == pin, binding.threadID == threadID,
+                  binding.version == 1, binding.virtualMachineID == virtualMachineID, binding.pin == pin, binding.threadID == threadID,
                   binding.parentRunID == parentRunID, binding.cwd == cwd,
                   binding.providerSessionID == resumeCursor else {
                 throw BotComputerGuestServiceError.contextualRuntimeUnavailable
@@ -124,7 +127,7 @@ enum BotContextSessionStore {
         defer { guestHome.close() }
         try guestHome.synchronize()
         try home.synchronize()
-        try validate(pin: pin, threadID: threadID, parentRunID: parentRunID, cwd: cwd, resumeCursor: resumeCursor, appSupport: appSupport, authorizes: authorizes)
+        try validate(pin: pin, threadID: threadID, parentRunID: parentRunID, cwd: cwd, resumeCursor: resumeCursor, appSupport: appSupport, authorizes: authorizes, virtualMachineID: virtualMachineID)
         return homeURL.appendingPathComponent(directoryName(pin: pin), isDirectory: true)
     }
 
@@ -136,15 +139,16 @@ enum BotContextSessionStore {
         cwd: String,
         expectedResumeCursor: String?,
         appSupport: URL,
-        authorizes: @Sendable () -> Bool
+        authorizes: @Sendable () -> Bool,
+        virtualMachineID: UUID? = nil
     ) throws {
         let trimmedID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedID.isEmpty, trimmedID == sessionID, sessionID.utf8.count <= 512,
               !sessionID.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains), authorizes() else {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
         }
-        try validate(pin: pin, threadID: threadID, parentRunID: parentRunID, cwd: cwd, resumeCursor: expectedResumeCursor, appSupport: appSupport, authorizes: authorizes)
-        let storageBotID = try identity(for: pin).storageBotID
+        try validate(pin: pin, threadID: threadID, parentRunID: parentRunID, cwd: cwd, resumeCursor: expectedResumeCursor, appSupport: appSupport, authorizes: authorizes, virtualMachineID: virtualMachineID)
+        let storageBotID = try identity(for: pin, virtualMachineID: virtualMachineID).storageBotID
         let support = try PrivateDirectory(appSupport, create: false)
         defer { support.close() }
         let root = try support.child("bot-context-sessions", create: false)
@@ -153,7 +157,7 @@ enum BotContextSessionStore {
         defer { scope.close() }
         let filename = pin.conversationID.value.uuidString.lowercased() + ".json"
         guard let data = scope.read(filename), var binding = try? JSONDecoder().decode(Binding.self, from: data),
-              binding.version == 1, binding.pin == pin, binding.threadID == threadID,
+              binding.version == 1, binding.virtualMachineID == virtualMachineID, binding.pin == pin, binding.threadID == threadID,
               binding.parentRunID == parentRunID, binding.cwd == cwd,
               binding.providerSessionID == expectedResumeCursor, authorizes() else {
             throw BotComputerGuestServiceError.contextualRuntimeUnavailable
