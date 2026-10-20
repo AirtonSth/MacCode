@@ -17978,6 +17978,65 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
+    func test_linkedDeskQueueDrainEventClearsDeskQueueRows_becauseDeskMustMirrorTabQueueSubscription() async throws {
+        // WHY: the embedded Desk VM has no tab subscription of its own. A host drain
+        // removes the queued row from the store; the Desk queue must learn from the
+        // EventBus lifecycle event instead of keeping the stale row until a reselect.
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let setupRunner = ControlledBotHandoffRunner(provider: .grok)
+        context.coordinator.replaceProvider(.grok, runner: setupRunner)
+        router.rememberProviderSnapshotsForSend([
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .grok,
+                models: [AgentModelDescriptor(id: "grok-4.6", label: "Grok 4.6", provider: .grok)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                id: "grok"
+            ),
+        ])
+        let vm = BotsViewModel(context: context, router: router)
+        let bot = try vm.create(name: "Piper", title: "Scout", provider: .grok, model: "grok-4.6")
+        vm.openDesk(bot)
+        vm.setDeskProvider(.grok, instanceID: "grok")
+        vm.setDeskModel("grok-4.6")
+        XCTAssertTrue(vm.createDeskThread())
+        let threadID = try await linkDeskThreadByFirstSend(
+            vm, context: context, router: router, providerAlreadyInstalled: true
+        )
+        let setupReachedFake = await waitUntil(timeout: 5) { setupRunner.requests.count == 1 }
+        XCTAssertTrue(setupReachedFake, "setup first-send must reach configured Grok fake")
+        XCTAssertTrue(setupRunner.finish(promptContaining: "hello", reply: "setup complete"))
+        let firstRunSettled = await waitUntil(timeout: 5) {
+            context.coordinator.activeRunId(threadId: threadID) == nil && !vm.deskSendInFlight
+        }
+        XCTAssertTrue(firstRunSettled, "the setup run must finish before queueing")
+
+        _ = try context.queuedMessageRepo.enqueue(
+            threadId: threadID,
+            text: "drained by host",
+            attachments: [],
+            interactionMode: .default
+        )
+        let deskAgent = try XCTUnwrap(vm.deskAgentVM)
+        deskAgent.reloadQueuedMessages()
+        let queued = try XCTUnwrap(deskAgent.queuedMessages.first)
+
+        // Drain the row the way the host does: claim, prepare, dispatch, acknowledge.
+        let lease = try XCTUnwrap(try context.queuedMessageRepo.claimFirst(threadId: threadID))
+        let dispatchRunId = AgentRunID()
+        XCTAssertTrue(try context.queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId))
+        XCTAssertTrue(try context.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId))
+        _ = try context.queuedMessageRepo.acknowledge(lease)
+        XCTAssertTrue(try context.queuedMessageRepo.list(threadId: threadID).isEmpty)
+        router.publishQueuedMessage(kind: AgentQueueEventKinds.drained, queued)
+
+        let cleared = await waitUntil(timeout: 5) { deskAgent.queuedMessages.isEmpty }
+        XCTAssertTrue(cleared, "the Desk queue must drop the drained row on the drain event")
+        XCTAssertNil(deskAgent.queueStatusMessage)
+    }
+
     func test_openingUnlinkedConversationDoesNotMarkItStarted_becauseViewingIsNotSending() async throws {
         // WHY: lastStartedConversationByBot drives "the bot just ran" bookkeeping
         // and must only move on a real send, never on viewing.

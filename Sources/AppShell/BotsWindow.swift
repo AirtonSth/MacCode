@@ -10700,6 +10700,7 @@ public final class BotsViewModel: ObservableObject {
     /// The embedded desk thread's placement, for `deskRuntimeLabel`.
     @Published private var deskThreadRuntime: DeskThreadRuntime?
     private var deskThreadRuntimeObservation: AnyCancellable?
+    private var deskQueueSubscription: UUID?
     private var isSyncingDeskAgent = false
     private var pendingDeskReceipts: [AgentRunID: ContextAssemblyReceipt] = [:]
 
@@ -10891,6 +10892,16 @@ public final class BotsViewModel: ObservableObject {
         vm.refreshProviderSnapshotsInBackground()
         deskAgentKey = key
         deskAgentVM = vm
+        deskQueueSubscription = EventBus.shared.subscribeFromCurrent(filter: .agentThreadAndQueue) { [weak vm] event in
+            let payload = event.payload.objectValue
+            guard let raw = payload?["thread_id"]?.stringValue,
+                  UUID(uuidString: raw) == threadID.value else { return }
+            DispatchQueue.main.async {
+                guard let vm else { return }
+                vm.handleQueueLifecycleEvent(kind: event.kind, threadId: raw, message: payload?["message"]?.stringValue)
+                vm.reloadQueuedMessages()
+            }
+        }.id
         observeDeskThreadRuntime(threadID, in: vm, row: thread)
         lastDeskAgentSyncThreadReadCountForTesting =
             context.threadRepo.durableGetCountForTesting - threadReadsBefore
@@ -11088,6 +11099,10 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private func tearDownDeskAgentVM() {
+        if let id = deskQueueSubscription {
+            EventBus.shared.unsubscribe(id)
+            deskQueueSubscription = nil
+        }
         deskThreadRuntimeObservation = nil
         deskAgentKey = nil
         guard let vm = deskAgentVM else { return }

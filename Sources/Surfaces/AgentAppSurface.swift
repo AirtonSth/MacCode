@@ -11202,6 +11202,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         persisted: (try? self.coordinator.runStartedAt(threadId: threadId)) ?? (try? self.coordinator.runStartedAt(runId: runId))
                     )
                     self.isStopping = false  // UX-MAC_AGENT-STOP: new run started; clear any stale stopping flag
+                    // Host-started runs (queue drain, Force, mirror send) persist
+                    // their user row before going live; show it now, not at run end.
+                    if !self.messages.contains(where: { $0.id == AgentMessageID(runId.value) }) {
+                        self.loadAllMessages(threadId)
+                    }
                 } else if Self.isTerminalRunStatus(status) {
                     // Always record the terminal runId so late stream events cannot
                     // re-inflate runThreads / Working after cancel/complete (ghost

@@ -3463,6 +3463,45 @@ final class AgentAppViewModelTests: XCTestCase {
         }
     }
 
+    func test_hostStartedRunShowsDurableUserRowWithoutWaitingForRunEnd() async throws {
+        // WHY: a queue drain or Force starts the run from the host; the user row is
+        // persisted before the run goes live. The transcript must show it at run start,
+        // not only when the run ends, or the started follow-up looks lost.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-host-start-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providers: [.codex: SlowStartRunner()])
+        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
+                                   coordinator: coord,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   queuedMessageRepo: queuedRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db))
+        installRunnableProviderFixtures(on: vm)
+        vm.createThread(title: "host started")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        // Let selection's own message load finish before the row exists, so
+        // only the running-status path can pull it into the transcript.
+        await vm.waitForMessageHistoryLoad()
+        let runId = AgentRunID()
+        try messageRepo.append(AgentMessage(id: AgentMessageID(runId.value), threadId: id,
+                                            role: .user, content: "drained follow-up"))
+        XCTAssertFalse(vm.messages.contains { $0.content == "drained follow-up" })
+
+        vm.runCoordinator(coord, didChangeStatus: .running, runId: runId, threadId: id)
+
+        await waitAsync("host-started user row reaches the transcript before run end") {
+            vm.messages.contains { $0.content == "drained follow-up" }
+        }
+        XCTAssertTrue(vm.messages.contains { $0.content == "drained follow-up" },
+                      "the host-started user row must render at run start")
+    }
+
     func test_mergeLoadedMessagesPreservesInMemoryUserMirror() {
         // WHY: concurrent same-thread reloads must not drop the optimistic user
         // bubble before the coordinator has persisted the durable run-id row.
