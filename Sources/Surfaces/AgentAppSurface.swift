@@ -6860,13 +6860,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             latestHiddenTimeline = hidden
             return
         }
-        if resetTimeline {
-            timeline = AssistantTimelineState()
-        }
+        let protectedIDs = protectedTranscriptTurnIDs
+        var next = resetTimeline ? AssistantTimelineState() : timeline
         for event in events {
-            timeline.apply(event)
+            next.apply(event)
         }
-        timeline.enforceAggregateHotTextBudget(protectedTurnIDs: protectedTranscriptTurnIDs)
+        if resetTimeline {
+            next.retainMissingTurns(from: timeline, protectedTurnIDs: protectedIDs)
+        }
+        next.enforceAggregateHotTextBudget(protectedTurnIDs: protectedIDs)
+        timeline = next
     }
 
     public var executionLocked: Bool { providerLocked || selectedThreadRunIsStartingOrRunning }
