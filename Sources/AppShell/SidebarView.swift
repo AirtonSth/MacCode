@@ -1174,8 +1174,10 @@ public final class SidebarViewModel: ObservableObject {
         guard let router else { return }
         do {
             switch try router.agentThreadOpenDestination(row.threadID) {
-            case .bot, .workspace:
-                // Every row here belongs to this workspace, Bot threads included: open it as a tab.
+            case .bot(let botID, let conversationID):
+                // Bot threads open in the Bot's own Desk, not as an Agent App tab.
+                _ = try router.openBotsDesk(botID: botID, conversationID: conversationID)
+            case .workspace:
                 _ = try router.openAgentThread(thread: row.threadID, markRead: false)
             case .unavailable:
                 showOperationError("Could not open conversation", detail: "This conversation is no longer available.")
