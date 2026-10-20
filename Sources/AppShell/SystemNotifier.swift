@@ -169,6 +169,10 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
                 options: []
             ),
             UNNotificationCategory(
+                identifier: RemoteCodeNotificationContent.titioQuestionCategoryIdentifier,
+                actions: [open], intentIdentifiers: [], options: []
+            ),
+            UNNotificationCategory(
                 identifier: RemoteCodeNotificationContent.titioNoticeCategoryIdentifier,
                 actions: [open],
                 intentIdentifiers: [],

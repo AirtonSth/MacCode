@@ -1448,6 +1448,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 // bot.guest.state observe:true (rate-limited fresh frame),
                 // controlled_by_user, bot.guest.control take|release and
                 // bot.guest.updated reason "agent_step".
+                "notice_reply_v1": true,
                 "guest_observe_v1": true
             ],
             "git": [

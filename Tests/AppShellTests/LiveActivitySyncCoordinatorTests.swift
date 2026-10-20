@@ -27,6 +27,30 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         })
     }
 
+    func testTitioInboxOwnsRunningPendingAndEndProjection() async {
+        let recorder = DeliveryRecorder()
+        let sync = LiveActivitySyncCoordinator(serverId: "host", bootEpoch: 1, initialActivityGeneration: 0,
+            deliver: { await recorder.append($0) }, heartbeatIntervalNanoseconds: 60_000_000_000_000)
+        var inbox = TitioInboxSnapshot(botID: BotID(), conversationID: BotConversationID(), threadID: AgentThreadID(),
+            unreadCount: 1, openDecisions: 1, lastPreview: "secret question", lastAt: Date())
+        sync.submitTitio(inbox)
+        sync.submitSurface(PetLiveActivityCopy.Output(title: "Other producer", statusLine: "Other status", preview: "Other preview", phase: .failed, activeThreadCount: 0))
+        sync.submit(active([("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000002")]), cause: .started)
+        inbox.openDecisions = 0
+        sync.submitTitio(inbox)
+        sync.submit(active([]), cause: .finished(.completed))
+        await sync.flush()
+        let deliveries = recorder.deliveries
+        XCTAssertEqual(deliveries.first?.event, .start)
+        XCTAssertEqual(deliveries.first?.projection.phase, .running)
+        XCTAssertEqual(deliveries.first?.projection.petState, "question")
+        XCTAssertEqual(deliveries.last?.event, .end, "a stale pet surface cannot keep Titio alive")
+        XCTAssertTrue(deliveries.allSatisfy { $0.projection.title == "Titio" })
+        XCTAssertTrue(deliveries.allSatisfy { $0.projection.threadId == inbox.threadID.value.uuidString })
+        XCTAssertTrue(deliveries.allSatisfy { !$0.projection.preview.contains("secret") && !$0.projection.preview.contains("Other") })
+        XCTAssertTrue(deliveries.contains { $0.projection.statusLine == "Following 1 run" })
+    }
+
     func testAggregateTransitionsUseOneGenerationAndMonotonicRevision() async {
         let recorder = DeliveryRecorder()
         let sync = LiveActivitySyncCoordinator(

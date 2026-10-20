@@ -83,6 +83,7 @@ public enum TitioNoticeStatus: Equatable, Sendable {
     case done
     /// The host action threw (not in the spec table; see `statusLine`).
     case failed
+    case unknownEffect
 
     /// Nil for `flap` (never posted) and `cleared` (the message is gone): nothing to rewrite.
     public init?(resolution: TitioNoticeResolution) {
@@ -95,6 +96,7 @@ public enum TitioNoticeStatus: Equatable, Sendable {
         case .elsewhere: self = .elsewhere
         case .expired: self = .expired
         case .failed: self = .failed
+        case .unknownEffect: self = .unknownEffect
         case .flap, .cleared: return nil
         }
     }
@@ -167,7 +169,7 @@ public enum TitioNoticeCopy {
             return TitioNoticeComposed(text: body, preview: itemPreview, cardOptions: nil, cardOwnerKey: nil)
         }
         let question = cardQuestion(for: item, language: language)
-        let block = choicesBlock(question: question, options: options.compactMap(\.label), notice: item.key)
+        let block = choicesBlock(question: question, options: options.compactMap(\.label), notice: item.key, source: sourceLabels(item.facts), canReply: actions.contains(.replyHere))
         return TitioNoticeComposed(text: body + "\n\n" + block, preview: itemPreview,
                                    cardOptions: options, cardOwnerKey: item.key)
     }
@@ -436,10 +438,17 @@ public enum TitioNoticeCopy {
         return result
     }
 
+    public static func sourceLabels(_ facts: TitioNoticeFacts) -> [String: String] {
+        ["workspace": facts.workspaceName, "bot": facts.botName, "conversation": facts.title]
+            .compactMapValues { $0 }
+    }
+
     /// The ```choices fence with `{"question","options","notice"}` (sorted keys, one line).
-    public static func choicesBlock(question: String?, options: [String], notice: String) -> String {
+    public static func choicesBlock(question: String?, options: [String], notice: String, source: [String: String] = [:], canReply: Bool = false) -> String {
         var object: [String: Any] = ["options": options, "notice": notice]
         if let question { object["question"] = question }
+        if !source.isEmpty { object["source"] = source }
+        if canReply { object["can_reply"] = true }
         let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data()
         return "```choices\n" + (String(data: data, encoding: .utf8) ?? "{}") + "\n```"
     }
@@ -471,7 +480,7 @@ public enum TitioNoticeCopy {
             let verb = approvalVerb(kind: f.requestKind, requestTitle: f.requestTitle, language: language)
             ask = verb + (approvalSnippet(f.detail).map { " (\(clip($0, max: 60)))" } ?? "") + "?"
         case .userInput, .botQuestion:
-            ask = clean(f.prompt ?? f.detail, max: 80) ?? generic
+            ask = (f.prompt ?? f.detail)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? generic
         default:
             ask = generic
         }
@@ -638,6 +647,7 @@ public enum TitioNoticeCopy {
         case .acknowledged: return pt ? "_Visto._" : "_Seen._"
         case .done: return pt ? "_Feito às \(time)._" : "_Done at \(time)._"
         case .failed: return pt ? "_Não deu certo; abra a conversa._" : "_Didn't go through; open the thread._"
+        case .unknownEffect: return pt ? "_Resultado não confirmado; confira a origem antes de tentar novamente._" : "_Outcome unconfirmed; check the source before trying again._"
         }
     }
 

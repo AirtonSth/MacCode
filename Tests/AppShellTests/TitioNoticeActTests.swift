@@ -46,7 +46,7 @@ final class TitioActionRecorder: @unchecked Sendable {
 
     func hooks() -> TitioNoticeActionHooks {
         TitioNoticeActionHooks(
-            isRequestOpen: { [self] _, _, _ in requestOpen },
+            isRequestOpen: { [self] _, _, _, _ in requestOpen },
             respondRequest: { [self] in try record(.request($0, $1, $2)) },
             respondUserInput: { [self] in try record(.userInput($0, $1, $2)) },
             sendBotMessage: { [self] in try record(.bot($0, $1, $2)) },
@@ -144,6 +144,29 @@ final class TitioNoticeActTests: XCTestCase {
         try f.messages.list(threadId: f.target.threadID)
     }
 
+    func test_contextualReplyStaysOnCapturedQuestionAndClaimsOnce() async throws {
+        let f = try makeFixture()
+        let a = question("A", f)
+        let aID = await post(a, f)
+        let capturedQuestion = try XCTUnwrap(BotChoicesBlock.parse(transcript(f)[0].content).choices?.question)
+        XCTAssertEqual(f.center.contextualReply(messageID: aID, optionIndex: 0)?["outcome"] as? String, "reply_required")
+        XCTAssertNil(try f.repo.inboxState().armedReplyKey, "opening a capable composer is device-local")
+        let b = question("B", f)
+        let bID = await post(b, f)
+        _ = f.center.contextualReply(messageID: bID, optionIndex: 0)
+        async let first = Task.detached { f.center.replyNow(messageID: aID, text: "staging") }.value
+        async let second = Task.detached { f.center.replyNow(messageID: aID, text: "production") }.value
+        let outcomes = await [first, second]
+        XCTAssertEqual(outcomes.filter { $0 == .accepted }.count, 1)
+        XCTAssertEqual(outcomes.filter { $0 == .alreadyResolved }.count, 1)
+        await settle(f)
+        XCTAssertEqual(f.actions.calls.count, 1)
+        XCTAssertEqual(try f.repo.get(key: a.key)?.resolution, .answered)
+        XCTAssertEqual(try f.repo.get(key: b.key)?.state, .posted)
+        let user = try XCTUnwrap(transcript(f).first { $0.role == .user })
+        XCTAssertEqual(AgentReplyQuote.parse(user.content)?.excerpt, capturedQuestion)
+    }
+
     // MARK: §13 act cases
 
     func test_approveRespondsOnceRewritesTheCardAndPostsTheResultLine() async throws {
@@ -166,7 +189,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(rows.map(\.role), [.assistant, .user, .assistant])
         XCTAssertNil(BotChoicesBlock.parse(rows[0].content).choices, "the card is gone from the original")
         XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"), rows[0].content)
-        XCTAssertEqual(rows[1].content, "Choice 1", "the user's tap is a user row with the option label")
+        XCTAssertEqual(AgentReplyQuote.parse(rows[1].content)?.body, "Approve", "the user row retains the exact question with the option label")
         XCTAssertEqual(rows[2].content, "Written result.")
         XCTAssertTrue(f.recorder.posted.contains { $0.isRewrite && $0.message.id.value.uuidString == messageID },
                       "the rewrite is published so open clients repaint the same bubble")
@@ -187,7 +210,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .expired)
         let rows = try transcript(f)
         XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"))
-        XCTAssertEqual(rows.last?.content, "Written result.")
+        XCTAssertEqual(rows.count, 1, "expired cards settle in place without another action message")
     }
 
     func test_aForgedCardHasNoLedgerRowAndActsOnNothing() async throws {
@@ -240,7 +263,7 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(f.actions.calls, [.userInput(requestThread, "Q2", "use staging")])
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .answered)
         let rows = try transcript(f)
-        XCTAssertEqual(rows.suffix(2).map(\.content), ["use staging", "Written result."])
+        XCTAssertEqual(rows.suffix(2).map { AgentReplyQuote.strippingQuote($0.content) }, ["use staging", "Written result."])
         XCTAssertEqual(rows.suffix(2).map(\.role), [.user, .assistant])
         XCTAssertTrue(rows[0].content.contains("_Written status._"))
     }
@@ -302,10 +325,11 @@ final class TitioNoticeActTests: XCTestCase {
             occurredAt: f.scheduler.now
         )
         let messageID = await post(fact, f)
+        let capturedQuestion = try XCTUnwrap(BotChoicesBlock.parse(transcript(f)[0].content).choices?.question)
         let tapped = await f.center.act(messageID: messageID, optionIndex: 0)
         XCTAssertEqual(tapped, .accepted)
         await settle(f)
-        XCTAssertEqual(f.actions.calls, [.bot(bot, conversation, "Ship it"), .ackBot(item)])
+        XCTAssertEqual(f.actions.calls, [.bot(bot, conversation, AgentReplyQuote.compose(excerpt: capturedQuestion, text: "Ship it")), .ackBot(item)])
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .forwarded)
         XCTAssertEqual(try transcript(f).last?.content, "Written result.")
     }
@@ -430,8 +454,8 @@ final class TitioNoticeActTests: XCTestCase {
         let f = try makeFixture()
         _ = await post(approval("Q1", f), f)
         _ = await post(approval("Q2", f), f)
-        XCTAssertFalse(f.center.takeOptionText("Choice 1"), "two open notices offer it: ambiguous")
-        XCTAssertFalse(f.center.takeOptionText("Choice 3"), "navigation never matches")
+        XCTAssertFalse(f.center.takeOptionText("Approve"), "two open notices offer it: ambiguous")
+        XCTAssertFalse(f.center.takeOptionText("Open thread"), "navigation never matches")
         let pick = question("Q3", options: ["Staging", "Production"], f)
         _ = await post(pick, f)
         XCTAssertTrue(f.center.takeOptionText("Staging"))

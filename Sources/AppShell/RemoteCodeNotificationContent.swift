@@ -16,6 +16,7 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
     public static let openActionIdentifier = "thread.open"
     /// Titio notices (hub spec §8, §9): Open action only.
     public static let titioNoticeCategoryIdentifier = "RemoteCodeTitioNotice"
+    public static let titioQuestionCategoryIdentifier = "RemoteCodeTitioQuestion"
     /// Groups every Titio banner in Notification Center.
     public static let titioThreadIdentifier = "bot.titio"
 
@@ -27,13 +28,14 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         identifier: String,
         body: String,
         userInfo: [String: String],
-        soundEnabled: Bool = true
+        soundEnabled: Bool = true,
+        canReply: Bool = false
     ) -> RemoteCodeNotificationContent {
         RemoteCodeNotificationContent(
             identifier: identifier,
             title: TitioNoticeCopy.bannerTitle,
             body: TitioNoticeCopy.preview(body),
-            categoryIdentifier: titioNoticeCategoryIdentifier,
+            categoryIdentifier: canReply ? titioQuestionCategoryIdentifier : titioNoticeCategoryIdentifier,
             threadIdentifier: titioThreadIdentifier,
             userInfo: userInfo,
             soundEnabled: soundEnabled
@@ -58,7 +60,8 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         profileID: String?,
         hostID: String?,
         legacy: [String: String] = [:],
-        includeBotIdWithoutProfile: Bool = false
+        includeBotIdWithoutProfile: Bool = false,
+        canReply: Bool = false
     ) -> [String: String] {
         var info: [String: String] = [:]
         for key in ["threadId", "workspaceId", "runId", "finalMessageId", "activityItemId", "outcome"] {
@@ -66,7 +69,7 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
                 info[key] = value
             }
         }
-        info["category"] = titioNoticeCategoryIdentifier
+        info["category"] = canReply ? titioQuestionCategoryIdentifier : titioNoticeCategoryIdentifier
         let profile = profileID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let host = hostID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !profile.isEmpty { info["profileId"] = profile }

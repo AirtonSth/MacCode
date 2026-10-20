@@ -195,6 +195,23 @@ final class TitioNoticeCenterTests: XCTestCase {
 
     // MARK: Delivery
 
+    func test_mixedMutedInfoBatchObservesBothAndOnlyInterruptsAllowedSource() async throws {
+        let f = try makeFixture()
+        var muted = completion("muted", title: "Private", at: f.scheduler)
+        muted.source.workspaceId = UUID().uuidString
+        SettingsStore(db: f.db).update { $0.notificationMutedWorkspaceIDs = [muted.source.workspaceId!] }
+        f.center.ingest(muted)
+        XCTAssertNotNil(try f.repo.get(key: muted.key), "producer return already has durable observation")
+        f.center.ingest(completion("allowed", title: "Public", at: f.scheduler))
+        await f.scheduler.advance(by: TitioNoticeTiming.infoWindow, center: f.center)
+        await waitForPushes(f.recorder, count: 1)
+        XCTAssertEqual(try threadMessages(f).count, 2, "different delivery policies never share generated copy")
+        XCTAssertEqual(f.recorder.banners.map(\.identifier), ["run.allowed.completed"])
+        XCTAssertEqual(f.recorder.pushes.map(\.identifier), ["run.allowed.completed"])
+        XCTAssertEqual(f.recorder.speech.count, 1)
+        XCTAssertEqual(try f.repo.get(key: muted.key)?.state, .posted)
+    }
+
     func test_runCompletionPostsOneMessageOneBannerOnePushWithTheRunIdentifier() async throws {
         // WHY: the key reuses today's banner identifier so the relay and
         // SystemNotifier dedupe a re-post; exactly one of each must go out.
@@ -209,7 +226,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(messages.count, 1)
         XCTAssertEqual(messages[0].id.value, TitioNoticeIDs.messageID(forKey: "run.R1.completed"))
         XCTAssertEqual(messages[0].role, .assistant)
-        XCTAssertEqual(messages[0].content, "Written notice.")
+        XCTAssertTrue(messages[0].content.hasSuffix("Written notice."))
         XCTAssertEqual(f.recorder.banners.map(\.identifier), ["run.R1.completed"])
         XCTAssertEqual(f.recorder.pushes.map(\.identifier), ["run.R1.completed"])
         let banner = try XCTUnwrap(f.recorder.banners.first)
@@ -268,9 +285,8 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(posted.first?.postedAt, f.scheduler.start.addingTimeInterval(TitioNoticeTiming.infoMaxWait))
     }
 
-    func test_decisionFlushesThePendingInfoBatchFirst() async throws {
-        // WHY: a decision posts at once; the info waiting behind it must not
-        // land later, below the card the user has to act on.
+    func test_decisionAndPendingInfoBothReachTheInboxWithoutBlockingUrgentIntake() async throws {
+        // Urgent intake must not wait for informational copy generation.
         let f = try makeFixture()
         f.center.ingest(completion("R1", at: f.scheduler))
         await f.scheduler.advance(by: 2, center: f.center)
@@ -278,13 +294,13 @@ final class TitioNoticeCenterTests: XCTestCase {
         await f.center.idle()
 
         let posted = f.recorder.posted.map(\.message.id.value)
-        XCTAssertEqual(posted, [
+        XCTAssertEqual(Set(posted), Set([
             TitioNoticeIDs.messageID(forKey: "run.R1.completed"),
             TitioNoticeIDs.messageID(forKey: "thread.T.attention.Q1"),
-        ])
+        ]))
         let decision = try XCTUnwrap(try f.repo.get(key: "thread.T.attention.Q1"))
         XCTAssertEqual(decision.state, .posted)
-        XCTAssertEqual(decision.actions?.compactMap(\.label), ["Choice 1", "Choice 2", "Choice 3"])
+        XCTAssertEqual(decision.actions?.compactMap(\.label), ["Approve", "Decline", "Open thread"])
         let text = try XCTUnwrap(f.messages.get(id: AgentMessageID(TitioNoticeIDs.messageID(forKey: "thread.T.attention.Q1"))))
         XCTAssertEqual(BotChoicesBlock.parse(text.content).choices?.notice, "thread.T.attention.Q1")
         XCTAssertEqual(f.recorder.posted.last?.conversation?.attentionState, .needsAttention)
@@ -549,9 +565,9 @@ final class TitioNoticeCenterTests: XCTestCase {
 
     // MARK: Bot attention projector (pure rules)
 
-    func test_attentionPlanSkipsTitioMutedBotsAndThreadCoveredItemsAndResolvesAcknowledged() throws {
+    func test_attentionPlanRetainsMutedBotsSkipsTitioAndThreadCoveredItemsAndResolvesAcknowledged() throws {
         // WHY: a Bot failure must produce exactly one notice (from here), never
-        // for Titio or a muted Bot, and never twice when the thread's request
+        // for Titio, and never twice when the thread's request
         // notice already covers it.
         let bot = BotDefinition(handle: "reviewer", name: "Reviewer", title: "", description: "")
         var muted = BotDefinition(handle: "muted", name: "Muted", title: "", description: "")
@@ -571,7 +587,7 @@ final class TitioNoticeCenterTests: XCTestCase {
             openThreadKeys: ["thread.\(coveredThread.value.uuidString).attention.REQ"],
             linkedThread: { $0 == covered ? coveredThread : nil }
         )
-        XCTAssertEqual(plan.ingest.map(\.key), ["bot.attention.\(blocked.id.value.uuidString)"])
+        XCTAssertEqual(plan.ingest.map(\.key), [blocked, mutedItem].map { "bot.attention.\($0.id.value.uuidString)" })
         XCTAssertEqual(plan.ingest.first?.kind, .botBlocked)
         XCTAssertEqual(plan.ingest.first?.facts.detail, "VM down")
         XCTAssertEqual(plan.ingest.first?.facts.botName, "Reviewer")
@@ -591,7 +607,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(TitioNoticeCenter.petTitle(payload: ["path": .string("/a/b/main.swift")]), "main.swift")
     }
 
-    func test_focusedSuccessIsSkippedButAFocusedFailureIsNot() async throws {
+    func test_focusedSuccessIsPersistedWithoutInterruptingAndFailureStillCounts() async throws {
         // WHY: a success the user is watching is noise; a failure always counts (§2).
         let f = try makeFixture()
         f.recorder.focusedSuccess = true
@@ -602,7 +618,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         f.center.handleEvent(EventBus.Event(seq: 8, kind: "git.push",
                                             payload: .object(["workspace_id": .string(workspace), "ok": .bool(false)]), ts: ts))
         await f.center.idle()
-        XCTAssertNil(try f.repo.get(key: "pet.event.7"))
+        XCTAssertEqual(try f.repo.get(key: "pet.event.7")?.facts.interruptionSuppressed, true)
         XCTAssertEqual(try f.repo.get(key: "pet.event.8")?.kind, .gitFailed)
     }
 
@@ -707,13 +723,14 @@ final class TitioNoticeHookTests: XCTestCase {
         XCTAssertFalse(failureHandled, "a Titio failure keeps today's banner")
     }
 
-    func test_botWithNotificationsOffProducesNoNotice() async throws {
-        // WHY: per-Bot notificationsEnabled still gates notices before ingest (§11).
+    func test_botWithNotificationsOffRetainsNoticeWithoutInterruption() async throws {
+        // The Bot toggle controls interruption, while inbox intake remains durable.
         let (context, _) = try makeContext()
         let (_, _, thread) = try linkedThread(context, handle: "quiet", notifications: false)
-        let (_, handled) = await runOutcome(context, thread: thread, status: .completed)
+        let (run, handled) = await runOutcome(context, thread: thread, status: .completed)
         XCTAssertTrue(handled)
-        XCTAssertTrue(try TitioNoticeRepository(db: context.db).listPending().isEmpty)
+        let row = try XCTUnwrap(TitioNoticeRepository(db: context.db).get(key: TitioNoticeIDs.botReply(runId: run.value.uuidString)))
+        XCTAssertEqual(row.facts.interruptionSuppressed, true)
     }
 
     func test_mainThreadFailureCarriesItsCardAndActivityRoute() async throws {

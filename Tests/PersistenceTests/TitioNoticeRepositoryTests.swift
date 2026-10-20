@@ -42,6 +42,24 @@ final class TitioNoticeRepositoryTests: XCTestCase {
         }
     }
 
+    func test_semanticOutboxSurvivesReplayPruningAndRollsBackWithEventWrite() throws {
+        let (db, _) = try make()
+        let events = EventLogRepository(db: db)
+        let outbox = TitioNoticeObservationRepository(db: db)
+        try events.append(seq: 1, kind: "agent.run.finished", payloadJSON: #"{"status":"failed"}"#)
+        try events.appendBatch((2...5_002).map { .init(seq: Int64($0), kind: "agent.item.delta", payloadJSON: "{}") })
+        XCTAssertFalse(try events.read(since: 0).contains { $0.seq == 1 })
+        XCTAssertEqual(try outbox.pending().map(\.seq), [1])
+        XCTAssertThrowsError(try events.appendBatch([
+            .init(seq: 7_000, kind: "git.deliver", payloadJSON: "{}"),
+            .init(seq: 7_000, kind: "git.deliver", payloadJSON: "{}"),
+        ]))
+        XCTAssertEqual(try outbox.pending().map(\.seq), [1], "failed source commit leaves no phantom observation")
+        try outbox.acknowledge(seq: 1, at: t0)
+        try outbox.pruneProcessed(before: t0.addingTimeInterval(1))
+        XCTAssertEqual(try rowCount(db, "titio_observations"), 0)
+    }
+
     // MARK: Ingest
 
     func test_sameKeyTwiceIsOneRowAndFactsMergeOnlyWhilePending() throws {

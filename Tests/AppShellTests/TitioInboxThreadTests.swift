@@ -307,7 +307,7 @@ final class TitioInboxThreadTests: XCTestCase {
         return key
     }
 
-    func test_inboxDeskHooksTakeTheArmedReplyAndCardTapsWithoutStartingARun() async throws {
+    func test_inboxDeskHooksSendCapturedQuestionReplyWithoutStartingARun() async throws {
         // WHY: on the Mac the desk composer and the card bypass
         // enqueueHostMessage; without these hooks an armed answer or a card tap
         // would start a Titio LLM run instead of reaching the request.
@@ -319,6 +319,8 @@ final class TitioInboxThreadTests: XCTestCase {
         XCTAssertNotNil(desk.embedding?.noticeChoiceHandler, "only the inbox desk acts on notice cards")
         XCTAssertNotNil(desk.embedding?.hostReplyHandler)
 
+        desk.embedding?.noticeChoiceHandler?(TitioNoticeIDs.messageID(forKey: key).uuidString, 0)
+        XCTAssertEqual(desk.activeReplyTarget?.noticeMessageID, TitioNoticeIDs.messageID(forKey: key).uuidString)
         desk.prompt = "use staging"
         await desk.send()
         XCTAssertEqual(desk.prompt, "", "the host took the text: the composer clears")
@@ -328,7 +330,7 @@ final class TitioInboxThreadTests: XCTestCase {
         let row = try XCTUnwrap(TitioNoticeRepository(db: context.db).get(key: key))
         XCTAssertEqual(row.state, .resolved, "the armed notice was answered (or honestly failed), never left armed")
         let texts = try context.messageRepo.list(threadId: target.threadID).map(\.content)
-        XCTAssertTrue(texts.contains("use staging"), "the user's words stay in the inbox transcript")
+        XCTAssertTrue(texts.contains { AgentReplyQuote.parse($0)?.body == "use staging" }, "the user's words and captured question stay in the inbox transcript")
     }
 
     func test_otherConversationsGetNoNoticeHooks() throws {

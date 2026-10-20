@@ -6665,7 +6665,7 @@ public final class BotsViewModel: ObservableObject {
         /// `bot.notice.act`, so its plain text is never taken as a card option
         /// (an option word typed in a sentence must stay chat). Older clients
         /// send the option text, so they keep the exact-text fallback.
-        case pairedClient(tapsNoticeCards: Bool)
+        case pairedClient(tapsNoticeCards: Bool, bindsNoticeReplies: Bool = false)
     }
 
     /// `bot.send` capability of clients that tap Titio cards through `bot.notice.act`.
@@ -6711,7 +6711,7 @@ public final class BotsViewModel: ObservableObject {
                 // An LLM must never approve or answer for the user (§0.2):
                 // only the paired user's own text may reach the intercept,
                 // and nothing else may write into the inbox as the user.
-                guard case .pairedClient(let tapsNoticeCards) = origin else {
+                guard case .pairedClient(let tapsNoticeCards, let bindsNoticeReplies) = origin else {
                     throw BotStoreError.invalidRow("Titio's Notifications inbox only takes messages from you.")
                 }
                 if attachments.isEmpty,
@@ -6719,7 +6719,8 @@ public final class BotsViewModel: ObservableObject {
                     bot: bot,
                     conversation: existing,
                     text: message,
-                    acceptsOptionText: !tapsNoticeCards
+                    acceptsOptionText: !tapsNoticeCards,
+                    acceptsArmedReply: !bindsNoticeReplies
                    ) {
                     return consumed
                 }
@@ -10963,6 +10964,7 @@ public final class BotsViewModel: ObservableObject {
         vm.refreshProviderSnapshotsInBackground()
         deskAgentKey = key
         deskAgentVM = vm
+        if isTitioInbox { bindTitioReplyDraft(vm, conversationID: live.id, threadID: threadID) }
         deskQueueSubscription = EventBus.shared.subscribeFromCurrent(filter: .agentThreadAndQueue) { [weak vm] event in
             let payload = event.payload.objectValue
             guard let raw = payload?["thread_id"]?.stringValue,
@@ -11176,6 +11178,7 @@ public final class BotsViewModel: ObservableObject {
         }
         deskThreadRuntimeObservation = nil
         deskAgentKey = nil
+        titioReplyDraftObservation = nil
         guard let vm = deskAgentVM else { return }
         deskAgentVM = nil
         vm.dispose()
@@ -11371,6 +11374,18 @@ public final class BotsViewModel: ObservableObject {
     /// with the same mapper a banner click uses.
     func actOnTitioNotice(messageID: String, optionIndex: Int) {
         let center = context.titioNoticeCenter
+        if let reply = center.contextualReply(messageID: messageID, optionIndex: optionIndex) {
+            guard reply["outcome"] as? String == "reply_required",
+                  let vm = deskAgentVM, let threadID = vm.selectedThreadId else {
+                deskAgentVM?.statusMessage = "This question is no longer awaiting a reply."
+                return
+            }
+            vm.composerState.replyTarget = AgentReplyTarget(
+                threadId: threadID, excerpt: reply["question"] as? String ?? "",
+                noticeMessageID: messageID
+            )
+            return
+        }
         Task { @MainActor [weak self] in
             let outcome = await center.act(messageID: messageID, optionIndex: optionIndex)
             guard case .navigate(let route) = outcome else { return }
@@ -11400,9 +11415,40 @@ public final class BotsViewModel: ObservableObject {
     }
 
     /// The inbox desk's send hook: an armed "Reply here" takes the text.
-    private func titioHostReplyHandler() -> @MainActor (String, AgentThreadID) -> Bool {
+    private func titioHostReplyHandler() -> @MainActor (String, AgentThreadID) throws -> Bool {
         { [weak self] text, _ in
-            self?.context.titioNoticeCenter.takeArmedReply(text: text) ?? false
+            guard let self, let id = self.deskAgentVM?.activeReplyTarget?.noticeMessageID else { return false }
+            switch self.context.titioNoticeCenter.replyNow(messageID: id, text: text) {
+            case .accepted: return true
+            case .alreadyResolved:
+                throw BotStoreError.invalidInput("This question has already been answered. Your draft was kept.")
+            default:
+                throw BotStoreError.invalidInput("This reply could not be sent to its original question. Your draft was kept.")
+            }
+        }
+    }
+
+    private var titioReplyDraftObservation: AnyCancellable?
+
+    private func bindTitioReplyDraft(_ vm: AgentAppViewModel, conversationID: BotConversationID, threadID: AgentThreadID) {
+        let key = "titio.reply_draft." + conversationID.value.uuidString.lowercased()
+        let settings = context.settingsRepo
+        if let raw = try? settings.get(key), let data = raw.data(using: .utf8),
+           let object = try? JSONDecoder().decode([String: String].self, from: data),
+           let messageID = object["message_id"], let question = object["question"] {
+            vm.composerState.replyTarget = AgentReplyTarget(threadId: threadID, excerpt: question, noticeMessageID: messageID)
+        }
+        titioReplyDraftObservation = vm.composerState.$replyTarget.sink { [weak vm] target in
+            do {
+                if let target, let messageID = target.noticeMessageID {
+                    let data = try JSONEncoder().encode(["message_id": messageID, "question": target.excerpt])
+                    try settings.set(key, String(decoding: data, as: UTF8.self))
+                } else {
+                    try settings.delete(key: key)
+                }
+            } catch {
+                vm?.statusMessage = "The reply context could not be saved: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -11416,11 +11462,12 @@ public final class BotsViewModel: ObservableObject {
         bot: BotDefinition,
         conversation: BotConversation,
         text: String,
-        acceptsOptionText: Bool
+        acceptsOptionText: Bool,
+        acceptsArmedReply: Bool
     ) -> JSONValue? {
         let center = context.titioNoticeCenter
         let consumed: String
-        if center.takeArmedReply(text: text) {
+        if acceptsArmedReply, center.takeArmedReply(text: text) {
             consumed = "reply"
         } else if acceptsOptionText, center.takeOptionText(text) {
             consumed = "option"

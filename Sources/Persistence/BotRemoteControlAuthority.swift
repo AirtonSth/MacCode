@@ -108,6 +108,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// `bot.notice.act` (hub spec §7): Titio's notice hub claims the row and
     /// answers `{"outcome", "route"?}`. Runs off the MainActor under the
     /// authority lock, so it must not call back into this authority.
+    public var onNoticeReply: ((BotID, String, String) throws -> [String: Any])?
+    public var onNoticeContextualAct: ((BotID, String, Int) throws -> [String: Any]?)?
     public var onNoticeAct: ((BotID, String, Int) throws -> [String: Any])?
     /// `bot.notice.read`: the inbox unread count goes to 0.
     public var onNoticeRead: ((BotID, BotConversationID) throws -> [String: Any])?
@@ -1433,6 +1435,8 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             return try cavemanSet(params: params, requestID: requestID, now: now)
         case "factory_reset":
             return try factoryReset(params: params, requestID: requestID, now: now)
+        case "notice.reply":
+            return try noticeReply(params: params, requestID: requestID)
         case "notice.act":
             return try noticeAct(params: params, requestID: requestID)
         case "notice.read":
@@ -3562,6 +3566,25 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     /// A tap on a Titio notice card (hub spec §7). The receipt is completed
     /// once the host claimed (or navigated); Titio's result message reports
     /// the final outcome of an `accepted` act.
+    private func noticeReply(params: [String: Any], requestID: String) throws -> [String: Any] {
+        let bot = try requireBot(params)
+        guard bot.handle.lowercased() == TitioIdentity.handle,
+              let messageID = string(params, "message_id"), UUID(uuidString: messageID) != nil,
+              let text = string(params, "text"), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              text.utf8.count <= 65_536 else { throw Error.invalidParams }
+        guard let onNoticeReply else { throw Error(code: -32091, message: "Bot runtime is unavailable.") }
+        let answer = try onNoticeReply(bot.id, messageID, text)
+        let outcome = answer["outcome"] ?? "not_found"
+        var result = receipt(requestID: requestID, status: .completed, botID: id(bot), readback: [
+            "message_id": messageID.lowercased(), "outcome": outcome, "route": "bot",
+            "bot_id": id(bot), "host_id": answer["host_id"] ?? NSNull(),
+        ])
+        result["message_id"] = messageID.lowercased()
+        result["host_id"] = answer["host_id"]
+        result["outcome"] = outcome
+        return result
+    }
+
     private func noticeAct(params: [String: Any], requestID: String) throws -> [String: Any] {
         let bot = try requireBot(params)
         guard bot.handle.lowercased() == TitioIdentity.handle,
@@ -3571,7 +3594,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             throw Error.invalidParams
         }
         guard let onNoticeAct else { throw Error(code: -32091, message: "Bot runtime is unavailable.") }
-        let answer = try onNoticeAct(bot.id, messageID, optionIndex)
+        let contextual = (params["client_capabilities"] as? [String] ?? []).contains("bot.notice_reply_v1")
+        let answer = try (contextual ? onNoticeContextualAct?(bot.id, messageID, optionIndex) : nil)
+            ?? onNoticeAct(bot.id, messageID, optionIndex)
         var readback: [String: Any] = [
             "message_id": messageID.lowercased(),
             "option_index": optionIndex,
@@ -3584,6 +3609,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         if let navigation = answer["route"] { readback["navigation"] = navigation }
         var result = receipt(requestID: requestID, status: .completed, botID: id(bot), readback: readback)
         result["outcome"] = readback["outcome"]
+        if let question = answer["question"] { result["question"] = question }
         if let navigation = answer["route"] { result["route"] = navigation }
         return result
     }

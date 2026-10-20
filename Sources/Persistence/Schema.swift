@@ -78,7 +78,8 @@ public enum Schema {
     /// permission, plan mode, execution location and base branch).
     static let scheduledTaskRunOptionsSchemaVersion = 100
     static let virtualMachinesSchemaVersion = 101
-    public static let currentVersion: Int = virtualMachinesSchemaVersion
+    static let titioObservationSchemaVersion = 102
+    public static let currentVersion: Int = titioObservationSchemaVersion
 
     /// SQL body for the named checkpoint-list migration (relocatable by version).
     public static let checkpointListMigrationSQL: String = """
@@ -1980,6 +1981,16 @@ public enum Schema {
         UPDATE agent_threads SET execution_destination='own_vm'
             WHERE execution_target='vm' AND guest_runtime='guest-v1';
         """),
+        SchemaStep(titioObservationSchemaVersion, """
+        CREATE TABLE titio_observations (
+            seq INTEGER PRIMARY KEY NOT NULL,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            occurred_at REAL NOT NULL,
+            processed_at REAL
+        );
+        CREATE INDEX idx_titio_observations_pending ON titio_observations(processed_at, seq);
+        """),
     ]
 
     /// Additive and idempotent. `key` reuses today's banner identifiers, so a
@@ -2181,7 +2192,7 @@ public enum Schema {
     private static let migrationAppliedAtFormatter = ISO8601DateFormatter()
 
     static func trustedRestoreSchema(version: Int) throws -> SQLiteDB {
-        guard [93, 96, hostRestoreQueueHoldsSchemaVersion, relayKeysSchemaVersion, botSortOrderSchemaVersion, scheduledTaskRunOptionsSchemaVersion, currentVersion].contains(version) else {
+        guard [93, 96, hostRestoreQueueHoldsSchemaVersion, relayKeysSchemaVersion, botSortOrderSchemaVersion, scheduledTaskRunOptionsSchemaVersion, virtualMachinesSchemaVersion, currentVersion].contains(version) else {
             throw SQLiteError.execute("unsupported restore schema version")
         }
         let db = try SQLiteDB(path: ":memory:")

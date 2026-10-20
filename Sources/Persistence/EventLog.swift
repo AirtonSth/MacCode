@@ -145,6 +145,10 @@ public final class EventLogRepository {
                     try st.bind(3, row.payloadJSON)
                     try st.bind(4, createdAt)
                     _ = try st.step()
+                    try TitioNoticeObservationRepository(db: db).record(
+                        seq: row.seq, kind: row.kind, payloadJSON: row.payloadJSON,
+                        occurredAt: Date().timeIntervalSince1970
+                    )
                 }
                 db.noteEventRowsInserted(Int64(rows.count))
                 try EventRetentionPolicy.prune(db: db, cap: EventLogRepository.cap)
