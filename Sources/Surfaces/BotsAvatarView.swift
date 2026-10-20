@@ -40,7 +40,7 @@ public struct BotsAvatarView: View {
             } else if let symbol, let spec = BotBlobatarSpec.parse(symbol) {
                 BotBlobatarView(
                     name: name.isEmpty ? handle : name,
-                    spec: spec.liveFaced(attention: attention),
+                    spec: spec.liveFaced(attention: attention, name: name, handle: handle),
                     size: size,
                     motion: Self.motionMode(for: attention),
                     handle: handle
@@ -54,11 +54,11 @@ public struct BotsAvatarView: View {
 
     @ViewBuilder
     private var symbolFallback: some View {
-        let ink = avatarColor(for: handle)
+        let ink = Color(hex: BotAvatar.fallbackHex(for: handle))
         ZStack {
             RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
                 .fill(ink)
-            if let symbol {
+            if let symbol, !symbol.isEmpty {
                 Image(systemName: symbol)
                     .font(.system(size: max(11, size * 0.42), weight: .semibold))
                     .foregroundColor(.white)
@@ -70,14 +70,6 @@ public struct BotsAvatarView: View {
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
-    }
-
-    private func avatarColor(for handle: String) -> Color {
-        let palette: [UInt32] = [
-            0x7B5CFF, 0x3B82F6, 0xF59E0B, 0x22C55E, 0xEC4899, 0x06B6D4,
-        ]
-        let index = abs(handle.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }) % palette.count
-        return Color(hex: palette[index])
     }
 
     private func initials(for name: String) -> String {

@@ -260,6 +260,7 @@ public struct AgentOverviewCard<Badge: View, Meta: View, Trailing: View>: View {
     public let preview: String?
     public let identifier: String
     public let accessibilityValue: String?
+    public let avatar: BotsAvatarView?
     public let onOpen: () -> Void
     public let badge: Badge
     public let meta: Meta
@@ -273,6 +274,7 @@ public struct AgentOverviewCard<Badge: View, Meta: View, Trailing: View>: View {
         preview: String? = nil,
         identifier: String,
         accessibilityValue: String? = nil,
+        avatar: BotsAvatarView? = nil,
         onOpen: @escaping () -> Void,
         @ViewBuilder badge: () -> Badge,
         @ViewBuilder meta: () -> Meta,
@@ -285,6 +287,7 @@ public struct AgentOverviewCard<Badge: View, Meta: View, Trailing: View>: View {
         self.preview = preview
         self.identifier = identifier
         self.accessibilityValue = accessibilityValue
+        self.avatar = avatar
         self.onOpen = onOpen
         self.badge = badge()
         self.meta = meta()
@@ -294,17 +297,21 @@ public struct AgentOverviewCard<Badge: View, Meta: View, Trailing: View>: View {
     public var body: some View {
         Button(action: onOpen) {
             HStack(alignment: .center, spacing: DS.Space.xl) {
-                Image(systemName: icon)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundColor(iconColor)
-                    .frame(width: 44, height: 44)
-                    .background(DS.Palette.surfaceRaised)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                    )
-                    .accessibilityHidden(true)
+                if let avatar {
+                    avatar.frame(width: 44, height: 44)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(iconColor)
+                        .frame(width: 44, height: 44)
+                        .background(DS.Palette.surfaceRaised)
+                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                        )
+                        .accessibilityHidden(true)
+                }
 
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     HStack(spacing: DS.Space.sm) {

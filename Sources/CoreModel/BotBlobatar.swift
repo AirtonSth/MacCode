@@ -144,9 +144,23 @@ public struct BotBlobatarSpec: Equatable, Sendable {
         shape == .auto && expression == .idle && background == .none && hue == .auto
     }
 
-    /// Paint-time face: live attention, never a plate.
-    public func liveFaced(attention: BotAttentionState) -> BotBlobatarSpec {
+    /// Picker previews and saved choices must resolve the same creature.
+    public func selecting(shape: BotBlobatarShape, hue: BotBlobatarHue, name: String, handle: String = "") -> BotBlobatarSpec {
         var next = self
+        next.shape = shape
+        next.hue = hue
+        next.expression = .idle
+        next.background = .none
+        next.frozenSeed = next.isDefaultAppearance ? nil : renderSeed(liveName: name, handle: handle)
+        return next
+    }
+
+    /// Paint-time face: live attention, never a plate.
+    public func liveFaced(attention: BotAttentionState, name: String, handle: String = "") -> BotBlobatarSpec {
+        var next = self
+        // Resolve identity before changing the face: a live expression must not
+        // turn an Auto avatar into a custom token seeded from the handle.
+        next.frozenSeed = renderSeed(liveName: name, handle: handle)
         next.expression = .live(for: attention)
         next.background = .none
         return next
@@ -187,6 +201,12 @@ public struct BotBlobatarSpec: Equatable, Sendable {
         let lower = trimmed.lowercased()
         if lower.hasPrefix(tokenPrefix) {
             return parseToken(String(lower.dropFirst(tokenPrefix.count)))
+        }
+        // Older iOS saves used this form; keep those persisted choices readable.
+        if lower.hasPrefix("blobatar:") {
+            let parts = lower.split(separator: ":", omittingEmptySubsequences: false)
+            guard parts.count == 3 else { return nil }
+            return parseToken("\(parts[1]):idle:none:\(parts[2])")
         }
         if let shape = BotBlobatarShape(rawValue: lower), shape != .auto {
             return BotBlobatarSpec(shape: shape)
@@ -324,8 +344,9 @@ public enum BotBlobatar {
         let pose = Pose.forExpression(spec.expression)
         layout = pose.bake(layout)
         var palette = palette(hue: spec.hue.degrees ?? traits.num("hue", 0, 360), tone: traits("tone"))
-        if spec.expression == .mad {
-            palette.head = mixHex(palette.head, 0xE8483F, 0.62)
+        if case .named(let id) = spec.hue,
+           let swatch = studioHues.first(where: { $0.id == id }) {
+            palette.head = swatch.preview
             palette.eye = contrastEye(against: palette.head)
         }
         return BotBlobatarFigure(
@@ -875,19 +896,18 @@ private func toHex(_ color: OKLCh) -> UInt32 {
     return (enc(rgb.0) << 16) | (enc(rgb.1) << 8) | enc(rgb.2)
 }
 
-private func mixHex(_ a: UInt32, _ b: UInt32, _ t: Double) -> UInt32 {
-    func ch(_ v: UInt32, _ shift: UInt32) -> Double { Double((v >> shift) & 0xFF) }
-    func mix(_ x: Double, _ y: Double) -> UInt32 { UInt32(x + (y - x) * t + 0.5) }
-    let r = mix(ch(a, 16), ch(b, 16))
-    let g = mix(ch(a, 8), ch(b, 8))
-    let bl = mix(ch(a, 0), ch(b, 0))
-    return (r << 16) | (g << 8) | bl
-}
-
 private func contrastEye(against head: UInt32) -> UInt32 {
-    let r = Double((head >> 16) & 0xFF)
-    let g = Double((head >> 8) & 0xFF)
-    let b = Double(head & 0xFF)
-    let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
-    return luma >= 0.5 ? 0x2A1A14 : 0xF7F3EE
+    func luminance(_ hex: UInt32) -> Double {
+        func linear(_ shift: UInt32) -> Double {
+            let channel = Double((hex >> shift) & 0xFF) / 255
+            return channel <= 0.04045 ? channel / 12.92 : pow((channel + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0)
+    }
+    let dark: UInt32 = 0x2A1A14
+    let light: UInt32 = 0xF7F3EE
+    let headLuminance = luminance(head)
+    let darkContrast = (headLuminance + 0.05) / (luminance(dark) + 0.05)
+    let lightContrast = (luminance(light) + 0.05) / (headLuminance + 0.05)
+    return darkContrast >= lightContrast ? dark : light
 }
