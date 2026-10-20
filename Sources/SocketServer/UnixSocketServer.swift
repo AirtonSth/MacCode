@@ -43,6 +43,8 @@ public final class UnixSocketServer: @unchecked Sendable {
     public let socketPath: String
     private let dispatcher: JSONRPCDispatcher
     private var listenFD: Int32 = -1
+    private var socketPathLockFD: Int32 = -1
+    private var socketFileIdentity: stat?
     private var acceptThread: Thread?
     private let lifecycleLock = NSLock()
     private var running = false
@@ -120,28 +122,32 @@ public final class UnixSocketServer: @unchecked Sendable {
                 lifecycleLock.lock()
                 starting = false
                 lifecycleLock.unlock()
+                publishListenerState(bound: false)
             }
         }
 
-        unlink(socketPath)
         let listenerFD = socket(AF_UNIX, SOCK_STREAM, 0)
         if listenerFD < 0 {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        var pathLockFD: Int32 = -1
+        var boundIdentity: stat?
+        defer {
+            if !committedStart {
+                close(listenerFD)
+                if let boundIdentity { removeSocket(matching: boundIdentity) }
+                if pathLockFD >= 0 { close(pathLockFD) }
+            }
+        }
         listenerFDObserverForTesting?(listenerFD)
         guard Self.enableCloseOnExec(listenerFD) else {
-            let savedErrno = errno
-            close(listenerFD)
-            unlink(socketPath)
-            throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = socketPath.utf8CString
         let maxPath = MemoryLayout.size(ofValue: addr.sun_path)
         if pathBytes.count > maxPath {
-            close(listenerFD)
-            unlink(socketPath)
             throw NSError(domain: "RemoteCode.Socket", code: 1, userInfo: [NSLocalizedDescriptionKey: "socket path too long: \(socketPath)"])
         }
         withUnsafeMutablePointer(to: &addr.sun_path) { tp in
@@ -152,6 +158,16 @@ public final class UnixSocketServer: @unchecked Sendable {
             }
         }
         let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
+        // Keep this lock file: unlinking it would let another process lock a
+        // different inode. The descriptor owns the path until stop completes.
+        pathLockFD = open(socketPath + ".lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard pathLockFD >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard flock(pathLockFD, LOCK_EX | LOCK_NB) == 0 else {
+            throw POSIXError(.EADDRINUSE)
+        }
+        try removeStaleSocket(address: &addr)
         let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 Darwin.bind(listenerFD, sa, addrLen)
@@ -160,25 +176,19 @@ public final class UnixSocketServer: @unchecked Sendable {
         if bindResult < 0 {
             let savedErrno = errno
             let msg = String(cString: strerror(savedErrno))
-            close(listenerFD)
-            unlink(socketPath)
-            let failPayload = unixSocketListenerEventPayload(bound: false, path: socketPath)
-            EventBus.shared.publish(kind: .serverListener, payload: .object(failPayload.mapValues { v -> JSONValue in
-                if let b = v as? Bool { return .bool(b) }
-                if let i = v as? Int { return .number(Double(i)) }
-                if let s = v as? String { return .string(s) }
-                return .string("\(v)")
-            }))
             throw NSError(domain: "RemoteCode.Socket", code: Int(savedErrno), userInfo: [NSLocalizedDescriptionKey: "bind: \(msg)"])
         }
+        var identity = stat()
+        guard lstat(socketPath, &identity) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        boundIdentity = identity
         // Establish same-user scope before the socket begins listening. A
         // permission failure is fatal; never expose the local IPC endpoint
         // with permissions inherited from the process umask.
         if chmod(socketPath, 0o600) < 0 {
             let savedErrno = errno
             let msg = String(cString: strerror(savedErrno))
-            close(listenerFD)
-            unlink(socketPath)
             throw NSError(
                 domain: "RemoteCode.Socket",
                 code: Int(savedErrno),
@@ -188,25 +198,16 @@ public final class UnixSocketServer: @unchecked Sendable {
         if Darwin.listen(listenerFD, 16) < 0 {
             let savedErrno = errno
             let msg = String(cString: strerror(savedErrno))
-            close(listenerFD)
-            unlink(socketPath)
-            let failPayload = unixSocketListenerEventPayload(bound: false, path: socketPath)
-            EventBus.shared.publish(kind: .serverListener, payload: .object(failPayload.mapValues { v -> JSONValue in
-                if let b = v as? Bool { return .bool(b) }
-                if let i = v as? Int { return .number(Double(i)) }
-                if let s = v as? String { return .string(s) }
-                return .string("\(v)")
-            }))
             throw NSError(domain: "RemoteCode.Socket", code: Int(savedErrno), userInfo: [NSLocalizedDescriptionKey: "listen: \(msg)"])
         }
         lifecycleLock.lock()
         guard !startCancellationRequested else {
             lifecycleLock.unlock()
-            close(listenerFD)
-            unlink(socketPath)
             throw POSIXError(.ECANCELED)
         }
         listenFD = listenerFD
+        socketPathLockFD = pathLockFD
+        socketFileIdentity = identity
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration
         running = true
@@ -229,8 +230,12 @@ public final class UnixSocketServer: @unchecked Sendable {
 
         // Publish success event so AppDelegate (or any observer) can surface
         // the server status without polling. Mirrors HTTPServer's pattern.
-        let successPayload = unixSocketListenerEventPayload(bound: true, path: socketPath)
-        EventBus.shared.publish(kind: .serverListener, payload: .object(successPayload.mapValues { v -> JSONValue in
+        publishListenerState(bound: true)
+    }
+
+    private func publishListenerState(bound: Bool) {
+        let payload = unixSocketListenerEventPayload(bound: bound, path: socketPath)
+        EventBus.shared.publish(kind: .serverListener, payload: .object(payload.mapValues { v -> JSONValue in
             if let b = v as? Bool { return .bool(b) }
             if let i = v as? Int { return .number(Double(i)) }
             if let s = v as? String { return .string(s) }
@@ -250,15 +255,57 @@ public final class UnixSocketServer: @unchecked Sendable {
         for fd in clientFDs { shutdown(fd, SHUT_RDWR) }
         let listenerFD = listenFD
         listenFD = -1
+        let pathLockFD = socketPathLockFD
+        socketPathLockFD = -1
+        let identity = socketFileIdentity
+        socketFileIdentity = nil
         lifecycleLock.unlock()
         if listenerFD >= 0 {
             shutdown(listenerFD, SHUT_RDWR)
             close(listenerFD)
         }
-        unlink(socketPath)
+        if let identity { removeSocket(matching: identity) }
+        if pathLockFD >= 0 { close(pathLockFD) }
         lifecycleLock.lock()
         stopping = false
         lifecycleLock.unlock()
+    }
+
+    /// The path lock serializes stale-file recovery across app launches. Probe
+    /// existing sockets too: a live listener may not use our lock (e.g. an
+    /// already-running app during an update).
+    private func removeStaleSocket(address: inout sockaddr_un) throws {
+        var identity = stat()
+        guard lstat(socketPath, &identity) == 0 else {
+            if errno == ENOENT { return }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard identity.st_mode & S_IFMT == S_IFSOCK else { throw POSIXError(.EADDRINUSE) }
+        let probeFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard probeFD >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(probeFD) }
+        guard Self.enableCloseOnExec(probeFD),
+              fcntl(probeFD, F_SETFL, O_NONBLOCK) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let connected = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(probeFD, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        // Only a refused connection proves the socket is abandoned. A live,
+        // busy, or inaccessible listener must keep its path.
+        guard connected < 0, errno == ECONNREFUSED else { throw POSIXError(.EADDRINUSE) }
+        guard removeSocket(matching: identity) else { throw POSIXError(.EADDRINUSE) }
+    }
+
+    @discardableResult
+    private func removeSocket(matching identity: stat) -> Bool {
+        var current = stat()
+        guard lstat(socketPath, &current) == 0,
+              current.st_dev == identity.st_dev,
+              current.st_ino == identity.st_ino else { return false }
+        return unlink(socketPath) == 0
     }
 
     private func acceptLoop(listenerFD: Int32, generation: UInt64) {

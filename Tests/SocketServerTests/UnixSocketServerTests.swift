@@ -5,6 +5,106 @@ import CoreModel
 
 final class UnixSocketServerTests: XCTestCase {
     @MainActor
+    func testCompetingServerCannotDisconnectTheRunningHost() throws {
+        // A second app launch must not steal the socket used by Titio and
+        // scheduled runs, or remove it when that second launch shuts down.
+        let path = "/tmp/rc2-u-owner-\(UUID().uuidString.prefix(8)).sock"
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let owner = UnixSocketServer(socketPath: path, dispatcher: dispatcher)
+        let competing = UnixSocketServer(socketPath: path, dispatcher: dispatcher)
+        defer {
+            competing.stop()
+            owner.stop()
+            try? FileManager.default.removeItem(atPath: path + ".lock")
+        }
+        try owner.start()
+        let original = try FileManager.default.attributesOfItem(atPath: path)[.systemFileNumber] as? NSNumber
+
+        XCTAssertThrowsError(try competing.start())
+        competing.stop()
+        XCTAssertEqual(
+            try FileManager.default.attributesOfItem(atPath: path)[.systemFileNumber] as? NSNumber,
+            original
+        )
+
+        let client = try connectUnix(path: path)
+        defer { close(client) }
+        let request = #"{"jsonrpc":"2.0","id":"still-connected","method":"events.stream","params":{}}"# + "\n"
+        try writeAll(fd: client, data: Data(request.utf8))
+        XCTAssertTrue(try readLine(fd: client).contains(#""subscribed":true"#))
+    }
+
+    @MainActor
+    func testRepeatedStopDoesNotRemoveTheNextHostsSocket() throws {
+        let path = "/tmp/rc2-u-next-\(UUID().uuidString.prefix(8)).sock"
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let previous = UnixSocketServer(socketPath: path, dispatcher: dispatcher)
+        let next = UnixSocketServer(socketPath: path, dispatcher: dispatcher)
+        defer {
+            previous.stop()
+            next.stop()
+            try? FileManager.default.removeItem(atPath: path + ".lock")
+        }
+        try previous.start()
+        previous.stop()
+        try next.start()
+
+        previous.stop()
+
+        let client = try connectUnix(path: path)
+        defer { close(client) }
+        let request = #"{"jsonrpc":"2.0","id":"next-host","method":"events.stream","params":{}}"# + "\n"
+        try writeAll(fd: client, data: Data(request.utf8))
+        XCTAssertTrue(try readLine(fd: client).contains(#""subscribed":true"#))
+    }
+
+    @MainActor
+    func testExistingSocketIsRecoveredOnlyAfterItsListenerCloses() throws {
+        // A listener from an already-running build has no path lock. Preserve
+        // it while live, but reclaim the socket file left behind after a crash.
+        let path = "/tmp/rc2-u-stale-\(UUID().uuidString.prefix(8)).sock"
+        var previousFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(previousFD, 0)
+        let server = UnixSocketServer(socketPath: path, dispatcher: JSONRPCDispatcher(router: FakeRouter()))
+        defer {
+            if previousFD >= 0 { close(previousFD) }
+            server.stop()
+            try? FileManager.default.removeItem(atPath: path)
+            try? FileManager.default.removeItem(atPath: path + ".lock")
+        }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let bytes = path.utf8CString
+        let capacity = MemoryLayout.size(ofValue: address.sun_path)
+        withUnsafeMutablePointer(to: &address.sun_path) {
+            $0.withMemoryRebound(to: CChar.self, capacity: capacity) {
+                for index in bytes.indices { $0[index] = bytes[index] }
+            }
+        }
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(previousFD, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        XCTAssertEqual(bound, 0)
+        XCTAssertEqual(Darwin.listen(previousFD, 16), 0)
+
+        XCTAssertThrowsError(try server.start())
+        server.stop()
+        let liveClient = try connectUnix(path: path)
+        close(liveClient)
+
+        close(previousFD)
+        previousFD = -1
+        try server.start()
+        let client = try connectUnix(path: path)
+        defer { close(client) }
+        let request = #"{"jsonrpc":"2.0","id":"recovered","method":"events.stream","params":{}}"# + "\n"
+        try writeAll(fd: client, data: Data(request.utf8))
+        XCTAssertTrue(try readLine(fd: client).contains(#""subscribed":true"#))
+    }
+
+    @MainActor
     func testFailedStartClearsListenerOwnershipBeforeStopCanCloseAReusedFD() throws {
         // WHY: a failed start used to close the descriptor without resetting
         // listenFD. A later stop could then close an unrelated PTY that reused
