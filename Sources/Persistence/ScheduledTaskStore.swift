@@ -564,7 +564,7 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         try statement.bind(20, string(task.lastRunAt))
         try statement.bind(21, string(task.createdAt))
         try statement.bind(22, string(task.updatedAt))
-        try statement.bind(23, task.distillUltracode)
+        try statement.bind(23, task.distillExecutionMode.storageValue)
         try statement.bind(24, task.permissionMode.rawValue)
         try statement.bind(25, task.interactionMode.rawValue)
         try statement.bind(26, task.executionMode.rawValue)
@@ -599,7 +599,7 @@ public final class ScheduledTaskStore: @unchecked Sendable {
             distillMainEffortSelection: mainEffortSelection,
             distillReasoningEffortSelection: reasoningEffortSelection,
             routingMode: routingMode,
-            distillUltracode: statement.columnInt64(24) != 0,
+            distillExecutionMode: DistillExecutionMode(storageValue: Int(statement.columnInt64(24))),
             permissionMode: statement.columnText(25).flatMap(AgentPermissionMode.init(rawValue:)) ?? .fullAccess,
             interactionMode: statement.columnText(26).flatMap(AgentInteractionMode.init(rawValue:)) ?? .default,
             executionMode: statement.columnText(27).flatMap(AgentExecutionMode.init(rawValue:)) ?? .local,

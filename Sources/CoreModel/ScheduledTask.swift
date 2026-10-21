@@ -34,7 +34,7 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
     /// before scheduled Auto routing existed. Missing values mean Manual.
     public var routingMode: AgentRoutingMode?
     /// Same run options a new Agent App message carries.
-    public var distillUltracode: Bool
+    public var distillExecutionMode: DistillExecutionMode
     public var permissionMode: AgentPermissionMode
     public var interactionMode: AgentInteractionMode
     public var executionMode: AgentExecutionMode
@@ -64,7 +64,7 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
         routingMode: AgentRoutingMode = .manual,
-        distillUltracode: Bool = false,
+        distillExecutionMode: DistillExecutionMode = .normal,
         permissionMode: AgentPermissionMode = .fullAccess,
         interactionMode: AgentInteractionMode = .default,
         executionMode: AgentExecutionMode = .local,
@@ -92,7 +92,7 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         self.distillMainEffortSelection = distillMainEffortSelection
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
         self.routingMode = routingMode
-        self.distillUltracode = distillUltracode
+        self.distillExecutionMode = distillExecutionMode
         self.permissionMode = permissionMode
         self.interactionMode = interactionMode
         self.executionMode = executionMode
@@ -111,7 +111,8 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         case id, title, prompt, workspaceID, workspacePathSnapshot, runAsUser, runAsUID
         case provider, providerInstanceID, model, reasoningEffort, reasoningModel
         case distillMainEffortSelection, distillReasoningEffortSelection, routingMode
-        case distillUltracode, permissionMode, interactionMode, executionMode, baseBranch
+        case permissionMode, interactionMode, executionMode, baseBranch
+        case distillExecutionMode = "distillUltracode"
         case recurrence, timeZoneIdentifier, isEnabled, nextRunAt, lastRunAt, createdAt, updatedAt
     }
 
@@ -133,7 +134,7 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
         routingMode = try c.decodeIfPresent(AgentRoutingMode.self, forKey: .routingMode)
-        distillUltracode = try c.decodeIfPresent(Bool.self, forKey: .distillUltracode) ?? false
+        distillExecutionMode = try c.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .normal
         permissionMode = try c.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode) ?? .fullAccess
         interactionMode = try c.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode) ?? .default
         executionMode = try c.decodeIfPresent(AgentExecutionMode.self, forKey: .executionMode) ?? .local

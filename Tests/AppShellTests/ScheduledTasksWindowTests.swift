@@ -145,7 +145,7 @@ final class ScheduledTasksWindowTests: XCTestCase {
         draft.prompt = "Summarize"
         draft.provider = .distill
         draft.model = "auto"
-        draft.distillUltracode = true
+        draft.distillExecutionMode = .ultrafast
         draft.permissionMode = .autoAcceptEdits
 
         botsVM.beginScheduleTask(botID: bot.id, carrying: draft)
@@ -155,7 +155,7 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertEqual(carried.name, "Digest")
         XCTAssertEqual(carried.prompt, "Summarize")
         XCTAssertEqual(carried.spec.model, "auto")
-        XCTAssertEqual(carried.spec.distillUltracode, true)
+        XCTAssertEqual(carried.spec.distillExecutionMode, .ultrafast)
         XCTAssertEqual(carried.spec.permissionMode, .autoAcceptEdits)
         XCTAssertEqual(carried.spec.frequencyRules, draft.frequencyRules)
     }

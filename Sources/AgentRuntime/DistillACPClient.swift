@@ -1261,6 +1261,21 @@ public final class DistillACPClient: @unchecked Sendable {
         )
         return response["enabled"] as? Bool ?? enabled
     }
+
+    /// Distill extension method that selects the session's one exclusive execution mode.
+    static let executionModeSetMethod = "_x.ai/session/execution_mode/set"
+    /// Selects `mode`; returns the mode Distill confirmed (Normal, UltraFast, UltraCode or UltraSave).
+    @discardableResult
+    func setExecutionMode(sessionId: String, mode: DistillExecutionMode) async throws -> DistillExecutionMode {
+        let response = try await requestJSONObject(
+            method: Self.executionModeSetMethod,
+            params: ["sessionId": sessionId, "mode": mode.rawValue],
+            timeout: 15
+        )
+        let nested = response["result"] as? JSONObject
+        let raw = (response["mode"] as? String) ?? (nested?["mode"] as? String)
+        return raw.flatMap(DistillExecutionMode.init(rawValue:)) ?? mode
+    }
     /// Distill extension method that deletes a scheduled (`/loop`) task.
     static let schedulerDeleteMethod = "_x.ai/scheduler/delete"
     /// True when Distill deleted the task (`{"result":{"deleted":true}}` nested or flat).

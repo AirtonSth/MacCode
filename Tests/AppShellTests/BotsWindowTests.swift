@@ -7843,21 +7843,21 @@ final class BotsWindowTests: XCTestCase {
         let footerStart = try XCTUnwrap(source.range(of: "private var deskUnlinkedFooter: some View"))
         let footer = source[footerStart.lowerBound...]
         for identifier in [
-            "bots.desk.runAsUser.menu", "bots.desk.distill.ultracode",
+            "bots.desk.runAsUser.menu", "bots.desk.distill.mode",
             "bots.desk.permission.menu", "bots.desk.execution.location",
         ] {
             XCTAssertTrue(footer.contains(identifier), "empty Desk footer must expose \\(identifier)")
         }
     }
 
-    func test_deskRoutingUltracodeRoundTripsAndMissingLegacyFieldDefaultsOff() throws {
-        let routing = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "main-a", distillUltracode: true)
+    func test_deskRoutingExecutionModeRoundTripsAndMissingLegacyFieldDefaultsToNormal() throws {
+        let routing = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "main-a", distillExecutionMode: .ultrasave)
         let restored = try JSONDecoder().decode(BotDeskRouting.self, from: JSONEncoder().encode(routing))
-        XCTAssertTrue(restored.distillUltracode)
-        XCTAssertTrue(restored.modelSelection.distillUltracode, "first-thread model selection must receive Ultracode")
+        XCTAssertEqual(restored.distillExecutionMode, .ultrasave)
+        XCTAssertEqual(restored.modelSelection.distillExecutionMode, .ultrasave, "first-thread model selection must receive the mode")
 
         let legacy = Data(#"{"provider":"distill","providerInstanceID":"distill","model":"main-a","routingMode":"manual","permissionMode":"supervised"}"#.utf8)
-        XCTAssertFalse(try JSONDecoder().decode(BotDeskRouting.self, from: legacy).distillUltracode)
+        XCTAssertEqual(try JSONDecoder().decode(BotDeskRouting.self, from: legacy).distillExecutionMode, .normal)
     }
 
     func test_deskRoutingDecodesLegacyPayloadWithoutRunAsUser() throws {

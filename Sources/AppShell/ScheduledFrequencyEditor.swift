@@ -165,19 +165,7 @@ struct ScheduledFrequencyEditor: View {
     }
 
     private func formRow<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(spacing: 0) {
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            HStack {
-                Text(label)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                Spacer(minLength: DS.Space.lg)
-                content()
-                    .frame(minWidth: 160, alignment: .trailing)
-            }
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.vertical, DS.Space.md)
-        }
+        ScheduleEditorRow(label, control: content)
     }
 
     private func dayLabel(_ day: ScheduledWeekday) -> String {

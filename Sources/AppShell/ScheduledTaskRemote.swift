@@ -68,7 +68,8 @@ public enum ScheduledTaskRemoteWire {
             "reasoning_model": task.reasoningModel.map(JSONValue.string) ?? .null,
             "main_effort": effort(task.distillMainEffortSelection),
             "reasoning_model_effort": effort(task.distillReasoningEffortSelection),
-            "ultracode": .bool(task.distillUltracode),
+            "ultracode": .bool(task.distillExecutionMode == .ultracode),
+            "distill_mode": .string(task.distillExecutionMode.rawValue),
             "permission_mode": .string(task.permissionMode.rawValue),
             "plan_mode": .bool(task.interactionMode == .plan),
             "execution_mode": .string(task.executionMode.rawValue),
@@ -95,7 +96,8 @@ public enum ScheduledTaskRemoteWire {
             "bot_avatar": .string(bot.avatarSymbol),
             "schedule_spec_json": .string(routine.definition.scheduleSpecJSON),
             "summary": .string(spec?.displayNote() ?? routine.definition.scheduleNote),
-            "ultracode": .bool(spec?.distillUltracode ?? false),
+            "ultracode": .bool(spec?.distillExecutionMode == .ultracode),
+            "distill_mode": .string((spec?.distillExecutionMode ?? .normal).rawValue),
             "permission_mode": .string((spec?.permissionMode ?? .fullAccess).rawValue),
             "enabled": .bool(routine.activation.isEnabled),
         ])
@@ -185,7 +187,11 @@ extension AppCommandRouter {
         if params["reasoning_model_effort"] != nil {
             draft.distillReasoningEffortSelection = ScheduledTaskRemoteWire.effort(params["reasoning_model_effort"])
         }
-        draft.distillUltracode = params["ultracode"]?.boolValue ?? draft.distillUltracode
+        if let raw = params["distill_mode"]?.stringValue, let mode = DistillExecutionMode(rawValue: raw) {
+            draft.distillExecutionMode = mode
+        } else if let legacy = params["ultracode"]?.boolValue {
+            draft.distillExecutionMode = legacy ? .ultracode : .normal
+        }
         if let raw = params["permission_mode"]?.stringValue, let mode = AgentPermissionMode(rawValue: raw) { draft.permissionMode = mode }
         if let plan = params["plan_mode"]?.boolValue { draft.interactionMode = plan ? .plan : .default }
         if let raw = params["execution_mode"]?.stringValue, let mode = AgentExecutionMode(rawValue: raw) { draft.executionMode = mode }

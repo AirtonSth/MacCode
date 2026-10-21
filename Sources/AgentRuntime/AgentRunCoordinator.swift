@@ -1161,7 +1161,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             reasoningModel: request.reasoningModel,
             distillMainEffortSelection: request.distillMainEffortSelection,
             distillReasoningEffortSelection: request.distillReasoningEffortSelection,
-            distillUltracode: request.distillUltracode,
+            distillExecutionMode: request.distillExecutionMode,
             serviceTier: request.serviceTier,
             interactionMode: request.interactionMode,
             providerBinary: request.providerBinary,
@@ -1214,7 +1214,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 reasoningModel: request.reasoningModel,
                 distillMainEffortSelection: request.distillMainEffortSelection,
                 distillReasoningEffortSelection: request.distillReasoningEffortSelection,
-                distillUltracode: request.distillUltracode,
+                distillExecutionMode: request.distillExecutionMode,
                 serviceTier: request.serviceTier,
                 interactionMode: request.interactionMode,
                 providerBinary: request.providerBinary,
@@ -1491,7 +1491,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             reasoningModel: request.reasoningModel,
             distillMainEffortSelection: request.distillMainEffortSelection,
             distillReasoningEffortSelection: request.distillReasoningEffortSelection,
-            distillUltracode: request.distillUltracode,
+            distillExecutionMode: request.distillExecutionMode,
             serviceTier: recoveryContext?.serviceTier ?? request.serviceTier,
             interactionMode: recoveryContext?.interactionMode ?? request.interactionMode,
             providerBinary: request.providerBinary,
@@ -1966,8 +1966,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     ? admission.route.selection.distillMainEffortSelection : nil,
                 distillReasoningEffortSelection: admission.route.provider == .distill
                     ? admission.route.selection.distillReasoningEffortSelection : nil,
-                distillUltracode: admission.route.provider == .distill
-                    ? admission.route.selection.distillUltracode : false,
+                distillExecutionMode: admission.route.provider == .distill
+                    ? admission.route.selection.distillExecutionMode : .normal,
                 serviceTier: admission.route.selection.serviceTier,
                 interactionMode: request.interactionMode,
                 providerBinary: launch?.binary ?? request.providerBinary,

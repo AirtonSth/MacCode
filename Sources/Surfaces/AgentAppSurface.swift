@@ -641,7 +641,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var reasoningModel: String?
     @Published public var distillMainEffortSelection: AgentEffortSelection = .automatic
     @Published public var distillReasoningEffortSelection: AgentEffortSelection = .automatic
-    @Published public var distillUltracode = false
+    @Published public var distillExecutionMode: DistillExecutionMode = .normal
     @Published public var serviceTier: AgentServiceTier = .auto
     @Published public private(set) var routingMode: AgentRoutingMode = .manual
     @Published public var executionMode: AgentExecutionMode = .local
@@ -2512,7 +2512,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         distillMainEffortSelection = manual.distillMainEffortSelection
             ?? .fixed(manual.reasoningEffort)
         distillReasoningEffortSelection = manual.distillReasoningEffortSelection ?? .automatic
-        distillUltracode = manual.distillUltracode
+        distillExecutionMode = manual.distillExecutionMode
         serviceTier = manual.serviceTier
         executionMode = selectedThread.executionMode
         baseBranch = selectedThread.baseBranch ?? gitBranch ?? "main"
@@ -4246,8 +4246,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if Self.shouldAssignIfChanged(current: distillReasoningEffortSelection, next: nextReasoningEffortSelection) {
             distillReasoningEffortSelection = nextReasoningEffortSelection
         }
-        if Self.shouldAssignIfChanged(current: distillUltracode, next: manual.distillUltracode) {
-            distillUltracode = manual.distillUltracode
+        if Self.shouldAssignIfChanged(current: distillExecutionMode, next: manual.distillExecutionMode) {
+            distillExecutionMode = manual.distillExecutionMode
         }
         if Self.shouldAssignIfChanged(current: serviceTier, next: manual.serviceTier) {
             serviceTier = manual.serviceTier
@@ -5974,7 +5974,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             serviceTier: serviceTier,
             distillMainEffortSelection: provider == .distill ? distillMainEffortSelection : nil,
             distillReasoningEffortSelection: provider == .distill ? distillReasoningEffortSelection : nil,
-            distillUltracode: provider == .distill && distillUltracode
+            distillExecutionMode: provider == .distill ? distillExecutionMode : .normal
         )
     }
 
@@ -7319,9 +7319,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         persistThreadConfig()
     }
 
-    public func setDistillUltracode(_ enabled: Bool) {
+    public func setDistillExecutionMode(_ mode: DistillExecutionMode) {
         guard provider == .distill else { return }
-        distillUltracode = enabled
+        distillExecutionMode = mode
         persistThreadConfig()
     }
 
@@ -9744,7 +9744,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 ? runModelSelection.distillMainEffortSelection : nil,
             distillReasoningEffortSelection: runProvider == .distill
                 ? runModelSelection.distillReasoningEffortSelection : nil,
-            distillUltracode: runProvider == .distill && runModelSelection.distillUltracode,
+            distillExecutionMode: runProvider == .distill ? runModelSelection.distillExecutionMode : .normal,
             serviceTier: runServiceTier,
             interactionMode: interactionMode,
             providerBinary: launchConfig?.binary,
@@ -18608,7 +18608,7 @@ public struct AgentAppView: View {
             attachUnavailableReason: composerChromeMode == .relay
                 ? AgentComposerChromePresentation.relayAttachUnavailable : nil,
             ultracodeBorder: AgentUltracodeBorderPresentation.shows(
-                provider: vm.provider, ultracode: vm.distillUltracode)
+                provider: vm.provider, ultracode: vm.distillExecutionMode == .ultracode)
         )
     }
 
@@ -18673,12 +18673,11 @@ public struct AgentAppView: View {
                             }
                         }
                     )
-                    AgentUltracodeChip(
-                        isOn: vm.distillUltracode,
+                    AgentExecutionModeCapsule(
+                        selected: vm.distillExecutionMode,
                         disabled: vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun,
-                        help: "Plan, fan out to parallel subagents, then integrate and verify",
-                        accessibilityIdentifier: "agent.distill.ultracode",
-                        onToggle: { vm.setDistillUltracode($0) }
+                        accessibilityIdentifier: "agent.distill.mode",
+                        onSelect: { vm.setDistillExecutionMode($0) }
                     )
                 } else { modelMenu }
             }

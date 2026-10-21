@@ -48,7 +48,7 @@ Use `DS.Palette` (SwiftUI) or `DS.NS` (AppKit). No `Color(hex:)`, `Color.blue`/`
 
 - Tinted fills use the tone color at low opacity: callouts and selected cards 0.10, pills and badges 0.12–0.16, icon tiles 0.14 with 0.22 stroke.
 - **Unread / count badges are `accent`**, never `Color.blue`.
-- **Auto is purple** (`ultracode`) everywhere: Auto model, Auto profile, Auto effort, Ultracode chip, new-conversation icon. Do not introduce a second Auto color.
+- **Auto is purple** (`ultracode`) everywhere: Auto model, Auto profile, Auto effort, the Ultracode mode, new-conversation icon. Do not introduce a second Auto color.
 - **Danger is for risk**, not for "on". A toggle being enabled is not dangerous; use `accent` or `success` unless the state is actually risky (Full access).
 - **Permission tones:** Supervised `textSecondary`, Auto-edit `warning`, Full access `danger`.
 - **Effort scale:** levels come from the model's `supportedReasoningEfforts`, ordered lightest→heaviest; tint runs blue→red by position (`Color(hue: 0.6 * (1 - t), saturation: 0.75, brightness: 0.95)`), Auto is `ultracode`. Never hard-code effort levels in UI.
@@ -81,7 +81,7 @@ SF system font only, via `DS.Font`. Monospace only for code, commands, paths, br
 ## 6. Iconography
 
 - SF Symbols only. Decorative icons are `.accessibilityHidden(true)`.
-- Fixed meanings: `sparkles` = Auto / new conversation; `speedometer` = effort; `wand.and.stars` = Ultracode; `lock.shield` / `exclamationmark.shield.fill` = permission / Full access; `arrow.triangle.branch` = git branch; `plus` / `plus.circle.fill` = create; `xmark` = close; `chevron.left` = back.
+- Fixed meanings: `sparkles` = Auto / new conversation; `speedometer` = effort; `wand.and.stars` = Ultracode mode, `bolt.fill` = Ultrafast, `leaf.fill` = Ultrasave, `circle.dotted` = Normal; `lock.shield` / `exclamationmark.shield.fill` = permission / Full access; `arrow.triangle.branch` = git branch; `plus` / `plus.circle.fill` = create; `xmark` = close; `chevron.left` = back.
 - **Icon tiles** (`AgentChoiceIconTile`): rounded square, radius `size * 0.28`, tint fill 0.14, stroke 0.22. Sizes: 24 (settings nav, menu rows), 30 (cards), 34 (sheet header), 40 (empty state), 56 (settings hero).
 
 ## 7. Layout
@@ -93,6 +93,10 @@ SF system font only, via `DS.Font`. Monospace only for code, commands, paths, br
 - **Settings:** two columns at ≥ 640 pt (nav list + page), a menu below that. Page = hero (56 tile, `title2`, subtitle, `surfaceRaised`, radius modal) then `DSSectionHeaderG` sections of rows.
 - **Grids:** choice grids are 2 columns, spacing `md`. Wide editors may place cards side by side and stack them when narrow.
 - **Max widths:** user bubble 420; empty-state subtitle 360–420; inline editors 880; sheet bodies scroll at 560 max height.
+
+## 7b. Responsive (mandatory)
+
+Every screen must work at any window width, from the narrowest the window allows to full screen. Cap content with `maxWidth` and center it; never fix widths that can exceed the container. Rows with a label and a control use `ViewThatFits` (side by side, then stacked). Wrapping text uses `fixedSize(horizontal: false, vertical: true)`. Two-column layouts collapse to one below about 640 pt (as Settings does). Verify narrow and wide in the running app.
 
 ## 8. Components (use these; do not fork)
 
@@ -112,9 +116,11 @@ SF system font only, via `DS.Font`. Monospace only for code, commands, paths, br
 
 **Composer (`Surfaces/AgentComposerChrome.swift`, `AgentModelPopover.swift`)**
 
-- Chip order, left to right: Run as → Source/account → Main pill → Worker pill → Ultracode → Permission → Execution (Local/Worktree).
-- `AgentComposerCapsule` (`.raised` or `.tinted`), `AgentModelPillLabel` ("Main"/"Worker" prefix in `caption2`, model in `caption` medium, effort after ` · `), `AgentUltracodeChip`.
+- Chip order, left to right: Run as → Source/account → Main pill → Worker pill → Mode → Permission → Execution (Local/Worktree).
+- `AgentComposerCapsule` (`.raised` or `.tinted`), `AgentModelPillLabel` ("Main"/"Worker" prefix in `caption2`, model in `caption` medium, effort after ` · `), `AgentExecutionModeCapsule`.
 - Compact menus (popovers): `AgentCompactMenuRow`, `AgentCompactMenuSection`, `AgentCompactMenuDivider`. The checkmark column is always reserved so selection does not shift text.
+
+**Execution mode** — Distill has one exclusive mode per session: Normal, Ultrafast, Ultracode, Ultrasave (`DistillExecutionMode`, wire values `normal|ultrafast|ultracode|ultrasave`). It is one capsule, `AgentExecutionModeCapsule` ("Mode · Normal"), that opens an `AgentChoiceSheet` with one card per mode. Never add a per-mode toggle or chip. Tints: Normal `textSecondary`, Ultrafast `warning`, Ultracode purple (gradient when active), Ultrasave `success`. Mount it wherever a message can set it: Agent App, Bot Desk and both Schedule Tasks editors.
 
 **Grouping and dividers**
 

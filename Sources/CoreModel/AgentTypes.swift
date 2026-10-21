@@ -403,6 +403,78 @@ public enum AgentAttachmentResolver {
     }
 }
 
+/// Distill session execution mode: exactly one is active per session.
+/// Wire values match `_x.ai/session/execution_mode/set`.
+public enum DistillExecutionMode: String, Sendable, CaseIterable, Equatable, Hashable {
+    case normal
+    case ultrafast
+    case ultracode
+    case ultrasave
+
+    public var displayName: String {
+        switch self {
+        case .normal: return "Normal"
+        case .ultrafast: return "Ultrafast"
+        case .ultracode: return "Ultracode"
+        case .ultrasave: return "Ultrasave"
+        }
+    }
+
+    public var pickerHelpText: String {
+        switch self {
+        case .normal: return "Standard behavior: plans, delegates and verifies as needed"
+        case .ultrafast: return "Direct execution and parallel independent work"
+        case .ultracode: return "Plan, fan out to parallel subagents, then integrate and verify"
+        case .ultrasave: return "Prioritize token economy with direct-work tools only"
+        }
+    }
+
+    /// Integer kept in `scheduled_tasks.distill_ultracode`; 0 and 1 keep the legacy flag's meaning.
+    public var storageValue: Int {
+        switch self {
+        case .normal: return 0
+        case .ultracode: return 1
+        case .ultrafast: return 2
+        case .ultrasave: return 3
+        }
+    }
+
+    public init(storageValue: Int) {
+        switch storageValue {
+        case 1: self = .ultracode
+        case 2: self = .ultrafast
+        case 3: self = .ultrasave
+        default: self = .normal
+        }
+    }
+}
+
+/// Persisted as the legacy Ultracode Bool for Normal and Ultracode, so stored data and older
+/// readers keep working; Ultrafast and Ultrasave persist as their wire string.
+extension DistillExecutionMode: Codable {
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let legacy = try? container.decode(Bool.self) {
+            self = legacy ? .ultracode : .normal
+            return
+        }
+        let raw = try container.decode(String.self)
+        guard let mode = DistillExecutionMode(rawValue: raw) else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unknown Distill execution mode \(raw)")
+        }
+        self = mode
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .normal: try container.encode(false)
+        case .ultracode: try container.encode(true)
+        case .ultrafast, .ultrasave: try container.encode(rawValue)
+        }
+    }
+}
+
 public struct AgentEffortSelection: Codable, Sendable, Equatable, Hashable {
     /// Nil means Auto; a value pins an advertised effort level.
     public var effort: AgentReasoningEffort?
@@ -433,7 +505,7 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
     /// Nil means Auto for a selected Reasoning model and Off when no model is selected.
     public var distillReasoningEffortSelection: AgentEffortSelection?
     /// Distill session-level Ultracode orchestration mode; independent of effort.
-    public var distillUltracode: Bool
+    public var distillExecutionMode: DistillExecutionMode
 
     public var effectiveModel: String {
         let custom = customModelId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -448,7 +520,7 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
         serviceTier: AgentServiceTier = .auto,
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
-        distillUltracode: Bool = false
+        distillExecutionMode: DistillExecutionMode = .normal
     ) {
         self.provider = provider
         self.modelId = modelId
@@ -457,12 +529,13 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
         self.serviceTier = serviceTier
         self.distillMainEffortSelection = distillMainEffortSelection
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
-        self.distillUltracode = distillUltracode
+        self.distillExecutionMode = distillExecutionMode
     }
 
     private enum CodingKeys: String, CodingKey {
         case provider, modelId, customModelId, reasoningEffort, serviceTier
-        case distillMainEffortSelection, distillReasoningEffortSelection, distillUltracode
+        case distillMainEffortSelection, distillReasoningEffortSelection
+        case distillExecutionMode = "distillUltracode"
     }
 
     public init(from decoder: Decoder) throws {
@@ -474,7 +547,7 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
         serviceTier = try c.decode(AgentServiceTier.self, forKey: .serviceTier)
         distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
-        distillUltracode = try c.decodeIfPresent(Bool.self, forKey: .distillUltracode) ?? false
+        distillExecutionMode = try c.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .normal
     }
 }
 
@@ -721,7 +794,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let distillMainEffortSelection: AgentEffortSelection?
     public let distillReasoningEffortSelection: AgentEffortSelection?
     /// Distill Ultracode mode for this turn's session.
-    public let distillUltracode: Bool
+    public let distillExecutionMode: DistillExecutionMode
     public let serviceTier: AgentServiceTier
     public let interactionMode: AgentInteractionMode
     public let providerBinary: String?
@@ -767,7 +840,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         reasoningModel: String? = nil,
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
-        distillUltracode: Bool = false,
+        distillExecutionMode: DistillExecutionMode = .normal,
         serviceTier: AgentServiceTier = .auto,
         interactionMode: AgentInteractionMode = .default,
         providerBinary: String? = nil,
@@ -793,7 +866,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.reasoningModel = reasoningModel
         self.distillMainEffortSelection = distillMainEffortSelection
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
-        self.distillUltracode = distillUltracode
+        self.distillExecutionMode = distillExecutionMode
         self.serviceTier = serviceTier
         self.interactionMode = interactionMode
         self.providerBinary = providerBinary
@@ -806,7 +879,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, reasoningModel, distillMainEffortSelection, distillReasoningEffortSelection, distillUltracode, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
+        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, reasoningModel, distillMainEffortSelection, distillReasoningEffortSelection, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
+        case distillExecutionMode = "distillUltracode"
     }
 
     public init(from decoder: Decoder) throws {
@@ -826,7 +900,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         reasoningModel = try c.decodeIfPresent(String.self, forKey: .reasoningModel)
         distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
-        distillUltracode = try c.decodeIfPresent(Bool.self, forKey: .distillUltracode) ?? false
+        distillExecutionMode = try c.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .normal
         serviceTier = try c.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         interactionMode = try c.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode) ?? .default
         providerBinary = try c.decodeIfPresent(String.self, forKey: .providerBinary)
@@ -852,7 +926,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
             && lhs.reasoningModel == rhs.reasoningModel
             && lhs.distillMainEffortSelection == rhs.distillMainEffortSelection
             && lhs.distillReasoningEffortSelection == rhs.distillReasoningEffortSelection
-            && lhs.distillUltracode == rhs.distillUltracode
+            && lhs.distillExecutionMode == rhs.distillExecutionMode
             && lhs.serviceTier == rhs.serviceTier
             && lhs.interactionMode == rhs.interactionMode
             && lhs.providerBinary == rhs.providerBinary

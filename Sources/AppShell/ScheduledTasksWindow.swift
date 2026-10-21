@@ -30,7 +30,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
     public var distillMainEffortSelection: AgentEffortSelection?
     public var distillReasoningEffortSelection: AgentEffortSelection?
     public var routingMode: AgentRoutingMode
-    public var distillUltracode: Bool
+    public var distillExecutionMode: DistillExecutionMode
     public var permissionMode: AgentPermissionMode
     public var interactionMode: AgentInteractionMode
     public var executionMode: AgentExecutionMode
@@ -56,7 +56,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         distillMainEffortSelection = task?.distillMainEffortSelection
         distillReasoningEffortSelection = task?.distillReasoningEffortSelection
         routingMode = provider == .distill ? .manual : (task?.effectiveRoutingMode ?? .auto)
-        distillUltracode = task?.distillUltracode ?? false
+        distillExecutionMode = task?.distillExecutionMode ?? .normal
         permissionMode = task?.permissionMode ?? .fullAccess
         interactionMode = task?.interactionMode ?? .default
         executionMode = task?.executionMode ?? .local
@@ -107,7 +107,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
             distillReasoningEffortSelection: provider == .distill
                 ? (distillReasoningEffortSelection ?? .automatic) : nil,
             routingMode: provider == .distill ? .manual : routingMode,
-            distillUltracode: provider == .distill && distillUltracode,
+            distillExecutionMode: provider == .distill ? distillExecutionMode : .normal,
             permissionMode: interactionMode == .plan ? .supervised : permissionMode,
             interactionMode: interactionMode,
             executionMode: executionMode,
@@ -1512,211 +1512,134 @@ private struct ScheduledTaskEditorView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: DS.Space.lg) {
-                Button(action: onBack) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
+        ScheduleEditorPage(
+            title: isNew ? "New Scheduled Task" : "Edit Scheduled Task",
+            subtitle: "Run an agent prompt on a schedule, in a workspace, while MacCode is open.",
+            saveTitle: vm.isSavingEditor ? "Checking…" : "Save Task",
+            saveIdentifier: "scheduledTasks.editor.save",
+            isSaving: vm.isSavingEditor,
+            onBack: onBack,
+            onSave: { confirmAndSave() },
+            content: {
+                ScheduleEditorSection("Task", identifier: "editorSection.Task") {
+                    VStack(alignment: .leading, spacing: DS.Space.md) {
+                        ScheduleEditorTextField(
+                            placeholder: "Title, e.g. Daily dependency scan",
+                            text: $draft.title,
+                            identifier: "scheduledTasks.editor.title"
+                        )
+                        ScheduleEditorPromptBox(
+                            placeholder: "Describe what the agent should do",
+                            text: $draft.prompt,
+                            identifier: "scheduledTasks.editor.prompt",
+                            label: "Prompt"
+                        )
+                    }
+                    .padding(DS.Space.md)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Back")
-                .disabled(vm.isSavingEditor)
 
-                Text(isNew ? "New Scheduled Task" : "Edit Scheduled Task")
-                    .font(DS.Font.title2.weight(.semibold))
-                    .foregroundColor(DS.Palette.text)
-                Spacer()
-                Button("Cancel", action: onCancel)
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .disabled(vm.isSavingEditor)
-                    .keyboardShortcut(.cancelAction)
-                Button(vm.isSavingEditor ? "Checking…" : "Save Task") { confirmAndSave() }
-                    .buttonStyle(DSPrimaryButtonStyle())
-                    .disabled(vm.isSavingEditor)
-                    .keyboardShortcut(.defaultAction)
-                    .accessibilityIdentifier("scheduledTasks.editor.save")
-            }
-            .padding(.horizontal, DS.Space.xxl)
-            .padding(.vertical, DS.Space.xl)
-            .dsBar(edge: .bottom)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: DS.Space.xxl) {
-                    labeledField("Scheduled task title") {
-                        TextField("e.g., Daily dependency scan", text: $draft.title)
-                            .textFieldStyle(.plain)
-                            .padding(.horizontal, DS.Space.lg)
-                            .padding(.vertical, DS.Space.md)
-                            .background(DS.Palette.surfaceRaised)
-                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                            )
-                            .accessibilityIdentifier("scheduledTasks.editor.title")
-                    }
-
-                    labeledField("Prompt") {
-                        ZStack(alignment: .topLeading) {
-                            if draft.prompt.isEmpty {
-                                Text("Describe what ChatGPT should do")
-                                    .foregroundColor(DS.Palette.textTertiary)
-                                    .padding(.horizontal, DS.Space.lg)
-                                    .padding(.vertical, DS.Space.lg)
-                                    .allowsHitTesting(false)
+                // Contract section names retained for chrome regression tests.
+                let _ = ["Basics", "Agent", "Schedule", "Prompt"] as [String]
+                editorGroup("Details") {
+                    formRow("Workspace", showsDivider: false) {
+                        Picker("Workspace", selection: $draft.workspaceID) {
+                            Text("Select a workspace").tag(WorkspaceID?.none)
+                            ForEach(vm.workspaces) { workspace in
+                                Text(workspace.name).tag(Optional(workspace.id))
                             }
-                            TextEditor(text: $draft.prompt)
-                                .font(DS.Font.body)
-                                .foregroundColor(DS.Palette.text)
-                                .scrollContentBackground(.hidden)
-                                .frame(minHeight: 120)
-                                .padding(.horizontal, DS.Space.md)
-                                .padding(.vertical, DS.Space.md)
                         }
-                        .background(DS.Palette.surfaceRaised)
-                        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                        )
-                        .accessibilityIdentifier("scheduledTasks.editor.prompt")
-                        .accessibilityLabel("Prompt")
+                        .labelsHidden()
+                        .fixedSize()
+                        .onChange(of: draft.workspaceID) { _, id in
+                            draft.workspacePathSnapshot = vm.workspaces.first { $0.id == id }?.cwd ?? ""
+                        }
                     }
-
-                    // Contract section names retained for chrome regression tests.
-                    let _ = ["Basics", "Agent", "Schedule", "Prompt"] as [String]
-                    editorGroup("Details") {
-                        formRow("Workspace") {
-                            Picker("Workspace", selection: $draft.workspaceID) {
-                                Text("Select a workspace").tag(WorkspaceID?.none)
-                                ForEach(vm.workspaces) { workspace in
-                                    Text(workspace.name).tag(Optional(workspace.id))
+                    formRow("Run as") {
+                        editorRunAsCapsule
+                    }
+                    // Parity with Agent App: one Provider/Source capsule only. Instance id is
+                    // derived from the selected provider's primary snapshot and stays in the model.
+                    if AgentSourceCapsulePresentation.isVisible(entryCount: editorSourceEntries.count) {
+                        formRow("Provider") {
+                            editorSourceCapsule
+                                .accessibilityIdentifier("scheduledTasks.editor.provider")
+                        }
+                    }
+                    if draft.provider != .distill {
+                        formRow("Model routing") {
+                            HStack(spacing: DS.Space.sm) {
+                                if vm.providersLoading {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .accessibilityLabel("Loading providers")
                                 }
-                            }
-                            .labelsHidden()
-                            .onChange(of: draft.workspaceID) { _, id in
-                                draft.workspacePathSnapshot = vm.workspaces.first { $0.id == id }?.cwd ?? ""
-                            }
-                        }
-                        formRow("Run as user") {
-                            editorRunAsCapsule
-                        }
-                        // Parity with Agent App: one Provider/Source capsule only
-                        // (Codex / Claude / Grok). Instance id is derived from the
-                        // selected provider's primary snapshot and stays in the model.
-                        if AgentSourceCapsulePresentation.isVisible(entryCount: editorSourceEntries.count) {
-                            formRow("Provider") {
-                                editorSourceCapsule
-                                    .accessibilityIdentifier("scheduledTasks.editor.provider")
-                            }
-                        }
-                        if draft.provider != .distill {
-                            formRow("Model routing") {
-                                HStack(spacing: DS.Space.sm) {
-                                    if vm.providersLoading {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                            .accessibilityLabel("Loading providers")
-                                    }
-                                    Toggle("Auto", isOn: Binding(
-                                        get: { draft.routingMode == .auto },
-                                        set: { setAutoRoutingEnabled($0) }
-                                    ))
-                                    .toggleStyle(.switch)
-                                    .tint(DS.Palette.success)
-                                    .accessibilityIdentifier("scheduledTasks.editor.autoRouting")
-                                }
-                            }
-                        }
-                        // Parity with Agent App: Auto never picks the provider/Source —
-                        // only the model within the selected host at run time.
-                        if draft.routingMode == .auto {
-                            formRow("Model") {
-                                Text("Auto selects the best model for the selected provider at run time.")
-                                    .font(DS.Font.caption)
-                                    .foregroundColor(DS.Palette.textSecondary)
-                                    .multilineTextAlignment(.trailing)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        } else {
-                            formRow("Model") {
-                                Button {
-                                    showModelOptions.toggle()
-                                } label: {
-                                    AgentModelPillLabel(presentation: editorModelPillPresentation)
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityIdentifier("scheduledTasks.editor.model")
-                                .popover(isPresented: $showModelOptions, arrowEdge: .bottom) {
-                                    editorModelPopover
-                                }
+                                Toggle("Auto", isOn: Binding(
+                                    get: { draft.routingMode == .auto },
+                                    set: { setAutoRoutingEnabled($0) }
+                                ))
+                                .toggleStyle(.switch)
+                                .tint(DS.Palette.success)
+                                .accessibilityIdentifier("scheduledTasks.editor.autoRouting")
                             }
                         }
                     }
+                    // Parity with Agent App: Auto never picks the provider/Source,
+                    // only the model within the selected host at run time.
+                    if draft.routingMode == .auto {
+                        formRow("Model") {
+                            Text("Auto selects the best model for the selected provider at run time.")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.textSecondary)
+                                .multilineTextAlignment(.trailing)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } else if draft.provider == .distill {
+                        // Same Main / Worker pills and modal sheets as the Agent App and Bot Desk composer.
+                        formRow("Model") { editorDistillModelPills }
+                    } else {
+                        formRow("Model") {
+                            Button {
+                                showModelOptions.toggle()
+                            } label: {
+                                AgentModelPillLabel(presentation: editorModelPillPresentation)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityIdentifier("scheduledTasks.editor.model")
+                            .popover(isPresented: $showModelOptions, arrowEdge: .bottom) {
+                                editorModelPopover
+                            }
+                        }
+                    }
+                }
 
-                    editorGroup("Run options") {
-                        ScheduledRunOptionsEditor(
-                            showsUltracode: draft.provider == .distill,
-                            ultracode: $draft.distillUltracode,
-                            permission: $draft.permissionMode,
-                            plan: Binding(get: { draft.interactionMode == .plan }, set: { draft.interactionMode = $0 ? .plan : .default }),
-                            execution: Binding(get: { draft.executionMode }, set: { draft.executionMode = $0 }),
-                            baseBranch: Binding(get: { draft.baseBranch }, set: { draft.baseBranch = $0 }),
-                            identifierPrefix: "scheduledTasks.editor"
-                        )
-                    }
-
-                    editorGroup("Frequency") {
-                        ScheduledFrequencyEditor(
-                            rules: $draft.frequencyRules,
-                            timeZoneIdentifier: $draft.timeZoneIdentifier,
-                            identifierPrefix: "scheduledTasks.editor"
-                        )
-                    }
-
-                    HStack(alignment: .center, spacing: DS.Space.md) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(DS.Palette.warning)
-                            .accessibilityHidden(true)
-                        Text(ScheduledRunOptionsEditor.unattendedNotice(permission: draft.interactionMode == .plan ? .supervised : draft.permissionMode))
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .padding(DS.Space.lg)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(DS.Palette.warning.opacity(0.10))
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                            .strokeBorder(DS.Palette.warning.opacity(0.35), lineWidth: DS.Border.hairline)
+                editorGroup("Run options") {
+                    ScheduledRunOptionsEditor(
+                        showsExecutionMode: draft.provider == .distill,
+                        executionMode: $draft.distillExecutionMode,
+                        permission: $draft.permissionMode,
+                        plan: Binding(get: { draft.interactionMode == .plan }, set: { draft.interactionMode = $0 ? .plan : .default }),
+                        execution: Binding(get: { draft.executionMode }, set: { draft.executionMode = $0 }),
+                        baseBranch: Binding(get: { draft.baseBranch }, set: { draft.baseBranch = $0 }),
+                        identifierPrefix: "scheduledTasks.editor"
                     )
                 }
-                .padding(DS.Space.xxl)
-                .frame(maxWidth: 920, alignment: .leading)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            HStack(spacing: DS.Space.sm) {
-                Image(systemName: "clock")
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-                Text("Next run: \(previewNextRun)")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-                Spacer()
-            }
-            .padding(.horizontal, DS.Space.xxl)
-            .frame(height: 40)
-            .background(DS.Palette.surface)
-            .overlay(alignment: .top) {
-                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            }
-        }
-        .background(DS.Palette.bg)
+                editorGroup("Frequency") {
+                    ScheduledFrequencyEditor(
+                        rules: $draft.frequencyRules,
+                        timeZoneIdentifier: $draft.timeZoneIdentifier,
+                        identifierPrefix: "scheduledTasks.editor"
+                    )
+                }
+
+                AgentChoiceCallout(
+                    icon: "exclamationmark.triangle.fill",
+                    tint: DS.Palette.warning,
+                    text: ScheduledRunOptionsEditor.unattendedNotice(permission: draft.interactionMode == .plan ? .supervised : draft.permissionMode)
+                )
+            },
+            footer: { ScheduleEditorFooter(nextRun: previewNextRun) }
+        )
         .onAppear { normalizeProviderInstance() }
         .onChange(of: vm.providers.map(\.id)) { _ in normalizeProviderInstance() }
         .accessibilityIdentifier("scheduledTasks.editor")
@@ -1740,49 +1663,13 @@ private struct ScheduledTaskEditorView: View {
     }
 
     private func editorGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(title)
-                .font(DS.Font.caption.weight(.semibold))
-                .foregroundColor(DS.Palette.textSecondary)
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.vertical, DS.Space.md)
-            content()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DS.Palette.surface)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-        )
-        // Section titles "Details" / "Frequency" match plan; legacy contract
-        // tests also pin Basics/Agent/Schedule/Prompt string anchors in source.
-        .accessibilityIdentifier("editorSection.\(title)")
+        // Section titles "Details" / "Frequency" match plan; legacy contract tests also pin
+        // Basics/Agent/Schedule/Prompt string anchors in source.
+        ScheduleEditorSection(title, identifier: "editorSection.\(title)", content: content)
     }
 
-    private func formRow<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(spacing: 0) {
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            HStack {
-                Text(label)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                Spacer(minLength: DS.Space.lg)
-                content()
-                    .frame(minWidth: 160, alignment: .trailing)
-            }
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.vertical, DS.Space.md)
-        }
-    }
-
-    private func labeledField<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
-            Text(label)
-                .font(DS.Font.caption.weight(.medium))
-                .foregroundColor(DS.Palette.textSecondary)
-            content()
-        }
+    private func formRow<Content: View>(_ label: String, showsDivider: Bool = true, @ViewBuilder content: () -> Content) -> some View {
+        ScheduleEditorRow(label, showsDivider: showsDivider, control: content)
     }
 
     private var editorRunAsCapsule: some View {
@@ -1854,6 +1741,52 @@ private struct ScheduledTaskEditorView: View {
             ? (draft.distillMainEffortSelection ?? .fixed(draft.reasoningEffort)).effort?.displayName ?? "Auto"
             : draft.reasoningEffort.displayName
         return AgentModelPillPresentation(title: title, effort: effort)
+    }
+
+    private var editorDistillModelPills: some View {
+        let models = AgentDistillModelCatalog.selectableModels(
+            vm.models(provider: draft.provider, instanceID: draft.providerInstanceID)
+        )
+        let snapshot = vm.providers.resolvedSnapshot(provider: draft.provider, instanceID: draft.providerInstanceID)
+        let mainUnavailable = !draft.model.isEmpty && !models.isEmpty
+            && !models.contains(where: { $0.id == draft.model || $0.supportsCustomModel })
+        return AgentDistillModelPills(
+            mainModel: draft.model, mainModels: models,
+            reasoningModel: draft.reasoningModel, reasoningModels: models,
+            mainEffortSelection: draft.distillMainEffortSelection ?? .fixed(draft.reasoningEffort),
+            mainEfforts: selectedModelEfforts,
+            supportsMainEffortAuto: snapshot?.effectiveCapabilities.supportsDistillMainEffortAuto == true,
+            reasoningEffortSelection: draft.distillReasoningEffortSelection ?? .automatic,
+            reasoningEfforts: selectedReasoningEfforts,
+            supportsReasoningModelEffort: snapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true,
+            homePath: snapshot?.homePath,
+            mainUnavailable: mainUnavailable,
+            isRunning: false,
+            isDisabled: false,
+            emptyListTitle: vm.providersLoading ? "Loading models..." : "No models available",
+            workerEmptyListTitle: vm.providersLoading
+                ? "Loading models..." : "No models yet. Connect an account on the start screen.",
+            menuWidth: AgentModelMenuWidth.estimatedWidth(
+                titles: models.map(\.label), min: AgentModelMenuWidth.distillMin, max: AgentModelMenuWidth.distillMax
+            ),
+            mainIdentifier: "scheduledTasks.editor.model",
+            mainPopoverIdentifier: "scheduledTasks.editor.model.popover",
+            workerIdentifier: "scheduledTasks.editor.reasoningModel",
+            workerPopoverIdentifier: "scheduledTasks.editor.reasoningModel.popover",
+            onSelectMainModel: { draft.model = $0 },
+            onSelectCustomMainModel: { draft.model = $0 },
+            onSelectMainEffort: { selection in
+                draft.distillMainEffortSelection = selection
+                if let effort = selection.effort { draft.reasoningEffort = effort }
+            },
+            onSelectWorkerModel: { model in
+                draft.reasoningModel = model
+                if model == nil { draft.distillReasoningEffortSelection = .automatic }
+            },
+            onSelectWorkerEffort: { draft.distillReasoningEffortSelection = $0 },
+            statusHeader: { EmptyView() },
+            mainFooter: { EmptyView() }
+        )
     }
 
     private var editorModelPopover: some View {
@@ -2135,11 +2068,11 @@ private extension ScheduledWeekday {
 }
 
 /// The run options a new Agent App message carries, for any scheduled task
-/// (workspace or Bot): Ultracode, permission, plan mode and execution location.
+/// (workspace or Bot): execution mode, permission, plan mode and execution location.
 /// One component so the two schedule editors cannot drift from each other.
 struct ScheduledRunOptionsEditor: View {
-    let showsUltracode: Bool
-    @Binding var ultracode: Bool
+    let showsExecutionMode: Bool
+    @Binding var executionMode: DistillExecutionMode
     @Binding var permission: AgentPermissionMode
     /// Nil hides plan mode and execution location (Bot runs use the Bot's own setup).
     var plan: Binding<Bool>?
@@ -2161,26 +2094,26 @@ struct ScheduledRunOptionsEditor: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            if showsUltracode {
-                AgentUltracodeChip(
-                    isOn: ultracode,
-                    disabled: false,
-                    help: "Plan, fan out to parallel subagents, then integrate and verify",
-                    accessibilityIdentifier: "\(identifierPrefix).ultracode",
-                    onToggle: { ultracode = $0 }
-                )
+        VStack(alignment: .leading, spacing: 0) {
+            if showsExecutionMode {
+                ScheduleEditorRow("Mode", hint: "How Distill works on each run", showsDivider: false) {
+                    AgentExecutionModeCapsule(
+                        selected: executionMode,
+                        accessibilityIdentifier: "\(identifierPrefix).mode",
+                        onSelect: { executionMode = $0 }
+                    )
+                }
             }
             if let plan {
-                Toggle("Plan mode", isOn: plan)
-                    .toggleStyle(.checkbox)
-                    .help("Propose a plan first; runs supervised")
-                    .accessibilityIdentifier("\(identifierPrefix).planMode")
+                ScheduleEditorRow("Plan mode", hint: "Propose a plan first; runs supervised", showsDivider: showsExecutionMode) {
+                    Toggle("Plan mode", isOn: plan)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(DS.Palette.accent)
+                        .accessibilityIdentifier("\(identifierPrefix).planMode")
+                }
             }
-            HStack(spacing: DS.Space.md) {
-                Text("Permission")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
+            ScheduleEditorRow("Permission", showsDivider: showsExecutionMode || plan != nil) {
                 AgentPermissionCapsule(
                     selected: Self.effectivePermission(permission, plan: plan?.wrappedValue ?? false),
                     modes: AgentPermissionMode.allCases,
@@ -2191,10 +2124,7 @@ struct ScheduledRunOptionsEditor: View {
                 )
             }
             if let execution {
-                HStack(spacing: DS.Space.md) {
-                    Text("Execution")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textSecondary)
+                ScheduleEditorRow("Execution", hint: "Local edits in place; Worktree uses a separate branch") {
                     Picker("Execution", selection: execution) {
                         Text("Local").tag(AgentExecutionMode.local)
                         Text("Worktree").tag(AgentExecutionMode.worktree)
@@ -2205,14 +2135,15 @@ struct ScheduledRunOptionsEditor: View {
                     .accessibilityIdentifier("\(identifierPrefix).execution")
                 }
                 if execution.wrappedValue == .worktree, let baseBranch {
-                    TextField("Base branch", text: baseBranch)
-                        .textFieldStyle(.roundedBorder)
-                        .accessibilityIdentifier("\(identifierPrefix).baseBranch")
+                    ScheduleEditorRow("Base branch") {
+                        TextField("main", text: baseBranch)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 180)
+                            .accessibilityIdentifier("\(identifierPrefix).baseBranch")
+                    }
                 }
             }
         }
-        .padding(.horizontal, DS.Space.lg)
-        .padding(.vertical, DS.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
