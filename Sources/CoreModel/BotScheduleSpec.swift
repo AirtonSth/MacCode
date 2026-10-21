@@ -12,7 +12,7 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     public var distillReasoningEffortSelection: AgentEffortSelection?
     public var routingMode: AgentRoutingMode
     /// Optional so specs saved before these options decode unchanged.
-    public var distillUltracode: Bool?
+    public var distillExecutionMode: DistillExecutionMode?
     public var permissionMode: AgentPermissionMode?
     public var executionDestination: BotExecutionDestination?
     public var frequency: ScheduledTaskFrequency
@@ -25,6 +25,14 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     public var timeZoneIdentifier: String
     /// Frequencies after the first; the flat fields above are rule 1 (JSON back-compat).
     public var additionalFrequencies: [ScheduledFrequencyRule]?
+
+    private enum CodingKeys: String, CodingKey {
+        case provider, providerInstanceID, model, reasoningEffort, reasoningModel
+        case distillMainEffortSelection, distillReasoningEffortSelection, routingMode
+        case distillExecutionMode = "distillUltracode"
+        case permissionMode, executionDestination, frequency, scheduledDate, intervalHours
+        case localTimeHour, localTimeMinute, weekdays, monthlyDay, timeZoneIdentifier, additionalFrequencies
+    }
 
     public init(
         provider: AgentProvider = .defaultProvider,

@@ -160,7 +160,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         var reasoningModel: String?
         var reasoningModelEffortSelection: AgentEffortSelection?
         /// Last Ultracode state applied to this ACP session; fresh and loaded sessions start off.
-        var ultracode = false
+        var executionMode: DistillExecutionMode = .normal
         /// True when open advertised a selectable `reasoning_effort` config option.
         let advertisesReasoningEffortConfig: Bool
         /// Thought-level ids from the open-result config option (and live model catalog).
@@ -1729,20 +1729,32 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     session.reasoningModelEffortSelection = appliedEffortSelection
                 }
             }
-            let wantsUltracode = request.distillUltracode
-            if wantsUltracode != synchronized({ session.ultracode }) {
+            let wantedMode = request.distillExecutionMode
+            if wantedMode != synchronized({ session.executionMode }) {
                 do {
-                    let applied = try await session.client.setUltracode(
+                    let applied = try await session.client.setExecutionMode(
                         sessionId: session.providerThreadId,
-                        enabled: wantsUltracode
+                        mode: wantedMode
                     )
-                    synchronized { session.ultracode = applied }
+                    synchronized { session.executionMode = applied }
                 } catch DistillACPError.rpcError(let code, let message, _, _) where code == -32601 {
-                    distillAcpLog.info("Distill peer lacks ultracode/set: \(message, privacy: .public)")
-                    synchronized { session.ultracode = wantsUltracode }
+                    // Older Distill only knows the Ultracode flag; Ultrafast and Ultrasave cannot be applied there.
+                    distillAcpLog.info("Distill peer lacks execution_mode/set: \(message, privacy: .public)")
+                    do {
+                        try await session.client.setUltracode(
+                            sessionId: session.providerThreadId,
+                            enabled: wantedMode == .ultracode
+                        )
+                        synchronized { session.executionMode = wantedMode == .ultracode ? .ultracode : .normal }
+                    } catch DistillACPError.rpcError(let legacyCode, _, _, _) where legacyCode == -32601 {
+                        synchronized { session.executionMode = wantedMode }
+                    } catch let error as DistillACPError {
+                        if case .processExited = error { throw error }
+                        distillAcpLog.error("Distill ultracode/set failed: \(String(describing: error), privacy: .public)")
+                    }
                 } catch let error as DistillACPError {
                     if case .processExited = error { throw error }
-                    distillAcpLog.error("Distill ultracode/set failed: \(String(describing: error), privacy: .public)")
+                    distillAcpLog.error("Distill execution_mode/set failed: \(String(describing: error), privacy: .public)")
                 }
             }
             let requestedMode: String?

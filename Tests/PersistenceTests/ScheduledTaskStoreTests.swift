@@ -131,7 +131,7 @@ final class ScheduledTaskStoreTests: XCTestCase {
         task.provider = .distill
         task.providerInstanceID = "distill"
         task.model = "auto"
-        task.distillUltracode = true
+        task.distillExecutionMode = .ultrasave
         task.permissionMode = .autoAcceptEdits
         task.interactionMode = .plan
         task.executionMode = .worktree

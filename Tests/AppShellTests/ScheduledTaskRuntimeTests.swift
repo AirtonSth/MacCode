@@ -227,23 +227,23 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         var task = makeHourly(nextRunAt: nil)
         task.provider = .distill
         task.model = "auto"
-        task.distillUltracode = true
-        XCTAssertTrue(ScheduledTaskExecutor.modelSelection(for: task).distillUltracode)
-        task.distillUltracode = false
-        XCTAssertFalse(ScheduledTaskExecutor.modelSelection(for: task).distillUltracode)
+        task.distillExecutionMode = .ultrafast
+        XCTAssertEqual(ScheduledTaskExecutor.modelSelection(for: task).distillExecutionMode, .ultrafast)
+        task.distillExecutionMode = .normal
+        XCTAssertEqual(ScheduledTaskExecutor.modelSelection(for: task).distillExecutionMode, .normal)
     }
 
     @MainActor
     func test_botScheduleCarriesUltracodeAndPermission_becauseBotRunsMustMatchTheComposer() {
         var spec = BotScheduleSpec(provider: .distill, providerInstanceID: "distill", model: "auto")
-        spec.distillUltracode = true
+        spec.distillExecutionMode = .ultrasave
         spec.permissionMode = .supervised
         let routing = BotsViewModel.routineRouting(spec, base: BotDeskRouting())
-        XCTAssertTrue(routing.distillUltracode)
+        XCTAssertEqual(routing.distillExecutionMode, .ultrasave)
         XCTAssertEqual(routing.permissionMode, .supervised)
 
         let legacy = BotsViewModel.routineRouting(BotScheduleSpec(provider: .distill), base: BotDeskRouting())
-        XCTAssertFalse(legacy.distillUltracode)
+        XCTAssertEqual(legacy.distillExecutionMode, .normal)
         XCTAssertEqual(legacy.permissionMode, BotDeskRouting().permissionMode, "Old specs keep the Bot default")
     }
 

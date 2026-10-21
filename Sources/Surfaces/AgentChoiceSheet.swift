@@ -1,4 +1,5 @@
 import AppKit
+import CoreModel
 import DesignSystemKit
 import SwiftUI
 
@@ -487,36 +488,64 @@ private struct OptionalAccessibilityIdentifier: ViewModifier {
     }
 }
 
-public struct AgentUltracodeChip: View {
-    public let isOn: Bool
+/// Presentation for one Distill execution mode: the tint and symbol shared by the composer
+/// capsule and its choice sheet, so a mode looks the same everywhere it appears.
+public extension DistillExecutionMode {
+    var capsuleTint: Color {
+        switch self {
+        case .normal: return DS.Palette.textSecondary
+        case .ultrafast: return DS.Palette.warning
+        case .ultracode: return DS.Palette.ultracode
+        case .ultrasave: return DS.Palette.success
+        }
+    }
+
+    var capsuleIcon: String {
+        switch self {
+        case .normal: return "circle.dotted"
+        case .ultrafast: return "bolt.fill"
+        case .ultracode: return "wand.and.stars"
+        case .ultrasave: return "leaf.fill"
+        }
+    }
+}
+
+/// Composer capsule for Distill's one exclusive execution mode. Opens `AgentChoiceSheet`.
+public struct AgentExecutionModeCapsule: View {
+    public let selected: DistillExecutionMode
     public let disabled: Bool
-    public let help: String
     public let accessibilityIdentifier: String
-    public let onToggle: (Bool) -> Void
+    public let onSelect: (DistillExecutionMode) -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isPresented = false
 
     public init(
-        isOn: Bool,
-        disabled: Bool,
-        help: String,
+        selected: DistillExecutionMode,
+        disabled: Bool = false,
         accessibilityIdentifier: String,
-        onToggle: @escaping (Bool) -> Void
+        onSelect: @escaping (DistillExecutionMode) -> Void
     ) {
-        self.isOn = isOn
+        self.selected = selected
         self.disabled = disabled
-        self.help = help
         self.accessibilityIdentifier = accessibilityIdentifier
-        self.onToggle = onToggle
+        self.onSelect = onSelect
     }
 
     public var body: some View {
-        Button { onToggle(!isOn) } label: {
+        Button { isPresented.toggle() } label: {
             HStack(spacing: DS.Space.xs) {
-                Image(systemName: "wand.and.stars")
-                    .foregroundColor(isOn ? DS.Palette.ultracode : DS.Palette.textSecondary)
-                Text("Ultracode")
+                Image(systemName: selected.capsuleIcon)
+                    .font(.system(size: 10))
+                    .foregroundColor(selected == .normal ? DS.Palette.textSecondary : selected.capsuleTint)
+                Text("Mode")
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                Text(selected.displayName)
                     .font(DS.Font.caption.weight(.medium))
-                    .foregroundColor(isOn ? DS.Palette.text : DS.Palette.textSecondary)
+                    .foregroundColor(selected == .normal ? DS.Palette.textSecondary : DS.Palette.text)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundColor(DS.Palette.textSecondary)
             }
             .fixedSize()
             .padding(.horizontal, DS.Space.sm)
@@ -529,37 +558,63 @@ public struct AgentUltracodeChip: View {
         .fixedSize()
         .opacity(disabled ? 0.5 : 1)
         .disabled(disabled)
-        .help(help)
-        .animation(reduceMotion ? nil : DS.Motion.micro, value: isOn)
-        .accessibilityLabel("Ultracode")
-        .accessibilityValue(isOn ? "On" : "Off")
-        .accessibilityAddTraits(toggleTrait)
+        .help("Execution mode: \(selected.pickerHelpText)")
+        .animation(reduceMotion ? nil : DS.Motion.micro, value: selected)
+        .accessibilityLabel("Mode \(selected.displayName)")
         .accessibilityIdentifier(accessibilityIdentifier)
-    }
-
-    private var toggleTrait: AccessibilityTraits {
-        if #available(macOS 14.0, *) { return .isToggle }
-        return .isButton
+        .sheet(isPresented: $isPresented) { sheet }
     }
 
     private var background: some View {
         ZStack {
             Capsule().fill(DS.Palette.surfaceRaised)
-            if isOn {
+            if selected == .ultracode {
                 Capsule()
                     .fill(LinearGradient(
                         colors: [DS.Palette.ultracode, DS.Palette.ultracodeDeep],
                         startPoint: .leading, endPoint: .trailing
                     ))
                     .opacity(0.22)
+            } else if selected != .normal {
+                Capsule().fill(selected.capsuleTint.opacity(0.13))
             }
         }
     }
 
     private var stroke: some View {
         Capsule().strokeBorder(
-            isOn ? DS.Palette.ultracode.opacity(0.6) : DS.Palette.line,
+            selected == .normal ? DS.Palette.line : selected.capsuleTint.opacity(0.6),
             lineWidth: DS.Border.hairline
         )
+    }
+
+    private var sheet: some View {
+        AgentChoiceSheet(
+            icon: "slider.horizontal.3",
+            tint: selected.capsuleTint,
+            title: "Execution mode",
+            subtitle: "How Distill works on this conversation. One mode is active at a time.",
+            width: 460,
+            accessibilityIdentifier: "agent.mode.sheet",
+            onClose: { isPresented = false }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                ForEach(DistillExecutionMode.allCases, id: \.self) { mode in
+                    AgentChoiceCard(
+                        title: mode.displayName,
+                        subtitle: mode.pickerHelpText,
+                        selected: mode == selected,
+                        tint: mode.capsuleTint,
+                        accessibilityIdentifier: "agent.mode.sheet.\(mode.rawValue)",
+                        action: {
+                            onSelect(mode)
+                            isPresented = false
+                        }
+                    ) {
+                        AgentChoiceIconTile(systemName: mode.capsuleIcon, tint: mode.capsuleTint)
+                    }
+                }
+            }
+        }
     }
 }

@@ -201,7 +201,7 @@ extension AppContext {
             reasoningModel: request.reasoningModel,
             distillMainEffortSelection: request.distillMainEffortSelection,
             distillReasoningEffortSelection: request.distillReasoningEffortSelection,
-            distillUltracode: request.distillUltracode, serviceTier: request.serviceTier,
+            distillExecutionMode: request.distillExecutionMode, serviceTier: request.serviceTier,
             interactionMode: request.interactionMode, providerBinary: request.providerBinary,
             environment: request.environment, extraArgs: request.extraArgs,
             runAsUser: request.runAsUser, acceptancePermit: permit,

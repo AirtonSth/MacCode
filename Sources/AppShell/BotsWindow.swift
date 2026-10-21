@@ -55,7 +55,7 @@ public struct BotDeskRouting: Equatable, Codable {
     public var reasoningModel: String?
     public var distillMainEffortSelection: AgentEffortSelection?
     public var distillReasoningEffortSelection: AgentEffortSelection?
-    public var distillUltracode: Bool
+    public var distillExecutionMode: DistillExecutionMode
     public var serviceTier: AgentServiceTier
     public var executionDestination: BotExecutionDestination?
     public var runAsUser: AgentRunAsUser
@@ -63,7 +63,8 @@ public struct BotDeskRouting: Equatable, Codable {
     private enum CodingKeys: String, CodingKey {
         case executionDestination
         case provider, providerInstanceID, model, routingMode, permissionMode, reasoningEffort, reasoningModel
-        case distillMainEffortSelection, distillReasoningEffortSelection, distillUltracode, serviceTier, runAsUser
+        case distillMainEffortSelection, distillReasoningEffortSelection, serviceTier, runAsUser
+        case distillExecutionMode = "distillUltracode"
     }
 
     public init(
@@ -76,7 +77,7 @@ public struct BotDeskRouting: Equatable, Codable {
         reasoningModel: String? = nil,
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
-        distillUltracode: Bool = false,
+        distillExecutionMode: DistillExecutionMode = .normal,
         serviceTier: AgentServiceTier = .auto,
         runAsUser: AgentRunAsUser? = nil
     ) {
@@ -89,7 +90,7 @@ public struct BotDeskRouting: Equatable, Codable {
         self.reasoningModel = reasoningModel
         self.distillMainEffortSelection = distillMainEffortSelection
         self.distillReasoningEffortSelection = distillReasoningEffortSelection
-        self.distillUltracode = distillUltracode
+        self.distillExecutionMode = distillExecutionMode
         self.serviceTier = serviceTier
         self.runAsUser = runAsUser ?? AgentRunAsUser.current()
         migrateLegacyProvider()
@@ -122,7 +123,7 @@ public struct BotDeskRouting: Equatable, Codable {
         reasoningModel = try container.decodeIfPresent(String.self, forKey: .reasoningModel)
         distillMainEffortSelection = try container.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try container.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
-        distillUltracode = try container.decodeIfPresent(Bool.self, forKey: .distillUltracode) ?? false
+        distillExecutionMode = try container.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .normal
         serviceTier = try container.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         runAsUser = try container.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
             ?? AgentRunAsUser.current()
@@ -160,7 +161,7 @@ public struct BotDeskRouting: Equatable, Codable {
             reasoningModel: thread.reasoningModel,
             distillMainEffortSelection: thread.modelSelection.distillMainEffortSelection,
             distillReasoningEffortSelection: thread.modelSelection.distillReasoningEffortSelection,
-            distillUltracode: thread.modelSelection.distillUltracode,
+            distillExecutionMode: thread.modelSelection.distillExecutionMode,
             serviceTier: thread.serviceTier,
             runAsUser: thread.runAsUser
         )
@@ -198,7 +199,7 @@ public struct BotDeskRouting: Equatable, Codable {
                 ? (distillMainEffortSelection ?? .fixed(reasoningEffort)) : nil,
             distillReasoningEffortSelection: provider == .distill
                 ? (distillReasoningEffortSelection ?? .automatic) : nil,
-            distillUltracode: provider == .distill && distillUltracode
+            distillExecutionMode: provider == .distill ? distillExecutionMode : .normal
         )
     }
 
@@ -4083,7 +4084,7 @@ public final class BotsViewModel: ObservableObject {
         next.spec.distillMainEffortSelection = draft.distillMainEffortSelection
         next.spec.distillReasoningEffortSelection = draft.distillReasoningEffortSelection
         next.spec.routingMode = draft.routingMode
-        next.spec.distillUltracode = draft.distillUltracode
+        next.spec.distillExecutionMode = draft.distillExecutionMode
         next.spec.permissionMode = draft.permissionMode
         next.spec.frequencyRules = draft.frequencyRules
         next.spec.timeZoneIdentifier = draft.timeZoneIdentifier
@@ -5300,7 +5301,7 @@ public final class BotsViewModel: ObservableObject {
                 reasoningEffort: route.reasoningEffort, serviceTier: route.serviceTier,
                 distillMainEffortSelection: route.distillMainEffortSelection ?? .fixed(route.reasoningEffort),
                 distillReasoningEffortSelection: route.distillReasoningEffortSelection ?? .automatic,
-                distillUltracode: route.distillUltracode
+                distillExecutionMode: route.distillExecutionMode
             ),
             runAsUser: route.runAsUser
         )
@@ -7552,7 +7553,7 @@ public final class BotsViewModel: ObservableObject {
             ? (spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)) : nil
         routing.distillReasoningEffortSelection = spec.provider == .distill
             ? (spec.distillReasoningEffortSelection ?? .automatic) : nil
-        routing.distillUltracode = spec.provider == .distill && (spec.distillUltracode ?? false)
+        routing.distillExecutionMode = spec.provider == .distill ? (spec.distillExecutionMode ?? .normal) : .normal
         if let permission = spec.permissionMode { routing.permissionMode = permission }
         return routing
     }
@@ -8695,8 +8696,8 @@ public final class BotsViewModel: ObservableObject {
         guard selectedBotExecutionTarget != .vm || mode == .fullAccess else { return }
         deskRouting.permissionMode = mode
     }
-    public func setDeskDistillUltracode(_ enabled: Bool) {
-        deskRouting.distillUltracode = enabled
+    public func setDeskDistillExecutionMode(_ mode: DistillExecutionMode) {
+        deskRouting.distillExecutionMode = mode
     }
     public var selectedBotExecutionTarget: ExecutionTarget {
         if let conversation = selectedConversation, conversation.botID == selectedBotID,
@@ -11703,7 +11704,7 @@ public final class BotsViewModel: ObservableObject {
                         ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
                     distillReasoningEffortSelection: routing.provider == .distill
                         ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
-                    distillUltracode: routing.provider == .distill && routing.distillUltracode
+                    distillExecutionMode: routing.provider == .distill ? routing.distillExecutionMode : .normal
                 )
                 try context.threadRepo.upsert(updated)
             }
@@ -11732,7 +11733,7 @@ public final class BotsViewModel: ObservableObject {
                         ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
                     distillReasoningEffortSelection: routing.provider == .distill
                         ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
-                    distillUltracode: routing.provider == .distill && routing.distillUltracode
+                    distillExecutionMode: routing.provider == .distill ? routing.distillExecutionMode : .normal
                 ),
                 providerInstanceId: routing.providerInstanceID,
                 runAsUser: routing.runAsUser,
@@ -12092,7 +12093,7 @@ public final class BotsViewModel: ObservableObject {
                         ? (routing.distillMainEffortSelection ?? .fixed(effort)) : nil,
                     distillReasoningEffortSelection: routing.provider == .distill
                         ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
-                    distillUltracode: routing.provider == .distill && routing.distillUltracode
+                    distillExecutionMode: routing.provider == .distill ? routing.distillExecutionMode : .normal
                 ),
                 providerInstanceId: routing.providerInstanceID,
                 attachments: attachments,
@@ -14422,12 +14423,10 @@ public struct BotsRootView: View {
                 )
                 if vm.deskRouting.provider == .distill { deskUnlinkedModelPills }
                 if vm.deskRouting.provider == .distill {
-                    AgentUltracodeChip(
-                        isOn: vm.deskRouting.distillUltracode,
-                        disabled: false,
-                        help: "",
-                        accessibilityIdentifier: "bots.desk.distill.ultracode",
-                        onToggle: vm.setDeskDistillUltracode
+                    AgentExecutionModeCapsule(
+                        selected: vm.deskRouting.distillExecutionMode,
+                        accessibilityIdentifier: "bots.desk.distill.mode",
+                        onSelect: vm.setDeskDistillExecutionMode
                     )
                 }
                 AgentPermissionCapsule(

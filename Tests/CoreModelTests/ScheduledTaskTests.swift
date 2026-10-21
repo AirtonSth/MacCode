@@ -67,7 +67,7 @@ final class ScheduledTaskTests: XCTestCase {
         let task = ScheduledTask(
             title: "Legacy", prompt: "Run", workspaceID: WorkspaceID(), workspacePathSnapshot: "/tmp",
             runAsUser: "sam", runAsUID: 501, provider: .distill, providerInstanceID: "distill",
-            model: "auto", reasoningEffort: .high, distillUltracode: true, permissionMode: .supervised,
+            model: "auto", reasoningEffort: .high, distillExecutionMode: .ultracode, permissionMode: .supervised,
             interactionMode: .plan, executionMode: .worktree, baseBranch: "main",
             recurrence: .daily(at: ScheduledLocalTime(hour: 9, minute: 0)!), timeZoneIdentifier: "UTC"
         )
@@ -78,7 +78,7 @@ final class ScheduledTaskTests: XCTestCase {
 
         let decoded = try JSONDecoder().decode(ScheduledTask.self, from: JSONSerialization.data(withJSONObject: object))
 
-        XCTAssertFalse(decoded.distillUltracode)
+        XCTAssertEqual(decoded.distillExecutionMode, .normal)
         XCTAssertEqual(decoded.permissionMode, .fullAccess)
         XCTAssertEqual(decoded.interactionMode, .default)
         XCTAssertEqual(decoded.executionMode, .local)

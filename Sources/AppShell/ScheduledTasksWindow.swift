@@ -30,7 +30,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
     public var distillMainEffortSelection: AgentEffortSelection?
     public var distillReasoningEffortSelection: AgentEffortSelection?
     public var routingMode: AgentRoutingMode
-    public var distillUltracode: Bool
+    public var distillExecutionMode: DistillExecutionMode
     public var permissionMode: AgentPermissionMode
     public var interactionMode: AgentInteractionMode
     public var executionMode: AgentExecutionMode
@@ -56,7 +56,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         distillMainEffortSelection = task?.distillMainEffortSelection
         distillReasoningEffortSelection = task?.distillReasoningEffortSelection
         routingMode = provider == .distill ? .manual : (task?.effectiveRoutingMode ?? .auto)
-        distillUltracode = task?.distillUltracode ?? false
+        distillExecutionMode = task?.distillExecutionMode ?? .normal
         permissionMode = task?.permissionMode ?? .fullAccess
         interactionMode = task?.interactionMode ?? .default
         executionMode = task?.executionMode ?? .local
@@ -107,7 +107,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
             distillReasoningEffortSelection: provider == .distill
                 ? (distillReasoningEffortSelection ?? .automatic) : nil,
             routingMode: provider == .distill ? .manual : routingMode,
-            distillUltracode: provider == .distill && distillUltracode,
+            distillExecutionMode: provider == .distill ? distillExecutionMode : .normal,
             permissionMode: interactionMode == .plan ? .supervised : permissionMode,
             interactionMode: interactionMode,
             executionMode: executionMode,
@@ -1659,8 +1659,8 @@ private struct ScheduledTaskEditorView: View {
 
                     editorGroup("Run options") {
                         ScheduledRunOptionsEditor(
-                            showsUltracode: draft.provider == .distill,
-                            ultracode: $draft.distillUltracode,
+                            showsExecutionMode: draft.provider == .distill,
+                            executionMode: $draft.distillExecutionMode,
                             permission: $draft.permissionMode,
                             plan: Binding(get: { draft.interactionMode == .plan }, set: { draft.interactionMode = $0 ? .plan : .default }),
                             execution: Binding(get: { draft.executionMode }, set: { draft.executionMode = $0 }),
@@ -2135,11 +2135,11 @@ private extension ScheduledWeekday {
 }
 
 /// The run options a new Agent App message carries, for any scheduled task
-/// (workspace or Bot): Ultracode, permission, plan mode and execution location.
+/// (workspace or Bot): execution mode, permission, plan mode and execution location.
 /// One component so the two schedule editors cannot drift from each other.
 struct ScheduledRunOptionsEditor: View {
-    let showsUltracode: Bool
-    @Binding var ultracode: Bool
+    let showsExecutionMode: Bool
+    @Binding var executionMode: DistillExecutionMode
     @Binding var permission: AgentPermissionMode
     /// Nil hides plan mode and execution location (Bot runs use the Bot's own setup).
     var plan: Binding<Bool>?
@@ -2162,13 +2162,11 @@ struct ScheduledRunOptionsEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
-            if showsUltracode {
-                AgentUltracodeChip(
-                    isOn: ultracode,
-                    disabled: false,
-                    help: "Plan, fan out to parallel subagents, then integrate and verify",
-                    accessibilityIdentifier: "\(identifierPrefix).ultracode",
-                    onToggle: { ultracode = $0 }
+            if showsExecutionMode {
+                AgentExecutionModeCapsule(
+                    selected: executionMode,
+                    accessibilityIdentifier: "\(identifierPrefix).mode",
+                    onSelect: { executionMode = $0 }
                 )
             }
             if let plan {

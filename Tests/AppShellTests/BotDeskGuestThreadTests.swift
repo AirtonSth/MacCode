@@ -87,12 +87,12 @@ final class BotDeskGuestThreadTests: XCTestCase {
 
     /// First send on a new desk conversation; returns its linked thread.
     private func firstSend(
-        _ f: Fixture, bot: BotDefinition, provider: AgentProvider, text: String = "first words", ultracode: Bool = false
+        _ f: Fixture, bot: BotDefinition, provider: AgentProvider, text: String = "first words", mode: DistillExecutionMode = .normal
     ) async throws -> AgentThread {
         f.vm.openDesk(bot)
         XCTAssertTrue(f.vm.createDeskThread())
         f.vm.setDeskProvider(provider)
-        f.vm.setDeskDistillUltracode(ultracode)
+        f.vm.setDeskDistillExecutionMode(mode)
         XCTAssertTrue(f.vm.send(text), f.vm.errorMessage ?? "")
         let runner = provider == .distill ? f.distill : f.claude
         let started = await waitUntil { runner.requests.contains { $0.prompt.contains(text) } }
@@ -161,10 +161,10 @@ final class BotDeskGuestThreadTests: XCTestCase {
     func test_firstDistillSendPersistsAndTransfersUltracodeSelection() async throws {
         let f = try makeFixture()
         let bot = try makeBot(f, docker: false)
-        let thread = try await firstSend(f, bot: bot, provider: .distill, ultracode: true)
-        XCTAssertTrue(thread.modelSelection.distillUltracode)
+        let thread = try await firstSend(f, bot: bot, provider: .distill, mode: .ultrafast)
+        XCTAssertEqual(thread.modelSelection.distillExecutionMode, .ultrafast)
         let request = try XCTUnwrap(f.distill.requests.first)
-        XCTAssertTrue(request.distillUltracode)
+        XCTAssertEqual(request.distillExecutionMode, .ultrafast)
         await finishAll(f)
     }
 

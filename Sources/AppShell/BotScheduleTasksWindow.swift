@@ -499,10 +499,10 @@ struct BotScheduleTaskEditorView: View {
                     )
                     labeled("Run options") {
                         ScheduledRunOptionsEditor(
-                            showsUltracode: draft.spec.provider == .distill,
-                            ultracode: Binding(
-                                get: { draft.spec.distillUltracode ?? false },
-                                set: { draft.spec.distillUltracode = $0 }
+                            showsExecutionMode: draft.spec.provider == .distill,
+                            executionMode: Binding(
+                                get: { draft.spec.distillExecutionMode ?? .normal },
+                                set: { draft.spec.distillExecutionMode = $0 }
                             ),
                             permission: Binding(
                                 get: { draft.spec.permissionMode ?? .fullAccess },

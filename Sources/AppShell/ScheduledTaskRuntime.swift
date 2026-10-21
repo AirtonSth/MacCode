@@ -419,7 +419,7 @@ public final class ScheduledTaskExecutor {
                 ? (task.distillMainEffortSelection ?? .fixed(task.reasoningEffort)) : nil,
             distillReasoningEffortSelection: task.provider == .distill
                 ? (task.distillReasoningEffortSelection ?? .automatic) : nil,
-            distillUltracode: task.provider == .distill && task.distillUltracode
+            distillExecutionMode: task.provider == .distill ? task.distillExecutionMode : .normal
         )
     }
 

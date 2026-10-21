@@ -5835,7 +5835,8 @@ public final class JSONRPCDispatcher {
         object["distill_main_effort"] = .string(thread.modelSelection.distillMainEffortSelection?.effort?.rawValue ?? "auto")
         object["worker_model"] = .string(thread.reasoningModel ?? "")
         object["worker_effort"] = .string(thread.modelSelection.distillReasoningEffortSelection?.effort?.rawValue ?? "auto")
-        object["distill_ultracode"] = .bool(thread.modelSelection.distillUltracode)
+        object["distill_ultracode"] = .bool(thread.modelSelection.distillExecutionMode == .ultracode)
+        object["distill_execution_mode"] = .string(thread.modelSelection.distillExecutionMode.rawValue)
     }
 
     private func encodeRunAsUser(_ user: AgentRunAsUser?) -> JSONValue {
@@ -6034,7 +6035,7 @@ public final class JSONRPCDispatcher {
 
     private func modelSelection(from params: [String: JSONValue]) throws -> AgentModelSelection? {
         let nested = modelSelection(from: params["model_selection"])
-        let hasFlat = params["distill_main_effort"] != nil || params["worker_model"] != nil || params["worker_effort"] != nil || params["distill_ultracode"] != nil
+        let hasFlat = params["distill_main_effort"] != nil || params["worker_model"] != nil || params["worker_effort"] != nil || params["distill_ultracode"] != nil || params["distill_execution_mode"] != nil
         guard nested != nil || hasFlat else { return nil }
         let provider = nested?.provider ?? AgentProvider(rawValue: params["provider"]?.stringValue ?? "distill") ?? .distill
         var selection = nested ?? AgentModelSelection(
@@ -6051,9 +6052,12 @@ public final class JSONRPCDispatcher {
             guard let value = raw.stringValue else { throw JSONRPCError.invalidParams }
             selection.distillReasoningEffortSelection = try effortSelection(value)
         }
-        if let raw = params["distill_ultracode"] {
+        if let raw = params["distill_execution_mode"] {
+            guard let value = raw.stringValue, let mode = DistillExecutionMode(rawValue: value) else { throw JSONRPCError.invalidParams }
+            selection.distillExecutionMode = mode
+        } else if let raw = params["distill_ultracode"] {
             guard case .bool(let enabled) = raw else { throw JSONRPCError.invalidParams }
-            selection.distillUltracode = enabled
+            selection.distillExecutionMode = enabled ? .ultracode : .normal
         }
         return selection
     }
@@ -6264,7 +6268,8 @@ public final class JSONRPCDispatcher {
             "distill_main_effort": .string(thread.modelSelection.distillMainEffortSelection?.effort?.rawValue ?? "auto"),
             "worker_model": .string(thread.reasoningModel ?? ""),
             "worker_effort": .string(thread.modelSelection.distillReasoningEffortSelection?.effort?.rawValue ?? "auto"),
-            "distill_ultracode": .bool(thread.modelSelection.distillUltracode),
+            "distill_ultracode": .bool(thread.modelSelection.distillExecutionMode == .ultracode),
+            "distill_execution_mode": .string(thread.modelSelection.distillExecutionMode.rawValue),
             "execution_mode": .string(thread.executionMode.rawValue),
             "interaction_mode": .string(thread.effectiveInteractionMode.rawValue),
             "interactionMode": .string(thread.effectiveInteractionMode.rawValue),

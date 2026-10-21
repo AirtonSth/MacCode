@@ -27,7 +27,7 @@ final class ScheduledTaskRemoteTests: XCTestCase {
         context.router = router
         let bot = try context.botStore.create(name: "Writer", title: "", description: "", handle: "writer")
         var spec = BotScheduleSpec(provider: .distill, providerInstanceID: "distill", model: "auto")
-        spec.distillUltracode = true
+        spec.distillExecutionMode = .ultracode
         try context.botStore.saveRoutine(BotRoutineDefinition(botID: bot.id, name: "Digest", prompt: "Summarize",
                                                                scheduleNote: spec.displayNote(), scheduleSpecJSON: spec.encodedJSON()))
         let list = try router.listScheduledTasksRemote()
