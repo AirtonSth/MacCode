@@ -75,8 +75,32 @@ struct ActivityWireItem: Codable, Identifiable, Equatable, Sendable {
         case "queued": "Queued"
         case "running": "Running"
         case "expired": "Request expired"
-        case "needs_you": "Needs attention"
+        case "needs_you": kind == "agent" ? "Run interrupted" : "Review required"
         default: state.capitalized
+        }
+    }
+
+    var attentionInstruction: String? {
+        guard needs_action else { return nil }
+        if kind == "request", let summary { return summary }
+        switch state {
+        case "waiting_approval":
+            return "Approve or decline the request. This alert clears after your decision."
+        case "waiting_answer":
+            return "Send your response in this conversation. This alert clears when you reply."
+        case "failed", "interrupted":
+            if id.hasPrefix("scheduled-occurrence:") {
+                return "Review this task in Schedule Tasks and run it again, or dismiss this alert."
+            }
+            if thread_id != nil {
+                return "Send a new message to retry, or dismiss this alert. Starting a new run clears the previous failure."
+            }
+            return "Review the error at its source and retry, or dismiss this alert."
+        case "needs_you":
+            return kind == "agent"
+                ? "This run has no active process. Send a new message to resume, or dismiss this alert."
+                : "Resolve the issue at its source, or dismiss this alert. Opening it alone does not resolve it."
+        default: return nil
         }
     }
 }
@@ -601,7 +625,7 @@ final class ActivityViewModel: ObservableObject {
     /// longer considers open are skipped, so the status reports what actually changed.
     func clearCurrentNeedsYou() {
         guard !batchRunning else { return }
-        beginBatch("Collecting items to clear…")
+        beginBatch("Collecting alerts to dismiss…")
         let scope = batchScope
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -609,7 +633,7 @@ final class ActivityViewModel: ObservableObject {
             do {
                 let items = try await self.collect(scope) { $0.isClearable }
                 guard !items.isEmpty else {
-                    self.batchStatus = "Nothing to clear in this filter."
+                    self.batchStatus = "Nothing to dismiss in this filter."
                     self.batchRunning = false
                     return
                 }
@@ -618,11 +642,11 @@ final class ActivityViewModel: ObservableObject {
                     let cleared = try self.clear(chunk)
                     self.applyCleared(cleared)
                 }
-                self.batchStatus = self.undoCleared.isEmpty ? "Nothing needed clearing." : "Cleared \(self.undoCleared.count) from Needs you."
+                self.batchStatus = self.undoCleared.isEmpty ? "No alerts needed dismissal." : "Dismissed \(self.undoCleared.count) from Needs you."
                 self.refreshAfterFrame()
             } catch {
                 if !self.undoCleared.isEmpty {
-                    self.batchStatus = "Cleared \(self.undoCleared.count) before a failure. Undo restores them."
+                    self.batchStatus = "Dismissed \(self.undoCleared.count) before a failure. Undo restores them."
                 }
                 self.fail(error)
             }
@@ -657,7 +681,7 @@ final class ActivityViewModel: ObservableObject {
         undoSnapshot = [:]
         undoCleared = [item.id]
         undoCount = 1
-        batchStatus = "Cleared from Needs you."
+        batchStatus = "Dismissed from Needs you."
         applyCleared([item.id])
         do {
             if item.isUnread {
@@ -1053,9 +1077,9 @@ struct ActivityRootView: View {
                 .accessibilityIdentifier("activity.markAllRead")
         }
         if model.tab == .needsYou {
-            Button("Clear all") { model.clearCurrentNeedsYou() }
+            Button("Dismiss all") { model.clearCurrentNeedsYou() }
                 .buttonStyle(DSSecondaryButtonStyle()).disabled(model.batchRunning || model.page.counts.needs_you == 0).fixedSize()
-                .help("Clears every item in this filter from Needs you and marks results read. Results stay in Results; a cleared approval or question still waits in its thread.")
+                .help("Dismisses alerts in this filter and marks results read. Pending approvals and questions still wait in their conversations.")
                 .accessibilityIdentifier("activity.clearAll")
         }
     }
@@ -1239,6 +1263,7 @@ struct ActivityRootView: View {
                         Text(facts).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary).lineLimit(1).truncationMode(.tail).help(facts)
                     }
                 }
+                attentionGuidance(item)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: DS.Space.sm) {
@@ -1249,7 +1274,8 @@ struct ActivityRootView: View {
                     Button("View changes") { openEvidence(item, nil) }.buttonStyle(DSSecondaryButtonStyle())
                 }
                 if item.isClearable {
-                    Button("Clear") { model.acknowledge(item) }.buttonStyle(DSSecondaryButtonStyle())
+                    Button("Dismiss") { model.acknowledge(item) }.buttonStyle(DSSecondaryButtonStyle())
+                        .help("Dismisses this alert without answering requests or deleting results.")
                 }
                 if item.isMarkable, !item.isNew {
                     Button("Mark as unread") { model.markUnread(item) }.buttonStyle(DSSecondaryButtonStyle())
@@ -1279,7 +1305,7 @@ struct ActivityRootView: View {
                 }
                 detailActions(item)
                 detailFacts(item)
-                if item.kind != "request" || item.summary != nil {
+                if item.kind != "request" || (item.summary != nil && item.summary != item.attentionInstruction) {
                     detailSection(item.kind == "agent" ? "Agent summary" : "Result") {
                         Text(item.summary ?? "No summary available for this run.").font(DS.Font.body).foregroundColor(DS.Palette.text)
                             .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
@@ -1327,7 +1353,7 @@ struct ActivityRootView: View {
                     Button("View changes") { openEvidence(item, nil) }.buttonStyle(DSSecondaryButtonStyle())
                 }
                 if item.isClearable {
-                    Button("Clear") { model.acknowledge(item) }.buttonStyle(DSSecondaryButtonStyle())
+                    Button("Dismiss") { model.acknowledge(item) }.buttonStyle(DSSecondaryButtonStyle())
                         .help(item.kind == "request" ? "Removes this from Needs you. The request stays in the bot's conversation." : "Removes this from Needs you. The result stays in Results.")
                 }
                 if item.isMarkable, !item.isNew {
@@ -1339,10 +1365,16 @@ struct ActivityRootView: View {
                 Text("This conversation can't be opened: its workspace is closed or no longer exists.")
                     .font(DS.Font.bodyDense).foregroundColor(DS.Palette.textSecondary)
             }
-            if item.state == "waiting_approval" || item.state == "waiting_answer", conversation?.threadID != item.thread_id {
-                Text("Open the conversation to respond. It leaves Needs you once answered.")
-                    .font(DS.Font.bodyDense).foregroundColor(DS.Palette.textSecondary)
-            }
+            attentionGuidance(item)
+        }
+    }
+
+    @ViewBuilder
+    private func attentionGuidance(_ item: ActivityWireItem) -> some View {
+        if let instruction = item.attentionInstruction {
+            Text(instruction).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("activity.attentionInstruction")
         }
     }
 
@@ -1371,6 +1403,7 @@ struct ActivityRootView: View {
     }
 
     private func canOpen(_ item: ActivityWireItem) -> Bool {
+        if item.id.hasPrefix("scheduled-occurrence:") { return true }
         if item.bot_id != nil || item.surface_id != nil || item.notification_id != nil { return true }
         // A thread no bot owns opens only into its workspace, which must still be open here.
         return item.thread_id != nil && item.workspace_id.map(isWorkspaceOpen) == true
@@ -1381,6 +1414,9 @@ struct ActivityRootView: View {
     }
 
     private func openLabel(_ item: ActivityWireItem) -> String {
+        if item.id.hasPrefix("scheduled-occurrence:") { return "Open Schedule Tasks" }
+        if item.state == "waiting_answer" { return "Reply" }
+        if item.state == "waiting_approval" { return "Review request" }
         if item.bot_id != nil { return "Open bot" }
         if item.thread_id != nil { return "Open conversation" }
         return item.surface_id != nil ? "Open terminal" : "Open destination"
@@ -1510,7 +1546,7 @@ private struct ActivityRow: View {
         .contextMenu {
             if let open { Button(openLabel, action: open) }
             if item.isMarkable { Button(item.isUnread ? "Mark as Read" : "Mark as Unread", action: toggleRead) }
-            if item.isClearable { Button("Clear from Needs You", action: clear) }
+            if item.isClearable { Button("Dismiss alert", action: clear) }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel([item.displayTitle, item.statusLabel, facts, item.listSummary ?? ""].filter { !$0.isEmpty }.joined(separator: ", "))
@@ -1518,7 +1554,7 @@ private struct ActivityRow: View {
         .accessibilityActions {
             if let open { Button(openLabel, action: open) }
             if item.isMarkable { Button(item.isUnread ? "Mark as read" : "Mark as unread", action: toggleRead) }
-            if item.isClearable { Button("Clear from Needs you", action: clear) }
+            if item.isClearable { Button("Dismiss alert", action: clear) }
         }
     }
 
@@ -1535,7 +1571,7 @@ private struct ActivityRow: View {
                         DSIconButton(item.isUnread ? "envelope.open" : "envelope.badge", help: item.isUnread ? "Mark as read" : "Mark as unread", action: toggleRead).packed()
                     }
                     if item.isClearable {
-                        DSIconButton("archivebox", help: "Clear from Needs you", action: clear).packed()
+                        DSIconButton("archivebox", help: "Dismiss alert", action: clear).packed()
                     }
                 }
             }
@@ -1558,11 +1594,11 @@ extension ActivityViewModel {
 
     /// What the user has to do decides the group: answer a paused run first, then decide on failures.
     var needsYouSections: [ItemSection] {
-        let reply: Set<String> = ["waiting_approval", "waiting_answer", "needs_you"]
+        let reply: Set<String> = ["waiting_approval", "waiting_answer"]
         let groups: [(String, (ActivityWireItem) -> Bool)] = [
             ("Waiting for your reply", { reply.contains($0.state) }),
-            ("Failed", { ["failed", "interrupted"].contains($0.state) }),
-            ("Expired requests", { $0.state == "expired" }),
+            ("Review and retry", { ["failed", "interrupted"].contains($0.state) || ($0.state == "needs_you" && $0.kind == "agent") }),
+            ("Review required", { $0.state == "needs_you" && $0.kind != "agent" }),
         ]
         var sections = groups.map { title, match in ItemSection(title: title, items: page.items.filter(match)) }
         let grouped = Set(sections.flatMap { $0.items.map(\.id) })

@@ -110,16 +110,19 @@ final class ActivityService: @unchecked Sendable {
         let runs = try allRuns(threadByID: threadByID)
         let origins = try ActivityOriginProjection.load(db: readDB, threads: threads)
         let runByID = Dictionary(uniqueKeysWithValues: runs.map { ($0.runID.description, $0) })
-        let callbacks = try ProviderPendingCallbackRepository(db: readDB).list(states: [.pending, .stale])
+        let allCallbacks = try ProviderPendingCallbackRepository(db: readDB).list(states: [.pending, .stale, .approved, .declined, .cancelled, .resolved, .acknowledged])
+        let callbacks = allCallbacks.filter { $0.state == .pending || $0.state == .stale }
         let activeRunByThread = Dictionary(uniqueKeysWithValues: threads.compactMap { thread in
             activeRunIDProvider(thread.id).map { (thread.id.description, $0) }
         })
-        let blockedRunIDs = Set(callbacks.compactMap { callback -> AgentRunID? in
+        func callbackRun(_ callback: ProviderPendingCallback) -> AgentRunID? {
             guard callback.state == .pending,
                   let active = activeRunByThread[callback.threadId.description],
-                  runByID[active.description]?.status == "running" else { return nil }
+                  let run = runByID[active.description], run.status == "running",
+                  callback.createdAt >= run.startedAt else { return nil }
             return active
-        })
+        }
+        let blockedRunIDs = Set(callbacks.compactMap(callbackRun))
         let resultRepository = AgentRunResultRepository(db: readDB)
         let resultRows = try stride(from: 0, to: runs.count, by: 500).flatMap { start in
             try resultRepository.list(runIds: Array(runs[start..<min(start + 500, runs.count)].map(\.runID)))
@@ -157,7 +160,8 @@ final class ActivityService: @unchecked Sendable {
             // Clear all reaches a run left "running" with no live process too.
             let orphanAcknowledgedAt = state == .needsYou ? notificationStates[Self.orphanRunLedgerKey(row.runID)]?.acknowledgedAt : nil
             let needsAction = !superseded && ((state == .needsYou && orphanAcknowledgedAt == nil)
-                || ((state == .failed || state == .interrupted) && result?.attentionAcknowledgedAt == nil))
+                || ((state == .failed || state == .interrupted) && result?.attentionAcknowledgedAt == nil
+                    && !origins.resolvedBotFailureRunIDs.contains(row.runID.description)))
             let checkpoint = checkpointByRun[row.runID.description]
             let workspaceName = thread.workspaceId.flatMap { workspaceNames[$0] }
             let botLink = origins.botLinksByThreadID[thread.id.value.uuidString.lowercased()]
@@ -165,7 +169,9 @@ final class ActivityService: @unchecked Sendable {
                 id: "run:\(row.runID.description)", kind: .agent, runID: row.runID.value,
                 workspaceID: thread.workspaceId?.value, threadID: thread.id.value, state: state,
                 title: thread.title, workspaceName: workspaceName, provider: thread.provider.rawValue,
-                summary: result?.summary ?? (terminal ? "No summary available for this run" : nil),
+                summary: result?.summary ?? (state == .needsYou
+                    ? "This run has no active process. Send a new message to resume, or dismiss this alert."
+                    : (terminal ? "No summary available for this run" : nil)),
                 occurredAt: row.finishedAt ?? row.startedAt, startedAt: row.startedAt, finishedAt: row.finishedAt,
                 viewedAt: result?.viewedAt, attentionAcknowledgedAt: result?.attentionAcknowledgedAt ?? orphanAcknowledgedAt,
                 needsAction: needsAction, blocking: blockedRunIDs.contains(row.runID), finalMessageID: result?.finalMessageId?.value,
@@ -177,7 +183,7 @@ final class ActivityService: @unchecked Sendable {
 
         for callback in callbacks {
             guard let thread = threadByID[callback.threadId.description] else { continue }
-            let activeRun = callback.state == .pending ? activeRunByThread[callback.threadId.description] : nil
+            let activeRun = callbackRun(callback)
             let state: AgentActivityState
             if callback.state == .stale || activeRun == nil { state = .expired }
             else { state = callback.kind == .approval ? .waitingApproval : .waitingAnswer }
@@ -189,11 +195,14 @@ final class ActivityService: @unchecked Sendable {
             items.append(AgentActivityItem(
                 id: requestID, kind: .request, runID: activeRun?.value, requestID: callback.requestId,
                 workspaceID: thread.workspaceId?.value, threadID: thread.id.value, state: state,
-                title: callback.kind == .approval ? "Approval needed" : "Information needed",
+                title: state == .expired ? "Request expired" : (callback.kind == .approval ? "Approve or decline request" : "Reply to question"),
                 workspaceName: thread.workspaceId.flatMap { workspaceNames[$0] },
-                provider: thread.provider.rawValue, occurredAt: callback.createdAt,
+                provider: thread.provider.rawValue,
+                summary: state == .expired ? "This request can no longer be answered. The run is no longer waiting for it."
+                    : (callback.kind == .approval ? BotAttentionItemKind.approval.resolutionHint : BotAttentionItemKind.question.resolutionHint),
+                occurredAt: callback.createdAt,
                 attentionAcknowledgedAt: acknowledgedAt,
-                needsAction: acknowledgedAt == nil, blocking: activeRun != nil,
+                needsAction: state != .expired && acknowledgedAt == nil, blocking: activeRun != nil,
                 botID: botLink?.botID, conversationID: botLink?.conversationID
             ))
         }
@@ -202,9 +211,9 @@ final class ActivityService: @unchecked Sendable {
             workspaceId: filter.workspaceID.map(WorkspaceID.init), limit: Int.max
         )
         let knownRunIDs = Set(runs.map { $0.runID.description })
-        let knownRequestIDs = Set(callbacks.map { "\($0.threadId.description):\($0.requestId)" })
+        let knownRequestIDs = Set(allCallbacks.map { "\($0.threadId.description):\($0.requestId)" })
         let botNotificationMetadata = BotAttentionNotificationMetadataStore(db: readDB).all()
-        let canonicalBotAttentionIDs = Set(origins.botRequests.map(\.id))
+        let canonicalBotAttentionIDs = origins.botAttentionIDs
         for note in notifications {
             let category = note.category.flatMap(PetNotificationCategory.init(rawValue:))
             let payload = Self.notificationPayload(note.body)
@@ -377,6 +386,14 @@ final class ActivityService: @unchecked Sendable {
         var updated = Set<String>()
         for runID in try AgentRunResultRepository(db: db).setFailureAcknowledged(runIds: Array(runIDs.keys), at: stamp) {
             if let id = runIDs[runID] { updated.insert(id) }
+        }
+        if !runIDs.isEmpty {
+            let origins = try ActivityOriginProjection.load(db: db, threads: AgentThreadRepository(db: db).list())
+            for runID in runIDs.keys {
+                for itemID in origins.botFailureIDsByRunID[runID.description] ?? [] {
+                    botAttentionIDs[itemID] = "bot-attention:\(itemID.value.uuidString.lowercased())"
+                }
+            }
         }
         // Runs still marked running with no live process (Needs you), and requests, keep
         // their cleared mark in the activity ledger under a key that outlives the item id.
@@ -596,7 +613,7 @@ final class ActivityService: @unchecked Sendable {
     }
 
     private static func isTerminal(_ state: AgentActivityState) -> Bool {
-        [.completed, .failed, .interrupted, .stopped].contains(state)
+        [.completed, .failed, .interrupted, .stopped, .expired].contains(state)
     }
     private static func activityOrder(_ lhs: AgentActivityItem, _ rhs: AgentActivityItem) -> Bool {
         lhs.occurredAt == rhs.occurredAt ? lhs.id < rhs.id : lhs.occurredAt > rhs.occurredAt

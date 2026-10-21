@@ -33,7 +33,7 @@ public enum PetNotificationCategory: String, CaseIterable, Sendable, Equatable {
 
     var classification: PetAttentionClassification {
         switch self {
-        case .sshUnexpectedDisconnect, .fileConflict, .serverListenerFailed, .notificationsDenied, .agentAttention: return .needsYou
+        case .sshUnexpectedDisconnect, .fileConflict, .serverListenerFailed, .agentAttention: return .needsYou
         default: return .completed
         }
     }
@@ -53,17 +53,17 @@ public enum PetNotificationCategory: String, CaseIterable, Sendable, Equatable {
         case .sshTransferFailed:
             return .safe(kind: .sshTransfer(.failed))
         case .sshUnexpectedDisconnect:
-            return PetAttentionPresentation(title: "SSH connection needs attention", detail: nil)
+            return PetAttentionPresentation(title: "Reconnect SSH", detail: "The connection ended unexpectedly. Reconnect or dismiss this alert.")
         case .providerUpdateFailed:
             return .safe(kind: .providerUpdateFailed)
         case .fileConflict:
             return .safe(kind: .fileConflict)
         case .serverListenerFailed:
-            return PetAttentionPresentation(title: "Remote access needs attention", detail: nil)
+            return PetAttentionPresentation(title: "Restore remote access", detail: "Open Settings to check the listener, or dismiss this alert.")
         case .notificationsDenied:
             return PetAttentionPresentation(
                 title: "Notifications are turned off",
-                detail: "Open System Settings to re-enable them."
+                detail: "You can enable notifications in System Settings. Your runs can continue without them."
             )
         case .agentAttention:
             return PetAttentionPresentation(title: "Agent input requested", detail: nil)
@@ -84,8 +84,8 @@ public enum PetAttentionItemKind: Sendable, Equatable {
 
     public var needsUserAction: Bool {
         switch self {
-        case .callback:
-            return true
+        case .callback(_, let isStale):
+            return !isStale
         case .agentOutcome:
             return false
         case .notification(let category):

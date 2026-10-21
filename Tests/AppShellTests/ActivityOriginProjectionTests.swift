@@ -7,6 +7,25 @@ import SocketServer
 
 @MainActor
 final class ActivityOriginProjectionTests: XCTestCase {
+    func testRetryingScheduledTaskClearsItsPreviousFailureWithoutRemovingTheResult() throws {
+        let fixture = try makeScheduled(status: "failed")
+        let before = try page(fixture.context)
+        XCTAssertEqual(before.counts.needsYou, 1)
+        let statement = try fixture.context.db.prepare("""
+            INSERT INTO scheduled_task_runs (id,task_id,occurrence_key,trigger,scheduled_at,queued_at,status,created_at)
+            SELECT ?,task_id,?,'manual','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','queued','2026-01-02T00:00:00Z'
+            FROM scheduled_task_runs WHERE id = ?;
+            """)
+        try statement.bind(1, UUID().uuidString)
+        try statement.bind(2, UUID().uuidString)
+        try statement.bind(3, fixture.occurrenceID)
+        _ = try statement.step()
+        let retried = try page(fixture.context)
+        XCTAssertEqual(retried.counts.needsYou, 0)
+        XCTAssertEqual(retried.counts.queued, 1)
+        XCTAssertEqual(retried.items.first { $0.id == "scheduled-occurrence:\(fixture.occurrenceID)" }?.state, .failed)
+    }
+
     func testScheduledQueuedOccurrenceCannotBeViewedOrAcknowledged() throws {
         let fixture = try makeScheduled(status: "queued")
         let id = "scheduled-occurrence:\(fixture.occurrenceID)"

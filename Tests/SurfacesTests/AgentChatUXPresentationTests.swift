@@ -150,10 +150,10 @@ final class AgentChatUXPresentationTests: XCTestCase {
             title: "CRM Controller",
             handle: "quinn"
         )
-        XCTAssertEqual(AgentPeerActivityPresentation.title(for: attention), "Quinn needs attention")
+        XCTAssertEqual(AgentPeerActivityPresentation.title(for: attention), "Quinn could not reply")
         XCTAssertEqual(
             AgentPeerActivityPresentation.detail(for: attention, elapsedSeconds: 95),
-            "The run stopped before Quinn could reply."
+            "The run stopped. Send a new instruction to retry the handoff."
         )
     }
 

@@ -726,6 +726,8 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         )
         let threadID = UUID()
         let runID = UUID()
+        try AgentThreadRepository(db: db).upsert(AgentThread(id: AgentThreadID(threadID), title: "Question", provider: .codex, model: "test"))
+        try AgentRunRepository(db: db).upsert(AgentRun(id: AgentRunID(runID), threadId: AgentThreadID(threadID), provider: .codex, model: "test", status: .running))
         authority.onSend = { callbackBotID, _, callbackConversationID, _, _, _ in
             XCTAssertEqual(callbackBotID, bot)
             XCTAssertEqual(callbackConversationID?.value.uuidString.lowercased(), conversationID)
@@ -824,6 +826,16 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(restoredItem["thread_id"] as? String, threadID.uuidString.lowercased())
         XCTAssertEqual(restoredItem["run_id"] as? String, runID.uuidString.lowercased())
         XCTAssertEqual(restoredItem["state"] as? String, "needs_attention")
+        _ = try authority.dispatch(method: "bot.attention.ack", params: [
+            "client_request_id": "dismiss-question",
+            "profile_id": profileID,
+            "host_id": hostID,
+            "attention_item_id": itemID,
+            "bot_id": botID,
+        ])
+        XCTAssertFalse(try store.listAttention().contains { $0.id.value.uuidString.lowercased() == itemID })
+        let dismissed = try authority.dispatch(method: "bot.attention.list", params: [:])
+        XCTAssertEqual((dismissed["items"] as? [[String: Any]])?.first { $0["bot_id"] as? String == botID }?["state"] as? String, "none")
     }
 
     /// WHY: run context is an identity fence. A Bot must not attach its
@@ -859,6 +871,8 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         let conversation = BotConversationID(try XCTUnwrap(UUID(uuidString: conversationID)))
         let threadID = UUID()
         let runID = UUID()
+        try AgentThreadRepository(db: db).upsert(AgentThread(id: AgentThreadID(threadID), title: "Questions", provider: .codex, model: "test"))
+        try AgentRunRepository(db: db).upsert(AgentRun(id: AgentRunID(runID), threadId: AgentThreadID(threadID), provider: .codex, model: "test", status: .running))
         authority.onSend = { _, _, _, _, _, _ in
             [
                 "bot_id": botID,
@@ -2003,6 +2017,15 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual(macItem.detail, "Daily review: Docker desktop is not ready.")
         XCTAssertTrue(try tick("fail-again", at: base.addingTimeInterval(90)).isEmpty,
                       "a failed slot is spent, not retried every tick")
+        authority.onRoutineSend = { _ in
+            ["bot_id": fixture.botID, "conversation_id": UUID().uuidString.lowercased(), "run_id": "retry"]
+        }
+        _ = try authority.dispatch(method: "bot.routine.run", params: [
+            "client_request_id": "retry-failed-routine", "bot_id": fixture.botID,
+            "routine_id": fixture.routineID, "host_id": hostID,
+        ], now: base.addingTimeInterval(100))
+        XCTAssertTrue(try store.listAttention().isEmpty, "an admitted retry resolves the previous failure")
+        XCTAssertNotNil(try store.listAttention(includeAcknowledged: true).first { $0.id == macItem.id }?.acknowledgedAt)
     }
 
     /// WHY: only Active tasks of live bots run, and only while automatic runs

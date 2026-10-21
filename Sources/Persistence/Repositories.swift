@@ -2920,6 +2920,7 @@ public final class AgentMessageRepository: @unchecked Sendable {
     public static let maxMessagesPerThread = 100
 
     public func append(_ m: AgentMessage) throws {
+        let newUserMessage = try m.role == .user && !exists(id: m.id)
         let bodyBytes = m.content.utf8.count
         let bodySHA256 = Self.bodySHA256Hex(m.content)
         let st = try db.prepare("""
@@ -2950,6 +2951,9 @@ public final class AgentMessageRepository: @unchecked Sendable {
         try st.bind(7, bodySHA256)
         try st.bind(8, bodyBytes)
         _ = try st.step()
+        if newUserMessage {
+            try BotStore(db: db).resolveAttention(threadID: m.threadId, kinds: [.question, .blocked, .handoff], at: m.createdAt)
+        }
         try pruneMessagesKeepingLatest(threadId: m.threadId, limit: Self.maxMessagesPerThread)
     }
 
@@ -5011,6 +5015,7 @@ public final class AgentRunRepository: @unchecked Sendable {
     }
 
     public func upsert(_ r: AgentRun) throws {
+        let newRun = try (r.status == .pending || r.status == .running) && status(of: r.id) == nil
         let st = try db.prepare("""
             INSERT INTO agent_runs(id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message, terminal_reason)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -5031,6 +5036,9 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(9, r.errorMessage)
         try st.bind(10, r.terminalReason)
         _ = try st.step()
+        if newRun {
+            try BotStore(db: db).resolveAttention(threadID: r.threadId, kinds: [.blocked, .handoff], at: r.startedAt)
+        }
     }
 
     /// Finish-path run chrome only. Avoids compiling the 10-column `get`

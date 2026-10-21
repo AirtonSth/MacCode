@@ -529,8 +529,8 @@ final class ActivityWindowModelTests: XCTestCase {
                        "an already cleared failure has nothing left to clear")
         XCTAssertFalse(item("bot-attention:one", kind: "request", state: "waiting_answer").isUnread,
                        "a request has no read state, so it must never show as a new result")
-        XCTAssertEqual(item("run:orphan", state: "needs_you").statusLabel, "Needs attention",
-                       "the raw wire state must not reach the screen")
+        XCTAssertEqual(item("run:orphan", state: "needs_you").statusLabel, "Run interrupted",
+                       "the label must describe why this run can be resumed")
     }
 
     func testClearingSelectedNeedsYouItemRemovesItAdvancesSelectionAndUndoRestoresExactState() async {
@@ -632,7 +632,7 @@ final class ActivityWindowModelTests: XCTestCase {
         XCTAssertFalse(viewed.contains("run:raced"), "an item the host did not clear must keep its unread state")
         XCTAssertEqual(viewed.count, 50)
         XCTAssertEqual(model.undoCount, 54, "Undo covers exactly what the host confirmed")
-        XCTAssertEqual(model.batchStatus, "Cleared 54 from Needs you.")
+        XCTAssertEqual(model.batchStatus, "Dismissed 54 from Needs you.")
         XCTAssertNil(model.error, "an item another client already resolved is not a failure")
     }
 
@@ -756,7 +756,7 @@ final class ActivityWindowModelTests: XCTestCase {
         ), defaults: defaults)
         model.refreshAfterFrame()
         await waitUntil("loaded") { model.page.items.count == 4 && !model.loading }
-        XCTAssertEqual(model.needsYouSections.map(\.title), ["Waiting for your reply", "Failed", "Expired requests", "Other"])
+        XCTAssertEqual(model.needsYouSections.map(\.title), ["Waiting for your reply", "Review and retry", "Other"])
         XCTAssertEqual(model.needsYouSections.first?.items.map(\.id), ["approval"])
         XCTAssertEqual(model.resultSections(now: now).map(\.title), ["Today", "Yesterday", "Earlier"])
     }

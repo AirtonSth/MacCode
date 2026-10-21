@@ -10,6 +10,9 @@ struct ActivityOriginSnapshot: Sendable {
     /// listed here; the router's destination check finds them by thread at open time.
     let botLinksByThreadID: [String: (botID: UUID, conversationID: UUID)]
     let botRequests: [AgentActivityItem]
+    let botAttentionIDs: Set<String>
+    let botFailureIDsByRunID: [String: [BotAttentionItemID]]
+    let resolvedBotFailureRunIDs: Set<String>
     let scheduledOccurrences: [AgentActivityItem]
 }
 
@@ -50,27 +53,47 @@ enum ActivityOriginProjection {
                   threadByID[threadID] != nil else { return nil }
             return (threadID, (conversation.botID.value, conversation.id.value))
         }, uniquingKeysWith: { first, _ in first })
-        let runThreads = try db.performSync { database -> [(String, String)] in
-            let statement = try database.prepare("SELECT id, thread_id FROM agent_runs;")
+        let runThreads = try db.performSync { database -> [(id: String, threadID: String, status: String, startedAt: Date, reason: String?)] in
+            let statement = try database.prepare("SELECT id, thread_id, status, started_at, terminal_reason FROM agent_runs ORDER BY started_at DESC, rowid DESC;")
             defer { statement.reset() }
-            var rows: [(String, String)] = []
+            var rows: [(id: String, threadID: String, status: String, startedAt: Date, reason: String?)] = []
             while try statement.step() {
-                if let runID = statement.columnText(0), let threadID = statement.columnText(1) {
-                    rows.append((runID, threadID.lowercased()))
+                if let runID = statement.columnText(0), let threadID = statement.columnText(1),
+                   let status = statement.columnText(2), let startedAt = statement.columnText(3).flatMap(Self.parseDate) {
+                    rows.append((runID, threadID.lowercased(), status, startedAt, statement.columnText(4)))
                 }
             }
             return rows
         }
-        for (runID, threadID) in runThreads where labels[runID] == nil {
-            if let label = contextLabels[threadID] { labels[runID] = label }
+        for run in runThreads where labels[run.id] == nil {
+            if let label = contextLabels[run.threadID] { labels[run.id] = label }
         }
 
-        let requests = try botStore.listAttention(includeAcknowledged: false).compactMap { item -> AgentActivityItem? in
+        let allAttention = try botStore.listAttention(includeAcknowledged: true)
+        let openAttention = try botStore.listAttention()
+        let openIDs = Set(openAttention.map(\.id))
+        let conversationByID = Dictionary(conversations.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let latestRunByThread = Dictionary(runThreads.map { ($0.threadID, $0) }, uniquingKeysWith: { first, _ in first })
+        var failureIDs: [String: [BotAttentionItemID]] = [:]
+        for item in allAttention where item.kind == .blocked {
+            guard let conversation = item.conversationID.flatMap({ conversationByID[$0] }),
+                  let threadID = conversation.linkedAgentThreadID?.description.lowercased(),
+                  let run = latestRunByThread[threadID], item.createdAt >= run.startedAt,
+                  ["failed", "interrupted", "cancelled"].contains(run.status), run.reason != "userStop" else { continue }
+            failureIDs[run.id, default: []].append(item.id)
+        }
+        let canonicalFailureIDs = Set(failureIDs.values.flatMap { $0 })
+        let resolvedFailures = Set(failureIDs.compactMap { runID, ids in ids.allSatisfy { !openIDs.contains($0) } ? runID : nil })
+        let requests = openAttention.compactMap { item -> AgentActivityItem? in
+            // A Bot failure and its Agent run describe one decision. Keep the
+            // run as the canonical row so dismissing it cannot expose a duplicate.
+            guard !canonicalFailureIDs.contains(item.id) else { return nil }
             let state: AgentActivityState
             switch item.kind {
             case .question: state = .waitingAnswer
             case .approval: state = .waitingApproval
-            case .handoff, .blocked, .unknownEffect: state = .needsYou
+            case .blocked: state = .failed
+            case .handoff, .unknownEffect: state = .needsYou
             case .unread: return nil
             }
             let conversation = item.conversationID.flatMap { id in conversations.first(where: { $0.id == id }) }
@@ -81,7 +104,8 @@ enum ActivityOriginProjection {
                 workspaceID: thread?.workspaceId?.value,
                 threadID: thread?.id.value,
                 state: state,
-                title: item.kind == .approval ? "Bot approval needed" : (item.kind == .question ? "Bot answer needed" : "Bot needs attention"),
+                title: item.kind.activityTitle,
+                summary: item.kind.resolutionHint,
                 occurredAt: item.createdAt,
                 needsAction: true,
                 botID: item.botID.value,
@@ -102,7 +126,13 @@ enum ActivityOriginProjection {
         let scheduledOccurrences = try db.performSync { database -> [AgentActivityItem] in
             let statement = try database.prepare("""
                 SELECT r.id, r.status, r.queued_at, r.started_at, r.finished_at, r.error_summary,
-                       t.id, t.title, t.workspace_id, t.provider
+                       t.id, t.title, t.workspace_id, t.provider,
+                       NOT EXISTS (
+                           SELECT 1 FROM scheduled_task_runs newer
+                           WHERE newer.task_id = r.task_id
+                             AND (julianday(newer.queued_at) > julianday(r.queued_at)
+                                  OR (newer.queued_at = r.queued_at AND newer.rowid > r.rowid))
+                       )
                 FROM scheduled_task_runs r
                 JOIN scheduled_tasks t ON t.id = r.task_id
                 WHERE r.agent_run_id IS NULL
@@ -135,12 +165,15 @@ enum ActivityOriginProjection {
                     provider: statement.columnText(9), summary: statement.columnText(5),
                     occurredAt: finishedAt ?? date(3) ?? queuedAt, startedAt: date(3), finishedAt: finishedAt,
                     viewedAt: storedState?.0, attentionAcknowledgedAt: storedState?.1,
-                    needsAction: state == .failed && storedState?.1 == nil, originLabel: "Scheduled task"
+                    needsAction: state == .failed && statement.columnInt64(10) != 0 && storedState?.1 == nil, originLabel: "Scheduled task"
                 ))
             }
             return items
         }
-        return ActivityOriginSnapshot(labelsByRunID: labels, botLinksByThreadID: botLinks, botRequests: requests, scheduledOccurrences: scheduledOccurrences)
+        let attentionIDs = Set(allAttention.map { "bot-attention:\($0.id.value.uuidString.lowercased())" })
+        return ActivityOriginSnapshot(labelsByRunID: labels, botLinksByThreadID: botLinks, botRequests: requests,
+                                      botAttentionIDs: attentionIDs, botFailureIDsByRunID: failureIDs,
+                                      resolvedBotFailureRunIDs: resolvedFailures, scheduledOccurrences: scheduledOccurrences)
     }
 
     // Shared and style-first: every scheduled occurrence parses three timestamps on each

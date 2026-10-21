@@ -243,7 +243,7 @@ final class PetAttentionStoreTests: XCTestCase {
         )
     }
 
-    func test_staleCallbacksRemainFirstAndUseFixedCopyWithoutStaleReason() throws {
+    func test_staleCallbacksUseFixedCopyAndDoNotNeedTheUser() throws {
         let fixture = try fixture()
         let workspaceID = WorkspaceID(UUID())
         var thread = thread(
@@ -274,7 +274,7 @@ final class PetAttentionStoreTests: XCTestCase {
 
         let item = try XCTUnwrap(fixture.store.refresh().items.first)
         XCTAssertEqual(item.kind, .callback(.question, isStale: true))
-        XCTAssertEqual(item.classification, .needsYou)
+        XCTAssertEqual(item.classification, .completed)
         XCTAssertEqual(item.title, "Input request expired")
         XCTAssertEqual(item.detail, "star - Claude - raw prompt must stay private")
         XCTAssertEqual(item.workspaceName, "star")
@@ -766,7 +766,7 @@ final class PetAttentionStoreTests: XCTestCase {
         let before = try store.refresh().items
         XCTAssertEqual(
             Set(before.map(\.title)),
-            ["Agent run failed", "SSH connection needs attention", "Input requested"]
+            ["Review failed Bot run", "Reconnect SSH", "Reply to Bot"]
         )
 
         XCTAssertEqual(try store.markAllRead(), 3)
@@ -993,7 +993,7 @@ final class PetAttentionStoreTests: XCTestCase {
         )))
         XCTAssertEqual(first.id, "pet.ssh-disconnect.\(surfaceID.value.uuidString)")
         XCTAssertEqual(first.category, PetNotificationCategory.sshUnexpectedDisconnect.rawValue)
-        XCTAssertEqual(first.title, "SSH connection needs attention")
+        XCTAssertEqual(first.title, "Reconnect SSH")
         XCTAssertNil(first.body)
         XCTAssertEqual(first.workspaceId, workspaceID)
         XCTAssertEqual(first.surfaceId, surfaceID)
@@ -1265,7 +1265,7 @@ final class PetAttentionStoreTests: XCTestCase {
             XCTAssertEqual(item.kind, .agentOutcome(.failed), "\(kind.rawValue) is a failed dest outcome")
             XCTAssertTrue(item.kind.isBulkViewable)
             XCTAssertEqual(item.classification, .needsYou)
-            XCTAssertEqual(item.title, "Agent run failed")
+            XCTAssertEqual(item.title, kind.activityTitle)
             XCTAssertFalse(item.title.contains("secret"))
             XCTAssertFalse((item.detail ?? "").contains("private"))
         }

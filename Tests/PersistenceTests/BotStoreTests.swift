@@ -3,6 +3,26 @@ import CoreModel
 @testable import Persistence
 
 final class BotStoreTests: XCTestCase {
+    func test_sameSecondReplyResolvesQuestionButReplayingTheOriginalPromptDoesNot() throws {
+        let bot = try store.create(name: "Worker", title: "", description: "")
+        let thread = AgentThread(title: "Task", provider: .distill, model: "auto")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let conversation = BotConversation(botID: bot.id, title: "Task", attentionState: .needsAttention, linkedAgentThreadID: thread.id)
+        try store.upsertConversation(conversation)
+        let messages = AgentMessageRepository(db: db)
+        let prompt = AgentMessage(threadId: thread.id, role: .user, content: "Start.", createdAt: Date(timeIntervalSince1970: 100.1))
+        try messages.append(prompt)
+        let question = BotAttentionItem(botID: bot.id, conversationID: conversation.id, kind: .question,
+                                        title: "Reply", createdAt: Date(timeIntervalSince1970: 100.2))
+        try store.upsertAttention(question)
+        try messages.append(prompt)
+        XCTAssertEqual(try store.listAttention().map(\.id), [question.id])
+        try messages.append(AgentMessage(threadId: thread.id, role: .user, content: "Use staging.", createdAt: Date(timeIntervalSince1970: 100.3)))
+        XCTAssertTrue(try BotStore(db: db).listAttention().isEmpty)
+        XCTAssertNotNil(try store.listAttention(includeAcknowledged: true).first?.acknowledgedAt)
+        XCTAssertNotEqual(try store.conversation(id: conversation.id)?.attentionState, .needsAttention)
+    }
+
     func test_sharedVMScopesPersistAndOnlyExclusiveWorkspaceBotsCanUseThem() throws {
         let workspace = WorkspaceID()
         let general = try store.create(name: "General", title: "", description: "")

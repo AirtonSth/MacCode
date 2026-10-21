@@ -2304,8 +2304,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 BotAttentionItem(
                     botID: next.botID,
                     conversationID: next.id,
-                    kind: .question,
-                    title: "Needs you",
+                    kind: .blocked,
+                    title: "Review Bot handoff",
                     detail: detail
                 )
             )
@@ -3440,9 +3440,6 @@ public final class BotsViewModel: ObservableObject {
     var deskLiveObservedEventByteLimitForTesting: Int?
     /// Test seam: dest at the moment send first acknowledged the click.
     public private(set) var lastSendAcknowledgedOnScreenForTesting: BotsScreen?
-    /// Test seam: dest at the moment Attention acknowledge ran. Dest-first
-    /// must already be Chat so the row click does not wait on the store.
-    public private(set) var lastAttentionAcknowledgedOnScreenForTesting: BotsScreen?
     /// Test seam: full-fleet reloads. Roster dest must not increment this.
     public private(set) var fleetReloadCountForTesting = 0
 #if DEBUG
@@ -5656,15 +5653,7 @@ public final class BotsViewModel: ObservableObject {
         } else {
             screen = .desk
         }
-        lastAttentionAcknowledgedOnScreenForTesting = screen
-        do {
-            // Dest first. Acknowledge used to listAttention after dest
-            // painted Chat. The store already marked this row read.
-            try botStore.acknowledgeAttention(id: item.id)
-            dropAcknowledgedAttention(item.id)
-        } catch {
-            errorMessage = String(describing: error)
-        }
+        // Opening is not an answer, approval, retry, or explicit dismissal.
     }
 
     public func acknowledge(_ item: BotAttentionItem) {
@@ -10580,9 +10569,13 @@ public final class BotsViewModel: ObservableObject {
     /// painted Chat. Drop this row locally so dest does not reread
     /// the inbox. Cold dest still lists.
     private func dropAcknowledgedAttention(_ id: BotAttentionItemID) {
-        let botID = attentionItems.first(where: { $0.id == id })?.botID
+        let item = attentionItems.first(where: { $0.id == id })
         attentionItems.removeAll { $0.id == id }
-        if let botID {
+        if let conversationID = item?.conversationID,
+           let conversation = try? botStore.conversation(id: conversationID) {
+            adoptFollowThroughConversation(conversation)
+        }
+        if let botID = item?.botID {
             applyAttentionState(for: botID, conversations: destConversations(botID: botID))
         }
     }
@@ -10612,7 +10605,7 @@ public final class BotsViewModel: ObservableObject {
         return [patched]
     }
 
-    private func recordNeedsAttention(bot: BotDefinition, conversation: BotConversation, userText: String) {
+    private func recordNeedsAttention(bot: BotDefinition, conversation: BotConversation) {
         do {
             var next = conversation
             next.attentionState = .needsAttention
@@ -10624,9 +10617,9 @@ public final class BotsViewModel: ObservableObject {
             let item = BotAttentionItem(
                 botID: bot.id,
                 conversationID: next.id,
-                kind: .question,
-                title: "Needs you",
-                detail: userText
+                kind: .blocked,
+                title: "Bot could not start",
+                detail: "Check the Bot's configuration, then send your request again."
             )
             try botStore.upsertAttention(item)
             appendDeskMessage(
@@ -10705,6 +10698,12 @@ public final class BotsViewModel: ObservableObject {
         working.attentionState = .working
         working.updatedAt = Date()
         try botStore.upsertConversation(working)
+        if attentionItems.contains(where: { $0.conversationID == working.id }) {
+            let open = try botStore.listAttention(conversationID: working.id)
+            attentionListCountForTesting += 1
+            attentionItems.removeAll { $0.conversationID == working.id }
+            attentionItems.append(contentsOf: open)
+        }
         lastStartedConversationByBot[working.botID] = working
         adoptFollowThroughConversation(working)
         // The attention state settles into one roster pass (see
@@ -11824,7 +11823,7 @@ public final class BotsViewModel: ObservableObject {
         lastSendUsedDestBrainForTesting = deskBrain != nil
         guard let router = resolvedRouter(),
               let revision = try currentRevision(for: bot) else {
-            recordNeedsAttention(bot: bot, conversation: conversation, userText: userText)
+            recordNeedsAttention(bot: bot, conversation: conversation)
             return nil
         }
         var routing = routingOverride ?? frozenDeskRouting(for: conversation)
@@ -11945,7 +11944,7 @@ public final class BotsViewModel: ObservableObject {
                     self.forgetDeskSend(work, botID: bot.id)
                     self.clearDeskSendInFlight(for: bot.id)
                     self.deskSendInFlightStartedAt = nil
-                    self.recordNeedsAttention(bot: bot, conversation: prepared.conversation, userText: userText)
+                    self.recordNeedsAttention(bot: bot, conversation: prepared.conversation)
                 }
             }
         }

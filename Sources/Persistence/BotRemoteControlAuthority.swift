@@ -365,7 +365,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             durableQuestion = try durableNeedsAttention(
                 botID: botID,
                 run: run,
-                items: store.listAttention(includeAcknowledged: true)
+                items: store.listAttention()
             )
         } catch {
             botRemoteControlLog.error(
@@ -581,6 +581,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             schedulerRuns.removeFirst(schedulerRuns.count - Self.schedulerRunHistoryLimit)
         }
         var runtime = routineRuntime[routineKey] ?? [:]
+        let previousAttentionID = (runtime["attention_item_id"] as? String).flatMap(UUID.init(uuidString:))
         runtime["last_run_id"] = run["run_id"] ?? NSNull()
         runtime["last_execution_at"] = now.timeIntervalSince1970
         runtime["last_result"] = run["result"] ?? NSNull()
@@ -606,6 +607,15 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         ], hostID: hostID)
         attention[botID] = item
         guard let error else {
+            if let previousAttentionID {
+                do {
+                    try store.acknowledgeAttention(id: BotAttentionItemID(previousAttentionID), now: now)
+                    runtime.removeValue(forKey: "attention_item_id")
+                    routineRuntime[routineKey] = runtime
+                } catch {
+                    botRemoteControlLog.error("bot_routine.attention_resolution_failed routine=\(routineKey, privacy: .public) error=\(String(describing: error), privacy: .public)")
+                }
+            }
             botRemoteControlLog.info(
                 "bot_routine.started routine=\(routineKey, privacy: .public) bot=\(botID, privacy: .public) automatic=\(automatic, privacy: .public)"
             )
@@ -616,13 +626,20 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         )
         var notification: [String: Any]?
         do {
+            let attentionID = BotAttentionItemID(UUID(uuidString: item["id"] as? String ?? "") ?? UUID())
             try store.upsertAttention(BotAttentionItem(
+                id: attentionID,
                 botID: definition.botID,
                 kind: .blocked,
                 title: notStarted,
                 detail: "\(definition.name): \(error)",
                 createdAt: now
             ))
+            if let previousAttentionID {
+                try store.acknowledgeAttention(id: BotAttentionItemID(previousAttentionID), now: now)
+            }
+            runtime["attention_item_id"] = attentionID.value.uuidString.lowercased()
+            routineRuntime[routineKey] = runtime
             notification = try persistAttentionNotification(item, now: now)
         } catch {
             botRemoteControlLog.error(
@@ -633,8 +650,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     }
 
     private func synchronizeDurableNeedsAttention() throws {
-        let items = try store.listAttention(includeAcknowledged: true)
+        let items = try store.listAttention()
         var changed = false
+        let openIDs = Set(items.map { $0.id.value.uuidString.lowercased() })
+        let routineAttentionIDs = Set(routineRuntime.values.compactMap { $0["attention_item_id"] as? String })
+        for (botID, item) in attention where item["state"] as? String == "needs_attention" {
+            guard item["source"] as? String == "bot_ask_user"
+                || routineAttentionIDs.contains(item["id"] as? String ?? "") else { continue }
+            guard let itemID = item["id"] as? String, !openIDs.contains(itemID.lowercased()) else { continue }
+            var resolved = item
+            resolved["state"] = "none"
+            attention[botID] = resolved
+            changed = true
+        }
         for (botID, run) in liveRuns {
             // One failing run must not fail the whole list.
             let projected: [String: Any]?
@@ -3823,6 +3851,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               item["profile_id"] as? String == profileID,
               item["host_id"] as? String == hostID,
               item["state"] as? String != "none" else { throw Error.crossTarget }
+        if let uuid = UUID(uuidString: itemID) {
+            try store.acknowledgeAttention(id: BotAttentionItemID(uuid))
+        }
         var cleared = item
         cleared["state"] = "none"
         attention[botID] = cleared
@@ -3877,7 +3908,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               !profileID.isEmpty, !hostID.isEmpty, !botID.isEmpty else {
             return nil
         }
-        let title = item["title"] as? String ?? "Bot needs attention"
+        let title = item["title"] as? String ?? "Review Bot request"
         let body = item["detail"] as? String
         let category = "RemoteCodeThreadUpdate"
         let metadata = BotAttentionNotificationMetadata(

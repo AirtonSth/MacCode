@@ -823,30 +823,9 @@ public final class BotStore: @unchecked Sendable {
         return try db.performSync { database in
             let marks = Array(repeating: "?", count: attentionStates.count).joined(separator: ",")
             let statement = try database.prepare(
-                Self.conversationSelect + """
-                 WHERE group_id IS NULL AND (
-                     CASE
-                         WHEN linked_agent_thread_id IS NOT NULL
-                          AND (
-                              NOT EXISTS (
-                                  SELECT 1 FROM agent_threads
-                                  WHERE agent_threads.id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
-                              )
-                              OR (
-                                  NOT EXISTS (
-                                      SELECT 1 FROM agent_messages
-                                      WHERE agent_messages.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
-                                  )
-                                  AND NOT EXISTS (
-                                      SELECT 1 FROM agent_runs
-                                      WHERE agent_runs.thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
-                                  )
-                              )
-                          )
-                         THEN 'none'
-                         ELSE attention_state
-                     END
-                 ) IN (\(marks))
+                """
+                 SELECT * FROM (\(Self.conversationSelect))
+                 WHERE group_id IS NULL AND attention_state IN (\(marks))
                  ORDER BY updated_at DESC;
                 """
             )
@@ -1161,12 +1140,12 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
-    public func listAttention(includeAcknowledged: Bool = false) throws -> [BotAttentionItem] {
+    public func listAttention(includeAcknowledged: Bool = false, conversationID: BotConversationID? = nil) throws -> [BotAttentionItem] {
         try db.performSync { database in
             var sql = Self.attentionSelect
             if !includeAcknowledged {
                 sql += """
-                     WHERE acknowledged_at IS NULL
+                     WHERE \(Self.openAttentionPredicate)
                        AND (
                            conversation_id IS NULL
                            OR EXISTS (
@@ -1198,13 +1177,39 @@ public final class BotStore: @unchecked Sendable {
                        )
                     """
             }
+            if conversationID != nil {
+                sql += includeAcknowledged ? " WHERE conversation_id = ?" : " AND conversation_id = ?"
+            }
             sql += " ORDER BY created_at DESC;"
             let statement = try database.prepare(sql)
             defer { statement.reset() }
+            if let conversationID { try statement.bind(1, conversationID.value.uuidString.lowercased()) }
             var result: [BotAttentionItem] = []
             while try statement.step() { result.append(try decodeAttention(statement)) }
             return result
         }
+    }
+
+    /// A new accepted message answers the previous question; a newly admitted
+    /// run retries the previous failure. Keep these receipts, but resolve them
+    /// before the new turn can create another request (including in the same second).
+    func resolveAttention(threadID: AgentThreadID, kinds: [BotAttentionItemKind], at date: Date) throws {
+        let statement = try db.prepare("""
+            UPDATE bot_attention_items SET acknowledged_at = ?
+            WHERE acknowledged_at IS NULL
+              AND kind IN (\(kinds.map { _ in "?" }.joined(separator: ",")))
+              AND julianday(created_at) <= julianday(?)
+              AND conversation_id IN (
+                  SELECT id FROM bot_conversations
+                  WHERE linked_agent_thread_id = ? COLLATE NOCASE AND group_id IS NULL
+              );
+            """)
+        defer { statement.reset() }
+        try statement.bind(1, string(date))
+        for (index, kind) in kinds.enumerated() { try statement.bind(Int32(index + 2), kind.rawValue) }
+        try statement.bind(Int32(kinds.count + 2), isoFractional.string(from: date))
+        try statement.bind(Int32(kinds.count + 3), threadID.description)
+        _ = try statement.step()
     }
 
     public func upsertAttention(_ item: BotAttentionItem) throws {
@@ -2688,6 +2693,22 @@ public final class BotStore: @unchecked Sendable {
                         )
                     )
                    THEN 'none'
+                   WHEN attention_state = 'needsAttention'
+                    AND EXISTS (
+                        SELECT 1 FROM bot_attention_items
+                        WHERE conversation_id = bot_conversations.id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM bot_attention_items
+                        WHERE conversation_id = bot_conversations.id AND \(openAttentionPredicate)
+                    )
+                   THEN CASE
+                       WHEN (SELECT status FROM agent_runs
+                             WHERE thread_id = bot_conversations.linked_agent_thread_id COLLATE NOCASE
+                             ORDER BY started_at DESC, rowid DESC LIMIT 1) IN ('pending', 'running') THEN 'working'
+                       WHEN unread = 1 THEN 'unreadActivity'
+                       ELSE 'none'
+                   END
                    ELSE attention_state
                END AS attention_state,
                linked_agent_thread_id, created_at, updated_at, group_id
@@ -2705,5 +2726,28 @@ public final class BotStore: @unchecked Sendable {
     private static let attentionSelect = """
         SELECT id, bot_id, conversation_id, kind, title, detail, created_at, acknowledged_at
         FROM bot_attention_items
+        """
+
+    /// Also settles receipts written by older versions. All inboxes and Bot
+    /// badges use the same durable evidence; reading a conversation alone is
+    /// never evidence that its question or failure was handled.
+    private static let openAttentionPredicate = """
+        acknowledged_at IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM bot_conversations AS owner
+            WHERE owner.id = bot_attention_items.conversation_id
+              AND (
+                  (bot_attention_items.kind IN ('question', 'blocked', 'handoff') AND EXISTS (
+                      SELECT 1 FROM agent_messages
+                      WHERE thread_id = owner.linked_agent_thread_id COLLATE NOCASE
+                        AND role = 'user' AND julianday(created_at) > julianday(bot_attention_items.created_at)
+                  ))
+                  OR (bot_attention_items.kind IN ('blocked', 'handoff') AND EXISTS (
+                      SELECT 1 FROM agent_runs
+                      WHERE thread_id = owner.linked_agent_thread_id COLLATE NOCASE
+                        AND julianday(started_at) > julianday(bot_attention_items.created_at)
+                  ))
+              )
+        )
         """
 }

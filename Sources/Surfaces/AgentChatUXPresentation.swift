@@ -306,7 +306,7 @@ public enum AgentPeerActivityPresentation {
         case .waiting:
             return "Waiting for \(snapshot.name)"
         case .needsAttention:
-            return "\(snapshot.name) needs attention"
+            return "\(snapshot.name) could not reply"
         }
     }
 
@@ -321,7 +321,7 @@ public enum AgentPeerActivityPresentation {
                 elapsedSeconds: elapsedSeconds
             )
         case .needsAttention:
-            return "The run stopped before \(snapshot.name) could reply."
+            return "The run stopped. Send a new instruction to retry the handoff."
         }
     }
 
