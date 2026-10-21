@@ -1,3 +1,4 @@
+import DesignSystemKit
 import SwiftUI
 
 /// Entry point for the Auto model guide. The guide edits the Distill Auto
@@ -9,4 +10,46 @@ public enum AgentAutoGuide {
     public static let subtitle = "How Auto picks a model for each turn. Changes apply to every Auto conversation."
 
     @MainActor public static var makeGuide: ((_ onClose: @escaping () -> Void) -> AnyView)?
+}
+
+/// Inline Accounts & Auto editor shown in a Distill conversation's empty state.
+/// AppShell installs the factory (the controller lives there); Surfaces only mounts it.
+public enum AgentAccountsInline {
+    @MainActor public static var make: (() -> AnyView)?
+}
+
+/// New-conversation empty state: title, subtitle and, when the host installed
+/// it, the Accounts & Auto editor. Shared by the Agent App and Bot Desk.
+public struct AgentNewConversationEmptyState: View {
+    public let title: String
+    public let subtitle: String
+
+    public init(title: String, subtitle: String) {
+        self.title = title
+        self.subtitle = subtitle
+    }
+
+    public var body: some View {
+        if let makeAccounts = AgentAccountsInline.make {
+            VStack(spacing: DS.Space.xxl) {
+                VStack(spacing: DS.Space.md) {
+                    AgentChoiceIconTile(systemName: "sparkles", tint: DS.Palette.ultracode, size: 40)
+                    Text(title).font(DS.Font.title3).foregroundColor(DS.Palette.text)
+                    Text(subtitle)
+                        .font(DS.Font.bodyDense)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 420)
+                }
+                makeAccounts()
+                    .frame(maxWidth: 880)
+                    .accessibilityIdentifier("agent.accounts.inline")
+            }
+            .padding(.horizontal, DS.Space.xxl)
+            .padding(.vertical, DS.Space.xxl)
+            .frame(maxWidth: .infinity, alignment: .center)
+        } else {
+            DSEmptyState(icon: "sparkles", title: title, subtitle: subtitle)
+        }
+    }
 }
