@@ -581,6 +581,9 @@ struct BotScheduleSpecEditor: View {
                             .multilineTextAlignment(.trailing)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                } else if spec.provider == .distill {
+                    // Same Main / Worker pills and modal sheets as the Agent App and Bot Desk composer.
+                    formRow("Model") { specDistillModelPills }
                 } else {
                     formRow("Model") {
                         Button {
@@ -665,6 +668,47 @@ struct BotScheduleSpecEditor: View {
             ? (spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)).effort?.displayName ?? "Auto"
             : spec.reasoningEffort.displayName
         return AgentModelPillPresentation(title: title, effort: effort)
+    }
+
+    private var specDistillModelPills: some View {
+        let selectable = AgentDistillModelCatalog.selectableModels(models)
+        let snapshot = providers.resolvedSnapshot(provider: spec.provider, instanceID: spec.providerInstanceID)
+        let mainUnavailable = !spec.model.isEmpty && !selectable.isEmpty
+            && !selectable.contains(where: { $0.id == spec.model || $0.supportsCustomModel })
+        return AgentDistillModelPills(
+            mainModel: spec.model, mainModels: selectable,
+            reasoningModel: spec.reasoningModel, reasoningModels: selectable,
+            mainEffortSelection: spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort),
+            mainEfforts: selectedMainEfforts,
+            supportsMainEffortAuto: snapshot?.effectiveCapabilities.supportsDistillMainEffortAuto == true,
+            reasoningEffortSelection: spec.distillReasoningEffortSelection ?? .automatic,
+            reasoningEfforts: selectedReasoningEfforts,
+            supportsReasoningModelEffort: snapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true,
+            homePath: snapshot?.homePath,
+            mainUnavailable: mainUnavailable,
+            isRunning: false,
+            isDisabled: false,
+            emptyListTitle: providersLoading ? "Loading models..." : "No models available",
+            workerEmptyListTitle: providersLoading
+                ? "Loading models..." : "No models yet. Connect an account on the start screen.",
+            menuWidth: AgentModelMenuWidth.estimatedWidth(
+                titles: selectable.map(\.label), min: AgentModelMenuWidth.distillMin, max: AgentModelMenuWidth.distillMax
+            ),
+            mainIdentifier: "bots.scheduleTasks.editor.model",
+            mainPopoverIdentifier: "bots.scheduleTasks.editor.model.popover",
+            workerIdentifier: "bots.scheduleTasks.editor.reasoningModel",
+            workerPopoverIdentifier: "bots.scheduleTasks.editor.reasoningModel.popover",
+            onSelectMainModel: { spec.model = $0 },
+            onSelectCustomMainModel: { spec.model = $0 },
+            onSelectMainEffort: { selection in
+                spec.distillMainEffortSelection = selection
+                if let effort = selection.effort { spec.reasoningEffort = effort }
+            },
+            onSelectWorkerModel: { spec.reasoningModel = $0 },
+            onSelectWorkerEffort: { spec.distillReasoningEffortSelection = $0 },
+            statusHeader: { EmptyView() },
+            mainFooter: { EmptyView() }
+        )
     }
 
     private var specModelPopover: some View {

@@ -1593,6 +1593,9 @@ private struct ScheduledTaskEditorView: View {
                                 .multilineTextAlignment(.trailing)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
+                    } else if draft.provider == .distill {
+                        // Same Main / Worker pills and modal sheets as the Agent App and Bot Desk composer.
+                        formRow("Model") { editorDistillModelPills }
                     } else {
                         formRow("Model") {
                             Button {
@@ -1738,6 +1741,52 @@ private struct ScheduledTaskEditorView: View {
             ? (draft.distillMainEffortSelection ?? .fixed(draft.reasoningEffort)).effort?.displayName ?? "Auto"
             : draft.reasoningEffort.displayName
         return AgentModelPillPresentation(title: title, effort: effort)
+    }
+
+    private var editorDistillModelPills: some View {
+        let models = AgentDistillModelCatalog.selectableModels(
+            vm.models(provider: draft.provider, instanceID: draft.providerInstanceID)
+        )
+        let snapshot = vm.providers.resolvedSnapshot(provider: draft.provider, instanceID: draft.providerInstanceID)
+        let mainUnavailable = !draft.model.isEmpty && !models.isEmpty
+            && !models.contains(where: { $0.id == draft.model || $0.supportsCustomModel })
+        return AgentDistillModelPills(
+            mainModel: draft.model, mainModels: models,
+            reasoningModel: draft.reasoningModel, reasoningModels: models,
+            mainEffortSelection: draft.distillMainEffortSelection ?? .fixed(draft.reasoningEffort),
+            mainEfforts: selectedModelEfforts,
+            supportsMainEffortAuto: snapshot?.effectiveCapabilities.supportsDistillMainEffortAuto == true,
+            reasoningEffortSelection: draft.distillReasoningEffortSelection ?? .automatic,
+            reasoningEfforts: selectedReasoningEfforts,
+            supportsReasoningModelEffort: snapshot?.effectiveCapabilities.supportsDistillReasoningModelEffort == true,
+            homePath: snapshot?.homePath,
+            mainUnavailable: mainUnavailable,
+            isRunning: false,
+            isDisabled: false,
+            emptyListTitle: vm.providersLoading ? "Loading models..." : "No models available",
+            workerEmptyListTitle: vm.providersLoading
+                ? "Loading models..." : "No models yet. Connect an account on the start screen.",
+            menuWidth: AgentModelMenuWidth.estimatedWidth(
+                titles: models.map(\.label), min: AgentModelMenuWidth.distillMin, max: AgentModelMenuWidth.distillMax
+            ),
+            mainIdentifier: "scheduledTasks.editor.model",
+            mainPopoverIdentifier: "scheduledTasks.editor.model.popover",
+            workerIdentifier: "scheduledTasks.editor.reasoningModel",
+            workerPopoverIdentifier: "scheduledTasks.editor.reasoningModel.popover",
+            onSelectMainModel: { draft.model = $0 },
+            onSelectCustomMainModel: { draft.model = $0 },
+            onSelectMainEffort: { selection in
+                draft.distillMainEffortSelection = selection
+                if let effort = selection.effort { draft.reasoningEffort = effort }
+            },
+            onSelectWorkerModel: { model in
+                draft.reasoningModel = model
+                if model == nil { draft.distillReasoningEffortSelection = .automatic }
+            },
+            onSelectWorkerEffort: { draft.distillReasoningEffortSelection = $0 },
+            statusHeader: { EmptyView() },
+            mainFooter: { EmptyView() }
+        )
     }
 
     private var editorModelPopover: some View {
