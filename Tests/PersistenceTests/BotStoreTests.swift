@@ -3,6 +3,33 @@ import CoreModel
 @testable import Persistence
 
 final class BotStoreTests: XCTestCase {
+    func test_storeErrorsKeepTheirActionableMessageAcrossLocalizedBridges() {
+        let error: Error = BotStoreError.invalidInput("This bot belongs to another workspace.")
+        XCTAssertEqual(error.localizedDescription, "This bot belongs to another workspace.")
+        XCTAssertEqual((BotStoreError.notFound as NSError).localizedDescription, "Bot was not found.")
+    }
+
+    func test_contextGrantOverridesLegacyWorkspaceButCannotCrossWorkspaceVMScope() throws {
+        let legacy = WorkspaceID()
+        let workspace = WorkspaceID()
+        let bot = try store.create(name: "Developer", title: "", description: "", workspaceID: legacy)
+        let grant = try store.grantContext(hostID: "host", botID: bot.id, context: .workspace(workspace),
+                                          actions: [.read, .send], expectedRevision: nil)
+        let thread = AgentThread(workspaceId: workspace, title: "Task", provider: .distill, model: "auto")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let pin = try store.createContextualConversation(
+            BotConversation(botID: bot.id, title: "Task", linkedAgentThreadID: thread.id),
+            hostID: "host", context: .workspace(workspace), policyRevision: grant.policyRevision
+        )
+        XCTAssertNoThrow(try store.validateExecutionDestination(.ownVM, botID: bot.id, workspaceID: workspace, contextPin: pin))
+        XCTAssertThrowsError(try store.validateExecutionDestination(.ownVM, botID: bot.id, workspaceID: workspace))
+        let scopedVM = try store.saveVirtualMachine(name: "Legacy", workspaceID: legacy)
+        XCTAssertThrowsError(try store.validateExecutionDestination(.virtualMachine(scopedVM.id),
+            botID: bot.id, workspaceID: workspace, contextPin: pin))
+        _ = try store.revokeContext(hostID: "host", botID: bot.id, context: .workspace(workspace), expectedRevision: grant.policyRevision)
+        XCTAssertThrowsError(try store.validateExecutionDestination(.ownVM, botID: bot.id, workspaceID: workspace, contextPin: pin))
+    }
+
     func test_sameSecondReplyResolvesQuestionButReplayingTheOriginalPromptDoesNot() throws {
         let bot = try store.create(name: "Worker", title: "", description: "")
         let thread = AgentThread(title: "Task", provider: .distill, model: "auto")

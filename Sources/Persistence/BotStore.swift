@@ -2,7 +2,7 @@ import Foundation
 import CoreModel
 import os
 
-public enum BotStoreError: Error, Equatable, CustomStringConvertible {
+public enum BotStoreError: Error, Equatable, CustomStringConvertible, LocalizedError {
     case notFound
     case invalidRow(String)
     case revisionConflict
@@ -16,6 +16,8 @@ public enum BotStoreError: Error, Equatable, CustomStringConvertible {
         case .invalidInput(let message): return message
         }
     }
+
+    public var errorDescription: String? { description }
 }
 
 public struct BotQueuedFollowUpRecord: Equatable, Sendable {
@@ -1556,7 +1558,7 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
-    public func saveRoutine(_ definition: BotRoutineDefinition, now: Date = Date()) throws {
+    public func saveRoutine(_ definition: BotRoutineDefinition, enabled: Bool? = nil, now: Date = Date()) throws {
         if let destination = definition.scheduleSpec?.executionDestination {
             try validateExecutionDestination(destination, botID: definition.botID)
         }
@@ -1575,6 +1577,9 @@ public final class BotStore: @unchecked Sendable {
                     ),
                     database: db
                 )
+            }
+            if let enabled {
+                try setRoutineEnabled(id: definition.id, botID: definition.botID, enabled: enabled, now: now)
             }
         }
     }

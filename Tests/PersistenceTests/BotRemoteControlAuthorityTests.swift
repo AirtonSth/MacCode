@@ -1601,7 +1601,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "bot_id": a.botID,
             "name": "Owned",
             "prompt": "Only A",
-            "schedule_spec_json": "{}",
+            "schedule_spec_json": BotScheduleSpec(model: "auto").encodedJSON(),
         ])
         let routineID = try XCTUnwrap((routine["readback"] as? [String: Any])?["routine_id"] as? String)
         for (suffix, method, extra) in [
@@ -1617,6 +1617,15 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             ]
             params.merge(extra) { _, new in new }
             XCTAssertThrowsError(try authority.dispatch(method: method, params: params), method)
+        }
+        for routineID: String? in [nil, "not-a-uuid"] {
+            var params: [String: Any] = [
+                "client_request_id": UUID().uuidString, "bot_id": a.botID,
+                "name": "Edit", "prompt": "Only A",
+                "schedule_spec_json": BotScheduleSpec(model: "auto").encodedJSON(),
+            ]
+            params["routine_id"] = routineID
+            XCTAssertThrowsError(try authority.dispatch(method: "bot.routine.update", params: params))
         }
         let listed = try authority.dispatch(method: "bot.routine.list", params: ["bot_id": a.botID])
         XCTAssertEqual((listed["routines"] as? [[String: Any]])?.count, 1)
@@ -1741,7 +1750,7 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
             "name": "Piper",
         ])
         let botID = try XCTUnwrap(created["bot_id"] as? String)
-        let spec = "{\"frequency\":\"weekly\",\"weekdays\":[\"monday\"]}"
+        let spec = BotScheduleSpec(model: "auto", frequency: .weekly, weekdays: [.monday]).encodedJSON()
         _ = try authority.dispatch(method: "bot.routine.create", params: [
             "client_request_id": "r1",
             "bot_id": botID,

@@ -59,7 +59,7 @@ final class BotGuestRunResolverTests: XCTestCase {
         var runsDirectory: URL { DistillGuestEnvironment.runsDirectory(appSupport: appSupport) }
     }
 
-    private func makeFixture(openBarrier: Bool = true) async throws -> Fixture {
+    private func makeFixture(openBarrier: Bool = true, legacyWorkspaceID: WorkspaceID? = nil) async throws -> Fixture {
         let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
@@ -67,7 +67,7 @@ final class BotGuestRunResolverTests: XCTestCase {
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
         let workspace = try router.createWorkspace(name: "ws", cwd: workspaceDir.path)
         let bot = try ctx.botStore.create(
-            name: "Vera", title: "", description: "", desktopKind: .dockerDesktop, workspaceID: workspace.id
+            name: "Vera", title: "", description: "", desktopKind: .dockerDesktop, workspaceID: legacyWorkspaceID ?? workspace.id
         )
         // Provisioning creates the bot's guest home; the fake VM does not.
         try FileManager.default.createDirectory(
@@ -266,6 +266,27 @@ final class BotGuestRunResolverTests: XCTestCase {
     }
 
     // MARK: - Routing
+
+    func test_authorizedWorkspaceConversationRunsDespiteLegacyBotWorkspace() async throws {
+        let f = try await makeFixture(legacyWorkspaceID: WorkspaceID())
+        defer { f.resolver.endRunsForAppTermination() }
+        let thread = try makeThread(f, workspace: true)
+        let host = f.ctx.liveActivityHostIdentity.serverId
+        let grant = try f.ctx.botStore.grantContext(
+            hostID: host, botID: f.bot.id, context: .workspace(f.workspace.id),
+            actions: [.read, .send], expectedRevision: nil
+        )
+        try f.ctx.botStore.createContextualConversation(
+            BotConversation(botID: f.bot.id, title: "Authorized", linkedAgentThreadID: thread.id),
+            hostID: host, context: .workspace(f.workspace.id), policyRevision: grant.policyRevision
+        )
+        XCTAssertNotEqual(try f.ctx.botStore.get(id: f.bot.id)?.workspaceID, f.workspace.id)
+        XCTAssertEqual(try f.ctx.threadRepo.get(id: thread.id)?.workspaceId, f.workspace.id)
+        let plan = try unwrapPlan(try await f.resolver.prepare(request(thread, cwd: f.workspace.cwd)) { _ in })
+        XCTAssertEqual(f.vm.calls.count, 1)
+        XCTAssertEqual(plan.guestCwd, f.workspace.cwd)
+        await plan.finish(.completed).value
+    }
 
     // WHY: a conversation pinned to This Mac but still marked as a VM thread failed every
     // send with "this bot no longer has a Docker desktop" instead of running on the Mac.

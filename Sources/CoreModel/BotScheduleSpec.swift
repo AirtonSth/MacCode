@@ -268,11 +268,12 @@ public struct BotScheduleSpec: Codable, Sendable, Equatable {
     }
 }
 
-public enum BotScheduleSpecError: Error, Equatable, CustomStringConvertible {
+public enum BotScheduleSpecError: Error, Equatable, CustomStringConvertible, LocalizedError {
     case invalid(String)
     public var description: String {
         switch self {
         case .invalid(let message): return message
         }
     }
+    public var errorDescription: String? { description }
 }

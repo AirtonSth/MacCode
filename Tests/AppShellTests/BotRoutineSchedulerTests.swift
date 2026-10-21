@@ -70,9 +70,11 @@ final class BotRoutineSchedulerTests: XCTestCase {
     private func saveActiveRoutine(
         _ f: Fixture,
         bot: BotDefinition,
-        base: Date
+        base: Date,
+        destination: BotExecutionDestination? = nil,
+        permission: AgentPermissionMode? = nil
     ) throws -> (routine: BotRoutineDefinition, slot: Date) {
-        let spec = BotScheduleSpec(
+        var spec = BotScheduleSpec(
             provider: .distill,
             providerInstanceID: "distill-acp",
             model: "main-b",
@@ -80,6 +82,8 @@ final class BotRoutineSchedulerTests: XCTestCase {
             localTime: base.addingTimeInterval(60),
             timeZoneIdentifier: "UTC"
         )
+        spec.executionDestination = destination
+        spec.permissionMode = permission
         let routine = BotRoutineDefinition(
             botID: bot.id,
             name: "Review Empath",
@@ -235,6 +239,93 @@ final class BotRoutineSchedulerTests: XCTestCase {
         XCTAssertEqual(thread.actor, .bot(bot.id))
         let request = try XCTUnwrap(f.runner.requests.first)
         f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
+    func test_workspaceScheduleUsesSavedMacDestinationWithoutStartingBotsDefaultVM() async throws {
+        let f = try makeFixture()
+        let workspace = try f.router.createWorkspace(name: "Schedule", cwd: directory)
+        let bot = try f.vm.create(name: "Builder", title: "", workspaceID: workspace.id)
+        try f.context.botStore.setExecutionDestination(.ownVM, botID: bot.id)
+        _ = try f.context.botStore.grantContext(
+            hostID: f.context.liveActivityHostIdentity.serverId, botID: bot.id,
+            context: .workspace(workspace.id), actions: [.read, .send], expectedRevision: nil
+        )
+        let docker = ScheduledDocker()
+        docker.startError = BotComputerDockerError.provisioningFailed
+        f.vm.computerGuestService = BotComputerGuestService(
+            appSupport: f.context.appSupportDirectory, docker: docker, observeAttempts: 1, observeDelay: 0
+        )
+        let (_, slot) = try saveActiveRoutine(f, bot: bot, base: Date(), destination: .mac, permission: .supervised)
+        f.scheduler.tick(now: slot.addingTimeInterval(5))
+        await f.scheduler.settleForTesting()
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started, "a Mac schedule must run even when Docker cannot start")
+        XCTAssertTrue(docker.containers.isEmpty, "the saved destination must control preparation")
+        let request = try XCTUnwrap(f.runner.requests.first)
+        let thread = try XCTUnwrap(f.context.threadRepo.get(id: request.threadId))
+        XCTAssertEqual(request.permissionMode, .supervised)
+        XCTAssertEqual(thread.workspaceId, workspace.id)
+        XCTAssertEqual(thread.executionTarget, .mac)
+        XCTAssertEqual(try f.context.botStore.threadExecutionDestination(thread.id), .mac)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
+    func test_workspaceSchedulePinsNamedVMOverrideBeforeSending() async throws {
+        let f = try makeFixture()
+        let workspace = try f.router.createWorkspace(name: "Schedule", cwd: directory)
+        let bot = try f.vm.create(name: "Builder", title: "", workspaceID: workspace.id)
+        _ = try f.context.botStore.grantContext(
+            hostID: f.context.liveActivityHostIdentity.serverId, botID: bot.id,
+            context: .workspace(workspace.id), actions: [.read, .send], expectedRevision: nil
+        )
+        let machine = try f.context.botStore.saveVirtualMachine(name: "Build", workspaceID: workspace.id)
+        let (_, slot) = try saveActiveRoutine(f, bot: bot, base: Date(), destination: .virtualMachine(machine.id))
+        f.scheduler.tick(now: slot.addingTimeInterval(5))
+        await f.scheduler.settleForTesting()
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started, "a new contextual schedule must accept its saved destination")
+        let request = try XCTUnwrap(f.runner.requests.first)
+        let thread = try XCTUnwrap(f.context.threadRepo.get(id: request.threadId))
+        XCTAssertEqual(thread.workspaceId, workspace.id)
+        XCTAssertEqual(thread.executionTarget, .vm)
+        XCTAssertEqual(try f.context.botStore.threadExecutionDestination(thread.id), .virtualMachine(machine.id))
+        XCTAssertEqual(try f.context.botStore.guestResourceID(botID: bot.id, threadID: thread.id), machine.storageID)
+        f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
+    func test_invalidContextualDestinationDoesNotFallBackToAnUnscopedConversation() throws {
+        let f = try makeFixture()
+        let legacy = try f.router.createWorkspace(name: "Old", cwd: directory)
+        let workspace = try f.router.createWorkspace(name: "Current", cwd: directory + "/current")
+        let bot = try f.vm.create(name: "Builder", title: "", workspaceID: legacy.id)
+        _ = try f.context.botStore.grantContext(
+            hostID: f.context.liveActivityHostIdentity.serverId, botID: bot.id,
+            context: .workspace(workspace.id), actions: [.read, .send], expectedRevision: nil
+        )
+        let machine = try f.context.botStore.saveVirtualMachine(name: "Old VM", workspaceID: legacy.id)
+        let (definition, _) = try saveActiveRoutine(f, bot: bot, base: Date(), destination: .virtualMachine(machine.id))
+        let routine = try XCTUnwrap(f.context.botStore.listRoutines(botID: bot.id).first)
+        XCTAssertEqual(routine.definition.id, definition.id)
+        XCTAssertThrowsError(try f.vm.enqueueScheduledRoutine(routine)) {
+            XCTAssertTrue($0.localizedDescription.contains("another workspace"), "\($0)")
+        }
+        XCTAssertTrue(try f.context.botStore.listConversations(botID: bot.id).isEmpty)
+        XCTAssertTrue(try f.context.threadRepo.list(workspaceId: workspace.id).isEmpty)
+        XCTAssertTrue(f.runner.requests.isEmpty)
+    }
+
+    func test_malformedSavedScheduleDoesNotRunWithDefaultSettings() throws {
+        let f = try makeFixture()
+        let bot = try f.vm.create(name: "Builder", title: "")
+        let definition = BotRoutineDefinition(botID: bot.id, name: "Broken", prompt: "Build",
+            scheduleNote: "Daily 09:00", scheduleSpecJSON: "{invalid")
+        try f.context.botStore.saveRoutine(definition)
+        let routine = try XCTUnwrap(f.context.botStore.listRoutines(botID: bot.id).first)
+        XCTAssertThrowsError(try f.vm.enqueueScheduledRoutine(routine)) {
+            XCTAssertTrue($0.localizedDescription.contains("saved schedule settings are invalid"), "\($0)")
+        }
+        XCTAssertTrue(try f.context.botStore.listConversations(botID: bot.id).isEmpty)
+        XCTAssertTrue(f.runner.requests.isEmpty)
     }
 
     func test_pausedSchedulerOrDisabledTaskNeverRuns() async throws {

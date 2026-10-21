@@ -425,6 +425,26 @@ final class BotVMFailureHandlingTests: XCTestCase {
         }
     }
 
+    func test_workspaceVMPreflightAcceptsItsThreadsWorktreeAndRejectsAnotherWorkspace() async throws {
+        let f = try makeFixture()
+        let workspaceID = try XCTUnwrap(f.thread.workspaceId)
+        let bot = try f.ctx.botStore.create(name: "Builder", title: "", description: "", workspaceID: workspaceID)
+        let machine = try f.ctx.botStore.saveVirtualMachine(name: "Build", workspaceID: workspaceID)
+        try f.ctx.botStore.setExecutionDestination(.virtualMachine(machine.id), botID: bot.id)
+        try f.ctx.threadRepo.setActor(id: f.thread.id, actor: .bot(bot.id), lockedAt: Date(), executionTarget: .vm)
+        let docker = RecordingDockerRun()
+        f.router.botVMDocker = BotComputerDockerCLI(run: { try docker.run($0) })
+        let worktree = f.workspaceDir.appendingPathComponent("worktree").path
+        let allowed = await f.router.botVMPreflight(bot.id, workspace: worktree, threadID: f.thread.id)
+        XCTAssertNil(allowed, "the worktree still belongs to the thread's workspace")
+
+        let foreign = AgentThread(workspaceId: WorkspaceID(), title: "Other workspace", provider: .distill, model: "auto")
+        try f.ctx.threadRepo.upsert(foreign)
+        try f.ctx.botStore.pinExecutionDestination(threadID: foreign.id, botID: bot.id, destination: .virtualMachine(machine.id))
+        let rejected = await f.router.botVMPreflight(bot.id, workspace: f.workspaceDir.path, threadID: foreign.id)
+        XCTAssertNotNil(rejected, "a matching path cannot authorize a foreign workspace")
+    }
+
     /// WHY: a thread's workspace must be bind-mounted in the bot VM before the send is allowed, or the bot edits nothing.
     func test_preflightMountsRunWorkspaceBeforeAllowingSend() async throws {
         let f = try makeFixture()

@@ -76,10 +76,17 @@ public extension BotStore {
     }
 
     func validateExecutionDestination(_ destination: BotExecutionDestination, botID: BotID,
-                                      workspaceID: WorkspaceID? = nil) throws {
+                                      workspaceID: WorkspaceID? = nil,
+                                      contextPin: BotConversationContextPin? = nil) throws {
         guard let bot = try get(id: botID), bot.deletedAt == nil else { throw BotStoreError.notFound }
-        if let owner = bot.workspaceID {
-            if let workspaceID, workspaceID != owner {
+        if let owner = bot.workspaceID, let workspaceID, workspaceID != owner {
+            // A conversation's explicit grant is authoritative over the legacy
+            // catalog workspace. It never grants access to another workspace's VM.
+            guard let pin = contextPin, pin.botID == botID, pin.context == .workspace(workspaceID),
+                  try authorizes(hostID: pin.hostID, botID: botID, context: pin.context,
+                                 action: .read, policyRevision: pin.policyRevision),
+                  try authorizes(hostID: pin.hostID, botID: botID, context: pin.context,
+                                 action: .send, policyRevision: pin.policyRevision) else {
                 throw BotStoreError.invalidInput("This bot belongs to another workspace.")
             }
         }
@@ -154,7 +161,8 @@ public extension BotStore {
 
     func contextRuntimeIdentity(pin: BotConversationContextPin, threadID: AgentThreadID) throws -> BotContextRuntimeIdentity {
         let destination = try threadExecutionDestination(threadID) ?? executionDestination(botID: pin.botID)
-        try validateExecutionDestination(destination, botID: pin.botID)
+        let workspaceID: WorkspaceID? = if case .workspace(let id) = pin.context { id } else { nil }
+        try validateExecutionDestination(destination, botID: pin.botID, workspaceID: workspaceID, contextPin: pin)
         return try BotContextRuntimeIdentity(hostID: pin.hostID, botID: pin.botID, context: pin.context,
             policyRevision: pin.policyRevision, virtualMachineID: destination.virtualMachineID)
     }

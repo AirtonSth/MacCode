@@ -1060,7 +1060,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
                   pin.contextVersion == BotContext.contractVersion, pin.policyRevision == revision,
                   let thread = try AgentThreadRepository(db: db).get(id: threadID),
                   thread.actor == .bot(botID), thread.actorLockedAt != nil,
-                  thread.provider == .distill, thread.executionTarget == .vm,
+                  thread.provider == .distill, thread.executionTarget != nil,
                   let rawIDs = params["message_ids"] as? [String], !rawIDs.isEmpty, rawIDs.count <= 32 else { throw denied }
             switch sourceContext {
             case .general: guard thread.workspaceId == nil else { throw denied }
@@ -1426,6 +1426,9 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
         case "conversation.clear_all":
             return try conversationClearAll(params: params, requestID: requestID)
         case "routine.create", "routine.update":
+            if name == "routine.update", string(params, "routine_id").flatMap(UUID.init) == nil {
+                throw Error.invalidParams
+            }
             return try routineUpsert(params: params, requestID: requestID, now: now)
         case "routine.enable":
             return try routineEnable(params: params, requestID: requestID, now: now)
@@ -2231,7 +2234,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
               Int64(pin.contextVersion) == integer(params["context_version"]), pin.policyRevision == revision,
               let thread = try AgentThreadRepository(db: db).get(id: threadID),
               thread.actor == .bot(botID), thread.actorLockedAt != nil,
-              thread.executionTarget == .vm, thread.provider == .distill,
+              thread.executionTarget != nil, thread.provider == .distill,
               (context == .general ? thread.workspaceId == nil : { if case .workspace(let workspace) = context { return thread.workspaceId == workspace }; return false }()),
               thread.parentThreadId == nil,
               thread.isEphemeral == false,
@@ -2295,12 +2298,19 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
 
     private func routineUpsert(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         let bot = try requireBot(params)
-        let specJSON = string(params, "schedule_spec_json") ?? ""
         let existingID = string(params, "routine_id").flatMap(UUID.init).map(BotRoutineID.init)
         if let existingID {
             guard try store.listRoutines(botID: bot.id).contains(where: {
                 $0.definition.id == existingID
             }) else { throw Error.routineGone }
+        }
+        let specJSON = string(params, "schedule_spec_json") ?? ""
+        if !specJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let spec = BotScheduleSpec.decodeJSON(specJSON) else {
+                throw Error(code: -32602, message: "Provide a valid Bot schedule.")
+            }
+            do { _ = try spec.makeRecurrence() }
+            catch { throw Error(code: -32602, message: error.localizedDescription) }
         }
         let definition = BotRoutineDefinition(
             id: existingID ?? BotRoutineID(),
@@ -2312,7 +2322,7 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
             createdAt: now,
             updatedAt: now
         )
-        try store.saveRoutine(definition)
+        try store.saveRoutine(definition, enabled: bool(params, "enabled"), now: now)
         let routineKey = definition.id.value.uuidString.lowercased()
         var runtime = routineRuntime[routineKey] ?? [:]
         runtime["next_run_at"] = dateValue(nextRunDate(
