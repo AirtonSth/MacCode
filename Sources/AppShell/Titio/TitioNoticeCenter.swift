@@ -1069,7 +1069,9 @@ public actor TitioNoticeCenter {
                     id: AgentMessageID(uuid),
                     threadId: target.threadID,
                     role: .assistant,
-                    content: (composed.cardOptions == nil ? Self.sourceHeading(rows) : "") + composed.text,
+                    content: rows.count == 1
+                        ? composed.text + "\n\n" + TitioNoticeBlock.render(key: rows[0].key, kind: rows[0].kind.rawValue, source: TitioNoticeCopy.sourceLabels(rows[0].facts), state: "open")
+                        : composed.text,
                     createdAt: postedAt
                 )
                 try messageRepo.append(message)
@@ -1107,19 +1109,6 @@ public actor TitioNoticeCenter {
         await fanOut(result, message: message, bannerText: bannerText, target: target, viewing: viewing)
         refreshMirrors()
         return true
-    }
-
-    private static func sourceHeading(_ rows: [TitioNoticeRecord]) -> String {
-        guard rows.count == 1, let row = rows.first else { return "" }
-        let names = [row.facts.workspaceName, row.facts.botName, row.facts.title]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        return names.isEmpty ? "" : names.map { name in
-            name.reduce(into: "") { text, character in
-                if "\\`*_{}[]<>()#+-.!|".contains(character) { text.append("\\") }
-                text.append(character)
-            }
-        }.joined(separator: " → ") + "\n\n"
     }
 
     /// Titio's text with the host's own card appended (labels may be the
@@ -1547,7 +1536,7 @@ public actor TitioNoticeCenter {
             let identifier = allInBatch.count == 1 ? allInBatch[0].key : TitioNoticeIDs.digestBannerIdentifier(messageID: uuid)
             let owner = allInBatch.first { $0.actions != nil }?.key ?? (allInBatch.count == 1 ? allInBatch[0].key : nil)
             let items = allInBatch.map(TitioNoticeRenderItem.init(record:))
-            let sentence = TitioVoiceOutput.firstSentence(BotChoicesBlock.parse(message.content).text)
+            let sentence = TitioVoiceOutput.firstSentence(TitioNoticeBlock.visibleText(message.content))
             let text = items.contains(where: { $0.kind.isLockScreenSensitive })
                 ? allInBatch.compactMap(\.facts.generatedNotificationLine).first : sentence
             // Old notices without generated redacted copy remain in the inbox;
@@ -1632,14 +1621,15 @@ public actor TitioNoticeCenter {
             titioNoticeLog.info("titio.notice.rewrite_skipped_missing key=\(record.key, privacy: .public)")
             return
         }
-        let messageLanguage = TitioNoticeCopy.detectedLanguage(original.content) ?? language()
+        let messageLanguage = TitioNoticeCopy.detectedLanguage(TitioNoticeBlock.visibleText(original.content)) ?? language()
         // Acknowledging a notice only closes its question. It must not call a
         // model to write "Seen", or turn the tap into another conversation turn.
         let writesStatus = resolution != .acknowledged
-        let text = TitioNoticeCopy.resolvedText(
+        let resolved = TitioNoticeCopy.resolvedText(
             original: original.content,
             statusLine: writesStatus ? TitioNoticeCopy.statusLine(status, language: messageLanguage, at: date, timeZone: timeZone) : nil
         )
+        let text = TitioNoticeBlock.withState(resolved, state: status.wireValue)
         if text != original.content {
             await writeRewrite(original, text: text, language: messageLanguage, key: record.key)
         }
@@ -1668,7 +1658,7 @@ public actor TitioNoticeCenter {
         guard let original = try? messageRepo.get(id: messageID) else { return }
         let text = TitioNoticeCopy.resolvedText(original: original.content, statusLine: line)
         guard text != original.content else { return }
-        let language = TitioNoticeCopy.detectedLanguage(original.content) ?? language()
+        let language = TitioNoticeCopy.detectedLanguage(TitioNoticeBlock.visibleText(original.content)) ?? language()
         await writeRewrite(original, text: text, language: language, key: nil)
     }
 
@@ -1741,7 +1731,7 @@ public actor TitioNoticeCenter {
             .last { $0.role == .assistant }
         let inbox = try? repo.updateInboxState { state in
             state.unreadCount = max(0, state.unreadCount - 1)
-            state.lastPreview = remaining.map { TitioNoticeCopy.preview($0.content) }
+            state.lastPreview = remaining.map { TitioNoticeCopy.preview(TitioNoticeBlock.visibleText($0.content)) }
             state.lastAt = remaining?.createdAt
         }
         let openDecisions = (try? repo.openDecisionCount()) ?? 0
@@ -2458,7 +2448,7 @@ public actor TitioNoticeCenter {
         guard role == .assistant,
               let inbox = try? repo.updateInboxState({ state in
                   if state.lastAt.map({ createdAt >= $0 }) ?? true {
-                      state.lastPreview = TitioNoticeCopy.preview(text)
+                      state.lastPreview = TitioNoticeCopy.preview(TitioNoticeBlock.visibleText(text))
                       state.lastAt = createdAt
                   }
               }) else { return }
@@ -2479,7 +2469,7 @@ public actor TitioNoticeCenter {
     private func messageLanguage(_ record: TitioNoticeRecord) -> TitioNoticeLanguage {
         if let raw = record.messageID, let uuid = UUID(uuidString: raw),
            let original = try? messageRepo.get(id: AgentMessageID(uuid)),
-           let detected = TitioNoticeCopy.detectedLanguage(original.content) {
+           let detected = TitioNoticeCopy.detectedLanguage(TitioNoticeBlock.visibleText(original.content)) {
             return detected
         }
         return language()

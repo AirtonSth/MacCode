@@ -42,12 +42,18 @@ public struct AgentChatChoicesCard: View {
     public var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
             if choices.notice != nil, !choices.source.isEmpty {
-                provenance
+                AgentChoiceProvenanceRow(source: choices.source, identifier: identifier)
             }
             header
             VStack(spacing: DS.Space.sm) {
                 ForEach(Array(choices.options.enumerated()), id: \.offset) { index, option in
-                    optionRow(index: index, option: option)
+                    AgentChoiceOptionRow(
+                        index: index,
+                        option: option,
+                        isSelected: selected.contains(index),
+                        multiple: choices.multiple,
+                        identifier: identifier
+                    ) { choose(index) }
                 }
             }
             .disabled(isBlockedByDraft)
@@ -71,53 +77,6 @@ public struct AgentChatChoicesCard: View {
         )
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(identifier)
-    }
-
-    /// Workspace, Bot and conversation as one breadcrumb row of chips; wraps
-    /// to a column when the card is too narrow.
-    private var provenance: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: DS.Space.xs) { provenanceChips(separated: true) }
-            VStack(alignment: .leading, spacing: DS.Space.xs) { provenanceChips(separated: false) }
-        }
-        .font(DS.Font.caption)
-        .foregroundColor(DS.Palette.textSecondary)
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("\(identifier).source")
-    }
-
-    private static let sources: [(key: String, name: String, symbol: String)] = [
-        ("workspace", "Workspace", "folder"),
-        ("bot", "Bot", "person.crop.circle"),
-        ("conversation", "Conversation", "bubble.left.and.bubble.right"),
-    ]
-
-    @ViewBuilder
-    private func provenanceChips(separated: Bool) -> some View {
-        let present = Self.sources.filter { !(choices.source[$0.key] ?? "").isEmpty }
-        ForEach(Array(present.enumerated()), id: \.element.key) { index, source in
-            if separated, index > 0 {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .accessibilityHidden(true)
-            }
-            sourceChip(name: source.name, symbol: source.symbol, value: choices.source[source.key] ?? "")
-        }
-    }
-
-    private func sourceChip(name: String, symbol: String, value: String) -> some View {
-        HStack(spacing: DS.Space.xs) {
-            Image(systemName: symbol)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(DS.Palette.textTertiary)
-            Text(value).lineLimit(1).truncationMode(.middle)
-        }
-        .padding(.horizontal, DS.Space.sm)
-        .padding(.vertical, 3)
-        .background(Capsule().fill(DS.Palette.surfaceRaised))
-        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-        .accessibilityLabel("\(name): \(value)")
     }
 
     private var header: some View {
@@ -151,54 +110,12 @@ public struct AgentChatChoicesCard: View {
         }
     }
 
-    private func optionRow(index: Int, option: String) -> some View {
-        let isSelected = selected.contains(index)
-        return Button {
-            if choices.multiple {
-                if isSelected { selected.remove(index) } else { selected.insert(index) }
-            } else if let answer = choices.answer(selecting: [index]) {
-                onAnswer(answer)
-            }
-        } label: {
-            HStack(spacing: DS.Space.lg) {
-                Text(BotChoicesBlock.letter(at: index))
-                    .font(DS.Font.captionStrong)
-                    .foregroundColor(isSelected ? DS.Palette.onAccent : DS.Palette.textSecondary)
-                    .frame(width: 22, height: 22)
-                    .background(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .fill(isSelected ? DS.Palette.accent : DS.Palette.surfaceOverlay)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                            .stroke(DS.Palette.lineStrong, lineWidth: isSelected ? 0 : DS.Border.hairline)
-                    )
-                Text(option)
-                    .font(.system(size: 14))
-                    .foregroundColor(DS.Palette.text)
-                    .multilineTextAlignment(.leading)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
-                if choices.multiple {
-                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundColor(isSelected ? DS.Palette.accent : DS.Palette.textTertiary)
-                        .accessibilityHidden(true)
-                } else {
-                    Image(systemName: "arrow.right")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .accessibilityHidden(true)
-                }
-            }
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.vertical, DS.Space.md)
-            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+    private func choose(_ index: Int) {
+        if choices.multiple {
+            if selected.contains(index) { selected.remove(index) } else { selected.insert(index) }
+        } else if let answer = choices.answer(selecting: [index]) {
+            onAnswer(answer)
         }
-        .buttonStyle(AgentChatChoiceRowStyle(isSelected: isSelected))
-        .accessibilityLabel("\(BotChoicesBlock.letter(at: index)), \(option)")
-        .accessibilityAddTraits(choices.multiple && isSelected ? .isSelected : [])
-        .accessibilityIdentifier("\(identifier).option.\(index)")
     }
 
     private var ownAnswerField: some View {
@@ -288,6 +205,110 @@ extension AgentChatChoicesCard {
             ids.append(messageID)
             defaults.set(Array(ids.suffix(limit)), forKey: key)
         }
+    }
+}
+
+/// Workspace › Bot › conversation chips; wraps to a column when too narrow.
+struct AgentChoiceProvenanceRow: View {
+    let source: [String: String]
+    let identifier: String
+
+    private static let sources: [(key: String, name: String, symbol: String)] = [
+        ("workspace", "Workspace", "folder"),
+        ("bot", "Bot", "person.crop.circle"),
+        ("conversation", "Conversation", "bubble.left.and.bubble.right"),
+    ]
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: DS.Space.xs) { chips(separated: true) }
+            VStack(alignment: .leading, spacing: DS.Space.xs) { chips(separated: false) }
+        }
+        .font(DS.Font.caption)
+        .foregroundColor(DS.Palette.textSecondary)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("\(identifier).source")
+    }
+
+    @ViewBuilder
+    private func chips(separated: Bool) -> some View {
+        let present = Self.sources.filter { !(source[$0.key] ?? "").isEmpty }
+        ForEach(Array(present.enumerated()), id: \.element.key) { index, item in
+            if separated, index > 0 {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityHidden(true)
+            }
+            sourceChip(name: item.name, symbol: item.symbol, value: source[item.key] ?? "")
+        }
+    }
+
+    private func sourceChip(name: String, symbol: String, value: String) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(DS.Palette.textTertiary)
+            Text(value).lineLimit(1).truncationMode(.middle)
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .padding(.vertical, 3)
+        .background(Capsule().fill(DS.Palette.surfaceRaised))
+        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+        .accessibilityLabel("\(name): \(value)")
+    }
+}
+
+/// One lettered option card: tap fires `action`; multiple choice shows check marks.
+struct AgentChoiceOptionRow: View {
+    let index: Int
+    let option: String
+    let isSelected: Bool
+    let multiple: Bool
+    let identifier: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: DS.Space.lg) {
+                Text(BotChoicesBlock.letter(at: index))
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(isSelected ? DS.Palette.onAccent : DS.Palette.textSecondary)
+                    .frame(width: 22, height: 22)
+                    .background(
+                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .fill(isSelected ? DS.Palette.accent : DS.Palette.surfaceOverlay)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                            .stroke(DS.Palette.lineStrong, lineWidth: isSelected ? 0 : DS.Border.hairline)
+                    )
+                Text(option)
+                    .font(.system(size: 14))
+                    .foregroundColor(DS.Palette.text)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                if multiple {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 14, weight: .regular))
+                        .foregroundColor(isSelected ? DS.Palette.accent : DS.Palette.textTertiary)
+                        .accessibilityHidden(true)
+                } else {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.vertical, DS.Space.md)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        }
+        .buttonStyle(AgentChatChoiceRowStyle(isSelected: isSelected))
+        .accessibilityLabel("\(BotChoicesBlock.letter(at: index)), \(option)")
+        .accessibilityAddTraits(multiple && isSelected ? .isSelected : [])
+        .accessibilityIdentifier("\(identifier).option.\(index)")
     }
 }
 

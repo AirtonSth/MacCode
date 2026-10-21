@@ -194,7 +194,8 @@ final class TitioNoticeActTests: XCTestCase {
         let rows = try transcript(f)
         XCTAssertEqual(rows.map(\.role), [.assistant, .user, .assistant])
         XCTAssertNil(BotChoicesBlock.parse(rows[0].content).choices, "the card is gone from the original")
-        XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"), rows[0].content)
+        XCTAssertTrue(TitioNoticeBlock.parse(rows[0].content).text.hasSuffix("_Written status._"), rows[0].content)
+        XCTAssertEqual(TitioNoticeBlock.parse(rows[0].content).block?.state, "approved")
         XCTAssertEqual(AgentReplyQuote.parse(rows[1].content)?.body, "Approve", "the user row retains the exact question with the option label")
         XCTAssertEqual(rows[2].content, "Written result.")
         XCTAssertTrue(f.recorder.posted.contains { $0.isRewrite && $0.message.id.value.uuidString == messageID },
@@ -215,7 +216,8 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(f.actions.calls, [], "nothing was sent to the provider")
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .expired)
         let rows = try transcript(f)
-        XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"))
+        XCTAssertTrue(TitioNoticeBlock.parse(rows[0].content).text.hasSuffix("_Written status._"))
+        XCTAssertEqual(TitioNoticeBlock.parse(rows[0].content).block?.state, "expired")
         XCTAssertEqual(rows.count, 1, "expired cards settle in place without another action message")
     }
 
@@ -350,7 +352,8 @@ final class TitioNoticeActTests: XCTestCase {
         await f.center.idle()
         let rows = try transcript(f)
         XCTAssertEqual(rows.count, 1, "no new message for an elsewhere resolution")
-        XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"), rows[0].content)
+        XCTAssertTrue(TitioNoticeBlock.parse(rows[0].content).text.hasSuffix("_Written status._"), rows[0].content)
+        XCTAssertEqual(TitioNoticeBlock.parse(rows[0].content).block?.state, "elsewhere")
         XCTAssertNil(BotChoicesBlock.parse(rows[0].content).choices)
     }
 
@@ -396,7 +399,8 @@ final class TitioNoticeActTests: XCTestCase {
         XCTAssertEqual(f.actions.calls, [.request(requestThread, "Q1", .approve)])
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .failed)
         let rows = try transcript(f)
-        XCTAssertTrue(rows[0].content.hasSuffix("_Written status._"))
+        XCTAssertTrue(TitioNoticeBlock.parse(rows[0].content).text.hasSuffix("_Written status._"))
+        XCTAssertEqual(TitioNoticeBlock.parse(rows[0].content).block?.state, "failed")
         XCTAssertEqual(rows.last?.content, "Written result.")
     }
 

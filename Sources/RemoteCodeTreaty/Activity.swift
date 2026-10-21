@@ -21,6 +21,8 @@ public struct AgentActivityItem: Codable, Equatable, Sendable {
     public let state: AgentActivityState
     public let title: String
     public let workspaceName: String?
+    /// `TabColor` raw value of the workspace color (e.g. "blue"); nil when the workspace has none.
+    public let workspaceColor: String?
     public let provider: String?
     public let summary: String?
     public let occurredAt: Date
@@ -39,10 +41,11 @@ public struct AgentActivityItem: Codable, Equatable, Sendable {
     public let conversationID: UUID?
     public let originLabel: String?
 
-    public init(id: String, kind: AgentActivityKind, runID: UUID? = nil, requestID: String? = nil, notificationID: String? = nil, workspaceID: UUID? = nil, threadID: UUID? = nil, surfaceID: UUID? = nil, state: AgentActivityState, title: String, workspaceName: String? = nil, provider: String? = nil, summary: String? = nil, occurredAt: Date, startedAt: Date? = nil, finishedAt: Date? = nil, viewedAt: Date? = nil, attentionAcknowledgedAt: Date? = nil, needsAction: Bool = false, blocking: Bool = false, finalMessageID: UUID? = nil, checkpointID: UUID? = nil, checkpointTurnCount: Int? = nil, changedFiles: [String] = [], error: String? = nil, botID: UUID? = nil, conversationID: UUID? = nil, originLabel: String? = nil) {
+    public init(id: String, kind: AgentActivityKind, runID: UUID? = nil, requestID: String? = nil, notificationID: String? = nil, workspaceID: UUID? = nil, threadID: UUID? = nil, surfaceID: UUID? = nil, state: AgentActivityState, title: String, workspaceName: String? = nil, workspaceColor: String? = nil, provider: String? = nil, summary: String? = nil, occurredAt: Date, startedAt: Date? = nil, finishedAt: Date? = nil, viewedAt: Date? = nil, attentionAcknowledgedAt: Date? = nil, needsAction: Bool = false, blocking: Bool = false, finalMessageID: UUID? = nil, checkpointID: UUID? = nil, checkpointTurnCount: Int? = nil, changedFiles: [String] = [], error: String? = nil, botID: UUID? = nil, conversationID: UUID? = nil, originLabel: String? = nil) {
         self.id = id; self.kind = kind; self.runID = runID; self.requestID = requestID
         self.notificationID = notificationID; self.workspaceID = workspaceID; self.threadID = threadID
         self.surfaceID = surfaceID; self.state = state; self.title = title; self.workspaceName = workspaceName
+        self.workspaceColor = workspaceColor
         self.provider = provider; self.summary = summary; self.occurredAt = occurredAt; self.startedAt = startedAt
         self.finishedAt = finishedAt; self.viewedAt = viewedAt; self.attentionAcknowledgedAt = attentionAcknowledgedAt
         self.needsAction = needsAction; self.blocking = blocking; self.finalMessageID = finalMessageID
@@ -54,7 +57,7 @@ public struct AgentActivityItem: Codable, Equatable, Sendable {
         case id, kind, state, title, provider, summary, error, blocking
         case runID = "run_id", requestID = "request_id", notificationID = "notification_id"
         case workspaceID = "workspace_id", threadID = "thread_id", surfaceID = "surface_id"
-        case workspaceName = "workspace_name", occurredAt = "occurred_at", startedAt = "started_at"
+        case workspaceName = "workspace_name", workspaceColor = "workspace_color", occurredAt = "occurred_at", startedAt = "started_at"
         case finishedAt = "finished_at", viewedAt = "viewed_at"
         case attentionAcknowledgedAt = "attention_acknowledged_at", needsAction = "needs_action"
         case finalMessageID = "final_message_id", checkpointID = "checkpoint_id", checkpointTurnCount = "checkpoint_turn_count", changedFiles = "changed_files"

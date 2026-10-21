@@ -306,7 +306,8 @@ final class TitioNoticeRecoveryTests: XCTestCase {
         XCTAssertEqual(try after.repo.get(key: fact.key)?.resolution, .expired)
         XCTAssertEqual(try after.repo.openDecisionCount(), 0)
         let message = try XCTUnwrap(after.messages.get(id: AgentMessageID(TitioNoticeIDs.messageID(forKey: fact.key))))
-        XCTAssertTrue(message.content.hasSuffix("_Written status._"), message.content)
+        XCTAssertTrue(TitioNoticeBlock.parse(message.content).text.hasSuffix("_Written status._"), message.content)
+        XCTAssertEqual(TitioNoticeBlock.parse(message.content).block?.state, "expired")
     }
 
     // MARK: 5 / 30 / 40. Transcript retention

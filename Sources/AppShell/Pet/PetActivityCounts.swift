@@ -23,6 +23,12 @@ struct PetActivityCounts: Equatable {
         newResults = counts.newResults
         isAvailable = true
     }
+
+    /// Red badge total: items needing the user plus just-finished results. Saturates instead of overflowing.
+    var badgeTotal: Int {
+        let (sum, overflow) = needsYou.addingReportingOverflow(newResults)
+        return overflow ? Int.max : sum
+    }
 }
 
 @MainActor

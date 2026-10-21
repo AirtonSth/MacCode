@@ -5,6 +5,7 @@ import CoreModel
 import DesignSystemKit
 import os
 import Persistence
+import RemoteCodeTreaty
 import SocketServer
 import Surfaces
 import SwiftUI
@@ -10916,7 +10917,9 @@ public final class BotsViewModel: ObservableObject {
             pinnedThread: thread,
             noticeChoiceHandler: isTitioInbox ? titioNoticeChoiceHandler() : nil,
             hostReplyHandler: isTitioInbox ? titioHostReplyHandler() : nil,
-            noticeClearHandler: isTitioInbox ? titioNoticeClearHandler() : nil
+            noticeClearHandler: isTitioInbox ? titioNoticeClearHandler() : nil,
+            nowStrip: isTitioInbox ? titioNowStripSource() : nil,
+            nowStripCached: isTitioInbox ? titioNowSnapshot : nil
         )
         let vm = AgentAppViewModel(
             workspaceID: Self.botDeskWorkspaceID,
@@ -11222,6 +11225,10 @@ public final class BotsViewModel: ObservableObject {
         deskThreadRuntimeObservation = nil
         deskAgentKey = nil
         titioReplyDraftObservation = nil
+        if let id = titioNowEventSubscription {
+            EventBus.shared.unsubscribe(id)
+            titioNowEventSubscription = nil
+        }
         guard let vm = deskAgentVM else { return }
         deskAgentVM = nil
         vm.dispose()
@@ -11479,6 +11486,100 @@ public final class BotsViewModel: ObservableObject {
     }
 
     private var titioReplyDraftObservation: AnyCancellable?
+    /// Last accepted "Now" strip snapshot; committed by `onAccept`, not by `load`.
+    private var titioNowSnapshot: AgentNowStripSnapshot?
+    private let titioNowChanges = PassthroughSubject<Void, Never>()
+    private var titioNowEventSubscription: UUID?
+
+    /// The Titio inbox's "Now" strip (running and needs-you Activity). Latest
+    /// load wins; `open` routes like an Activity row does.
+    private func titioNowStripSource() -> AgentNowStripSource {
+        ensureTitioNowEventSubscription()
+        return AgentNowStripSource(
+            load: { [weak self] in
+                guard let router = await MainActor.run(body: { self?.resolvedRouter() }) else {
+                    throw LayoutError.workspaceNotFound
+                }
+                let running = try await Self.titioNowPage(router: router, section: "running")
+                let needsYou = try await Self.titioNowPage(router: router, section: "needs_you")
+                return Self.nowStripSnapshot(running: running, needsYou: needsYou)
+            },
+            changes: titioNowChanges.eraseToAnyPublisher(),
+            open: { [weak self] item in self?.openTitioNowItem(item) },
+            onAccept: { [weak self] snapshot in self?.titioNowSnapshot = snapshot }
+        )
+    }
+
+    /// Needs-you first, then running, one row per id (needs-you wins when both
+    /// pages carry it), max 5. Counts are the page counts.
+    nonisolated static func nowStripSnapshot(running: AgentActivityPage, needsYou: AgentActivityPage) -> AgentNowStripSnapshot {
+        let needsItems = needsYou.items.map { (item: $0, state: AgentNowStripItem.State.needsYou) }
+        let runningItems = running.items.filter { $0.state == .running }
+            .map { (item: $0, state: AgentNowStripItem.State.running) }
+        var seen = Set<String>()
+        let unique = (needsItems + runningItems).filter { seen.insert($0.item.id).inserted }
+        return AgentNowStripSnapshot(
+            running: running.counts.running,
+            needsYou: needsYou.counts.needsYou,
+            items: unique.prefix(5).map { entry in
+                let parts = [entry.item.workspaceName, entry.item.originLabel]
+                    .compactMap { $0 }.filter { !$0.isEmpty }
+                return AgentNowStripItem(
+                    id: entry.item.id, state: entry.state, title: entry.item.title,
+                    subtitle: parts.isEmpty ? nil : parts.joined(separator: " · "),
+                    startedAt: entry.item.startedAt,
+                    route: AgentNowStripRoute(
+                        botID: entry.item.botID, conversationID: entry.item.conversationID,
+                        threadID: entry.item.threadID, workspaceID: entry.item.workspaceID,
+                        surfaceID: entry.item.surfaceID
+                    )
+                )
+            }
+        )
+    }
+
+    private static func titioNowPage(router: AppCommandRouter, section: String) async throws -> AgentActivityPage {
+        let value = try await router.activityListOffMain(params: ["section": .string(section), "limit": .number(5)])
+        return try AgentActivityPage.makeJSONDecoder().decode(AgentActivityPage.self, from: JSONEncoder().encode(value))
+    }
+
+    private static let titioNowEventKinds: Set<String> = [
+        "notification.created", "notification.read", "notification.dismissed", "bots.attention.changed",
+        "bot.attention.updated", "bot.scheduler.updated", "operation.updated", "surface.updated",
+        "agent.run.started", "agent.run.completed", "agent.run.failed", "agent.run.finished",
+        "agent.run.cancelled", "agent.request.opened", "agent.request.resolved",
+        "agent.user_input.requested", "agent.user_input.resolved",
+    ]
+
+    private func ensureTitioNowEventSubscription() {
+        guard titioNowEventSubscription == nil else { return }
+        titioNowEventSubscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { [weak self] event in
+            guard Self.titioNowEventKinds.contains(event.kind) else { return }
+            Task { @MainActor in self?.titioNowChanges.send() }
+        }
+    }
+
+    /// Same destinations as Activity rows: bot, then thread, then surface.
+    private func openTitioNowItem(_ strip: AgentNowStripItem) {
+        guard let route = strip.route, let router = resolvedRouter() else { return }
+        do {
+            if let botID = route.botID {
+                guard try router.openBotsDesk(
+                    botID: BotID(botID),
+                    conversationID: route.conversationID.map(BotConversationID.init)
+                ) else { throw LayoutError.surfaceNotFound }
+            } else if let threadID = route.threadID {
+                _ = try router.openAgentThread(thread: AgentThreadID(threadID))
+            } else if let surfaceID = route.surfaceID, let workspaceID = route.workspaceID {
+                try router.selectWorkspace(WorkspaceID(workspaceID))
+                try router.focusSurface(workspace: WorkspaceID(workspaceID), surface: SurfaceID(surfaceID))
+            } else {
+                errorMessage = "This activity has no conversation destination."
+            }
+        } catch {
+            errorMessage = "Could not open activity: \(error.localizedDescription)"
+        }
+    }
 
     private func bindTitioReplyDraft(_ vm: AgentAppViewModel, conversationID: BotConversationID, threadID: AgentThreadID) {
         let key = "titio.reply_draft." + conversationID.value.uuidString.lowercased()

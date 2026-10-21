@@ -203,8 +203,9 @@ final class TitioVoiceCenterTests: XCTestCase {
         await f.scheduler.advance(by: TitioNoticeTiming.infoWindow, center: f.center)
         await waitForPushes(f, count: 1)
         let message = try XCTUnwrap(transcript(f).first)
-        XCTAssertTrue(message.content.hasSuffix("The build finished. Its report is ready."))
-        XCTAssertTrue(message.content.contains("api → Build"))
+        XCTAssertTrue(TitioNoticeBlock.parse(message.content).text.hasSuffix("The build finished. Its report is ready."))
+        XCTAssertFalse(message.content.contains("→"), "provenance lives in the notice block, not a heading")
+        XCTAssertEqual(TitioNoticeBlock.parse(message.content).block?.source, ["workspace": "api", "conversation": "Build"])
         XCTAssertEqual(f.recorder.banners.first?.body, "The build finished.")
         XCTAssertEqual(voice.requests.count, 1)
         XCTAssertEqual(voice.requests.first?.threadID, f.target.threadID)
@@ -277,7 +278,10 @@ final class TitioVoiceCenterTests: XCTestCase {
         XCTAssertEqual(try f.repo.get(key: first.key)?.resolution, .acknowledged)
         XCTAssertEqual(try f.repo.get(key: second.key)?.state, .posted)
         let acknowledged = try XCTUnwrap(after.first { $0.id.value.uuidString == firstID })
-        XCTAssertEqual(acknowledged.content, BotChoicesBlock.parse(try XCTUnwrap(before.first { $0.id == acknowledged.id }).content).text)
+        let beforeAcknowledged = try XCTUnwrap(before.first { $0.id == acknowledged.id })
+        XCTAssertEqual(TitioNoticeBlock.parse(acknowledged.content).text,
+                       TitioNoticeBlock.parse(BotChoicesBlock.parse(beforeAcknowledged.content).text).text)
+        XCTAssertEqual(TitioNoticeBlock.parse(acknowledged.content).block?.state, "acknowledged")
         XCTAssertEqual(after.filter { BotChoicesBlock.parse($0.content).choices != nil }.count, 1)
     }
 
@@ -440,7 +444,8 @@ final class TitioVoiceCenterTests: XCTestCase {
         let rows = try transcript(f)
         XCTAssertEqual(AgentReplyQuote.parse(rows[1].content)?.body, "Aprovar")
         XCTAssertEqual(rows.last?.content, "Pronto, liberei pro agente seguir.")
-        XCTAssertTrue(rows.first?.content.hasSuffix("_liberado por você_") == true)
+        XCTAssertTrue(TitioNoticeBlock.parse(rows.first?.content ?? "").text.hasSuffix("_liberado por você_") == true)
+        XCTAssertEqual(TitioNoticeBlock.parse(rows.first?.content ?? "").block?.state, "approved")
         XCTAssertNil(BotChoicesBlock.parse(rows.first?.content ?? "").choices)
         let resultPrompt = try XCTUnwrap(voice.requests.first { $0.purpose == .result }?.prompt)
         XCTAssertTrue(resultPrompt.contains("You approved the agent's request in the workspace “api”"))

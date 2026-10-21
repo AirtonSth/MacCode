@@ -67,6 +67,16 @@ final class IncompleteTurnContinuationTests: XCTestCase {
         XCTAssertTrue(IncompleteTurnContinuation.isIncompleteTurn(phase2HandoffNoMarker))
     }
 
+    func test_syntheticPromptsAreRecognizedAndUserTextIsNot() {
+        // WHY: host nudges are machine input; a user typing the same words is not a nudge.
+        XCTAssertTrue(IncompleteTurnContinuation.isSyntheticPrompt(BackgroundAwaitContinuation.continuationPrompt))
+        for reason in [IncompleteTurnContinuationReason.workflowHandoff, .uncalledToolInvocation, .backgroundAwait] {
+            XCTAssertTrue(IncompleteTurnContinuation.isSyntheticPrompt("  \(IncompleteTurnContinuation.prompt(for: reason))\n"))
+        }
+        XCTAssertFalse(IncompleteTurnContinuation.isSyntheticPrompt("Check the deploy."))
+        XCTAssertFalse(IncompleteTurnContinuation.isSyntheticPrompt(""))
+    }
+
     func test_trueBackgroundAwait_stillClassifiesAsBackground() {
         let stall = "Standing by for the demo recording to complete."
         XCTAssertEqual(IncompleteTurnContinuation.classify(stall), .backgroundAwait)

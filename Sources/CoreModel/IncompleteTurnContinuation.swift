@@ -94,6 +94,14 @@ public enum IncompleteTurnContinuation {
         classify(finalMessage) != nil
     }
 
+    /// True for the host-written nudges above. Those user rows are machine
+    /// input, shown as a system line instead of a user bubble.
+    public static func isSyntheticPrompt(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reasons: [IncompleteTurnContinuationReason] = [.workflowHandoff, .uncalledToolInvocation, .backgroundAwait]
+        return reasons.contains { prompt(for: $0).trimmingCharacters(in: .whitespacesAndNewlines) == trimmed }
+    }
+
     public static func prompt(for reason: IncompleteTurnContinuationReason) -> String {
         switch reason {
         case .workflowHandoff:

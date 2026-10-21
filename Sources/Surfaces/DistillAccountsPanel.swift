@@ -223,9 +223,12 @@ public struct DistillAccountsPanel: View {
         .sheet(isPresented: $showingAddAccount) {
             VStack(alignment: .leading, spacing: DS.Space.xl) {
                 Text("Add account").font(DS.Font.title3)
-                Picker("Provider", selection: $newProvider) {
-                    ForEach(DistillAccountProvider.allCases, id: \.self) { Text($0.displayName).tag($0) }
-                }.frame(minHeight: 44)
+                AgentChoiceSelectField(
+                    caption: "PROVIDER",
+                    options: DistillAccountProvider.allCases.map { (value: $0, title: $0.displayName, subtitle: nil) },
+                    selection: $newProvider,
+                    identifier: "agent.accounts.add.provider"
+                )
                 TextField("Account label", text: $newLabel).frame(minHeight: 44)
                     .accessibilityLabel("Account label")
                 Text("Give this account a name, then connect to sign in.")

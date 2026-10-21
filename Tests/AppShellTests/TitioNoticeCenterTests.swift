@@ -227,7 +227,7 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(messages.count, 1)
         XCTAssertEqual(messages[0].id.value, TitioNoticeIDs.messageID(forKey: "run.R1.completed"))
         XCTAssertEqual(messages[0].role, .assistant)
-        XCTAssertTrue(messages[0].content.hasSuffix("Written notice."))
+        XCTAssertTrue(TitioNoticeBlock.parse(messages[0].content).text.hasSuffix("Written notice."))
         XCTAssertEqual(f.recorder.banners.map(\.identifier), ["run.R1.completed"])
         XCTAssertEqual(f.recorder.pushes.map(\.identifier), ["run.R1.completed"])
         let banner = try XCTUnwrap(f.recorder.banners.first)
@@ -276,6 +276,24 @@ final class TitioNoticeCenterTests: XCTestCase {
         f.recorder.pushAccepted = true
         await f.scheduler.advance(by: 60, center: f.center)
         XCTAssertEqual(f.recorder.pushes.count, 1)
+    }
+
+    func test_singleNoticeWritesRawProvenanceInTheBlockWithoutAHeading() async throws {
+        // WHY: the card renders provenance from the block; markdown escapes
+        // belong to the old heading only and would show as stray backslashes.
+        let f = try makeFixture()
+        f.center.ingest(completion("R1", title: "Fix *login* → now", at: f.scheduler))
+        await f.center.idle()
+        await f.scheduler.advance(by: TitioNoticeTiming.infoWindow, center: f.center)
+        await waitForPushes(f.recorder, count: 1)
+
+        let content = try XCTUnwrap(try threadMessages(f).first).content
+        let parsed = TitioNoticeBlock.parse(content)
+        XCTAssertEqual(parsed.block?.source["conversation"], "Fix *login* → now", "labels are raw, not markdown-escaped")
+        XCTAssertEqual(parsed.block?.source["workspace"], "api")
+        XCTAssertEqual(parsed.block?.state, "open")
+        XCTAssertFalse(parsed.text.contains(" → "), "no ws → bot → title heading")
+        XCTAssertFalse(parsed.text.contains("\\*"))
     }
 
     func test_eightSecondWindowMergesThreeCompletionsIntoOneDigest() async throws {
@@ -464,7 +482,8 @@ final class TitioNoticeCenterTests: XCTestCase {
         let messages = try threadMessages(f)
         XCTAssertEqual(messages.count, 1)
         XCTAssertNil(BotChoicesBlock.parse(messages[0].content).choices, "the card is gone")
-        XCTAssertTrue(messages[0].content.hasSuffix("_Written status._"), messages[0].content)
+        XCTAssertTrue(TitioNoticeBlock.parse(messages[0].content).text.hasSuffix("_Written status._"), messages[0].content)
+        XCTAssertEqual(TitioNoticeBlock.parse(messages[0].content).block?.state, "elsewhere")
         XCTAssertEqual(try f.messages.bodyRevision(id: messages[0].id), 3)
         XCTAssertEqual(f.recorder.posted.last?.isRewrite, true)
         XCTAssertEqual(f.recorder.posted.last?.bodyRevision, 3)

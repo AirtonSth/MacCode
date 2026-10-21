@@ -416,4 +416,26 @@ final class RemoteCodeTreatyTests: XCTestCase {
             )
         }
     }
+
+    func testActivityItemWorkspaceColorRoundTripsAndMissingKeyDecodesNil() throws {
+        let item = AgentActivityItem(
+            id: "run:1", kind: .agent, state: .running, title: "t", workspaceName: "api",
+            workspaceColor: "blue", occurredAt: Date(timeIntervalSince1970: 1_792_094_460)
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(item)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["workspace_color"] as? String, "blue")
+
+        let decoded = try AgentActivityPage.makeJSONDecoder().decode(AgentActivityItem.self, from: data)
+        XCTAssertEqual(decoded.workspaceColor, "blue")
+        XCTAssertEqual(decoded, item)
+
+        var legacy = object
+        legacy.removeValue(forKey: "workspace_color")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacy)
+        let old = try AgentActivityPage.makeJSONDecoder().decode(AgentActivityItem.self, from: legacyData)
+        XCTAssertNil(old.workspaceColor, "an older host omits workspace_color; the item must still decode")
+    }
 }

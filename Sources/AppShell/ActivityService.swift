@@ -11,6 +11,8 @@ final class ActivityService: @unchecked Sendable {
     private let db: SQLiteDB
     private let readDB: SQLiteDB
     private let workspaceNames: [WorkspaceID: String]
+    /// Valid `TabColor` raw values only; a workspace without a known color has no entry.
+    private let workspaceColors: [WorkspaceID: String]
     private let activeRunIDProvider: (AgentThreadID) -> AgentRunID?
     private let registeredScripts: [AgentActivityItem]
     /// Live terminal and SSH tabs with a busy foreground job; never persisted.
@@ -20,7 +22,9 @@ final class ActivityService: @unchecked Sendable {
     init(context: AppContext, activeRunIDProvider: ((AgentThreadID) -> AgentRunID?)? = nil) {
         db = context.db
         readDB = context.readDB
+        let colors = context.state.workspaces.compactMapValues { TabColor.from($0.metadata["color"])?.rawValue }
         workspaceNames = context.state.workspaces.mapValues(\.name)
+        workspaceColors = colors
         let activeRuns = Dictionary(uniqueKeysWithValues: context.coordinator.primaryActiveThreadIdsSnapshot().compactMap { thread in
             context.coordinator.activeRunId(threadId: thread).map { (thread, $0) }
         })
@@ -30,13 +34,14 @@ final class ActivityService: @unchecked Sendable {
                 id: "project-script:\(script.surfaceID.value.uuidString):\(script.startedAt.timeIntervalSince1970)",
                 kind: .notification, workspaceID: script.workspaceID.value, surfaceID: script.surfaceID.value,
                 state: .running, title: "Project script: \(PetAttentionRedactor.safeContextLabel(script.name) ?? "Running")",
-                workspaceName: context.state.workspaces[script.workspaceID]?.name, occurredAt: script.startedAt, startedAt: script.startedAt
+                workspaceName: context.state.workspaces[script.workspaceID]?.name, workspaceColor: colors[script.workspaceID], occurredAt: script.startedAt, startedAt: script.startedAt
             )
         }
         busySurfaces = Self.busySurfaceItems(
             ActiveSurfaceProjector.currentItems(context: context),
             excluding: Set(registeredScripts.compactMap(\.surfaceID)),
-            now: Date()
+            now: Date(),
+            workspaceColors: colors
         )
     }
 
@@ -45,6 +50,7 @@ final class ActivityService: @unchecked Sendable {
         self.db = db
         self.readDB = readDB
         workspaceNames = [:]
+        workspaceColors = [:]
         self.activeRunIDProvider = activeRunIDProvider
         registeredScripts = []
         busySurfaces = []
@@ -52,7 +58,7 @@ final class ActivityService: @unchecked Sendable {
 
     /// Busy terminal and SSH tabs count as running work. Project-script tabs already
     /// have their own row, and browser/diff loading is not user work.
-    static func busySurfaceItems(_ surfaces: [ActiveSurfaceItem], excluding scriptSurfaceIDs: Set<UUID>, now: Date) -> [AgentActivityItem] {
+    static func busySurfaceItems(_ surfaces: [ActiveSurfaceItem], excluding scriptSurfaceIDs: Set<UUID>, now: Date, workspaceColors: [WorkspaceID: String] = [:]) -> [AgentActivityItem] {
         surfaces
             .filter { ($0.type == .terminal || $0.type == .ssh) && !scriptSurfaceIDs.contains($0.surfaceID.value) }
             .map { surface in
@@ -61,7 +67,7 @@ final class ActivityService: @unchecked Sendable {
                     id: "surface:\(surface.surfaceID.value.uuidString)", kind: .operation,
                     workspaceID: surface.workspaceID.value, surfaceID: surface.surfaceID.value, state: .running,
                     title: PetAttentionRedactor.safeContextLabel(surface.title) ?? label,
-                    workspaceName: surface.workspaceName, occurredAt: now, originLabel: label
+                    workspaceName: surface.workspaceName, workspaceColor: workspaceColors[surface.workspaceID], occurredAt: now, originLabel: label
                 )
             }
     }
@@ -168,7 +174,7 @@ final class ActivityService: @unchecked Sendable {
             return AgentActivityItem(
                 id: "run:\(row.runID.description)", kind: .agent, runID: row.runID.value,
                 workspaceID: thread.workspaceId?.value, threadID: thread.id.value, state: state,
-                title: thread.title, workspaceName: workspaceName, provider: thread.provider.rawValue,
+                title: thread.title, workspaceName: workspaceName, workspaceColor: thread.workspaceId.flatMap { workspaceColors[$0] }, provider: thread.provider.rawValue,
                 summary: result?.summary ?? (state == .needsYou
                     ? "This run has no active process. Send a new message to resume, or dismiss this alert."
                     : (terminal ? "No summary available for this run" : nil)),
@@ -197,6 +203,7 @@ final class ActivityService: @unchecked Sendable {
                 workspaceID: thread.workspaceId?.value, threadID: thread.id.value, state: state,
                 title: state == .expired ? "Request expired" : (callback.kind == .approval ? "Approve or decline request" : "Reply to question"),
                 workspaceName: thread.workspaceId.flatMap { workspaceNames[$0] },
+                workspaceColor: thread.workspaceId.flatMap { workspaceColors[$0] },
                 provider: thread.provider.rawValue,
                 summary: state == .expired ? "This request can no longer be answered. The run is no longer waiting for it."
                     : (callback.kind == .approval ? BotAttentionItemKind.approval.resolutionHint : BotAttentionItemKind.question.resolutionHint),
@@ -233,6 +240,7 @@ final class ActivityService: @unchecked Sendable {
                 id: "notification:\(note.id)", kind: .notification, notificationID: note.id, workspaceID: note.workspaceId?.value,
                 surfaceID: note.surfaceId?.value, state: isFailure ? .failed : (isResolutionRequired ? .needsYou : .completed), title: title,
                 workspaceName: note.workspaceId.flatMap { workspaceNames[$0] },
+                workspaceColor: note.workspaceId.flatMap { workspaceColors[$0] },
                 summary: category == nil || !includeDisplayDetail ? nil : (Self.notificationSummary(payload.activitySummary) ?? category?.presentation.detail),
                 occurredAt: note.createdAt, finishedAt: isResolutionRequired ? nil : note.createdAt,
                 viewedAt: state?.viewedAt,

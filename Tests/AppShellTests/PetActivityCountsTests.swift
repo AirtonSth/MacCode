@@ -228,15 +228,17 @@ final class PetActivityCountsTests: XCTestCase {
         XCTFail("Timed out waiting for count \(expected); got \(observed())", file: file, line: line)
     }
 
-    func testPetBadgeUsesNeedsYouCountAndExistingPreference() {
+    func testPetBadgeAddsJustFinishedToNeedsYouAndKeepsExistingPreference() {
+        // WHY: the pet dot and the Dock badge must show the same total; the accessibility value still
+        // speaks only of items that need attention, so the spoken count is unchanged.
         let enabled = PetViewModel(settings: AppSettings(petEnabled: true, petReadyCounterEnabled: true))
-        enabled.apply(activityCounts: PetActivityCounts(running: 4, needsYou: 2, newResults: 6))
-        XCTAssertEqual(enabled.badgeText, "2")
+        enabled.apply(activityCounts: PetActivityCounts(running: 4, needsYou: 2, newResults: 4))
+        XCTAssertEqual(enabled.badgeText, "6")
         XCTAssertTrue(enabled.accessibilityValue.contains("4 running"))
         XCTAssertTrue(enabled.accessibilityValue.contains("2 items need attention"))
 
         let disabled = PetViewModel(settings: AppSettings(petEnabled: true, petReadyCounterEnabled: false))
-        disabled.apply(activityCounts: PetActivityCounts(running: 4, needsYou: 2, newResults: 6))
+        disabled.apply(activityCounts: PetActivityCounts(running: 4, needsYou: 2, newResults: 4))
         XCTAssertNil(disabled.badgeText)
     }
 }

@@ -368,6 +368,22 @@ final class TitioNoticeCopyTests: XCTestCase {
 
     // MARK: Results and resolution rewrite
 
+    func test_resolutionKeepsTheNoticeBlockLastAfterTheStatusLine() {
+        // WHY: the notice identity must survive a resolution, and the status
+        // line stays on the visible text above it.
+        let composed = TitioNoticeCopy.compose(
+            item(.runFailed, TitioNoticeFacts(title: "Deploy", workspaceName: "api"), key: "run.x.failed", actions: [.openThread, .ack]),
+            language: .en, timeZone: utc
+        )
+        let withNotice = composed.text + "\n\n" + TitioNoticeBlock.render(key: "run.x.failed", kind: "runFailed", source: ["workspace": "api"], state: "open")
+        let rewritten = TitioNoticeCopy.resolvedText(original: withNotice, statusLine: "_Done._")
+        let parsed = TitioNoticeBlock.parse(rewritten)
+        XCTAssertEqual(parsed.block?.key, "run.x.failed")
+        XCTAssertNil(BotChoicesBlock.parse(parsed.text).choices, "the card is gone")
+        XCTAssertTrue(parsed.text.hasSuffix("\n\n_Done._"), parsed.text)
+        XCTAssertTrue(rewritten.hasSuffix("```"), "notice block stays last")
+    }
+
     func test_resolutionStripsTheCardAndAppendsTheStatusLine() {
         // WHY (§7): a resolved notice must lose its card on every client, which
         // only happens when the block leaves the message text.

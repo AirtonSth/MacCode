@@ -234,6 +234,49 @@ final class AgentAppEmbeddingTests: XCTestCase {
         XCTAssertTrue(h.runner.requests.isEmpty)
     }
 
+    func test_sendNoticeReplyReportsAcceptedAndClearsItsOwnDraft() async throws {
+        // WHY: a host-accepted notice answer must read as sent (no resend), and the
+        // composer must end empty so the card's text is not sent twice.
+        var sent: [String] = []
+        let h = try makeHarness(threadWorkspace: nil) { threadID in
+            AgentAppEmbedding(pinnedThreadId: threadID, hostReplyHandler: { text, _ in
+                sent.append(text)
+                return true
+            })
+        }
+        h.vm.selectThread(h.thread.id)
+        await h.vm.waitForSelectThreadHydrationForTesting()
+        let notice = AgentMessage(id: AgentMessageID(), threadId: h.thread.id, role: .assistant,
+                                  content: "Deploy which workspace?", createdAt: Date())
+
+        let ok = await h.vm.sendNoticeReply(to: notice, text: "Use staging")
+
+        XCTAssertTrue(ok)
+        XCTAssertEqual(sent, ["Use staging"])
+        XCTAssertTrue(h.vm.prompt.isEmpty)
+        XCTAssertNil(h.vm.activeReplyTarget)
+    }
+
+    func test_sendNoticeReplyFailureKeepsDraftTypedDuringSend() async throws {
+        // WHY: a failed notice answer must not wipe a draft the user typed while it sent.
+        let h = try makeHarness(threadWorkspace: nil) { threadID in
+            AgentAppEmbedding(pinnedThreadId: threadID, hostReplyHandler: { _, _ in
+                throw NSError(domain: "Notice", code: 1, userInfo: [NSLocalizedDescriptionKey: "Question is already resolved"])
+            })
+        }
+        h.vm.selectThread(h.thread.id)
+        await h.vm.waitForSelectThreadHydrationForTesting()
+        let notice = AgentMessage(id: AgentMessageID(), threadId: h.thread.id, role: .assistant,
+                                  content: "Deploy which workspace?", createdAt: Date())
+
+        let ok = await h.vm.sendNoticeReply(to: notice, text: "Use staging")
+
+        XCTAssertFalse(ok)
+        XCTAssertEqual(h.vm.statusMessage, "Question is already resolved")
+        XCTAssertNil(h.vm.activeReplyTarget, "the target we set is cleared on failure")
+        XCTAssertTrue(h.vm.prompt.isEmpty, "our own text is cleared on failure")
+    }
+
 }
 
 private final class EmbeddingCapturingRunner: AgentProviderRunner, @unchecked Sendable {

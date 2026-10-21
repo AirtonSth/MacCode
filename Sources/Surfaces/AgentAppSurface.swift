@@ -271,6 +271,21 @@ public final class AgentTranscriptState: ObservableObject {
 /// WITHOUT invalidating the enclosing AgentAppView body that owns the transcript.
 /// View-model-driven changes still reach the composer because AgentAppView re-creates
 /// this wrapper (with a fresh `content`) whenever the view model publishes.
+/// Owns the Now strip model for one mounted surface: starts on appear, stops on disappear.
+private struct AgentNowStripHost: View {
+    @StateObject private var model: AgentNowStripModel
+
+    init(source: AgentNowStripSource, cached: AgentNowStripSnapshot?) {
+        _model = StateObject(wrappedValue: AgentNowStripModel(source: source, cached: cached))
+    }
+
+    var body: some View {
+        AgentNowStrip(model: model)
+            .onAppear { model.start() }
+            .onDisappear { model.stop() }
+    }
+}
+
 private struct ComposerReactiveScope<Content: View>: View {
     @ObservedObject var composerState: AgentComposerState
     @ViewBuilder var content: () -> Content
@@ -451,6 +466,10 @@ public struct AgentAppEmbedding {
     /// The host removes it (`bot.notice.clear` semantics); false means it did
     /// not, and the row comes back.
     public let noticeClearHandler: (@MainActor (_ messageID: AgentMessageID) async -> Bool)?
+    /// Titio's inbox only: the "Now" strip above the composer. Nil hides it.
+    public let nowStrip: AgentNowStripSource?
+    /// Last strip snapshot the host saw, painted before the first load.
+    public let nowStripCached: AgentNowStripSnapshot?
 
     public init(
         pinnedThreadId: AgentThreadID,
@@ -466,10 +485,14 @@ public struct AgentAppEmbedding {
         ownsComposerDraft: Bool = true,
         noticeChoiceHandler: (@MainActor (_ messageID: String, _ optionIndex: Int) -> Void)? = nil,
         hostReplyHandler: (@MainActor (_ text: String, _ threadId: AgentThreadID) throws -> Bool)? = nil,
-        noticeClearHandler: (@MainActor (_ messageID: AgentMessageID) async -> Bool)? = nil
+        noticeClearHandler: (@MainActor (_ messageID: AgentMessageID) async -> Bool)? = nil,
+        nowStrip: AgentNowStripSource? = nil,
+        nowStripCached: AgentNowStripSnapshot? = nil
     ) {
         self.ownsComposerDraft = ownsComposerDraft
         self.noticeClearHandler = noticeClearHandler
+        self.nowStrip = nowStrip
+        self.nowStripCached = nowStripCached
         self.noticeChoiceHandler = noticeChoiceHandler
         self.hostReplyHandler = hostReplyHandler
         self.pinnedThreadId = pinnedThreadId
@@ -883,6 +906,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Derived from `loadingOlderGeneration != 0` for ownership-safe clears.
     @Published public private(set) var isLoadingOlderMessages = false
     @Published public private(set) var messageScrollTarget: AgentChatTimelineScrollTarget?
+    /// How the last `send()` ended. Read by `sendNoticeReply`; reset before each send.
+    enum SendOutcome: Equatable { case none, accepted, queued, failed }
+    private(set) var lastSendOutcome: SendOutcome = .none
     /// Monotonic owner token for the active older-page load (0 = idle).
     /// Stale Tasks must not clear a newer load's flag (SSHRemoteView pattern).
     private var loadingOlderGeneration: UInt64 = 0
@@ -4582,6 +4608,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         messageScrollTarget = AgentChatTimelineScrollTarget(
             anchor: "message-\(id.value.uuidString)"
         )
+    }
+
+    /// Scrolls the transcript to a loaded message (reply quote jump).
+    public func scrollToMessage(_ id: AgentMessageID) {
+        messageScrollTarget = AgentChatTimelineScrollTarget(anchor: "message-\(id.value.uuidString)")
     }
 
     /// Text of the failed-read banner; nil when the read did not fail.
@@ -8708,6 +8739,46 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         beginReply(to: parsed.text)
     }
 
+    /// Answers a Titio notice card from its own field. The reply goes through
+    /// the composer send, so the draft and attachment guards apply. Returns
+    /// false on failure; the caller keeps its text.
+    public func sendNoticeReply(to message: AgentMessage, text: String) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              attachments.isEmpty, let threadID = selectedThreadId else { return false }
+        let parsed = BotChoicesBlock.parse(TitioNoticeBlock.parse(message.content).text)
+        if supportsReplies, embedding?.hostReplyHandler != nil,
+           let choices = parsed.choices, choices.notice != nil, choices.canReply {
+            composerState.replyTarget = AgentReplyTarget(
+                threadId: threadID,
+                excerpt: choices.question ?? TitioNoticeBlock.visibleText(message.content),
+                noticeMessageID: message.id.value.uuidString.lowercased()
+            )
+        } else {
+            let firstLine = MarkdownPlainText.firstLine(TitioNoticeBlock.visibleText(message.content))
+            let source = TitioNoticeBlock.parse(message.content).block?.source ?? [:]
+            let label = [source["workspace"], source["bot"]].compactMap { $0 }.joined(separator: " › ")
+            let excerpt = label.isEmpty ? firstLine : "\(label): \(firstLine)"
+            composerState.replyTarget = AgentReplyTarget(threadId: threadID, excerpt: excerpt)
+        }
+        let target = composerState.replyTarget
+        prompt = trimmed
+        lastSendOutcome = .none
+        await send()
+        switch lastSendOutcome {
+        case .accepted, .queued:
+            return true
+        case .none, .failed:
+            // send() quoted the text into the composer and kept it there with
+            // the error: the composer owns it now, so the card must not keep a copy.
+            if prompt != trimmed, prompt.contains(trimmed) { return true }
+            // Only undo what we set: a draft or target typed during the send stays.
+            if prompt == trimmed { prompt = "" }
+            if composerState.replyTarget == target { composerState.replyTarget = nil }
+            return false
+        }
+    }
+
     private var protectedTranscriptTurnIDs: Set<String> {
         guard !isHiddenFromSurface else { return [] }
         let entries = AgentAppView.mergeTranscriptEntries(messages: messages, turns: timeline.turns)
@@ -8756,10 +8827,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     prompt = ""
                     composerState.replyTarget = nil
                     statusMessage = ""
+                    lastSendOutcome = .accepted
                     return
                 }
             } catch {
                 statusMessage = error.localizedDescription
+                lastSendOutcome = .failed
                 return
             }
         }
@@ -8891,7 +8964,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 interactionMode: interactionMode,
                 recoveryDisplayText: originalPrompt
             ) == nil {
+                lastSendOutcome = .failed
                 restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+            } else {
+                lastSendOutcome = .accepted
             }
             return
         }
@@ -8913,6 +8989,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if selectedThreadCanQueuePrompt,
            await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
+            lastSendOutcome = .queued
             return
         }
         if await startProviderRun(
@@ -8931,7 +9008,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 )
                 return
             }
+            lastSendOutcome = .failed
             restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+        } else {
+            lastSendOutcome = .accepted
         }
     }
 
@@ -8961,6 +9041,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     if selectedThreadId == tid {
                         statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
                     }
+                    lastSendOutcome = .failed
                     restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
                     return
                 }
@@ -8968,10 +9049,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if await enqueuePromptWhileRunning(text: text, attached: attached, threadId: tid) {
                 botWaitForVM?(botID, tid)
                 if selectedThreadId == tid { statusMessage = busy }
+                lastSendOutcome = .queued
                 return
             }
         }
         if selectedThreadId == sendThreadId { statusMessage = busy }
+        lastSendOutcome = .failed
         restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
     }
 
@@ -13063,6 +13146,9 @@ public struct AgentAppView: View {
     /// Host action on the transcript's bottom-trailing corner (Bots Desk +).
     private let timelineAccessory: AnyView?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Message a reply-quote jump landed on; cleared 1.2s later by the latest jump only.
+    @State private var quoteJumpHighlightID: AgentMessageID?
+    @State private var quoteJumpHighlightTask: Task<Void, Never>?
     @State private var announcedUndoToasts: Set<Date> = []
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
@@ -15750,6 +15836,9 @@ public struct AgentAppView: View {
                 BotVMUnavailableBanner(vm: vm)
             }
             if layout.showsComposer {
+                if let nowStrip = vm.embedding?.nowStrip {
+                    AgentNowStripHost(source: nowStrip, cached: vm.embedding?.nowStripCached)
+                }
                 ComposerReactiveScope(composerState: vm.composerState) {
                     composer
                         .disabled(vm.isLegacyProviderThread || vm.selectedThreadBotUnavailable)
@@ -16490,7 +16579,9 @@ public struct AgentAppView: View {
     /// index to the host, never the label as a new model prompt.
     @ViewBuilder
     private func inlineNoticeCard(for message: AgentMessage) -> some View {
+        // A message with a notice block renders its options inside its notice card.
         if vm.embedding?.noticeChoiceHandler != nil,
+           TitioNoticeBlock.parse(message.content).block == nil,
            let pending = AgentChatChoicesCard.Pending.openNotices(in: [message], dismissed: dismissedChoices).first {
             noticeCard(pending)
         }
@@ -17369,6 +17460,43 @@ public struct AgentAppView: View {
     }
 
     @ViewBuilder
+    /// Tap on a reply quote: scroll to the quoted assistant message and flash it.
+    /// Nil when the quote is not a reply or its source is not loaded.
+    private func replyQuoteJumpAction(for msg: AgentMessage) -> (() -> Void)? {
+        guard let excerpt = AgentReplyQuote.parse(msg.content)?.excerpt,
+              let targetID = AgentReplyQuoteTarget.messageID(for: excerpt, in: vm.messages, before: msg.id) else {
+            return nil
+        }
+        return {
+            vm.scrollToMessage(targetID)
+            quoteJumpHighlightTask?.cancel()
+            quoteJumpHighlightID = targetID
+            quoteJumpHighlightTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                guard !Task.isCancelled, quoteJumpHighlightID == targetID else { return }
+                quoteJumpHighlightID = nil
+            }
+        }
+    }
+
+    /// `messageRow` with the reply-quote jump highlight drawn over it.
+    private func highlightedMessageRow(
+        _ msg: AgentMessage,
+        columnWidth: CGFloat,
+        mentionableBots: [BotDefinition],
+        relativeNow: Date?
+    ) -> some View {
+        messageRow(msg, columnWidth: columnWidth, mentionableBots: mentionableBots, relativeNow: relativeNow)
+            .overlay {
+                RoundedRectangle(cornerRadius: DS.Radius.bubble)
+                    .stroke(DS.Palette.accent, lineWidth: 1.5)
+                    .opacity(quoteJumpHighlightID == msg.id ? 1 : 0)
+                    .animation(reduceMotion ? nil : DS.Motion.micro, value: quoteJumpHighlightID)
+                    .allowsHitTesting(false)
+            }
+    }
+
+    @ViewBuilder
     private func messageRow(
         _ msg: AgentMessage,
         columnWidth: CGFloat = 10_000,
@@ -17379,6 +17507,14 @@ public struct AgentAppView: View {
         case .user:
             if Self.isInternalPeerHopUserMessage(msg) {
                 EmptyView()
+            } else if IncompleteTurnContinuation.isSyntheticPrompt(msg.content) {
+                AnyView(
+                    Text("Checked on a background task · \(AgentChatTranscriptChrome.relativeTimestamp(msg.createdAt, now: relativeNow ?? Date()))")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .frame(maxWidth: .infinity)
+                        .accessibilityIdentifier("agent.syntheticPrompt")
+                )
             } else {
             let displayText = Self.userMessageDisplayText(msg.content)
             let mentioned = Self.messagedPeer(
@@ -17404,7 +17540,8 @@ public struct AgentAppView: View {
                             accessibilityIdentifier: "agent.peer.mentioned"
                         )
                     )
-                }
+                },
+                onReplyQuoteTap: replyQuoteJumpAction(for: msg)
             )
             }
         case .assistant:
@@ -17456,6 +17593,27 @@ public struct AgentAppView: View {
                             }
                         )
                     )
+                } else if vm.embedding?.noticeChoiceHandler != nil,
+                          let notice = TitioNoticeBlock.parse(msg.content).block {
+                    ComposerReactiveScope(composerState: vm.composerState) {
+                        AgentChatNoticeCard(
+                            messageID: msg.id.value.uuidString.lowercased(),
+                            block: notice,
+                            choices: BotChoicesBlock.parse(msg.content).choices.flatMap { choices in
+                                choices.notice == nil || dismissedChoices.contains(msg.id.value.uuidString.lowercased())
+                                    ? nil : choices
+                            },
+                            createdAt: msg.createdAt,
+                            content: AnyView(assistantProse(TitioNoticeBlock.visibleText(msg.content))),
+                            isBlockedByDraft: !vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || !vm.attachments.isEmpty
+                                || (vm.activeReplyTarget != nil && vm.activeReplyTarget?.noticeMessageID != msg.id.value.uuidString.lowercased()),
+                            isSending: vm.selectedThreadIsPreparingRun,
+                            onOption: { index in vm.embedding?.noticeChoiceHandler?(msg.id.value.uuidString.lowercased(), index) },
+                            onReply: { text in await vm.sendNoticeReply(to: msg, text: text) },
+                            onClear: vm.embedding?.noticeClearHandler == nil ? nil : { vm.clearHostMessage(msg.id) }
+                        )
+                    }
                 } else {
                     AgentChatAssistantReply(
                         text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content),
@@ -17495,7 +17653,7 @@ public struct AgentAppView: View {
             }
             switch entry {
             case .message(let message):
-                messageRow(
+                highlightedMessageRow(
                     message,
                     columnWidth: columnWidth,
                     mentionableBots: mentionableBots,

@@ -185,7 +185,7 @@ final class NotificationPetProjectionEventTests: XCTestCase {
         XCTAssertEqual(id, "pet.server-failure.rc2-socket")
         let unread = try XCTUnwrap(repository.list(unreadOnly: true).first)
         XCTAssertEqual(unread.id, id, "A recurring listener failure must become unread again after an earlier recovery.")
-        XCTAssertEqual(unread.title, "Remote access needs attention")
+        XCTAssertEqual(unread.title, "Restore remote access")
         XCTAssertNil(unread.body, "Listener errors and addresses must never enter the Pet row.")
         XCTAssertEqual(events.map(\.kind), ["notification.created", "notification.read", "notification.created"])
         let encoded = events.map { String(describing: $0.payload) }.joined(separator: " ")

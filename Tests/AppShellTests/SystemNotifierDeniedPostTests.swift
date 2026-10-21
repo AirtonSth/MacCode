@@ -209,6 +209,6 @@ final class SystemNotifierDeniedPostTests: XCTestCase {
         XCTAssertEqual(row.workspaceId, workspaceID)
         XCTAssertEqual(row.category, PetNotificationCategory.notificationsDenied.rawValue)
         XCTAssertEqual(row.title, "Notifications are turned off")
-        XCTAssertEqual(row.body, "Open System Settings to re-enable them.")
+        XCTAssertEqual(row.body, "You can enable notifications in System Settings. Your runs can continue without them.")
     }
 }

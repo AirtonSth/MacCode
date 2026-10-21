@@ -281,6 +281,7 @@ public struct AgentChatUserBubble: View, Equatable {
     public var roleIdentifier: String = "bots.desk.role.user"
     public var copyIdentifier: String? = nil
     public var header: AnyView? = nil
+    public var onReplyQuoteTap: (() -> Void)? = nil
 
     public init(
         text: String,
@@ -290,8 +291,10 @@ public struct AgentChatUserBubble: View, Equatable {
         accessibilityIdentifier: String = "agent.userMessageBubble",
         roleIdentifier: String = "bots.desk.role.user",
         copyIdentifier: String? = nil,
-        header: AnyView? = nil
+        header: AnyView? = nil,
+        onReplyQuoteTap: (() -> Void)? = nil
     ) {
+        self.onReplyQuoteTap = onReplyQuoteTap
         self.text = text
         self.createdAt = createdAt
         self.now = now
@@ -318,7 +321,7 @@ public struct AgentChatUserBubble: View, Equatable {
                     header
                 }
                 if let reply {
-                    AgentChatReplyQuoteStrip(excerpt: reply.excerpt)
+                    AgentChatReplyQuoteStrip(excerpt: reply.excerpt, onTap: onReplyQuoteTap)
                         .frame(maxWidth: bubbleMax, alignment: .trailing)
                 }
                 bubbleLabel(text: text, textWidth: textWidth)
@@ -362,6 +365,7 @@ public struct AgentChatUserBubble: View, Equatable {
             && lhs.roleIdentifier == rhs.roleIdentifier
             && lhs.copyIdentifier == rhs.copyIdentifier
             && (lhs.header != nil) == (rhs.header != nil)
+            && (lhs.onReplyQuoteTap != nil) == (rhs.onReplyQuoteTap != nil)
     }
 
     private func bubbleLabel(text: String, textWidth: CGFloat) -> some View {
@@ -381,13 +385,25 @@ public struct AgentChatUserBubble: View, Equatable {
 public struct AgentChatReplyQuoteStrip: View {
     public let excerpt: String
     public var onCancel: (() -> Void)? = nil
+    /// Jumps to the quoted message when set (transcript quotes only).
+    public var onTap: (() -> Void)? = nil
 
-    public init(excerpt: String, onCancel: (() -> Void)? = nil) {
+    public init(excerpt: String, onCancel: (() -> Void)? = nil, onTap: (() -> Void)? = nil) {
         self.excerpt = excerpt
         self.onCancel = onCancel
+        self.onTap = onTap
     }
 
     public var body: some View {
+        if let onTap {
+            Button(action: onTap) { strip }
+                .buttonStyle(.plain)
+        } else {
+            strip
+        }
+    }
+
+    private var strip: some View {
         HStack(spacing: DS.Space.sm) {
             Image(systemName: "ellipsis.bubble")
                 .font(.system(size: 12, weight: .regular))
@@ -423,6 +439,28 @@ public struct AgentChatReplyQuoteStrip: View {
     }
 }
 
+/// Finds the assistant message a reply quote came from, for the quote jump.
+public enum AgentReplyQuoteTarget {
+    /// Latest assistant message before `before` whose visible text contains the
+    /// excerpt, or whose "ws › bot: " label plus visible text starts with it.
+    /// A trailing "…" (clipped excerpt) is ignored.
+    public static func messageID(for excerpt: String, in messages: [AgentMessage], before: AgentMessageID) -> AgentMessageID? {
+        var needle = excerpt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if needle.hasSuffix("…") {
+            needle = String(needle.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !needle.isEmpty, let end = messages.firstIndex(where: { $0.id == before }) else { return nil }
+        return messages[..<end].last { message in
+            guard message.role == .assistant else { return false }
+            let visible = TitioNoticeBlock.visibleText(message.content)
+            let source = TitioNoticeBlock.parse(message.content).block?.source ?? [:]
+            let label = [source["workspace"], source["bot"]].compactMap { $0 }.joined(separator: " › ")
+            let prefix = label.isEmpty ? "" : "\(label): "
+            return visible.contains(needle) || (prefix + visible).hasPrefix(needle)
+        }?.id
+    }
+}
+
 public struct AgentChatAssistantReply: View, Equatable {
     public let text: String
     public var roleIdentifier: String = "bots.desk.role.assistant"
@@ -455,7 +493,7 @@ public struct AgentChatAssistantReply: View, Equatable {
     ) {
         // A ready-made answers block is shown (and answered) as the choices
         // card, in Bot threads only (`stripsChoices`).
-        self.text = stripsChoices ? BotChoicesBlock.parse(text).text : text
+        self.text = stripsChoices ? TitioNoticeBlock.visibleText(text) : text
         self.roleIdentifier = roleIdentifier
         self.copyIdentifier = copyIdentifier
         self.branchIdentifier = branchIdentifier

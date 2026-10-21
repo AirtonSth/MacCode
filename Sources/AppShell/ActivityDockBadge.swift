@@ -1,7 +1,7 @@
 import AppKit
 import os
 
-/// Red Dock-icon badge carrying the global needs-you count: the same number
+/// Red Dock-icon badge carrying the global needs-you plus just-finished total: the same number
 /// and "99+" cap as the pet's dot. Fed by the shared activity projection the
 /// sidebar keeps refreshing, so it does not depend on the pet being enabled.
 @MainActor
@@ -23,7 +23,7 @@ final class ActivityDockBadge {
     /// Nil hides the badge: nothing needs the user, or the counts are unknown.
     static func label(for counts: PetActivityCounts) -> String? {
         guard counts.isAvailable else { return nil }
-        return PetAttentionCountFormatter.badgeText(count: counts.needsYou)
+        return PetAttentionCountFormatter.badgeText(count: counts.badgeTotal)
     }
 
     func start() {

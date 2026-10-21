@@ -85,6 +85,21 @@ public enum TitioNoticeStatus: Equatable, Sendable {
     case failed
     case unknownEffect
 
+    /// Stored in the `notice` block's `state`; stable across releases.
+    public var wireValue: String {
+        switch self {
+        case .approved: return "approved"
+        case .declined: return "declined"
+        case .answered: return "answered"
+        case .elsewhere: return "elsewhere"
+        case .expired: return "expired"
+        case .acknowledged: return "acknowledged"
+        case .done: return "done"
+        case .failed: return "failed"
+        case .unknownEffect: return "unknown_effect"
+        }
+    }
+
     /// Nil for `flap` (never posted) and `cleared` (the message is gone): nothing to rewrite.
     public init?(resolution: TitioNoticeResolution) {
         switch resolution {
@@ -653,12 +668,17 @@ public enum TitioNoticeCopy {
 
     /// The original message with its ```choices block removed and the status
     /// line appended (nil: the card is only removed; the voice adds the line).
+    /// The ```notice block, when present, stays last, after the status line.
     public static func resolvedText(original: String, statusLine: String?) -> String {
-        let parsed = BotChoicesBlock.parse(original)
-        let base = trimmedTrailing(parsed.choices != nil ? parsed.text : original)
-        guard let statusLine, !statusLine.isEmpty else { return base }
-        if base.hasSuffix(statusLine) { return base }
-        return base + "\n\n" + statusLine
+        let notice = TitioNoticeBlock.parse(original)
+        let parsed = BotChoicesBlock.parse(notice.text)
+        var base = trimmedTrailing(parsed.choices != nil ? parsed.text : notice.text)
+        if let statusLine, !statusLine.isEmpty, !base.hasSuffix(statusLine) {
+            base += "\n\n" + statusLine
+        }
+        guard let block = notice.block else { return base }
+        let fence = TitioNoticeBlock.render(key: block.key, kind: block.kind, source: block.source, state: block.state)
+        return base.isEmpty ? fence : base + "\n\n" + fence
     }
 
     // MARK: Misc copy

@@ -34,7 +34,7 @@ public final class PetViewModel: ObservableObject {
     public var badgeText: String? {
         guard activityCounts.isAvailable else { return nil }
         return PetAttentionCountFormatter.badgeText(
-            count: activityCounts.needsYou,
+            count: activityCounts.badgeTotal,
             isEnabled: settings.petReadyCounterEnabled
         )
     }

@@ -347,6 +347,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
     }
 
     func test_viewModelFormatsBadgeAndSeparatesNeedsYouFromCompleted() {
+        // WHY: the badge sums needs-you and just-finished, but the spoken value stays needs-you only.
         let model = PetViewModel(settings: AppSettings(petEnabled: true))
         let callback = PetAttentionItem(
             id: "callback-1",
@@ -370,8 +371,8 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertNil(model.badgeText, "Pet attention rows do not classify Activity service counts.")
         model.apply(activityCounts: PetActivityCounts(running: 0, needsYou: 2, newResults: 1))
 
-        XCTAssertEqual(model.badgeText, "2")
-        XCTAssertEqual(model.accessibilityValue, "Activity: 0 running, 2 items need attention")
+        XCTAssertEqual(model.badgeText, "3", "badge is needs-you plus just-finished results")
+        XCTAssertEqual(model.accessibilityValue, "Activity: 0 running, 2 items need attention", "spoken count stays needs-you only")
 
         let many = (0..<100).map { index in
             PetAttentionItem(
@@ -385,7 +386,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             )
         }
         model.apply(snapshot: PetAttentionSnapshot(items: many))
-        XCTAssertEqual(model.badgeText, "2", "Legacy item count must not replace service counts.")
+        XCTAssertEqual(model.badgeText, "3", "Legacy item count must not replace service counts.")
         model.apply(activityCounts: PetActivityCounts(running: 0, needsYou: 100, newResults: 0))
         XCTAssertEqual(model.badgeText, "99+")
         model.apply(settings: AppSettings(petEnabled: true, petReadyCounterEnabled: false))
