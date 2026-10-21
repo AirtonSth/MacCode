@@ -989,6 +989,14 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                     # A long stream whose session/prompt never returns.
                     for _ in range(2000):
                         send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"x"}}}})
+                elif "TOOL_HANG" in text:
+                    # A blocking tool call that stays open silently, then completes.
+                    import time
+                    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"get_command_or_subagent_output","status":"in_progress"}}})
+                    time.sleep(2.5)
+                    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}}})
+                    send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}})
+                    send({"jsonrpc":"2.0","id":message["id"],"result":{"stopReason":"end_turn"}})
                 else:
                     send({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"reply from " + session}}}})
                     send({"jsonrpc":"2.0","id":message["id"],"result":{"stopReason":"end_turn"}})
@@ -1497,6 +1505,58 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(adapter.turnWatchdogTimersScheduledForTesting, 1)
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(events.finishedCount, 1, "the watchdog must terminate the turn exactly once")
+    }
+
+    func test_turnWatchdogWaitsForAnOpenToolInsteadOfInterruptingIt() async throws {
+        // WHY: a blocking tool wait (e.g. get_command_or_subagent_output with a long
+        // timeout_ms) emits nothing while it runs. That silence is healthy, so the
+        // watchdog must not end the turn as interrupted while the tool is open.
+        let root = try makeTempRoot("distill-acp-watchdog-open-tool")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(
+            binaryNameOverride: harness.path,
+            cancellationGracePeriod: 0.05,
+            turnInactivityTimeout: 1
+        )
+        defer { adapter.stopAll() }
+
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            distillRequest(thread: AgentThreadID(), model: "claude/claude-opus-5-5", prompt: "TOOL_HANG", root: root)
+        ) { events.append($0) }
+
+        let finished = try await events.waitForFinish(timeout: 15)
+        XCTAssertEqual(finished.status, .completed,
+                       "a healthy open tool call must finish through session/prompt, not be interrupted")
+        XCTAssertFalse(events.hasWatchdogSynthesizedMarker,
+                       "the watchdog must not synthesize a terminal while the tool is open and recent")
+    }
+
+    func test_turnWatchdogStillInterruptsAnOpenToolPastTheQuietLimit() async throws {
+        // WHY: the open-tool allowance is bounded. A tool that stays silent past the
+        // quiet limit is treated as stuck and must still be released as interrupted.
+        let root = try makeTempRoot("distill-acp-watchdog-open-tool-limit")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(
+            binaryNameOverride: harness.path,
+            cancellationGracePeriod: 0.05,
+            turnInactivityTimeout: 1,
+            openToolQuietLimit: 0.5
+        )
+        defer { adapter.stopAll() }
+
+        let events = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(
+            distillRequest(thread: AgentThreadID(), model: "claude/claude-opus-5-5", prompt: "TOOL_HANG", root: root)
+        ) { events.append($0) }
+
+        let finished = try await events.waitForFinish(timeout: 15)
+        XCTAssertEqual(finished.status, .interrupted,
+                       "an open tool silent past the quiet limit must be released as interrupted")
+        XCTAssertTrue(events.hasWatchdogSynthesizedMarker,
+                      "only the watchdog can end a turn whose tool stays silent past the limit")
     }
 
     func test_historyRetentionGrowsWithItsEventsInsteadOfPreallocatingTheWindow() {

@@ -134,7 +134,8 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         let adapter = GrokACPAdapter(
             binaryNameOverride: peer.path,
             cancellationGracePeriod: 0.05,
-            turnInactivityTimeout: 0.25
+            turnInactivityTimeout: 0.25,
+            openToolQuietLimit: 0.1
         )
         let request = makeRequest()
         let box = GrokACPEventBox()
@@ -142,7 +143,7 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
 
         let finished = try await box.waitFinished(timeout: 4)
         XCTAssertEqual(finished.status, .interrupted,
-                       "open tool_call + quiet must not paint completed")
+                       "open tool_call silent past openToolQuietLimit must not paint completed")
         XCTAssertTrue(box.hasWatchdogSynthesizedMarker)
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(box.finishedCount, 1)

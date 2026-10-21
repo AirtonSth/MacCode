@@ -177,6 +177,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         /// Blocks emit→refresh→fire re-entry: finishTurn/emit used to re-arm the
         /// inactivity timer mid-synthesis and recurse until SIGBUS (stack guard).
         var turnWatchdogSynthesisInProgress = false
+        /// Last event emitted for this session; an open tool call stays alive while it is recent.
+        var lastEventAt = Date()
         var promptWritePermit = AgentRunAcceptancePermit()
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: GrokACPHistoryRetention
@@ -244,6 +246,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     /// absolute wall-clock max: long goals with continuous tool progress must
     /// not be cut mid-work (field: 15m false `completed` on starsac CI goal).
     private let turnInactivityTimeout: TimeInterval
+    /// Silence allowed while a tool call is open (blocking tool waits emit nothing).
+    private let openToolQuietLimit: TimeInterval
     private let discoveryCwd: String
     private let discoveryEnvironment: [String: String]
     private let modelCacheTTL: TimeInterval
@@ -280,6 +284,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         binaryNameOverride: String? = nil,
         cancellationGracePeriod: TimeInterval = 2,
         turnInactivityTimeout: TimeInterval = 900,
+        openToolQuietLimit: TimeInterval = 7_200,
         discoveryCwd: String = FileManager.default.temporaryDirectory.path,
         discoveryEnvironment: [String: String] = [:],
         discoveryRunAsUser: AgentRunAsUser? = nil,
@@ -290,6 +295,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         self.binaryNameOverride = binaryNameOverride
         self.cancellationGracePeriod = max(0.01, cancellationGracePeriod)
         self.turnInactivityTimeout = max(0.01, turnInactivityTimeout)
+        self.openToolQuietLimit = max(0, openToolQuietLimit)
         self.discoveryCwd = discoveryCwd
         self.discoveryEnvironment = discoveryEnvironment
         self.discoveryRunAsUser = discoveryRunAsUser
@@ -937,6 +943,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             session.forceKillWorkItem?.cancel()
             session.forceKillWorkItem = nil
             session.promptGeneration &+= 1
+            session.lastEventAt = Date()
             session.promptFailureDetail = nil
             session.onEvent = onEvent
             cancelTurnWatchdogLocked(session: session)
@@ -1378,6 +1385,15 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             lock.unlock()
             return
         }
+        // Open tool call and recent activity: a blocking tool wait is healthy, so keep the turn open.
+        if session.mapper.hasOpenToolCalls,
+           session.client.runningProcess.isRunning,
+           Date().timeIntervalSince(session.lastEventAt) < openToolQuietLimit {
+            session.turnWatchdog?.refresh()
+            lock.unlock()
+            grokAcpLog.info("grok.turn.watchdog.extended_open_tool thread=\(session.threadId.value.uuidString, privacy: .public) generation=\(generation, privacy: .public)")
+            return
+        }
         // Claim synthesis before any emit. emit re-arms the watchdog; without
         // this flag that re-arm can re-enter fire and overflow the GCD worker
         // stack (crash: RemoteCode.SQLiteDB stack guard via EventBus).
@@ -1446,6 +1462,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             return
         }
         session.history.append(event)
+        session.lastEventAt = Date()
         let generation = session.promptGeneration
         // Do not re-arm while the watchdog is synthesizing a terminal: that path
         // is what previously re-entered fireTurnInactivityWatchdog from emit.

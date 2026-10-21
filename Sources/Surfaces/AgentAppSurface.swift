@@ -16993,7 +16993,7 @@ public struct AgentAppView: View {
         return ["BOTTOM"]
     }
 
-    // UX-MAC_AGENT-CONTINUE: shown when the thread was interrupted by relaunch.
+    // UX-MAC_AGENT-CONTINUE: shown when a turn was interrupted (relaunch or stalled provider).
     // One tap resumes via recoverableResumeContext without requiring a retype.
     @ViewBuilder
     private var interruptedContinueRow: some View {
@@ -17002,7 +17002,7 @@ public struct AgentAppView: View {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 11))
                     .foregroundColor(DS.Palette.warning)
-                Text("This thread was interrupted by an app restart.")
+                Text("This turn stopped before finishing.")
                     .font(DS.Font.body)
                     .foregroundColor(DS.Palette.textSecondary)
             }
