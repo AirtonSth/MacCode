@@ -251,6 +251,28 @@ public enum BotAttentionItemKind: String, Codable, Sendable, Equatable {
     case unread
     case blocked
     case unknownEffect
+
+    public var activityTitle: String {
+        switch self {
+        case .question: return "Reply to Bot"
+        case .approval: return "Approve or decline Bot request"
+        case .blocked: return "Review failed Bot run"
+        case .handoff: return "Review Bot handoff"
+        case .unknownEffect: return "Verify action outcome"
+        case .unread: return "New Bot result"
+        }
+    }
+
+    public var resolutionHint: String {
+        switch self {
+        case .question: return "Reply in this conversation. This request clears when you send your response."
+        case .approval: return "Approve or decline the request in this conversation. It clears after your decision."
+        case .blocked: return "Review the error and try again, or dismiss this alert. A new run clears the previous failure."
+        case .handoff: return "Review the handoff and send the next instruction, or dismiss this alert."
+        case .unknownEffect: return "Check whether the action took effect before retrying. Dismiss this alert after verifying the outcome."
+        case .unread: return "Open the conversation to read the result."
+        }
+    }
 }
 
 public enum BotRoutineCopy {

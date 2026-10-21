@@ -687,7 +687,7 @@ public struct BotSelfConfigService: Sendable {
             botID: callerBotID,
             conversationID: conversation?.id,
             kind: .question,
-            title: "Needs you",
+            title: "Reply to Bot",
             detail: text
         )
         try store.upsertAttention(item)

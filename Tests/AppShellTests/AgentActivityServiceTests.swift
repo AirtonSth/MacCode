@@ -7,6 +7,88 @@ import SocketServer
 
 @MainActor
 final class AgentActivityServiceTests: XCTestCase {
+    func test_botFailureHasOneActionAndDismissalClearsBothProjections() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let bot = try context.botStore.create(name: "Worker", title: "", description: "")
+        let conversation = BotConversation(botID: bot.id, title: "Task", attentionState: .needsAttention, linkedAgentThreadID: thread.id)
+        try context.botStore.upsertConversation(conversation)
+        let failed = try makeRun(context, thread: thread, status: .failed, at: 100)
+        let receipt = BotAttentionItem(botID: bot.id, conversationID: conversation.id, kind: .blocked,
+                                      title: "Run needs you", createdAt: Date(timeIntervalSince1970: 110))
+        try context.botStore.upsertAttention(receipt)
+        let activity = service(context)
+        let runID = "run:\(failed.id.description)"
+        XCTAssertEqual(try decodePage(activity.list(["section": .string("needs_you")])).items.map(\.id), [runID])
+        _ = try activity.acknowledge(["item_id": .string(runID)])
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 0)
+        XCTAssertTrue(try context.botStore.listAttention().isEmpty)
+        XCTAssertNotEqual(try context.botStore.conversation(id: conversation.id)?.attentionState, .needsAttention)
+        _ = try activity.acknowledge(["item_ids": .array([.string(runID)]), "acknowledged": .bool(false)])
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 1)
+        try context.botStore.acknowledgeAttention(id: receipt.id)
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 0, "dismissing from Bots must not reveal the same failure again in Activity")
+        XCTAssertEqual(try context.runRepo.get(id: failed.id)?.status, .failed)
+    }
+
+    func test_resolvedApprovalNotificationDoesNotReappearAsANewRequest() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let run = try makeRun(context, thread: thread, status: .running, at: 100)
+        try context.providerPendingCallbackRepo.record(threadId: thread.id, request: pendingRequest("approval"))
+        try NotificationRepository(db: context.db).insert(AppNotification(
+            id: "approval-notice", title: "Approval", body: "{\"thread_id\":\"\(thread.id.description)\",\"request_id\":\"approval\"}",
+            category: PetNotificationCategory.agentAttention.rawValue
+        ))
+        let activity = service(context, activeRunID: run.id)
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 1)
+        try context.providerPendingCallbackRepo.resolve(threadId: thread.id, requestId: "approval", kind: .approval, state: .approved)
+        let page = try decodePage(activity.list([:]))
+        XCTAssertEqual(page.counts.needsYou, 0)
+        XCTAssertEqual(page.counts.running, 1)
+        XCTAssertFalse(page.items.contains { $0.notificationID == "approval-notice" })
+    }
+
+    func test_retriedBotFailureDoesNotAskForAttentionWhileTheBotIsWorking() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let bot = try context.botStore.create(name: "Worker", title: "", description: "")
+        let conversation = BotConversation(botID: bot.id, title: "Task", attentionState: .needsAttention, linkedAgentThreadID: thread.id)
+        try context.botStore.upsertConversation(conversation)
+        _ = try makeRun(context, thread: thread, status: .failed, at: 100)
+        try context.botStore.upsertAttention(BotAttentionItem(
+            botID: bot.id, conversationID: conversation.id, kind: .blocked,
+            title: "Run needs you", detail: "The previous run failed.", createdAt: Date(timeIntervalSince1970: 110)
+        ))
+        let retry = try makeRun(context, thread: thread, status: .running, at: 200)
+
+        let page = try decodePage(service(context, activeRunID: retry.id).list([:]))
+        XCTAssertEqual(page.counts.running, 1)
+        XCTAssertEqual(page.counts.needsYou, 0, "a retry supersedes the old Bot failure as well as its run result")
+        XCTAssertTrue(try context.botStore.listAttention().isEmpty)
+        XCTAssertNotEqual(try context.botStore.conversation(id: conversation.id)?.attentionState, .needsAttention)
+    }
+
+    func test_botQuestionNeedsAReplyAndClearsOnlyAfterNewUserInput() throws {
+        let context = try makeContext()
+        let thread = try makeThread(context)
+        let bot = try context.botStore.create(name: "Worker", title: "", description: "")
+        let conversation = BotConversation(botID: bot.id, title: "Task", attentionState: .needsAttention, linkedAgentThreadID: thread.id)
+        try context.botStore.upsertConversation(conversation)
+        let run = try makeRun(context, thread: thread, status: .running, at: 100)
+        let question = BotAttentionItem(botID: bot.id, conversationID: conversation.id, kind: .question,
+                                        title: "Reply requested", detail: "Which destination?", createdAt: Date(timeIntervalSince1970: 110))
+        try context.botStore.upsertAttention(question)
+        let activity = service(context, activeRunID: run.id)
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 1)
+        try context.messageRepo.append(AgentMessage(threadId: thread.id, role: .assistant, content: "Waiting for your choice.", createdAt: Date(timeIntervalSince1970: 120)))
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 1, "assistant activity is not a user answer")
+        try context.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "Use staging.", createdAt: Date(timeIntervalSince1970: 130)))
+        XCTAssertEqual(try decodePage(activity.list([:])).counts.needsYou, 0)
+        XCTAssertTrue(try BotStore(db: context.db).listAttention().isEmpty, "reopening must not resurrect an answered question")
+        XCTAssertNotEqual(try context.botStore.conversation(id: conversation.id)?.attentionState, .needsAttention)
+    }
+
     func test_acknowledgingFailurePreservesFailedRunAndRemovesNeedsYou() throws {
         let context = try makeContext()
         let thread = try makeThread(context)
@@ -116,8 +198,12 @@ final class AgentActivityServiceTests: XCTestCase {
         XCTAssertEqual(page.counts.running, 0)
         XCTAssertTrue(page.items.contains { $0.runID == running.id.value && $0.blocking })
         XCTAssertTrue(page.items.contains { $0.requestID == "approval" && $0.state == .waitingApproval })
-        XCTAssertTrue(page.items.contains { $0.requestID == "stale" && $0.state == .expired && $0.needsAction })
+        XCTAssertTrue(page.items.contains { $0.requestID == "stale" && $0.state == .expired && !$0.needsAction })
         XCTAssertNil(page.items.first(where: { $0.requestID == "stale" })?.runID)
+        let retry = try makeRun(context, thread: thread, status: .running, at: 200)
+        let retried = try decodePage(service(context, activeRunID: retry.id).list([:]))
+        XCTAssertEqual(retried.counts.needsYou, 0, "an older callback cannot block a new run")
+        XCTAssertEqual(retried.counts.running, 1)
     }
 
     func test_notificationKeepsCustomIDUsesSafeTypeAndDedupesOnlyProvenRunOrRequest() throws {
@@ -385,7 +471,7 @@ final class AgentActivityServiceTests: XCTestCase {
         let before = try decodePage(live.list(["section": .string("needs_you")]))
         let ids = before.items.map(\.id)
         XCTAssertEqual(Set(ids), [
-            "request:\(running.id.description):approval", "request:\(thread.id.description):stale", "run:\(orphan.id.description)"
+            "request:\(running.id.description):approval", "run:\(orphan.id.description)"
         ])
         let response = try live.acknowledge(["item_ids": .array(ids.map(JSONValue.string))])
         XCTAssertEqual(response.objectValue?["updated_ids"]?.arrayValue?.compactMap(\.stringValue), ids)
@@ -406,7 +492,7 @@ final class AgentActivityServiceTests: XCTestCase {
             .string("request:\(thread.id.description):approval"), .string("request:\(thread.id.description):stale"),
             .string("run:\(orphan.id.description)")
         ]), "acknowledged": .bool(false)])
-        XCTAssertEqual(try decodePage(service(context).list([:])).counts.needsYou, 3, "Undo puts every cleared item back")
+        XCTAssertEqual(try decodePage(service(context).list([:])).counts.needsYou, 1, "Undo restores the orphan alert, but cannot make expired requests actionable")
     }
 
     func test_conversationShowsOnlyItsLatestResultAndALaterRunSettlesAnOldFailure() throws {
@@ -482,7 +568,7 @@ final class AgentActivityServiceTests: XCTestCase {
         _ = try statement.step()
     }
     private func pendingRequest(_ id: String) -> AssistantPendingRequest {
-        AssistantPendingRequest(id: id, turnId: nil, kind: .commandExecution, title: "not exposed", createdAtMs: 1)
+        AssistantPendingRequest(id: id, turnId: nil, kind: .commandExecution, title: "not exposed", createdAtMs: 101_000)
     }
     private func service(_ context: AppContext, activeRunID: AgentRunID? = nil) -> ActivityService {
         ActivityService(context: context, activeRunIDProvider: { _ in activeRunID })

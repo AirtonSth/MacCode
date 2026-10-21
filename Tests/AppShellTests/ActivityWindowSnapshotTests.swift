@@ -45,10 +45,10 @@ final class ActivityWindowSnapshotTests: XCTestCase {
             item("run:blank", state: "failed", title: "  \n ", summary: nil, at: "1970-01-01T00:00:00Z", needsAction: true),
             item("run:markup", state: "completed", title: "<script>alert(1)</script> &amp; **bold** _under_", summary: "line one\nline two\nline three\nline four"),
             item("run:future", state: "completed", title: "Finished ahead of the local clock", summary: "Clock skew", at: "2099-01-01T00:00:00Z"),
-            item("bot-attention:1", kind: "request", state: "waiting_answer", title: "Bot answer needed", workspace: nil, provider: nil, needsAction: true, origin: "Bot conversation: You are an autonomous GitHub PR maintenance agent. Your goal is to bring every open pull request to a mergeable state"),
-            item("bot-attention:2", kind: "request", state: "needs_you", title: "Bot needs attention", workspace: nil, provider: nil, needsAction: true),
-            item("request:thread:1", kind: "request", state: "waiting_approval", title: "Approval needed", needsAction: true),
-            item("request:thread:2", kind: "request", state: "expired", title: "Information needed", needsAction: true),
+            item("bot-attention:1", kind: "request", state: "waiting_answer", title: "Reply to Bot", workspace: nil, provider: nil, needsAction: true, origin: "Bot conversation: You are an autonomous GitHub PR maintenance agent. Your goal is to bring every open pull request to a mergeable state"),
+            item("bot-attention:2", kind: "request", state: "needs_you", title: "Review Bot handoff", workspace: nil, provider: nil, needsAction: true),
+            item("request:thread:1", kind: "request", state: "waiting_approval", title: "Approve or decline request", needsAction: true),
+            item("request:thread:2", kind: "request", state: "expired", title: "Request expired"),
             item("run:running", state: "running", title: "Star - Task 1", origin: "Scheduled task: Star - Task 1"),
             item("run:queued", state: "queued", title: "Star - Testing to Review")
         ]
@@ -198,6 +198,18 @@ final class ActivityWindowSnapshotTests: XCTestCase {
             size: CGSize(width: 540, height: 900)
         )
         XCTAssertGreaterThan(inkSamples(in: bitmap), 300, "the minimum window width must still render the list")
+    }
+
+    func testActionableRequestShowsItsResolutionRule() async throws {
+        let reply = item("bot-attention:reply", kind: "request", state: "waiting_answer", title: "Reply to Bot",
+                         summary: BotAttentionItemKind.question.resolutionHint, needsAction: true, origin: "Bot conversation: Elephant - Task")
+        XCTAssertEqual(reply.attentionInstruction, BotAttentionItemKind.question.resolutionHint)
+        XCTAssertNil(item("request:expired", kind: "request", state: "expired", title: "Request expired").attentionInstruction)
+        let bitmap = try await render(
+            "actionable-request", items: [reply], counts: ActivityWireCounts(needs_you: 1),
+            size: CGSize(width: 1_100, height: 700), selecting: reply.id
+        )
+        XCTAssertGreaterThan(inkSamples(in: bitmap, columns: 0.4...1), 80, "the request must render its actions and resolution guidance")
     }
 
     func testEmptySingleFailureAndUndoStatesRenderTheirOwnChrome() async throws {

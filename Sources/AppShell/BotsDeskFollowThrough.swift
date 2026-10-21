@@ -59,15 +59,13 @@ enum BotsDeskFollowThrough {
     }
 
     static func attentionTitle(for status: AgentRunStatus, terminalReason: String? = nil) -> String {
-        if status == .cancelled && terminalReason != "userStop" {
-            return "Run needs you"
-        }
-        return status == .cancelled ? "Run cancelled" : "Run needs you"
+        if status == .cancelled && terminalReason == "userStop" { return "Stopped by you" }
+        return status == .failed ? "Bot run failed" : "Bot run interrupted"
     }
 
     static let workingPlaceholder = "Working…"
     static let noRouterPlaceholder =
-        "Supervised run starts from this conversation; provider turn is the next slice"
+        "This Bot could not start. Check its configuration, then send your request again."
 
     static func visibleDeskMessages(
         cached: [BotDeskMessage],
@@ -131,8 +129,10 @@ enum BotsDeskFollowThrough {
             return "Working"
         case .completed:
             return "Done"
-        case .failed, .interrupted:
-            return "Needs you"
+        case .failed:
+            return "Failed"
+        case .interrupted:
+            return "Interrupted"
         case .cancelled:
             return "Cancelled"
         }

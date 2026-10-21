@@ -3050,7 +3050,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.selectedBotID, piper.id)
         XCTAssertEqual(vm.screen, .desk)
         XCTAssertEqual(vm.openAttentionCount, 1)
-        XCTAssertEqual(vm.attentionItems.first?.title, "Needs you")
+        XCTAssertEqual(vm.attentionItems.first?.title, "Bot could not start")
         XCTAssertEqual(vm.attentionItems.first?.botID, piper.id)
         XCTAssertEqual(try context.botStore.listAttention().count, 1)
         XCTAssertEqual(vm.deskMessages.first?.text, "Please look at the failing test")
@@ -3518,7 +3518,7 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(vm.rosterPreview(for: copy), "Scout")
     }
 
-    func test_openAttentionDestsBeforeAcknowledge_becauseAttentionRowMustNotWaitOnStore() throws {
+    func test_openAttentionShowsConversationWithoutResolvingItsRequest() throws {
         // WHY: clicking an Attention row used to acknowledge and list the
         // queue before dest. Chat must paint first; store work follows.
         let context = try makeContext()
@@ -3529,17 +3529,14 @@ final class BotsWindowTests: XCTestCase {
         vm.send("Please look at the failing test")
         let item = try XCTUnwrap(context.botStore.listAttention().first)
         vm.openAttention(item)
-        XCTAssertEqual(
-            vm.lastAttentionAcknowledgedOnScreenForTesting,
-            .desk,
-            "Attention dest must already be Chat when acknowledge runs"
-        )
+        XCTAssertEqual(try context.botStore.listAttention().map(\.id), [item.id],
+                       "Opening the conversation must not resolve the request")
         XCTAssertEqual(vm.screen, .desk)
         XCTAssertEqual(vm.selectedBotID, piper.id)
         XCTAssertEqual(vm.deskMessages.first?.text, "Please look at the failing test")
     }
 
-    func test_openAttentionStillAcknowledges_becauseStaleInboxMustNotLookCurrent() throws {
+    func test_explicitAcknowledgementResolvesAttentionAfterOpening() throws {
         // WHY: dest-first dest is honest only when the inbox item is still
         // marked read after Chat paints.
         let context = try makeContext()
@@ -3549,6 +3546,8 @@ final class BotsWindowTests: XCTestCase {
         vm.send("Please look at the failing test")
         let item = try XCTUnwrap(context.botStore.listAttention().first)
         vm.openAttention(item)
+        XCTAssertEqual(vm.openAttentionCount, 1, "Opening alone is not resolution")
+        vm.acknowledge(item)
         XCTAssertTrue(vm.attentionItems.isEmpty)
         XCTAssertEqual(try context.botStore.listAttention().count, 0)
     }
@@ -3575,7 +3574,7 @@ final class BotsWindowTests: XCTestCase {
         )
     }
 
-    func test_openAttentionStillClearsInbox_becauseStaleBellMustNotLookCurrent() throws {
+    func test_explicitAcknowledgementClearsTheBellAndKeepsTheConversation() throws {
         // WHY: dest-first acknowledge is honest only when dest still
         // hides this row after the store write.
         let context = try makeContext()
@@ -3586,6 +3585,8 @@ final class BotsWindowTests: XCTestCase {
         let item = try XCTUnwrap(context.botStore.listAttention().first)
         XCTAssertEqual(vm.openAttentionCount, 1)
         vm.openAttention(item)
+        XCTAssertEqual(vm.openAttentionCount, 1, "Opening alone is not resolution")
+        vm.acknowledge(item)
         XCTAssertTrue(vm.attentionItems.isEmpty)
         XCTAssertEqual(vm.openAttentionCount, 0)
         XCTAssertEqual(try context.botStore.listAttention().count, 0)
@@ -3615,7 +3616,7 @@ final class BotsWindowTests: XCTestCase {
             afterDest,
             "bell dest must not reread the inbox"
         )
-        XCTAssertTrue(vm.attentionItems.isEmpty)
+        XCTAssertEqual(vm.openAttentionCount, 1, "opening the request does not resolve it")
         XCTAssertEqual(vm.deskMessages.first?.text, "Please look at the failing test")
     }
 
@@ -13209,7 +13210,7 @@ final class BotsWindowTests: XCTestCase {
         let attention = try context.botStore.listAttention()
         XCTAssertEqual(attention.count, 1, "a send that cannot start a provider run must land in Attention")
         XCTAssertEqual(attention.first?.botID, bot.id)
-        XCTAssertEqual(attention.first?.kind, .question)
+        XCTAssertEqual(attention.first?.kind, .blocked)
         XCTAssertEqual(try context.botStore.listConversations(botID: bot.id).count, 1)
         XCTAssertEqual(vm.deskMessages.first?.text, "Please look at the failing test")
         XCTAssertEqual(vm.deskMessages.last?.text, BotsViewModel.assistantPlaceholder)
@@ -13282,7 +13283,7 @@ final class BotsWindowTests: XCTestCase {
         let items = try context.botStore.listAttention()
         XCTAssertEqual(items.count, 1)
         XCTAssertEqual(items.first?.kind, .blocked)
-        XCTAssertEqual(items.first?.title, "Run needs you")
+        XCTAssertEqual(items.first?.title, "Bot run interrupted")
     }
 
     func test_rosterPreviewPrefersLastDeskLine_becauseGrokShowsTheLastLine() throws {
@@ -16181,8 +16182,8 @@ final class BotsWindowTests: XCTestCase {
         vm.openDesk(piper)
         XCTAssertTrue(vm.send("Please look at the failing test"))
         XCTAssertEqual(vm.openAttentionCount, 1)
-        XCTAssertEqual(vm.attentionItems.first?.title, "Needs you")
-        XCTAssertEqual(vm.attentionItems.first?.detail, "Please look at the failing test")
+        XCTAssertEqual(vm.attentionItems.first?.title, "Bot could not start")
+        XCTAssertEqual(vm.attentionItems.first?.detail, "Check the Bot's configuration, then send your request again.")
         XCTAssertEqual(try context.botStore.listAttention().count, 1)
         XCTAssertEqual(vm.deskMessages.last?.text, BotsViewModel.assistantPlaceholder)
         XCTAssertEqual(vm.screen, .desk)

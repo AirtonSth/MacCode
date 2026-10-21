@@ -355,6 +355,14 @@ public final class ActiveThreadsViewModel: ObservableObject {
     func openActivity(_ item: ActivityWireItem) {
         // A new open owns the alert; an older failure must not outlive it.
         errorMessage = nil
+        if item.id.hasPrefix("scheduled-occurrence:") {
+            guard let windowController = router.windowController else {
+                errorMessage = "Open Schedule Tasks from the main window to review this task."
+                return
+            }
+            windowController.presentScheduledTasksInMainContent()
+            return
+        }
         if let notificationID = item.notification_id, item.bot_id == nil {
             do {
                 guard let notification = try NotificationRepository(db: context.db).get(id: notificationID),

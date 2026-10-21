@@ -104,15 +104,11 @@ public final class PetAttentionStore {
             try markAgentThreadReadMutation(threadID)
             return .marked
         case .notification(let id):
-            if case .notification(.notificationsDenied) = item.kind {
-                try markNotificationReadMutation(id)
-                return .marked
-            }
             guard !item.kind.needsUserAction else { return .retainedBlocker }
             try markNotificationReadMutation(id)
             return .marked
         case .bot(_, let conversationID, let attentionItemID):
-            guard !item.kind.needsUserAction else { return .retainedBlocker }
+            guard item.classification != .needsYou else { return .retainedBlocker }
             if let conversationID {
                 try markBotConversationViewed?(conversationID)
             }
@@ -352,7 +348,7 @@ public final class PetAttentionStore {
                 PetAttentionItem(
                     id: "bot.attention:\(row.id.value.uuidString)",
                     kind: kinds.item,
-                    title: presentation.title,
+                    title: row.kind.activityTitle,
                     detail: presentation.detail,
                     workspaceName: "Bots",
                     createdAt: row.createdAt,

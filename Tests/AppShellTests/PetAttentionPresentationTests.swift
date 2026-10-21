@@ -117,7 +117,7 @@ final class PetAttentionPresentationTests: XCTestCase {
             (.sshTransfer(.succeeded), "SSH transfer completed"),
             (.sshTransfer(.failed), "SSH transfer failed"),
             (.providerUpdateFailed, "Provider update failed"),
-            (.serverListenerFailed, "MacCode listener needs attention")
+            (.serverListenerFailed, "Restore remote access")
         ]
 
         for (kind, title) in expected {
@@ -134,17 +134,17 @@ final class PetAttentionPresentationTests: XCTestCase {
         }
         XCTAssertEqual(
             PetNotificationCategory.sshUnexpectedDisconnect.presentation,
-            PetAttentionPresentation(title: "SSH connection needs attention", detail: nil)
+            PetAttentionPresentation(title: "Reconnect SSH", detail: "The connection ended unexpectedly. Reconnect or dismiss this alert.")
         )
         XCTAssertEqual(
             PetNotificationCategory.serverListenerFailed.presentation,
-            PetAttentionPresentation(title: "Remote access needs attention", detail: nil)
+            PetAttentionPresentation(title: "Restore remote access", detail: "Open Settings to check the listener, or dismiss this alert.")
         )
         XCTAssertEqual(
             PetNotificationCategory.notificationsDenied.presentation,
             PetAttentionPresentation(
                 title: "Notifications are turned off",
-                detail: "Open System Settings to re-enable them."
+                detail: "You can enable notifications in System Settings. Your runs can continue without them."
             )
         )
         XCTAssertEqual(
