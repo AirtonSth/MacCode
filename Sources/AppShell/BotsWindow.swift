@@ -3,11 +3,14 @@ import AgentRuntime
 import Combine
 import CoreModel
 import DesignSystemKit
+import os
 import Persistence
 import SocketServer
 import Surfaces
 import SwiftUI
 import WebKit
+
+private let botsWindowLog = Logger(subsystem: "io.remotecode.appshell", category: "bots")
 
 // MARK: - Drafts & rows
 
@@ -1946,17 +1949,13 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                             thread: threadID,
                             text: receipt.compiledPayload,
                             provider: routing.provider,
-                            model: routing.resolvedModel(
-                                defaultModel: BotsViewModel.defaultModel(for:)
-                            ),
+                            model: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
                             permissionMode: routing.permissionMode,
                             reasoningEffort: routing.reasoningEffort,
                             serviceTier: routing.serviceTier,
                             modelSelection: AgentModelSelection(
                                 provider: routing.provider,
-                                modelId: routing.resolvedModel(
-                                    defaultModel: BotsViewModel.defaultModel(for:)
-                                ),
+                                modelId: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
                                 reasoningEffort: routing.reasoningEffort,
                                 serviceTier: routing.serviceTier,
                                 distillMainEffortSelection: routing.provider == .distill
@@ -4536,7 +4535,7 @@ public final class BotsViewModel: ObservableObject {
             return deskModelDisplayLabel
         }
         return resolvedThreadRouting(for: bot).flatMap {
-            trimmedNonEmpty($0.resolvedModel(defaultModel: Self.defaultModel(for:)))
+            trimmedNonEmpty($0.resolvedModel(defaultModel: runDefaultModel(for:)))
         }
     }
 
@@ -7251,7 +7250,7 @@ public final class BotsViewModel: ObservableObject {
         )
         let memoryFiles = memoryFileTexts(for: bot)
         let previewProvider = deskRouting.provider
-        let previewModel = deskRouting.resolvedModel(defaultModel: Self.defaultModel(for:))
+        let previewModel = deskRouting.resolvedModel(defaultModel: runDefaultModel(for:))
         // The run of the selected desk conversation compiles the guest
         // Desktop and tools text when its agent runs inside the guest; the
         // preview says the same.
@@ -7568,12 +7567,24 @@ public final class BotsViewModel: ObservableObject {
     /// Instruction on the task's route, kept as that conversation's desk
     /// route for follow-ups. The user's selection and panels stay as they are.
     func enqueueScheduledRoutine(_ routine: BotRoutine) throws -> JSONValue {
-        let route = routine.definition.scheduleSpec.map { Self.routineRouting($0, base: BotDeskRouting()) }
-        let pinned = try? contextualRoutineConversation(
-            botID: routine.definition.botID,
-            route: route ?? BotDeskRouting(),
-            title: routine.definition.name
-        )
+        var route = routine.definition.scheduleSpec.map { Self.routineRouting($0, base: BotDeskRouting()) }
+        // A schedule saved without a Main model must not reach Distill empty.
+        if var filled = route, filled.provider == .distill,
+           filled.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            filled.model = runDefaultModel(for: .distill)
+            route = filled
+        }
+        let pinned: (conversation: BotConversation, routing: BotDeskRouting)?
+        do {
+            pinned = try contextualRoutineConversation(
+                botID: routine.definition.botID,
+                route: route ?? BotDeskRouting(),
+                title: routine.definition.name
+            )
+        } catch {
+            botsWindowLog.error("Scheduled routine stays unpinned: \(error.localizedDescription, privacy: .public)")
+            pinned = nil
+        }
         return try enqueueHostMessage(
             botID: routine.definition.botID,
             text: routine.definition.prompt,
@@ -7591,8 +7602,9 @@ public final class BotsViewModel: ObservableObject {
         route: BotDeskRouting,
         title: String
     ) throws -> (conversation: BotConversation, routing: BotDeskRouting)? {
-        guard let bot = try botStore.get(id: botID), bot.deletedAt == nil,
-              let workspaceID = bot.workspaceID else { return nil }
+        guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else { return nil }
+        let bindings = try botStore.listContextBindings(hostID: context.liveActivityHostIdentity.serverId, botID: botID)
+        guard let workspaceID = SidebarViewModel.sidebarWorkspace(for: bot, bindings: bindings) ?? bot.workspaceID else { return nil }
         let snapshot = providers.first(where: { $0.id == route.providerInstanceID })
             ?? providers.first(where: { $0.provider == route.provider })
         let made = try makeContextualConversation(
@@ -7634,6 +7646,29 @@ public final class BotsViewModel: ObservableObject {
         case .grok: return "grok-4.6"
         case .distill: return ""
         }
+    }
+
+    /// Model a run uses when its route has none: Distill never resolves to ""
+    /// (the adapter refuses an empty model), so it falls back to the desk default.
+    func runDefaultModel(for provider: AgentProvider) -> String {
+        Self.runDefaultModel(
+            for: provider,
+            lastUsed: lastModelStore.model(for: provider),
+            availableModelIds: selectedDeskSnapshot?.models.filter { $0.provider == provider }.map(\.id) ?? []
+        )
+    }
+
+    nonisolated static func runDefaultModel(
+        for provider: AgentProvider,
+        lastUsed: String?,
+        availableModelIds: [String]
+    ) -> String {
+        guard provider == .distill else { return defaultModel(for: provider) }
+        return AgentDefaultModelSelection.resolve(
+            provider: provider,
+            lastUsed: lastUsed,
+            availableModelIds: availableModelIds
+        )
     }
 
     // MARK: - Internals
@@ -8897,7 +8932,7 @@ public final class BotsViewModel: ObservableObject {
     public var deskRunProvider: AgentProvider { deskRouting.provider }
 
     public var deskRunModel: String {
-        deskRouting.resolvedModel(defaultModel: Self.defaultModel(for:))
+        deskRouting.resolvedModel(defaultModel: runDefaultModel(for:))
     }
 
     public var deskRunReasoning: AgentReasoningEffort {
@@ -11223,7 +11258,7 @@ public final class BotsViewModel: ObservableObject {
             resolvedRouter()?.publishAgentThreadUpdated(thread)
         }
         let routing = thread.map { BotDeskRouting(thread: $0) } ?? deskRouting
-        let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
+        let model = routing.resolvedModel(defaultModel: runDefaultModel(for:))
         let inGuest = runsInGuest(threadID: threadID, provider: routing.provider)
         let conversation = conversations.first(where: { $0.id == conversationID })
             ?? ((try? botStore.conversation(id: conversationID)) ?? nil)
@@ -11622,7 +11657,7 @@ public final class BotsViewModel: ObservableObject {
             || bot.handle == TitioBot.handle {
             routing.permissionMode = .fullAccess
         }
-        let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
+        let model = routing.resolvedModel(defaultModel: runDefaultModel(for:))
         var liveConversation = conversation
         // 1.8: Bot runs use BotHome as cwd (not "/") so provider file tools
         // operate inside the bot's home directory. Workspace-less threads
@@ -11958,7 +11993,7 @@ public final class BotsViewModel: ObservableObject {
             return nil
         }
         let routing = prepared.routing
-        let model = routing.resolvedModel(defaultModel: Self.defaultModel(for:))
+        let model = routing.resolvedModel(defaultModel: runDefaultModel(for:))
         let effort = routing.reasoningEffort
         lastDeskRunProviderForTesting = routing.provider
         lastDeskRunModelForTesting = model
@@ -13205,6 +13240,7 @@ public struct BotsRootView: View {
     private var studioCompact: Bool { studioWidth < Self.studioCompactWidth }
     @State private var pendingDockerDataClear: BotID?
     @State private var isConfirmingTitioFactoryReset = false
+    @State private var addingSecret = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(vm: BotsViewModel) {
@@ -13350,14 +13386,26 @@ public struct BotsRootView: View {
                 case .files:
                     filesTab
                 case .routines:
-                    studioPage { routinesTab }
+                    if let botID = vm.studioDraft.botID {
+                        BotScheduleTasksRootView(vm: vm, scopeBotID: botID)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        studioPage {
+                            studioEmptyState(
+                                icon: "clock.arrow.2.circlepath",
+                                title: "No bot selected",
+                                subtitle: "Pick a bot to see its scheduled tasks."
+                            )
+                        }
+                    }
                 case .security:
                     studioPage {
                         VStack(alignment: .leading, spacing: DS.Space.xl) {
-                            studioSecurity
-                            studioSecrets
                             studioDesktop
+                            studioSecrets
+                            studioSecurity
                         }
+                        .frame(maxWidth: 720, alignment: .leading)
                     }
                 }
             }
@@ -13743,19 +13791,88 @@ public struct BotsRootView: View {
         .accessibilityIdentifier("bots.studio.soul")
     }
 
-    private var studioDesktop: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xl) {
-            studioSectionHeader("Run on", caption: "The default for new conversations. Existing conversations keep their destination.")
-            BotExecutionDestinationPicker(
-                selection: Binding(get: { vm.studioExecutionDestination }, set: { vm.studioExecutionDestination = $0 }),
-                bot: vm.selectedBot, store: vm.executionDestinationStore, workspaces: vm.executionWorkspaces
-            )
-            if vm.studioExecutionDestination == .mac {
-                Toggle("Use a separate browser for this bot", isOn: Binding(
-                    get: { vm.studioDraft.desktopKind == .botOwnedBrowser },
-                    set: { vm.studioDraft.desktopKind = $0 ? .botOwnedBrowser : .logicalExecutionSpace }
-                ))
+    /// Dark grouped card: one rounded surface, hairline rows inside.
+    private func securityCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            content()
+        }
+        .padding(.horizontal, DS.Space.xl)
+        .padding(.vertical, DS.Space.xs)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
+    }
+
+    /// One settings row: icon tile, title with optional caption, trailing control.
+    private func securityRow<Trailing: View>(
+        icon: String,
+        tint: Color,
+        title: String,
+        caption: String? = nil,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(alignment: .center, spacing: DS.Space.lg) {
+            AgentChoiceIconTile(systemName: icon, tint: tint, size: 28)
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                Text(title)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                if let caption {
+                    Text(caption)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
+            Spacer(minLength: DS.Space.lg)
+            trailing()
+        }
+        .padding(.vertical, DS.Space.md)
+        .frame(minHeight: BotsChrome.hitTarget)
+    }
+
+    private var studioDesktop: some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            AgentChoiceSectionHeader("Where it runs")
+            securityCard {
+                securityRow(
+                    icon: "desktopcomputer",
+                    tint: DS.Palette.accent,
+                    title: "Run on",
+                    caption: "Default for new conversations. Existing conversations keep theirs."
+                ) {
+                    BotExecutionDestinationPicker(
+                        selection: Binding(get: { vm.studioExecutionDestination }, set: { vm.studioExecutionDestination = $0 }),
+                        bot: vm.selectedBot, store: vm.executionDestinationStore, workspaces: vm.executionWorkspaces
+                    )
+                    .labelsHidden()
+                    .frame(maxWidth: 260, alignment: .trailing)
+                }
+                if vm.studioExecutionDestination == .mac {
+                    studioRule
+                    securityRow(
+                        icon: "safari",
+                        tint: DS.Palette.accent,
+                        title: "Use a separate browser for this bot",
+                        caption: "Gives this bot its own browser instead of the shared logical space."
+                    ) {
+                        Toggle("Use a separate browser for this bot", isOn: Binding(
+                            get: { vm.studioDraft.desktopKind == .botOwnedBrowser },
+                            set: { vm.studioDraft.desktopKind = $0 ? .botOwnedBrowser : .logicalExecutionSpace }
+                        ))
+                        .toggleStyle(.switch)
+                        .labelsHidden()
+                    }
+                }
+            }
+            Text("Logical space is not a security boundary.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityIdentifier("bots.studio.desktop.honesty")
             if !vm.studioDestinationIsSaved {
                 Text("Save the bot to apply this destination.")
                     .font(DS.Font.caption).foregroundStyle(DS.Palette.textSecondary)
@@ -13783,136 +13900,155 @@ public struct BotsRootView: View {
                 .disabled(!vm.studioDestinationIsSaved)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("bots.studio.desktop")
     }
 
-    private var studioSecurity: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xl) {
-            studioSectionHeader(
-                BotsChrome.Label.security,
-                caption: "Manage secrets and review runtime access."
-            )
-            VStack(alignment: .leading, spacing: 0) {
-                securityRow(symbol: "hand.raised", title: "Approvals", detail: "Allow once / Deny stay off until P1b.")
-                studioRule
-                securityRow(symbol: "pencil.and.outline", title: "Host-brokered writes", detail: "Effects stay off until that phase ships.")
-                studioRule
-                securityRow(symbol: "desktopcomputer", title: "Desktop", detail: "Logical space is not a security boundary.")
-            }
-            Text("No Allow once / Deny actions are live. Desktop isolation is not a security boundary.")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.warning)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityIdentifier("bots.studio.security")
-    }
-
     private var studioSecrets: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xl) {
-            studioSectionHeader(
-                "Secrets",
-                caption: "Stored in protected macOS storage for this Bot. Values are write-only here and are only exposed to this Bot's runtime."
-            )
-            if vm.isBotSecretsLoading {
-                ProgressView()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityIdentifier("bots.studio.secrets.loading")
-            } else if vm.botSecretsLoadFailed {
-                Text("Protected secret storage is unavailable.")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.warning)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("bots.studio.secrets.error")
-            } else if vm.botSecrets.isEmpty {
-                studioEmptyState(
-                    icon: "key",
-                    title: "No secrets saved",
-                    subtitle: "Add an environment-variable name and value for this Bot."
-                )
-            } else {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(vm.botSecrets) { secret in
-                        HStack(spacing: DS.Space.lg) {
-                            Image(systemName: "key.fill")
-                                .foregroundColor(DS.Palette.textSecondary)
-                                .accessibilityHidden(true)
-                            Text(secret.name)
-                                .font(DS.Font.body)
-                                .foregroundColor(DS.Palette.text)
-                            Spacer(minLength: 0)
+        let formVisible = addingSecret || vm.studioState.editingSecretName != nil
+        return VStack(alignment: .leading, spacing: DS.Space.sm) {
+            securityCard {
+                HStack(alignment: .center, spacing: DS.Space.lg) {
+                    AgentChoiceIconTile(systemName: "key.fill", tint: DS.Palette.warning, size: 28)
+                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        Text("Secrets")
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.text)
+                        Text("Encrypted values this bot can use. Values are never shown again.")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: DS.Space.lg)
+                    Button("Add secret") {
+                        vm.cancelBotSecretEdit()
+                        addingSecret = true
+                    }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("bots.studio.secrets.add")
+                }
+                .padding(.vertical, DS.Space.md)
+                .frame(minHeight: BotsChrome.hitTarget)
+                if vm.isBotSecretsLoading {
+                    studioRule
+                    ProgressView()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, DS.Space.md)
+                        .accessibilityIdentifier("bots.studio.secrets.loading")
+                } else if vm.botSecretsLoadFailed {
+                    studioRule
+                    Text("Protected secret storage is unavailable.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.vertical, DS.Space.md)
+                        .accessibilityIdentifier("bots.studio.secrets.error")
+                } else if vm.botSecrets.isEmpty, !formVisible {
+                    studioRule
+                    Text("No secrets yet")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .padding(.vertical, DS.Space.md)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                ForEach(vm.botSecrets) { secret in
+                    studioRule
+                    HStack(spacing: DS.Space.lg) {
+                        Image(systemName: "key.fill")
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .accessibilityHidden(true)
+                        Text(secret.name)
+                            .font(DS.Font.mono)
+                            .foregroundColor(DS.Palette.text)
+                        Text("••••••••")
+                            .font(DS.Font.mono)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .accessibilityHidden(true)
+                        Spacer(minLength: 0)
+                        Menu {
                             Button("Update") {
+                                addingSecret = false
                                 vm.editBotSecret(secret.name)
                             }
-                            .buttonStyle(DSSecondaryButtonStyle())
                             .accessibilityIdentifier("bots.studio.secrets.update.\(secret.name)")
-                            Button("Remove", role: .destructive) {
+                            Button("Remove…", role: .destructive) {
                                 vm.requestDeleteBotSecret(secret.name)
                             }
-                            .buttonStyle(.plain)
-                            .foregroundColor(DS.Palette.danger)
                             .accessibilityIdentifier("bots.studio.secrets.remove.\(secret.name)")
+                        } label: {
+                            Image(systemName: "ellipsis")
+                                .foregroundColor(DS.Palette.textSecondary)
                         }
-                        .frame(minHeight: BotsChrome.hitTarget)
-                        if secret.id != vm.botSecrets.last?.id {
-                            studioRule
-                        }
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .accessibilityLabel("Actions for \(secret.name)")
                     }
-                }
-            }
-            VStack(alignment: .leading, spacing: DS.Space.lg) {
-                labeledField("Name", caption: "Environment-variable name used only by this Bot's runtime.") {
-                    studioField(
-                        placeholder: "SERVICE_TOKEN",
-                        text: Binding(
-                            get: { vm.studioState.secretNameDraft },
-                            set: { vm.studioState.secretNameDraft = $0 }
-                        )
-                    )
-                    .disabled(vm.studioState.editingSecretName != nil)
-                    .accessibilityIdentifier("bots.studio.secrets.name")
-                }
-                labeledField(
-                    "Value",
-                    caption: vm.studioState.editingSecretName == nil
-                        ? "The value is cleared after save."
-                        : "Enter the replacement value."
-                ) {
-                    SecureField(
-                        "Enter secret value",
-                        text: Binding(
-                            get: { vm.studioState.secretValueDraft },
-                            set: { vm.studioState.secretValueDraft = $0 }
-                        )
-                    )
-                    .textFieldStyle(.plain)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                    .padding(.horizontal, DS.Space.lg)
                     .padding(.vertical, DS.Space.md)
-                    .frame(minHeight: 34)
-                    .background(DS.Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                            .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-                    )
-                    .accessibilityIdentifier("bots.studio.secrets.value")
+                    .frame(minHeight: BotsChrome.hitTarget)
                 }
-                HStack(spacing: DS.Space.md) {
-                    if vm.studioState.editingSecretName != nil {
-                        Button("Cancel") {
-                            vm.cancelBotSecretEdit()
+                if formVisible {
+                    studioRule
+                    VStack(alignment: .leading, spacing: DS.Space.lg) {
+                        labeledField("Name", caption: "Environment-variable name used only by this Bot's runtime.") {
+                            studioField(
+                                placeholder: "SERVICE_TOKEN",
+                                text: Binding(
+                                    get: { vm.studioState.secretNameDraft },
+                                    set: { vm.studioState.secretNameDraft = $0 }
+                                )
+                            )
+                            .disabled(vm.studioState.editingSecretName != nil)
+                            .accessibilityIdentifier("bots.studio.secrets.name")
                         }
-                        .buttonStyle(DSSecondaryButtonStyle())
-                        .accessibilityIdentifier("bots.studio.secrets.cancel")
+                        labeledField(
+                            "Value",
+                            caption: vm.studioState.editingSecretName == nil
+                                ? "The value is cleared after save."
+                                : "Enter the replacement value."
+                        ) {
+                            SecureField(
+                                "Enter secret value",
+                                text: Binding(
+                                    get: { vm.studioState.secretValueDraft },
+                                    set: { vm.studioState.secretValueDraft = $0 }
+                                )
+                            )
+                            .textFieldStyle(.plain)
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.text)
+                            .padding(.horizontal, DS.Space.lg)
+                            .padding(.vertical, DS.Space.md)
+                            .frame(minHeight: 34)
+                            .background(DS.Palette.bg)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                            )
+                            .accessibilityIdentifier("bots.studio.secrets.value")
+                        }
+                        HStack(spacing: DS.Space.md) {
+                            Spacer(minLength: 0)
+                            Button("Cancel") {
+                                addingSecret = false
+                                vm.cancelBotSecretEdit()
+                            }
+                            .buttonStyle(DSSecondaryButtonStyle())
+                            .accessibilityIdentifier("bots.studio.secrets.cancel")
+                            Button(vm.studioState.editingSecretName == nil ? "Save secret" : "Update secret") {
+                                vm.saveBotSecret()
+                                // A failed save keeps the value draft, so the form stays open.
+                                if vm.studioState.secretValueDraft.isEmpty {
+                                    addingSecret = false
+                                }
+                            }
+                            .buttonStyle(BotsPrimaryButtonStyle())
+                            .disabled(!vm.isControlPlaneActive)
+                            .accessibilityIdentifier("bots.studio.secrets.save")
+                        }
                     }
-                    Button(vm.studioState.editingSecretName == nil ? "Save secret" : "Update secret") {
-                        vm.saveBotSecret()
-                    }
-                    .buttonStyle(BotsPrimaryButtonStyle())
-                    .disabled(!vm.isControlPlaneActive)
-                    .accessibilityIdentifier("bots.studio.secrets.save")
+                    .padding(.vertical, DS.Space.md)
                 }
             }
         }
@@ -13920,26 +14056,31 @@ public struct BotsRootView: View {
         .accessibilityIdentifier("bots.studio.secrets")
     }
 
-    private func securityRow(symbol: String, title: String, detail: String) -> some View {
-        HStack(alignment: .center, spacing: DS.Space.lg) {
-            Image(systemName: symbol)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(DS.Palette.textSecondary)
-                .frame(width: 24)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                Text(detail)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .fixedSize(horizontal: false, vertical: true)
+    private var studioSecurity: some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            AgentChoiceSectionHeader("Safety")
+            securityCard {
+                securityRow(
+                    icon: "hand.raised",
+                    tint: DS.Palette.textSecondary,
+                    title: "Approvals",
+                    caption: "Allow once / Deny prompts are not live yet."
+                ) {
+                    AgentChoiceBadge("Coming soon", tint: DS.Palette.textSecondary)
+                }
+                studioRule
+                securityRow(
+                    icon: "pencil.and.outline",
+                    tint: DS.Palette.textSecondary,
+                    title: "Host writes",
+                    caption: "Host-brokered effects stay off until that phase ships."
+                ) {
+                    AgentChoiceBadge("Off", tint: DS.Palette.textSecondary)
+                }
             }
-            Spacer(minLength: 0)
         }
-        .padding(.vertical, DS.Space.lg)
-        .frame(minHeight: BotsChrome.hitTarget)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityIdentifier("bots.studio.security")
     }
 
     private var studioAvatarAttention: BotAttentionState {
@@ -14260,12 +14401,13 @@ public struct BotsRootView: View {
                 )
                 if vm.deskRouting.provider == .distill { deskUnlinkedModelPills }
                 if vm.deskRouting.provider == .distill {
-                    Toggle("Ultracode", isOn: Binding(
-                        get: { vm.deskRouting.distillUltracode }, set: vm.setDeskDistillUltracode
-                    ))
-                    .toggleStyle(.checkbox)
-                    .fixedSize()
-                    .accessibilityIdentifier("bots.desk.distill.ultracode")
+                    AgentUltracodeChip(
+                        isOn: vm.deskRouting.distillUltracode,
+                        disabled: false,
+                        help: "",
+                        accessibilityIdentifier: "bots.desk.distill.ultracode",
+                        onToggle: vm.setDeskDistillUltracode
+                    )
                 }
                 AgentPermissionCapsule(
                     selected: vm.effectiveDeskPermissionMode,
@@ -14839,131 +14981,6 @@ public struct BotsRootView: View {
             Button("Cancel", role: .cancel) { pendingDockerDataClear = nil }
         } message: {
             Text("Deletes this teammate’s Docker container and every file in /home/remotecode. This cannot be undone.")
-        }
-    }
-
-    // MARK: Routines
-
-    private var routinesTab: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xxl) {
-            studioSectionHeader(BotsChrome.Label.routines)
-            Text(BotRoutineCopy.testRunHonestyCaption)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.warning)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityIdentifier("bots.routines.honesty")
-            if !vm.isAutonomyActive {
-                Text("Enabling a schedule does not run while MacCode is closed.")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-            }
-            VStack(alignment: .leading, spacing: DS.Space.xl) {
-                labeledField("Name") {
-                    studioField(placeholder: "Morning scan", text: $vm.routineName)
-                        .accessibilityIdentifier("bots.routines.name")
-                }
-                labeledField("Instruction") {
-                    studioMultiline(text: $vm.routinePrompt, minHeight: 72, maxHeight: 140)
-                        .accessibilityIdentifier("bots.routines.instruction")
-                }
-                BotScheduleSpecEditor(
-                    spec: $vm.routineSpec,
-                    providers: vm.providers,
-                    providersLoading: false
-                )
-                .accessibilityIdentifier("bots.routines.when")
-                Toggle("Use bot default", isOn: Binding(
-                    get: { vm.routineSpec.executionDestination == nil },
-                    set: { vm.routineSpec.executionDestination = $0 ? nil : vm.studioExecutionDestination }
-                ))
-                if vm.routineSpec.executionDestination != nil {
-                    BotExecutionDestinationPicker(selection: Binding(
-                        get: { vm.routineSpec.executionDestination ?? .mac },
-                        set: { vm.routineSpec.executionDestination = $0 }
-                    ), bot: vm.selectedBot, store: vm.executionDestinationStore, workspaces: vm.executionWorkspaces)
-                }
-                Button("Save task") { vm.saveRoutine() }
-                    .buttonStyle(BotsPrimaryButtonStyle())
-                    .accessibilityIdentifier("bots.routines.save")
-            }
-
-            if vm.routines.isEmpty {
-                studioEmptyState(
-                    icon: "clock.arrow.2.circlepath",
-                    title: "No scheduled tasks",
-                    subtitle: "Name an instruction and when it should run."
-                )
-            } else {
-                VStack(alignment: .leading, spacing: DS.Space.xl) {
-                    studioRule
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(vm.routines.enumerated()), id: \.element.definition.id) { index, routine in
-                            if index > 0 { studioRule }
-                            routineRow(routine)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Studio lists routines as open rows between hairline rules; the Desk
-    /// inspector keeps its own compact card per routine.
-    @ViewBuilder
-    private func routineRow(_ routine: BotRoutine, compact: Bool = false) -> some View {
-        if compact {
-            routineRowBody(routine)
-                .dsPanel(padding: DS.Space.lg)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            routineRowBody(routine)
-                .padding(.vertical, DS.Space.lg)
-        }
-    }
-
-    private func routineRowBody(_ routine: BotRoutine) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            HStack(spacing: DS.Space.lg) {
-                Button {
-                    vm.editRoutine(routine)
-                } label: {
-                    Text(routine.definition.name)
-                        .font(DS.Font.bodyStrong)
-                        .foregroundColor(DS.Palette.text)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Edit \(routine.definition.name)")
-                Button("Edit") { vm.editRoutine(routine) }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .accessibilityIdentifier("bots.routines.edit")
-                Button("Test run") { vm.requestRoutineTestRun(id: routine.definition.id) }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .accessibilityIdentifier("bots.routines.test")
-                Toggle("Active", isOn: Binding(
-                    get: { routine.activation.isEnabled },
-                    set: { vm.setRoutineEnabled(id: routine.definition.id, enabled: $0) }
-                ))
-                .toggleStyle(.switch)
-                .labelsHidden()
-                .controlSize(.small)
-                .accessibilityLabel("Active, \(routine.definition.name)")
-                .accessibilityIdentifier("bots.routines.active")
-            }
-            Text(routine.definition.prompt)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-            if !routine.definition.scheduleNote.isEmpty {
-                Text(routine.definition.scheduleNote)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-            }
-            if let at = routine.activation.lastTestRunRequestedAt {
-                Text("Test run requested \(at.formatted(date: .abbreviated, time: .shortened))")
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-            }
         }
     }
 

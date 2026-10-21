@@ -244,6 +244,104 @@ public enum RemoteAccessStatus: Equatable {
     }
 }
 
+/// Left-column destinations of the in-app Settings layout.
+public enum SettingsCategory: String, CaseIterable, Identifiable {
+    case remoteAccess, accounts, fileAccess, computerUse, diff, terminal, sidebar, pet, insomnia,
+         bots, keybindings, storage, customModels, devices, diagnostics
+
+    /// Rows rendered as separate groups, in order.
+    public static let groups: [[SettingsCategory]] = [
+        [.remoteAccess, .accounts, .devices],
+        [.fileAccess, .computerUse, .bots, .customModels],
+        [.terminal, .diff, .sidebar, .keybindings],
+        [.pet, .insomnia],
+        [.storage, .diagnostics],
+    ]
+
+    public var id: String { rawValue }
+
+    public var group: Int { Self.groups.firstIndex { $0.contains(self) } ?? 0 }
+
+    public var title: String {
+        switch self {
+        case .remoteAccess: return "Remote Access"
+        case .accounts: return "Accounts & Auto"
+        case .fileAccess: return "File Access"
+        case .computerUse: return "Computer Use"
+        case .diff: return "Diff"
+        case .terminal: return "Terminal"
+        case .sidebar: return "Sidebar"
+        case .pet: return "Desktop Pet"
+        case .insomnia: return "Insomnia"
+        case .bots: return "Bots"
+        case .keybindings: return "Keybindings"
+        case .storage: return "Storage"
+        case .customModels: return "Custom Models"
+        case .devices: return "Trusted Devices"
+        case .diagnostics: return "Diagnostics"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .remoteAccess: return "Let paired iPhones and other devices reach this Mac over the network."
+        case .accounts: return "Connect the accounts Distill uses and choose how Auto picks between them."
+        case .fileAccess: return "Choose which folders and disks MacCode agents can read and write."
+        case .computerUse: return "Connect the Chrome extension and manage computer-use access for agents."
+        case .diff: return "Set default word wrap and whitespace handling for the diff viewer."
+        case .terminal: return "Adjust the terminal font size."
+        case .sidebar: return "Choose how workspaces and threads are sorted and shown in the sidebar."
+        case .pet: return "Show or hide the desktop pet, its position, size, and alerts."
+        case .insomnia: return "Keep this Mac awake while agents work, with display and sleep options."
+        case .bots: return "Configure Bots control, memory, effects, autonomy, and channels."
+        case .keybindings: return "Customize keyboard shortcuts through your keybindings file."
+        case .storage: return "See local usage and clean up expired attachments and data."
+        case .customModels: return "Add or remove custom model names for each agent provider."
+        case .devices: return "Review paired devices and revoke access you no longer need."
+        case .diagnostics: return "Check provider CLIs, versions, and server status for troubleshooting."
+        }
+    }
+
+    public var symbol: String {
+        switch self {
+        case .remoteAccess: return "antenna.radiowaves.left.and.right"
+        case .accounts: return "person.crop.circle.badge.checkmark"
+        case .fileAccess: return "folder.badge.gearshape"
+        case .computerUse: return "cursorarrow.rays"
+        case .diff: return "plus.forwardslash.minus"
+        case .terminal: return "terminal"
+        case .sidebar: return "sidebar.left"
+        case .pet: return "pawprint.fill"
+        case .insomnia: return "moon.zzz.fill"
+        case .bots: return "cpu"
+        case .keybindings: return "keyboard"
+        case .storage: return "internaldrive"
+        case .customModels: return "slider.horizontal.3"
+        case .devices: return "iphone.and.arrow.forward"
+        case .diagnostics: return "stethoscope"
+        }
+    }
+
+    public var tint: Color {
+        switch self {
+        case .remoteAccess, .fileAccess, .sidebar, .storage, .devices: return DS.Palette.accent
+        case .accounts, .insomnia, .customModels: return DS.Palette.ultracode
+        case .computerUse, .bots: return DS.Palette.success
+        case .diff, .pet: return DS.Palette.warning
+        case .terminal, .keybindings: return DS.Palette.textSecondary
+        case .diagnostics: return DS.Palette.danger
+        }
+    }
+
+    public static func forRoute(_ route: PetSettingsRoute) -> SettingsCategory {
+        switch route {
+        case .general: return .remoteAccess
+        case .accounts: return .accounts
+        case .providers: return .diagnostics
+        }
+    }
+}
+
 @MainActor
 public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
@@ -257,6 +355,20 @@ public final class SettingsViewModel: ObservableObject {
     private let openURL: @MainActor (URL) -> Void
     private let updater: AppUpdateChecking?
     private var changeObservers: [NSObjectProtocol] = []
+
+    /// Selected left-column category. Restored from `settings.category` and
+    /// persisted on change so reopening MacCode keeps the same destination.
+    @Published public var selectedCategory: SettingsCategory = .remoteAccess {
+        didSet {
+            guard selectedCategory != oldValue else { return }
+            try? settingsRepo.set(Self.selectedCategoryKey, selectedCategory.rawValue)
+        }
+    }
+    static let selectedCategoryKey = "settings.category"
+
+    public func select(route: PetSettingsRoute) {
+        selectedCategory = .forRoute(route)
+    }
 
     @Published public var remoteAccessEnabled: Bool = false
     /// Non-nil when the HTTP listener failed to bind after the last remote-access
@@ -413,6 +525,10 @@ public final class SettingsViewModel: ObservableObject {
             attachmentRoot: context.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
         )
         self.privateAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
+        if let raw = (try? context.settingsRepo.get(Self.selectedCategoryKey)) ?? nil,
+           let stored = SettingsCategory(rawValue: raw) {
+            self.selectedCategory = stored
+        }
         self.updateAvailability = updater?.availability ?? .unknown
         // First-frame deferral (mirrors BotsViewModel.loadImmediately): callers
         // that present right away hydrate via the post-commit freshness pass
@@ -1301,6 +1417,38 @@ struct PairingCodeCountdownPresentation: Equatable {
     }
 }
 
+private struct SettingsCategoryRow: View {
+    let category: SettingsCategory
+    let selected: Bool
+    let onSelect: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: DS.Space.md) {
+                AgentChoiceIconTile(systemName: category.symbol, tint: category.tint, size: 24)
+                Text(category.title)
+                    .font(DS.Font.body)
+                    .foregroundColor(selected ? DS.Palette.onAccent : DS.Palette.text)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .frame(height: 32)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                    .fill(selected ? DS.Palette.accent : (hovered ? DS.Palette.hover : Color.clear))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .accessibilityIdentifier("settings.category.\(category.rawValue)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
 public struct SettingsView: View {
     @ObservedObject var vm: SettingsViewModel
     private let onClose: (() -> Void)?
@@ -1323,6 +1471,7 @@ public struct SettingsView: View {
     }()
 
     @State private var deviceToRevoke: DeviceTrust?
+    @State private var categoryQuery: String = ""
     @State private var expandedUpdateDetails: Set<AgentProvider> = []
     // notificationStatus is now owned by the ViewModel (notificationAuthStatus)
     // so show() can refresh it without re-creating the hosting view (P2-Settings-7).
@@ -1351,17 +1500,81 @@ public struct SettingsView: View {
     }
 
     public var body: some View {
-        VStack(spacing: DS.Space.md) {
-            HStack {
-                Text("Settings")
+        // Two columns when there is room (System Settings); narrow panes stack a
+        // category menu above the detail so Settings still fits 360 pt.
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 0) {
+                categoryColumn
+                Rectangle()
+                    .fill(DS.Palette.line)
+                    .frame(width: DS.Border.hairline)
+                detailColumn(compact: false)
+            }
+            .frame(minWidth: Self.twoColumnMinWidth)
+            detailColumn(compact: true)
+        }
+        .frame(maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
+        .background(DS.Palette.bg)
+        .task { await vm.refreshNotificationStatus() }
+        .task { await vm.refreshStorageUsage() }
+        .onAppear {
+            codexPathDraft = vm.codexPath
+            claudePathDraft = vm.claudePath
+            grokPathDraft = vm.grokPath
+            distillPathDraft = vm.distillPath
+            vm.refreshHostFileAccessState()
+        }
+        .onChange(of: vm.codexPath) { codexPathDraft = $0 }
+        .onChange(of: vm.claudePath) { claudePathDraft = $0 }
+        .onChange(of: vm.grokPath) { grokPathDraft = $0 }
+        .onChange(of: vm.distillPath) { distillPathDraft = $0 }
+    }
+
+    /// Below this the category column collapses into a menu (ViewThatFits picks it).
+    static let twoColumnMinWidth: CGFloat = 640
+
+    private var compactCategoryMenu: some View {
+        Menu {
+            ForEach(Array(SettingsCategory.groups.enumerated()), id: \.offset) { index, group in
+                if index > 0 { Divider() }
+                ForEach(group) { category in
+                    Button { vm.selectedCategory = category } label: {
+                        Label(category.title, systemImage: category.symbol)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: DS.Space.sm) {
+                AgentChoiceIconTile(systemName: vm.selectedCategory.symbol, tint: vm.selectedCategory.tint, size: 24)
+                Text(vm.selectedCategory.title)
                     .font(DS.Font.bodyStrong)
                     .foregroundColor(DS.Palette.text)
-                Spacer()
-                Button("Done") { onClose?() }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .keyboardShortcut(.cancelAction)
-                    .accessibilityIdentifier("settings.done")
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
             }
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .accessibilityLabel("Settings category \(vm.selectedCategory.title)")
+        .accessibilityIdentifier("settings.category.menu")
+    }
+
+    private func detailColumn(compact: Bool) -> some View {
+            VStack(spacing: DS.Space.md) {
+                if compact { compactCategoryMenu }
+                if onClose != nil {
+                    HStack {
+                        Spacer()
+                        Button("Done") { onClose?() }
+                            .buttonStyle(DSSecondaryButtonStyle())
+                            .keyboardShortcut(.cancelAction)
+                            .accessibilityIdentifier("settings.done")
+                    }
+                }
 
             // P2-Settings-5: surface toggle write errors as a dismissible banner.
             if let err = vm.settingsWriteError {
@@ -1420,52 +1633,114 @@ public struct SettingsView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
-                    remoteAccessSection
-                        .background(routeAnchor(.general))
-                        .accessibilityIdentifier("settings.section.general")
-                    DistillAccountsSettingsSection(
-                        controller: vm.context.distillAccountsController,
-                        loadModels: { [weak context = vm.context] in
-                            await context?.router?.listAgentModels(provider: .distill) ?? []
-                        }
-                    )
-                    .background(routeAnchor(.accounts))
-                    .accessibilityIdentifier("settings.section.accounts")
-                    hostFileAccessSection
-                    ChromeExtensionSettingsSection()
-                    diffDefaultsSection
-                    terminalSection
-                    sidebarSection
-                    petSection
-                    insomniaSection
-                    botsSection
-                    keybindingsSection
-                    storageSection
-                    customModelsSection
-                    trustedDevicesSection
-                    diagnosticsSection
-                        .background(routeAnchor(.providers))
-                        .accessibilityIdentifier("settings.section.providers")
+                    settingsHero
+                    selectedSection
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: 680, alignment: .leading)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, DS.Space.md)
             }
         }
-        .padding(DS.Space.xl)
-        .frame(minWidth: 360, maxWidth: .infinity, minHeight: 480)
-        .background(DS.Palette.bg)
-        .task { await vm.refreshNotificationStatus() }
-        .task { await vm.refreshStorageUsage() }
-        .onAppear {
-            codexPathDraft = vm.codexPath
-            claudePathDraft = vm.claudePath
-            grokPathDraft = vm.grokPath
-            distillPathDraft = vm.distillPath
-            vm.refreshHostFileAccessState()
+        .padding(compact ? DS.Space.lg : DS.Space.xxl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var filteredCategoryGroups: [[SettingsCategory]] {
+        let query = categoryQuery.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !query.isEmpty else { return SettingsCategory.groups }
+        return SettingsCategory.groups
+            .map { $0.filter { $0.title.lowercased().contains(query) || $0.subtitle.lowercased().contains(query) } }
+            .filter { !$0.isEmpty }
+    }
+
+    private var categoryColumn: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            AgentChoiceSearchField(
+                query: $categoryQuery,
+                placeholder: "Search settings",
+                accessibilityIdentifier: "settings.search"
+            )
+            ScrollView {
+                VStack(alignment: .leading, spacing: DS.Space.lg) {
+                    ForEach(Array(filteredCategoryGroups.enumerated()), id: \.offset) { _, group in
+                        VStack(alignment: .leading, spacing: DS.Space.xs) {
+                            ForEach(group) { category in
+                                SettingsCategoryRow(
+                                    category: category,
+                                    selected: vm.selectedCategory == category,
+                                    onSelect: { vm.selectedCategory = category }
+                                )
+                            }
+                        }
+                    }
+                    if filteredCategoryGroups.isEmpty {
+                        Text("No settings match “\(categoryQuery)”.")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .accessibilityIdentifier("settings.search.empty")
+                    }
+                }
+            }
         }
-        .onChange(of: vm.codexPath) { codexPathDraft = $0 }
-        .onChange(of: vm.claudePath) { claudePathDraft = $0 }
-        .onChange(of: vm.grokPath) { grokPathDraft = $0 }
-        .onChange(of: vm.distillPath) { distillPathDraft = $0 }
+        .padding(DS.Space.lg)
+        .frame(minWidth: 220, idealWidth: 240, maxWidth: 240, maxHeight: .infinity, alignment: .top)
+        .background(DS.Palette.surface)
+    }
+
+    private var settingsHero: some View {
+        let category = vm.selectedCategory
+        return VStack(spacing: DS.Space.md) {
+            AgentChoiceIconTile(systemName: category.symbol, tint: category.tint, size: 56)
+            Text(category.title)
+                .font(DS.Font.title2)
+                .foregroundColor(DS.Palette.text)
+            Text(category.subtitle)
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(DS.Space.xxl)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.modal, style: .continuous)
+                .fill(DS.Palette.surfaceRaised)
+        )
+    }
+
+    @ViewBuilder
+    private var selectedSection: some View {
+        switch vm.selectedCategory {
+        case .remoteAccess:
+            remoteAccessSection
+                .background(routeAnchor(.general))
+                .accessibilityIdentifier("settings.section.general")
+        case .accounts:
+            DistillAccountsSettingsSection(
+                controller: vm.context.distillAccountsController,
+                loadModels: { [weak context = vm.context] in
+                    await context?.router?.listAgentModels(provider: .distill) ?? []
+                }
+            )
+            .background(routeAnchor(.accounts))
+            .accessibilityIdentifier("settings.section.accounts")
+        case .fileAccess: hostFileAccessSection
+        case .computerUse: ChromeExtensionSettingsSection()
+        case .diff: diffDefaultsSection
+        case .terminal: terminalSection
+        case .sidebar: sidebarSection
+        case .pet: petSection
+        case .insomnia: insomniaSection
+        case .bots: botsSection
+        case .keybindings: keybindingsSection
+        case .storage: storageSection
+        case .customModels: customModelsSection
+        case .devices: trustedDevicesSection
+        case .diagnostics:
+            diagnosticsSection
+                .background(routeAnchor(.providers))
+                .accessibilityIdentifier("settings.section.providers")
+        }
     }
 
     @ViewBuilder
@@ -2815,8 +3090,8 @@ public final class SettingsWindowController: NSObject {
         win.styleMask = [.titled, .closable, .resizable]
         // Match the SwiftUI content frame so the window doesn't open smaller
         // than its content and jump-resize; guard against shrinking below it.
-        win.setContentSize(NSSize(width: 620, height: 560))
-        win.contentMinSize = NSSize(width: 620, height: 480)
+        win.setContentSize(NSSize(width: 880, height: 620))
+        win.contentMinSize = NSSize(width: 720, height: 480)
         win.center()
         self.window = win
         host.rootView = SettingsView(
@@ -2902,6 +3177,7 @@ public final class SettingsWindowController: NSObject {
 
     private func present(_ route: PetSettingsRoute) -> Bool {
         presentedRoute = nil
+        viewModel.select(route: route)
         window.contentView?.layoutSubtreeIfNeeded()
         guard routeRegistry.present(route, in: window) else { return false }
         presentedRoute = route

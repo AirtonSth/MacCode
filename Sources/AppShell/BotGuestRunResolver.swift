@@ -542,11 +542,26 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         return cwd
     }
 
+    /// A Bot home: under the running app's bots root, or at
+    /// `…/RemoteCode*/bots/<uuid>/e<N>` from another channel's or an override's
+    /// Application Support.
     static func isBotHome(_ cwd: String, appSupport: URL) -> Bool {
         let root = BotHome.botsRootURL(appSupportDirectory: appSupport).resolvingSymlinksInPath().standardizedFileURL.path
         let path = URL(fileURLWithPath: cwd).resolvingSymlinksInPath().standardizedFileURL.path
-        return mountContaining(path, [root]) != nil
+        return mountContaining(path, [root]) != nil || hasBotHomeLayout(path)
     }
+
+    static func hasBotHomeLayout(_ path: String) -> Bool {
+        let parts = URL(fileURLWithPath: path).standardizedFileURL.pathComponents
+        guard parts.count >= 4 else { return false }
+        return (1..<(parts.count - 2)).contains { index in
+            parts[index] == "bots"
+                && parts[index - 1].hasPrefix("RemoteCode")
+                && UUID(uuidString: parts[index + 1]) != nil
+                && parts[index + 2].range(of: #"^e\d+$"#, options: .regularExpression) != nil
+        }
+    }
+
 
     private static func mountContaining(_ path: String, _ mounted: [String]) -> String? {
         mounted.first { path == $0 || path.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }

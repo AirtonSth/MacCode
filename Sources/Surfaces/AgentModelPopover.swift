@@ -352,6 +352,7 @@ public struct AgentDistillMainModelSection<Footer: View>: View {
 
     private func isMainUnavailable(in selectable: [AgentModelDescriptor]) -> Bool {
         guard !mainModel.isEmpty,
+              mainModel != "auto",
               !selectable.contains(where: { $0.id == mainModel }),
               !customMainModels.contains(mainModel) else { return false }
         return true
@@ -615,6 +616,8 @@ public struct AgentDistillModelPills<StatusHeader: View, MainFooter: View>: View
     private let mainFooter: MainFooter
     @State private var showingMain = false
     @State private var showingWorker = false
+    @State private var showingMainAutoGuide = false
+    @State private var showingWorkerAutoGuide = false
 
     public init(
         mainModel: String,
@@ -713,7 +716,7 @@ public struct AgentDistillModelPills<StatusHeader: View, MainFooter: View>: View
             effort: mainEffortSelection.pickerDisplayName,
             serviceTier: serviceTierLabel,
             prefix: "Main",
-            warning: mainUnavailable
+            warning: mainUnavailable && mainModel != "auto"
         )
     }
 
@@ -725,13 +728,6 @@ public struct AgentDistillModelPills<StatusHeader: View, MainFooter: View>: View
             prefix: "Worker",
             warning: mainModel != "auto" && AgentDistillModelCatalog.workerUnavailable(reasoningModel: reasoningModel, models: reasoningModels)
         )
-    }
-
-    private var readOnlyNote: some View {
-        Text("Read-only while running")
-            .font(DS.Font.caption2)
-            .foregroundColor(DS.Palette.textTertiary)
-            .fixedSize(horizontal: true, vertical: false)
     }
 
     private var mainPill: some View {
@@ -746,45 +742,32 @@ public struct AgentDistillModelPills<StatusHeader: View, MainFooter: View>: View
         .accessibilityLabel(mainPresentation.accessibilityLabel)
         .accessibilityIdentifier(mainIdentifier)
         .help("Main model · main effort")
-        .popover(isPresented: mainPresentedBinding, arrowEdge: .bottom) {
-            // The shared Main section owns its title and subtitle.
-            AgentModelPopoverChrome(
-                presentation: .current(mode: .manual),
-                autoEnabled: .constant(false),
-                toggleDisabled: true,
-                showsAutoRouting: false,
-                title: ""
-            ) {
-                if isRunning { readOnlyNote }
-                statusHeader
-                AgentDistillMainModelSection(
-                    mainModel: mainModel,
-                    mainModels: mainModels,
-                    customMainModels: customMainModels,
-                    reasoningModel: reasoningModel,
-                    mainEffortSelection: mainEffortSelection,
-                    mainEfforts: mainEfforts,
-                    supportsMainEffortAuto: supportsMainEffortAuto,
-                    width: menuWidth,
-                    isDisabled: isDisabled,
-                    emptyListTitle: emptyListTitle,
-                    onSelectMainModel: { model in
-                        onSelectMainModel(model)
-                        mainPresentedBinding.wrappedValue = false
-                    },
-                    onSelectCustomMainModel: { model in
-                        onSelectCustomMainModel(model)
-                        mainPresentedBinding.wrappedValue = false
-                    },
-                    onSelectMainEffort: onSelectMainEffort
-                ) {
-                    mainFooter
-                }
-            }
-            .accessibilityIdentifier(mainPopoverIdentifier)
+        .sheet(isPresented: mainPresentedBinding) {
+            AgentDistillMainModelSheet(
+                mainModel: mainModel,
+                mainModels: mainModels,
+                customMainModels: customMainModels,
+                mainEffortSelection: mainEffortSelection,
+                mainEfforts: mainEfforts,
+                mainUnavailable: mainUnavailable,
+                isRunning: isRunning,
+                isDisabled: isDisabled,
+                emptyListTitle: emptyListTitle,
+                identifier: mainPopoverIdentifier,
+                statusHeader: statusHeader,
+                mainFooter: mainFooter,
+                showingAutoGuide: $showingMainAutoGuide,
+                onSelectMainModel: onSelectMainModel,
+                onSelectCustomMainModel: onSelectCustomMainModel,
+                onSelectMainEffort: onSelectMainEffort,
+                close: { mainPresentedBinding.wrappedValue = false }
+            )
         }
         .onChange(of: mainPresentedBinding.wrappedValue) { isShowing in
-            if !isShowing { onMainPopoverClosed?() }
+            if !isShowing {
+                showingMainAutoGuide = false
+                onMainPopoverClosed?()
+            }
         }
     }
 
@@ -801,34 +784,428 @@ public struct AgentDistillModelPills<StatusHeader: View, MainFooter: View>: View
         .accessibilityLabel(workerPresentation.accessibilityLabel)
         .accessibilityIdentifier(workerIdentifier)
         .help("Worker model · Worker effort")
-        .popover(isPresented: $showingWorker, arrowEdge: .bottom) {
-            // The shared Worker section owns its title and subtitle.
-            AgentModelPopoverChrome(
-                presentation: .current(mode: .manual),
-                autoEnabled: .constant(false),
-                toggleDisabled: true,
-                showsAutoRouting: false,
-                title: ""
-            ) {
-                if isRunning { readOnlyNote }
+        .sheet(isPresented: $showingWorker) {
+            AgentDistillWorkerModelSheet(
+                mainModel: mainModel,
+                reasoningModel: reasoningModel,
+                reasoningModels: reasoningModels,
+                reasoningEffortSelection: reasoningEffortSelection,
+                reasoningEfforts: reasoningEfforts,
+                supportsReasoningModelEffort: supportsReasoningModelEffort,
+                configWorkerSummary: supportsReasoningModelEffort
+                    ? nil : AgentDistillModelCatalog.configWorkerSummary(homePath: homePath),
+                isRunning: isRunning,
+                isDisabled: isDisabled,
+                emptyListTitle: workerEmptyListTitle,
+                identifier: workerPopoverIdentifier,
+                statusHeader: statusHeader,
+                showingAutoGuide: $showingWorkerAutoGuide,
+                onSelectWorkerModel: onSelectWorkerModel,
+                onSelectWorkerEffort: onSelectWorkerEffort,
+                close: { showingWorker = false }
+            )
+        }
+        .onChange(of: showingWorker) { isShowing in
+            if !isShowing { showingWorkerAutoGuide = false }
+        }
+    }
+}
+
+private func agentDistillDisabledReason(_ isDisabled: Bool) -> String? {
+    isDisabled ? "Unavailable right now." : nil
+}
+
+private func agentDistillProviderIcon(_ provider: String) -> String {
+    switch provider {
+    case "Grok": return "bolt.fill"
+    case "ChatGPT": return "bubble.left.and.text.bubble.right.fill"
+    case "Claude": return "asterisk"
+    case "OpenRouter": return "point.3.connected.trianglepath.dotted"
+    case "Custom": return "slider.horizontal.3"
+    default: return "cpu"
+    }
+}
+
+private func agentDistillEffortOptions(_ efforts: [AgentReasoningEffort]) -> [(value: AgentEffortSelection, title: String, help: String?)] {
+    [(value: AgentEffortSelection.automatic, title: "Auto", help: nil)] + AgentEffortChipRow.ordered(efforts).map {
+        (value: AgentEffortSelection.fixed($0), title: $0.displayName, help: $0.pickerHelpText)
+    }
+}
+
+private func agentDistillDoneButton(_ close: @escaping () -> Void) -> some View {
+    Button("Done", action: close)
+        .keyboardShortcut(.defaultAction)
+        .buttonStyle(.borderedProminent)
+}
+
+private struct AgentDistillChoiceGrid: View {
+    let models: [AgentModelDescriptor]
+    let customModels: [String]
+    let selectedId: String?
+    let isDisabled: Bool
+    let emptyTitle: String
+    let searchIdentifier: String
+    let onSelectModel: (String) -> Void
+    let onSelectCustomModel: (String) -> Void
+    @State private var query = ""
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: DS.Space.md), count: 2)
+
+    var body: some View {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayed = AgentDistillModelCatalog.filtered(models, query: trimmed)
+        let customMatches = trimmed.isEmpty
+            ? customModels
+            : customModels.filter { $0.lowercased().contains(trimmed.lowercased()) }
+        let disabledReason = agentDistillDisabledReason(isDisabled)
+        VStack(alignment: .leading, spacing: DS.Space.xl) {
+            if models.isEmpty && customModels.isEmpty {
+                Text(emptyTitle)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            if models.count > AgentDistillModelCatalog.searchThreshold {
+                AgentChoiceSearchField(query: $query, placeholder: "Search models", accessibilityIdentifier: searchIdentifier)
+                    .disabled(isDisabled)
+            }
+            if !trimmed.isEmpty && displayed.isEmpty && customMatches.isEmpty {
+                Text("No models match \"\(trimmed)\".")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            ForEach(AgentDistillModelCatalog.providerGroups(displayed), id: \.0) { provider, group in
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    AgentChoiceSectionHeader(provider)
+                    LazyVGrid(columns: columns, alignment: .leading, spacing: DS.Space.md) {
+                        ForEach(group, id: \.id) { model in
+                            AgentChoiceCard(
+                                title: AgentDistillModelCatalog.shortLabel(model.label),
+                                badge: model.contextWindowLabel,
+                                selected: model.id == selectedId,
+                                disabledReason: disabledReason,
+                                action: { onSelectModel(model.id) }
+                            ) {
+                                AgentChoiceIconTile(systemName: agentDistillProviderIcon(provider), size: 30)
+                            }
+                            .help("\(model.label)\n\(model.id)")
+                        }
+                    }
+                }
+            }
+            if !customMatches.isEmpty {
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    AgentChoiceSectionHeader("Custom")
+                    LazyVGrid(columns: columns, alignment: .leading, spacing: DS.Space.md) {
+                        ForEach(customMatches, id: \.self) { model in
+                            AgentChoiceCard(
+                                title: model,
+                                subtitle: "Custom model",
+                                selected: model == selectedId,
+                                disabledReason: disabledReason,
+                                action: { onSelectCustomModel(model) }
+                            ) {
+                                AgentChoiceIconTile(systemName: agentDistillProviderIcon("Custom"), size: 30)
+                            }
+                            .help(model)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>: View {
+    let mainModel: String
+    let mainModels: [AgentModelDescriptor]
+    let customMainModels: [String]
+    let mainEffortSelection: AgentEffortSelection
+    let mainEfforts: [AgentReasoningEffort]
+    let mainUnavailable: Bool
+    let isRunning: Bool
+    let isDisabled: Bool
+    let emptyListTitle: String
+    let identifier: String
+    let statusHeader: StatusHeader
+    let mainFooter: MainFooter
+    @Binding var showingAutoGuide: Bool
+    let onSelectMainModel: (String) -> Void
+    let onSelectCustomMainModel: (String) -> Void
+    let onSelectMainEffort: (AgentEffortSelection) -> Void
+    let close: () -> Void
+
+    private var models: [AgentModelDescriptor] {
+        AgentDistillModelCatalog.selectableModels(mainModels).filter { $0.id != "auto" }
+    }
+
+    private var hasAutoOption: Bool {
+        mainModel == "auto" || mainModels.contains(where: { $0.id == "auto" })
+    }
+
+    var body: some View {
+        AgentChoiceSheet(
+            icon: showingAutoGuide ? "sparkles" : "cpu",
+            tint: showingAutoGuide ? DS.Palette.ultracode : DS.Palette.accent,
+            title: showingAutoGuide ? AgentAutoGuide.title : "Main model",
+            subtitle: showingAutoGuide ? AgentAutoGuide.subtitle : "Leads the conversation: plans, reviews and answers.",
+            width: 600,
+            accessibilityIdentifier: identifier,
+            onClose: close
+        ) {
+            if showingAutoGuide, let makeGuide = AgentAutoGuide.makeGuide {
+                makeGuide(close)
+            } else {
+                if isRunning {
+                    AgentChoiceCallout(icon: "info.circle", tint: DS.Palette.textSecondary, text: "Read-only while a run is active.")
+                }
                 statusHeader
-                AgentDistillReasoningModelSection(
-                    mainModel: mainModel,
-                    reasoningModel: reasoningModel,
-                    reasoningModels: reasoningModels,
-                    reasoningEffortSelection: reasoningEffortSelection,
-                    reasoningEfforts: reasoningEfforts,
-                    supportsReasoningModelEffort: supportsReasoningModelEffort,
-                    configWorkerSummary: supportsReasoningModelEffort
-                        ? nil : AgentDistillModelCatalog.configWorkerSummary(homePath: homePath),
-                    width: menuWidth,
-                    isDisabled: isDisabled,
-                    emptyListTitle: workerEmptyListTitle,
-                    onSelectReasoningModel: onSelectWorkerModel,
-                    onSelectReasoningEffort: onSelectWorkerEffort
+                if hasAutoOption {
+                    autoCard
+                }
+                if mainUnavailable && mainModel != "auto" {
+                    AgentChoiceCallout(
+                        icon: "exclamationmark.triangle.fill",
+                        tint: DS.Palette.warning,
+                        text: "Selected Main model unavailable: \(mainModel). Choose a model below or add it as Custom."
+                    )
+                }
+                modelsSection
+                effortSection
+            }
+        } footer: {
+            if showingAutoGuide {
+                Button {
+                    showingAutoGuide = false
+                } label: {
+                    Label("Back to models", systemImage: "chevron.left")
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+            }
+            agentDistillDoneButton(close)
+        }
+    }
+
+    @ViewBuilder
+    private var autoCard: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            AgentChoiceCard(
+                title: "Auto",
+                subtitle: "Picks the best account and model for each turn from your Auto profile.",
+                badge: "Recommended",
+                selected: mainModel == "auto",
+                tint: DS.Palette.ultracode,
+                disabledReason: agentDistillDisabledReason(isDisabled),
+                action: { selectAuto() }
+            ) {
+                AgentChoiceIconTile(systemName: "sparkles", tint: DS.Palette.ultracode, size: 34)
+            }
+            if mainModel == "auto", AgentAutoGuide.makeGuide != nil {
+                HStack {
+                    Spacer()
+                    Button("How Auto is set up →") { showingAutoGuide = true }
+                        .buttonStyle(.plain)
+                        .font(DS.Font.caption)
+                        .foregroundStyle(DS.Palette.accent)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var modelsSection: some View {
+        AgentChoiceSectionHeader("Models") {
+            Text("\(models.count + customMainModels.count)")
+                .font(DS.Font.caption2)
+                .foregroundStyle(DS.Palette.textSecondary)
+        }
+        AgentDistillChoiceGrid(
+            models: models,
+            customModels: customMainModels,
+            selectedId: mainModel,
+            isDisabled: isDisabled,
+            emptyTitle: emptyListTitle,
+            searchIdentifier: "agent.distill.mainModel.search",
+            onSelectModel: { id in
+                onSelectMainModel(id)
+                close()
+            },
+            onSelectCustomModel: { model in
+                onSelectCustomMainModel(model)
+                close()
+            }
+        )
+        mainFooter
+    }
+
+    @ViewBuilder
+    private var effortSection: some View {
+        AgentChoiceSectionHeader("Effort")
+        AgentChoiceSegmented(
+            options: agentDistillEffortOptions(mainEfforts),
+            selection: mainEffortSelection,
+            disabled: isDisabled,
+            onSelect: onSelectMainEffort
+        )
+        if let effort = mainEffortSelection.effort, !mainEfforts.isEmpty, !mainEfforts.contains(effort) {
+            AgentChoiceCallout(
+                icon: "exclamationmark.triangle.fill",
+                tint: DS.Palette.warning,
+                text: "Selected Main effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level."
+            )
+        }
+    }
+
+    private func selectAuto() {
+        onSelectMainModel("auto")
+        if AgentAutoGuide.makeGuide != nil {
+            showingAutoGuide = true
+        } else {
+            close()
+        }
+    }
+}
+
+private struct AgentDistillWorkerModelSheet<StatusHeader: View>: View {
+    let mainModel: String
+    let reasoningModel: String?
+    let reasoningModels: [AgentModelDescriptor]
+    let reasoningEffortSelection: AgentEffortSelection
+    let reasoningEfforts: [AgentReasoningEffort]
+    let supportsReasoningModelEffort: Bool
+    let configWorkerSummary: String?
+    let isRunning: Bool
+    let isDisabled: Bool
+    let emptyListTitle: String
+    let identifier: String
+    let statusHeader: StatusHeader
+    @Binding var showingAutoGuide: Bool
+    let onSelectWorkerModel: (String?) -> Void
+    let onSelectWorkerEffort: (AgentEffortSelection) -> Void
+    let close: () -> Void
+
+    private var models: [AgentModelDescriptor] {
+        AgentDistillModelCatalog.concreteWorkerModels(reasoningModels)
+    }
+
+    private var reasoningUnavailable: Bool {
+        AgentDistillModelCatalog.workerUnavailable(reasoningModel: reasoningModel, models: models)
+    }
+
+    var body: some View {
+        AgentChoiceSheet(
+            icon: showingAutoGuide ? "sparkles" : "person.2.wave.2",
+            tint: showingAutoGuide ? DS.Palette.ultracode : DS.Palette.accent,
+            title: showingAutoGuide ? AgentAutoGuide.title : "Worker model",
+            subtitle: showingAutoGuide ? AgentAutoGuide.subtitle : "Runs the tasks Main delegates.",
+            width: 600,
+            accessibilityIdentifier: identifier,
+            onClose: close
+        ) {
+            if showingAutoGuide, let makeGuide = AgentAutoGuide.makeGuide {
+                makeGuide(close)
+            } else {
+                if isRunning {
+                    AgentChoiceCallout(icon: "info.circle", tint: DS.Palette.textSecondary, text: "Read-only while a run is active.")
+                }
+                statusHeader
+                if mainModel == "auto" {
+                    autoContent
+                } else if let configWorkerSummary {
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        Text(configWorkerSummary)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.text)
+                        Text("Update Distill to choose a Worker per conversation.")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textSecondary)
+                    }
+                } else {
+                    workerContent
+                }
+            }
+        } footer: {
+            if showingAutoGuide {
+                Button {
+                    showingAutoGuide = false
+                } label: {
+                    Label("Back to models", systemImage: "chevron.left")
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+            }
+            agentDistillDoneButton(close)
+        }
+    }
+
+    @ViewBuilder
+    private var autoContent: some View {
+        AgentChoiceCallout(
+            icon: "sparkles",
+            tint: DS.Palette.ultracode,
+            text: "Worker follows your Auto profile. Each Auto option pairs a Main and a Worker model."
+        )
+        if AgentAutoGuide.makeGuide != nil {
+            Button("Open Auto guide") { showingAutoGuide = true }
+                .buttonStyle(.borderedProminent)
+        }
+    }
+
+    @ViewBuilder
+    private var workerContent: some View {
+        if reasoningUnavailable, let reasoningModel {
+            AgentChoiceCallout(
+                icon: "exclamationmark.triangle.fill",
+                tint: DS.Palette.warning,
+                text: "Selected Worker model unavailable: \(reasoningModel). Choose Off or a model below."
+            )
+        }
+        AgentChoiceCard(
+            title: "Off",
+            subtitle: "Main does all the work",
+            selected: reasoningModel == nil,
+            disabledReason: agentDistillDisabledReason(isDisabled),
+            action: {
+                onSelectWorkerModel(nil)
+                close()
+            }
+        ) {
+            AgentChoiceIconTile(systemName: "minus.circle", tint: DS.Palette.textSecondary, size: 34)
+        }
+        .help("Run without a separate reasoning model")
+        AgentChoiceSectionHeader("Models") {
+            Text("\(models.count)")
+                .font(DS.Font.caption2)
+                .foregroundStyle(DS.Palette.textSecondary)
+        }
+        AgentDistillChoiceGrid(
+            models: models,
+            customModels: [],
+            selectedId: reasoningModel,
+            isDisabled: isDisabled,
+            emptyTitle: emptyListTitle,
+            searchIdentifier: "agent.distill.reasoningModel.search",
+            onSelectModel: { id in
+                onSelectWorkerModel(id)
+                close()
+            },
+            onSelectCustomModel: { _ in }
+        )
+        if supportsReasoningModelEffort, reasoningModel != nil {
+            AgentChoiceSectionHeader("Worker effort")
+            AgentChoiceSegmented(
+                options: agentDistillEffortOptions(reasoningEfforts),
+                selection: reasoningEffortSelection,
+                disabled: isDisabled,
+                onSelect: onSelectWorkerEffort
+            )
+            if let effort = reasoningEffortSelection.effort, !reasoningEfforts.isEmpty, !reasoningEfforts.contains(effort) {
+                AgentChoiceCallout(
+                    icon: "exclamationmark.triangle.fill",
+                    tint: DS.Palette.warning,
+                    text: "Selected Worker effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level."
                 )
             }
-            .accessibilityIdentifier(workerPopoverIdentifier)
         }
     }
 }

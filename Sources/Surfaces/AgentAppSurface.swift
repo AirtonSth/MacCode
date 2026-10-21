@@ -13116,6 +13116,7 @@ public struct AgentAppView: View {
     @State private var showSubagentActivity = false
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
     @State private var showCustomModelField = false
+    @State private var showExecutionSheet = false
     @State private var customModelDraft = ""
     /// Composer Simple (attach/model/send) vs Power (full toolbar).
     /// Always full chrome — no Simple/Power collapse toggle on macOS.
@@ -18678,11 +18679,13 @@ public struct AgentAppView: View {
                             }
                         }
                     )
-                    Toggle("Ultracode", isOn: Binding(get: { vm.distillUltracode }, set: { vm.setDistillUltracode($0) }))
-                        .toggleStyle(.checkbox)
-                        .disabled(vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun)
-                        .help("Plan, fan out to parallel subagents, then integrate and verify")
-                        .accessibilityIdentifier("agent.distill.ultracode")
+                    AgentUltracodeChip(
+                        isOn: vm.distillUltracode,
+                        disabled: vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun,
+                        help: "Plan, fan out to parallel subagents, then integrate and verify",
+                        accessibilityIdentifier: "agent.distill.ultracode",
+                        onToggle: { vm.setDistillUltracode($0) }
+                    )
                 } else { modelMenu }
             }
             if AgentComposerChromePresentation.shows(.permission, mode: composerChromeMode) {
@@ -18986,42 +18989,7 @@ public struct AgentAppView: View {
     }
 
     private var executionMenu: some View {
-        Menu {
-            TextField("PR URL", text: $vm.pullRequestURL)
-                .textFieldStyle(.roundedBorder)
-            Button(vm.pullRequestPreparing ? "Opening..." : "Open PR as thread") {
-                Task { await vm.preparePullRequestThread() }
-            }
-            .disabled(vm.pullRequestPreparing || vm.pullRequestURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.executionLocked)
-            if let message = vm.pullRequestStatusMessage {
-                Divider()
-                dismissibleStatusRow(
-                    message,
-                    identifier: "agent.pr.status.dismiss",
-                    color: message.hasPrefix("PR preparation failed") ? DS.Palette.danger : DS.Palette.textSecondary,
-                    dismiss: { vm.dismissPullRequestStatusMessage() }
-                )
-            }
-            Divider()
-            Picker("Execution", selection: $vm.executionMode) {
-                Text("Local").tag(AgentExecutionMode.local)
-                Text("Worktree").tag(AgentExecutionMode.worktree)
-            }
-            .onChange(of: vm.executionMode) { mode in vm.setExecutionMode(mode) }
-            if vm.executionMode == .worktree {
-                TextField("Base branch", text: Binding(
-                    get: { vm.baseBranch },
-                    set: { vm.setBaseBranch($0) }
-                ))
-                .textFieldStyle(.roundedBorder)
-                if let path = vm.worktreePath, !path.isEmpty {
-                    Divider()
-                    Text(path)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textSecondary)
-                }
-            }
-        } label: {
+        Button { showExecutionSheet = true } label: {
             AgentComposerCapsule {
                 AgentComposerCapsuleLabel(
                     icon: vm.executionMode == .worktree ? "arrow.triangle.branch" : "folder",
@@ -19030,11 +18998,98 @@ public struct AgentAppView: View {
                 )
             }
         }
-        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+        .buttonStyle(.plain).fixedSize()
         .disabled(vm.executionLocked || !vm.selectedProviderCanRun)
         .help(vm.providerExecutionUnavailableReason
             ?? (vm.executionLocked ? "Execution mode locks after the first message" : "Execution mode"))
         .accessibilityIdentifier("agent.execution.menu")
+        .sheet(isPresented: $showExecutionSheet) { executionSheet }
+    }
+
+    private var executionSheet: some View {
+        AgentChoiceSheet(
+            icon: "folder",
+            title: "Where should it run?",
+            subtitle: "Choose how changes land in this workspace.",
+            width: 520,
+            accessibilityIdentifier: "agent.execution.sheet",
+            onClose: { showExecutionSheet = false }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.xl) {
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    AgentChoiceSectionHeader("Mode")
+                    AgentChoiceCard(
+                        title: "Local",
+                        subtitle: "Edit files directly in this workspace.",
+                        selected: vm.executionMode == .local,
+                        disabledReason: vm.executionLocked ? "Execution mode locks after the first message" : nil,
+                        accessibilityIdentifier: "agent.execution.local",
+                        action: { vm.setExecutionMode(.local) }
+                    ) {
+                        AgentChoiceIconTile(systemName: "folder")
+                    }
+                    AgentChoiceCard(
+                        title: "Worktree",
+                        subtitle: "Work in an isolated git worktree, then review the changes.",
+                        selected: vm.executionMode == .worktree,
+                        disabledReason: vm.executionLocked ? "Execution mode locks after the first message" : nil,
+                        accessibilityIdentifier: "agent.execution.worktree",
+                        action: { vm.setExecutionMode(.worktree) }
+                    ) {
+                        AgentChoiceIconTile(systemName: "arrow.triangle.branch")
+                    }
+                }
+                if vm.executionMode == .worktree {
+                    VStack(alignment: .leading, spacing: DS.Space.md) {
+                        AgentChoiceSectionHeader("Base branch")
+                        TextField("Base branch", text: Binding(
+                            get: { vm.baseBranch },
+                            set: { vm.setBaseBranch($0) }
+                        ))
+                        .textFieldStyle(.plain)
+                        .font(DS.Font.bodyDense)
+                        .padding(.horizontal, DS.Space.md)
+                        .padding(.vertical, DS.Space.sm)
+                        .background(RoundedRectangle(cornerRadius: DS.Radius.control).fill(DS.Palette.surfaceRaised))
+                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control).strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                        if let path = vm.worktreePath, !path.isEmpty {
+                            Text(path)
+                                .font(DS.Font.caption.monospaced())
+                                .foregroundColor(DS.Palette.textSecondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+                VStack(alignment: .leading, spacing: DS.Space.md) {
+                    AgentChoiceSectionHeader("Open a pull request")
+                    TextField("PR URL", text: $vm.pullRequestURL)
+                        .textFieldStyle(.plain)
+                        .font(DS.Font.bodyDense)
+                        .padding(.horizontal, DS.Space.md)
+                        .padding(.vertical, DS.Space.sm)
+                        .background(RoundedRectangle(cornerRadius: DS.Radius.control).fill(DS.Palette.surfaceRaised))
+                        .overlay(RoundedRectangle(cornerRadius: DS.Radius.control).strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+                    Button(vm.pullRequestPreparing ? "Opening..." : "Open PR as thread") {
+                        Task { await vm.preparePullRequestThread() }
+                    }
+                    .disabled(vm.pullRequestPreparing || vm.pullRequestURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.executionLocked)
+                    if let message = vm.pullRequestStatusMessage {
+                        dismissibleStatusRow(
+                            message,
+                            identifier: "agent.pr.status.dismiss",
+                            color: message.hasPrefix("PR preparation failed") ? DS.Palette.danger : DS.Palette.textSecondary,
+                            dismiss: { vm.dismissPullRequestStatusMessage() }
+                        )
+                    }
+                }
+            }
+        } footer: {
+            HStack {
+                Spacer(minLength: 0)
+                Button("Done") { showExecutionSheet = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
     }
 
     /// Run-as capsule: macOS user + Bot actor. Left of provider source + model.

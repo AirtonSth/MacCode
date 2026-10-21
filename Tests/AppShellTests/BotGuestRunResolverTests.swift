@@ -267,6 +267,20 @@ final class BotGuestRunResolverTests: XCTestCase {
 
     // MARK: - Routing
 
+    // WHY: a conversation pinned to This Mac but still marked as a VM thread failed every
+    // send with "this bot no longer has a Docker desktop" instead of running on the Mac.
+    func test_threadPinnedToThisMacDropsStaleVMTarget() async throws {
+        let f = try await makeFixture()
+        let thread = try makeThread(f)
+        try f.ctx.db.execute("UPDATE agent_threads SET execution_destination='mac', execution_target='vm' WHERE id='\(thread.id.value.uuidString)';")
+        let stale = try XCTUnwrap(f.ctx.threadRepo.get(id: thread.id))
+        XCTAssertEqual(stale.executionTarget, .vm)
+        let repaired = try f.ctx.threadRepo.reconcileBotExecutionTarget(stale)
+        XCTAssertEqual(repaired.executionTarget, .mac)
+        XCTAssertEqual(try f.ctx.threadRepo.get(id: thread.id)?.executionTarget, .mac)
+        f.resolver.endRunsForAppTermination()
+    }
+
     func test_localBotRepairsStalePlacementButContextIsolationAndDockerFailuresStayClosed() async throws {
         let f = try await makeFixture()
         let ordinary = try makeThread(f)

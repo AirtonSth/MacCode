@@ -4698,39 +4698,35 @@ final class BotsWindowTests: XCTestCase {
     }
 
     func test_studioRoutineActiveSwitchSaysActiveAndName_becauseTitleAloneHidesTheJob() throws {
-        // WHY: Computer Use / VoiceOver named the Studio Active switch
-        // "QA morning scan" only. The visible job is Active; the title
-        // is already a heading. Speak both so the switch is not just
-        // another copy of the task name.
+        // WHY: Computer Use / VoiceOver named the Studio Active control
+        // by the task title only. Studio now mounts the shared Schedule
+        // Tasks card, so its status pill, toggle and title must keep
+        // naming the job for the card in every surface.
         let source = try String(
-            contentsOf: sourceURL("Sources/AppShell/BotsWindow.swift"),
+            contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"),
             encoding: .utf8
         )
-        guard let start = source.range(of: "private func routineRowBody") else {
-            return XCTFail("studio routine row must exist")
+        guard let start = source.range(of: "struct BotScheduleTaskCard: View") else {
+            return XCTFail("shared schedule task card must exist")
         }
         let rest = source[start.lowerBound...]
-        let end = rest.range(of: "// MARK: Shared chrome")?.lowerBound ?? rest.endIndex
-        let body = String(source[start.lowerBound..<end])
+        let end = rest.range(of: "struct BotScheduleTaskEditorView")?.lowerBound ?? rest.endIndex
+        let body = String(rest[..<end])
         XCTAssertTrue(
-            body.contains("Toggle(\"Active\""),
-            "the visible switch title stays Active"
+            body.contains("title: item.name"),
+            "the card title must carry the task name"
         )
         XCTAssertTrue(
-            body.contains(".accessibilityLabel(\"Active, \\(routine.definition.name)\")"),
-            "VoiceOver must hear Active plus the routine name"
-        )
-        XCTAssertFalse(
-            body.contains(".accessibilityLabel(routine.definition.name)"),
-            "the switch must not reuse the heading as its only name"
+            body.contains("DSPill(\"Active\", tone: .success)"),
+            "the visible status must say Active"
         )
         XCTAssertTrue(
-            body.contains("Button(\"Edit\") { vm.editRoutine(routine) }"),
-            "existing Studio tasks must expose Edit, not only Test run"
+            body.contains("Button(item.isEnabled ? \"Pause\" : \"Resume\", action: onToggle)"),
+            "the card must expose the enable toggle as a named action"
         )
         XCTAssertTrue(
-            body.contains("accessibilityIdentifier(\"bots.routines.edit\")"),
-            "Edit must be a named control so Computer Use can open the dedicated editor"
+            body.contains("Button(\"Edit\", action: onEdit)"),
+            "existing tasks must expose Edit, not only Run Now"
         )
     }
 
@@ -13194,7 +13190,9 @@ final class BotsWindowTests: XCTestCase {
             "Home desktop honesty is gone with the Home screen"
         )
         XCTAssertTrue(source.contains("bots.studio.desktop.honesty") || source.contains("bots.desk.desktop"))
-        XCTAssertTrue(source.contains("BotRoutineCopy.testRunHonestyCaption"))
+        // Studio mounts the shared Schedule Tasks screen; its editor carries the caption.
+        let schedules = try String(contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(schedules.contains("BotRoutineCopy.testRunHonestyCaption"))
         XCTAssertFalse(
             source.contains("isAutonomyActive ? \"active\""),
             "autonomy-on must not imply app-closed execution"
@@ -17066,12 +17064,15 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertFalse(bots.contains("bots.memory.correct"))
         XCTAssertFalse(bots.contains("bots.memory.forget"))
         XCTAssertFalse(bots.contains("bots.studio.skills.remove"))
-        XCTAssertTrue(bots.contains("bots.routines.name"))
-        XCTAssertTrue(bots.contains("bots.routines.instruction"))
-        XCTAssertTrue(bots.contains("bots.routines.when"))
+        XCTAssertTrue(bots.contains("BotScheduleTasksRootView(vm: vm, scopeBotID:"))
+        let scheduleTasksSource = try String(contentsOf: sourceURL("Sources/AppShell/BotScheduleTasksWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(scheduleTasksSource.contains("bots.scheduleTasks.editor.name"))
+        XCTAssertTrue(scheduleTasksSource.contains("bots.scheduleTasks.editor.instruction"))
+        XCTAssertTrue(scheduleTasksSource.contains("bots.scheduleTasks.editor.spec"))
+        XCTAssertTrue(scheduleTasksSource.contains("bots.scheduleTasks.editor.active"))
+        XCTAssertTrue(scheduleTasksSource.contains("bots.scheduleTasks.new"))
+        XCTAssertTrue(scheduleTasksSource.contains("BotRoutineCopy.testRunHonestyCaption"))
         XCTAssertTrue(bots.contains("bots.routines.active"))
-        XCTAssertTrue(bots.contains("bots.routines.test"))
-        XCTAssertTrue(bots.contains("bots.routines.honesty"))
         XCTAssertFalse(bots.contains("BotDetailTab"))
         XCTAssertFalse(bots.contains("detailTab = .desk"))
         XCTAssertTrue(bots.contains("BOT ROSTER") || chrome.contains("BOT ROSTER"))

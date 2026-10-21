@@ -368,6 +368,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         case scheduledTasks
         case activeThreads
         case bots
+        case settings
     }
     private var shellContentMode: ShellContentMode = .workspace {
         didSet {
@@ -386,6 +387,10 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
     private var scheduledTasksHostingView: NSView?
     private var activeThreadsViewModel: ActiveThreadsViewModel?
     private var activeThreadsHostingView: NSView?
+    private var settingsViewModel: SettingsViewModel?
+    private var settingsHostingView: NSView?
+    private var settingsFreshnessTask: Task<Void, Never>?
+    private var settingsFreshnessGeneration: UInt64 = 0
     private var botsViewModel: BotsViewModel?
     private var botsHostingView: NSView?
     private var currentShellHostingView: NSView?
@@ -445,6 +450,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         }
         sidebar.onPresentActiveThreads = { [weak self] in
             self?.presentActiveThreadsInMainContent()
+        }
+        sidebar.onPresentSettings = { [weak self] in
+            self?.presentSettingsInMainContent()
         }
         sidebar.botsViewModel.onLeaveBots = { [weak self] in
             self?.presentWorkspaceContent()
@@ -841,6 +849,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
                 collapsedWorkspaceLabel.stringValue = "Active Threads"
                 visibleWorkspaceLabel.stringValue = "Active Threads"
                 window.title = "Active Threads"
+                visibleFinderButton.isHidden = true
+                visibleNewWindowButton.isHidden = true
+                return
+            }
+            if shellContentMode == .settings {
+                collapsedWorkspaceLabel.stringValue = "Settings"
+                visibleWorkspaceLabel.stringValue = "Settings"
+                window.title = "Settings"
                 visibleFinderButton.isHidden = true
                 visibleNewWindowButton.isHidden = true
                 return
@@ -1332,10 +1348,32 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setScheduledTasksSelected(true)
         sidebar.setActiveThreadsSelected(false)
         sidebar.setBotsSelected(false)
+        sidebar.setSettingsSelected(false)
         persistBotsShellDestination()
         installScheduledTasksContent()
         updateCollapsedWorkspaceHeader()
         shellLog.debug("shellContentMode=scheduledTasks")
+    }
+
+    /// Settings shell destination: System Settings-style categories in the main
+    /// content column. A non-nil route selects its category first.
+    func presentSettingsInMainContent(route: PetSettingsRoute? = nil) {
+        if let route, let vm = settingsShellViewModel() {
+            vm.select(route: route)
+        }
+        guard shellContentMode != .settings else {
+            scheduleSettingsFreshnessPass()
+            return
+        }
+        shellContentMode = .settings
+        sidebar.setSettingsSelected(true)
+        sidebar.setScheduledTasksSelected(false)
+        sidebar.setActiveThreadsSelected(false)
+        sidebar.setBotsSelected(false)
+        persistBotsShellDestination()
+        installSettingsContent()
+        updateCollapsedWorkspaceHeader()
+        shellLog.debug("shellContentMode=settings")
     }
 
     func openActivityRoute(intent: NotificationRouteIntent) {
@@ -1353,6 +1391,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setActiveThreadsSelected(true)
         sidebar.setScheduledTasksSelected(false)
         sidebar.setBotsSelected(false)
+        sidebar.setSettingsSelected(false)
         persistBotsShellDestination()
         installActiveThreadsContent()
         updateCollapsedWorkspaceHeader()
@@ -1366,6 +1405,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setBotsSelected(true)
         sidebar.setScheduledTasksSelected(false)
         sidebar.setActiveThreadsSelected(false)
+        sidebar.setSettingsSelected(false)
         persistBotsShellDestination()
         installBotsContent()
         updateCollapsedWorkspaceHeader()
@@ -1379,6 +1419,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.setScheduledTasksSelected(false)
         sidebar.setActiveThreadsSelected(false)
         sidebar.setBotsSelected(false)
+        sidebar.setSettingsSelected(false)
         persistBotsShellDestination()
         currentShellHostingView?.removeFromSuperview()
         currentShellHostingView = nil
@@ -1420,6 +1461,52 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         RemoteCodeAppearance.apply(to: host)
         scheduledTasksHostingView = host
         attachShellHost(host)
+    }
+
+    private func settingsShellViewModel() -> SettingsViewModel? {
+        if let settingsViewModel { return settingsViewModel }
+        guard let context else { return nil }
+        let vm = (NSApp.delegate as? AppDelegate)?.settings?.viewModel
+            ?? SettingsViewModel(context: context, loadImmediately: false)
+        settingsViewModel = vm
+        return vm
+    }
+
+    private func installSettingsContent() {
+        guard let vm = settingsShellViewModel() else {
+            let empty = makeEmptyState()
+            workspaceContent.addSubview(empty)
+            pin(empty, to: workspaceContent)
+            return
+        }
+        scheduleSettingsFreshnessPass()
+        if let existing = settingsHostingView {
+            attachShellHost(existing)
+            return
+        }
+        let host = NSHostingView(rootView: SettingsView(vm: vm, onClose: nil))
+        host.translatesAutoresizingMaskIntoConstraints = false
+        host.wantsLayer = true
+        host.layer?.backgroundColor = DS.NS.bg.cgColor
+        RemoteCodeAppearance.apply(to: host)
+        settingsHostingView = host
+        attachShellHost(host)
+    }
+
+    /// Latest-wins: a newer presenter call cancels the pending pass.
+    private func scheduleSettingsFreshnessPass() {
+        guard let vm = settingsViewModel else { return }
+        settingsFreshnessTask?.cancel()
+        settingsFreshnessGeneration &+= 1
+        let generation = settingsFreshnessGeneration
+        settingsFreshnessTask = Task { @MainActor [weak self] in
+            await Self.waitForCommittedFrame()
+            guard let self, !Task.isCancelled, self.settingsFreshnessGeneration == generation,
+                  self.shellContentMode == .settings else { return }
+            self.settingsFreshnessTask = nil
+            vm.reload()
+            await vm.refreshNotificationStatus()
+        }
     }
 
     private func installActiveThreadsContent() {
@@ -1566,6 +1653,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
                 return
             }
             installActiveThreadsContent()
+            return
+        }
+        if shellContentMode == .settings {
+            if settingsHostingView?.superview === workspaceContent {
+                scheduleSettingsFreshnessPass()
+                return
+            }
+            installSettingsContent()
             return
         }
         if shellContentMode == .bots {
@@ -1929,6 +2024,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         case .bots: value = "bots"
         case .scheduledTasks: value = "scheduledTasks"
         case .activeThreads: value = "activeThreads"
+        case .settings: value = "settings"
         case .workspace: value = "workspace"
         }
         // Construction/restoration tests and first-launch setup happen before
@@ -1956,6 +2052,8 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
             presentScheduledTasksInMainContent()
         case "activeThreads":
             presentActiveThreadsInMainContent()
+        case "settings":
+            presentSettingsInMainContent()
         default:
             break
         }

@@ -394,6 +394,10 @@ public final class ActiveThreadsViewModel: ObservableObject {
                 try router.focusSurface(workspace: workspaceID, surface: surfaceID)
             case .workspace(let workspaceID): try router.selectWorkspace(workspaceID)
             case .settings(let route):
+                if let windowController = router.windowController {
+                    windowController.presentSettingsInMainContent(route: route)
+                    return
+                }
                 guard let settings = (NSApp.delegate as? AppDelegate)?.settings,
                       settings.show(route: route) else {
                     errorMessage = "Could not open activity settings destination."

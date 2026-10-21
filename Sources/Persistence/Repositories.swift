@@ -2499,7 +2499,17 @@ public final class AgentThreadRepository {
     /// internal contextual admissions retain their explicitly isolated runtime.
     public func reconcileBotExecutionTarget(_ thread: AgentThread, forUserSend: Bool = false) throws -> AgentThread {
         guard thread.executionTarget == .vm else { return thread }
-        if try BotStore(db: db).threadExecutionDestination(thread.id) != nil { return thread }
+        if let pinned = try BotStore(db: db).threadExecutionDestination(thread.id) {
+            // A conversation pinned to This Mac must not keep a VM target, or the
+            // guest resolver refuses it ("no longer has a Docker desktop").
+            guard pinned == .mac else { return thread }
+            guard try setActor(
+                id: thread.id, actor: thread.actor, lockedAt: thread.actorLockedAt, executionTarget: .mac
+            ) else { throw BotStoreError.notFound }
+            var updated = thread
+            updated.executionTarget = .mac
+            return updated
+        }
         if let runtime = try guestPlacement(of: thread.id)?.guestRuntime,
            !runtime.isEmpty, runtime != BotGuestRuntime.distillV1 { return thread }
         let store = BotStore(db: db)

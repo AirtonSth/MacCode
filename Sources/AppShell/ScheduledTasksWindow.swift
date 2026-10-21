@@ -2163,10 +2163,13 @@ struct ScheduledRunOptionsEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             if showsUltracode {
-                Toggle("Ultracode", isOn: $ultracode)
-                    .toggleStyle(.checkbox)
-                    .help("Plan, fan out to parallel subagents, then integrate and verify")
-                    .accessibilityIdentifier("\(identifierPrefix).ultracode")
+                AgentUltracodeChip(
+                    isOn: ultracode,
+                    disabled: false,
+                    help: "Plan, fan out to parallel subagents, then integrate and verify",
+                    accessibilityIdentifier: "\(identifierPrefix).ultracode",
+                    onToggle: { ultracode = $0 }
+                )
             }
             if let plan {
                 Toggle("Plan mode", isOn: plan)

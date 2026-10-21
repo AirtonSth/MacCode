@@ -381,6 +381,8 @@ public struct AgentPermissionCapsule: View {
     public let accessibilityIdentifier: String
     public let onSelect: (AgentPermissionMode) -> Void
 
+    @State private var isPresented = false
+
     public init(
         selected: AgentPermissionMode,
         modes: [AgentPermissionMode],
@@ -400,17 +402,8 @@ public struct AgentPermissionCapsule: View {
     }
 
     public var body: some View {
-        Menu {
-            ForEach(modes, id: \.self) { mode in
-                Button {
-                    onSelect(mode)
-                } label: {
-                    if mode == selected { Image(systemName: "checkmark") }
-                    Text(mode.displayName)
-                }
-                .disabled(unavailableReason(mode) != nil)
-                .help(unavailableReason(mode) ?? mode.pickerHelpText)
-            }
+        Button {
+            isPresented.toggle()
         } label: {
             AgentComposerCapsule(style: .tinted(selected.capsuleTint), foreground: selected.capsuleTint) {
                 AgentComposerCapsuleLabel(
@@ -420,17 +413,66 @@ public struct AgentPermissionCapsule: View {
                 )
             }
         }
-        .menuStyle(.button)
         .buttonStyle(.plain)
-        .menuIndicator(.hidden)
         .fixedSize()
         .disabled(disabled)
         .help(help)
         .accessibilityLabel("Permission \(selected.displayName)")
         .accessibilityIdentifier(accessibilityIdentifier)
+        .sheet(isPresented: $isPresented) { sheet }
+    }
+
+    private var sheet: some View {
+        AgentChoiceSheet(
+            icon: "lock.shield",
+            title: "Permissions",
+            subtitle: "How much the agent can do before asking you.",
+            width: 460,
+            accessibilityIdentifier: "agent.permission.sheet",
+            onClose: { isPresented = false }
+        ) {
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                ForEach(modes, id: \.self) { mode in
+                    AgentChoiceCard(
+                        title: mode.displayName,
+                        subtitle: mode.pickerHelpText,
+                        selected: mode == selected,
+                        tint: permissionTint(mode),
+                        disabledReason: unavailableReason(mode),
+                        accessibilityIdentifier: "agent.permission.sheet.\(mode.rawValue)",
+                        action: {
+                            onSelect(mode)
+                            isPresented = false
+                        }
+                    ) {
+                        AgentChoiceIconTile(systemName: permissionSymbol(mode), tint: permissionTint(mode))
+                    }
+                }
+            }
+            if selected == .fullAccess {
+                AgentChoiceCallout(
+                    icon: "exclamationmark.triangle.fill",
+                    tint: DS.Palette.warning,
+                    text: "Full access runs commands and edits files without asking. Use it only in trusted projects."
+                )
+            }
+        }
+    }
+
+    private func permissionTint(_ mode: AgentPermissionMode) -> Color {
+        mode == .supervised ? DS.Palette.accent : mode.capsuleTint
+    }
+
+    private func permissionSymbol(_ mode: AgentPermissionMode) -> String {
+        switch mode {
+        case .supervised: return "hand.raised.fill"
+        case .autoAcceptEdits: return "pencil.and.outline"
+        case .fullAccess: return "bolt.shield.fill"
+        }
     }
 }
 
+// MARK: - Run as
 // MARK: - Run as
 
 public enum AgentRunAsUserPresentation {
@@ -443,7 +485,7 @@ public enum AgentRunAsUserPresentation {
         userCount > 1 && !identityLocked && !runLocked
     }
 
-    /// The chip opens a popover when there is anything to choose, or when a
+    /// The chip opens a sheet when there is anything to choose, or when a
     /// locked thread offers the hand-off.
     public static func isInteractive(
         userCount: Int,
@@ -508,7 +550,7 @@ public struct AgentRunAsUserCapsule: View {
     public let identityLocked: Bool
     public let accessibilityIdentifier: String
     public let actor: RunActor
-    /// Read only while the popover is open.
+    /// Read only while the sheet is open.
     public let botsProvider: (() -> [BotDefinition])?
     /// Single-name lookup for the chip label; never the full list.
     public let botNameLookup: (BotID) -> String?
@@ -525,6 +567,7 @@ public struct AgentRunAsUserCapsule: View {
     @State private var users: [AgentRunAsUser] = []
     @State private var bots: [BotDefinition] = []
     @State private var actorName: String?
+    @State private var botQuery = ""
 
     public init(
         usersProvider: @escaping () -> [AgentRunAsUser],
@@ -612,7 +655,7 @@ public struct AgentRunAsUserCapsule: View {
                     capsule(chevron: !identityLocked)
                 }
                 .buttonStyle(.plain)
-                .popover(isPresented: $isPresented, arrowEdge: .bottom) { popover }
+                .sheet(isPresented: $isPresented) { sheet }
             } else {
                 capsule(chevron: false)
             }
@@ -638,70 +681,158 @@ public struct AgentRunAsUserCapsule: View {
         actorName = AgentRunAsUserPresentation.resolveBotName(botID: botID, lookup: botNameLookup)
     }
 
-    private var popover: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
+    private var sheet: some View {
+        AgentChoiceSheet(
+            icon: "person.crop.circle.badge.checkmark",
+            title: "Who runs this conversation?",
+            subtitle: "Pick a Bot to give it its own identity, memory and tools, or run as yourself.",
+            width: 540,
+            accessibilityIdentifier: "agent.runAsUser.sheet",
+            onClose: { isPresented = false }
+        ) {
             if identityLocked {
-                if botID != nil {
-                    AgentCompactMenuRow(
-                        AgentRunAsUserPresentation.continueWithoutBotLabel,
-                        selected: false
-                    ) {
-                        onContinueWithoutBot()
-                        isPresented = false
-                    }
-                }
-                if let onHandoffToBot {
-                    AgentCompactMenuSection(AgentRunAsUserPresentation.handoffToBotSection)
-                    ForEach(bots.filter { $0.id != botID }, id: \.id.value) { bot in
-                        AgentCompactMenuRow(
-                            bot.name,
-                            detail: AgentRunAsUserPresentation.targetBadge(executionTarget(bot.id)),
-                            selected: false
-                        ) {
-                            onHandoffToBot(bot.id)
-                            isPresented = false
-                        }
-                    }
-                }
+                lockedContent
             } else {
-                if users.count > 1 {
-                    AgentCompactMenuSection("macOS user")
-                    ForEach(users, id: \.id) { user in
-                        AgentCompactMenuRow(
-                            user.shortName,
-                            detail: user.fullName.flatMap { $0 != user.shortName ? $0 : nil },
-                            selected: user.uid == selected.uid
-                        ) {
+                unlockedContent
+            }
+        }
+        .onAppear {
+            users = usersProvider()
+            bots = botsProvider?() ?? []
+            botQuery = ""
+        }
+    }
+
+    @ViewBuilder
+    private var unlockedContent: some View {
+        if botsProvider != nil {
+            AgentChoiceCard(
+                title: AgentRunAsUserPresentation.noBotLabel,
+                subtitle: "Run as yourself with your own settings",
+                selected: actor == .none,
+                accessibilityIdentifier: "agent.runAsUser.sheet.noBot",
+                action: {
+                    onSelectActor(.none)
+                    isPresented = false
+                }
+            ) {
+                AgentChoiceIconTile(systemName: "person.fill", tint: DS.Palette.textSecondary)
+            }
+            botsSection(
+                title: "Bots",
+                list: bots,
+                searchable: true,
+                isSelected: { actor == .bot($0) },
+                onPick: { bot in
+                    onSelectActor(.bot(bot.id))
+                    isPresented = false
+                }
+            )
+        }
+        if users.count > 1 {
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                AgentChoiceSectionHeader("macOS user")
+                ForEach(users, id: \.id) { user in
+                    AgentChoiceCard(
+                        title: user.shortName,
+                        subtitle: user.fullName.flatMap { $0 != user.shortName ? $0 : nil },
+                        selected: user.uid == selected.uid,
+                        accessibilityIdentifier: "agent.runAsUser.sheet.user.\(user.shortName)",
+                        action: {
                             onSelect(user)
                             isPresented = false
                         }
+                    ) {
+                        AgentChoiceIconTile(systemName: "person.crop.square")
                     }
                 }
-                if botsProvider != nil {
-                    AgentCompactMenuRow(AgentRunAsUserPresentation.noBotLabel, selected: actor == .none) {
-                        onSelectActor(.none)
-                        isPresented = false
-                    }
-                    AgentCompactMenuSection("Bots")
-                    ForEach(bots, id: \.id.value) { bot in
-                        AgentCompactMenuRow(
-                            bot.name,
-                            detail: AgentRunAsUserPresentation.targetBadge(executionTarget(bot.id)),
-                            selected: actor == .bot(bot.id)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var lockedContent: some View {
+        if botID != nil {
+            AgentChoiceCard(
+                title: AgentRunAsUserPresentation.continueWithoutBotLabel,
+                selected: false,
+                accessibilityIdentifier: "agent.runAsUser.sheet.continueWithoutBot",
+                action: {
+                    onContinueWithoutBot()
+                    isPresented = false
+                }
+            ) {
+                AgentChoiceIconTile(systemName: "arrow.uturn.backward", tint: DS.Palette.textSecondary)
+            }
+        }
+        if let onHandoffToBot {
+            botsSection(
+                title: AgentRunAsUserPresentation.handoffToBotSection,
+                list: bots.filter { $0.id != botID },
+                searchable: false,
+                isSelected: { _ in false },
+                onPick: { bot in
+                    onHandoffToBot(bot.id)
+                    isPresented = false
+                }
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func botsSection(
+        title: String,
+        list: [BotDefinition],
+        searchable: Bool,
+        isSelected: @escaping (BotID) -> Bool,
+        onPick: @escaping (BotDefinition) -> Void
+    ) -> some View {
+        let shown = searchable ? matchingBots(list) : list
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            AgentChoiceSectionHeader(title) {
+                Text("\(list.count)")
+                    .font(DS.Font.caption.monospacedDigit())
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            if searchable && list.count > 6 {
+                AgentChoiceSearchField(
+                    query: $botQuery,
+                    placeholder: "Search bots",
+                    accessibilityIdentifier: "agent.runAsUser.sheet.botSearch"
+                )
+            }
+            if list.isEmpty {
+                AgentChoiceCallout(icon: "info.circle", tint: DS.Palette.textSecondary, text: "No bots in this workspace yet.")
+            } else if shown.isEmpty {
+                Text("No bots match “\(botQuery.trimmingCharacters(in: .whitespacesAndNewlines))”.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            } else {
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: DS.Space.md), GridItem(.flexible())], spacing: DS.Space.md) {
+                    ForEach(shown, id: \.id.value) { bot in
+                        AgentChoiceCard(
+                            title: bot.name,
+                            subtitle: bot.title.isEmpty ? "@\(bot.handle)" : bot.title,
+                            badge: AgentRunAsUserPresentation.targetBadge(executionTarget(bot.id)),
+                            selected: isSelected(bot.id),
+                            accessibilityIdentifier: "agent.runAsUser.sheet.bot.\(bot.handle)",
+                            action: { onPick(bot) }
                         ) {
-                            onSelectActor(.bot(bot.id))
-                            isPresented = false
+                            BotsAvatarView(name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol, size: 30)
                         }
                     }
                 }
             }
         }
-        .padding(DS.Space.sm)
-        .background(DS.Palette.surfaceOverlay)
-        .fixedSize(horizontal: true, vertical: false)
-        .onAppear {
-            users = usersProvider()
-            bots = botsProvider?() ?? []
+    }
+
+    private func matchingBots(_ list: [BotDefinition]) -> [BotDefinition] {
+        let query = botQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return list }
+        return list.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || $0.handle.localizedCaseInsensitiveContains(query)
+                || $0.title.localizedCaseInsensitiveContains(query)
         }
     }
 

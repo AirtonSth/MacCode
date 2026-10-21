@@ -1218,6 +1218,53 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         session.onEvent = onEvent
     }
 
+    /// Stored-session cwd for a resume, or `request.cwd` when no stored session
+    /// directory exists. Host runs only; the guest plan owns its own cwd.
+    static func resumeCwd(for request: AgentRunRequest) -> String {
+        guard let sessionId = request.providerThreadId, !sessionId.isEmpty else { return request.cwd }
+        let userHome = request.runAsUser?.homePath ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let home = DistillProvisioner.homeURL(environment: request.environment, userHome: userHome)
+        let sessionsRoot = home.appendingPathComponent("sessions", isDirectory: true)
+        guard let stored = storedSessionCwd(sessionsRoot: sessionsRoot, sessionId: sessionId),
+              stored != request.cwd else { return request.cwd }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: stored, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return request.cwd
+        }
+        distillAcpLog.info(
+            "Distill resume cwd switched to stored session cwd thread=\(request.threadId.description, privacy: .public) session=\(sessionId, privacy: .public)"
+        )
+        return stored
+    }
+
+    /// Finds `<sessionsRoot>/<encoded cwd>/<sessionId>` and returns its cwd:
+    /// `summary.json` `info.cwd` first, else the percent-decoded parent name.
+    static func storedSessionCwd(sessionsRoot: URL, sessionId: String) -> String? {
+        guard !sessionId.isEmpty, !sessionId.contains("/"), !sessionId.contains("..") else { return nil }
+        let fileManager = FileManager.default
+        guard let groups = try? fileManager.contentsOfDirectory(
+            at: sessionsRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        for group in groups {
+            let sessionDirectory = group.appendingPathComponent(sessionId, isDirectory: true)
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: sessionDirectory.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { continue }
+            if let data = try? Data(contentsOf: sessionDirectory.appendingPathComponent("summary.json")),
+               let summary = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let info = summary["info"] as? [String: Any],
+               let cwd = info["cwd"] as? String, cwd.hasPrefix("/") {
+                return cwd
+            }
+            if let cwd = group.lastPathComponent.removingPercentEncoding, cwd.hasPrefix("/") {
+                return cwd
+            }
+        }
+        return nil
+    }
+
     private func openSession(
         _ request: AgentRunRequest,
         loadExisting: Bool,
@@ -1257,6 +1304,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 "A bot guest run was prepared for a session open that sends no prompt."
             )
         }
+        // A resumed session runs in the cwd Distill stored it under; entry points
+        // disagree on cwd and session/load fails when the path differs.
+        let cwd = guestPlan == nil && loadExisting ? Self.resumeCwd(for: request) : request.cwd
         let client: DistillACPClient
         do {
             if let guestPlan {
@@ -1276,7 +1326,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     : nil
                 client = try DistillACPClient(
                     binary: binary,
-                    cwd: request.cwd,
+                    cwd: cwd,
                     environment: request.environment,
                     launchArguments: launchArguments,
                     runAsUser: request.runAsUser,
@@ -1314,7 +1364,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 // Recover without prompt: keep full replay so readThread has history.
                 opened = try await client.loadSession(
                     sessionId: providerThreadId,
-                    cwd: request.cwd,
+                    cwd: cwd,
                     noReplay: shouldStartPrompt,
                     yoloMode: request.permissionMode == .fullAccess,
                     modelId: request.model,
@@ -1361,7 +1411,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 threadId: request.threadId,
                 providerThreadId: opened.sessionId,
                 client: client,
-                cwd: request.cwd,
+                cwd: cwd,
                 guestPlan: guestPlan,
                 capabilities: capabilities,
                 mapper: mapper,

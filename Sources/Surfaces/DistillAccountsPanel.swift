@@ -338,28 +338,14 @@ public struct DistillAccountsPanel: View {
             Text("Auto routing").font(DS.Font.title3)
             Text("Choose Auto in Main to use this profile. Worker uses this route’s setting.")
                 .foregroundStyle(DS.Palette.textSecondary).fixedSize(horizontal: false, vertical: true)
-            Toggle("Enable profile", isOn: Binding(get: { currentDraft.enabled }, set: { var value = currentDraft; value.enabled = $0; draft = value })).frame(minHeight: 44)
-            Picker("Strategy", selection: Binding(get: { currentDraft.strategy }, set: { var value = currentDraft; value.strategy = $0; draft = value })) {
-                Text("First available in order").tag(DistillAutoStrategy.orderedFirst)
-                Text("Highest remaining quota").tag(DistillAutoStrategy.highestRemaining)
-            }.frame(minHeight: 44)
-            Text(currentDraft.strategy == .orderedFirst
-                 ? "Try connected accounts in the order below."
-                 : "Prefer the connected account with the highest known remaining quota.")
-                .font(DS.Font.bodyDense).foregroundStyle(DS.Palette.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if currentDraft.options.isEmpty {
-                Text("Add an option to choose an account and its models.").foregroundStyle(DS.Palette.textSecondary)
-            }
-            ForEach(currentDraft.options, id: \.id) { option in routeRow(option) }
-            Button("Add option") {
-                let account = presentation.statuses.first
-                let model = DistillRoutingValidation.models(for: account, catalog: presentation.models).first
-                var value = currentDraft
-                value.options.append(.init(id: UUID().uuidString.lowercased(), accountID: account?.id ?? "", mainModel: model?.id ?? ""))
-                draft = value
-            }.frame(minHeight: 44)
-        }.disabled(unavailable).padding(DS.Space.xl).frame(maxWidth: .infinity, alignment: .leading)
+            DistillAutoRoutingEditor(
+                draft: Binding(get: { currentDraft }, set: { draft = $0 }),
+                saved: presentation.routing,
+                statuses: presentation.statuses,
+                models: presentation.models,
+                disabled: unavailable
+            )
+        }.padding(DS.Space.xl).frame(maxWidth: .infinity, alignment: .leading)
             .background(DS.Palette.surfaceRaised).clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
             .accessibilityIdentifier("agent.accounts.routing")
     }
@@ -367,9 +353,6 @@ public struct DistillAccountsPanel: View {
     private var routingFooter: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             Divider()
-            if let error = validationError {
-                Text(error).foregroundStyle(DS.Palette.warning).fixedSize(horizontal: false, vertical: true)
-            }
             HStack(spacing: DS.Space.lg) {
                 Text(!presentation.routingLoaded ? "Loading saved profile…" :
                      (hasChanges ? "Unsaved changes" : "Saved profile · \(presentation.routing.enabled ? "Enabled" : "Disabled")"))
@@ -387,58 +370,5 @@ public struct DistillAccountsPanel: View {
                 }
             }
         }.accessibilityIdentifier("agent.accounts.routing.footer")
-    }
-
-    private func editOption(_ id: String, _ edit: (inout DistillAutoOption) -> Void) {
-        var value = currentDraft
-        guard let index = value.options.firstIndex(where: { $0.id == id }) else { return }
-        edit(&value.options[index]); draft = value
-    }
-    private func moveOption(_ id: String, offset: Int) {
-        var value = currentDraft
-        guard let index = value.options.firstIndex(where: { $0.id == id }), value.options.indices.contains(index + offset) else { return }
-        value.options.swapAt(index, index + offset); draft = value
-    }
-
-    private func routeRow(_ option: DistillAutoOption) -> some View {
-        let account = presentation.statuses.first { $0.id == option.accountID }
-        let models = DistillRoutingValidation.models(for: account, catalog: presentation.models)
-        let index = currentDraft.options.firstIndex { $0.id == option.id } ?? 0
-        return VStack(alignment: .leading, spacing: DS.Space.md) {
-            HStack {
-                Text("Option \(index + 1)").font(DS.Font.bodyStrong)
-                Spacer()
-                Menu("Option actions") {
-                    Button("Move up") { moveOption(option.id, offset: -1) }.disabled(index == 0)
-                    Button("Move down") { moveOption(option.id, offset: 1) }.disabled(index == currentDraft.options.count - 1)
-                    Button("Remove option", role: .destructive) { var value = currentDraft; value.options.removeAll { $0.id == option.id }; draft = value }
-                }.frame(minHeight: 44)
-                    .accessibilityLabel("Actions for option \(index + 1)")
-            }
-            Text("Account").font(DS.Font.bodyStrong)
-            Picker("Account", selection: Binding(get: { option.accountID }, set: { id in
-                editOption(option.id) {
-                    $0.accountID = id
-                    $0.mainModel = DistillRoutingValidation.models(for: presentation.statuses.first { $0.id == id }, catalog: presentation.models).first?.id ?? ""
-                    $0.workerModel = nil
-                }
-            })) {
-                if account == nil { Text("Choose account").tag(option.accountID) }
-                ForEach(presentation.statuses, id: \.id) { Text("\($0.provider.displayName) · \($0.label)").tag($0.id) }
-            }.labelsHidden().frame(maxWidth: .infinity, minHeight: 44).help(account.map { "\($0.provider.displayName) · \($0.label)" } ?? "Choose account")
-            Text("Main").font(DS.Font.bodyStrong)
-            Picker("Main", selection: Binding(get: { option.mainModel }, set: { model in editOption(option.id) { $0.mainModel = model } })) {
-                if !models.contains(where: { $0.id == option.mainModel }) { Text(option.mainModel.isEmpty ? "Choose model" : "Unavailable: \(option.mainModel)").tag(option.mainModel) }
-                ForEach(models, id: \.id) { Text($0.label).tag($0.id) }
-            }.labelsHidden().frame(maxWidth: .infinity, minHeight: 44).help(option.mainModel)
-            Text("Worker").font(DS.Font.bodyStrong).foregroundStyle(DS.Palette.textSecondary)
-            Picker("Worker", selection: Binding(get: { option.workerModel ?? "" }, set: { model in editOption(option.id) { $0.workerModel = model.isEmpty ? nil : model } })) {
-                Text("Same as Main").tag("")
-                if let worker = option.workerModel, !models.contains(where: { $0.id == worker }) { Text("Unavailable: \(worker)").tag(worker) }
-                ForEach(models, id: \.id) { Text($0.label).tag($0.id) }
-            }.labelsHidden().frame(maxWidth: .infinity, minHeight: 44).help(option.workerModel ?? "Same as Main")
-        }.padding(DS.Space.lg).background(DS.Palette.surface)
-            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
-            .accessibilityElement(children: .contain).accessibilityIdentifier("agent.accounts.routing.\(option.id)")
     }
 }

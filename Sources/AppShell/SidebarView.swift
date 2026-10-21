@@ -530,6 +530,8 @@ public final class SidebarViewModel: ObservableObject {
     @Published public var isActiveThreadsSelected: Bool = false
     /// True while the main content pane shows Bots (not a workspace).
     @Published public var isBotsSelected: Bool = false
+    /// True while the main content pane shows Settings (not a workspace).
+    @Published public var isSettingsSelected: Bool = false
     /// Host-authoritative active agent thread count for the sidebar badge.
     @Published public private(set) var activeThreadCount: Int = 0
     @Published private(set) var activityCounts = PetActivityCounts.zero
@@ -876,8 +878,10 @@ public final class SidebarViewModel: ObservableObject {
             // Titio, pinned, user drag order, then most recent.
             let bots = BotOrdering.sorted(try botStore.list(includeHidden: includeHidden))
             var general: [GeneralBotRow] = []
+            var workspaceBots: [WorkspaceID: [BotDefinition]] = [:]
             for bot in bots {
                 let bindings = try botStore.listContextBindings(hostID: hostID, botID: bot.id)
+                if let workspaceID = Self.sidebarWorkspace(for: bot, bindings: bindings) { workspaceBots[workspaceID, default: []].append(bot) }
                 // Any workspace binding, even revoked, means the Bot was scoped: revoking must not move it to General.
                 let workspaceScoped = bindings.contains { workspaceID(for: $0.context) != nil }
                 let generalReadable = bindings.contains { $0.context == .general && $0.state == .active && $0.actions.contains(.read) }
@@ -903,6 +907,18 @@ public final class SidebarViewModel: ObservableObject {
                         continue
                     }
                     rows.append(WorkspaceConversationRow(threadID: thread.id, workspaceID: workspaceID, title: thread.title, botID: thread.actor.botID, updatedAt: thread.updatedAt))
+                }
+                let scopedBots = workspaceBots[workspaceID] ?? []
+                if !scopedBots.isEmpty {
+                    for bot in scopedBots {
+                        rows += try Self.unpinnedBotRows(bot: bot, workspaceID: workspaceID, botStore: botStore, threadRepo: threadRepo)
+                    }
+                    rows.sort { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id < $1.id }
+                    var capped: [WorkspaceConversationRow] = []
+                    for row in rows where capped.count < Self.workspaceConversationLoadLimit || keepUntitled.contains(row.threadID) {
+                        capped.append(row)
+                    }
+                    rows = capped
                 }
                 conversations[workspaceID] = rows
             }
@@ -1243,6 +1259,20 @@ public final class SidebarViewModel: ObservableObject {
                 reloadAuthorizedBotConversationRows()
                 return
             }
+            createBotConversation(row)
+        } catch {
+            showOperationError("Could not start conversation", detail: error.localizedDescription)
+        }
+    }
+
+    /// Starts a new conversation with the Bot even when one is already running (sidebar "New conversation" menu).
+    public func startNewBotConversation(_ row: AuthorizedBotConversationRow) {
+        finishedBotIDs.remove(row.botID)
+        createBotConversation(row)
+    }
+
+    private func createBotConversation(_ row: AuthorizedBotConversationRow) {
+        do {
             guard let router, try router.openBotsDesk(botID: row.botID),
                   let botsViewModel = router.botsViewModel,
                   botsViewModel.createDeskThread(in: row.context) else {
@@ -1342,6 +1372,33 @@ public final class SidebarViewModel: ObservableObject {
         return nil
     }
 
+    /// The workspace whose Conversations list a Bot's unpinned conversations: its own `workspaceID`
+    /// when actively readable there, else the first readable workspace by UUID string. Nil when none.
+    nonisolated static func sidebarWorkspace(for bot: BotDefinition, bindings: [BotContextBinding]) -> WorkspaceID? {
+        let readable = bindings.compactMap { binding -> WorkspaceID? in
+            guard binding.state == .active, binding.actions.contains(.read) else { return nil }
+            return workspaceID(for: binding.context)
+        }
+        if let own = bot.workspaceID, readable.contains(own) { return own }
+        return readable.min { $0.value.uuidString < $1.value.uuidString }
+    }
+
+    /// A Bot's conversations that no context pin lists: plain threads it started (Desk first send,
+    /// scheduled run, remote). Hidden, grouped and foreign-owned threads are excluded.
+    nonisolated private static func unpinnedBotRows(
+        bot: BotDefinition, workspaceID: WorkspaceID, botStore: BotStore, threadRepo: AgentThreadRepository
+    ) throws -> [WorkspaceConversationRow] {
+        try botStore.listConversations(botID: bot.id).compactMap { conversation -> WorkspaceConversationRow? in
+            guard !conversation.hidden, conversation.groupID == nil,
+                  let threadID = conversation.linkedAgentThreadID,
+                  try botStore.conversationContextPin(linkedTo: threadID) == nil,
+                  let thread = try threadRepo.get(id: threadID),
+                  thread.workspaceId == nil, !thread.isEphemeral, thread.parentThreadId == nil,
+                  thread.actor == .bot(bot.id) else { return nil }
+            return WorkspaceConversationRow(threadID: threadID, workspaceID: workspaceID, title: thread.title, botID: bot.id, updatedAt: thread.updatedAt)
+        }
+    }
+
     public func openAuthorizedBotConversation(_ row: AuthorizedBotConversationRow) {
         newBotConversationThreadID = nil
         finishedBotIDs.remove(row.botID)
@@ -1382,7 +1439,7 @@ public final class SidebarViewModel: ObservableObject {
         // selected this tick is correctly treated as "being viewed" (no dot).
         // While a shell destination owns the main content, keep every workspace
         // row deselected so the destination is unambiguous.
-        let shellDestinationSelected = isScheduledTasksSelected || isActiveThreadsSelected || isBotsSelected
+        let shellDestinationSelected = isScheduledTasksSelected || isActiveThreadsSelected || isBotsSelected || isSettingsSelected
         if shellDestinationSelected {
             if selectedWorkspaceID != nil { selectedWorkspaceID = nil }
             if !selectedWorkspaceIDs.isEmpty { selectedWorkspaceIDs.removeAll() }
@@ -1666,6 +1723,7 @@ public final class SidebarViewModel: ObservableObject {
         isScheduledTasksSelected = false
         isActiveThreadsSelected = false
         isBotsSelected = false
+        isSettingsSelected = false
         // UX-SIDEBAR-COMPLETED-DOT: opening a workspace clears its completed dot.
         completedWorkspaces.remove(wid)
         if !expandedWorkspaceIDs.contains(wid) {
@@ -2627,14 +2685,20 @@ public struct SidebarRootView: View {
 
                 Button(action: onOpenSettings) {
                     Image(systemName: "gearshape")
-                        .font(.system(size: 15, weight: .regular))
-                        .foregroundColor(DS.Palette.textSecondary)
+                        .font(.system(size: 15, weight: vm.isSettingsSelected ? .semibold : .regular))
+                        .foregroundColor(vm.isSettingsSelected ? DS.Palette.accent : DS.Palette.textSecondary)
                         .frame(width: 28, height: 32)
                         .contentShape(Rectangle())
+                        .background(
+                            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                .fill(vm.isSettingsSelected ? DS.Palette.selection : Color.clear)
+                        )
                 }
                 .buttonStyle(.plain)
                 .help("Settings")
                 .accessibilityLabel("Settings")
+                .accessibilityIdentifier("sidebar.settings")
+                .accessibilityAddTraits(vm.isSettingsSelected ? .isSelected : [])
 
                 // Account usage sits left of the avatar it describes.
                 AccountUsageSidebarControl(vm: vm, onOpenAccount: onOpenAccount)
@@ -3557,7 +3621,26 @@ public struct SidebarRootView: View {
         }
         if !vm.isWorkspaceSectionCollapsed(ws.id, .conversations) {
         if vm.showsNewConversation(ws.id) {
-            Button { navigate { vm.newWorkspaceConversation(in: ws.id) } } label: {
+            Menu {
+                Button { navigate { vm.newWorkspaceConversation(in: ws.id) } } label: {
+                    Label("No Bot", systemImage: "person.fill")
+                }
+                let bots = vm.workspaceBotRows(ws.id)
+                if bots.isEmpty {
+                    Text("No bots in this workspace").disabled(true)
+                } else {
+                    Divider()
+                    ForEach(bots) { row in
+                        Button { navigate { vm.startNewBotConversation(row) } } label: {
+                            Label(row.botName, systemImage: "cpu")
+                        }
+                    }
+                }
+                Divider()
+                Button { navigate { vm.addBot(inWorkspace: ws.id) } } label: {
+                    Text("New bot…")
+                }
+            } label: {
                 HStack(spacing: DS.Space.sm) {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .regular))
@@ -3571,7 +3654,9 @@ public struct SidebarRootView: View {
                 .frame(height: 30)
                 .contentShape(Rectangle())
             }
+            .menuStyle(.button)
             .buttonStyle(.plain)
+            .menuIndicator(.hidden)
             .help("Start a new conversation in \(ws.name)")
             .accessibilityIdentifier("sidebar.newConversation.\(ws.id.value.uuidString)")
         }
@@ -4268,6 +4353,8 @@ public final class SidebarView: NSObject {
     public var onPresentScheduledTasks: (() -> Void)?
     /// Main window mounts Active Threads in the workspace content column.
     public var onPresentActiveThreads: (() -> Void)?
+    /// Main window mounts Settings in the workspace content column.
+    public var onPresentSettings: (() -> Void)?
     /// Fired when a workspace is selected so main content leaves shell destinations.
     public var onWorkspaceContentActivated: (() -> Void)? {
         get { viewModel.onWorkspaceContentActivated }
@@ -4326,6 +4413,7 @@ public final class SidebarView: NSObject {
         if selected {
             viewModel.isActiveThreadsSelected = false
             viewModel.isBotsSelected = false
+            viewModel.isSettingsSelected = false
             // Visual deselect of all workspace rows while Schedule Tasks is active.
             viewModel.selectedWorkspaceID = nil
             viewModel.selectedWorkspaceIDs.removeAll()
@@ -4342,6 +4430,7 @@ public final class SidebarView: NSObject {
         if selected {
             viewModel.isScheduledTasksSelected = false
             viewModel.isBotsSelected = false
+            viewModel.isSettingsSelected = false
             viewModel.selectedWorkspaceID = nil
             viewModel.selectedWorkspaceIDs.removeAll()
             viewModel.clearSelectionAnchorForShellDestination()
@@ -4353,6 +4442,19 @@ public final class SidebarView: NSObject {
         if selected {
             viewModel.isScheduledTasksSelected = false
             viewModel.isActiveThreadsSelected = false
+            viewModel.isSettingsSelected = false
+            viewModel.selectedWorkspaceID = nil
+            viewModel.selectedWorkspaceIDs.removeAll()
+            viewModel.clearSelectionAnchorForShellDestination()
+        }
+    }
+
+    public func setSettingsSelected(_ selected: Bool) {
+        viewModel.isSettingsSelected = selected
+        if selected {
+            viewModel.isScheduledTasksSelected = false
+            viewModel.isActiveThreadsSelected = false
+            viewModel.isBotsSelected = false
             viewModel.selectedWorkspaceID = nil
             viewModel.selectedWorkspaceIDs.removeAll()
             viewModel.clearSelectionAnchorForShellDestination()
@@ -4380,6 +4482,10 @@ public final class SidebarView: NSObject {
     }
 
     @objc private func showSettings() {
+        if let onPresentSettings {
+            onPresentSettings()
+            return
+        }
         guard let context else { return }
         // Defer hydration to the post-commit freshness pass so the first
         // click paints the window immediately (AGENTS.md loading rule).

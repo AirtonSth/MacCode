@@ -508,7 +508,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Accounts & Auto lives in Settings; the Agent App's empty state links there.
     private var openAccountsSettings: (() -> Void)? {
         guard context != nil else { return nil }
-        return {
+        return { [weak self] in
+            if let windowController = self?.windowController {
+                windowController.presentSettingsInMainContent(route: .accounts)
+                return
+            }
             guard let settings = (NSApp.delegate as? AppDelegate)?.settings else { return }
             settings.show(route: .accounts)
         }

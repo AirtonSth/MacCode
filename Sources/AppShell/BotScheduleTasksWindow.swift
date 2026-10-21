@@ -75,11 +75,52 @@ public struct BotScheduleTaskDraft: Identifiable, Equatable {
     }
 }
 
+/// Pure seams for the bot-scoped Schedule Tasks screen.
+enum BotScheduleScope {
+    static func items(_ items: [BotScheduleTaskItem], botID: BotID) -> [BotScheduleTaskItem] {
+        items.filter { $0.botID == botID }
+    }
+
+    /// Counts over the search-filtered, status-unfiltered set, matching the global `applyScheduleTaskFilters`.
+    static func counts(_ items: [BotScheduleTaskItem], query: String) -> (all: Int, active: Int, paused: Int) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let searched = trimmed.isEmpty ? items : items.filter { item in
+            [item.name, item.botName, item.prompt, item.scheduleNote]
+                .contains { $0.range(of: trimmed, options: .caseInsensitive) != nil }
+        }
+        let active = searched.filter(\.isEnabled).count
+        return (searched.count, active, searched.count - active)
+    }
+
+    /// Search + status filter over one bot's routines, same rules as the global list.
+    static func visible(_ items: [BotScheduleTaskItem], query: String, filter: ScheduledTaskStatusFilter) -> [BotScheduleTaskItem] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let searched = trimmed.isEmpty ? items : items.filter { item in
+            [item.name, item.botName, item.prompt, item.scheduleNote]
+                .contains { $0.range(of: trimmed, options: .caseInsensitive) != nil }
+        }
+        switch filter {
+        case .all: return searched
+        case .active: return searched.filter(\.isEnabled)
+        case .paused: return searched.filter { !$0.isEnabled }
+        }
+    }
+
+    static func footerLine(all: Int, active: Int) -> String {
+        let tasks = all == 1 ? "1 task" : "\(all) tasks"
+        let live = active == 1 ? "1 active" : "\(active) active"
+        return "\(tasks) · \(live)"
+    }
+}
+
 public struct BotScheduleTasksRootView: View {
     @ObservedObject private var vm: BotsViewModel
+    private let scopeBotID: BotID?
+    @State private var scopedSource: [BotScheduleTaskItem] = []
 
-    public init(vm: BotsViewModel) {
+    public init(vm: BotsViewModel, scopeBotID: BotID? = nil) {
         self.vm = vm
+        self.scopeBotID = scopeBotID
     }
 
     public var body: some View {
@@ -95,7 +136,40 @@ public struct BotScheduleTasksRootView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DS.Palette.bg)
         .accessibilityIdentifier("bots.scheduleTasks.screen")
-        .onAppear { vm.scheduleFreshnessPass() }
+        .onAppear {
+            vm.scheduleFreshnessPass()
+            reloadScopedSource()
+        }
+        .onChange(of: vm.scheduleTaskItems) { _ in reloadScopedSource() }
+        .onChange(of: vm.routines.map(\.definition)) { _ in reloadScopedSource() }
+    }
+
+    private var visibleItems: [BotScheduleTaskItem] {
+        guard scopeBotID != nil else { return vm.scheduleTaskItems }
+        return BotScheduleScope.visible(scopedSource, query: vm.scheduleTaskSearchText, filter: vm.scheduleTaskStatusFilter)
+    }
+
+    private var chipCounts: (all: Int, active: Int, paused: Int) {
+        guard scopeBotID != nil else { return vm.scheduleTaskFilterCounts }
+        return BotScheduleScope.counts(scopedSource, query: vm.scheduleTaskSearchText)
+    }
+
+    /// Reads the bot's routines from the store so chip counts see the unfiltered set.
+    private func reloadScopedSource() {
+        guard let scopeBotID else { return }
+        let routines = (try? vm.executionDestinationStore.listRoutines(botID: scopeBotID)) ?? []
+        guard let bot = vm.fleet.first(where: { $0.id == scopeBotID }) else {
+            scopedSource = []
+            return
+        }
+        scopedSource = routines.map { BotScheduleTaskItem(routine: $0, bot: bot) }
+    }
+
+    private var subtitle: String {
+        if scopeBotID != nil, vm.isAutonomyActive {
+            return "Tasks this bot runs automatically while MacCode is open"
+        }
+        return vm.scheduleTasksSubtitle
     }
 
     private var overviewScreen: some View {
@@ -105,14 +179,18 @@ public struct BotScheduleTasksRootView: View {
                     Text("Scheduled Tasks")
                         .font(DS.Font.title.weight(.semibold))
                         .foregroundColor(DS.Palette.text)
-                    Text(vm.scheduleTasksSubtitle)
+                    Text(subtitle)
                         .font(DS.Font.body)
                         .foregroundColor(vm.isAutonomyActive ? DS.Palette.textSecondary : DS.Palette.warning)
                 }
                 Spacer(minLength: DS.Space.lg)
                 HStack(spacing: DS.Space.md) {
                     Button {
-                        vm.createScheduleTask()
+                        if let scopeBotID {
+                            vm.scheduleTaskDraft = BotScheduleTaskDraft(botID: scopeBotID)
+                        } else {
+                            vm.createScheduleTask()
+                        }
                     } label: {
                         Label("New Task", systemImage: "plus")
                     }
@@ -135,19 +213,37 @@ public struct BotScheduleTasksRootView: View {
             .padding(.horizontal, DS.Space.xxl)
             .padding(.bottom, DS.Space.xl)
 
-            if vm.scheduleTaskItems.isEmpty {
-                DSEmptyState(
-                    icon: "calendar.badge.clock",
-                    title: vm.scheduleTaskSearchText.isEmpty ? "No scheduled tasks" : "No matching tasks",
-                    subtitle: vm.scheduleTaskSearchText.isEmpty
-                        ? "Create a task to run a bot automatically while MacCode is open."
-                        : "Try another search or clear the status filter."
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if visibleItems.isEmpty {
+                if scopeBotID != nil, scopedSource.isEmpty {
+                    DSEmptyState(
+                        icon: "calendar.badge.clock",
+                        title: "No scheduled tasks yet",
+                        subtitle: "Create a task to have this bot work on a schedule."
+                    ) {
+                        Button {
+                            if let scopeBotID {
+                                vm.scheduleTaskDraft = BotScheduleTaskDraft(botID: scopeBotID)
+                            }
+                        } label: {
+                            Label("New Task", systemImage: "plus")
+                        }
+                        .buttonStyle(DSPrimaryButtonStyle())
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    DSEmptyState(
+                        icon: "calendar.badge.clock",
+                        title: vm.scheduleTaskSearchText.isEmpty ? "No scheduled tasks" : "No matching tasks",
+                        subtitle: vm.scheduleTaskSearchText.isEmpty
+                            ? "Create a task to run a bot automatically while MacCode is open."
+                            : "Try another search or clear the status filter."
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             } else {
                 ScrollView {
                     LazyVStack(spacing: DS.Space.md) {
-                        ForEach(vm.scheduleTaskItems) { item in
+                        ForEach(visibleItems) { item in
                             BotScheduleTaskCard(
                                 item: item,
                                 isAutonomyActive: vm.isAutonomyActive,
@@ -181,19 +277,19 @@ public struct BotScheduleTasksRootView: View {
         HStack(spacing: DS.Space.sm) {
             AgentListFilterChip(
                 title: ScheduledTaskStatusFilter.all.rawValue,
-                count: vm.scheduleTaskFilterCounts.all,
+                count: chipCounts.all,
                 selected: vm.scheduleTaskStatusFilter == .all,
                 identifier: "bots.scheduleTasks.filter.all"
             ) { vm.scheduleTaskStatusFilter = .all }
             AgentListFilterChip(
                 title: ScheduledTaskStatusFilter.active.rawValue,
-                count: vm.scheduleTaskFilterCounts.active,
+                count: chipCounts.active,
                 selected: vm.scheduleTaskStatusFilter == .active,
                 identifier: "bots.scheduleTasks.filter.active"
             ) { vm.scheduleTaskStatusFilter = .active }
             AgentListFilterChip(
                 title: ScheduledTaskStatusFilter.paused.rawValue,
-                count: vm.scheduleTaskFilterCounts.paused,
+                count: chipCounts.paused,
                 selected: vm.scheduleTaskStatusFilter == .paused,
                 identifier: "bots.scheduleTasks.filter.paused"
             ) { vm.scheduleTaskStatusFilter = .paused }
@@ -213,11 +309,17 @@ public struct BotScheduleTasksRootView: View {
 
     private var footerBar: some View {
         AgentListFooterBar(
-            caption: vm.scheduleTasksFooterLine,
+            caption: footerCaption,
             pillTitle: vm.isAutonomyActive ? "Scheduler online" : "Scheduler paused",
             pillTone: vm.isAutonomyActive ? .success : .warning
         )
-        .accessibilityLabel(vm.scheduleTasksFooterLine)
+        .accessibilityLabel(footerCaption)
+    }
+
+    private var footerCaption: String {
+        guard scopeBotID != nil else { return vm.scheduleTasksFooterLine }
+        let counts = chipCounts
+        return BotScheduleScope.footerLine(all: counts.all, active: counts.active)
     }
 
     @ViewBuilder

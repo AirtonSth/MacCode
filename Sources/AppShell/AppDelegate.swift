@@ -252,6 +252,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         router = AppCommandRouter(context: context)
         context.router = router
         context.distillAccountsController.ensureDistillInstalled()
+        DistillAutoGuideSheet.installFactory(context: context)
 
         // Wire EventBus to the persisted event log so events survive restart.
         // Encoding + SQLite run on AppContext's serial writer queue; publish
@@ -510,7 +511,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 context: context,
                 router: router,
                 openSettings: { [weak self] route in
-                    guard let self, let settings = self.settings else { return false }
+                    guard let self else { return false }
+                    if let windowController = self.windowController {
+                        windowController.presentSettingsInMainContent(route: route)
+                        return true
+                    }
+                    guard let settings = self.settings else { return false }
                     if let window = self.windowController?.window {
                         return settings.show(route: route, attachedTo: window)
                     }
@@ -1849,6 +1855,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     @objc private func showSettings() {
+        if let windowController {
+            windowController.presentSettingsInMainContent()
+            return
+        }
         if let window = windowController?.window {
             settings?.show(attachedTo: window)
         } else {
