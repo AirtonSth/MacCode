@@ -14360,8 +14360,7 @@ public struct BotsRootView: View {
             // Same copy as the linked thread's empty state, which is rarely
             // painted: a thread is linked by its first message.
             if vm.deskMessages.isEmpty {
-                DSEmptyState(
-                    icon: "sparkles",
+                AgentNewConversationEmptyState(
                     title: "Message \(BotsViewModel.displayName(bot.name))",
                     subtitle: "This thread has no messages yet."
                 )

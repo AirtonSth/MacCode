@@ -749,6 +749,7 @@ public struct AgentDistillModelPills<StatusHeader: View, MainFooter: View>: View
                 customMainModels: customMainModels,
                 mainEffortSelection: mainEffortSelection,
                 mainEfforts: mainEfforts,
+                supportsMainEffortAuto: supportsMainEffortAuto,
                 mainUnavailable: mainUnavailable,
                 isRunning: isRunning,
                 isDisabled: isDisabled,
@@ -826,8 +827,8 @@ private func agentDistillProviderIcon(_ provider: String) -> String {
     }
 }
 
-private func agentDistillEffortOptions(_ efforts: [AgentReasoningEffort]) -> [(value: AgentEffortSelection, title: String, help: String?)] {
-    [(value: AgentEffortSelection.automatic, title: "Auto", help: nil)] + AgentEffortChipRow.ordered(efforts).map {
+private func agentDistillEffortOptions(_ efforts: [AgentReasoningEffort], includesAuto: Bool = true) -> [(value: AgentEffortSelection, title: String, help: String?)] {
+    (includesAuto ? [(value: AgentEffortSelection.automatic, title: "Auto", help: nil)] : []) + AgentEffortChipRow.ordered(efforts).map {
         (value: AgentEffortSelection.fixed($0), title: $0.displayName, help: $0.pickerHelpText)
     }
 }
@@ -915,12 +916,67 @@ private struct AgentDistillChoiceGrid: View {
     }
 }
 
+/// Second step after picking a model: choose its effort, then the sheet closes.
+private struct AgentDistillEffortStep: View {
+    let efforts: [AgentReasoningEffort]
+    let selection: AgentEffortSelection
+    let isDisabled: Bool
+    let identifierPrefix: String
+    let includesAuto: Bool
+    let onSelect: (AgentEffortSelection) -> Void
+
+    /// Blue (lightest) to red (deepest) across whatever levels the model advertises.
+    private func tint(_ effort: AgentReasoningEffort) -> Color {
+        let ordered = AgentEffortChipRow.ordered(efforts)
+        guard ordered.count > 1, let i = ordered.firstIndex(of: effort) else { return Color(hue: 0.6, saturation: 0.7, brightness: 0.95) }
+        let t = Double(i) / Double(ordered.count - 1)
+        return Color(hue: 0.6 * (1 - t), saturation: 0.75, brightness: 0.95)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            ForEach(agentDistillEffortOptions(efforts, includesAuto: includesAuto), id: \.title) { option in
+                AgentChoiceCard(
+                    title: option.title,
+                    subtitle: option.value.isAutomatic ? "Let the model decide how long to think." : option.help,
+                    selected: option.value == selection,
+                    tint: option.value.effort.map(tint) ?? DS.Palette.ultracode,
+                    disabledReason: agentDistillDisabledReason(isDisabled),
+                    accessibilityIdentifier: "\(identifierPrefix).\(option.title.lowercased())",
+                    action: { onSelect(option.value) }
+                ) {
+                    AgentChoiceIconTile(systemName: option.value.isAutomatic ? "wand.and.stars" : "speedometer",
+                                        tint: option.value.effort.map(tint) ?? DS.Palette.ultracode, size: 30)
+                }
+            }
+            if let effort = selection.effort, !efforts.isEmpty, !efforts.contains(effort) {
+                AgentChoiceCallout(
+                    icon: "exclamationmark.triangle.fill",
+                    tint: DS.Palette.warning,
+                    text: "Selected effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level."
+                )
+            }
+        }
+    }
+}
+
+private struct AgentDistillEffortTarget: Equatable {
+    let modelTitle: String
+    let efforts: [AgentReasoningEffort]
+}
+
+private func agentDistillBackToModels(_ action: @escaping () -> Void) -> some View {
+    Button(action: action) { Label("Back to models", systemImage: "chevron.left") }
+        .buttonStyle(.borderless)
+}
+
 private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>: View {
     let mainModel: String
     let mainModels: [AgentModelDescriptor]
     let customMainModels: [String]
     let mainEffortSelection: AgentEffortSelection
     let mainEfforts: [AgentReasoningEffort]
+    let supportsMainEffortAuto: Bool
     let mainUnavailable: Bool
     let isRunning: Bool
     let isDisabled: Bool
@@ -933,6 +989,7 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
     let onSelectCustomMainModel: (String) -> Void
     let onSelectMainEffort: (AgentEffortSelection) -> Void
     let close: () -> Void
+    @State private var effortTarget: AgentDistillEffortTarget?
 
     private var models: [AgentModelDescriptor] {
         AgentDistillModelCatalog.selectableModels(mainModels).filter { $0.id != "auto" }
@@ -944,16 +1001,29 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
 
     var body: some View {
         AgentChoiceSheet(
-            icon: showingAutoGuide ? "sparkles" : "cpu",
+            icon: showingAutoGuide ? "sparkles" : (effortTarget != nil ? "speedometer" : "cpu"),
             tint: showingAutoGuide ? DS.Palette.ultracode : DS.Palette.accent,
-            title: showingAutoGuide ? AgentAutoGuide.title : "Main model",
-            subtitle: showingAutoGuide ? AgentAutoGuide.subtitle : "Leads the conversation: plans, reviews and answers.",
+            title: showingAutoGuide ? AgentAutoGuide.title : (effortTarget != nil ? "Main effort" : "Main model"),
+            subtitle: showingAutoGuide ? AgentAutoGuide.subtitle
+                : (effortTarget.map { "\($0.modelTitle) · how much it thinks before answering." } ?? "Leads the conversation: plans, reviews and answers."),
             width: 600,
             accessibilityIdentifier: identifier,
             onClose: close
         ) {
             if showingAutoGuide, let makeGuide = AgentAutoGuide.makeGuide {
                 makeGuide(close)
+            } else if let target = effortTarget {
+                AgentDistillEffortStep(
+                    efforts: target.efforts,
+                    selection: mainEffortSelection,
+                    isDisabled: isDisabled,
+                    identifierPrefix: "agent.distill.mainEffort",
+                    includesAuto: supportsMainEffortAuto,
+                    onSelect: { selection in
+                        onSelectMainEffort(selection)
+                        close()
+                    }
+                )
             } else {
                 if isRunning {
                     AgentChoiceCallout(icon: "info.circle", tint: DS.Palette.textSecondary, text: "Read-only while a run is active.")
@@ -970,16 +1040,16 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
                     )
                 }
                 modelsSection
-                effortSection
+                if mainModel != "auto", !currentModelEfforts.isEmpty {
+                    effortSummaryRow
+                }
             }
         } footer: {
             if showingAutoGuide {
-                Button {
-                    showingAutoGuide = false
-                } label: {
-                    Label("Back to models", systemImage: "chevron.left")
-                }
-                .buttonStyle(.borderless)
+                agentDistillBackToModels { showingAutoGuide = false }
+                Spacer()
+            } else if effortTarget != nil {
+                agentDistillBackToModels { effortTarget = nil }
                 Spacer()
             }
             agentDistillDoneButton(close)
@@ -1028,7 +1098,16 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
             searchIdentifier: "agent.distill.mainModel.search",
             onSelectModel: { id in
                 onSelectMainModel(id)
-                close()
+                let descriptor = models.first { $0.id == id }
+                let efforts = descriptor?.supportedReasoningEfforts ?? []
+                if efforts.isEmpty {
+                    close()
+                } else {
+                    effortTarget = AgentDistillEffortTarget(
+                        modelTitle: AgentDistillModelCatalog.shortLabel(descriptor?.label ?? id),
+                        efforts: efforts
+                    )
+                }
             },
             onSelectCustomModel: { model in
                 onSelectCustomMainModel(model)
@@ -1038,21 +1117,32 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
         mainFooter
     }
 
-    @ViewBuilder
-    private var effortSection: some View {
-        AgentChoiceSectionHeader("Effort")
-        AgentChoiceSegmented(
-            options: agentDistillEffortOptions(mainEfforts),
-            selection: mainEffortSelection,
-            disabled: isDisabled,
-            onSelect: onSelectMainEffort
-        )
-        if let effort = mainEffortSelection.effort, !mainEfforts.isEmpty, !mainEfforts.contains(effort) {
-            AgentChoiceCallout(
-                icon: "exclamationmark.triangle.fill",
-                tint: DS.Palette.warning,
-                text: "Selected Main effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level."
-            )
+    /// Efforts advertised by the selected model's own descriptor.
+    private var currentModelEfforts: [AgentReasoningEffort] {
+        mainModels.first { $0.id == mainModel }?.supportedReasoningEfforts ?? []
+    }
+
+    private var effortSummaryRow: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            AgentChoiceSectionHeader("Effort")
+            AgentChoiceCard(
+                title: "Main effort",
+                subtitle: "Change how much the selected model thinks.",
+                badge: mainEffortSelection.pickerDisplayName,
+                selected: false,
+                disabledReason: agentDistillDisabledReason(isDisabled),
+                accessibilityIdentifier: "agent.distill.mainEffort.change",
+                action: {
+                    effortTarget = AgentDistillEffortTarget(
+                        modelTitle: AgentDistillModelCatalog.shortLabel(
+                            mainModels.first { $0.id == mainModel }?.label ?? mainModel
+                        ),
+                        efforts: currentModelEfforts
+                    )
+                }
+            ) {
+                AgentChoiceIconTile(systemName: "speedometer", size: 30)
+            }
         }
     }
 
@@ -1083,6 +1173,7 @@ private struct AgentDistillWorkerModelSheet<StatusHeader: View>: View {
     let onSelectWorkerModel: (String?) -> Void
     let onSelectWorkerEffort: (AgentEffortSelection) -> Void
     let close: () -> Void
+    @State private var effortTarget: AgentDistillEffortTarget?
 
     private var models: [AgentModelDescriptor] {
         AgentDistillModelCatalog.concreteWorkerModels(reasoningModels)
@@ -1094,16 +1185,29 @@ private struct AgentDistillWorkerModelSheet<StatusHeader: View>: View {
 
     var body: some View {
         AgentChoiceSheet(
-            icon: showingAutoGuide ? "sparkles" : "person.2.wave.2",
+            icon: showingAutoGuide ? "sparkles" : (effortTarget != nil ? "speedometer" : "person.2.wave.2"),
             tint: showingAutoGuide ? DS.Palette.ultracode : DS.Palette.accent,
-            title: showingAutoGuide ? AgentAutoGuide.title : "Worker model",
-            subtitle: showingAutoGuide ? AgentAutoGuide.subtitle : "Runs the tasks Main delegates.",
+            title: showingAutoGuide ? AgentAutoGuide.title : (effortTarget != nil ? "Worker effort" : "Worker model"),
+            subtitle: showingAutoGuide ? AgentAutoGuide.subtitle
+                : (effortTarget.map { "\($0.modelTitle) · how much it thinks before answering." } ?? "Runs the tasks Main delegates."),
             width: 600,
             accessibilityIdentifier: identifier,
             onClose: close
         ) {
             if showingAutoGuide, let makeGuide = AgentAutoGuide.makeGuide {
                 makeGuide(close)
+            } else if let target = effortTarget {
+                AgentDistillEffortStep(
+                    efforts: target.efforts,
+                    selection: reasoningEffortSelection,
+                    isDisabled: isDisabled,
+                    identifierPrefix: "agent.distill.reasoningEffort",
+                    includesAuto: true,
+                    onSelect: { selection in
+                        onSelectWorkerEffort(selection)
+                        close()
+                    }
+                )
             } else {
                 if isRunning {
                     AgentChoiceCallout(icon: "info.circle", tint: DS.Palette.textSecondary, text: "Read-only while a run is active.")
@@ -1126,12 +1230,10 @@ private struct AgentDistillWorkerModelSheet<StatusHeader: View>: View {
             }
         } footer: {
             if showingAutoGuide {
-                Button {
-                    showingAutoGuide = false
-                } label: {
-                    Label("Back to models", systemImage: "chevron.left")
-                }
-                .buttonStyle(.borderless)
+                agentDistillBackToModels { showingAutoGuide = false }
+                Spacer()
+            } else if effortTarget != nil {
+                agentDistillBackToModels { effortTarget = nil }
                 Spacer()
             }
             agentDistillDoneButton(close)
@@ -1187,24 +1289,38 @@ private struct AgentDistillWorkerModelSheet<StatusHeader: View>: View {
             searchIdentifier: "agent.distill.reasoningModel.search",
             onSelectModel: { id in
                 onSelectWorkerModel(id)
-                close()
+                let descriptor = models.first { $0.id == id }
+                let efforts = descriptor?.supportedReasoningEfforts ?? []
+                if !supportsReasoningModelEffort || efforts.isEmpty {
+                    close()
+                } else {
+                    effortTarget = AgentDistillEffortTarget(
+                        modelTitle: AgentDistillModelCatalog.shortLabel(descriptor?.label ?? id),
+                        efforts: efforts
+                    )
+                }
             },
             onSelectCustomModel: { _ in }
         )
-        if supportsReasoningModelEffort, reasoningModel != nil {
-            AgentChoiceSectionHeader("Worker effort")
-            AgentChoiceSegmented(
-                options: agentDistillEffortOptions(reasoningEfforts),
-                selection: reasoningEffortSelection,
-                disabled: isDisabled,
-                onSelect: onSelectWorkerEffort
-            )
-            if let effort = reasoningEffortSelection.effort, !reasoningEfforts.isEmpty, !reasoningEfforts.contains(effort) {
-                AgentChoiceCallout(
-                    icon: "exclamationmark.triangle.fill",
-                    tint: DS.Palette.warning,
-                    text: "Selected Worker effort \(effort.displayName) is unavailable for this model. Choose Auto or a supported level."
-                )
+        if supportsReasoningModelEffort, let reasoningModel, !reasoningEfforts.isEmpty {
+            AgentChoiceSectionHeader("Effort")
+            AgentChoiceCard(
+                title: "Worker effort",
+                subtitle: "Change how much the selected Worker thinks.",
+                badge: reasoningEffortSelection.pickerDisplayName,
+                selected: false,
+                disabledReason: agentDistillDisabledReason(isDisabled),
+                accessibilityIdentifier: "agent.distill.reasoningEffort.change",
+                action: {
+                    effortTarget = AgentDistillEffortTarget(
+                        modelTitle: AgentDistillModelCatalog.shortLabel(
+                            models.first { $0.id == reasoningModel }?.label ?? reasoningModel
+                        ),
+                        efforts: reasoningEfforts
+                    )
+                }
+            ) {
+                AgentChoiceIconTile(systemName: "speedometer", size: 30)
             }
         }
     }

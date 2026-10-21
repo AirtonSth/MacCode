@@ -34,6 +34,17 @@ The user's running MacCode (`io.remotecode.desktop`) is off-limits. A git worktr
 - Do not touch `~/.remote-code/bin` or `~/.local/bin/distill` from the sandbox; keep `RC2_DISABLE_MANAGED_DISTILL_RECONCILE=1`.
 - Identity, ports, and App Support live in `scripts/isolated-sandbox.sh`. Ritual: `.grok/skills/isolated-sandbox/SKILL.md`.
 
+## Verify every change in the running sandbox app with mac-use (mandatory)
+
+Every change, however small, must be exercised in the real isolated debug app before you call it done. A green build or unit test does not count as verification of anything the user sees or does.
+
+- Rebuild and relaunch the isolated build from the linked worktree: `scripts/isolated-sandbox.sh run`. Never test against the user's `io.remotecode.desktop`.
+- Drive and observe the app with the mac-use MCP, targeting only the debug bundle `io.remotecode.desktop.debug` (exact `target_pid` and `target_window_id` from `list_windows`). Use `get_ui_tree` / `screenshot` and targeted AX actions (`click_element`); the state token changes after every observation, so act on the token the last call returned.
+- Exercise the changed behavior end to end the way a user would, then visit the other surfaces that share the touched state or components (e.g. Agent App and Bot Desk) and look for regressions.
+- Follow the macOS UI automation lease rules below: read-only observation by default; input-producing automation only via `scripts/macos-ui-lease.sh --allow-input` for one bounded, reversible E2E.
+- Clean up what you start: stop the sandbox app you launched with `scripts/isolated-sandbox.sh stop`, and release mac-use sessions or recordings you created.
+- Report what you observed. If a path could not be exercised (for example it needs a native file picker or input that the lease forbids), say so explicitly and mark it unverified; never claim it was tested.
+
 ## macOS UI automation lease (mandatory)
 
 - macOS event posting is host-global even when a harness targets an app PID. Run every

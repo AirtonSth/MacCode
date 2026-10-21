@@ -17194,21 +17194,13 @@ public struct AgentAppView: View {
         if vm.selectedThreadIsEphemeral {
             sideChatEmptyConversation
         } else {
-            DSEmptyState(
-                icon: "sparkles",
+            AgentNewConversationEmptyState(
                 title: vm.embedding?.emptyConversationTitle ?? "No messages",
                 subtitle: vm.embedding?.emptyConversationSubtitle ?? "Start a new agent run."
-            ) {
-                if let openAccountsSettings {
-                    Button("Accounts & Auto", action: openAccountsSettings)
-                        .buttonStyle(.bordered).frame(minHeight: 44)
-                        .accessibilityIdentifier("agent.accounts.open.empty")
-                }
-            }
+            )
             .frame(maxWidth: .infinity, minHeight: 280, alignment: .center)
         }
     }
-
     private var sideChatEmptyConversation: some View {
         DSEmptyState(
             icon: "plus.circle",

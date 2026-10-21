@@ -90,6 +90,13 @@ struct DistillAutoGuideSheet: View {
 
     /// Installs the factory that the model sheet uses to render the Auto guide.
     @MainActor static func installFactory(context: AppContext) {
+        AgentAccountsInline.make = { [weak context] in
+            guard let context else { return AnyView(EmptyView()) }
+            return AnyView(DistillAccountsSettingsSection(
+                controller: context.distillAccountsController,
+                loadModels: { [weak context] in await context?.router?.listAgentModels(provider: .distill) ?? [] }
+            ))
+        }
         AgentAutoGuide.makeGuide = { [weak context] onClose in
             guard let context else { return AnyView(EmptyView()) }
             return AnyView(DistillAutoGuideSheet(

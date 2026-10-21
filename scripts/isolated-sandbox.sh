@@ -268,6 +268,17 @@ cmd_stop() {
   echo "[sandbox] stopped $executable"
 }
 
+# The sandbox HOME has no keychain, so any SecItemAdd (relay host key, bot secrets)
+# raises "Keychain Not Found". Give it a private, empty, unlocked login keychain.
+ensure_sandbox_keychain() {
+  local home="$1" kc
+  kc="$home/Library/Keychains/login.keychain-db"
+  mkdir -p "$home/Library/Keychains" "$home/Library/Preferences"
+  [ -f "$kc" ] || HOME="$home" CFFIXED_USER_HOME="$home" security create-keychain -p sandbox "$kc" >/dev/null
+  HOME="$home" CFFIXED_USER_HOME="$home" security set-keychain-settings "$kc" >/dev/null 2>&1 || true
+  HOME="$home" CFFIXED_USER_HOME="$home" security default-keychain -d user -s "$kc" >/dev/null
+}
+
 cmd_run() {
   cmd_build
   local executable support home log pid
@@ -278,6 +289,7 @@ cmd_run() {
   mkdir -p "$support" "$home/.codex" "$home/.claude" "$home/.grok" "$(repo_root)/.sandbox-state"
   log="$(repo_root)/.sandbox-state/RemoteCodeDebug.log"
   cmd_stop >/dev/null
+  ensure_sandbox_keychain "$home"
   HOME="$home" \
     CFFIXED_USER_HOME="$home" \
     CODEX_HOME="$home/.codex" \
