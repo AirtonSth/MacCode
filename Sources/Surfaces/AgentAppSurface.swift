@@ -8902,7 +8902,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if (text.hasPrefix("/") || text.hasPrefix("$")), handleSlashCommand(text) {
             return
         }
-        // One run per bot VM: a second thread queues behind the holder. A fresh thread
+        // A rebuild or stop holding the bot VM: the send queues behind it. A fresh thread
         // is created and its bot actor locked first so the drained message runs as the bot.
         let sendThread = sendThreadId.flatMap { id in threads.first(where: { $0.id == id }) }
         let sendActor: RunActor = sendThread?.actorLockedAt != nil ? (sendThread?.actor ?? .none) : selectedRunActor
@@ -8939,8 +8939,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// One run per bot VM: the send waits in the queue of the thread it was
-    /// sent for (`threadId`; nil = a fresh thread) behind the holder, even when
+    /// A rebuild or stop holds the bot VM: the send waits in the queue of the thread it was
+    /// sent for (`threadId`; nil = a fresh thread) behind it, even when
     /// the user switched threads meanwhile. A fresh thread is created and its
     /// bot actor locked first so the drained message runs as the bot.
     private func queueBehindBusyBotVM(
@@ -9556,8 +9556,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             statusMessage = ThreadActorAlreadyLockedError().errorDescription ?? ""
             return nil
         }
-        // D12: claim the bot's VM before any visible start effect. When another
-        // thread's run holds it, refuse so `send()` queues behind that run.
+        // D12: claim the bot's VM before any visible start effect. When a
+        // rebuild or stop holds it, refuse so `send()` queues behind it.
         var vmClaimRunId: AgentRunID?
         var vmRunStarted = false
         defer {

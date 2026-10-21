@@ -14,56 +14,85 @@ final class BotVMExecutionTests: XCTestCase {
         .init(threadID: threadA, runID: runA, title: "Tarefa A", workspace: workspace)
     }
 
-    func test_otherThreadSeesBusyMessageButOwnerDoesNot() {
-        // WHY: one VM runs one thread at a time; only a different thread must be queued.
-        let registry = BotVMRunRegistry()
-        registry.begin(botID: botID, entry: entry())
-        XCTAssertEqual(registry.busyMessage(botID: botID, threadID: threadB), "The VM is busy in Tarefa A")
-        XCTAssertNil(registry.busyMessage(botID: botID, threadID: threadA))
+    private func rebuild() -> BotVMRunRegistry.Entry {
+        .init(threadID: AgentThreadID(), runID: AgentRunID(), title: "Linux desktop rebuild", workspace: "", exclusive: true)
     }
 
-    func test_tryBeginGivesSecondThreadTheHolderAndSameThreadReclaims() {
-        // WHY: claim must be atomic so two threads can never both run on one bot VM.
+    func test_conversationsOnOneVMRunInParallel() {
+        // WHY: a bot VM has no parallelism limit; a second conversation must
+        // start at once instead of failing with "The VM is busy".
         let registry = BotVMRunRegistry()
         XCTAssertNil(registry.tryBegin(botID: botID, entry: entry()))
         let other = BotVMRunRegistry.Entry(threadID: threadB, runID: AgentRunID(), title: "B", workspace: workspace)
-        XCTAssertEqual(registry.tryBegin(botID: botID, entry: other), entry())
-        XCTAssertEqual(registry.active(botID: botID), entry())
-        let sameThread = BotVMRunRegistry.Entry(threadID: threadA, runID: AgentRunID(), title: "A", workspace: workspace)
-        XCTAssertNil(registry.tryBegin(botID: botID, entry: sameThread))
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: other))
+        let third = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "C", workspace: workspace)
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: third))
+        XCTAssertNil(registry.busyMessage(botID: botID, threadID: threadB))
+        XCTAssertEqual(registry.claim(botID: botID, threadID: threadB), other, "each run keeps its own workspace")
+        registry.endRun(runID: runA)
+        XCTAssertEqual(registry.active(botID: botID), other, "ending one run keeps the others")
+    }
+
+    func test_rebuildWaitsForEveryRunAndRunsWaitForTheRebuild() {
+        // WHY: a rebuild replaces the container, so it must never stop it
+        // under a running conversation, and no conversation may start on the
+        // old container while it builds.
+        let registry = BotVMRunRegistry()
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: entry()))
+        XCTAssertEqual(registry.tryBegin(botID: botID, entry: rebuild()), entry())
+        registry.endRun(runID: runA)
+        let build = rebuild()
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: build))
+        let other = BotVMRunRegistry.Entry(threadID: threadB, runID: AgentRunID(), title: "B", workspace: workspace)
+        XCTAssertEqual(registry.tryBegin(botID: botID, entry: other), build)
+        XCTAssertEqual(registry.busyMessage(botID: botID, threadID: threadB), "The VM is busy in Linux desktop rebuild")
+        registry.addWaiting(botID: botID, threadID: threadB)
+        XCTAssertNil(registry.popWaitingIfFree(botID: botID), "no hand-off while the rebuild holds the VM")
+        XCTAssertEqual(registry.releaseAndNextWaiting(runID: build.runID), threadB)
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: other))
+    }
+
+    func test_theRequestingThreadsOwnRunKeepsGoingDuringItsRebuild() {
+        // WHY: a bot's own agent rebuilds its VM mid-run; its claim must not
+        // block that rebuild, while other threads' runs still do.
+        let registry = BotVMRunRegistry()
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: entry()))
+        let own = BotVMRunRegistry.Entry(threadID: threadA, runID: AgentRunID(), title: "rebuild", workspace: "", exclusive: true)
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: own))
+        let other = BotVMRunRegistry.Entry(threadID: threadB, runID: AgentRunID(), title: "B", workspace: workspace)
+        XCTAssertEqual(registry.tryBegin(botID: botID, entry: other), own)
     }
 
     func test_anUnstartedSecondClaimOfTheSameThreadNeverFreesTheVMUnderTheRunThatStarted() {
-        // WHY (D12): two starts on one thread (router + tab, iOS + Mac) both
-        // claim. Whichever does not start releases its claim; that must not free
-        // the VM (and hand it to a waiter) while the other run is still running.
+        // WHY: two starts on one thread (router + tab, iOS + Mac) both claim.
+        // Whichever does not start releases its claim; that must not free the
+        // VM for a rebuild while the other run is still running.
         for startedFirst in [true, false] {
             let registry = BotVMRunRegistry()
             let first = entry()
             let second = BotVMRunRegistry.Entry(threadID: threadA, runID: AgentRunID(), title: "A", workspace: workspace)
             XCTAssertNil(registry.tryBegin(botID: botID, entry: first))
             XCTAssertNil(registry.tryBegin(botID: botID, entry: second))
-            registry.addWaiting(botID: botID, threadID: threadB)
             let (started, unstarted) = startedFirst ? (first, second) : (second, first)
-            XCTAssertNil(registry.releaseAndNextWaiting(runID: unstarted.runID), "no hand-off while a run holds the VM")
-            XCTAssertEqual(registry.busyMessage(botID: botID, threadID: threadB) != nil, true)
-            XCTAssertNil(registry.popWaitingIfFree(botID: botID))
-            XCTAssertEqual(registry.releaseAndNextWaiting(runID: started.runID), threadB)
+            _ = registry.releaseAndNextWaiting(runID: unstarted.runID)
+            XCTAssertEqual(registry.tryBegin(botID: botID, entry: rebuild()), started)
+            _ = registry.releaseAndNextWaiting(runID: started.runID)
             XCTAssertNil(registry.active(botID: botID))
         }
     }
 
-    func test_releaseAndNextWaitingFreesBotAndPopsFirstWaiterOnce() {
-        // WHY: the first queued thread must resume when the VM frees, in order, exactly once.
+    func test_releaseAndNextWaitingFreesTheVMAndPopsFirstWaiterOnce() {
+        // WHY: threads queued behind a rebuild resume when it ends, in order, exactly once.
         let registry = BotVMRunRegistry()
-        _ = registry.tryBegin(botID: botID, entry: entry())
+        let build = rebuild()
+        _ = registry.tryBegin(botID: botID, entry: build)
         registry.addWaiting(botID: botID, threadID: threadB)
         registry.addWaiting(botID: botID, threadID: threadB)
         let threadC = AgentThreadID()
         registry.addWaiting(botID: botID, threadID: threadC)
         XCTAssertEqual(registry.releaseAndNextWaiting(runID: AgentRunID()), nil)
         XCTAssertNotNil(registry.active(botID: botID), "unknown run must not free the bot")
-        XCTAssertEqual(registry.releaseAndNextWaiting(runID: runA), threadB)
+        XCTAssertEqual(registry.releaseAndNextWaiting(runID: build.runID), threadB)
         XCTAssertNil(registry.active(botID: botID))
         XCTAssertEqual(registry.waitingThreads(botID: botID), [threadC])
     }

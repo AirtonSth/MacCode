@@ -784,29 +784,24 @@ final class BotGuestRunResolverTests: XCTestCase {
 
     // MARK: - One run per bot
 
-    func test_twoConversationsStartingTogether_getOnePlanAndOneBusy() async throws {
-        // WHY (B2): two runs in one container would share its DISTILL_HOME,
-        // config and sign-in copies.
+    func test_twoConversationsStartingTogether_bothRunOnTheVM() async throws {
+        // WHY: a bot VM has no parallelism limit. Each run has its own env
+        // file, lease file and gateway bearer, so both can run at once.
         let f = try await makeFixture()
         let first = try makeThread(f, title: "First chat")
         let second = try makeThread(f, title: "Second chat")
-        let gate = DispatchSemaphore(value: 0)
-        f.vm.gate = gate
-        let firstRun = Task { try await f.resolver.prepare(self.request(first)) { _ in } }
-        try await waitUntil { f.vm.calls.count == 1 }
-        do {
-            _ = try await f.resolver.prepare(request(second)) { _ in }
-            XCTFail("the second conversation must not get the bot")
-        } catch {
-            XCTAssertEqual(error as? DistillGuestLaunchError, .busy("The VM is busy in First chat"))
-        }
-        gate.signal()
-        let plan = try unwrapPlan(try await firstRun.value)
-        XCTAssertEqual(f.vm.calls.count, 1)
-        await plan.finish(.completed).value
+        let firstPlan = try unwrapPlan(try await f.resolver.prepare(request(first)) { _ in })
+        let secondPlan = try unwrapPlan(try await f.resolver.prepare(request(second)) { _ in })
+        XCTAssertEqual(f.vm.calls.count, 2)
+        XCTAssertNotEqual(firstPlan.envFileURL, secondPlan.envFileURL)
+        await firstPlan.finish(.completed).value
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: f.guestDistillHome.appendingPathComponent("claude-auth.json").path),
+            "the first run's teardown keeps the sign-in copy the second run still uses")
+        await secondPlan.finish(.completed).value
     }
 
-    func test_twoBotsShareOneVMAndTheQueueRetainsTheWaitingBotsIdentity() async throws {
+    func test_twoBotsShareOneVMAndRunTogether() async throws {
         let f = try await makeFixture()
         let machine = try f.ctx.botStore.saveVirtualMachine(name: "Shared")
         let peer = try f.ctx.botStore.create(name: "Peer", title: "", description: "", desktopKind: .dockerDesktop)
@@ -820,52 +815,28 @@ final class BotGuestRunResolverTests: XCTestCase {
         try f.ctx.threadRepo.upsert(second)
         try f.ctx.threadRepo.setActor(id: second.id, actor: .bot(peer.id), lockedAt: Date(), executionTarget: .vm)
         try f.ctx.threadRepo.setGuestRuntime(id: second.id, BotGuestRuntime.distillV1)
-        let firstRequest = request(first)
-        let plan = try unwrapPlan(try await f.resolver.prepare(firstRequest) { _ in })
-        XCTAssertEqual(f.vm.calls.first?.botID, machine.storageID)
-        do {
-            _ = try await f.resolver.prepare(request(second)) { _ in }
-            XCTFail("Two bots must not run in the shared VM together.")
-        } catch {
-            XCTAssertEqual(error as? DistillGuestLaunchError, .busy("The VM is busy in First"))
-        }
-        f.registry.addWaiting(botID: peer.id, threadID: second.id, resourceID: machine.storageID)
-        await plan.finish(.completed).value
-        let next = f.registry.releaseAndNextWaiter(runID: firstRequest.runId)
-        XCTAssertEqual(next?.botID, peer.id)
-        XCTAssertEqual(next?.threadID, second.id)
+        let plan = try unwrapPlan(try await f.resolver.prepare(request(first)) { _ in })
         let peerPlan = try unwrapPlan(try await f.resolver.prepare(request(second)) { _ in })
-        XCTAssertEqual(f.vm.calls.last?.botID, machine.storageID)
+        XCTAssertEqual(f.vm.calls.map(\.botID), [machine.storageID, machine.storageID])
+        await plan.finish(.completed).value
         await peerPlan.finish(.completed).value
     }
 
-    func test_stopThenQueuedSend_waitsForTheStoppedRunsTeardownBeforeTouchingTheGuest() async throws {
-        // WHY (B1): Stop frees the registry before the stopped run's guest
-        // process and sign-in copies are gone; the next run must not start in
-        // the guest (or rewrite its copies) until that teardown is done.
+    func test_aRebuildHoldingTheVMRefusesANewRun() async throws {
+        // WHY: a rebuild replaces the container; a run started on it would be
+        // stopped with the old container.
         let f = try await makeFixture()
-        let first = try makeThread(f, title: "First chat")
-        let second = try makeThread(f, title: "Second chat")
-        let firstRequest = request(first)
-        let firstPlan = try unwrapPlan(try await f.resolver.prepare(firstRequest) { _ in })
-        _ = f.registry.releaseAndNextWaiting(runID: firstRequest.runId) // the coordinator's run-finished
-
-        let firstLease = leaseFile(f, firstRequest.runId)
-        f.vm.onPrepare = { XCTAssertFalse(FileManager.default.fileExists(atPath: firstLease.path),
-                                          "the second run reached the guest before the first run's teardown") }
-        let stages = Recorder<DistillGuestStage>()
-        let secondRun = Task { try await f.resolver.prepare(self.request(second)) { stages.append($0) } }
-        try await waitUntil { stages.values.first == .waitingForBot }
-        try await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertEqual(f.vm.calls.count, 1, "the second run waits on the bot's lease")
-
-        await firstPlan.finish(.cancelled).value
-        let secondPlan = try unwrapPlan(try await secondRun.value)
-        XCTAssertEqual(f.vm.calls.count, 2)
-        XCTAssertTrue(FileManager.default.fileExists(
-            atPath: f.guestDistillHome.appendingPathComponent("claude-auth.json").path),
-            "the first run's cleanup did not delete the second run's sign-in copy")
-        await secondPlan.finish(.completed).value
+        let thread = try makeThread(f, title: "Chat")
+        let build = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(),
+            title: "Linux desktop rebuild", workspace: "", exclusive: true)
+        XCTAssertNil(f.registry.tryBegin(botID: f.bot.id, entry: build))
+        do {
+            _ = try await f.resolver.prepare(request(thread)) { _ in }
+            XCTFail("no run during a rebuild")
+        } catch {
+            XCTAssertEqual(error as? DistillGuestLaunchError, .busy("The VM is busy in Linux desktop rebuild"))
+        }
+        XCTAssertTrue(f.vm.calls.isEmpty)
     }
 
     func test_guestRunsWaitForLaunchCleanupBeforeClaimingTheBot() async throws {

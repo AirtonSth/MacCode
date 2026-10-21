@@ -36,11 +36,12 @@ protocol BotGuestVMPreparing: Sendable {
 /// `.vm` target go to the guest; legacy `.vm` threads keep their Mac sessions.
 /// A guest thread never falls back to the Mac: every failure throws.
 ///
-/// One guest run per bot: the registry claim (`tryBegin`) is taken here, at
-/// the spawn point every send path goes through, and refuses another
-/// conversation's run ("The bot is busy"); the coordinator's run-finished callback
-/// frees it. The per-bot lease then makes the run wait until the previous
-/// run's guest process is dead and its sign-in copies are gone.
+/// Conversations run on one bot VM in parallel. The registry claim
+/// (`tryBegin`) is taken here, at the spawn point every send path goes
+/// through, and is refused only while a rebuild or stop holds the VM ("The
+/// VM is busy"); the coordinator's run-finished callback frees it. A
+/// contextual runtime keeps one run per identity: its claim is exclusive and
+/// its lease waits for the previous run's teardown.
 ///
 /// Stop while a run is still preparing (an image build can take minutes)
 /// invalidates the run's acceptance permit; preparation then stops at its
@@ -177,7 +178,8 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             throw DistillGuestLaunchError.unavailable("You are controlling this VM. Return control before starting a conversation.")
         }
         let claim = BotVMRunRegistry.Entry(threadID: request.threadId, runID: request.runId,
-            title: (try deps.threadRepo.get(id: request.threadId))?.title ?? "Conversation", workspace: request.cwd)
+            title: (try deps.threadRepo.get(id: request.threadId))?.title ?? "Conversation", workspace: request.cwd,
+            exclusive: true)
         if let holder = deps.registry.tryBegin(botID: admission.pin.botID, entry: claim, resourceID: identity.storageBotID) {
             throw DistillGuestLaunchError.busy("The VM is busy in \(holder.title)")
         }
@@ -293,9 +295,10 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         // From here the claim is the coordinator's to free (run finished,
         // which also fires for a failed start): freeing it here would skip
         // the queued send that run-finished hands to the next thread.
+        // Runs share the VM: each has its own env file, lease file, gateway
+        // bearer and in-guest process, and the sign-in copies stay until the
+        // last run on the VM ends.
         let leaseKey = resourceID.value.uuidString.lowercased()
-        if await deps.leases.isHeld(leaseKey) { progress(.waitingForBot) }
-        let lease = try await deps.leases.acquire(leaseKey)
         let runID = request.runId.value.uuidString.lowercased()
         var undo: [() -> Void] = []
         do {
@@ -449,7 +452,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 guestCwd: guestCwd,
                 guestCommand: guestCommand,
                 envFileURL: envFile,
-                lease: lease,
+                lease: nil,
                 teardown: { [weak self] _ in
                     heartbeat.stop()
                     mirror.end(runID: runID)
@@ -461,7 +464,6 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             return plan
         } catch {
             undo.reversed().forEach { $0() }
-            await lease.release()
             if error is CancellationError {
                 guestResolverLog.info(
                     "bot.guest.prepare_stopped run=\(runID, privacy: .public) bot=\(leaseKey, privacy: .public)"

@@ -132,12 +132,12 @@ final class AgentAppBotRunActorTests: XCTestCase {
         )
     }
 
-    func test_vmBotBusyOnOtherThreadQueuesFreshThreadInsteadOfRunning() async throws {
-        // WHY: one VM runs one thread at a time; a second thread must wait, not start a run.
+    func test_vmHeldByARebuildQueuesFreshThreadInsteadOfRunning() async throws {
+        // WHY: a rebuild or stop holding the VM replaces its container; a send must wait, not start a run.
         let f = try makeFixture()
         f.vm.botExecutionTargetProvider = { _ in .vm }
         let holder = BotVMRunRegistry.Entry(
-            threadID: AgentThreadID(), runID: AgentRunID(), title: "Tarefa A", workspace: f.workspaceCwd
+            threadID: AgentThreadID(), runID: AgentRunID(), title: "Tarefa A", workspace: f.workspaceCwd, exclusive: true
         )
         XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: holder))
         defer { _ = BotVMRunRegistry.shared.releaseAndNextWaiting(runID: holder.runID) }
@@ -167,7 +167,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
         f.vm.providerSnapshots = snapshots
         f.vm.selectThread(thread.id)
         let holder = BotVMRunRegistry.Entry(
-            threadID: AgentThreadID(), runID: AgentRunID(), title: "Tarefa A", workspace: f.workspaceCwd
+            threadID: AgentThreadID(), runID: AgentRunID(), title: "Tarefa A", workspace: f.workspaceCwd, exclusive: true
         )
         XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: holder))
         defer { _ = BotVMRunRegistry.shared.releaseAndNextWaiting(runID: holder.runID) }
@@ -413,7 +413,7 @@ final class AgentAppBotRunActorTests: XCTestCase {
 
     private func otherThreadHolder(_ f: Fixture, title: String) -> BotVMRunRegistry.Entry {
         BotVMRunRegistry.Entry(
-            threadID: AgentThreadID(), runID: AgentRunID(), title: title, workspace: f.workspaceCwd
+            threadID: AgentThreadID(), runID: AgentRunID(), title: title, workspace: f.workspaceCwd, exclusive: true
         )
     }
 
@@ -451,6 +451,31 @@ final class AgentAppBotRunActorTests: XCTestCase {
         XCTAssertTrue(f.runner.finish(runID: request.runId, status: .completed, reply: "done"))
         let freed = await waitUntil { BotVMRunRegistry.shared.active(botID: f.bot.id) == nil }
         XCTAssertTrue(freed, "the run's finish frees the VM")
+    }
+
+    func test_vmBotRunsASecondConversationWhileAnotherRunsOnItsVM() async throws {
+        // WHY: a bot VM has no parallelism limit. Another conversation running
+        // on the VM must not make this send fail with "The VM is busy".
+        let f = try makeFixture()
+        f.vm.botExecutionTargetProvider = { _ in .vm }
+        f.vm.botVMPreflight = { _, _, _ in nil }
+        let other = BotVMRunRegistry.Entry(
+            threadID: AgentThreadID(), runID: AgentRunID(), title: "Tarefa A", workspace: f.workspaceCwd
+        )
+        XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.bot.id, entry: other))
+        defer { BotVMRunRegistry.shared.endRun(runID: other.runID) }
+        f.vm.setRunActor(.bot(f.bot.id))
+        f.vm.prompt = "parallel task"
+        await f.vm.send()
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started, f.vm.statusMessage)
+        XCTAssertFalse(f.vm.statusMessage.contains("The VM is busy"), f.vm.statusMessage)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertEqual(BotVMRunRegistry.shared.claim(botID: f.bot.id, threadID: f.thread.id)?.runID, request.runId)
+        XCTAssertTrue(f.runner.finish(runID: request.runId, status: .completed, reply: "done"))
+        let freed = await waitUntil { BotVMRunRegistry.shared.claim(botID: f.bot.id, threadID: f.thread.id) == nil }
+        XCTAssertTrue(freed)
+        XCTAssertEqual(BotVMRunRegistry.shared.active(botID: f.bot.id), other, "the other run keeps the VM")
     }
 
     func test_vmTakenAfterTheBusyCheckQueuesThenStartsWhenTheHolderFinishes() async throws {

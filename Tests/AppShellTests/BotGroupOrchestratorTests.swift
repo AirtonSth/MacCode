@@ -261,7 +261,7 @@ final class BotGroupOrchestratorTests: XCTestCase {
     func test_vmBotBusyInAnotherThreadWaitsPersistedThenStartsWhenTheVMIsFreed() async throws {
         let f = try makeFixture(anaDesktop: .dockerDesktop)
         let group = try await makeGroup(f, bots: [f.ana])
-        let holder = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Tarefa A", workspace: "")
+        let holder = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Tarefa A", workspace: "", exclusive: true)
         XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.ana.id, entry: holder))
         defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
 
@@ -300,7 +300,7 @@ final class BotGroupOrchestratorTests: XCTestCase {
         f.orchestrator.vmPreflight = { _ in await gate.wait() }
         let group = try await makeGroup(f, bots: [f.ana])
         let holderThread = AgentThreadID()
-        let holder = BotVMRunRegistry.Entry(threadID: holderThread, runID: AgentRunID(), title: "Tarefa A", workspace: "")
+        let holder = BotVMRunRegistry.Entry(threadID: holderThread, runID: AgentRunID(), title: "Tarefa A", workspace: "", exclusive: true)
         XCTAssertNil(BotVMRunRegistry.shared.tryBegin(botID: f.ana.id, entry: holder))
         defer { BotVMRunRegistry.shared.endRun(runID: holder.runID) }
 
