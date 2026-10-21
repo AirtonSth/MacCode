@@ -1120,7 +1120,7 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             vm.dispose()
             try? FileManager.default.removeItem(at: rootURL)
         }
-        vm.aggregateHotTextByteLimitForTesting = 10_000
+        vm.aggregateHotTextByteLimitForTesting = 20_000
         var timeline = AssistantTimelineState()
         timeline.apply(.turnStarted(turnId: "t-history"))
         timeline.apply(.itemStarted(item: AssistantItem(
@@ -1133,9 +1133,16 @@ final class AgentAppMemPerfWinsTests: XCTestCase {
             startedAtMs: 1
         )))
         timeline.apply(.turnCompleted(turnId: "t-history", finalMessage: nil))
+        // Only offscreen history is eligible for eviction. Keep the old tool
+        // outside the mounted recent window while exercising cache invalidation.
+        for index in 0..<AgentAppView.idleTranscriptWindowCount {
+            let id = "recent-\(index)"
+            timeline.apply(.turnStarted(turnId: id))
+            timeline.apply(.turnCompleted(turnId: id, finalMessage: nil))
+        }
         timeline.apply(.turnStarted(turnId: "t-live"))
         XCTAssertGreaterThan(timeline.aggregateHotTextByteCount, 7_000)
-        XCTAssertLessThan(timeline.aggregateHotTextByteCount, 10_000)
+        XCTAssertLessThan(timeline.aggregateHotTextByteCount, 20_000)
 
         func quantum(_ value: AssistantTimelineState) -> StreamQuantumReduceResult {
             StreamQuantumReduceResult(

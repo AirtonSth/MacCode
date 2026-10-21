@@ -179,6 +179,7 @@ public enum HostMutationContract {
     bot.caveman.set
     bot.factory_reset
     bot.notice.act
+    bot.notice.reply
     bot.notice.read
     bot.notice.clear
     bot.desktop.set
@@ -465,6 +466,8 @@ public enum HostMutationContract {
                 ]
             case "bot.guest.control":
                 return [.uuid("bot_id"), .stringEnum("action", ["take", "release"])]
+            case "bot.notice.reply":
+                return [.uuid("bot_id"), .uuid("message_id"), .string("text", nonempty: true)]
             case "bot.notice.act":
                 return [.uuid("bot_id"), .uuid("message_id"), .int("option_index")]
             case "bot.notice.read":

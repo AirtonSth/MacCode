@@ -922,11 +922,6 @@ public final class ScheduledTaskScheduler {
     nonisolated private func notifyFailure(for run: ScheduledTaskRun) {
         let task = try? store.get(id: run.taskID)
         let settings = SettingsStore(db: context.db).load()
-        guard RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
-            isAction: true,
-            workspaceId: task?.workspaceID.value.uuidString,
-            settings: settings
-        ) else { return }
         let content = RemoteCodeNotificationContent(
             identifier: "scheduled_task_run.\(run.id.uuidString).failed",
             title: "Scheduled task failed",
@@ -938,6 +933,11 @@ public final class ScheduledTaskScheduler {
         )
         let center = context.titioNoticeCenter
         guard center.isEnabled(settings) else {
+        guard RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: true,
+            workspaceId: task?.workspaceID.value.uuidString,
+            settings: settings
+        ) else { return }
             SystemNotifier.shared.post(content, settings: settings)
             return
         }
@@ -956,21 +956,15 @@ public final class ScheduledTaskScheduler {
         )
         let title = task?.title
         let occurredAt = Date()
-        let workspaceName = context.workspaceName
-        Task { @MainActor in
-            let facts = TitioNoticeFacts(title: title, workspaceName: workspaceID.flatMap { workspaceName($0) })
-            center.ingest(
-                TitioNoticeFact(
-                    key: key,
-                    kind: .scheduledFailed,
-                    source: source,
-                    facts: facts,
-                    actions: TitioNoticeAction.defaultActions(kind: .scheduledFailed, facts: facts),
-                    occurredAt: occurredAt
-                ),
-                legacy: TitioNoticeLegacyDelivery(content: content, pushes: false)
-            )
-        }
+        let facts = TitioNoticeFacts(title: title)
+        center.ingest(
+            TitioNoticeFact(
+                key: key, kind: .scheduledFailed, source: source, facts: facts,
+                actions: TitioNoticeAction.defaultActions(kind: .scheduledFailed, facts: facts),
+                occurredAt: occurredAt
+            ),
+            legacy: TitioNoticeLegacyDelivery(content: content, pushes: false)
+        )
     }
 
     nonisolated private func reconcileNextRunDates(now: Date) throws {

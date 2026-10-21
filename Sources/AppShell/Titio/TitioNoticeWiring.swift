@@ -104,6 +104,7 @@ extension AppContext {
                 }
             },
             inboxChanged: { snapshot in
+                await MainActor.run { box.context?.liveActivitySyncCoordinator.submitTitio(snapshot) }
                 EventBus.shared.publish(kind: .botUpdated, payload: AppContext.titioInboxEventPayload(snapshot))
             },
             messagesRemoved: { target, ids in
@@ -133,6 +134,10 @@ extension AppContext {
             },
             isFocusedSuccess: { event in
                 await MainActor.run { box.context?.router?.isFocusedPetSuccess(event) ?? false }
+            },
+            observeAgentEvent: { event in
+                guard let context = box.context else { return false }
+                return await context.observeTitioAgentEvent(event)
             }
         )
     }
@@ -188,6 +193,7 @@ extension AppContext {
         botStore: BotStore
     ) -> TitioNoticeActionHooks {
         let pending = ProviderPendingCallbackRepository(db: db)
+        let runs = AgentRunRepository(db: db)
         @Sendable func router() async throws -> AppCommandRouter {
             guard let router = await MainActor.run(body: { box.context?.router }) else {
                 throw TitioNoticeActionError(reason: "MacCode is not ready")
@@ -195,8 +201,12 @@ extension AppContext {
             return router
         }
         return TitioNoticeActionHooks(
-            isRequestOpen: { thread, request, kind in
-                // No recorded callback (its write failed): let the provider decide.
+            isRequestOpen: { thread, request, kind, expectedRunID in
+                if let expectedRunID {
+                    guard let active = try? runs.latestActive(for: thread),
+                          active.id.value.uuidString.caseInsensitiveCompare(expectedRunID) == .orderedSame else { return false }
+                }
+                // Older notices without a run binding retain the provider's check.
                 guard let row = (try? pending.get(
                     threadId: thread, requestId: request, kind: kind == .approval ? .approval : .userInput
                 )) ?? nil else { return true }
@@ -393,13 +403,12 @@ extension AppContext {
             }
             // Bot failures come only from the bot-attention projector.
             guard status == .completed else { return true }
-            guard bot.notificationsEnabled else { return true }
-            if router?.isBotConversationFocused(conversation.id) == true { return true }
-            let botFacts = TitioNoticeFacts(
+            var botFacts = TitioNoticeFacts(
                 workspaceName: workspaceId.flatMap { state.workspaces[$0]?.name },
                 botName: bot.name,
                 summary: facts.summary
             )
+            botFacts.interruptionSuppressed = !bot.notificationsEnabled || router?.isBotConversationFocused(conversation.id) == true
             titioNoticeCenter.ingest(TitioNoticeFact(
                 key: TitioNoticeIDs.botReply(runId: rid),
                 kind: .botReply,
@@ -416,7 +425,6 @@ extension AppContext {
             return true
         }
         // Successes whose destination is focused are excluded; failures never are.
-        if status == .completed, router?.isAgentThreadFocused(threadId) == true { return true }
         if status == .failed, let scheduled = facts.scheduled {
             titioNoticeCenter.ingest(
                 Self.scheduledRunFailureFact(
@@ -431,12 +439,13 @@ extension AppContext {
             )
             return true
         }
-        let noticeFacts = TitioNoticeFacts(
+        var noticeFacts = TitioNoticeFacts(
             title: threadTitle,
             workspaceName: workspaceId.flatMap { state.workspaces[$0]?.name },
             summary: facts.summary,
             durationMs: status == .completed ? facts.durationMs : nil
         )
+        noticeFacts.interruptionSuppressed = status == .completed && router?.isAgentThreadFocused(threadId) == true
         titioNoticeCenter.ingest(
             TitioNoticeFact(
                 key: TitioNoticeIDs.runOutcome(runId: rid, outcome: outcome),
@@ -538,6 +547,85 @@ struct TitioRequestFacts: Sendable, Equatable {
 }
 
 extension AppContext {
+    /// Replays the source event through the same classification as live intake.
+    /// A checkpoint advances only after the canonical ledger row exists.
+    func observeTitioAgentEvent(_ event: EventBus.Event) async -> Bool {
+        guard case .object(let payload) = event.payload,
+              let threadUUID = payload["thread_id"]?.stringValue.flatMap(UUID.init(uuidString:)),
+              let runUUID = payload["run_id"]?.stringValue.flatMap(UUID.init(uuidString:)) else { return true }
+        let thread = AgentThreadID(threadUUID)
+        let run = AgentRunID(runUUID)
+        let notices = TitioNoticeRepository(db: db)
+        if event.kind == "agent.run.finished" {
+            guard let status = payload["status"]?.stringValue.flatMap(AgentRunStatus.init(rawValue:)),
+                  [.completed, .failed, .interrupted].contains(status),
+                  (try? threadRepo.isEphemeral(of: thread)) != true else { return true }
+            let inputs = await runFinishedNotificationInputs(runId: run, threadId: thread)
+            // Titio's own replies have their existing direct banner path.
+            if inputs.titio.bot?.handle.lowercased() == TitioBot.handle { return true }
+            guard let content = RemoteCodeNotificationContent.threadOutcome(
+                threadId: threadUUID.uuidString, runId: runUUID.uuidString,
+                workspaceId: inputs.chrome?.workspaceId?.value.uuidString,
+                title: inputs.chrome?.title, phase: status,
+                isNestedWorker: inputs.isNestedWorker, finalMessageId: inputs.finalMessageId
+            ) else { return true }
+            _ = ingestTitioRunOutcome(threadId: thread, runId: run, status: status,
+                workspaceId: inputs.chrome?.workspaceId, threadTitle: inputs.chrome?.title,
+                finalMessageId: inputs.finalMessageId, facts: inputs.titio, legacy: content)
+            if inputs.titio.bot != nil && status != .completed { return true }
+            let key: String
+            if inputs.titio.bot != nil { key = TitioNoticeIDs.botReply(runId: runUUID.uuidString) }
+            else if status == .failed, inputs.titio.scheduled != nil {
+                key = Self.scheduledRunFailureFact(runId: run, threadId: thread,
+                    workspaceId: inputs.chrome?.workspaceId, workspaceName: nil,
+                    finalMessageId: inputs.finalMessageId, scheduled: inputs.titio.scheduled!).key
+            } else {
+                key = TitioNoticeIDs.runOutcome(runId: runUUID.uuidString,
+                    outcome: status == .completed ? .completed : status == .failed ? .failed : .interrupted)
+            }
+            return (try? notices.get(key: key)) != nil
+        }
+        guard let requestID = payload["request_id"]?.stringValue,
+              ["agent.request.opened", "agent.user_input.requested"].contains(event.kind) else { return true }
+        let approval = event.kind == "agent.request.opened"
+        // Closed callbacks must not reappear as actionable questions after restart.
+        guard let callback = try? providerPendingCallbackRepo.get(threadId: thread,
+            requestId: requestID, kind: approval ? .approval : .userInput),
+            callback.state == .pending,
+            let active = try? runRepo.latestActive(for: thread), active.id == run else { return true }
+        let facts: TitioRequestFacts
+        if approval {
+            facts = TitioRequestFacts(kind: .approval, legacyActionTitle: "Approval requested",
+                requestTitle: payload["title"]?.stringValue, detail: payload["detail"]?.stringValue,
+                allowsSessionApproval: payload["allows_session_approval"]?.boolValue ?? true,
+                requestKind: payload["kind"]?.stringValue)
+        } else {
+            let questions: [JSONValue]
+            if case .array(let values) = payload["questions"] { questions = values } else { questions = [] }
+            let single = questions.count == 1 ? questions.first?.objectValue : nil
+            let options: [String]
+            if case .array(let values) = payload["options"], !values.isEmpty { options = values.compactMap(\.stringValue) }
+            else if case .array(let values) = single?["options"] { options = values.compactMap { $0.objectValue?["label"]?.stringValue } }
+            else { options = [] }
+            let multiple = payload["allows_multiple_selection"]?.boolValue == true || single?["allows_multiple_selection"]?.boolValue == true
+            let prompt = payload["prompt"]?.stringValue
+            let secret = payload["is_secret"]?.boolValue == true
+            facts = TitioRequestFacts(kind: .userInput,
+                legacyActionTitle: secret ? "Secret input requested" : "Input requested",
+                prompt: prompt?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? prompt : single?["prompt"]?.stringValue,
+                options: multiple ? nil : options, isSecret: secret, questionCount: questions.count)
+        }
+        let chrome = (try? threadRepo.listChrome(ids: [thread]))?[thread]
+        guard let content = RemoteCodeNotificationContent.userActionNeeded(threadId: threadUUID.uuidString,
+            workspaceId: chrome?.workspaceId?.value.uuidString, threadTitle: chrome?.title,
+            actionTitle: facts.legacyActionTitle, requestId: requestID,
+            isNestedWorker: isNestedAgentWorker(runId: run, threadId: thread)) else { return true }
+        guard ingestTitioRequest(threadId: thread, runId: run, requestId: requestID,
+            facts: facts, chrome: chrome, legacy: content) else { return true }
+        return (try? notices.get(key: TitioNoticeIDs.threadAttention(
+            threadId: threadUUID.uuidString, requestId: requestID, runId: runUUID.uuidString))) != nil
+    }
+
     /// Requests (§5): approvals, input questions and manual actions. True when
     /// the hub took it; a Titio-linked thread keeps today's banner (Titio's own
     /// threads never produce a notice). Runs after the policy checks.

@@ -41,6 +41,9 @@ public struct AgentChatChoicesCard: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
+            if choices.notice != nil, !choices.source.isEmpty {
+                provenance
+            }
             header
             VStack(spacing: 0) {
                 ForEach(Array(choices.options.enumerated()), id: \.offset) { index, option in
@@ -73,6 +76,30 @@ public struct AgentChatChoicesCard: View {
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.modal, style: .continuous))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(identifier)
+    }
+
+    private var provenance: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            sourceLabel("workspace", name: "Workspace", symbol: "folder")
+            sourceLabel("bot", name: "Bot", symbol: "person.crop.circle")
+            sourceLabel("conversation", name: "Conversation", symbol: "bubble.left.and.bubble.right")
+        }
+        .font(DS.Font.caption)
+        .foregroundColor(DS.Palette.textSecondary)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("\(identifier).source")
+    }
+
+    @ViewBuilder
+    private func sourceLabel(_ key: String, name: String, symbol: String) -> some View {
+        if let value = choices.source[key], !value.isEmpty {
+            Label {
+                Text(value).fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: symbol).frame(width: 16)
+            }
+            .accessibilityLabel("\(name): \(value)")
+        }
     }
 
     private var header: some View {

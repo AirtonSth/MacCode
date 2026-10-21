@@ -307,7 +307,7 @@ final class TitioInboxThreadTests: XCTestCase {
         return key
     }
 
-    func test_inboxDeskHooksTakeTheArmedReplyAndCardTapsWithoutStartingARun() async throws {
+    func test_inboxDeskHooksSendCapturedQuestionReplyWithoutStartingARun() async throws {
         // WHY: on the Mac the desk composer and the card bypass
         // enqueueHostMessage; without these hooks an armed answer or a card tap
         // would start a Titio LLM run instead of reaching the request.
@@ -319,16 +319,30 @@ final class TitioInboxThreadTests: XCTestCase {
         XCTAssertNotNil(desk.embedding?.noticeChoiceHandler, "only the inbox desk acts on notice cards")
         XCTAssertNotNil(desk.embedding?.hostReplyHandler)
 
+        let initialFocus = desk.focusTick
+        desk.embedding?.noticeChoiceHandler?(TitioNoticeIDs.messageID(forKey: key).uuidString, 0)
+        XCTAssertEqual(desk.activeReplyTarget?.noticeMessageID, TitioNoticeIDs.messageID(forKey: key).uuidString)
+        XCTAssertEqual(desk.focusTick, initialFocus + 1)
         desk.prompt = "use staging"
+        let capturedReply = desk.activeReplyTarget
+        let otherKey = try await armReplyHere(context, target: target)
+        let capturedFocus = desk.focusTick
+        desk.embedding?.noticeChoiceHandler?(TitioNoticeIDs.messageID(forKey: otherKey).uuidString, 0)
+        XCTAssertEqual(desk.activeReplyTarget, capturedReply, "another card cannot rebind the existing answer")
+        XCTAssertEqual(desk.prompt, "use staging")
+        XCTAssertEqual(desk.focusTick, capturedFocus, "a refused capture does not steal focus")
+        XCTAssertTrue(desk.statusMessage.contains("current reply"))
         await desk.send()
         XCTAssertEqual(desk.prompt, "", "the host took the text: the composer clears")
         await context.titioNoticeCenter.settleActs()
         await context.titioNoticeCenter.idle()
         XCTAssertNil(try context.runRepo.latestActive(for: target.threadID), "no Titio run started")
         let row = try XCTUnwrap(TitioNoticeRepository(db: context.db).get(key: key))
-        XCTAssertEqual(row.state, .resolved, "the armed notice was answered (or honestly failed), never left armed")
+        XCTAssertEqual(row.state, .resolved, "the original captured notice was answered (or honestly failed)")
+        XCTAssertEqual(try TitioNoticeRepository(db: context.db).get(key: otherKey)?.state, .awaitingReply,
+                       "the other question receives no answer")
         let texts = try context.messageRepo.list(threadId: target.threadID).map(\.content)
-        XCTAssertTrue(texts.contains("use staging"), "the user's words stay in the inbox transcript")
+        XCTAssertTrue(texts.contains { AgentReplyQuote.parse($0)?.body == "use staging" }, "the user's words and captured question stay in the inbox transcript")
     }
 
     func test_otherConversationsGetNoNoticeHooks() throws {

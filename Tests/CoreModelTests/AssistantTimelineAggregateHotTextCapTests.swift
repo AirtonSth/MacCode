@@ -48,6 +48,28 @@ final class AssistantTimelineAggregateHotTextCapTests: XCTestCase {
         XCTAssertLessThanOrEqual(state.aggregateHotTextByteCount, limit)
     }
 
+    func test_memoryPressurePreservesDisplayedQuestionAndReplayContinuity() {
+        var state = AssistantTimelineState()
+        for id in ["offscreen", "displayed"] {
+            state.apply(.turnStarted(turnId: id))
+            state.apply(.itemStarted(item: AssistantItem(
+                id: "item-" + id, turnId: id, type: .assistantMessage,
+                state: .completed, body: String(repeating: id, count: 100), startedAtMs: 1
+            )))
+        }
+        let displayed = state.turns.last!
+        state.enforceAggregateHotTextBudget(byteLimit: 100, protectedTurnIDs: ["displayed"])
+        XCTAssertEqual(state.turns.last, displayed)
+        XCTAssertEqual(state.turns.first?.items.first?.body, "")
+
+        var replay = AssistantTimelineState()
+        replay.apply(.turnStarted(turnId: "new"))
+        replay.retainMissingTurns(from: state, protectedTurnIDs: ["displayed"])
+        replay.apply(.itemDelta(itemId: "item-displayed", bodyAppend: " continued", outputAppend: nil, summary: nil))
+        XCTAssertEqual(replay.turns.first?.items.first?.body, displayed.items.first!.body + " continued")
+        XCTAssertEqual(replay.turns.map(\.turnId), ["displayed", "new"])
+    }
+
     /// Under-limit repeats (and small watermarked growth) must not re-walk the
     /// whole timeline. Over-limit must still take the exact eviction path.
     func test_enforceAggregateHotTextBudget_underLimitRepeatsSkipWalkAndPreserveSemantics() {

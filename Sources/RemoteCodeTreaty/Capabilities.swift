@@ -177,17 +177,20 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
         /// `bot.guest.control` and `bot.guest.updated` with `reason: "agent_step"`
         /// (see BotGuestContracts.swift). False for older hosts: no live viewer
         /// and no Take/Release.
+        public let noticeReplyV1: Bool
         public let guestObserveV1: Bool
 
         public init(
             queueControls: [String],
             teamsV1: Bool = false,
             groupsV1: Bool = false,
+            noticeReplyV1: Bool = false,
             guestObserveV1: Bool = false
         ) {
             self.queueControls = queueControls
             self.teamsV1 = teamsV1
             self.groupsV1 = groupsV1
+            self.noticeReplyV1 = noticeReplyV1
             self.guestObserveV1 = guestObserveV1
         }
 
@@ -195,6 +198,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             case queueControls = "queue_controls"
             case teamsV1 = "teams_v1"
             case groupsV1 = "groups_v1"
+            case noticeReplyV1 = "notice_reply_v1"
             case guestObserveV1 = "guest_observe_v1"
         }
 
@@ -203,6 +207,7 @@ public struct HostCapabilities: Codable, Equatable, Sendable {
             queueControls = try container.decode([String].self, forKey: .queueControls)
             teamsV1 = try container.decodeIfPresent(Bool.self, forKey: .teamsV1) ?? false
             groupsV1 = try container.decodeIfPresent(Bool.self, forKey: .groupsV1) ?? false
+            noticeReplyV1 = try container.decodeIfPresent(Bool.self, forKey: .noticeReplyV1) ?? false
             guestObserveV1 = try container.decodeIfPresent(Bool.self, forKey: .guestObserveV1) ?? false
         }
     }

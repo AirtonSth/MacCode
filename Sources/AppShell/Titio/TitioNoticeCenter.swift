@@ -111,6 +111,7 @@ public struct TitioInboxSnapshot: Equatable, Sendable {
     public var openDecisions: Int
     public var lastPreview: String?
     public var lastAt: Date?
+    public var focus: TitioLiveActivityFocus? = nil
 
     /// The `titio_inbox` wire object (`bot.updated`, later `bot.list`).
     public var wireObject: JSONValue {
@@ -208,7 +209,7 @@ public struct TitioNoticeActionHooks: Sendable {
 
     /// The provider request still waits for an answer (false: it expired or
     /// was answered elsewhere, so nothing is sent).
-    public var isRequestOpen: @Sendable (AgentThreadID, String, RequestKind) -> Bool
+    public var isRequestOpen: @Sendable (AgentThreadID, String, RequestKind, String?) -> Bool
     /// `respondAgentRequest(thread:requestId:response:)`.
     public var respondRequest: @Sendable (AgentThreadID, String, RequestDecision) async throws -> Void
     /// `respondAgentUserInput(thread:requestId:text:)`.
@@ -228,7 +229,7 @@ public struct TitioNoticeActionHooks: Sendable {
     public var dismissNotification: @Sendable (String) async throws -> Void
 
     public init(
-        isRequestOpen: @escaping @Sendable (AgentThreadID, String, RequestKind) -> Bool,
+        isRequestOpen: @escaping @Sendable (AgentThreadID, String, RequestKind, String?) -> Bool,
         respondRequest: @escaping @Sendable (AgentThreadID, String, RequestDecision) async throws -> Void,
         respondUserInput: @escaping @Sendable (AgentThreadID, String, String) async throws -> Void,
         sendBotMessage: @escaping @Sendable (BotID, BotConversationID, String) async throws -> Void,
@@ -298,6 +299,8 @@ public struct TitioNoticeHooks: Sendable {
     /// A successful pet/terminal event whose destination the user is looking
     /// at (`PetAttentionFocusPolicy`): no notice (§2). Failures never are.
     public var isFocusedSuccess: @Sendable (EventBus.Event) async -> Bool
+    /// Reuses canonical run/request projection for durable source observations.
+    public var observeAgentEvent: @Sendable (EventBus.Event) async -> Bool
 
     public init(
         resolveInbox: @escaping @Sendable (TitioNoticeLanguage) async -> TitioInboxTarget?,
@@ -313,7 +316,8 @@ public struct TitioNoticeHooks: Sendable {
         deliverPush: @escaping @Sendable (RemoteCodeNotificationContent) async -> Void = { _ in },
         pushBinding: @escaping @Sendable () -> TitioNoticePushBinding = { TitioNoticePushBinding(profileID: nil, hostID: nil) },
         workspaceName: @escaping @Sendable (WorkspaceID) async -> String? = { _ in nil },
-        isFocusedSuccess: @escaping @Sendable (EventBus.Event) async -> Bool = { _ in false }
+        isFocusedSuccess: @escaping @Sendable (EventBus.Event) async -> Bool = { _ in false },
+        observeAgentEvent: @escaping @Sendable (EventBus.Event) async -> Bool = { _ in true }
     ) {
         self.resolveInbox = resolveInbox
         self.isInboxViewed = isInboxViewed
@@ -327,6 +331,7 @@ public struct TitioNoticeHooks: Sendable {
         self.pushBinding = pushBinding
         self.workspaceName = workspaceName
         self.isFocusedSuccess = isFocusedSuccess
+        self.observeAgentEvent = observeAgentEvent
     }
 }
 
@@ -391,7 +396,9 @@ public actor TitioNoticeCenter {
 
     // Dependencies
     private let repo: TitioNoticeRepository
+    private let observations: TitioNoticeObservationRepository
     private let messageRepo: AgentMessageRepository
+    private let threadRepo: AgentThreadRepository
     private let settingsStore: SettingsStore
     private let botStore: BotStore
     private let hooks: TitioNoticeHooks
@@ -408,6 +415,7 @@ public actor TitioNoticeCenter {
     /// In-memory mirrors of ledger state that MainActor send paths read
     /// without SQLite: the live "Reply here" arm, the open cards and the
     /// `titio_inbox` snapshot. Refreshed on this actor after every mutation.
+    private nonisolated let voiceStarts = TitioNoticeLockedBox<[Date]>([])
     private nonisolated let armBox = TitioNoticeLockedBox<TitioNoticeArm?>(nil)
     /// Arms a send already took: a stale refresh must not hand them out again.
     private nonisolated let takenArmKeys = TitioNoticeLockedBox<Set<String>>([])
@@ -465,7 +473,9 @@ public actor TitioNoticeCenter {
         timeZone: TimeZone = .current
     ) {
         self.repo = TitioNoticeRepository(db: db)
+        self.observations = TitioNoticeObservationRepository(db: db)
         self.messageRepo = AgentMessageRepository(db: db)
+        self.threadRepo = AgentThreadRepository(db: db)
         self.settingsStore = SettingsStore(db: db)
         self.botStore = botStore
         self.hooks = hooks
@@ -505,7 +515,7 @@ public actor TitioNoticeCenter {
     public nonisolated func start(subscribeToEvents: Bool = true) {
         guard startedBox.exchange(true) == false else { return }
         if subscribeToEvents {
-            let kinds = PetController.potentialProjectionKinds.union(Self.botAttentionEventKinds)
+            let kinds = PetController.potentialProjectionKinds.union(Self.botAttentionEventKinds).union(TitioNoticeObservationRepository.eventKinds)
             let id = EventBus.shared.subscribeFromCurrent { [weak self] event in
                 guard kinds.contains(event.kind) else { return }
                 self?.handleEvent(event)
@@ -517,6 +527,12 @@ public actor TitioNoticeCenter {
     }
 
     public nonisolated func ingest(_ fact: TitioNoticeFact, legacy: TitioNoticeLegacyDelivery? = nil) {
+        // Durably observe before returning to the producer. Delivery and voice
+        // remain asynchronous; a quit in that gap is recovered by startup.
+        do { _ = try repo.ingest(fact) }
+        catch {
+            titioNoticeLog.error("titio.notice.intake_failed key=\(fact.key, privacy: .public) error=\(String(describing: error), privacy: .public)")
+        }
         continuation.yield(.ingest(fact, legacy))
     }
 
@@ -564,6 +580,12 @@ public actor TitioNoticeCenter {
         if Self.botAttentionEventKinds.contains(event.kind) {
             continuation.yield(.botAttentionChanged)
         } else {
+            do {
+                try observations.record(seq: event.seq, kind: event.kind,
+                    payloadJSON: EventBus.encodePayloadForPersistence(event.payload), occurredAt: event.ts)
+            } catch {
+                titioNoticeLog.error("titio.notice.observation_failed seq=\(event.seq) error=\(String(describing: error), privacy: .public)")
+            }
             continuation.yield(.petEvent(event))
         }
     }
@@ -647,7 +669,10 @@ public actor TitioNoticeCenter {
         case .botAttentionChanged:
             scheduleAttentionPass()
         case .petEvent(let event):
-            await handlePetEvent(event)
+            if await handleObservedEvent(event) {
+                do { try observations.acknowledge(seq: event.seq, at: now()) }
+                catch { titioNoticeLog.error("titio.notice.observation_checkpoint_failed seq=\(event.seq)") }
+            }
         case .refreshMirrors:
             refreshMirrors()
         case .expireArm(let key):
@@ -667,11 +692,12 @@ public actor TitioNoticeCenter {
         settingsStore.load().titioNotificationsEnabled
     }
 
-    private func handleIngest(_ fact: TitioNoticeFact, legacy legacyDelivery: TitioNoticeLegacyDelivery?) async {
+    @discardableResult
+    private func handleIngest(_ fact: TitioNoticeFact, legacy legacyDelivery: TitioNoticeLegacyDelivery?) async -> Bool {
         // Kill switch off (a hook raced the toggle): today's banner, as is.
         guard hubEnabled() else {
             if let legacyDelivery { await postLegacy(key: fact.key, legacyDelivery, reason: "disabled") }
-            return
+            return false
         }
         await expireSupersededRequests(by: fact)
         let record: TitioNoticeRecord?
@@ -680,10 +706,10 @@ public actor TitioNoticeCenter {
         } catch {
             titioNoticeLog.error("titio.notice.ingest_failed key=\(fact.key, privacy: .public) error=\(String(describing: error), privacy: .public)")
             if let legacyDelivery { await postLegacy(key: fact.key, legacyDelivery, reason: "ingest_failed") }
-            return
+            return false
         }
         // A replay or a second producer of an already posted notice is a no-op.
-        guard let record, record.state == .pending else { return }
+        guard let record, record.state == .pending else { return true }
         if let legacyDelivery, record.urgency != .info { legacy[record.key] = legacyDelivery }
         switch record.urgency {
         case .decision:
@@ -700,6 +726,7 @@ public actor TitioNoticeCenter {
             if infoFirstAt == nil { infoFirstAt = now() }
             armInfoWindow()
         }
+        return true
     }
 
     private func handleTimer(_ id: TimerID) async {
@@ -844,15 +871,17 @@ public actor TitioNoticeCenter {
     private func flush(keys requested: [String], catchUp: Bool) async -> Bool {
         let keys = requested.filter { !composing.contains($0) }
         guard !keys.isEmpty else { return true }
+        if keys.count > 32 {
+            var succeeded = true
+            for start in stride(from: 0, to: keys.count, by: 32) {
+                let batch = Array(keys[start..<min(start + 32, keys.count)])
+                if !(await flush(keys: batch, catchUp: catchUp)) { succeeded = false }
+            }
+            return succeeded
+        }
         let language = language()
         guard let target = await target(language: language) else {
             titioNoticeLog.info("titio.notice.inbox_unavailable keys=\(keys.count, privacy: .public)")
-            armFallbacks(keys)
-            scheduleRetry()
-            return false
-        }
-        guard let writer = voice else {
-            titioNoticeLog.error("titio.voice.unavailable purpose=notice keys=\(keys.count, privacy: .public)")
             armFallbacks(keys)
             scheduleRetry()
             return false
@@ -867,6 +896,19 @@ public actor TitioNoticeCenter {
             return false
         }
         guard !rows.isEmpty else { return true }
+        let interrupting = rows.filter(allowsInterruption)
+        if !interrupting.isEmpty, interrupting.count != rows.count {
+            let allowed = Set(interrupting.map(\.key))
+            let first = await flush(keys: interrupting.map(\.key), catchUp: catchUp)
+            let second = await flush(keys: rows.filter { !allowed.contains($0.key) }.map(\.key), catchUp: catchUp)
+            return first && second
+        }
+        // Facts and actionable questions must never wait for a model. The same
+        // durable message/card identity is used whether synthesis is available.
+        if rows.contains(where: { $0.urgency != .info }) || voice == nil {
+            return await commit(keys: keys, catchUp: catchUp, target: target, language: language, reply: nil)
+        }
+        guard let writer = voice else { return false }
         startNoticeVoice(rows: rows, catchUp: catchUp, target: target, language: language, writer: writer)
         return true
     }
@@ -924,6 +966,18 @@ public actor TitioNoticeCenter {
         accept: @escaping @Sendable (String) -> Bool,
         complete: @escaping @Sendable (String?) -> VoiceCompletion
     ) {
+        let current = now()
+        let admitted = voiceStarts.mutate { starts in
+            starts.removeAll { current.timeIntervalSince($0) >= 60 }
+            guard starts.count < 12 else { return false }
+            starts.append(current)
+            return true
+        }
+        guard admitted else {
+            voiceInFlight.mutate { $0 += 1 }
+            continuation.yield(.voiced(complete(nil)))
+            return
+        }
         let id = UUID()
         let tasks = voiceTasks
         let timing = voiceTiming
@@ -948,11 +1002,6 @@ public actor TitioNoticeCenter {
         switch completion {
         case .notice(let plan, let reply):
             composing.subtract(plan.keys)
-            guard let reply else {
-                armFallbacks(plan.keys)
-                scheduleRetry()
-                return
-            }
             guard let target = await target(language: plan.language) else {
                 titioNoticeLog.info("titio.notice.inbox_unavailable keys=\(plan.keys.count, privacy: .public)")
                 armFallbacks(plan.keys)
@@ -978,7 +1027,7 @@ public actor TitioNoticeCenter {
         catchUp: Bool,
         target: TitioInboxTarget,
         language: TitioNoticeLanguage,
-        reply: TitioVoiceReply,
+        reply: TitioVoiceReply?,
         voicedKeys: Set<String>? = nil
     ) async -> Bool {
         let viewing = await hooks.isInboxViewed(target)
@@ -997,7 +1046,7 @@ public actor TitioNoticeCenter {
                 guard let fallback = TitioNoticeCopy.composeBatch(items, language: language, catchUp: catchUp, timeZone: timeZone) else {
                     return nil
                 }
-                let composed = Self.composed(fallback: fallback, reply: reply)
+                let composed = reply.map { Self.composed(fallback: fallback, reply: $0) } ?? fallback
                 let uuid = rows.count == 1
                     ? TitioNoticeIDs.messageID(forKey: rows[0].key)
                     : TitioNoticeIDs.digestMessageID(forKeys: rows.map(\.key))
@@ -1005,12 +1054,13 @@ public actor TitioNoticeCenter {
                     id: AgentMessageID(uuid),
                     threadId: target.threadID,
                     role: .assistant,
-                    content: composed.text,
+                    content: (composed.cardOptions == nil ? Self.sourceHeading(rows) : "") + composed.text,
                     createdAt: postedAt
                 )
                 try messageRepo.append(message)
                 written = message
-                bannerText = Self.bannerText(items: items, reply: reply)
+                bannerText = reply.map { Self.bannerText(items: items, reply: $0) }
+                    ?? TitioNoticeCopy.bannerBody(items, language: language, catchUp: catchUp, timeZone: timeZone)
                 return TitioNoticePosting(
                     messageID: uuid.uuidString,
                     batchID: rows.count > 1 ? uuid.uuidString : nil,
@@ -1018,7 +1068,7 @@ public actor TitioNoticeCenter {
                     cardOptions: composed.cardOptions,
                     preview: composed.preview,
                     countsAsUnread: !viewing,
-                    notificationLine: reply.notificationLine
+                    notificationLine: bannerText
                 )
             }
         } catch {
@@ -1044,6 +1094,19 @@ public actor TitioNoticeCenter {
         return true
     }
 
+    private static func sourceHeading(_ rows: [TitioNoticeRecord]) -> String {
+        guard rows.count == 1, let row = rows.first else { return "" }
+        let names = [row.facts.workspaceName, row.facts.botName, row.facts.title]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return names.isEmpty ? "" : names.map { name in
+            name.reduce(into: "") { text, character in
+                if "\\`*_{}[]<>()#+-.!|".contains(character) { text.append("\\") }
+                text.append(character)
+            }
+        }.joined(separator: " → ") + "\n\n"
+    }
+
     /// Titio's text with the host's own card appended (labels may be the
     /// writer's translation, but every action stays the ledger's). Template
     /// prose is never displayed; the writer supplies every conversational field.
@@ -1059,7 +1122,10 @@ public actor TitioNoticeCenter {
                 if Set(merged.compactMap(\.label)).count == merged.count { options = merged }
             }
             text += "\n\n" + TitioNoticeCopy.choicesBlock(
-                question: reply.question, options: (options ?? defaults).compactMap(\.label), notice: owner
+                question: BotChoicesBlock.parse(fallback.text).choices?.question ?? reply.question,
+                options: (options ?? defaults).compactMap(\.label), notice: owner,
+                source: BotChoicesBlock.parse(fallback.text).choices?.source ?? [:],
+                canReply: defaults.contains(where: { $0.action == .replyHere })
             )
         }
         return TitioNoticeComposed(
@@ -1113,7 +1179,7 @@ public actor TitioNoticeCenter {
         do { try repo.markBanner(keys: keys, at: now()) } catch {
             titioNoticeLog.error("titio.notice.mark_banner_failed error=\(String(describing: error), privacy: .public)")
         }
-        if let speak = speechBox.value {
+        if result.records.allSatisfy(allowsInterruption), let speak = speechBox.value {
             let urgency: TitioNoticeUrgency = result.records.contains { $0.urgency == .decision } ? .decision
                 : result.records.contains { $0.urgency == .alert } ? .alert : .info
             speak(TitioNoticeSpeech(
@@ -1126,6 +1192,15 @@ public actor TitioNoticeCenter {
         }
     }
 
+    private func allowsInterruption(_ row: TitioNoticeRecord) -> Bool {
+        guard row.facts.interruptionSuppressed != true else { return false }
+        if let id = row.source.botId.flatMap(UUID.init(uuidString:)).map(BotID.init),
+           let bot = try? botStore.get(id: id), !bot.notificationsEnabled { return false }
+        return RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+            isAction: row.urgency != .info, workspaceId: row.source.workspaceId, settings: settingsStore.load()
+        )
+    }
+
     /// Banner + push with the same identifier (the relay deduplicates re-posts).
     private func deliver(
         identifier: String,
@@ -1135,6 +1210,8 @@ public actor TitioNoticeCenter {
         noticeKey: String?,
         records: [TitioNoticeRecord]
     ) {
+        guard records.allSatisfy(allowsInterruption) else { return }
+        let canReply = records.count == 1 && records[0].actions?.contains(where: { $0.action == .replyHere }) == true
         let binding = hooks.pushBinding()
         let legacyKeys = Self.legacyRouteKeys(records)
         let conversation = target.conversationID.value.uuidString.lowercased()
@@ -1143,15 +1220,15 @@ public actor TitioNoticeCenter {
         let bannerInfo = RemoteCodeNotificationContent.titioNoticeUserInfo(
             botID: bot, conversationID: conversation, messageID: messageID, noticeKey: noticeKey,
             identifier: identifier, profileID: binding.profileID, hostID: binding.hostID,
-            legacy: legacyKeys, includeBotIdWithoutProfile: true
+            legacy: legacyKeys, includeBotIdWithoutProfile: true, canReply: canReply
         )
         let pushInfo = RemoteCodeNotificationContent.titioNoticeUserInfo(
             botID: bot, conversationID: conversation, messageID: messageID, noticeKey: noticeKey,
             identifier: identifier, profileID: binding.profileID, hostID: binding.hostID,
-            legacy: legacyKeys
+            legacy: legacyKeys, canReply: canReply
         )
-        hooks.postBanner(RemoteCodeNotificationContent.titioNotice(identifier: identifier, body: text, userInfo: bannerInfo))
-        let push = RemoteCodeNotificationContent.titioNotice(identifier: identifier, body: text, userInfo: pushInfo)
+        hooks.postBanner(RemoteCodeNotificationContent.titioNotice(identifier: identifier, body: text, userInfo: bannerInfo, canReply: canReply))
+        let push = RemoteCodeNotificationContent.titioNotice(identifier: identifier, body: text, userInfo: pushInfo, canReply: canReply)
         let deliverPush = hooks.deliverPush
         Task { await deliverPush(push) }
     }
@@ -1176,7 +1253,7 @@ public actor TitioNoticeCenter {
     }
 
     private func snapshot(target: TitioInboxTarget, inbox: TitioInboxState, openDecisions: Int) -> TitioInboxSnapshot {
-        TitioInboxSnapshot(
+        var value = TitioInboxSnapshot(
             botID: target.botID,
             conversationID: target.conversationID,
             threadID: target.threadID,
@@ -1185,6 +1262,23 @@ public actor TitioNoticeCenter {
             lastPreview: inbox.lastPreview,
             lastAt: inbox.lastAt
         )
+        if openDecisions > 0 {
+            for row in (try? repo.openCards()) ?? [] where row.urgency == .decision {
+                if let actions = actionsBox.value, !isSourceRequestOpen(row, actions: actions) { continue }
+                guard let raw = row.messageID, let uuid = UUID(uuidString: raw),
+                      let message = try? messageRepo.get(id: AgentMessageID(uuid)),
+                      message.threadId == target.threadID,
+                      let revision = try? messageRepo.bodyRevision(id: message.id) else { continue }
+                value.focus = TitioLiveActivityFocus(
+                    botId: target.botID.value.uuidString.lowercased(),
+                    conversationId: target.conversationID.value.uuidString.lowercased(),
+                    messageId: uuid.uuidString.lowercased(),
+                    actionId: row.actions?.contains(where: { $0.action == .replyHere }) == true ? "reply" : "review",
+                    questionRevision: revision)
+                break
+            }
+        }
+        return value
     }
 
     // MARK: Failure handling (§3 step 6)
@@ -1225,6 +1319,7 @@ public actor TitioNoticeCenter {
     /// the rest as one batch. Info rows in the live window stay there.
     private func retryPending() async {
         guard hubEnabled() else { return }
+        await replayObservations()
         if !(await warmTarget()) { return }
         guard let pending = try? repo.listPending() else { scheduleRetry(); return }
         let waiting = Set(infoKeys).union(flapTimers.keys)
@@ -1255,6 +1350,26 @@ public actor TitioNoticeCenter {
 
     // MARK: Startup (§3 steps 5, 7)
 
+    private func replayObservations() async {
+        do {
+            while true {
+                let rows = try observations.pending()
+                guard !rows.isEmpty else { return }
+                for row in rows {
+                    guard let data = row.payloadJSON.data(using: .utf8), let payload = JSONValue.decode(from: data) else {
+                        throw SQLiteError.execute("Invalid Titio observation \(row.seq)")
+                    }
+                    let event = EventBus.Event(seq: row.seq, kind: row.kind, payload: payload, ts: row.occurredAt)
+                    guard await handleObservedEvent(event) else { scheduleRetry(); return }
+                    try observations.acknowledge(seq: row.seq, at: now())
+                }
+            }
+        } catch {
+            titioNoticeLog.error("titio.notice.replay_failed error=\(String(describing: error), privacy: .public)")
+            scheduleRetry()
+        }
+    }
+
     private func handleStartup() async {
         let current = now()
         do {
@@ -1267,12 +1382,54 @@ public actor TitioNoticeCenter {
         // Settle what no live task owns first, so a dead request is neither
         // re-announced nor posted below.
         await reconcileAfterRestart(at: current)
+        await enrichOpenCardSources()
+        if hubEnabled() { await replayObservations() }
+        do { try observations.pruneProcessed(before: current.addingTimeInterval(-TitioNoticeTiming.retention)) }
+        catch { titioNoticeLog.error("titio.notice.observation_prune_failed") }
         await repostMissingBanners(now: current)
         guard hubEnabled(), let pending = try? repo.listPending(), !pending.isEmpty else {
             _ = await warmTarget()
             return
         }
         await flushPendingRows(pending, catchUp: true)
+        if pending.count == 500 { scheduleRetry() }
+    }
+
+    /// Upgrade host-owned open cards in place; retain their exact question,
+    /// options and body so replies still refer to the same displayed request.
+    private func enrichOpenCardSources() async {
+        for row in (try? repo.openCards()) ?? [] {
+            guard let raw = row.messageID, let uuid = UUID(uuidString: raw),
+                  let message = try? messageRepo.get(id: AgentMessageID(uuid)),
+                  let start = message.content.range(of: "```choices\n"),
+                  let end = message.content.range(of: "\n```", range: start.upperBound..<message.content.endIndex),
+                  let data = String(message.content[start.upperBound..<end.lowerBound]).data(using: .utf8),
+                  var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  object["notice"] as? String == row.key else { continue }
+            var facts = row.facts
+            if let rawThread = row.source.threadId, let id = UUID(uuidString: rawThread),
+               let thread = try? threadRepo.get(id: AgentThreadID(id)) {
+                if facts.title == nil { facts.title = thread.title }
+                if facts.workspaceName == nil, let workspace = thread.workspaceId {
+                    facts.workspaceName = await hooks.workspaceName(workspace)
+                }
+            }
+            if facts.workspaceName == nil, let workspace = row.source.workspaceId.flatMap(UUID.init(uuidString:)) {
+                facts.workspaceName = await hooks.workspaceName(WorkspaceID(workspace))
+            }
+            if facts.botName == nil, let botID = row.source.botId.flatMap(UUID.init(uuidString:)),
+               let bot = try? botStore.get(id: BotID(botID)) { facts.botName = bot.name }
+            let labels = TitioNoticeCopy.sourceLabels(facts)
+            let canReply = row.actions?.contains(where: { $0.action == .replyHere }) == true
+            guard object["source"] as? [String: String] != labels || (object["can_reply"] as? Bool ?? false) != canReply else { continue }
+            if !labels.isEmpty { object["source"] = labels }
+            object["can_reply"] = canReply
+            guard let encoded = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]),
+                  let json = String(data: encoded, encoding: .utf8) else { continue }
+            var text = message.content
+            text.replaceSubrange(start.upperBound..<end.lowerBound, with: json)
+            await writeRewrite(message, text: text, language: language(), key: row.key)
+        }
     }
 
     /// No act task, provider callback or inbox message survives a quit or
@@ -1292,7 +1449,11 @@ public actor TitioNoticeCenter {
                     await rewrite(resolved, at: current)
                 }
             } else {
-                _ = try? repo.reopen(key: row.key)
+                // The process died between claim and receipt. The external effect
+                // cannot be proven absent, so never make it executable again.
+                if let resolved = try? repo.resolve(key: row.key, resolution: .unknownEffect, at: current) {
+                    await rewrite(resolved, at: current)
+                }
             }
         }
         if let actions {
@@ -1307,7 +1468,7 @@ public actor TitioNoticeCenter {
 
     /// True unless the row is an approval/input whose provider request is
     /// known to be closed.
-    private func isSourceRequestOpen(_ row: TitioNoticeRecord, actions: TitioNoticeActionHooks) -> Bool {
+    private nonisolated func isSourceRequestOpen(_ row: TitioNoticeRecord, actions: TitioNoticeActionHooks) -> Bool {
         let kind: TitioNoticeActionHooks.RequestKind
         switch row.kind {
         case .approval: kind = .approval
@@ -1315,7 +1476,7 @@ public actor TitioNoticeCenter {
         default: return true
         }
         guard let request = requestTarget(row) else { return true }
-        return actions.isRequestOpen(request.thread, request.id, kind)
+        return actions.isRequestOpen(request.thread, request.id, kind, row.source.runId)
     }
 
     /// Open rows whose message no longer exists (transcript retention before
@@ -1364,7 +1525,19 @@ public actor TitioNoticeCenter {
     /// or a request resolution names the source, not the occurrence.
     private func handleSourceResolved(key: String, reason: TitioNoticeResolution) async {
         let occurrences = ((try? repo.openKeys(prefix: key + TitioNoticeIDs.occurrenceSeparator)) ?? []).sorted()
-        for target in [key] + occurrences {
+        var targets = [key] + occurrences
+        // Upgraded cards retain their original unscoped key and message ID.
+        // Only resolve that legacy row when it names this exact run.
+        if key.hasPrefix("thread."), key.contains(".attention."),
+           let separator = key.range(of: TitioNoticeIDs.occurrenceSeparator, options: .backwards) {
+            let base = String(key[..<separator.lowerBound])
+            let run = String(key[separator.upperBound...])
+            if let legacy = try? repo.get(key: base),
+               legacy.source.runId?.caseInsensitiveCompare(run) == .orderedSame {
+                targets.append(base)
+            }
+        }
+        for target in targets {
             await resolveOne(key: target, reason: reason)
         }
     }
@@ -1426,12 +1599,12 @@ public actor TitioNoticeCenter {
         let writesStatus = resolution != .acknowledged
         let text = TitioNoticeCopy.resolvedText(
             original: original.content,
-            statusLine: nil
+            statusLine: writesStatus ? TitioNoticeCopy.statusLine(status, language: messageLanguage, at: date, timeZone: timeZone) : nil
         )
         if text != original.content {
             await writeRewrite(original, text: text, language: messageLanguage, key: record.key)
         }
-        guard writesStatus, let writer = voice else { return }
+        guard writesStatus, resolution != .unknownEffect, let writer = voice else { return }
         let request = TitioVoiceRequest(
             purpose: .status,
             prompt: TitioVoicePrompt.status(status, at: date, language: voiceLanguage(), timeZone: timeZone),
@@ -1609,44 +1782,56 @@ public actor TitioNoticeCenter {
 
     // MARK: Pet / terminal events (§5)
 
-    private func handlePetEvent(_ event: EventBus.Event) async {
-        guard case .object(let payload) = event.payload else { return }
+    private func handleObservedEvent(_ event: EventBus.Event) async -> Bool {
+        guard event.kind.hasPrefix("agent."), event.kind != "agent.provider.updated" else {
+            return await handlePetEvent(event)
+        }
+        if ["agent.request.resolved", "agent.user_input.resolved"].contains(event.kind),
+           case .object(let payload) = event.payload,
+           let thread = payload["thread_id"]?.stringValue,
+           let request = payload["request_id"]?.stringValue {
+            let key = payload["run_id"]?.stringValue.map {
+                TitioNoticeIDs.threadAttention(threadId: thread, requestId: request, runId: $0)
+            } ?? TitioNoticeIDs.threadAttention(threadId: thread, requestId: request)
+            await handleSourceResolved(key: key, reason: .elsewhere)
+            return true
+        }
+        guard hubEnabled() else { return false }
+        return await hooks.observeAgentEvent(event)
+    }
+
+    private func handlePetEvent(_ event: EventBus.Event) async -> Bool {
+        guard case .object(let payload) = event.payload else { return true }
         // Resolutions first: they never classify as a notice.
         if event.kind == "ssh.session.updated",
            payload["status"]?.stringValue == "connected" || payload["reason"]?.stringValue == "user_requested",
            let surface = payload["surface_id"]?.stringValue.flatMap(UUID.init(uuidString:)) {
             await handleSourceResolved(key: TitioNoticeIDs.petSSHDisconnect(surfaceId: surface.uuidString), reason: .elsewhere)
-            return
+            return true
         }
         if ["files.edit.saved", "files.edit.discarded", "files.edit.closed"].contains(event.kind),
            let session = payload["session_id"]?.stringValue, !session.isEmpty {
             await handleSourceResolved(key: TitioNoticeIDs.petFileConflict(sessionId: session), reason: .elsewhere)
-            return
+            return true
         }
         guard let terminal = PetTerminalNotificationRecorder.classify(event),
-              let mapped = Self.noticeKind(for: terminal.kind) else { return }
+              let mapped = Self.noticeKind(for: terminal.kind) else { return true }
         // The same gates as every hook (§2, §0.5): the kill switch, the
         // action/completion toggles and workspace mutes. Resolutions above
         // still run, so a muted or disabled hub never leaves a stale row.
         let settings = settingsStore.load()
-        guard settings.titioNotificationsEnabled,
-              RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
-                isAction: mapped.defaultUrgency != .info,
-                workspaceId: terminal.workspaceID?.value.uuidString,
-                settings: settings
-              ) else { return }
-        if !mapped.isFailure, mapped.defaultUrgency == .info, await hooks.isFocusedSuccess(event) { return }
+        guard settings.titioNotificationsEnabled else { return false }
         let key: String
         switch terminal.kind {
         case .sshUnexpectedDisconnect:
-            guard let surface = terminal.surfaceID else { return }
+            guard let surface = terminal.surfaceID else { return true }
             // One row per occurrence: a drop after an earlier flap or
             // reconnect must post again (the source key alone is finished).
             key = TitioNoticeIDs.occurrence(
                 of: TitioNoticeIDs.petSSHDisconnect(surfaceId: surface.value.uuidString), String(terminal.sequence)
             )
         case .fileConflict:
-            guard let session = payload["session_id"]?.stringValue, !session.isEmpty else { return }
+            guard let session = payload["session_id"]?.stringValue, !session.isEmpty else { return true }
             key = TitioNoticeIDs.occurrence(of: TitioNoticeIDs.petFileConflict(sessionId: session), String(terminal.sequence))
         default:
             key = TitioNoticeIDs.petEvent(sequence: terminal.sequence)
@@ -1657,12 +1842,14 @@ public actor TitioNoticeCenter {
         } else {
             workspaceName = nil
         }
-        let facts = TitioNoticeFacts(
+        var facts = TitioNoticeFacts(
             title: Self.petTitle(payload: payload),
             workspaceName: workspaceName,
             exitCode: payload["exit_code"]?.intValue,
             durationMs: payload["duration_ms"]?.intValue
         )
+        facts.interruptionSuppressed = !mapped.isFailure && mapped.defaultUrgency == .info
+            ? await hooks.isFocusedSuccess(event) : false
         let fact = TitioNoticeFact(
             key: key,
             kind: mapped,
@@ -1671,7 +1858,7 @@ public actor TitioNoticeCenter {
             actions: TitioNoticeAction.defaultActions(kind: mapped, facts: facts),
             occurredAt: terminal.createdAt
         )
-        await handleIngest(fact, legacy: nil)
+        return await handleIngest(fact, legacy: nil)
     }
 
     static func noticeKind(for kind: PetTerminalNotificationKind) -> TitioNoticeKind? {
@@ -1738,37 +1925,37 @@ public actor TitioNoticeCenter {
         // Kill switch and the action toggle gate new Bot notices (§0.5, §2);
         // items acknowledged elsewhere still resolve above.
         let settings = settingsStore.load()
-        guard settings.titioNotificationsEnabled,
-              RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
-                isAction: true, workspaceId: nil, settings: settings
-              ) else { return }
+        guard settings.titioNotificationsEnabled else { return }
         for candidate in plan.ingest {
-            let options: [String]?
-            if candidate.kind == .botQuestion, let thread = candidate.threadID {
-                options = latestChoices(thread: thread)
-            } else {
-                options = nil
-            }
+            var source = candidate.source
             var facts = candidate.facts
-            facts.options = options
+            if let conversationID = source.conversationId.flatMap(UUID.init(uuidString:)).map(BotConversationID.init),
+               let conversation = try? botStore.conversation(id: conversationID) {
+                facts.title = conversation.title
+            }
+            if let threadID = candidate.threadID, let thread = try? threadRepo.get(id: threadID) {
+                source.workspaceId = thread.workspaceId?.value.uuidString
+                if let workspaceID = thread.workspaceId { facts.workspaceName = await hooks.workspaceName(workspaceID) }
+                if facts.title == nil { facts.title = thread.title }
+                if candidate.kind == .botQuestion,
+                   let message = try? messageRepo.listRecent(threadId: threadID, limit: 20)
+                    .last(where: { $0.role == .assistant && $0.createdAt <= candidate.occurredAt }),
+                   let choices = BotChoicesBlock.parse(message.content).choices {
+                    facts.options = choices.options
+                    facts.prompt = choices.question
+                    source.finalMessageId = message.id.value.uuidString
+                }
+            }
             let fact = TitioNoticeFact(
                 key: candidate.key,
                 kind: candidate.kind,
-                source: candidate.source,
+                source: source,
                 facts: facts,
                 actions: TitioNoticeAction.defaultActions(kind: candidate.kind, facts: facts),
                 occurredAt: candidate.occurredAt
             )
             await handleIngest(fact, legacy: nil)
         }
-    }
-
-    /// The Bot's own choices from its latest assistant message, if any.
-    private func latestChoices(thread: AgentThreadID) -> [String]? {
-        guard let recent = try? messageRepo.listRecent(threadId: thread, limit: 6),
-              let last = recent.last(where: { $0.role == .assistant }),
-              let choices = BotChoicesBlock.parse(last.content).choices else { return nil }
-        return choices.options
     }
 
     struct AttentionCandidate: Equatable {
@@ -1809,12 +1996,9 @@ public actor TitioNoticeCenter {
             }
             let key = TitioNoticeIDs.botAttention(itemId: item.id.value.uuidString)
             live.insert(key)
-            guard let bot = bots[item.botID], bot.deletedAt == nil, bot.notificationsEnabled,
+            guard let bot = bots[item.botID], bot.deletedAt == nil,
                   bot.handle.lowercased() != TitioBot.handle else { continue }
             if openBotKeys.contains(key) { continue }
-            // A backlog item (older than `attentionMaxAge`, e.g. from before
-            // the hub existed) stays in Activity: no burst on first launch.
-            if now.timeIntervalSince(item.createdAt) > TitioNoticeTiming.attentionMaxAge { continue }
             let thread = item.conversationID.flatMap(linkedThread)
             if let thread {
                 let prefix = "thread.\(thread.value.uuidString).attention."
@@ -1865,6 +2049,10 @@ public actor TitioNoticeCenter {
             return .navigate(route: Self.navigationRoute(for: option.action, record: record, binding: hooks.pushBinding()))
         }
         guard let actions = actionsBox.value else { return .unsupported }
+        guard isSourceRequestOpen(record, actions: actions) else {
+            continuation.yield(.sourceResolved(record.key, .expired))
+            return .alreadyResolved
+        }
         // Any other tap clears a live arm on another notice (§7 "Armed reply").
         let cleared: TitioNoticeArm? = armBox.mutate { arm in
             guard let current = arm else { return nil }
@@ -1884,6 +2072,62 @@ public actor TitioNoticeCenter {
         }
         spawnAct { center in await center.runClaimedAct(record, option: option, actions: actions) }
         return .accepted
+    }
+
+    /// Capable clients capture this source card in their own composer. Merely
+    /// opening that composer never changes a shared armed-reply slot.
+    public nonisolated func contextualReply(messageID: String, optionIndex: Int) -> [String: Any]? {
+        guard let record = try? repo.notice(messageID: messageID.uppercased()),
+              let options = record.actions, options.indices.contains(optionIndex),
+              options[optionIndex].action == .replyHere else { return nil }
+        guard record.state == .posted || record.state == .awaitingReply else {
+            return ["outcome": "already_resolved"]
+        }
+        let question = capturedQuestion(record)
+        return ["outcome": "reply_required", "question": question]
+    }
+
+    /// The card identity, not the latest global arm, owns this reply. Claim
+    /// before returning acceptance; a concurrent device cannot send it twice.
+    public nonisolated func replyNow(messageID: String, text: String, expectedQuestionRevision: Int? = nil) -> TitioNoticeActOutcome {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.utf8.count <= 65_536 else { return .invalidOption }
+        guard let record = try? repo.notice(messageID: messageID.uppercased()),
+              record.actions?.contains(where: { $0.action == .replyHere }) == true else { return .notFound }
+        if let expectedQuestionRevision {
+            guard let uuid = UUID(uuidString: messageID),
+                  (try? messageRepo.bodyRevision(id: AgentMessageID(uuid))) == expectedQuestionRevision else { return .alreadyResolved }
+        }
+        guard let actions = actionsBox.value else { return .unsupported }
+        guard isSourceRequestOpen(record, actions: actions) else {
+            continuation.yield(.sourceResolved(record.key, .expired))
+            return .alreadyResolved
+        }
+        guard (try? repo.claim(key: record.key)) == true else { return .alreadyResolved }
+        continuation.yield(.refreshMirrors)
+        spawnAct { center in
+            await center.appendActMessage(role: .user, text: center.quotedAnswer(text, record: record))
+            let language = await center.messageLanguage(record)
+            if record.kind == .botQuestion {
+                await center.forwardToBot(record, text: text, actions: actions, language: language)
+            } else {
+                await center.answerRequest(record, text: text, actions: actions, language: language)
+            }
+        }
+        return .accepted
+    }
+
+    private nonisolated func capturedQuestion(_ record: TitioNoticeRecord) -> String {
+        if let raw = record.messageID, let uuid = UUID(uuidString: raw),
+           let message = try? messageRepo.get(id: AgentMessageID(uuid)),
+           let question = BotChoicesBlock.parse(message.content).choices?.question { return question }
+        return record.facts.prompt ?? record.facts.detail ?? record.facts.title ?? ""
+    }
+
+    private nonisolated func quotedAnswer(_ text: String, record: TitioNoticeRecord) -> String {
+        let question = capturedQuestion(record)
+        guard !question.isEmpty else { return text }
+        return AgentReplyQuote.compose(excerpt: question, text: text)
     }
 
     /// The Mac `hostReplyHandler` and the iOS inbox intercept: the next text
@@ -1968,7 +2212,7 @@ public actor TitioNoticeCenter {
         let language = messageLanguage(record)
         let label = option.label ?? TitioNoticeCopy.label(for: option.action, language: language, botName: record.facts.botName)
         if option.action != .ack {
-            await appendActMessage(role: .user, text: label)
+            await appendActMessage(role: .user, text: quotedAnswer(label, record: record))
         }
         let facts = record.facts
         let source = record.source
@@ -1985,7 +2229,7 @@ public actor TitioNoticeCenter {
             guard let request = requestTarget(record) else {
                 return await finish(record, .failed, result: .failed(error: missingSourceReason(language)))
             }
-            guard actions.isRequestOpen(request.thread, request.id, .approval) else {
+            guard actions.isRequestOpen(request.thread, request.id, .approval, record.source.runId) else {
                 return await finish(record, .expired, result: .alreadyResolved)
             }
             await perform(record, resolution: resolution, result: result) {
@@ -2045,7 +2289,7 @@ public actor TitioNoticeCenter {
     private func consumeArmedReply(key: String, text: String, actions: TitioNoticeActionHooks) async {
         defer { takenArmKeys.mutate { _ = $0.remove(key) } }
         let record = try? repo.get(key: key)
-        await appendActMessage(role: .user, text: text)
+        await appendActMessage(role: .user, text: record.map { quotedAnswer(text, record: $0) } ?? text)
         guard let record, (try? repo.claim(key: key)) == true else {
             refreshMirrors()
             await speakResult(.alreadyResolved)
@@ -2064,7 +2308,7 @@ public actor TitioNoticeCenter {
         guard let request = requestTarget(record) else {
             return await finish(record, .failed, result: .failed(error: missingSourceReason(language)))
         }
-        guard actions.isRequestOpen(request.thread, request.id, .userInput) else {
+        guard actions.isRequestOpen(request.thread, request.id, .userInput, record.source.runId) else {
             return await finish(record, .expired, result: .alreadyResolved)
         }
         await perform(record, resolution: .answered,
@@ -2082,7 +2326,7 @@ public actor TitioNoticeCenter {
         }
         await perform(record, resolution: .forwarded,
                       result: .answered(answer: text, target: .bot(name: record.facts.botName))) {
-            try await actions.sendBotMessage(bot, conversation, text)
+            try await actions.sendBotMessage(bot, conversation, quotedAnswer(text, record: record))
             if let item = record.source.attentionItemId.flatMap(UUID.init(uuidString:)).map(BotAttentionItemID.init) {
                 do {
                     try await actions.acknowledgeBotAttention(item)
@@ -2160,7 +2404,7 @@ public actor TitioNoticeCenter {
         await publishInbox(target: target, fallback: snapshot(target: target, inbox: inbox, openDecisions: (try? repo.openDecisionCount()) ?? 0))
     }
 
-    private func requestTarget(_ record: TitioNoticeRecord) -> (thread: AgentThreadID, id: String)? {
+    private nonisolated func requestTarget(_ record: TitioNoticeRecord) -> (thread: AgentThreadID, id: String)? {
         guard let thread = record.source.threadId.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init),
               let request = record.source.requestId, !request.isEmpty else { return nil }
         return (thread, request)

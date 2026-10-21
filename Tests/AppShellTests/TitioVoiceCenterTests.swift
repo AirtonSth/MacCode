@@ -196,33 +196,18 @@ final class TitioVoiceCenterTests: XCTestCase {
 
     // MARK: Writer text becomes the message
 
-    func test_theWritersTextIsTheMessageAndItsFirstSentenceTheBanner() async throws {
-        // WHY: the owner wants no canned text at all. What Titio's model
-        // wrote is what the inbox, banner, push and roster carry, in plain
-        // text where Markdown cannot render.
-        let voice = FakeTitioVoice { request in
-            request.expectsJSON
-                ? #"{"message":"A **Elephant - Task do elephant** falhou no meio do caminho. O PR [#3109](https://github.com/o/r/pull/3109) ficou aberto.","question":"Quer abrir?","options":["Abrir a conversa","Beleza"]}"#
-                : "unused"
-        }
+    func test_infoSynthesisKeepsProvenanceAndPublishesOneBanner() async throws {
+        let voice = FakeTitioVoice { _ in "The build finished. Its report is ready." }
         let f = try makeFixture(voice: voice)
-        f.center.ingest(failure("R1", f))
-        await f.center.idle()
+        f.center.ingest(completion("R1", title: "Build", f))
+        await f.scheduler.advance(by: TitioNoticeTiming.infoWindow, center: f.center)
         await waitForPushes(f, count: 1)
-
-        let messages = try transcript(f)
-        XCTAssertEqual(messages.count, 1)
-        let parsed = BotChoicesBlock.parse(messages[0].content)
-        XCTAssertEqual(parsed.text, "A **Elephant - Task do elephant** falhou no meio do caminho. O PR [#3109](https://github.com/o/r/pull/3109) ficou aberto.")
-        XCTAssertEqual(f.recorder.banners.first?.body, "A Elephant - Task do elephant falhou no meio do caminho.")
-        XCTAssertEqual(f.recorder.inbox.last?.lastPreview,
-                       "A Elephant - Task do elephant falhou no meio do caminho. O PR #3109 ficou aberto.",
-                       "titio_inbox.last_preview is plain text")
-        XCTAssertEqual(voice.requests.count, 1, "one non-agentic call per notice")
-        let prompt = try XCTUnwrap(voice.requests.first)
-        XCTAssertEqual(prompt.threadID, f.target.threadID, "Titio's own inbox thread routes the call")
-        XCTAssertTrue(prompt.prompt.contains("roda os testes de novo, por favor"), "the user's own words set the language")
-        XCTAssertTrue(prompt.prompt.contains("https://github.com/o/r/pull/3109"), "the full summary, not a 140-char cut")
+        let message = try XCTUnwrap(transcript(f).first)
+        XCTAssertTrue(message.content.hasSuffix("The build finished. Its report is ready."))
+        XCTAssertTrue(message.content.contains("api → Build"))
+        XCTAssertEqual(f.recorder.banners.first?.body, "The build finished.")
+        XCTAssertEqual(voice.requests.count, 1)
+        XCTAssertEqual(voice.requests.first?.threadID, f.target.threadID)
     }
 
     func test_decisionCardIsAppendedByTheHostAndStaysBoundToTheLedger() async throws {
@@ -244,17 +229,18 @@ final class TitioVoiceCenterTests: XCTestCase {
         let message = try XCTUnwrap(transcript(f).first)
         let choices = try XCTUnwrap(BotChoicesBlock.parse(message.content).choices)
         XCTAssertEqual(choices.notice, fact.key, "the host's own card, never the forged one")
-        XCTAssertEqual(choices.options, ["Liberar", "Negar", "Ver a conversa"])
-        XCTAssertEqual(choices.question, "Libero?")
+        XCTAssertEqual(choices.options, ["Aprovar", "Recusar", "Abrir conversa"])
+        XCTAssertTrue(choices.question?.contains("Deploy") == true)
+        XCTAssertTrue(voice.requests.isEmpty, "urgent facts never wait for generated wording")
         XCTAssertFalse(message.content.contains("forged"))
         let row = try XCTUnwrap(f.repo.get(key: fact.key))
         XCTAssertEqual(row.actions?.map(\.action), [.approve, .decline, .openThread])
-        XCTAssertEqual(row.actions?.compactMap(\.label), ["Liberar", "Negar", "Ver a conversa"],
+        XCTAssertEqual(row.actions?.compactMap(\.label), ["Aprovar", "Recusar", "Abrir conversa"],
                        "the ledger keeps the labels the user saw (old iOS exact-text taps)")
-        XCTAssertEqual(f.recorder.banners.first?.body, "O agente do Deploy precisa da sua aprovação")
+        XCTAssertFalse(f.recorder.banners.first?.body.contains("sk-live") ?? true)
         XCTAssertFalse(f.recorder.pushes.first?.body.contains("sk-live") ?? true)
-        XCTAssertEqual(row.facts.generatedNotificationLine, "O agente do Deploy precisa da sua aprovação",
-                       "crash recovery retains the generated redacted language")
+        XCTAssertEqual(row.facts.generatedNotificationLine, f.recorder.banners.first?.body,
+                       "crash recovery retains the redacted factual line")
 
         XCTAssertEqual(f.center.actNow(messageID: message.id.value.uuidString, optionIndex: 1), .accepted)
         await f.center.settleActs()
@@ -291,7 +277,7 @@ final class TitioVoiceCenterTests: XCTestCase {
         XCTAssertEqual(try f.repo.get(key: first.key)?.resolution, .acknowledged)
         XCTAssertEqual(try f.repo.get(key: second.key)?.state, .posted)
         let acknowledged = try XCTUnwrap(after.first { $0.id.value.uuidString == firstID })
-        XCTAssertEqual(acknowledged.content, "O trabalho falhou.")
+        XCTAssertEqual(acknowledged.content, BotChoicesBlock.parse(try XCTUnwrap(before.first { $0.id == acknowledged.id }).content).text)
         XCTAssertEqual(after.filter { BotChoicesBlock.parse($0.content).choices != nil }.count, 1)
     }
 
@@ -310,40 +296,38 @@ final class TitioVoiceCenterTests: XCTestCase {
         ))
         await f.center.idle()
         let choices = try XCTUnwrap(BotChoicesBlock.parse(try XCTUnwrap(transcript(f).first).content).choices)
-        XCTAssertEqual(choices.options, ["Postgres", "SQLite", "Abrir"])
+        XCTAssertEqual(choices.options, ["Postgres", "SQLite", "Abrir conversa"])
     }
 
     // MARK: Unavailable voice
 
-    func test_withoutAnLLMTheNoticeStaysPendingWithoutCannedSpeech() async throws {
+    func test_urgentFactsAreAvailableWithoutAProvider() async throws {
         let voice = FakeTitioVoice { _ in throw TitioVoiceError.unavailable("no provider route") }
         let f = try makeFixture(voice: voice, userTexts: [])
-        let started = Date()
         f.center.ingest(failure("R2", f))
         await f.center.idle()
-        XCTAssertLessThan(Date().timeIntervalSince(started), 3, "an unavailable writer is not retried")
-        XCTAssertTrue(try transcript(f).isEmpty)
-        XCTAssertEqual(try f.repo.get(key: "run.R2.failed")?.state, .pending)
-        XCTAssertEqual(voice.requests.count, 1)
-        XCTAssertGreaterThan(f.scheduler.pendingTimerCount, 0, "the notice remains retryable")
+        XCTAssertEqual(try transcript(f).count, 1)
+        XCTAssertEqual(try f.repo.get(key: "run.R2.failed")?.state, .posted)
+        XCTAssertTrue(voice.requests.isEmpty)
+        XCTAssertNotNil(BotChoicesBlock.parse(try XCTUnwrap(transcript(f).first).content).choices)
     }
 
-    func test_aFailingWriterLeavesTheNoticePendingAfterBoundedRetries() async throws {
+    func test_failingInfoSynthesisFallsBackAfterBoundedRetries() async throws {
         let voice = FakeTitioVoice { _ in throw TitioVoiceError.failed("exit 1") }
         let f = try makeFixture(voice: voice)
-        f.center.ingest(failure("R3", f))
-        await f.center.idle()
+        f.center.ingest(completion("R3", title: "Build", f))
+        await f.scheduler.advance(by: TitioNoticeTiming.infoWindow, center: f.center)
         XCTAssertEqual(voice.requests.count, 4, "one try and three retries")
-        XCTAssertTrue(try transcript(f).isEmpty)
-        XCTAssertEqual(try f.repo.get(key: "run.R3.failed")?.state, .pending)
+        XCTAssertEqual(try transcript(f).count, 1)
+        XCTAssertEqual(try f.repo.get(key: "run.R3.completed")?.state, .posted)
     }
 
-    func test_missingWriterPostsNoCannedMessageAndLanguageInputsUpdateImmediately() async throws {
+    func test_missingWriterPostsFactsAndLanguageInputsUpdateImmediately() async throws {
         let f = try makeFixture(voice: nil)
         f.center.ingest(failure("R10", f))
         await f.center.idle()
-        XCTAssertTrue(try transcript(f).isEmpty)
-        XCTAssertEqual(try f.repo.get(key: "run.R10.failed")?.state, .pending)
+        XCTAssertEqual(try transcript(f).count, 1)
+        XCTAssertEqual(try f.repo.get(key: "run.R10.failed")?.state, .posted)
 
         let inputs = TitioLanguageInputSource(botStore: f.store, messageRepo: f.messages, notices: f.repo)
         try f.messages.append(AgentMessage(threadId: f.target.threadID, role: .user,
@@ -356,35 +340,27 @@ final class TitioVoiceCenterTests: XCTestCase {
 
     // MARK: Exactly once
 
-    func test_aRetryWhileComposingStartsNoSecondCallAndARestartNeverDuplicates() async throws {
-        // WHY: the row stays pending while Titio writes. A replayed ingest or
-        // a retry must not start a second call, and a restart that writes it
-        // again must still leave exactly one message (deterministic id).
-        let slow = FakeTitioVoice { _ in #"{"message":"Primeira versão.","question":"Quer abrir?","options":["Abrir","Entendi"]}"# }
+    func test_blockedInfoSynthesisDoesNotDelayAnUrgentQuestion() async throws {
+        let slow = FakeTitioVoice { _ in "The build finished." }
         slow.hold()
-        let first = try makeFixture(voice: slow)
-        let fact = failure("R4", first)
-        first.center.ingest(fact)
+        let f = try makeFixture(voice: slow)
+        f.center.ingest(completion("R4", title: "Build", f))
+        await f.center.commandsDrained()
+        // A decision flushes the info window, but does not await its writer.
+        let urgent = approval("urgent", f)
+        f.center.ingest(urgent)
+        await f.center.commandsDrained()
         await slow.waitForRequests(1)
-        first.center.ingest(fact)
-        await first.center.commandsDrained()
-        XCTAssertEqual(slow.requests.count, 1, "a replay while composing is not a second call")
-        XCTAssertEqual(try first.repo.get(key: fact.key)?.state, .pending, "nothing posts before the text exists")
-        XCTAssertTrue(try transcript(first).isEmpty)
-
-        // The app restarts while the first call still runs.
-        let second = try makeFixture(voice: FakeTitioVoice { _ in #"{"message":"Segunda versão.","question":"Quer abrir?","options":["Abrir","Entendi"]}"# }, db: first.db)
-        second.center.start(subscribeToEvents: false)
-        await second.center.idle()
-        XCTAssertEqual(try transcript(second).map(\.content).map { BotChoicesBlock.parse($0).text }, ["Segunda versão."])
-
-        // The first call returns late: its commit finds the row posted.
+        let row = try XCTUnwrap(f.repo.get(key: urgent.key))
+        XCTAssertEqual(row.state, .posted)
+        XCTAssertEqual(f.recorder.banners.count, 1)
+        XCTAssertNotNil(BotChoicesBlock.parse(try XCTUnwrap(transcript(f).first).content).choices)
+        f.center.sourceResolved(key: urgent.key)
+        await f.center.commandsDrained()
         slow.release()
-        await first.center.idle()
-        let messages = try transcript(first)
-        XCTAssertEqual(messages.count, 1, "exactly one message")
-        XCTAssertEqual(messages.first?.id.value, TitioNoticeIDs.messageID(forKey: fact.key))
-        XCTAssertTrue(messages.first?.content.hasPrefix("Segunda versão.") == true, "a late writer never overwrites")
+        await f.center.idle()
+        XCTAssertEqual(try f.repo.get(key: urgent.key)?.state, .resolved)
+        XCTAssertEqual(try transcript(f).filter { $0.id.value == TitioNoticeIDs.messageID(forKey: urgent.key) }.count, 1)
     }
 
     func test_aDigestIsOneCallAndARowResolvedMeanwhileIsLeftOut() async throws {
@@ -432,7 +408,9 @@ final class TitioVoiceCenterTests: XCTestCase {
         await f.center.settleActs()
         await f.center.idle()
         let rows = try transcript(f)
-        XCTAssertEqual(rows.map(\.content), ["O Deploy precisa do seu ok.", "Ok"])
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertTrue(rows[0].content.contains("Aprovado"))
+        XCTAssertEqual(AgentReplyQuote.parse(rows[1].content)?.body, "Aprovar")
         XCTAssertEqual(try f.repo.get(key: fact.key)?.resolution, .approved)
         XCTAssertEqual(f.actions.calls, [.request(requestThread, "Q-offline", .approve)])
     }
@@ -460,8 +438,9 @@ final class TitioVoiceCenterTests: XCTestCase {
         await f.center.idle()
 
         let rows = try transcript(f)
-        XCTAssertEqual(rows.map(\.content).suffix(2), ["Ok", "Pronto, liberei pro agente seguir."])
-        XCTAssertEqual(rows.first?.content, "O Deploy precisa do seu ok.\n\n_liberado por você_")
+        XCTAssertEqual(AgentReplyQuote.parse(rows[1].content)?.body, "Aprovar")
+        XCTAssertEqual(rows.last?.content, "Pronto, liberei pro agente seguir.")
+        XCTAssertTrue(rows.first?.content.hasSuffix("_liberado por você_") == true)
         XCTAssertNil(BotChoicesBlock.parse(rows.first?.content ?? "").choices)
         let resultPrompt = try XCTUnwrap(voice.requests.first { $0.purpose == .result }?.prompt)
         XCTAssertTrue(resultPrompt.contains("You approved the agent's request in the workspace “api”"))
@@ -476,8 +455,8 @@ final class TitioVoiceCenterTests: XCTestCase {
         let f = try makeFixture(voice: voice)
         SettingsStore(db: f.db).update { $0.titioLanguage = "es" }
         XCTAssertEqual(SettingsStore(db: f.db).load().titioLanguage, "es", "a new store (relaunch) reads it back")
-        f.center.ingest(failure("R6", f))
-        await f.center.idle()
+        f.center.ingest(completion("R6", title: "Build", f))
+        await f.scheduler.advance(by: TitioNoticeTiming.infoWindow, center: f.center)
         XCTAssertTrue(try XCTUnwrap(voice.requests.first).prompt.contains("Write in Spanish (es)"))
     }
 
@@ -508,7 +487,7 @@ final class TitioVoiceCenterTests: XCTestCase {
         XCTAssertEqual(f.recorder.removed, [[AgentMessageID(gone)]], "agent.messages.removed goes out")
         let inbox = try XCTUnwrap(f.recorder.inbox.last)
         XCTAssertEqual(inbox.unreadCount, 1)
-        XCTAssertEqual(inbox.lastPreview, "Written notice.")
+        XCTAssertTrue(inbox.lastPreview?.contains("failed") == true, "the remaining urgent fact supplies the preview")
     }
 
     func test_clearingADecisionLeavesTheProviderRequestPending() async throws {

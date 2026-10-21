@@ -46,12 +46,24 @@ public enum PrivateLiveActivityProjectionPhase: String, Codable, Equatable, Send
     case failed
 }
 
+/// A canonical inbox card to review in the authenticated foreground app.
+/// Contains no question text and grants no authority to execute an action.
+public struct TitioLiveActivityFocus: Codable, Equatable, Sendable {
+    public let botId: String
+    public let conversationId: String
+    public let messageId: String
+    public let actionId: String
+    public let questionRevision: Int
+}
+
 /// Versioned ActivityKit content-state shared by the Mac host, backend, and iOS.
 /// Dates stay integer Unix seconds on the wire; clients construct `Date` locally.
 public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
     public let title: String
     public let statusLine: String
     public let preview: String
+    public let petState: String?
+    public let titioFocus: TitioLiveActivityFocus?
     public let phase: PrivateLiveActivityProjectionPhase
     public let activeThreadCount: Int
     public let updatedAt: Double
@@ -69,6 +81,8 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
         title: String = "MacCode",
         statusLine: String,
         preview: String = "MacCode",
+        petState: String? = nil,
+        titioFocus: TitioLiveActivityFocus? = nil,
         phase: PrivateLiveActivityProjectionPhase,
         activeThreadCount: Int,
         updatedAt: Double,
@@ -85,6 +99,8 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
         self.title = title
         self.statusLine = statusLine
         self.preview = preview
+        self.petState = petState
+        self.titioFocus = titioFocus
         self.phase = phase
         self.activeThreadCount = activeThreadCount
         self.updatedAt = updatedAt
@@ -101,7 +117,7 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
 
     public var legacyContentState: PrivateLiveActivityContentState {
         PrivateLiveActivityContentState(
-            title: title,
+            title: "Titio",
             statusLine: statusLine,
             preview: preview,
             phase: phase.rawValue,
@@ -109,7 +125,9 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
             updatedAt: updatedAt,
             runStartDate: runStartDate,
             workspaceId: workspaceId,
-            threadId: threadId
+            threadId: threadId,
+            petState: petState,
+            titioFocus: titioFocus
         )
     }
 }
@@ -309,6 +327,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         /// Pet-surface copy (active ∪ needs-you ∪ completed). Nil ends attention-
         /// only cards; run projection can still keep the activity alive.
         case surface(PetLiveActivityCopy.Output?, Date)
+        case titio(TitioInboxSnapshot, Date)
         case heartbeat(Date)
         case flush(CheckedContinuation<Void, Never>)
     }
@@ -372,12 +391,14 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         self.worker = Task {
             var latest = ActiveRunProjection(runs: [])
             var surface: PetLiveActivityCopy.Output?
+            var titio: TitioInboxSnapshot?
             var wasPresent = false
             var activityGeneration = initialActivityGeneration
             var stateRevision: UInt64 = 0
 
             func presentNow() -> Bool {
-                surface != nil || latest.activeRunCount > 0
+                if let titio { return titio.openDecisions > 0 || latest.activeRunCount > 0 }
+                return surface != nil || latest.activeRunCount > 0
             }
 
             /// Returns true only when `deliver` eventually succeeds. Presence is
@@ -395,6 +416,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                 let delivery = Self.delivery(
                     projection: latest,
                     surface: surface,
+                    titio: titio,
                     cause: cause,
                     event: event,
                     serverId: serverId,
@@ -472,6 +494,9 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                         continue
                     }
                     await publishLifecycle(cause: cause, now: now)
+                case .titio(let inbox, let now):
+                    titio = inbox
+                    await publishLifecycle(cause: .changed, now: now)
                 case .surface(let content, let now):
                     surface = content
                     await publishLifecycle(cause: .changed, now: now)
@@ -495,6 +520,10 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
     }
 
     /// Publish pet-identical Live Activity copy (active + needs-you + completed).
+    public func submitTitio(_ inbox: TitioInboxSnapshot, now: Date = Date()) {
+        continuation.yield(.titio(inbox, now))
+    }
+
     public func submitSurface(_ content: PetLiveActivityCopy.Output?, now: Date = Date()) {
         continuation.yield(.surface(content, now))
     }
@@ -519,6 +548,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
     private static func delivery(
         projection: ActiveRunProjection,
         surface: PetLiveActivityCopy.Output?,
+        titio: TitioInboxSnapshot?,
         cause: LiveActivitySyncCause,
         event: PrivateLiveActivityEvent,
         serverId: String,
@@ -540,7 +570,24 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         // Running projection always wins over attention-only pet surface so the
         // Lock Screen cannot show "done/failed" while ActiveRunProjection still
         // has host-owned runs (Ready for you vs LA split-brain).
-        if projection.activeRunCount > 0 {
+        if let titio {
+            count = projection.activeRunCount
+            phase = count > 0 || titio.openDecisions > 0 ? .running : .completed
+            title = "Titio"
+            if titio.openDecisions > 0 {
+                statusLine = titio.openDecisions == 1 ? "1 question needs you" : "\(titio.openDecisions) questions need you"
+                preview = count > 0 ? "\(count) running · Open Titio to reply" : "Open Titio to reply"
+            } else if count > 0 {
+                statusLine = count == 1 ? "Following 1 run" : "Following \(count) runs"
+                preview = "Titio will bring updates here"
+            } else {
+                statusLine = titio.unreadCount > 0 ? "\(titio.unreadCount) unread updates" : "Up to date"
+                preview = titio.unreadCount > 0 ? "Open Titio to review" : "No pending questions or running work"
+            }
+            threadId = titio.threadID.value.uuidString
+            workspaceId = nil
+            runStartDate = nil
+        } else if projection.activeRunCount > 0 {
             phase = .running
             count = projection.activeRunCount
             if let surface, surface.activeThreadCount > 0 {
@@ -593,6 +640,8 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
             title: title,
             statusLine: statusLine,
             preview: preview,
+            petState: titio.map { $0.openDecisions > 0 ? "question" : count > 0 ? "coding" : "success" },
+            titioFocus: event != .end && phase == .running ? titio?.focus : nil,
             phase: phase,
             activeThreadCount: count,
             updatedAt: Double(Int64(now.timeIntervalSince1970)),

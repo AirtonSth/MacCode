@@ -1385,8 +1385,32 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// Under the limit, skip the exact walk when `lastMeasured + dirty <= limit`.
     /// Dirty is an event-estimate watermark updated on `apply`; over-limit still
     /// takes the exact eviction path.
+    /// Bounded replay can omit older mounted rows. Keep those rows while newer
+    /// replayed values remain authoritative, then rebuild the derived index.
+    public mutating func retainMissingTurns(
+        from previous: AssistantTimelineState,
+        protectedTurnIDs: Set<String>
+    ) {
+        guard !protectedTurnIDs.isEmpty else { return }
+        let previousTurns = Dictionary(uniqueKeysWithValues: previous.turns
+            .filter { protectedTurnIDs.contains($0.turnId) }.map { ($0.turnId, $0) })
+        let replayedIDs = Set(turns.map(\.turnId))
+        let retained = previous.turns.filter {
+            protectedTurnIDs.contains($0.turnId) && !replayedIDs.contains($0.turnId)
+        }
+        for index in turns.indices {
+            guard let old = previousTurns[turns[index].turnId] else { continue }
+            let replayedItems = Set(turns[index].items.map(\.id))
+            turns[index].items.insert(contentsOf: old.items.filter { !replayedItems.contains($0.id) }, at: 0)
+        }
+        turns.insert(contentsOf: retained, at: 0)
+        lastMeasuredAggregateHotTextBytes = nil
+        rebuildLocationIndex()
+    }
+
     public mutating func enforceAggregateHotTextBudget(
-        byteLimit: Int = aggregateHotTextByteLimit
+        byteLimit: Int = aggregateHotTextByteLimit,
+        protectedTurnIDs: Set<String> = []
     ) {
         let limit = max(1, byteLimit)
         let dirty = aggregateHotTextDirtyBytes ?? 0
@@ -1413,6 +1437,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             value = nil
         }
         for turnIndex in turns.indices {
+            guard !protectedTurnIDs.contains(turns[turnIndex].turnId) else { continue }
             for itemIndex in turns[turnIndex].items.indices {
                 if total <= limit { return }
                 debit(turns[turnIndex].items[itemIndex].body.utf8.count)
@@ -1422,6 +1447,9 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
             remove(&turns[turnIndex].finalAssistantMessage)
         }
+        // Visible transcript and decision chrome take priority over the soft
+        // memory target. Only offscreen turn payloads may be evicted here.
+        guard protectedTurnIDs.isEmpty else { return }
         if total > limit, !providerRuntimeEvents.isEmpty {
             var drop = 0
             var debitSum = 0

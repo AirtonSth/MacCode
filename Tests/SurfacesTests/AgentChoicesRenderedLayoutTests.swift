@@ -35,7 +35,8 @@ final class AgentChoicesRenderedLayoutTests: XCTestCase {
         if withNotices {
             for index in 0..<3 {
                 let choices = TitioNoticeCopy.choicesBlock(
-                    question: "Decision \(index)", options: ["Approve", "Decline"], notice: "fixture.notice.\(index)"
+                    question: "Decision \(index)", options: ["Approve", "Decline"], notice: "fixture.notice.\(index)",
+                    source: ["workspace": "MacCode", "bot": "Developer", "conversation": "Review deployment for staging"]
                 )
                 try messageRepo.append(AgentMessage(
                     threadId: thread.id, role: .assistant,
@@ -123,7 +124,7 @@ final class AgentChoicesRenderedLayoutTests: XCTestCase {
         }
     }
 
-    func testCollapsedQuestionsDoNotPaintBelowTheReplyWhileRunning() async throws {
+    func testEarlierQuestionsRemainPaintedWhileRunning() async throws {
         let harness = try makeHarness()
         defer { try? FileManager.default.removeItem(atPath: harness.directory) }
         await harness.vm.waitForSelectThreadHydrationForTesting()
@@ -143,16 +144,18 @@ final class AgentChoicesRenderedLayoutTests: XCTestCase {
         let (withoutQuestions, expectedWindow) = try render(harness.vm, size: size, name: "collapsed-running-without-questions")
         defer { expectedWindow.contentView = nil }
         let scale = CGFloat(actual.pixelsWide) / size.width
-        // The lower timeline must be unchanged when hidden questions are removed.
-        // The old orphan stack painted three cards here during the current turn.
+        // Earlier questions remain in the timeline after an answer starts a run.
+        // Removing their cards must visibly change that retained history.
+        var changedSamples = 0
         for y in stride(from: Int(200 * scale), to: Int(560 * scale), by: 16) {
             for x in stride(from: Int(30 * scale), to: actual.pixelsWide - Int(30 * scale), by: 24) {
                 let a = try XCTUnwrap(actual.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
                 let b = try XCTUnwrap(withoutQuestions.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
                 let difference = abs(a.redComponent - b.redComponent)
                     + abs(a.greenComponent - b.greenComponent) + abs(a.blueComponent - b.blueComponent)
-                XCTAssertLessThan(difference, 0.04, "a collapsed question painted at \(x),\(y)")
+                if difference > 0.04 { changedSamples += 1 }
             }
         }
+        XCTAssertGreaterThan(changedSamples, 4, "earlier question cards must remain visible during a follow-up")
     }
 }

@@ -1322,7 +1322,14 @@ final class AgentAppPerfBundleTests: XCTestCase {
             "suffix apply must not zero the already-painted timeline"
         )
 
-        let delete = try db.prepare("DELETE FROM agent_stream_events WHERE seq > 7;")
+        let displayedIDs = Set(AgentAppView.transcriptColumnPaint(
+            mergedEntries: AgentAppView.mergeTranscriptEntries(messages: vm.messages, turns: vm.timeline.turns),
+            status: vm.status, runStartedAt: vm.runStartedAt, revealCount: 0
+        ).paint.compactMap { entry -> String? in
+            if case .turn(let turn) = entry { return turn.turnId }
+            return nil
+        })
+        let delete = try db.prepare("DELETE FROM agent_stream_events WHERE seq <= 98;")
         _ = try delete.step()
         vm.tickScheduledLivePollForTesting()
         XCTAssertEqual(
@@ -1330,7 +1337,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
             7,
             "prune 100→7 must fail closed to one full latestStreamEvents replay"
         )
-        XCTAssertEqual(vm.timeline.turns.count, 7)
+        XCTAssertEqual(Set(vm.timeline.turns.map(\.turnId)), displayedIDs, "bounded scheduled replay must retain the displayed history")
     }
 
     func test_tickScheduledLivePoll_hiddenDoesNotRefillPublishedTimeline() async throws {

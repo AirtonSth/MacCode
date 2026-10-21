@@ -97,6 +97,8 @@ public enum TitioNoticeResolution: String, Codable, CaseIterable, Sendable {
     case elsewhere
     case expired
     case failed
+    /// The host stopped after claiming; an external effect cannot be ruled out.
+    case unknownEffect = "unknown_effect"
     case flap
     /// The user cleared the notice's message from the inbox (`bot.notice.clear`).
     case cleared
@@ -190,6 +192,8 @@ public struct TitioNoticeFacts: Codable, Equatable, Sendable {
     public var questionCount: Int?
     /// Generated, checked lock-screen copy, retained for crash recovery.
     public var generatedNotificationLine: String?
+    /// Observation survives focus/mute; only interruption is suppressed.
+    public var interruptionSuppressed: Bool?
 
     public init(
         title: String? = nil,
@@ -242,6 +246,7 @@ public struct TitioNoticeFacts: Codable, Equatable, Sendable {
         case isSecret = "is_secret"
         case questionCount = "question_count"
         case generatedNotificationLine = "generated_notification_line"
+        case interruptionSuppressed = "interruption_suppressed"
     }
 
     /// Which user-input card applies (§2): secret or multi-question → no card,

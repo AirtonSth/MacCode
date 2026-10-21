@@ -111,6 +111,34 @@ final class TitioNoticeRecoveryTests: XCTestCase {
         store.save(settings)
     }
 
+    func test_startupEnrichesExistingOpenCardWithoutReplacingQuestionOrIdentity() async throws {
+        let f = try makeFixture()
+        let facts = TitioNoticeFacts(title: "Exact conversation", workspaceName: "Workspace", botName: "Scout", prompt: "Exact question?")
+        let fact = TitioNoticeFact(key: "existing-card", kind: .botQuestion,
+            source: TitioNoticeSource(threadId: requestThread.value.uuidString), facts: facts,
+            actions: [.replyHere, .openThread])
+        f.center.ingest(fact)
+        await f.center.idle()
+        let id = AgentMessageID(TitioNoticeIDs.messageID(forKey: fact.key))
+        let original = try XCTUnwrap(f.messages.get(id: id))
+        let oldBody = "Original body\n\n" + TitioNoticeCopy.choicesBlock(
+            question: "Exact question?", options: ["Reply here", "Open source"], notice: fact.key)
+        try f.messages.append(AgentMessage(id: id, threadId: original.threadId, role: original.role,
+            content: oldBody, createdAt: original.createdAt))
+        f.center.start(subscribeToEvents: false)
+        await f.center.idle()
+        let updated = try XCTUnwrap(f.messages.get(id: id))
+        let choices = try XCTUnwrap(BotChoicesBlock.parse(updated.content).choices)
+        XCTAssertEqual(choices.question, "Exact question?")
+        XCTAssertEqual(choices.options, ["Reply here", "Open source"])
+        XCTAssertTrue(choices.canReply)
+        XCTAssertEqual(choices.source["workspace"], "Workspace")
+        XCTAssertEqual(choices.source["conversation"], "Exact conversation")
+        XCTAssertTrue(updated.content.hasPrefix("Original body\n\n"))
+        XCTAssertEqual(try transcript(f).count, 1)
+        XCTAssertEqual(f.recorder.banners.count, 1, "metadata upgrade does not announce again")
+    }
+
     // MARK: 1. Repeat occurrences
 
     func test_aSecondSSHDropAfterAFlapPostsAgain() async throws {
@@ -191,19 +219,21 @@ final class TitioNoticeRecoveryTests: XCTestCase {
         f.center.ingest(TitioNoticeFact(key: "run.X.failed", kind: .runFailed),
                         legacy: TitioNoticeLegacyDelivery(content: legacy, pushes: false))
         await f.center.idle()
-        XCTAssertNil(try f.repo.get(key: "run.X.failed"))
+        XCTAssertEqual(try f.repo.get(key: "run.X.failed")?.state, .pending, "observation is durable even when delivery is disabled")
         XCTAssertEqual(f.recorder.banners.map(\.identifier), ["run.X.failed"])
         XCTAssertEqual(f.recorder.banners.first?.title, "Run failed")
     }
 
-    func test_mutedWorkspaceSilencesPetEvents() async throws {
+    func test_mutedWorkspaceRetainsPetFactsWithoutInterrupting() async throws {
         // WHY (§2): workspace mutes gate every notice before ingest.
         let f = try makeFixture()
         let workspace = UUID().uuidString
         setHub(true, f, mute: workspace)
         f.center.handleEvent(gitFailure(7, workspace: workspace, f))
         await f.center.idle()
-        XCTAssertNil(try f.repo.get(key: "pet.event.7"))
+        XCTAssertEqual(try f.repo.get(key: "pet.event.7")?.state, .posted)
+        XCTAssertTrue(f.recorder.banners.isEmpty)
+        XCTAssertEqual(try transcript(f).count, 1)
     }
 
     func test_killSwitchOffStopsBotAttentionNotices() async throws {
@@ -222,7 +252,7 @@ final class TitioNoticeRecoveryTests: XCTestCase {
 
     // MARK: 3 / 17 / 23 / 33 / 39. Rows left in `acting`
 
-    func test_startupGivesBackActingCardsAndExpiresOnesWhoseRequestIsGone() async throws {
+    func test_startupQuarantinesUnknownActsAndExpiresGoneRequests() async throws {
         // WHY: the act runs in an in-memory task. A quit or crash mid-act left
         // the row `acting` forever: a dead card, every tap silent, and the
         // inbox stuck in needs-attention.
@@ -238,9 +268,9 @@ final class TitioNoticeRecoveryTests: XCTestCase {
         open.actions.requestOpen = true
         open.center.start(subscribeToEvents: false)
         await open.center.idle()
-        XCTAssertEqual(try open.repo.get(key: stuck.key)?.state, .posted)
+        XCTAssertEqual(try open.repo.get(key: stuck.key)?.resolution, .unknownEffect)
         XCTAssertEqual(open.center.actNow(messageID: TitioNoticeIDs.messageID(forKey: stuck.key).uuidString, optionIndex: 0),
-                       .accepted, "a tap acts again")
+                       .alreadyResolved, "an unknown external effect is never retried blindly")
         await settle(open)
 
         // Another stuck act whose request is gone after the restart: expired.
@@ -374,9 +404,8 @@ final class TitioNoticeRecoveryTests: XCTestCase {
 
     // MARK: 9. Attention backlog
 
-    func test_attentionPlanSkipsABacklogOlderThanADay() {
-        // WHY: the first pass after an upgrade turned every weeks-old
-        // unacknowledged Bot item into its own message, banner and push.
+    func test_attentionPlanRetainsUnresolvedQuestionsAcrossLongDowntime() {
+        // An unresolved question remains part of the inbox after long downtime.
         let bot = BotDefinition(handle: "scout", name: "Scout", title: "", description: "")
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let old = BotAttentionItem(botID: bot.id, kind: .question, title: "Old", createdAt: now.addingTimeInterval(-3 * 86_400))
@@ -388,7 +417,7 @@ final class TitioNoticeRecoveryTests: XCTestCase {
             openBotKeys: [TitioNoticeIDs.botAttention(itemId: oldPosted.id.value.uuidString)],
             openThreadKeys: [], linkedThread: { _ in nil }, now: now
         )
-        XCTAssertEqual(plan.ingest.map(\.key), [TitioNoticeIDs.botAttention(itemId: recent.id.value.uuidString)])
+        XCTAssertEqual(plan.ingest.map(\.key), [old, recent].map { TitioNoticeIDs.botAttention(itemId: $0.id.value.uuidString) })
         XCTAssertEqual(plan.resolved, [], "an old item that already has a notice still counts as live")
     }
 

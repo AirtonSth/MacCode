@@ -4038,6 +4038,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// so they run like the off-main reads, never on the MainActor.
     nonisolated static let pairedBotOffMainMutationMethods: Set<String> = [
         "bot.notice.act",
+        "bot.notice.reply",
         "bot.notice.read",
         "bot.notice.clear",
     ]
@@ -4426,7 +4427,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 routing: routing,
                 adoptAsDeskRoute: routingValues.map(Self.pairedRouteKeepsItsProvider) ?? false,
                 origin: .pairedClient(
-                    tapsNoticeCards: clientCapabilities.contains(BotsViewModel.noticeActClientCapability)
+                    tapsNoticeCards: clientCapabilities.contains(BotsViewModel.noticeActClientCapability),
+                    bindsNoticeReplies: clientCapabilities.contains("bot.notice_reply_v1")
                 )
             )
             return Self.foundationObject(result.objectValue ?? [:])
@@ -4435,6 +4437,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // MainActor (see `pairedBotOffMainMutationMethods`), so these only
         // touch the hub's thread-safe ledger and in-memory mirrors.
         let noticeCenter = ctx.titioNoticeCenter
+        let noticeHostID = ctx.liveActivityHostIdentity.serverId
+        created.onNoticeReply = { botID, messageID, text, revision in
+            ["outcome": noticeCenter.replyNow(messageID: messageID, text: text, expectedQuestionRevision: revision).wireName,
+             "host_id": noticeHostID, "bot_id": botID.value.uuidString.lowercased()]
+        }
+        created.onNoticeContextualAct = { _, messageID, optionIndex in
+            noticeCenter.contextualReply(messageID: messageID, optionIndex: optionIndex)
+        }
         created.onNoticeAct = { _, messageID, optionIndex in
             let outcome = noticeCenter.actNow(messageID: messageID, optionIndex: optionIndex)
             var answer: [String: Any] = ["outcome": outcome.wireName]

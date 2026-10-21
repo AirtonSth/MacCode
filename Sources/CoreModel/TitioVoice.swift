@@ -312,6 +312,7 @@ public enum TitioVoicePrompt {
         case .acknowledged: fact = "The user saw this and dismissed it."
         case .done: fact = "What the user asked for was done at \(time)."
         case .failed: fact = "It did not go through; the user should open the conversation."
+        case .unknownEffect: fact = "The outcome is unconfirmed after interruption; check the source before retrying. Do not say it failed or succeeded."
         }
         return [
             persona,

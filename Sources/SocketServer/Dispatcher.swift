@@ -1046,6 +1046,7 @@ public final class JSONRPCDispatcher {
         "bot.caveman.set",
         "bot.factory_reset",
         "bot.notice.act",
+        "bot.notice.reply",
         "bot.notice.read",
         "bot.notice.clear",
         "bot.desktop.set",

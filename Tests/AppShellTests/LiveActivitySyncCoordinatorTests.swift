@@ -27,6 +27,34 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         })
     }
 
+    func testTitioInboxOwnsRunningPendingAndEndProjection() async {
+        let recorder = DeliveryRecorder()
+        let sync = LiveActivitySyncCoordinator(serverId: "host", bootEpoch: 1, initialActivityGeneration: 0,
+            deliver: { await recorder.append($0) }, heartbeatIntervalNanoseconds: 60_000_000_000_000)
+        var inbox = TitioInboxSnapshot(botID: BotID(), conversationID: BotConversationID(), threadID: AgentThreadID(),
+            unreadCount: 1, openDecisions: 1, lastPreview: "secret question", lastAt: Date())
+        inbox.focus = TitioLiveActivityFocus(botId: inbox.botID.description, conversationId: inbox.conversationID.description,
+            messageId: UUID().uuidString, actionId: "reply", questionRevision: 2)
+        sync.submitTitio(inbox)
+        sync.submitSurface(PetLiveActivityCopy.Output(title: "Other producer", statusLine: "Other status", preview: "Other preview", phase: .failed, activeThreadCount: 0))
+        sync.submit(active([("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000002")]), cause: .started)
+        inbox.openDecisions = 0
+        sync.submitTitio(inbox)
+        sync.submit(active([]), cause: .finished(.completed))
+        await sync.flush()
+        let deliveries = recorder.deliveries
+        XCTAssertEqual(deliveries.first?.event, .start)
+        XCTAssertEqual(deliveries.first?.projection.phase, .running)
+        XCTAssertEqual(deliveries.first?.projection.petState, "question")
+        XCTAssertEqual(deliveries.first?.projection.titioFocus, inbox.focus)
+        XCTAssertNil(deliveries.last?.projection.titioFocus, "terminal delivery never offers a stale question")
+        XCTAssertEqual(deliveries.last?.event, .end, "a stale pet surface cannot keep Titio alive")
+        XCTAssertTrue(deliveries.allSatisfy { $0.projection.title == "Titio" })
+        XCTAssertTrue(deliveries.allSatisfy { $0.projection.threadId == inbox.threadID.value.uuidString })
+        XCTAssertTrue(deliveries.allSatisfy { !$0.projection.preview.contains("secret") && !$0.projection.preview.contains("Other") })
+        XCTAssertTrue(deliveries.contains { $0.projection.statusLine == "Following 1 run" })
+    }
+
     func testAggregateTransitionsUseOneGenerationAndMonotonicRevision() async {
         let recorder = DeliveryRecorder()
         let sync = LiveActivitySyncCoordinator(
@@ -815,6 +843,8 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
     func testV2ContractEncodesRootSharedFieldNamesAndEpochIntegers() throws {
         let projection = PrivateLiveActivityProjectionV2(
             statusLine: "1 active run",
+            petState: "question",
+            titioFocus: TitioLiveActivityFocus(botId: "bot-1", conversationId: "conversation-1", messageId: "message-1", actionId: "reply", questionRevision: 3),
             phase: .running,
             activeThreadCount: 1,
             updatedAt: 900,
@@ -833,7 +863,7 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(Set(object.keys), [
             "title", "statusLine", "preview", "phase", "activeThreadCount", "updatedAt",
             "runStartDate", "workspaceId", "threadId", "protocolVersion", "activityKey",
-            "sessionId", "hostId", "epoch", "revision"
+            "sessionId", "hostId", "epoch", "revision", "petState", "titioFocus"
         ])
         XCTAssertEqual(object["protocolVersion"] as? Int, 2)
         XCTAssertEqual(object["activityKey"] as? String, "active-threads")
@@ -870,8 +900,13 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             "protocolVersion", "activityKey", "activitySessionId", "hostId", "bootEpoch", "activityGeneration",
             "revision", "event", "deviceId", "environment", "phase", "activeThreadCount",
             "title", "statusLine", "preview", "updatedAtEpochSeconds", "runStartEpochSeconds",
-            "workspaceId", "threadId"
+            "workspaceId", "threadId", "petState", "titioFocus"
         ])
+        XCTAssertEqual(requestObject["petState"] as? String, "question")
+        let focus = try XCTUnwrap(requestObject["titioFocus"] as? [String: Any])
+        XCTAssertEqual(focus["messageId"] as? String, "message-1")
+        XCTAssertEqual(focus["actionId"] as? String, "reply")
+        XCTAssertEqual(focus["questionRevision"] as? Int, 3)
         XCTAssertEqual(requestObject["bootEpoch"] as? Int, 8)
         XCTAssertEqual(requestObject["activityGeneration"] as? Int, 3)
         XCTAssertEqual(requestObject["updatedAtEpochSeconds"] as? Int, 900,

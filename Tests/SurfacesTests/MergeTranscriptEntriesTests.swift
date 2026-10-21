@@ -242,10 +242,6 @@ final class MergeTranscriptEntriesTests: XCTestCase {
             ids.contains("message-\(hop.id.value.uuidString)"),
             "internal hop prompt must not enter the Agent App transcript"
         )
-        let window = AgentAppView.followUpAnchoredWindow(entries: [
-            .message(ask),
-            .message(hop),
-        ])
-        XCTAssertEqual(window?.first?.id, "message-\(ask.id.value.uuidString)")
+
     }
 }

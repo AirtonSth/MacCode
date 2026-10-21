@@ -1061,6 +1061,8 @@ public final class AppContext {
                 var requestPayload: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "request_id": .string(request.id),
+                    "run_id": .string(runId.value.uuidString),
+                    "allows_session_approval": .bool(request.allowsSessionApproval),
                     "kind": .string(request.kind.rawValue),
                     "title": .string(request.title),
                     "detail": request.detail.map(JSONValue.string) ?? .null
@@ -1094,11 +1096,12 @@ public final class AppContext {
                 EventBus.shared.publish(kind: .agentRequestResolved, payload: .object([
                     "thread_id": .string(t),
                     "request_id": .string(requestId),
+                    "run_id": .string(runId.value.uuidString),
                     "state": .string(state.rawValue)
                 ]))
                 // A Titio card for this request is now stale (§5 "Request resolutions").
                 self.titioNoticeCenter.sourceResolved(
-                    key: TitioNoticeIDs.threadAttention(threadId: tid.value.uuidString, requestId: requestId)
+                    key: TitioNoticeIDs.threadAttention(threadId: tid.value.uuidString, requestId: requestId, runId: runId.value.uuidString)
                 )
             case .userInputRequested(let request):
                 do {
@@ -1111,6 +1114,7 @@ public final class AppContext {
                 var userInputPayload: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "request_id": .string(request.id),
+                    "run_id": .string(runId.value.uuidString),
                     "prompt": .string(request.prompt),
                     "options": .array(request.options.map(JSONValue.string)),
                     "allows_multiple_selection": .bool(request.allowsMultipleSelection),
@@ -1164,10 +1168,11 @@ public final class AppContext {
                 EventBus.shared.publish(kind: .agentUserInputResolved, payload: .object([
                     "thread_id": .string(t),
                     "request_id": .string(requestId),
+                    "run_id": .string(runId.value.uuidString),
                     "answer": answer.map(JSONValue.string) ?? .null
                 ]))
                 self.titioNoticeCenter.sourceResolved(
-                    key: TitioNoticeIDs.threadAttention(threadId: tid.value.uuidString, requestId: requestId)
+                    key: TitioNoticeIDs.threadAttention(threadId: tid.value.uuidString, requestId: requestId, runId: runId.value.uuidString)
                 )
             case .tokenUsage(let usage):
                 self.recordProviderTokenUsage(usage, runId: runId)
@@ -1335,7 +1340,7 @@ public final class AppContext {
                         )
                         // Titio hub branch (§5): the policy checks above stay
                         // first; a user stop and pausedForUser never notify.
-                        if allowed, !isUserStop, !pausedForUser, !isSideThread,
+                        if !isUserStop, !pausedForUser, !isSideThread,
                            self.titioNoticeCenter.isEnabled(notificationSettings),
                            self.ingestTitioRunOutcome(
                                threadId: tid,
@@ -1932,15 +1937,15 @@ public final class AppContext {
             requestId: requestId,
             isNestedWorker: nested
         ) else { return }
+        if titioNoticeCenter.isEnabled(notificationSettings),
+           ingestTitioRequest(threadId: threadId, runId: runId, requestId: requestId, facts: facts, chrome: chrome, legacy: content) {
+            return
+        }
         guard RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
             isAction: true,
             workspaceId: chrome?.workspaceId?.value.uuidString,
             settings: notificationSettings
         ) else { return }
-        if titioNoticeCenter.isEnabled(notificationSettings),
-           ingestTitioRequest(threadId: threadId, runId: runId, requestId: requestId, facts: facts, chrome: chrome, legacy: content) {
-            return
-        }
         SystemNotifier.shared.post(content, settings: notificationSettings)
         Task {
             await privateNotificationBridge.deliver(content)
