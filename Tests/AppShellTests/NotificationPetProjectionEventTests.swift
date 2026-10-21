@@ -267,5 +267,8 @@ final class TitioNoticeKeyEventTests: XCTestCase {
 
         XCTAssertEqual(events.count, 1)
         XCTAssertNil(events.first?.payload.objectValue?["titio_notice_key"])
+        XCTAssertNil(events.first?.payload.objectValue?["title"], "Refresh events must not expose private notification text.")
+        XCTAssertNil(events.first?.payload.objectValue?["body"])
+        XCTAssertEqual(events.first?.payload.objectValue?["soundEnabled"], .bool(false))
     }
 }

@@ -247,10 +247,6 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     private func post(_ content: RemoteCodeNotificationContent) {
-        postedIdentifiersLock.lock()
-        let inserted = postedIdentifiers.insert(content.identifier).inserted
-        postedIdentifiersLock.unlock()
-        guard inserted else { return }
         guard authorized, canUseNotificationCenterForInstance else {
             // Notify the caller so an in-app fallback can surface the result
             // when OS-level delivery is blocked (permission denied).
@@ -259,7 +255,17 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
             }
             return
         }
-        notificationCenterClient.add(content.makeRequest(), withCompletionHandler: nil)
+        postedIdentifiersLock.lock()
+        let inserted = postedIdentifiers.insert(content.identifier).inserted
+        postedIdentifiersLock.unlock()
+        guard inserted else { return }
+        notificationCenterClient.add(content.makeRequest()) { [weak self] error in
+            guard let self, let error else { return }
+            self.postedIdentifiersLock.lock()
+            self.postedIdentifiers.remove(content.identifier)
+            self.postedIdentifiersLock.unlock()
+            Self.log.error("notifications.schedule_failed id=\(content.identifier, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+        }
     }
 
     /// Current OS authorization status, used by Settings to decide whether to
@@ -268,21 +274,24 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// UNUserNotificationCenter is unavailable.
     public func authorizationStatus() async -> UNAuthorizationStatus {
         guard Self.canUseNotificationCenter else { return .notDetermined }
-        return await notificationCenterClient.notificationSettings().authorizationStatus
+        let status = await notificationCenterClient.notificationSettings().authorizationStatus
+        authorized = status == .authorized || status == .provisional
+        return status
     }
 
     /// Best-effort test notification for the Settings "Test notification"
     /// button. Re-requests authorization when still undetermined so the first
     /// press also triggers the OS prompt.
-    public func postTestNotification() {
+    public func postTestNotification(settings: AppSettings = AppSettings()) {
         guard Self.canUseNotificationCenter else { return }
-        let deliver = { [notificationCenterClient] in
-            let content = UNMutableNotificationContent()
-            content.title = "MacCode"
-            content.body = "Test notification — delivery is working."
-            content.sound = .default
-            let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-            notificationCenterClient.add(req, withCompletionHandler: nil)
+        let deliver = { [self] in
+            post(RemoteCodeNotificationContent(
+                identifier: UUID().uuidString, title: "MacCode",
+                body: "Test notification — your alerts appear here.",
+                categoryIdentifier: RemoteCodeNotificationContent.threadUpdateCategoryIdentifier,
+                threadIdentifier: "notification.test", userInfo: [:],
+                soundEnabled: settings.notificationSoundEnabled
+            ))
         }
         if authorized {
             deliver()
@@ -310,7 +319,10 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler(Self.presentationOptions(appIsForeground: true))
+        completionHandler(Self.presentationOptions(
+            appIsForeground: true,
+            isTestNotification: notification.request.content.threadIdentifier == "notification.test"
+        ))
     }
 
     public func userNotificationCenter(
@@ -325,7 +337,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         completionHandler()
     }
 
-    public static func presentationOptions(appIsForeground: Bool) -> UNNotificationPresentationOptions {
-        appIsForeground ? [] : [.banner, .list, .sound]
+    public static func presentationOptions(appIsForeground: Bool, isTestNotification: Bool = false) -> UNNotificationPresentationOptions {
+        appIsForeground && !isTestNotification ? [] : [.banner, .list, .sound]
     }
 }

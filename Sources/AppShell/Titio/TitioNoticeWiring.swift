@@ -124,7 +124,7 @@ extension AppContext {
                 SystemNotifier.shared.post(content, settings: settings.load())
             },
             deliverPush: { content in
-                await bridge.deliver(content)
+                await bridge.deliver(content.withSound(settings.load().notificationSoundEnabled))
             },
             pushBinding: {
                 TitioNoticePushBinding(profileID: bindings.unique(hostID: hostID)?.profileID, hostID: hostID)

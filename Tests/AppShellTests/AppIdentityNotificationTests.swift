@@ -208,6 +208,8 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "foreground clients must update the in-app feed without showing a system push")
         XCTAssertEqual(SystemNotifier.presentationOptions(appIsForeground: false), [.banner, .list, .sound],
                        "push presentation is reserved for background or closed app states")
+        XCTAssertEqual(SystemNotifier.presentationOptions(appIsForeground: true, isTestNotification: true),
+                       [.banner, .list, .sound], "The explicit Settings test must show a real banner.")
     }
 
     func testPrivateAccountLoginIsOptionalAndPersistsSessionForBackendPush() async throws {
@@ -632,7 +634,7 @@ final class AppIdentityNotificationTests: XCTestCase {
             title: "Build fix",
             phase: .completed
         ))
-        await bridge.deliverThreadOutcomeRemote(content, phase: .completed)
+        await bridge.deliverThreadOutcomeRemote(content.withSound(false), phase: .completed)
 
         // Visible alert + coalesced silent catch-up wake for iOS auto-sync.
         XCTAssertEqual(api.alertRequests.count, 2)
@@ -649,6 +651,10 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(alert.data["workspaceId"], "ws-1")
         XCTAssertEqual(alert.data["threadId"], "thread-1")
         XCTAssertEqual(alert.data["category"], "RemoteCodeThreadUpdate")
+        XCTAssertEqual(alert.data["categoryIdentifier"], "RemoteCodeThreadUpdate")
+        XCTAssertEqual(alert.data["threadIdentifier"], content.threadIdentifier)
+        XCTAssertEqual(alert.data["soundEnabled"], "false")
+        XCTAssertEqual(alert.data["idempotencyKey"], content.identifier)
         XCTAssertEqual(alert.silent, false)
 
         let silent = try XCTUnwrap(api.alertRequests.last)

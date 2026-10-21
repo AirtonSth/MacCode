@@ -507,6 +507,28 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(banner.body, "Pronto! Fiz o deploy.")
         XCTAssertEqual(banner.userInfo["botId"], f.target.botID.value.uuidString.lowercased(), "the Mac banner always routes to the bot")
         XCTAssertNil(f.recorder.pushes.first?.userInfo["botId"], "no profile binding: iOS must fall back, not get a nil route")
+        XCTAssertEqual(f.recorder.pushes.first?.userInfo["threadId"], f.target.threadID.value.uuidString,
+                       "a reply without a unique profile must still open its exact thread")
+    }
+
+    func testDirectReplyRespectsCompletionPreferenceAndBotMute() async throws {
+        let f = try makeFixture()
+        let settings = SettingsStore(db: f.db)
+        var value = settings.load()
+        value.notificationCompletionAlertsEnabled = false
+        settings.save(value)
+        f.center.postDirectReplyBanner(botID: f.target.botID, conversationID: f.target.conversationID,
+                                      runID: AgentRunID(), text: "Ready", messageID: nil)
+        await f.center.idle()
+        XCTAssertTrue(f.recorder.banners.isEmpty)
+        value.notificationCompletionAlertsEnabled = true
+        settings.save(value)
+        _ = try f.store.updateProfile(id: f.target.botID, notificationsEnabled: false)
+        f.center.postDirectReplyBanner(botID: f.target.botID, conversationID: f.target.conversationID,
+                                      runID: AgentRunID(), text: "Ready", messageID: nil)
+        await f.center.idle()
+        XCTAssertTrue(f.recorder.banners.isEmpty)
+        XCTAssertTrue(f.recorder.pushes.isEmpty)
     }
 
     func test_actAnswersNavigationAndUnknownMessagesWithoutChangingState() async throws {

@@ -1,40 +1,39 @@
-# Notifications implementation design coverage
+# Notifications design coverage — 2026-10-21
 
-This ledger covers the native macOS and iOS implementation of `plan-notifications`. All 21 installed skills were consulted. The existing RemoteCode design system, native SwiftUI controls, and accessibility requirements take precedence over generated web palettes or libraries. Paths under `Sources/` refer to the macOS repository; paths under `App/Sources/` and `Tests/` refer to the iOS worktree. Copied native test screenshots live under `docs/notifications/evidence/` in each repository.
+All 21 mandatory `sam-design` skills were read. The existing macOS `DESIGN.md` and iOS `docs/design-system.md` govern implementation. This ledger records decisions for this audit, not a claim that every possible design or accessibility check passed.
 
-Implementation uses three distinct views: Running, Needs you, and Finished. Viewed state and attention acknowledgement remain independent. Counts describe the complete query scope, not the currently loaded page. External notification text stays generic; detailed run summaries remain inside the authenticated app.
+## Appllama references
 
-| Skill | Phase | Status | Decision or reason | Evidence |
-|---|---|---|---|---|
-| ui-ux-pro-max | Direction / review | applied | Use its checklist; retain the existing native design system instead of the generated web palette. | Existing DS tokens; Activity layouts and unavailable/error states. |
-| design-system | Direction | applied | Reuse DS colors, system fonts, spacing, chips, and native list controls. | `Sources/AppShell/ActivityWindow.swift`; iOS `ActivityView.swift`. |
-| ui-styling | Direction | not-applicable | Native SwiftUI; no Tailwind, Radix, or CSS. | Both application stacks. |
-| brand | Direction | applied | Keep direct English interface copy and separate failed, stopped, viewed, and acknowledged states. | Activity captions and safe notification copy. |
-| apple-design | Direction | applied | Native lists, segmented controls, sheets, keyboard semantics, and labelled accessibility values. | Activity and shared attention controls on both platforms. |
-| emil-design-eng | Direction | applied | Prioritize result and required action; avoid decorative motion and duplicate counters. | Activity detail and simplified Pet controls. |
-| pick-ui-library | Direction | applied | Add no library; reuse existing SwiftUI and RemoteCode components. | No dependency changes. |
-| animation-vocabulary | Direction | not-applicable | No ambiguous new motion effect needs naming. | Navigation and data refresh remain immediate. |
-| animate | Build | not-applicable | No web animation in this native task. | SwiftUI applications. |
-| animate-expo | Build | not-applicable | Neither application uses React Native or Expo. | Swift application sources. |
-| mobile-native | Build | not-applicable | This skill targets mobile web CSS; the iOS surface is native. | SwiftUI controls and platform touch targets. |
-| prototype | Build | not-applicable | The approved plan defines one direction, not alternative visual prototypes. | `plan-notifications` specification. |
-| ask-sonner | Build | not-applicable | No React or Sonner toast system. | Native notification and inline error handling. |
-| write-swift | Build | applied | Use value DTOs, canonical IDs, isolated reads, and owner-checked async effects. | Activity service, stores, DTOs, and regression tests. |
-| design | Build | not-applicable | No logo, identity asset, or social image requested. | Native interface scope. |
-| banner-design | Build | not-applicable | No advertising banner requested. | Native interface scope. |
-| slides | Build | not-applicable | No presentation requested. | Application implementation scope. |
-| find-animation-opportunities | Review | applied | Frequent activity updates do not justify entrance cascades, moving targets, or delayed navigation. | No new decorative animation. |
-| review-animations | Review | applied | Exact-message navigation uses existing scroll components; reduced-motion verification remains an explicit gate. | Shared transcript scroll targets and native verification report. |
-| improve-animations | Review | not-applicable | No unrelated motion audit or redesign requested. | Frozen notifications and model-error scope. |
-| break-ui | Review | applied | Cover empty/unknown counts, page limit +1, large counts, long CJK titles, missing summaries, failures, and stale results. | Activity fixtures, unit tests, and native UI test artifacts. |
+Thirty returned screens were inspected. The relevant precedents were OmniFocus 4 Notifications (`1542143627/oth_vbb3t`), Driversnote Notifications (`924418916/oth_mp61u`), Timery Live Activities (`1425368544/oth_nmg15`), and Slack Later (`618783545/oth_5uilg`). They informed grouped native preferences, separation of OS permission from app preferences, and clear state/action wording. Existing app colors, typography, components, and navigation were retained.
 
-## Precedence overrides
+| Skill | Status | Concrete decision / evidence |
+|---|---|---|
+| ui-ux-pro-max | applied; generator blocked | Used the native UX checklist. The installed `scripts` entry is a packaged symlink placeholder rather than an executable directory; no generated palette was used. |
+| design-system | applied | Reused Settings category/hero/row controls, DS colors, system fonts, and the existing Activity menu. |
+| ui-styling | not applicable | Both surfaces are SwiftUI; no CSS, Tailwind, or Radix work. |
+| brand | applied | Direct English copy: “Notifications,” “Local notification categories,” and an actionable permission-denied explanation. |
+| apple-design | applied | Native permission deep link, grouped preferences, notification actions, and system Live Activity presentation. |
+| emil-design-eng | applied | Kept frequent status controls immediate and stable; made the explicit test button produce an explicit test presentation. |
+| pick-ui-library | applied | Existing native components suffice. No dependency added. |
+| animation-vocabulary | not applicable | No new motion effect needed identification. |
+| animate | not applicable | No web animation. |
+| animate-expo | not applicable | No React Native or Expo runtime. |
+| mobile-native | not applicable | Native SwiftUI already supplies platform controls and touch behavior. |
+| prototype | not applicable | A focused correction to existing screens did not need alternative product prototypes. |
+| ask-sonner | not applicable | No React toast system. Native notifications and existing in-app history remain authoritative. |
+| write-swift | applied | Preserve value payloads, exact route keys, existing isolation, and the same notification scheduler seam. |
+| design | applied | Appllama reference review informed information hierarchy and the dedicated Notifications destination. |
+| banner-design | not applicable | No marketing banner or generated artwork requested. |
+| slides | not applicable | No presentation requested. |
+| find-animation-opportunities | applied | No additional animation was justified for repeated operational updates. |
+| review-animations | applied | Retained existing native motion; no navigation-boundary animation added. Reduced Motion runtime remains unverified. |
+| improve-animations | not applicable | No animation defect or animation redesign was required. |
+| break-ui | applied | Exercised denied authorization, failed scheduling/retry, duplicate concurrent delivery, silent catch-up, missing signing profile, stale activity ownership, exact routes, and narrow/wide Settings. |
 
-- Existing DS tokens and system fonts override generated palette, font, and library recommendations.
-- Accessibility and truthful state override density, decorative motion, and badge compactness.
-- Existing protocol compatibility overrides introducing unsupported Live Activity phase values.
-- The task does not authorize production deployment, user-app teardown, provider-model substitution, or additional AI summary calls.
+## Native evidence
 
-## Verification status
+- macOS: Notifications category persisted across view models/relaunch; settings, toggles, permission recovery, and test action exercised through mac-use in `io.remotecode.desktop.debug`. Narrow 1100×780 and wide 1600×960 captures are in the macOS `docs/notifications/evidence/` folder.
+- iOS: the real Activity menu exposes local categories and Titio. A real SpringBoard notification tap routes into the fixture's authenticated workspace. Screenshots are in the iOS `docs/notifications/evidence/` folder.
+- Physical iPhone: real APNs alert and Live Activity start were observed; the test activity was removed after the end push. These checks used the already installed app, not the new simulator build.
 
-The delivery evidence document records executed checks and native observations. A skill marked applied records a concrete design or implementation decision; it does not by itself establish native interaction, VoiceOver, reduced-motion, device, push, or performance proof. Unverified gates remain listed explicitly rather than inferred from screenshots or passing unit tests.
+See [delivery verification](delivery.md) for test counts, baseline failures, hardware limitations, and the boundary between APNs acceptance and visible delivery. VoiceOver, acoustic output, and reduced-motion behavior are not inferred from screenshots.

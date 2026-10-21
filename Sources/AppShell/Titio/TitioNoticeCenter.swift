@@ -1760,6 +1760,13 @@ public actor TitioNoticeCenter {
     // MARK: Direct reply banner (§2)
 
     private func handleDirectReply(_ reply: DirectReply) async {
+        let settings = settingsStore.load()
+        let conversation = try? botStore.conversation(id: reply.conversationID)
+        let workspaceID = conversation?.linkedAgentThreadID.flatMap { try? threadRepo.get(id: $0)?.workspaceId }
+        guard (try? botStore.get(id: reply.botID))?.notificationsEnabled != false,
+              RemoteCodeNotificationContent.AgentAppPushPolicy.allowsNotification(
+                isAction: false, workspaceId: workspaceID?.value.uuidString, settings: settings
+              ) else { return }
         let banner = TitioNoticeCopy.directReplyBanner(replyText: reply.text)
         guard !banner.body.isEmpty else { return }
         let identifier = "titio.reply.\(reply.runID.value.uuidString)"
@@ -1771,6 +1778,7 @@ public actor TitioNoticeCenter {
                 conversationID: reply.conversationID.value.uuidString.lowercased(),
                 messageID: messageID, noticeKey: nil, identifier: identifier,
                 profileID: binding.profileID, hostID: binding.hostID,
+                legacy: conversation?.linkedAgentThreadID.map { ["threadId": $0.value.uuidString] } ?? [:],
                 includeBotIdWithoutProfile: includeBot
             )
         }

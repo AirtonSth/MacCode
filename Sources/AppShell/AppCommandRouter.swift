@@ -10059,9 +10059,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ))
         } else {
             titioNoticeKey = nil
-            SystemNotifier.shared.post(title: title, body: body, category: category)
+            SystemNotifier.shared.post(
+                SystemNotifier.legacyContent(title: title, body: body, category: category),
+                settings: SettingsStore(db: ctx.db).load()
+            )
         }
-        var eventPayload: [String: JSONValue] = ["id": .string(n.id)]
+        var eventPayload: [String: JSONValue] = [
+            "id": .string(n.id),
+            "soundEnabled": .bool(SettingsStore(db: ctx.db).load().notificationSoundEnabled)
+        ]
         // Titio's push already alerts the phone for this one: a paired client
         // that sees the key must not schedule its own local notification too.
         // Only when a push can really go out; otherwise the phone's local

@@ -1075,6 +1075,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     public func applicationDidBecomeActive(_ notification: Notification) {
+        Task { _ = await SystemNotifier.shared.authorizationStatus() }
         // Timestamps the reveal (deminiaturize/refocus) AND samples memory at
         // that instant, so the lifecycle log shows the app was alive at the
         // moment focus returned — the gesture the silent-vanish report is tied

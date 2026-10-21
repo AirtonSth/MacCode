@@ -1,28 +1,49 @@
-# Notifications delivery status
+# Notifications integration verification — 2026-10-21
 
-Status: **review candidate; full acceptance remains blocked by the limits below**. The implementation covers host-owned Activity, durable exact results, viewed/Undo receipts, explicit failure acknowledgment, shared counts, scheduled and registered operations, safe grouped alerts, and macOS/iOS navigation. Two draft merge requests are the requested delivery; no merge, tag, deployment, or stable-app replacement is authorized.
+This audit covers macOS, iOS, and the private push relay. The changes are review candidates; they are not a deployment or a claim of unconditional delivery by the operating system.
 
-## Verified
+## Corrections
 
-- **macOS integrated50:** 337 selected tests passed: Surfaces 5, Socket 67, Persistence 52, AppShell 190, AgentRuntime 23. The runtime tests include 7 cold-catalog tests and 16 session-parameter tests. These are selected regression suites, not a full-suite claim.
-- **macOS native debug:** viewing and Undo changed unseen counts from 2 to 0 to 2 in the same session. Acknowledgment cleared Needs you in the sidebar without the former false missing-result alert and preserved failed history. View changes automatically opened the saved checkpoint at default content width with the outer sidebar visible; this check was repeated after rebasing onto `2fbf5db58` with production account integration. The saved patch differed from current workspace content. Run detail showed the saved summary and recorded duration. Narrow 1225×835 and wide 1600×1000 layouts were exercised.
-- **iOS integrated49:** 232 unit tests and all 4 native Activity UI tests passed against current `main`. Simulator diagnostics collection timed out after tests; `xcodebuild` exited 0, so this was not a test failure. These are selected regression suites, not a full-suite claim.
-- **Design:** the 21-skill ledger records 10 applied decisions and 11 not-applicable decisions. It is a design record, not proof of every accessibility or device gate.
+- The Mac carries the notification category, grouping identifier, sound preference, and occurrence ID through the private relay. APNs and Firebase preserve those fields. Titio pushes use the same sound preference as local alerts.
+- Firebase catch-up messages are background pushes without a visible notification or sound. Concurrent relay requests for the same idempotency key share one delivery; successful repeats retain the existing cache policy.
+- Denied or failed macOS local scheduling no longer consumes the notification ID. Authorization is refreshed when the app becomes active. The explicit Settings test can present while the app is foregrounded and respects the selected sound preference.
+- Titio direct replies respect Bot, workspace, and completion-alert preferences and retain their linked thread route.
+- Mirrored iOS notifications retain run, final-message, activity-item, grouping, and sound metadata. Ordinary task notifications use ordinary sound/interruption levels, without requesting unsupported critical-alert or Focus-bypass behavior.
+- Notifications have their own native macOS Settings destination. The iOS Activity menu exposes **Local notification categories**, including one Titio preference shared by notices and questions, even when the feed is empty.
+- A remotely started Live Activity uses the projected title, including Titio, in its start alert.
 
-Synthetic screenshot evidence is stored under `docs/notifications/evidence/`. Machine-local test logs use `/tmp/plan-notifications-macos-integrated50.log` and `/tmp/plan-notifications-ios-integrated49.log`. Screenshots supplement interaction tests; they are not standalone behavioral proof.
+## Verification matrix
 
-## Remaining acceptance limits
+| Path | Evidence |
+|---|---|
+| Mac local scheduling, permission recovery, deduplication, Titio policy, relay metadata | 91 focused sandbox tests passed. Final broad selection: 468 tests, 460 passed, 3 skipped, 5 baseline failures. Native Settings and its test action exercised through mac-use. |
+| Titio generation, questions, recovery, exact routes, scheduled outcomes | Existing notification/Titio suites exercised; the full macOS selection retains the baseline failures listed below. No new run option or scheduled-task field was introduced. |
+| iOS token registration, routing, lifecycle adoption, stale generations, local copy and sound | 307 selected unit tests: 306 passed, 1 simulator-only signing-profile check skipped, 0 failures. |
+| iOS category controls | Native UI test passed and captured `evidence/ios-local-notification-categories.png`. |
+| iOS system notification tap | A host-coordinated `simctl push` reached SpringBoard; tapping it opened the authenticated `ws-2` workspace. Existing UI test passed after updating its initial home-screen assertion. `evidence/ios-system-notification-route.png`. |
+| Private relay/APNs/Firebase/Live Activity v2 | 133 tests passed, 788 assertions, and backend TypeScript checking and targeted ESLint passed. Includes concurrent idempotency, silent Firebase catch-up, APNs category/grouping/sound, ownership and monotonic Live Activity timestamps. |
+| Physical iPhone APNs | The modified local relay sent an APNs alert successfully and the Titio test banner was observed on the phone. Live Activity start/update/end were accepted by APNs; the start card and its eventual removal were observed. The intermediate updated text was not independently observed. |
+| Native macOS sizing | Notifications Settings inspected at 1100×780 and 1600×960 with existing responsive controls. `evidence/mac-notifications-narrow.png` and `evidence/mac-notifications-wide.png` in the macOS repository. |
 
-- The private remote-alert API exposes no sound toggle. Local sound preferences are implemented; remote sound parity remains blocked by that API.
-- No durable receipt proves that the same occurrence is already visible in Live Activity. Delivery remains conservative rather than suppressing unrelated alerts; a banner and Live Activity may duplicate.
-- The Live Activity transport supports workspace/thread targets, not an exact registered-operation surface target. Operation-card navigation remains workspace-scoped.
-- Physical APNS delivery, VoiceOver, and Reduce Motion were not exercised. Accessibility labels and large-text UI tests do not replace those checks.
-- No performance improvement is claimed and no five-sample before/after benchmark was performed.
-- The Bot VM Main/Worker cold-catalog selection path has regression coverage. No real paid Bot VM prompt was run; the live guest's missing ChatGPT catalog and credential cause remain unproven. This is not a claim that the live VM is fixed or deployed.
+Physical checks used the already installed iOS build **2.0.55 (2026101803)** and the modified backend sender locally. They prove transport to that installation; the new iOS code was exercised in the isolated simulator. No installed user app was replaced.
 
-The isolated debug app was stopped after native checks. The running stable macOS app and primary user data were preserved. Draft merge requests must retain these limits until external contracts and hardware checks establish full acceptance.
+The macOS permission was enabled for `io.remotecode.desktop.debug`. `usernoted` and `NotificationCenter` confirmed delivery to alert/lock-screen/history destinations and storage in notification history. The floating banner was not visible to mac-use, so visual banner presentation is not claimed. The explicit test foreground policy is covered by a regression test.
 
-## Draft merge requests
+## Limits and known findings
 
-- macOS: https://gitlab.com/desenvolvimento-ninja/remodecode/remotecode/-/merge_requests/435 — draft, conflict-free at check; not merged or deployed.
-- iOS: https://gitlab.com/desenvolvimento-ninja/remotecode2-ios/-/merge_requests/73 — draft, conflict-free at check; not merged or deployed. Previous external pipeline failed, but API returned no job logs. Current pipeline is pending/running, not green.
+- The broad macOS baseline already failed five tests: two stale sidebar source assertions, two existing notification-copy expectations, and a Titio delegation test requiring a ready Docker Desktop. The final audit reproduced exactly those five baseline failures; focused changed-path tests pass. These are not five newly introduced regressions and are not reported as a green full suite.
+- A registered push target is not a delivery receipt. The existing `titio_notice_key` suppression path chooses Titio as the phone's alert owner before remote delivery is confirmed. A transient relay failure can therefore leave only the durable in-app notice. Durable per-occurrence delivery receipts/retry remain a follow-up; no unproven exactly-once cross-channel claim is made.
+- A Live Activity and a banner may both describe an occurrence because no receipt proves the same occurrence is already visible. An OS policy, revoked permission, expired token, disconnection, or delivery budget can still prevent an interruption.
+- Live Activity navigation for registered operations remains workspace-scoped. Exact thread, run, final-message, and Titio targets retain their existing authenticated routes.
+- The iOS category menu controls local mirrored notifications. Remote alert preferences remain host-owned; the copy now says so explicitly.
+- Physical Reply/Open action completion, acoustic sound output, VoiceOver, Reduce Motion, provider-backed Bot prompts, and every production network state were not exercised. No performance improvement is claimed.
+
+The phone test activity was ended and its removal observed. The phone automation session was closed and its task-owned runner removed. The macOS debug app and isolated simulator are stopped after verification. The user's stable MacCode process and data are preserved.
+
+## Design and delivery
+
+See [design coverage](design-coverage.md) for the 21-skill ledger and Appllama references. Native controls, existing DS tokens, English interface copy, truthful permission state, and immediate navigation are retained. No new dependency or design pattern was introduced.
+
+Companion merge requests are linked in each MR description. The private relay must ship with the host metadata changes for remote sound/category parity. No merge, tag, or deployment was performed.
+
+Payload behavior follows Apple's [remote-notification payload documentation](https://developer.apple.com/documentation/UserNotifications/generating-a-remote-notification) and [ActivityKit push lifecycle documentation](https://developer.apple.com/documentation/ActivityKit/starting-and-updating-live-activities-with-activitykit-push-notifications).

@@ -1408,7 +1408,12 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             return
         }
         var alertDelivered = false
-        let alertData = await withConnectionHints(content.userInfo)
+        var alertData = content.userInfo
+        alertData["categoryIdentifier"] = content.categoryIdentifier
+        alertData["threadIdentifier"] = content.threadIdentifier
+        alertData["soundEnabled"] = content.soundEnabled ? "true" : "false"
+        alertData["idempotencyKey"] = content.identifier
+        alertData = await withConnectionHints(alertData)
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
                 try await self.api.deliverAlert(
