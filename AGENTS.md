@@ -61,6 +61,11 @@ Every change, however small, must be exercised in the real isolated debug app be
   target stable MacCode or leave SkyComputerUseService, `node_repl`, or Computer Use MCP
   daemons running; never use a persistent harness `repl`.
 
+## Design standard (mandatory)
+
+- Before changing anything a user sees, read [`DESIGN.md`](DESIGN.md) and follow it. It is the binding UI standard (tokens, components, states, motion, accessibility, copy, verification).
+- If a change needs a new pattern or changes the standard, update `DESIGN.md` in the same change.
+
 ## Shared components
 
 - Reusing components is welcome and encouraged when it is done well. If two surfaces already show the same control (composer chips, popovers, bubbles, live-turn chrome, queued header), extract one component and mount it from both. Do not copy a second SwiftUI implementation just because the caller lives in another file.
