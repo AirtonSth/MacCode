@@ -6040,6 +6040,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public var mentionableBotsProvider: () -> [BotDefinition] = { [] }
+    /// Opens the New Bot flow for this workspace; nil hides "New bot…" in the run-as sheet.
+    public var createBotInWorkspace: ((WorkspaceID) -> Void)?
     public var mentionableBotsRevisionProvider: () -> UInt64 = { 0 }
 
     #if DEBUG
@@ -19105,7 +19107,9 @@ public struct AgentAppView: View {
                 guard let id = vm.selectedThreadId else { return }
                 vm.startHandoffThread(from: id, actor: .bot(botID))
             },
-            onAppear: { vm.refreshAvailableRunAsUsers() }
+            onAppear: { vm.refreshAvailableRunAsUsers() },
+            workspaceID: vm.embedding == nil ? vm.workspaceID : nil,
+            onNewBot: vm.createBotInWorkspace.map { create in { create(vm.workspaceID) } }
         )
     }
 
