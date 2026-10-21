@@ -76,6 +76,7 @@ final class TitioHookRecorder: @unchecked Sendable {
     var titioRunActive = false
     var viewing = false
     var focusedSuccess = false
+    var pushAccepted = true
     var resolveCalls = 0
 
     var banners: [RemoteCodeNotificationContent] { lock.withLock { bannersValue } }
@@ -99,7 +100,7 @@ final class TitioHookRecorder: @unchecked Sendable {
             inboxChanged: { [self] snapshot in lock.withLock { inboxValue.append(snapshot) } },
             messagesRemoved: { [self] _, ids in lock.withLock { removedValue.append(ids) } },
             postBanner: { [self] content in lock.withLock { bannersValue.append(content) } },
-            deliverPush: { [self] content in lock.withLock { pushesValue.append(content) } },
+            deliverPush: { [self] content in lock.withLock { pushesValue.append(content); return pushAccepted } },
             pushBinding: { TitioNoticePushBinding(profileID: profileID, hostID: "host-1") },
             isFocusedSuccess: { [self] _ in lock.withLock { focusedSuccess } }
         )
@@ -244,6 +245,37 @@ final class TitioNoticeCenterTests: XCTestCase {
         XCTAssertEqual(f.recorder.speech.count, 1, "the pet hears about the new notice")
         XCTAssertEqual(f.recorder.posted.first?.conversation?.unread, true)
         XCTAssertEqual(f.recorder.posted.first?.conversation?.attentionState, .unreadActivity)
+    }
+
+    func test_relayFailureRetriesCommittedNoticeWithoutAnotherMessage() async throws {
+        let f = try makeFixture()
+        f.recorder.pushAccepted = false
+        f.center.ingest(completion("retry", at: f.scheduler))
+        await f.scheduler.advance(by: TitioNoticeTiming.infoWindow, center: f.center)
+        XCTAssertNil(try f.repo.get(key: "run.retry.completed")?.bannerAt)
+        XCTAssertEqual(f.recorder.pushes.count, 1)
+
+        f.recorder.pushAccepted = true
+        await f.scheduler.advance(by: TitioNoticeTiming.retryBackoff[0], center: f.center)
+        XCTAssertEqual(f.recorder.pushes.map(\.identifier), ["run.retry.completed", "run.retry.completed"])
+        XCTAssertEqual(try threadMessages(f).count, 1)
+        XCTAssertEqual(f.recorder.posted.count, 1)
+        XCTAssertNotNil(try f.repo.get(key: "run.retry.completed")?.bannerAt)
+        await f.scheduler.advance(by: 60, center: f.center)
+        XCTAssertEqual(f.recorder.pushes.count, 2)
+    }
+
+    func test_resolvedDecisionIsNotPushedAgainAfterRelayFailure() async throws {
+        let f = try makeFixture()
+        f.recorder.pushAccepted = false
+        f.center.ingest(approval("retry", at: f.scheduler))
+        await f.center.idle()
+        XCTAssertEqual(f.recorder.pushes.count, 1)
+        f.center.sourceResolved(key: "thread.T.attention.retry")
+        await f.center.idle()
+        f.recorder.pushAccepted = true
+        await f.scheduler.advance(by: 60, center: f.center)
+        XCTAssertEqual(f.recorder.pushes.count, 1)
     }
 
     func test_eightSecondWindowMergesThreeCompletionsIntoOneDigest() async throws {

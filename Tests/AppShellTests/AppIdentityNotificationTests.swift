@@ -1137,9 +1137,11 @@ final class AppIdentityNotificationTests: XCTestCase {
             threadId: "thread-2", title: "Second", phase: .completed
         ))
 
-        async let firstDelivery: Void = bridge.deliver(first)
-        async let secondDelivery: Void = bridge.deliver(second)
-        _ = await (firstDelivery, secondDelivery)
+        async let firstDelivery = bridge.deliver(first)
+        async let secondDelivery = bridge.deliver(second)
+        let delivered = await (firstDelivery, secondDelivery)
+        XCTAssertTrue(delivered.0)
+        XCTAssertTrue(delivered.1)
 
         XCTAssertEqual(api.refreshCallCount, 1,
                        "concurrent access-token expiry must share one refresh instead of creating a retry storm")
@@ -1166,9 +1168,11 @@ final class AppIdentityNotificationTests: XCTestCase {
             threadId: "thread-2", title: "Second", phase: .completed
         ))
 
-        async let firstDelivery: Void = bridge.deliver(first)
-        async let secondDelivery: Void = bridge.deliver(second)
-        _ = await (firstDelivery, secondDelivery)
+        async let firstDelivery = bridge.deliver(first)
+        async let secondDelivery = bridge.deliver(second)
+        let delivered = await (firstDelivery, secondDelivery)
+        XCTAssertFalse(delivered.0)
+        XCTAssertFalse(delivered.1)
 
         XCTAssertEqual(api.refreshCallCount, 1)
         XCTAssertNil(accountStore.load(),

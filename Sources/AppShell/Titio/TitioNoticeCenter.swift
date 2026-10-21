@@ -291,8 +291,8 @@ public struct TitioNoticeHooks: Sendable {
     public var messagesRemoved: @Sendable (TitioInboxTarget, [AgentMessageID]) async -> Void
     /// Mac banner (`SystemNotifier.post`).
     public var postBanner: @Sendable (RemoteCodeNotificationContent) -> Void
-    /// iOS push (`PrivateNotificationBridge.deliver`).
-    public var deliverPush: @Sendable (RemoteCodeNotificationContent) async -> Void
+    /// True once the relay accepts the push, or no phone target requires one.
+    public var deliverPush: @Sendable (RemoteCodeNotificationContent) async -> Bool
     public var pushBinding: @Sendable () -> TitioNoticePushBinding
     /// Workspace display name for pet/terminal events (MainActor state).
     public var workspaceName: @Sendable (WorkspaceID) async -> String?
@@ -313,7 +313,7 @@ public struct TitioNoticeHooks: Sendable {
         inboxChanged: @escaping @Sendable (TitioInboxSnapshot) async -> Void = { _ in },
         messagesRemoved: @escaping @Sendable (TitioInboxTarget, [AgentMessageID]) async -> Void = { _, _ in },
         postBanner: @escaping @Sendable (RemoteCodeNotificationContent) -> Void = { _ in },
-        deliverPush: @escaping @Sendable (RemoteCodeNotificationContent) async -> Void = { _ in },
+        deliverPush: @escaping @Sendable (RemoteCodeNotificationContent) async -> Bool = { _ in true },
         pushBinding: @escaping @Sendable () -> TitioNoticePushBinding = { TitioNoticePushBinding(profileID: nil, hostID: nil) },
         workspaceName: @escaping @Sendable (WorkspaceID) async -> String? = { _ in nil },
         isFocusedSuccess: @escaping @Sendable (EventBus.Event) async -> Bool = { _ in false },
@@ -359,6 +359,7 @@ public actor TitioNoticeCenter {
         case refreshMirrors
         case expireArm(String)
         case voiced(VoiceCompletion)
+        case pushFinished(identifier: String, keys: [String], accepted: Bool)
         case clear(AgentMessageID)
         case barrier(CheckedContinuation<Void, Never>)
     }
@@ -431,6 +432,7 @@ public actor TitioNoticeCenter {
     private nonisolated let eventSubscription = TitioNoticeLockedBox<UUID?>(nil)
 
     // Scheduler state (actor-isolated)
+    private var pushTasks: [String: Task<Void, Never>] = [:]
     private var cachedTarget: TitioInboxTarget?
     private var infoKeys: [String] = []
     private var infoFirstAt: Date?
@@ -597,9 +599,10 @@ public actor TitioNoticeCenter {
             await withCheckedContinuation { (waiter: CheckedContinuation<Void, Never>) in
                 continuation.yield(.barrier(waiter))
             }
-            if voiceInFlight.value == 0 { return }
+            if voiceInFlight.value == 0 && pushTasks.isEmpty { return }
             // The next barrier applies whatever these calls yield.
             for task in voiceTasks.value.values { await task.value }
+            for task in pushTasks.values { await task.value }
         }
     }
 
@@ -679,6 +682,14 @@ public actor TitioNoticeCenter {
             handleExpireArm(key)
         case .voiced(let completion):
             await handleVoiced(completion)
+        case .pushFinished(let identifier, let keys, let accepted):
+            pushTasks[identifier] = nil
+            if accepted {
+                markBanner(keys: keys)
+            } else {
+                keys.forEach { fallbackPosted.remove($0) }
+                scheduleRetry()
+            }
         case .clear(let messageID):
             await performClear(messageID)
         case .barrier(let waiter):
@@ -1175,9 +1186,8 @@ public actor TitioNoticeCenter {
             deliver(identifier: identifier, text: bannerText, message: message, target: target,
                     noticeKey: result.posting.cardOwnerKey ?? (result.records.count == 1 ? result.records[0].key : nil),
                     records: result.records)
-        }
-        do { try repo.markBanner(keys: keys, at: now()) } catch {
-            titioNoticeLog.error("titio.notice.mark_banner_failed error=\(String(describing: error), privacy: .public)")
+        } else {
+            markBanner(keys: keys)
         }
         if result.records.allSatisfy(allowsInterruption), let speak = speechBox.value {
             let urgency: TitioNoticeUrgency = result.records.contains { $0.urgency == .decision } ? .decision
@@ -1210,7 +1220,10 @@ public actor TitioNoticeCenter {
         noticeKey: String?,
         records: [TitioNoticeRecord]
     ) {
-        guard records.allSatisfy(allowsInterruption) else { return }
+        guard records.allSatisfy(allowsInterruption) else {
+            markBanner(keys: records.map(\.key))
+            return
+        }
         let canReply = records.count == 1 && records[0].actions?.contains(where: { $0.action == .replyHere }) == true
         let binding = hooks.pushBinding()
         let legacyKeys = Self.legacyRouteKeys(records)
@@ -1229,8 +1242,25 @@ public actor TitioNoticeCenter {
         )
         hooks.postBanner(RemoteCodeNotificationContent.titioNotice(identifier: identifier, body: text, userInfo: bannerInfo, canReply: canReply))
         let push = RemoteCodeNotificationContent.titioNotice(identifier: identifier, body: text, userInfo: pushInfo, canReply: canReply)
-        let deliverPush = hooks.deliverPush
-        Task { await deliverPush(push) }
+        deliverPush(push, keys: records.map(\.key))
+    }
+
+    private func markBanner(keys: [String]) {
+        do { try repo.markBanner(keys: keys, at: now()) } catch {
+            titioNoticeLog.error("titio.notice.mark_banner_failed error=\(String(describing: error), privacy: .public)")
+            scheduleRetry()
+        }
+    }
+
+    /// The committed notice is the retry record; failed sends keep banner_at unset.
+    private func deliverPush(_ content: RemoteCodeNotificationContent, keys: [String]) {
+        guard pushTasks[content.identifier] == nil else { return }
+        let send = hooks.deliverPush
+        let continuation = self.continuation
+        pushTasks[content.identifier] = Task {
+            let accepted = await send(content)
+            continuation.yield(.pushFinished(identifier: content.identifier, keys: keys, accepted: accepted))
+        }
     }
 
     /// Writes the inbox conversation's unread/attention state off the MainActor
@@ -1303,15 +1333,16 @@ public actor TitioNoticeCenter {
 
     private func postLegacy(key: String, _ delivery: TitioNoticeLegacyDelivery, reason: String) async {
         guard fallbackPosted.insert(key).inserted else { return }
+        if let row = try? repo.get(key: key), !allowsInterruption(row) {
+            markBanner(keys: [key])
+            return
+        }
         titioNoticeLog.error("titio.notice.fallback key=\(key, privacy: .public) reason=\(reason, privacy: .public)")
-        // Persisted, so a later flush (this session or after a restart, when
-        // `SystemNotifier`'s in-memory dedupe is empty) never announces it again.
-        try? repo.markBanner(keys: [key], at: now())
         hooks.postBanner(delivery.content)
         if delivery.pushes {
-            let deliverPush = hooks.deliverPush
-            let content = delivery.content
-            Task { await deliverPush(content) }
+            deliverPush(delivery.content, keys: [key])
+        } else {
+            markBanner(keys: [key])
         }
     }
 
@@ -1321,6 +1352,7 @@ public actor TitioNoticeCenter {
         guard hubEnabled() else { return }
         await replayObservations()
         if !(await warmTarget()) { return }
+        await repostMissingBanners(now: now())
         guard let pending = try? repo.listPending() else { scheduleRetry(); return }
         let waiting = Set(infoKeys).union(flapTimers.keys)
         await flushPendingRows(pending.filter { !waiting.contains($0.key) }, catchUp: false)
@@ -1499,7 +1531,10 @@ public actor TitioNoticeCenter {
         for (messageID, records) in grouped.sorted(by: { $0.key < $1.key }) {
             guard let uuid = UUID(uuidString: messageID) else { continue }
             let keys = records.map(\.key)
-            defer { try? repo.markBanner(keys: keys, at: current) }
+            guard records.contains(where: { $0.state == .posted || $0.state == .awaitingReply }) else {
+                markBanner(keys: keys)
+                continue
+            }
             guard !records.allSatisfy({ $0.kind == .notificationsDenied }),
                   let message = try? messageRepo.get(id: AgentMessageID(uuid)),
                   let target = await target(language: language()),

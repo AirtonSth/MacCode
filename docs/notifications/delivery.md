@@ -8,6 +8,7 @@ This audit covers macOS, iOS, and the private push relay. The changes are review
 - Firebase catch-up messages are background pushes without a visible notification or sound. Concurrent relay requests for the same idempotency key share one delivery; successful repeats retain the existing cache policy.
 - Denied or failed macOS local scheduling no longer consumes the notification ID. Authorization is refreshed when the app becomes active. The explicit Settings test can present while the app is foregrounded and respects the selected sound preference.
 - Titio direct replies respect Bot, workspace, and completion-alert preferences and retain their linked thread route.
+- Committed Titio notices retain their pending delivery marker until the relay accepts the push. Failed attempts reuse the existing backoff and 10-minute restart recovery window, preserving the occurrence ID and the single inbox message. Resolved decisions are excluded from retries.
 - Mirrored iOS notifications retain run, final-message, activity-item, grouping, and sound metadata. Ordinary task notifications use ordinary sound/interruption levels, without requesting unsupported critical-alert or Focus-bypass behavior.
 - Notifications have their own native macOS Settings destination. The iOS Activity menu exposes **Local notification categories**, including one Titio preference shared by notices and questions, even when the feed is empty.
 - A remotely started Live Activity uses the projected title, including Titio, in its start alert.
@@ -16,7 +17,7 @@ This audit covers macOS, iOS, and the private push relay. The changes are review
 
 | Path | Evidence |
 |---|---|
-| Mac local scheduling, permission recovery, deduplication, Titio policy, relay metadata | 91 focused sandbox tests passed. Final broad selection: 468 tests, 460 passed, 3 skipped, 5 baseline failures. Native Settings and its test action exercised through mac-use. |
+| Mac local scheduling, permission recovery, deduplication, Titio policy, relay metadata | 91 focused sandbox tests passed; an additional 35-test relay recovery selection passed before the final broad run. Final broad selection: 470 tests, 462 passed, 3 skipped, 5 baseline failures. Native Settings and its test action exercised through mac-use. |
 | Titio generation, questions, recovery, exact routes, scheduled outcomes | Existing notification/Titio suites exercised; the full macOS selection retains the baseline failures listed below. No new run option or scheduled-task field was introduced. |
 | iOS token registration, routing, lifecycle adoption, stale generations, local copy and sound | 307 selected unit tests: 306 passed, 1 simulator-only signing-profile check skipped, 0 failures. |
 | iOS category controls | Native UI test passed and captured `evidence/ios-local-notification-categories.png`. |
@@ -27,12 +28,12 @@ This audit covers macOS, iOS, and the private push relay. The changes are review
 
 Physical checks used the already installed iOS build **2.0.55 (2026101803)** and the modified backend sender locally. They prove transport to that installation; the new iOS code was exercised in the isolated simulator. No installed user app was replaced.
 
-The macOS permission was enabled for `io.remotecode.desktop.debug`. `usernoted` and `NotificationCenter` confirmed delivery to alert/lock-screen/history destinations and storage in notification history. The floating banner was not visible to mac-use, so visual banner presentation is not claimed. The explicit test foreground policy is covered by a regression test.
+The macOS permission was enabled for `io.remotecode.desktop.debug`. `usernoted` and `NotificationCenter` confirmed delivery to alert/lock-screen/history destinations and storage in notification history. The floating banner was not visible to mac-use, so visual banner presentation is not claimed. The explicit test foreground policy is covered by a regression test. Relay failure/recovery and cancellation of resolved decisions are verified by deterministic sandbox tests; a relay outage was not injected into the native GUI session.
 
 ## Limits and known findings
 
 - The broad macOS baseline already failed five tests: two stale sidebar source assertions, two existing notification-copy expectations, and a Titio delegation test requiring a ready Docker Desktop. The final audit reproduced exactly those five baseline failures; focused changed-path tests pass. These are not five newly introduced regressions and are not reported as a green full suite.
-- A registered push target is not a delivery receipt. The existing `titio_notice_key` suppression path chooses Titio as the phone's alert owner before remote delivery is confirmed. A transient relay failure can therefore leave only the durable in-app notice. Durable per-occurrence delivery receipts/retry remain a follow-up; no unproven exactly-once cross-channel claim is made.
+- `titio_notice_key` selects Titio as the phone alert owner; it is not an OS presentation receipt. Committed notices now retry transient relay failure and recover after restart within the existing 10-minute window. Outages beyond that window and direct chat replies do not have an indefinite durable alert outbox. The inbox message remains available.
 - A Live Activity and a banner may both describe an occurrence because no receipt proves the same occurrence is already visible. An OS policy, revoked permission, expired token, disconnection, or delivery budget can still prevent an interruption.
 - Live Activity navigation for registered operations remains workspace-scoped. Exact thread, run, final-message, and Titio targets retain their existing authenticated routes.
 - The iOS category menu controls local mirrored notifications. Remote alert preferences remain host-owned; the copy now says so explicitly.
@@ -43,6 +44,8 @@ The phone test activity was ended and its removal observed. The phone automation
 ## Design and delivery
 
 See [design coverage](design-coverage.md) for the 21-skill ledger and Appllama references. Native controls, existing DS tokens, English interface copy, truthful permission state, and immediate navigation are retained. No new dependency or design pattern was introduced.
+
+External CI: the private relay pipeline passed type checking and lint. The iOS Xcode Cloud status is failed; App Store Connect requires sign-in to retrieve the diagnostic log, so its cause is not attributed to this change. The macOS repository has no MR pipeline for this branch.
 
 Companion merge requests are linked in each MR description. The private relay must ship with the host metadata changes for remote sound/category parity. No merge, tag, or deployment was performed.
 

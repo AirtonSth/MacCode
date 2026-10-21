@@ -10068,10 +10068,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "id": .string(n.id),
             "soundEnabled": .bool(SettingsStore(db: ctx.db).load().notificationSoundEnabled)
         ]
-        // Titio's push already alerts the phone for this one: a paired client
-        // that sees the key must not schedule its own local notification too.
-        // Only when a push can really go out; otherwise the phone's local
-        // notification stays its only alert.
+        // Titio owns the phone alert and retries relay failures from its ledger.
+        // This key selects that path; it is not proof of OS presentation.
+        // Without a push target the phone schedules its own local notification.
         if let titioNoticeKey, ctx.privateNotificationBridge.hasAlertPushTarget {
             eventPayload["titio_notice_key"] = .string(titioNoticeKey)
         }
