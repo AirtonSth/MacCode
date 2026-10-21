@@ -247,11 +247,11 @@ public enum RemoteAccessStatus: Equatable {
 /// Left-column destinations of the in-app Settings layout.
 public enum SettingsCategory: String, CaseIterable, Identifiable {
     case remoteAccess, accounts, fileAccess, computerUse, diff, terminal, sidebar, pet, insomnia,
-         bots, keybindings, storage, customModels, devices, diagnostics
+         bots, keybindings, storage, customModels, devices, notifications, diagnostics
 
     /// Rows rendered as separate groups, in order.
     public static let groups: [[SettingsCategory]] = [
-        [.remoteAccess, .accounts, .devices],
+        [.remoteAccess, .accounts, .devices, .notifications],
         [.fileAccess, .computerUse, .bots, .customModels],
         [.terminal, .diff, .sidebar, .keybindings],
         [.pet, .insomnia],
@@ -278,6 +278,7 @@ public enum SettingsCategory: String, CaseIterable, Identifiable {
         case .storage: return "Storage"
         case .customModels: return "Custom Models"
         case .devices: return "Trusted Devices"
+        case .notifications: return "Notifications"
         case .diagnostics: return "Diagnostics"
         }
     }
@@ -298,6 +299,7 @@ public enum SettingsCategory: String, CaseIterable, Identifiable {
         case .storage: return "See local usage and clean up expired attachments and data."
         case .customModels: return "Add or remove custom model names for each agent provider."
         case .devices: return "Review paired devices and revoke access you no longer need."
+        case .notifications: return "Choose how Titio, alerts, and sounds reach this Mac and your paired iPhone."
         case .diagnostics: return "Check provider CLIs, versions, and server status for troubleshooting."
         }
     }
@@ -318,13 +320,14 @@ public enum SettingsCategory: String, CaseIterable, Identifiable {
         case .storage: return "internaldrive"
         case .customModels: return "slider.horizontal.3"
         case .devices: return "iphone.and.arrow.forward"
+        case .notifications: return "bell.badge"
         case .diagnostics: return "stethoscope"
         }
     }
 
     public var tint: Color {
         switch self {
-        case .remoteAccess, .fileAccess, .sidebar, .storage, .devices: return DS.Palette.accent
+        case .remoteAccess, .fileAccess, .sidebar, .storage, .devices, .notifications: return DS.Palette.accent
         case .accounts, .insomnia, .customModels: return DS.Palette.ultracode
         case .computerUse, .bots: return DS.Palette.success
         case .diff, .pet: return DS.Palette.warning
@@ -1736,6 +1739,7 @@ public struct SettingsView: View {
         case .storage: storageSection
         case .customModels: customModelsSection
         case .devices: trustedDevicesSection
+        case .notifications: notificationsRow
         case .diagnostics:
             diagnosticsSection
                 .background(routeAnchor(.providers))
@@ -2443,7 +2447,6 @@ public struct SettingsView: View {
             if vm.showsAppUpdates {
                 appUpdatesRow
             }
-            notificationsRow
             Text("State directory")
                 .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
             HStack(spacing: DS.Space.md) {
@@ -2619,7 +2622,7 @@ extension SettingsView {
                     .accessibilityIdentifier("settings.notifications.openSettings")
                 } else {
                     Button("Test notification") {
-                        SystemNotifier.shared.postTestNotification()
+                        SystemNotifier.shared.postTestNotification(settings: vm.appSettings)
                         Task { await vm.refreshNotificationStatus() }
                     }
                     .buttonStyle(DSSecondaryButtonStyle())
@@ -2627,7 +2630,7 @@ extension SettingsView {
                 }
             }
             if notificationStatus == .denied {
-                Text("Notifications are turned off for MacCode. Thread banners won't appear until you re-enable them in System Settings.")
+                Text("Notifications are off on this Mac. Enable them in System Settings to receive banners here.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.danger)
                     .accessibilityIdentifier("settings.notifications.deniedNote")

@@ -8,6 +8,14 @@ import Persistence
 /// survive a reopen of MacCode, or the Settings destination silently resets.
 @MainActor
 final class SettingsCategorySelectionTests: XCTestCase {
+    func testNotificationsCategoryPersistsAcrossViewModels() throws {
+        let dir = NSTemporaryDirectory() + "RC2SettingsCategory-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: dir)
+        let viewModel = SettingsViewModel(context: context)
+        viewModel.selectedCategory = .notifications
+        XCTAssertEqual(SettingsViewModel(context: context).selectedCategory, .notifications)
+    }
+
     func test_selectRouteAccountsSelectsAccountsAndPersistsAcrossViewModels() throws {
         let dir = NSTemporaryDirectory() + "RC2SettingsCategory-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)

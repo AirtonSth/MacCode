@@ -14,6 +14,7 @@ final class FakeNotificationCenterClient: NotificationCenterClient, @unchecked S
     private var _authorizationGranted: Bool
     private var _authorizationCallCount = 0
     var addCompletionExpectation: XCTestExpectation?
+    var addError: Error?
 
     var addedRequests: [UNNotificationRequest] {
         lock.lock(); defer { lock.unlock() }; return _addedRequests
@@ -28,7 +29,7 @@ final class FakeNotificationCenterClient: NotificationCenterClient, @unchecked S
 
     func add(_ request: UNNotificationRequest, withCompletionHandler: ((Error?) -> Void)?) {
         lock.lock(); _addedRequests.append(request); lock.unlock()
-        withCompletionHandler?(nil)
+        withCompletionHandler?(addError)
         addCompletionExpectation?.fulfill()
     }
     func setDelegate(_ delegate: UNUserNotificationCenterDelegate?) {}
@@ -54,6 +55,22 @@ final class FakeNotificationCenterClient: NotificationCenterClient, @unchecked S
 /// these scenarios are unit-testable without a bundled .app.
 @MainActor
 final class SystemNotifierClientSeamTests: XCTestCase {
+    func testDeniedOrFailedPostCanRetryAndSuccessfulPostIsDeduplicated() {
+        let fake = FakeNotificationCenterClient()
+        let notifier = SystemNotifier(notificationCenterClient: fake, allowsNotificationCenterForTesting: true)
+        let content = RemoteCodeNotificationContent.titioNotice(identifier: "retry-notice", body: "Ready", userInfo: [:])
+        notifier.post(content)
+        XCTAssertTrue(fake.addedRequests.isEmpty)
+        notifier.setAuthorizedForTesting(true)
+        fake.addError = NSError(domain: "test", code: 1)
+        notifier.post(content)
+        XCTAssertEqual(fake.addedRequests.count, 1)
+        fake.addError = nil
+        notifier.post(content)
+        notifier.post(content)
+        XCTAssertEqual(fake.addedRequests.count, 2)
+        XCTAssertEqual(fake.addedRequests.last?.content.title, "Titio")
+    }
 
     // MARK: - T009: post(_:) routes through the injected client
 

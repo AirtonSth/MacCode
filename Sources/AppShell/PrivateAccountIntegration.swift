@@ -1394,21 +1394,27 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         return pushTargetStore.load() != nil
     }
 
-    public func deliver(_ content: RemoteCodeNotificationContent) async {
+    @discardableResult
+    public func deliver(_ content: RemoteCodeNotificationContent) async -> Bool {
         guard let session = accountStore.load() else {
             recordWakeNotSent(reason: "no_session")
-            return
+            return false
         }
         guard session.user.subscribed else {
             recordWakeNotSent(reason: "unsubscribed")
-            return
+            return false
         }
         guard let target = pushTargetStore.load() else {
             recordWakeNotSent(reason: "no_push_target")
-            return
+            return false
         }
         var alertDelivered = false
-        let alertData = await withConnectionHints(content.userInfo)
+        var alertData = content.userInfo
+        alertData["categoryIdentifier"] = content.categoryIdentifier
+        alertData["threadIdentifier"] = content.threadIdentifier
+        alertData["soundEnabled"] = content.soundEnabled ? "true" : "false"
+        alertData["idempotencyKey"] = content.identifier
+        let deliveryData = await withConnectionHints(alertData)
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
                 try await self.api.deliverAlert(
@@ -1416,7 +1422,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     title: content.title,
                     body: content.body,
                     // Carry routing keys so a remote alert opens the exact thread.
-                    data: alertData,
+                    data: deliveryData,
                     pushToken: target.pushToken,
                     pushTokenType: target.pushTokenType,
                     idempotencyKey: content.identifier,
@@ -1435,7 +1441,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                 force: true,
                 coalesceClass: .other
             )
-            return
+            return false
         }
         // Prefer silent wake coalescing over a second full alert. Force the
         // wake when the visible alert was not delivered so a rate-limited
@@ -1445,6 +1451,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             force: !alertDelivered,
             coalesceClass: .other
         )
+        return alertDelivered
     }
 
     /// Legacy single-bucket key (pre per-class coalesce). Kept for cleanup only.

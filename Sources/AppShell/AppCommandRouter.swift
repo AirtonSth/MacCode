@@ -10059,13 +10059,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ))
         } else {
             titioNoticeKey = nil
-            SystemNotifier.shared.post(title: title, body: body, category: category)
+            SystemNotifier.shared.post(
+                SystemNotifier.legacyContent(title: title, body: body, category: category),
+                settings: SettingsStore(db: ctx.db).load()
+            )
         }
-        var eventPayload: [String: JSONValue] = ["id": .string(n.id)]
-        // Titio's push already alerts the phone for this one: a paired client
-        // that sees the key must not schedule its own local notification too.
-        // Only when a push can really go out; otherwise the phone's local
-        // notification stays its only alert.
+        var eventPayload: [String: JSONValue] = [
+            "id": .string(n.id),
+            "soundEnabled": .bool(SettingsStore(db: ctx.db).load().notificationSoundEnabled)
+        ]
+        // Titio owns the phone alert and retries relay failures from its ledger.
+        // This key selects that path; it is not proof of OS presentation.
+        // Without a push target the phone schedules its own local notification.
         if let titioNoticeKey, ctx.privateNotificationBridge.hasAlertPushTarget {
             eventPayload["titio_notice_key"] = .string(titioNoticeKey)
         }
