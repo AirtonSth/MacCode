@@ -8,12 +8,15 @@ External services require an available provider integration, skill or Bot.
 The current operating contract is injected into every Titio run, including
 scheduled runs and existing profiles with a custom soul. `rc_host_help` exposes
 this map to the model. A topic supplies the host workflow and parameter guidance;
-the index lists admitted host methods. Mutations use the existing host controls,
-permissions, persistence and mirroring.
+`query` searches the index and `method` returns the current admission requirements
+and related workflows. Requirements are derived from host validation and are not
+a complete schema of optional domain fields. The index lists admitted host
+methods. Mutations use the existing host controls, permissions, persistence and
+mirroring.
 
 | Family | Examples the user can say | Execution and verification |
 | --- | --- | --- |
-| Activity | “O que está acontecendo agora?”, “O que precisa de mim no elephant?”, “Por que falhou?” | Read canonical Activity, counts, summaries, errors and open decisions. Follow pagination for a complete list; read the source thread for details. |
+| Activity | “O que está acontecendo agora?”, “O que precisa de mim no elephant?”, “Por que falhou?” | Read filtered canonical Activity, counts, summaries and errors. Request `include_context:true` for open decisions and the full inventory. Follow pagination for a complete list; read the source thread for details. |
 | Workspaces and layout | “Abra o elephant”, “Crie um workspace para esta pasta”, “Abra o navegador ao lado do terminal” | Resolve exact workspace and surface IDs; create, select, rename, pin, split, move or close through host APIs; read back the layout. |
 | Bots | “Crie um revisor”, “Mude as instruções do XPTO”, “Desative as notificações dele” | Inspect the Bot, update the requested identity/settings, and read back. Workspace grants use the current policy revision. |
 | Delegation and queues | “Mande o Bot XPTO limpar o repositório do elephant”, “Continue naquela conversa”, “Cancele o próximo envio” | Find the Bot and authorized conversation; send to that exact conversation, then inspect its run. Ambiguous names fail without starting work. Queue acceptance is distinct from completion. |
@@ -26,6 +29,7 @@ permissions, persistence and mirroring.
 | Terminal and SSH | “Rode os testes”, “Inicie o servidor”, “O que está nesse terminal?”, “Conecte ao servidor salvo” | Prefer registered project scripts; otherwise target the exact terminal. Read output and health afterwards. Use existing SSH profiles and the app's privilege helper. |
 | Models, accounts and settings | “Quais modelos estão disponíveis?”, “Quanto de quota resta?”, “Mude o modelo desta conversa”, “Mude o idioma do Titio” | Query current supported values, preserve other fields, change the requested setting and read back. Schedule settings change only when the user asks to change future runs. |
 | Teams and groups | “Crie um time”, “Peça ao Developer e ao QA para discutir isso”, “Adicione o Writer”, “Pare a discussão” | Resolve participants, create/update the team or group with its current revision, send with a stable submission key, then inspect the group's progress. |
+| Desktop automation and handoffs | “Use este aplicativo”, “Automatize este site”, “Terminei o login, continue” | Prefer direct service/host tools; use the available browser/computer tools for other apps. Observe the exact session, honor human takeover, and report missing authentication or OS permissions. |
 | Memory, skills and integrations | “Lembre deste fluxo”, “Esqueça esta preferência”, “Ensine esta rotina ao XPTO”, “Pegue uma tarefa do Linear” | Use the relevant Bot's memory/skills and available service connections. Reuse a requested routine; otherwise perform the authorized work through the provider or an appropriate Bot. Report missing authentication or capability explicitly. |
 
 ## The three primary flows
@@ -38,10 +42,53 @@ permissions, persistence and mirroring.
    context bindings/conversations, then call `rc_bot_delegate` or `rc_bot_send`
    with the exact `conversation_id`. The normal send path enforces the current
    grant. Read the returned thread/run before reporting the outcome.
-3. **Global overview:** call `rc_activity_list`, summarize canonical running,
-   queued, needs-user and finished/failed activity by workspace and Bot, and use
-   the returned summaries/errors and exact notice options. Follow the Activity
-   cursor when the user requests all entries.
+3. **Global overview:** call `rc_activity_list` with the relevant filters and
+   summarize canonical running, queued, needs-user and finished/failed activity
+   by workspace and Bot. Use `include_context:true` for exact notice options.
+   Follow the Activity cursor when the user requests all entries.
+
+## Automation audit (2026-10-21)
+
+The discoverable host surface contains **270 methods** across 18 namespaces:
+192 mutations with host receipts, 74 reads, and four thread fork/side-question
+commands. This counts callable controls, not every possible sentence or every
+control in an external application. `rc_host_help` is the live inventory.
+
+| Request or bottleneck | Finding and current behavior |
+| --- | --- |
+| “Continue todas as conversas interrompidas” | The RPC previously sent an empty prompt and recorded an empty user message. It now follows the saved-session recovery path, sends a provider-only continuation instruction and preserves the user transcript. Active or unrecoverable threads fail explicitly. |
+| Several independent actions | `rc_host_batch` submits up to 20 calls in one model/tool round trip. Each has an independent `operation_id`, authorization check, receipt and result/error. A failed action does not hide or cancel the others; cancelled batches do not start remaining calls. |
+| Finding only interrupted, failed or workspace-specific work | `rc_activity_list` accepts Activity's section, outcome, workspace, search, time and pagination filters. Its default response contains the canonical page; `include_context:true` opts into the larger inventory and notice decisions. |
+| Discovering an unfamiliar command | Help can search method names and workflows, or return the chosen method's current validation requirements. Titio does not need to repeatedly fetch the whole index or guess required identifiers. |
+| Inspecting state in supervised mode | Known read-only `rc_host_call` and batches work in supervised mode. Mutations still require the authenticated run's captured Full Access permission. Other Bots cannot use these cross-object tools. |
+| Creating/editing a Bot in Schedule Tasks | The shared save route accepts a Bot owner as well as a workspace owner, and forwards the authenticated host and receipt identity to Bot scheduling. Replays do not create duplicate routines. |
+| Waiting unnecessarily for another conversation on the same VM | The guide now matches the VM registry: independent conversations can run concurrently; exclusive rebuild/stop operations block them. Shared files/browser sessions still need coordination. |
+| Manual actions, moving execution to the Mac, guest input | The guide exposes the existing handoff/resolve and guest controls, including required identities and fresh frame evidence. User decisions and human takeover remain authoritative. |
+| Browser and run-setting mistakes | The guide distinguishes workspace browser actions from the Bot browser's navigation/login API, names the current Distill modes, and documents Bot routing fields that must be preserved. |
+
+For the interruption example, Titio should:
+
+1. Read `rc_activity_list` with `section:"needs_you"`, `outcome:"interrupted"`
+   and `limit:500`, plus the user's workspace filter if provided.
+2. Collect all pages before starting work, deduplicate `thread_id`, and exclude
+   its own thread and work superseded by a newer active run.
+3. Call `rc_host_batch` with independent `agent.run.continue` calls and a stable,
+   distinct `operation_id` per thread. Repeat for additional groups of 20.
+4. Read those exact threads/runs and report started work and individual failures.
+   An accepted run is not a completed task. Missing saved context requires
+   inspecting the original conversation before proposing a new message.
+
+A batch contains independent, already resolved calls. Creation followed by use
+of a returned ID stays sequential. The four `agent.thread.fork`,
+`agent.thread.side`, `agent.thread.side.close` and `agent.thread.btw` commands do
+not have the shared mutation-receipt contract and are excluded from batches;
+inspect their outcome before retrying a lost response.
+
+External desktop/web automation uses the provider's installed computer/browser
+or service tools. Authentication, native OS permissions, missing integrations
+and controls without a host API remain real capability limits; this change does
+not promise every arbitrary action will work. Provider selection of tools from
+natural language requires live-model verification separately from host tests.
 
 ## Questions behave as messages
 

@@ -271,6 +271,37 @@ public enum HostMutationContract {
         return params
     }
 
+    /// The same entrance requirements used by admission, exposed to Titio on
+    /// demand. These are not a complete schema for optional domain fields.
+    static func parameterRequirements(for method: String) -> [String] {
+        syntaxRules(for: method).map { rule in
+            switch rule {
+            case .uuid(let key): return "\(key): required UUID"
+            case .optionalUUID(let key): return "\(key): optional UUID"
+            case .optionalString(let key): return "\(key): optional string or null"
+            case .anyUUID(let keys): return "one of \(keys.joined(separator: ", ")): required UUID"
+            case .string(let key, let nonempty): return "\(key): required \(nonempty ? "non-empty " : "")string"
+            case .anyString(let keys, let nonempty): return "one of \(keys.joined(separator: ", ")): required \(nonempty ? "non-empty " : "")string"
+            case .int(let key): return "\(key): required integer"
+            case .firstPresentInt(let keys): return "first present of \(keys.joined(separator: ", ")): required integer"
+            case .bool(let key): return "\(key): required boolean"
+            case .optionalBool(let key): return "\(key): optional boolean"
+            case .object(let key): return "\(key): required object"
+            case .nestedInt(let object, let key): return "\(object).\(key): required integer"
+            case .stringEnum(let key, let values): return "\(key): one of \(values.sorted().joined(separator: ", "))"
+            case .surfaceType(let key): return "\(key): terminal, ssh, browser, agentApp, files, markdown, filePreview or rightSidebarTool"
+            case .uuidArrayWithAtLeastOne(let key): return "\(key): array containing at least one UUID"
+            case .uuidArray(let key): return "\(key): array of UUIDs"
+            case .surfaceSplitTarget: return "id (existing surface UUID) or type (new surface type) is required"
+            case .requiredSSHProfile: return "profile or top-level destination/host is required"
+            case .optionalSSHProfile: return "profile is optional; when supplied it needs destination or host"
+            case .pushTokenContract: return "push_token and push_token_type are required; typed registrations require the push-token contract"
+            case .threadActor: return "actor: {kind:none} or {kind:bot,bot_id:UUID}; execution_target: optional mac or vm"
+            case .activityItemIDs(let allowSingle): return "item_ids: up to 200 distinct strings\(allowSingle ? "; alternatively item_id: string" : "")"
+            }
+        }
+    }
+
     private static func validate(_ rule: SyntaxRule, params: [String: JSONValue]) throws {
         switch rule {
         case .uuid(let key):
@@ -529,7 +560,7 @@ public enum HostMutationContract {
         case "agent.thread.execution.configure": return [.uuid("thread_id"), .stringEnum("execution_mode", ["local", "worktree"])]
         case "agent.activity.viewed.set": return [.activityItemIDs(allowSingle: false), .bool("viewed")]
         case "agent.activity.acknowledge": return [.activityItemIDs(allowSingle: true), .optionalBool("acknowledged")]
-        case "scheduled_task.save": return [.uuid("workspace_id"), .optionalUUID("task_id")]
+        case "scheduled_task.save": return [.anyUUID(["workspace_id", "bot_id"]), .optionalUUID("task_id")]
         case "scheduled_task.delete", "scheduled_task.run": return [.uuid("task_id")]
         case "scheduled_task.enable": return [.uuid("task_id"), .bool("enabled")]
         case "agent.thread.prepare_pr": return [.uuid("workspace_id"), .string("url")]

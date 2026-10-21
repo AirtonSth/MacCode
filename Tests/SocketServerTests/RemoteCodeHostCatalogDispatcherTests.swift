@@ -126,6 +126,94 @@ final class RemoteCodeHostCatalogDispatcherTests: XCTestCase {
         XCTAssertNil(response.error)
         XCTAssertEqual(router.pairedBotCalls.first?.params["host_id"]?.stringValue, router.activeHostID, "a caller-supplied host id is replaced")
         XCTAssertNil(router.pairedBotCalls.first?.params["client_request_id"], "reads get no receipt id")
+        XCTAssertEqual(router.authorizationMutations, [false], "read-only inspection must work without Full Access")
+    }
+
+    func test_hostHelpSearchAndMethodRequirementsFollowTheAdmissionContract() async throws {
+        let router = HostCatalogReceiptRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        var params = hostCall("unused", params: [:], operationID: "unused", router: router).params ?? [:]
+        params.removeValue(forKey: "method")
+        params["query"] = .string("scheduled_task")
+        let search = await dispatcher.dispatchUnixSocket(.init(jsonrpc: "2.0", id: .number(1), method: "host.help", params: params))
+        let methods = try XCTUnwrap(search.result?.objectValue?["methods"]?.arrayValue)
+        XCTAssertFalse(methods.isEmpty)
+        XCTAssertTrue(methods.allSatisfy { $0.objectValue?["method"]?.stringValue?.hasPrefix("scheduled_task.") == true })
+        params.removeValue(forKey: "query")
+        params["method"] = .string("scheduled_task.save")
+        let detail = await dispatcher.dispatchUnixSocket(.init(jsonrpc: "2.0", id: .number(2), method: "host.help", params: params))
+        let requirements = try XCTUnwrap(detail.result?.objectValue?["validation_requirements"]?.arrayValue)
+        XCTAssertTrue(requirements.contains { $0.stringValue?.contains("workspace_id, bot_id") == true })
+        XCTAssertTrue(detail.result?.objectValue?["workflows"]?.arrayValue?.contains {
+            $0.objectValue?["topic"] == .string("schedules")
+        } == true)
+    }
+
+    func test_hostBatchReportsEachFailureAndReplaysSuccessfulActionsOnce() async throws {
+        let router = HostCatalogReceiptRouter()
+        router.callerIsTitio = true
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let base = hostCall("bot.save", params: [:], operationID: "unused", router: router)
+        var params = base.params ?? [:]
+        params["calls"] = .array([
+            .object(["method": .string("bot.save"), "operation_id": .string("batch-rename"),
+                     "params": .object(["bot_id": .string(UUID().uuidString), "name": .string("Renamed")])]),
+            .object(["method": .string("bot.save"), "operation_id": .string("batch-invalid"),
+                     "params": .object(["bot_id": .string("not-a-uuid")])]),
+            .object(["method": .string("bot.get"), "operation_id": .string("batch-read"),
+                     "params": .object(["bot_id": .string(UUID().uuidString)])]),
+        ])
+        let request = JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "host.batch", params: params)
+        let first = await dispatcher.dispatchUnixSocket(request)
+        XCTAssertNil(first.error)
+        let results = try XCTUnwrap(first.result?.objectValue?["results"]?.arrayValue)
+        XCTAssertEqual(results.count, 3)
+        XCTAssertNotNil(results[0].objectValue?["result"])
+        XCTAssertEqual(results[1].objectValue?["error"]?.objectValue?["code"], .number(-32602))
+        XCTAssertNotNil(results[2].objectValue?["result"], "a failed independent action does not cancel the others")
+        let replay = await dispatcher.dispatchUnixSocket(request)
+        XCTAssertEqual(replay.result, first.result)
+        XCTAssertEqual(router.pairedBotCalls.filter { $0.method == "bot.save" }.count, 1)
+        XCTAssertEqual(router.pairedBotCalls.filter { $0.method == "bot.get" }.count, 2, "readbacks stay fresh")
+        XCTAssertTrue(router.pairedBotCalls.allSatisfy { $0.params["host_id"] == .string(router.activeHostID) })
+    }
+
+    func test_hostBatchRejectsNestedCallsBeforeEffectsAndRequiresTitio() async throws {
+        let router = HostCatalogReceiptRouter()
+        router.callerIsTitio = true
+        let dispatcher = JSONRPCDispatcher(router: router)
+        var params = hostCall("bot.save", params: [:], operationID: "unused", router: router).params ?? [:]
+        let valid: JSONValue = .object(["method": .string("bot.save"), "operation_id": .string("rename"),
+                                       "params": .object(["bot_id": .string(UUID().uuidString)])])
+        params["calls"] = .array([valid, .object(["method": .string("host.call"), "operation_id": .string("nested")])])
+        let invalid = await dispatcher.dispatchUnixSocket(.init(jsonrpc: "2.0", id: .number(1), method: "host.batch", params: params))
+        XCTAssertEqual(invalid.error?.code, -32602)
+        XCTAssertTrue(router.pairedBotCalls.isEmpty)
+        params["calls"] = .array([valid])
+        router.callerIsTitio = false
+        let denied = await dispatcher.dispatchUnixSocket(.init(jsonrpc: "2.0", id: .number(2), method: "host.batch", params: params))
+        XCTAssertEqual(denied.error?.code, -32098)
+        XCTAssertTrue(router.pairedBotCalls.isEmpty)
+    }
+
+    func test_supervisedTitioCanReadButCannotMutateThroughSingleOrBatchCalls() async throws {
+        let router = HostCatalogReceiptRouter()
+        router.callerIsTitio = true
+        router.capturedFullAccess = false
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let bot = ["bot_id": JSONValue.string(UUID().uuidString)]
+        let read = await dispatcher.dispatchUnixSocket(hostCall("bot.get", params: bot, operationID: "inspect", router: router))
+        XCTAssertNil(read.error)
+        let mutation = await dispatcher.dispatchUnixSocket(hostCall("bot.save", params: bot, operationID: "edit", router: router))
+        XCTAssertEqual(mutation.error?.code, -32048)
+        var params = hostCall("unused", params: [:], operationID: "unused", router: router).params ?? [:]
+        params["calls"] = .array([.object(["method": .string("bot.get"), "params": .object(bot), "operation_id": .string("inspect-batch")])])
+        let batchRead = await dispatcher.dispatchUnixSocket(.init(jsonrpc: "2.0", id: .number(1), method: "host.batch", params: params))
+        XCTAssertNil(batchRead.error)
+        params["calls"] = .array([.object(["method": .string("bot.save"), "params": .object(bot), "operation_id": .string("edit-batch")])])
+        let batchEdit = await dispatcher.dispatchUnixSocket(.init(jsonrpc: "2.0", id: .number(2), method: "host.batch", params: params))
+        XCTAssertEqual(batchEdit.error?.code, -32048)
+        XCTAssertEqual(router.pairedBotCalls.map(\.method), ["bot.get", "bot.get"])
     }
 
     func test_hostCallIsDeniedToEveryBotExceptTitio() async {
@@ -651,6 +739,7 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
     var lastMethod = ""
     var markNextUnknown = false
     var authorized = true
+    var capturedFullAccess = true
     var authorizationMutations: [Bool] = []
     var lastCallerThread: AgentThreadID?
     var lastCallerRun: AgentRunID?
@@ -696,6 +785,9 @@ private final class HostCatalogReceiptRouter: FakeRouter, CommandReceiptStateRou
         authorizationMutations.append(mutation)
         guard authorized else {
             throw JSONRPCError(code: -32047, message: "Host catalog requires an authenticated active run.")
+        }
+        if mutation && !capturedFullAccess {
+            throw JSONRPCError(code: -32048, message: "Host catalog mutations require the captured fullAccess permission.")
         }
         guard let capability = delegationCapability, !capability.isEmpty else {
             throw JSONRPCError(code: -32047, message: "Host catalog requires an authenticated active run.")
