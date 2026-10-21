@@ -4,7 +4,7 @@ This is the binding design standard for MacCode on macOS. Every new or changed U
 
 - Tokens and primitives live in `Sources/DesignSystemKit/` (`Tokens.swift`, `Components.swift`).
 - Shared product controls live in `Sources/Surfaces/` (`AgentChoiceSheet.swift`, `AgentComposerChrome.swift`, `AgentModelPopover.swift`, `AgentAutoGuide.swift`).
-- `docs/design-system.md` is the older long-form reference. This file wins when they disagree.
+- This is the only design document for macOS. iOS keeps its own in `../ios-app/docs/design-system.md` and shares the parity rules in §7.
 
 ## 1. Principles
 
@@ -88,7 +88,8 @@ SF system font only, via `DS.Font`. Monospace only for code, commands, paths, br
 
 - **Window:** sidebar + content. Sidebar visibility follows `AdaptiveSidebarPolicy` (hysteresis 120 pt, 2 s resize cooldown); never hide content to show the sidebar.
 - **Headers:** compact, full width, 44 pt high, `dsBar(edge: .bottom)`. Title left, icon buttons right.
-- **Surfaces:** a task that becomes the user's main task replaces the body; it does not float over it.
+- **Surfaces:** a task that becomes the user's main task replaces the body; it does not float over it. Sidebars and drawers must not cover the primary terminal or editor content.
+- **Apple surface parity (shared with iOS):** SSH and Agent App are the visual baseline (compact header, dense dark content, direct controls). Terminal UI appears only for real usable sessions; empty or disconnected states use a clear empty state with a recovery action. iOS may adapt layout for touch but must keep every host capability macOS exposes.
 - **Settings:** two columns at ≥ 640 pt (nav list + page), a menu below that. Page = hero (56 tile, `title2`, subtitle, `surfaceRaised`, radius modal) then `DSSectionHeaderG` sections of rows.
 - **Grids:** choice grids are 2 columns, spacing `md`. Wide editors may place cards side by side and stack them when narrow.
 - **Max widths:** user bubble 420; empty-state subtitle 360–420; inline editors 880; sheet bodies scroll at 560 max height.
@@ -171,4 +172,3 @@ SF system font only, via `DS.Font`. Monospace only for code, commands, paths, br
 - Duplicate lookalikes to merge: settings `settingRow` vs keybindings `settingRow` vs scheduled `formRow`; `statusPill` (Activity) vs `runStatusPill` (Scheduled); `DistillAccountsPanel` add/rename sheets do not use `AgentChoiceSheet`.
 - Error surfaces differ (inline strip in Bots, alerts in Activity and Scheduled) → prefer inline.
 - `DS.NS` lacks `surfaceOverlay`, `hover`, `pressed`, `selection`, `focusRing`, `ultracode`.
-- `docs/design-system.md` has stale terminal colors and misses newer tokens and components.

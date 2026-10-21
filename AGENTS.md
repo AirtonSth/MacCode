@@ -63,7 +63,8 @@ Every change, however small, must be exercised in the real isolated debug app be
 
 ## Design standard (mandatory)
 
-- `DESIGN.md` is the binding UI standard (tokens, components, states, motion, accessibility, copy). Follow it for every UI change; update it in the same change when the standard itself changes.
+- Before changing anything a user sees, read [`DESIGN.md`](DESIGN.md) and follow it. It is the binding UI standard (tokens, components, states, motion, accessibility, copy, verification).
+- If a change needs a new pattern or changes the standard, update `DESIGN.md` in the same change.
 
 ## Shared components
 
