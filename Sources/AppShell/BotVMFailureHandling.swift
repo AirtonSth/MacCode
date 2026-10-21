@@ -115,8 +115,8 @@ extension AppCommandRouter {
         publishQueuedMessage(kind: "agent.message.queue.updated", head)
     }
 
-    /// D12 for the coordinator's auto-continuation: false when another
-    /// thread's run holds the bot's VM (the continuation is skipped).
+    /// D12 for the coordinator's auto-continuation: false when a rebuild or
+    /// stop holds the bot's VM (the continuation is skipped).
     func claimBotVMForAutoContinuation(thread: AgentThreadID, runID: AgentRunID) -> Bool {
         claimBotVMRun(thread: thread, runID: runID)?.holder == nil
     }

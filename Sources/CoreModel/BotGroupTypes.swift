@@ -153,7 +153,7 @@ public struct BotGroupParticipant: Codable, Sendable, Equatable {
 public struct BotGroupTurn: Codable, Sendable, Equatable {
     public enum State: String, Codable, Sendable, CaseIterable {
         case planned
-        /// The bot's VM is busy in another thread (D12); queued, not started.
+        /// A rebuild or stop holds the bot's VM (D12); queued, not started.
         case waitingForBot = "waiting_for_bot"
         case running
         case completed

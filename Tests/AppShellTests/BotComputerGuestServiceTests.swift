@@ -2128,11 +2128,41 @@ final class BotComputerGuestServiceTests: XCTestCase {
         XCTAssertTrue(registry.waitingThreads(botID: botID).isEmpty)
     }
 
-    func test_rebuildAbortsWhenAnotherRunTookTheBotDuringTheBuild() throws {
-        // WHY: the holding thread's own agent may rebuild, but if that run ends
-        // during the build and another thread's run starts, the old container
-        // now hosts that run and must not be stopped under it.
+    func test_aRunOfAnotherThreadCannotStartWhileTheHoldersOwnRebuildBuilds() throws {
+        // WHY: the holding thread's own agent may rebuild. Another thread's
+        // run must not start during the build: its processes would live in
+        // the container the rebuild stops.
         let support = makeSupport("rc-guest-rebuild-recheck")
+        defer { try? FileManager.default.removeItem(at: support) }
+        let fake = FakeDocker()
+        let registry = BotVMRunRegistry()
+        let service = BotComputerGuestService(
+            appSupport: support, docker: fake, observeAttempts: 1, observeDelay: 0,
+            vmRuns: registry
+        )
+        let botID = BotID()
+        _ = try service.provision(botID: botID)
+        let holder = AgentThreadID()
+        let holderRun = AgentRunID()
+        registry.begin(botID: botID, entry: .init(threadID: holder, runID: holderRun, title: "Fix CI", workspace: ""))
+        let other = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Deploy", workspace: "")
+        var refusedBy: BotVMRunRegistry.Entry?
+        fake.onBuild = {
+            registry.end(botID: botID, runID: holderRun)
+            refusedBy = registry.tryBegin(botID: botID, entry: other)
+        }
+
+        _ = try service.rebuild(botID: botID, requestingThreadID: holder)
+
+        XCTAssertEqual(refusedBy?.title, BotComputerGuestService.rebuildClaimTitle)
+        XCTAssertNil(registry.active(botID: botID), "the rebuild lets go of the VM")
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: other), "the run starts after the rebuild")
+    }
+
+    func test_rebuildIsRefusedWhileAnotherThreadRunsOnTheVM() throws {
+        // WHY: conversations share the VM; a rebuild must not stop the
+        // container under another thread's run.
+        let support = makeSupport("rc-guest-rebuild-parallel")
         defer { try? FileManager.default.removeItem(at: support) }
         let fake = FakeDocker()
         let registry = BotVMRunRegistry()
@@ -2143,23 +2173,16 @@ final class BotComputerGuestServiceTests: XCTestCase {
         let botID = BotID()
         let canonical = BotComputerGuestSpec.containerName(botID: botID)
         _ = try service.provision(botID: botID)
-        let holder = AgentThreadID()
-        let holderRun = AgentRunID()
-        registry.begin(botID: botID, entry: .init(threadID: holder, runID: holderRun, title: "Fix CI", workspace: ""))
-        let other = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Deploy", workspace: "")
-        fake.onBuild = {
-            registry.end(botID: botID, runID: holderRun)
-            XCTAssertNil(registry.tryBegin(botID: botID, entry: other))
-        }
+        let requester = AgentThreadID()
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: .init(threadID: requester, runID: AgentRunID(), title: "Fix CI", workspace: "")))
+        XCTAssertNil(registry.tryBegin(botID: botID, entry: .init(threadID: AgentThreadID(), runID: AgentRunID(), title: "Deploy", workspace: "")))
         fake.stopped.removeAll()
 
-        XCTAssertThrowsError(try service.rebuild(botID: botID, requestingThreadID: holder)) {
+        XCTAssertThrowsError(try service.rebuild(botID: botID, requestingThreadID: requester)) {
             XCTAssertEqual($0 as? BotComputerGuestServiceError, .rebuildWhileRunActive(threadTitle: "Deploy"))
         }
         XCTAssertFalse(fake.stopped.contains(canonical))
         XCTAssertEqual(fake.containers[canonical]?.running, true)
-        XCTAssertNil(fake.containers[BotComputerGuestSpec.nextContainerName(botID: botID)])
-        XCTAssertEqual(registry.active(botID: botID), other)
     }
 
     func test_provisionByTheHoldingThreadReplacesAnOutdatedContainer() throws {

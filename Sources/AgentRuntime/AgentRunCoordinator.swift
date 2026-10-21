@@ -708,8 +708,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onRunStarted: ((AgentThreadID, AgentRunID) -> Void)?
     public var onAssistantEvent: ((AssistantEvent, AgentThreadID, AgentRunID) -> Void)?
     public var onRunFinished: ((AgentThreadID, AgentRunID, AgentRunStatus) -> Void)?
-    /// D12: claims the bot VM an auto-continuation runs on; false (another
-    /// thread holds it) skips the continuation. The release frees a claim
+    /// D12: claims the bot VM an auto-continuation runs on; false (a rebuild
+    /// or stop holds it) skips the continuation. The release frees a claim
     /// whose continuation did not start.
     public var autoContinuationClaimsBotVM: (@Sendable (AgentThreadID, AgentRunID) async -> Bool)?
     public var autoContinuationReleasesBotVM: (@Sendable (AgentRunID) async -> Void)?

@@ -3515,8 +3515,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     /// The bot VM hooks every Agent App that runs bot threads shares (Agent
-    /// App tabs and the embedded Bots Desk): target default, one-run-per-VM
-    /// queue, Mac-execution approvals, and the VM gate behind the D11 banner.
+    /// App tabs and the embedded Bots Desk): target default, the queue behind
+    /// a VM rebuild or stop, Mac-execution approvals, and the VM gate behind the D11 banner.
     func configureBotVMHooks(on viewModel: AgentAppViewModel) {
         viewModel.botExecutionTargetProvider = { [weak self] botID in
             guard let store = self?.context?.botStore else { return .mac }
@@ -6546,8 +6546,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             return try enqueueBehindActiveRun()
         }
-        // D12: one run per bot VM. A VM busy in another thread queues this send
-        // behind that run (its run-finished drain starts it); a queued dispatch
+        // D12: runs share a bot VM. A rebuild or stop holding it queues this
+        // send until it lets go (its release drains the queue); a queued dispatch
         // was already claimed by the drain. Unstarted claims are freed below.
         let startRunID = requestedRunID ?? queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID()
         let vmClaim = claimBotVMRun(thread: thread, runID: startRunID, firstMessage: text)
@@ -6889,8 +6889,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let queued = lease.message
         let dispatchRunId = AgentRunID(queued.id.value)
-        // D12: a VM busy in another thread keeps the message queued; the
-        // holder's run-finished drain starts it. A claim whose run never
+        // D12: a rebuild or stop holding the VM keeps the message queued; its
+        // release drains it. A claim whose run never
         // started is freed on every exit.
         let vmClaim = claimBotVMRun(thread: thread, runID: dispatchRunId)
         if let vmClaim, let holder = vmClaim.holder {
@@ -9359,12 +9359,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
         return {
             let resource = resourceID ?? botID
-            if let holder = BotVMRunRegistry.shared.active(botID: resource) {
-                guard holder.threadID == threadID else {
-                    throw BotComputerError.invalid("The VM is busy in \(holder.title)")
-                }
-                if service.isContainerRunning(botID: resource) { return }
+            if let holder = BotVMRunRegistry.shared.blocker(botID: resource, threadID: threadID) {
+                throw BotComputerError.invalid("The VM is busy in \(holder.title)")
             }
+            // Runs share the VM: never recreate the container under them.
+            if BotVMRunRegistry.shared.active(botID: resource) != nil, service.isContainerRunning(botID: resource) { return }
             _ = try service.provision(botID: resource, requestingThreadID: threadID)
         }
     }
@@ -9476,7 +9475,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let threadID = action.threadID.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
         let resourceID = try ctx.botStore.guestResourceID(botID: botID, threadID: threadID)
-        if let holder = BotVMRunRegistry.shared.active(botID: resourceID), holder.threadID != threadID {
+        if let holder = BotVMRunRegistry.shared.blocker(botID: resourceID, threadID: threadID) {
             throw BotBrowserError.invalid("The VM is busy in \(holder.title)")
         }
         if action.kind == BotBrowserCatalog.act, botComputerControl.isControlledByUser(botID, resourceID: resourceID) {

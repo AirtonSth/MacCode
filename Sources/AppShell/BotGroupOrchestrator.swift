@@ -455,8 +455,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
         let threadID = member.thread.id
         let onVM = member.thread.executionTarget == .vm
 
-        // D12: one run per bot VM. Another thread holds it: wait, persisted.
-        if onVM, let holder = BotVMRunRegistry.shared.active(botID: bot.id), holder.threadID != threadID {
+        // A rebuild or stop holds the bot's VM: wait, persisted.
+        if onVM, let holder = BotVMRunRegistry.shared.blocker(botID: bot.id, threadID: threadID) {
             if turn.state != .waitingForBot {
                 move(turn, from: [.planned], to: .waitingForBot, roomThreadID: roomThreadID)
             }

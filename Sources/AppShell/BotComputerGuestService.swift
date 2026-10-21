@@ -500,8 +500,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
     /// whatever that run has inside. The requesting thread's own run does not
     /// count, so an in-guest agent gets a current container before it starts.
     private func heldByAnotherRun(botID: BotID, requestingThreadID: AgentThreadID?) -> Bool {
-        guard let holder = vmRuns.active(botID: botID) else { return false }
-        return holder.threadID != requestingThreadID
+        vmRuns.otherClaim(botID: botID, threadID: requestingThreadID) != nil
     }
 
     /// Every container binds the shared agent kit; its host directory must
@@ -548,7 +547,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
     }
 
     public func stop(botID: BotID) throws {
-        let claim = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Stopping VM", workspace: "")
+        let claim = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Stopping VM", workspace: "", exclusive: true)
         if let holder = vmRuns.tryBegin(botID: botID, entry: claim) {
             throw BotStoreError.invalidInput("The VM is busy in \(holder.title). Stop that conversation first.")
         }
@@ -810,11 +809,11 @@ public final class BotComputerGuestService: @unchecked Sendable {
 
     static let rebuildClaimTitle = "Linux desktop rebuild"
 
-    /// Refused while another thread's run holds the bot: the rebuild replaces
+    /// Refused while another thread's run is on the VM: the rebuild replaces
     /// the container that run is using. `requestingThreadID` is the thread whose
     /// own agent asked for the rebuild (nil for the user's Rebuild button).
-    /// Otherwise the rebuild holds the bot itself until it is done, so a send
-    /// made during the build queues instead of starting on the old container.
+    /// The rebuild holds the VM exclusively until it is done, so a send made
+    /// during the build queues instead of starting on the old container.
     public func rebuild(botID: BotID, requestingThreadID: AgentThreadID? = nil) throws -> BotComputerGuestReady {
         let container = BotComputerGuestSpec.containerName(botID: botID)
         var sharedVirtualMachine = false
@@ -828,25 +827,22 @@ public final class BotComputerGuestService: @unchecked Sendable {
             }
         }
         let claim = BotVMRunRegistry.Entry(
-            threadID: AgentThreadID(), runID: AgentRunID(), title: Self.rebuildClaimTitle, workspace: ""
+            threadID: requestingThreadID ?? AgentThreadID(), runID: AgentRunID(), title: Self.rebuildClaimTitle,
+            workspace: "", exclusive: true
         )
-        var claimed = false
+        // Exclusive until the new container runs: other threads' runs neither
+        // run in the container this stops nor start during the build. The
+        // requesting thread's own run keeps going.
+        if let holder = vmRuns.tryBegin(botID: botID, entry: claim) {
+            throw BotComputerGuestServiceError.rebuildWhileRunActive(threadTitle: holder.title)
+        }
         defer {
-            if claimed, let next = vmRuns.releaseAndNextWaiter(runID: claim.runID) {
+            if let next = vmRuns.releaseAndNextWaiter(runID: claim.runID) {
                 notificationCenter.post(
                     name: .botVMRebuildReleased, object: nil,
                     userInfo: [BotHostNotificationKey.botID: next.botID, BotHostNotificationKey.threadID: next.threadID]
                 )
             }
-        }
-        let ownerRunID: AgentRunID
-        if let holder = vmRuns.active(botID: botID), let requestingThreadID, holder.threadID == requestingThreadID {
-            ownerRunID = holder.runID
-        } else if let holder = vmRuns.tryBegin(botID: botID, entry: claim) {
-            throw BotComputerGuestServiceError.rebuildWhileRunActive(threadTitle: holder.title)
-        } else {
-            claimed = true
-            ownerRunID = claim.runID
         }
         try seedRecipe(botID: botID)
         let recipe = BotComputerGuestSpec.recipeURL(appSupport: appSupport, botID: botID)
@@ -874,14 +870,6 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let canonicalWasRunning = (try? docker.inspect(name: canonical))?.running == true
         var stoppedCanonical = false
         do {
-            // The requesting run may have ended during the build and another
-            // started; its processes live in the container this would stop.
-            if !claimed, vmRuns.active(botID: botID)?.runID != ownerRunID {
-                if let holder = vmRuns.tryBegin(botID: botID, entry: claim) {
-                    throw BotComputerGuestServiceError.rebuildWhileRunActive(threadTitle: holder.title)
-                }
-                claimed = true
-            }
             // Both containers bind this home. Stop the old one before the new
             // one starts, so two Chromiums never write one profile (cookies,
             // logins) at the same time.
@@ -915,7 +903,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
         let botID = BotID(uuid)
         let resource = resourceID ?? botID
         let callerThread = action.threadID.flatMap(UUID.init(uuidString:)).map(AgentThreadID.init)
-        if let holder = vmRuns.active(botID: resource), holder.threadID != callerThread,
+        if let holder = vmRuns.blocker(botID: resource, threadID: callerThread),
            resource != botID || callerThread != nil {
             throw BotComputerError.invalid("The VM is busy in \(holder.title)")
         }
@@ -941,7 +929,8 @@ public final class BotComputerGuestService: @unchecked Sendable {
             return ["ok": true, "steps": action.steps.count]
         case BotComputerCatalog.exec:
             let output: Data
-            if let run = vmRuns.active(botID: resource) {
+            if let run = vmRuns.claim(botID: resource, threadID: callerThread)
+                ?? (callerThread == nil ? vmRuns.active(botID: resource) : nil) {
                 output = try exec(
                     botID: resource,
                     command: action.command,
