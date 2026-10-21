@@ -270,7 +270,10 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         let botID = try dockerBot(of: thread)
         let destination = try deps.botStore.threadExecutionDestination(thread.id)
             ?? deps.botStore.executionDestination(botID: botID)
-        try deps.botStore.validateExecutionDestination(destination, botID: botID, workspaceID: thread.workspaceId)
+        try deps.botStore.validateExecutionDestination(
+            destination, botID: botID, workspaceID: thread.workspaceId,
+            contextPin: deps.botStore.conversationContextPin(linkedTo: thread.id)
+        )
         let machine = try destination.virtualMachineID.flatMap { try deps.botStore.virtualMachine(id: $0) }
         if let workspaceID = machine?.workspaceID, await deps.workspaces()[workspaceID] == nil {
             throw DistillGuestLaunchError.unavailable("This VM's workspace is no longer available.")

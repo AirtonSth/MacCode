@@ -55,6 +55,7 @@ final class BotRoutineScheduler {
         fireTasks[id] = Task { [weak self] in
             let notReady = await self?.botsViewModel()?.awaitGuestForScheduledSend(
                 botID: fire.routine.definition.botID,
+                destination: fire.routine.definition.scheduleSpec?.executionDestination,
                 timeout: Self.guestStartTimeout
             )
             let run = notReady.map { authority.failRoutineFire(fire, reason: $0) }

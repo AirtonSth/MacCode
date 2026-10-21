@@ -5305,12 +5305,15 @@ public final class BotsViewModel: ObservableObject {
             runAsUser: route.runAsUser
         )
         thread.reasoningModel = route.reasoningModel
-        thread.executionTarget = BotExecutionDefault.target(for: try currentRevision(for: bot))
+        let destination = try routing.executionDestination ?? botStore.executionDestination(botID: bot.id)
+        thread.executionTarget = destination.target
         let conversation = BotConversation(botID: bot.id, title: title, linkedAgentThreadID: thread.id)
         try botStore.createContextualConversation(
             conversation, newThread: thread, hostID: hostID,
-            context: context, policyRevision: binding.policyRevision
+            context: context, policyRevision: binding.policyRevision, executionDestination: destination
         )
+        // The new thread now owns this choice; sending must not request a retarget.
+        routing.executionDestination = nil
         return (conversation, routing)
     }
 
@@ -7480,12 +7483,13 @@ public final class BotsViewModel: ObservableObject {
             }
             // Like a scheduled fire, a stopped bot computer is started and awaited
             // instead of failing at once with "Docker desktop is not ready".
-            if scheduledSendNeedsGuestStart(botID: botID) {
+            if scheduledSendNeedsGuestStart(botID: botID, destination: routine.definition.scheduleSpec?.executionDestination) {
                 startingRoutineIDs.insert(id)
                 Task { [weak self] in
                     guard let self else { return }
                     let notReady = await self.awaitGuestForScheduledSend(
-                        botID: botID, timeout: BotRoutineScheduler.guestStartTimeout
+                        botID: botID, destination: routine.definition.scheduleSpec?.executionDestination,
+                        timeout: BotRoutineScheduler.guestStartTimeout
                     )
                     self.startingRoutineIDs.remove(id)
                     if let notReady {
@@ -7557,6 +7561,10 @@ public final class BotsViewModel: ObservableObject {
     /// Instruction on the task's route, kept as that conversation's desk
     /// route for follow-ups. The user's selection and panels stay as they are.
     func enqueueScheduledRoutine(_ routine: BotRoutine) throws -> JSONValue {
+        if !routine.definition.scheduleSpecJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           BotScheduleSpec.decodeJSON(routine.definition.scheduleSpecJSON) == nil {
+            throw BotStoreError.invalidInput("The saved schedule settings are invalid. Open Schedule Tasks and save this task again.")
+        }
         var route = routine.definition.scheduleSpec.map { Self.routineRouting($0, base: BotDeskRouting()) }
         // A schedule saved without a Main model must not reach Distill empty.
         if var filled = route, filled.provider == .distill,
@@ -7564,17 +7572,11 @@ public final class BotsViewModel: ObservableObject {
             filled.model = runDefaultModel(for: .distill)
             route = filled
         }
-        let pinned: (conversation: BotConversation, routing: BotDeskRouting)?
-        do {
-            pinned = try contextualRoutineConversation(
-                botID: routine.definition.botID,
-                route: route ?? BotDeskRouting(),
-                title: routine.definition.name
-            )
-        } catch {
-            botsWindowLog.error("Scheduled routine stays unpinned: \(error.localizedDescription, privacy: .public)")
-            pinned = nil
-        }
+        let pinned = try contextualRoutineConversation(
+            botID: routine.definition.botID,
+            route: route ?? BotDeskRouting(),
+            title: routine.definition.name
+        )
         return try enqueueHostMessage(
             botID: routine.definition.botID,
             text: routine.definition.prompt,
@@ -7586,7 +7588,7 @@ public final class BotsViewModel: ObservableObject {
 
     /// A workspace-exclusive Bot's scheduled run is pinned to its workspace so it
     /// lists in that workspace's Conversations. Nil when the Bot has no workspace
-    /// or the grant or route cannot host a contextual thread; the run then stays unpinned.
+    /// or no active read/send grant exists; the legacy run then stays unpinned.
     private func contextualRoutineConversation(
         botID: BotID,
         route: BotDeskRouting,
@@ -7595,6 +7597,9 @@ public final class BotsViewModel: ObservableObject {
         guard let bot = try botStore.get(id: botID), bot.deletedAt == nil else { return nil }
         let bindings = try botStore.listContextBindings(hostID: context.liveActivityHostIdentity.serverId, botID: botID)
         guard let workspaceID = SidebarViewModel.sidebarWorkspace(for: bot, bindings: bindings) ?? bot.workspaceID else { return nil }
+        guard bindings.contains(where: {
+            $0.context == .workspace(workspaceID) && $0.state == .active && $0.actions.isSuperset(of: [.read, .send])
+        }) else { return nil }
         let snapshot = providers.first(where: { $0.id == route.providerInstanceID })
             ?? providers.first(where: { $0.provider == route.provider })
         let made = try makeContextualConversation(
@@ -7604,26 +7609,31 @@ public final class BotsViewModel: ObservableObject {
         return made
     }
 
-    private func scheduledSendNeedsGuestStart(botID: BotID) -> Bool {
+    private func scheduledSendNeedsGuestStart(botID: BotID, destination: BotExecutionDestination? = nil) -> Bool {
         guard dockerGuestReadyOverrideForTesting == nil,
               let bot = try? botStore.get(id: botID),
-              let revision = try? currentRevision(for: bot) else { return false }
-        return (desktopKindOverrideForTesting ?? resolvedDesktopKind(revision.desktopKind)) == .dockerDesktop
-            && !isGuestRunning(botID)
+              let selected = try? destination ?? botStore.executionDestination(botID: bot.id) else { return false }
+        // Named VMs are prepared by the run resolver, with the thread's workspace.
+        guard selected.virtualMachineID == nil else { return false }
+        let kind = destination == nil ? (desktopKindOverrideForTesting
+            ?? (selected.target == .vm ? .dockerDesktop : .logicalExecutionSpace))
+            : (selected.target == .vm ? BotDesktopKind.dockerDesktop : .logicalExecutionSpace)
+        return kind == .dockerDesktop && guestRunningByBot[botID.value] != true
     }
 
     /// Before a scheduled send, a Docker bot whose computer is stopped waits
     /// (bounded) for it to come up, instead of losing the slot to "not ready".
     /// Nil when the send can go ahead; otherwise why the computer is not up.
-    func awaitGuestForScheduledSend(botID: BotID, timeout: TimeInterval) async -> String? {
-        guard scheduledSendNeedsGuestStart(botID: botID) else { return nil }
-        if guestLaunchState(for: botID) != .starting {
-            presentGuestDesktop(botID: botID)
+    func awaitGuestForScheduledSend(botID: BotID, destination: BotExecutionDestination? = nil, timeout: TimeInterval) async -> String? {
+        guard scheduledSendNeedsGuestStart(botID: botID, destination: destination) else { return nil }
+        if guestLaunchStateByBot[botID.value] != .starting {
+            presentGuestDesktop(botID: botID, executionDestination: .ownVM)
         }
         let deadline = Date().addingTimeInterval(timeout)
         while true {
-            if isGuestRunning(botID) { return nil }
-            if case .failed(let reason) = guestLaunchState(for: botID) { return reason }
+            if Task.isCancelled { return "Scheduled task start was cancelled." }
+            if guestRunningByBot[botID.value] == true { return nil }
+            if case .failed(let reason) = guestLaunchStateByBot[botID.value] { return reason }
             guard Date() < deadline else { return "The bot computer did not start in time." }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
@@ -11653,8 +11663,9 @@ public final class BotsViewModel: ObservableObject {
         markStarted: Bool = true
     ) throws -> (thread: AgentThread, conversation: BotConversation) {
         var routing = routing
-        if BotExecutionDefault.target(for: try currentRevision(for: bot)) == .vm
-            || bot.handle == TitioBot.handle {
+        let destination = try conversation.linkedAgentThreadID.flatMap { try botStore.threadExecutionDestination($0) }
+            ?? routing.executionDestination ?? botStore.executionDestination(botID: bot.id)
+        if destination.target == .vm || bot.handle == TitioBot.handle {
             routing.permissionMode = .fullAccess
         }
         let model = routing.resolvedModel(defaultModel: runDefaultModel(for:))
@@ -11829,7 +11840,9 @@ public final class BotsViewModel: ObservableObject {
         }
         var routing = routingOverride ?? frozenDeskRouting(for: conversation)
         // Titio acts through host catalog mutations, which require fullAccess.
-        if BotExecutionDefault.target(for: revision) == .vm || bot.handle == TitioBot.handle {
+        let destination = try conversation.linkedAgentThreadID.flatMap { try botStore.threadExecutionDestination($0) }
+            ?? routing.executionDestination ?? botStore.executionDestination(botID: bot.id)
+        if destination.target == .vm || bot.handle == TitioBot.handle {
             routing.permissionMode = .fullAccess
         }
         let prepared = try prepareSupervisedRun(
@@ -12497,14 +12510,19 @@ public final class BotsViewModel: ObservableObject {
         objectWillChange.send()
     }
 
-    func presentGuestDesktop(botID: BotID, threadID: AgentThreadID? = nil, onSettled: ((BotComputerGuestReady?) -> Void)? = nil) {
+    func presentGuestDesktop(botID: BotID, threadID: AgentThreadID? = nil, executionDestination: BotExecutionDestination? = nil, onSettled: ((BotComputerGuestReady?) -> Void)? = nil) {
         let resourceID: BotID
         do {
-            resourceID = try threadID.map { try botStore.guestResourceID(botID: botID, threadID: $0) }
-                ?? guestDisplayResourceID(botID)
+            if let executionDestination {
+                try botStore.validateExecutionDestination(executionDestination, botID: botID)
+                resourceID = executionDestination.virtualMachineID.map(BotID.init) ?? botID
+            } else {
+                resourceID = try threadID.map { try botStore.guestResourceID(botID: botID, threadID: $0) }
+                    ?? guestDisplayResourceID(botID)
+            }
         }
         catch { errorMessage = String(describing: error); onSettled?(nil); return }
-        guard guestLaunchState(for: botID) != .starting else {
+        guard guestLaunchStateByBot[resourceID.value] != .starting else {
             DispatchQueue.main.async { onSettled?(nil) }
             return
         }

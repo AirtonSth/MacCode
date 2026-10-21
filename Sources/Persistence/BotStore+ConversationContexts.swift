@@ -3,7 +3,7 @@ import CoreModel
 
 public extension BotStore {
     func createContextualConversation(_ conversation: BotConversation, hostID: String, context: BotContext, policyRevision: Int64) throws -> BotConversationContextPin {
-        try createContextualConversationBody(conversation, newThread: nil, hostID: hostID, context: context, policyRevision: policyRevision)
+        try createContextualConversationBody(conversation, newThread: nil, hostID: hostID, context: context, policyRevision: policyRevision, executionDestination: nil)
     }
 
     func createContextualConversation(
@@ -11,9 +11,10 @@ public extension BotStore {
         newThread: AgentThread,
         hostID: String,
         context: BotContext,
-        policyRevision: Int64
+        policyRevision: Int64,
+        executionDestination: BotExecutionDestination? = nil
     ) throws -> BotConversationContextPin {
-        try createContextualConversationBody(conversation, newThread: newThread, hostID: hostID, context: context, policyRevision: policyRevision)
+        try createContextualConversationBody(conversation, newThread: newThread, hostID: hostID, context: context, policyRevision: policyRevision, executionDestination: executionDestination)
     }
 
     private func createContextualConversationBody(
@@ -21,7 +22,8 @@ public extension BotStore {
         newThread: AgentThread?,
         hostID: String,
         context: BotContext,
-        policyRevision: Int64
+        policyRevision: Int64,
+        executionDestination: BotExecutionDestination?
     ) throws -> BotConversationContextPin {
         guard conversation.groupID == nil,
               let threadID = conversation.linkedAgentThreadID,
@@ -63,9 +65,14 @@ public extension BotStore {
                     let repository = AgentThreadRepository(db: db)
                     try repository.upsert(newThread)
                     insertedThread = true
+                    if let executionDestination {
+                        try validateExecutionDestination(executionDestination, botID: conversation.botID,
+                            workspaceID: newThread.workspaceId, contextPin: pin)
+                        try pinExecutionDestination(threadID: threadID, botID: conversation.botID, destination: executionDestination)
+                    }
                     // Native/paired creation carries the Bot's selected desktop.
                     // Internal contextual workers retain their isolated VM route.
-                    let target = newThread.executionTarget ?? .vm
+                    let target = executionDestination?.target ?? newThread.executionTarget ?? .vm
                     guard try repository.lockActorIfUnlocked(
                         id: threadID,
                         actor: .bot(conversation.botID),

@@ -166,12 +166,18 @@ extension AppCommandRouter {
         draft.prompt = params["prompt"]?.stringValue ?? draft.prompt
         draft.workspaceID = workspace.id
         draft.workspacePathSnapshot = workspace.cwd
-        if let user = params["run_as_user"]?.stringValue, let resolved = ScheduledSystemUserCatalog.user(named: user) {
+        if let value = params["run_as_user"] {
+            guard let user = value.stringValue, let resolved = ScheduledSystemUserCatalog.user(named: user) else {
+                throw JSONRPCError(code: -32602, message: "Select an eligible system user.")
+            }
             draft.runAsUser = resolved.name
             draft.runAsUID = resolved.uid
         }
-        if let raw = params["provider"]?.stringValue, let provider = AgentProvider(rawValue: raw) { draft.provider = provider }
-        draft.providerInstanceID = params["provider_instance_id"]?.stringValue ?? draft.provider.rawValue
+        if let raw = params["provider"]?.stringValue, let provider = AgentProvider(rawValue: raw), provider != draft.provider {
+            draft.provider = provider
+            draft.providerInstanceID = provider.rawValue
+        }
+        draft.providerInstanceID = params["provider_instance_id"]?.stringValue ?? draft.providerInstanceID
         draft.model = params["model"]?.stringValue ?? draft.model
         if let raw = params["reasoning_effort"]?.stringValue, let effort = AgentReasoningEffort(rawValue: raw) { draft.reasoningEffort = effort }
         if params["reasoning_model"] != nil { draft.reasoningModel = params["reasoning_model"]?.stringValue }
@@ -183,7 +189,7 @@ extension AppCommandRouter {
         if let raw = params["permission_mode"]?.stringValue, let mode = AgentPermissionMode(rawValue: raw) { draft.permissionMode = mode }
         if let plan = params["plan_mode"]?.boolValue { draft.interactionMode = plan ? .plan : .default }
         if let raw = params["execution_mode"]?.stringValue, let mode = AgentExecutionMode(rawValue: raw) { draft.executionMode = mode }
-        draft.baseBranch = params["base_branch"]?.stringValue ?? draft.baseBranch
+        if let value = params["base_branch"] { draft.baseBranch = value.stringValue ?? "" }
         if let rules = params["frequencies"]?.arrayValue { draft.frequencyRules = try rules.map(ScheduledTaskRemoteWire.decodeRule) }
         draft.timeZoneIdentifier = params["time_zone"]?.stringValue ?? draft.timeZoneIdentifier
         draft.isEnabled = params["enabled"]?.boolValue ?? draft.isEnabled

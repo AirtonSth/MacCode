@@ -63,6 +63,7 @@ final class ScheduledTaskRemoteTests: XCTestCase {
             "client_request_id": .string(UUID().uuidString),
             "bot_id": .string(bot.id.value.uuidString.lowercased()),
             "title": .string("Research"), "prompt": .string("Summarize"),
+            "enabled": .bool(true),
             "schedule_spec_json": .string(spec.encodedJSON()),
             "execution_destination": .string(BotExecutionDestination.virtualMachine(machine.id).storageValue),
         ]
@@ -70,8 +71,67 @@ final class ScheduledTaskRemoteTests: XCTestCase {
         _ = try await router.saveScheduledTaskRemote(params: params)
         let routines = try context.botStore.listRoutines(botID: bot.id)
         XCTAssertEqual(routines.count, 1)
+        XCTAssertTrue(try XCTUnwrap(routines.first).activation.isEnabled)
         let saved = try XCTUnwrap(routines.first?.definition.scheduleSpec)
         XCTAssertEqual(saved.executionDestination, .virtualMachine(machine.id))
         XCTAssertEqual(BotsViewModel.routineRouting(saved, base: BotDeskRouting()).executionDestination, saved.executionDestination)
+
+        var edit = params
+        edit["client_request_id"] = .string(UUID().uuidString)
+        edit["task_id"] = .string(try XCTUnwrap(routines.first).definition.id.value.uuidString.lowercased())
+        edit["enabled"] = .bool(false)
+        _ = try await router.saveScheduledTaskRemote(params: edit)
+        XCTAssertFalse(try XCTUnwrap(context.botStore.listRoutines(botID: bot.id).first).activation.isEnabled)
+        edit["client_request_id"] = .string(UUID().uuidString)
+        edit.removeValue(forKey: "enabled")
+        _ = try await router.saveScheduledTaskRemote(params: edit)
+        XCTAssertFalse(try XCTUnwrap(context.botStore.listRoutines(botID: bot.id).first).activation.isEnabled)
+    }
+
+    @MainActor
+    func test_invalidBotScheduleDoesNotCreateAnUnrunnableTask() async throws {
+        let directory = NSTemporaryDirectory() + "RC2InvalidBotSchedule-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        SettingsStore(db: context.db).update { $0.botsControlPlaneEnabled = true }
+        let bot = try context.botStore.create(name: "Writer", title: "", description: "")
+        var spec = BotScheduleSpec(model: "auto")
+        spec.timeZoneIdentifier = "invalid"
+        let params: [String: JSONValue] = [
+            "client_request_id": .string(UUID().uuidString),
+            "bot_id": .string(bot.id.value.uuidString.lowercased()),
+            "title": .string("Digest"), "prompt": .string("Summarize"),
+            "schedule_spec_json": .string(spec.encodedJSON()), "enabled": .bool(true)
+        ]
+        let result = try await router.saveScheduledTaskRemote(params: params)
+        XCTAssertEqual(result.objectValue?["status"], .string("failed"))
+        XCTAssertEqual(result.objectValue?["readback"]?.objectValue?["error_code"], .number(-32602))
+        XCTAssertTrue(result.objectValue?["readback"]?.objectValue?["error"]?.stringValue?.contains("time zone") == true)
+        let replay = try await router.saveScheduledTaskRemote(params: params)
+        XCTAssertEqual(replay, result)
+        XCTAssertTrue(try context.botStore.listRoutines(botID: bot.id).isEmpty)
+    }
+
+    @MainActor
+    func test_invalidSystemUserCannotSilentlyBecomeTheCurrentAccount() async throws {
+        let directory = NSTemporaryDirectory() + "RC2ScheduleUser-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "Schedule", cwd: directory)
+        do {
+            _ = try await router.saveScheduledTaskRemote(params: [
+                "workspace_id": .string(workspace.id.value.uuidString),
+                "title": .string("Task"), "prompt": .string("Build"),
+                "run_as_user": .string("missing-user-" + UUID().uuidString)
+            ])
+            XCTFail("an unavailable account must not be substituted")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("eligible system user"), "\(error)")
+        }
+        XCTAssertTrue(try ScheduledTaskStore(db: context.db).list().isEmpty)
     }
 }

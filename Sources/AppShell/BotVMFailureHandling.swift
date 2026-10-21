@@ -1,6 +1,7 @@
 import Foundation
 import AgentRuntime
 import CoreModel
+import Persistence
 import SocketServer
 import Surfaces
 
@@ -206,13 +207,24 @@ extension AppCommandRouter {
         let registered = Set(ctx.state.workspaces.values.map(\.cwd))
         let prefetch = guestDistillPrefetch()
         let store = ctx.botStore
+        let threads = ctx.threadRepo
         let workspaces = ctx.state.workspaces
         return await Task.detached(priority: .userInitiated) { () -> String? in
             do {
                 let destination = try threadID.flatMap { try store.threadExecutionDestination($0) } ?? store.executionDestination(botID: botID)
+                let thread = try threadID.map { id -> AgentThread in
+                    guard let thread = try threads.get(id: id) else {
+                        throw BotStoreError.invalidInput("This conversation no longer exists.")
+                    }
+                    return thread
+                }
+                try store.validateExecutionDestination(destination, botID: botID, workspaceID: thread?.workspaceId,
+                    contextPin: threadID.flatMap { try store.conversationContextPin(linkedTo: $0) })
                 let machine = try destination.virtualMachineID.flatMap { try store.virtualMachine(id: $0) }
                 if let owner = machine?.workspaceID {
-                    guard let ownerWorkspace = workspaces[owner], workspace == nil || workspace == ownerWorkspace.cwd else {
+                    // A worktree has its own path while retaining the workspace identity.
+                    guard let ownerWorkspace = workspaces[owner],
+                          thread != nil || workspace == nil || workspace == ownerWorkspace.cwd else {
                         return "This VM belongs to another workspace or its workspace is no longer available."
                     }
                 }
