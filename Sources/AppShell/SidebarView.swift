@@ -1345,6 +1345,14 @@ public final class SidebarViewModel: ObservableObject {
         }
     }
 
+    /// "New conversation" with a General Bot: its general context when granted, else its Desk.
+    public func startNewGeneralBotConversation(_ row: GeneralBotRow) {
+        if let authorized = authorizedBotConversationRows.first(where: { $0.botID == row.botID && $0.context == .general }) {
+            return startNewBotConversation(authorized)
+        }
+        openGeneralBot(row)
+    }
+
     /// Starts a new conversation with the Bot even when one is already running (sidebar "New conversation" menu).
     public func startNewBotConversation(_ row: AuthorizedBotConversationRow) {
         finishedBotIDs.remove(row.botID)
@@ -3696,28 +3704,51 @@ public struct SidebarRootView: View {
                 AgentChoiceIconTile(systemName: "person.fill", tint: DS.Palette.textSecondary, size: 24)
             }
             AgentCompactMenuDivider()
-            AgentChoiceSectionHeader("Bots")
-                .padding(.horizontal, DS.Space.sm)
-                .padding(.bottom, 2)
-            let bots = vm.workspaceBotRows(ws.id)
-            if bots.isEmpty {
-                Text("No bots in this workspace")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .padding(.horizontal, DS.Space.sm)
-                    .padding(.vertical, DS.Space.xs)
-            } else {
-                ForEach(bots) { row in
-                    newConversationMenuRow(
-                        title: row.botName,
-                        subtitle: row.handle.isEmpty ? nil : "@\(row.handle)",
-                        id: "sidebar.newConversation.bot.\(row.botID.value.uuidString)",
-                        action: { navigate { vm.startNewBotConversation(row) } }
-                    ) {
-                        BotsAvatarView(name: row.botName, handle: row.handle, symbol: row.symbol.isEmpty ? nil : row.symbol, size: 24)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    AgentChoiceSectionHeader("Workspace bots")
+                        .padding(.horizontal, DS.Space.sm)
+                        .padding(.bottom, 2)
+                    let bots = vm.workspaceBotRows(ws.id)
+                    if bots.isEmpty {
+                        Text("No bots in this workspace")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .padding(.horizontal, DS.Space.sm)
+                            .padding(.vertical, DS.Space.xs)
+                    } else {
+                        ForEach(bots) { row in
+                            newConversationMenuRow(
+                                title: row.botName,
+                                subtitle: row.handle.isEmpty ? nil : "@\(row.handle)",
+                                id: "sidebar.newConversation.bot.\(row.botID.value.uuidString)",
+                                action: { navigate { vm.startNewBotConversation(row) } }
+                            ) {
+                                BotsAvatarView(name: row.botName, handle: row.handle, symbol: row.symbol.isEmpty ? nil : row.symbol, size: 24)
+                            }
+                        }
+                    }
+                    let general = vm.generalBots.filter { !$0.hidden }
+                    if !general.isEmpty {
+                        AgentCompactMenuDivider()
+                        AgentChoiceSectionHeader("General bots")
+                            .padding(.horizontal, DS.Space.sm)
+                            .padding(.bottom, 2)
+                        ForEach(general) { row in
+                            newConversationMenuRow(
+                                title: BotsViewModel.displayName(row.name),
+                                subtitle: row.handle.isEmpty ? nil : "@\(row.handle)",
+                                id: "sidebar.newConversation.generalBot.\(row.botID.value.uuidString)",
+                                action: { navigate { vm.startNewGeneralBotConversation(row) } }
+                            ) {
+                                BotsAvatarView(name: row.name, handle: row.handle, symbol: row.symbol.isEmpty ? nil : row.symbol, size: 24)
+                            }
+                        }
                     }
                 }
             }
+            .frame(maxHeight: 340)
+            .fixedSize(horizontal: false, vertical: true)
             AgentCompactMenuDivider()
             newConversationMenuRow(title: "New bot…", subtitle: nil, id: "sidebar.newConversation.newBot", action: {
                 navigate { vm.addBot(inWorkspace: ws.id) }

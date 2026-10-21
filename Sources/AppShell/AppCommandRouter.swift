@@ -3481,6 +3481,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         agent.viewModel.mentionableBotsProvider = { [weak self] in
             (try? self?.context?.botStore.listCached()) ?? []
         }
+        agent.viewModel.createBotInWorkspace = { [weak self] workspaceID in
+            self?.windowController?.presentBotsInMainContent()
+            self?.botsViewModel?.beginCreate(inWorkspace: workspaceID)
+        }
         agent.viewModel.mentionableBotsRevisionProvider = { [weak self] in
             self?.context?.botStore.botsListRevision ?? 0
         }

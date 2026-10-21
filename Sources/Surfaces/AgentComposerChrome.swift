@@ -562,6 +562,10 @@ public struct AgentRunAsUserCapsule: View {
     public let onContinueWithoutBot: () -> Void
     public let onHandoffToBot: ((BotID) -> Void)?
     public let onAppear: (() -> Void)?
+    /// Set when the conversation lives in a workspace: Bots split into that workspace's and General.
+    public let workspaceID: WorkspaceID?
+    /// Shows a "New bot…" card; the host opens its create flow.
+    public let onNewBot: (() -> Void)?
 
     @State private var isPresented = false
     @State private var users: [AgentRunAsUser] = []
@@ -584,8 +588,12 @@ public struct AgentRunAsUserCapsule: View {
         onSelectActor: @escaping (RunActor) -> Void = { _ in },
         onContinueWithoutBot: @escaping () -> Void = {},
         onHandoffToBot: ((BotID) -> Void)? = nil,
-        onAppear: (() -> Void)? = nil
+        onAppear: (() -> Void)? = nil,
+        workspaceID: WorkspaceID? = nil,
+        onNewBot: (() -> Void)? = nil
     ) {
+        self.workspaceID = workspaceID
+        self.onNewBot = onNewBot
         self.usersProvider = usersProvider
         self.selected = selected
         self.runLocked = runLocked
@@ -718,16 +726,59 @@ public struct AgentRunAsUserCapsule: View {
             ) {
                 AgentChoiceIconTile(systemName: "person.fill", tint: DS.Palette.textSecondary)
             }
-            botsSection(
-                title: "Bots",
-                list: bots,
-                searchable: true,
-                isSelected: { actor == .bot($0) },
-                onPick: { bot in
-                    onSelectActor(.bot(bot.id))
-                    isPresented = false
+            if let workspaceID {
+                // Bots owned by another workspace belong to neither group.
+                let workspaceBots = bots.filter { $0.workspaceID == workspaceID }
+                let generalBots = bots.filter { $0.workspaceID == nil }
+                if bots.count > 6 {
+                    AgentChoiceSearchField(
+                        query: $botQuery,
+                        placeholder: "Search bots",
+                        accessibilityIdentifier: "agent.runAsUser.sheet.botSearch"
+                    )
                 }
-            )
+                botsSection(
+                    title: "Workspace bots",
+                    list: workspaceBots,
+                    searchable: true,
+                    showsSearchField: false,
+                    emptyText: "No bots in this workspace yet.",
+                    isSelected: { actor == .bot($0) },
+                    onPick: pickBot
+                )
+                Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+                botsSection(
+                    title: "General bots",
+                    list: generalBots,
+                    searchable: true,
+                    showsSearchField: false,
+                    emptyText: "No general bots yet.",
+                    isSelected: { actor == .bot($0) },
+                    onPick: pickBot
+                )
+            } else {
+                botsSection(
+                    title: "Bots",
+                    list: bots,
+                    searchable: true,
+                    isSelected: { actor == .bot($0) },
+                    onPick: pickBot
+                )
+            }
+            if let onNewBot {
+                AgentChoiceCard(
+                    title: "New bot…",
+                    subtitle: workspaceID == nil ? "Create a Bot" : "Create a Bot for this workspace",
+                    selected: false,
+                    accessibilityIdentifier: "agent.runAsUser.sheet.newBot",
+                    action: {
+                        isPresented = false
+                        onNewBot()
+                    }
+                ) {
+                    AgentChoiceIconTile(systemName: "plus", tint: DS.Palette.accent)
+                }
+            }
         }
         if users.count > 1 {
             VStack(alignment: .leading, spacing: DS.Space.md) {
@@ -748,6 +799,11 @@ public struct AgentRunAsUserCapsule: View {
                 }
             }
         }
+    }
+
+    private func pickBot(_ bot: BotDefinition) {
+        onSelectActor(.bot(bot.id))
+        isPresented = false
     }
 
     @ViewBuilder
@@ -784,6 +840,8 @@ public struct AgentRunAsUserCapsule: View {
         title: String,
         list: [BotDefinition],
         searchable: Bool,
+        showsSearchField: Bool = true,
+        emptyText: String = "No bots in this workspace yet.",
         isSelected: @escaping (BotID) -> Bool,
         onPick: @escaping (BotDefinition) -> Void
     ) -> some View {
@@ -794,7 +852,7 @@ public struct AgentRunAsUserCapsule: View {
                     .font(DS.Font.caption.monospacedDigit())
                     .foregroundColor(DS.Palette.textTertiary)
             }
-            if searchable && list.count > 6 {
+            if searchable && showsSearchField && list.count > 6 {
                 AgentChoiceSearchField(
                     query: $botQuery,
                     placeholder: "Search bots",
@@ -802,7 +860,7 @@ public struct AgentRunAsUserCapsule: View {
                 )
             }
             if list.isEmpty {
-                AgentChoiceCallout(icon: "info.circle", tint: DS.Palette.textSecondary, text: "No bots in this workspace yet.")
+                AgentChoiceCallout(icon: "info.circle", tint: DS.Palette.textSecondary, text: emptyText)
             } else if shown.isEmpty {
                 Text("No bots match “\(botQuery.trimmingCharacters(in: .whitespacesAndNewlines))”.")
                     .font(DS.Font.caption)
