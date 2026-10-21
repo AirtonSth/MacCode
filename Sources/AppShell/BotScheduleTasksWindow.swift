@@ -445,113 +445,94 @@ struct BotScheduleTaskEditorView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: DS.Space.lg) {
-                Button(action: onBack) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Back")
-                Text(draft.isNew ? "New Scheduled Task" : "Edit Scheduled Task")
-                    .font(DS.Font.title2.weight(.semibold))
-                    .foregroundColor(DS.Palette.text)
-                Spacer()
-                Button("Cancel") { onBack() }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                Button("Save") { onSave(draft) }
-                    .buttonStyle(DSPrimaryButtonStyle())
-                    .accessibilityIdentifier("bots.scheduleTasks.save")
-            }
-            .padding(.horizontal, DS.Space.xxl)
-            .padding(.vertical, DS.Space.xl)
-            .dsBar(edge: .bottom)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: DS.Space.xxl) {
-                    labeled("Bot") {
+        ScheduleEditorPage(
+            title: draft.isNew ? "New Scheduled Task" : "Edit Scheduled Task",
+            subtitle: "Run a Bot on a schedule, with its own identity, memory and tools.",
+            saveTitle: "Save",
+            saveIdentifier: "bots.scheduleTasks.save",
+            onBack: onBack,
+            onSave: { onSave(draft) },
+            content: {
+                ScheduleEditorSection("Task", identifier: "bots.scheduleTasks.editorSection.Task") {
+                    ScheduleEditorRow("Bot", showsDivider: false) {
                         Picker("", selection: $draft.botID) {
                             ForEach(bots, id: \.id) { bot in
                                 Text(bot.name).tag(bot.id)
                             }
                         }
                         .labelsHidden()
+                        .fixedSize()
                         .accessibilityIdentifier("bots.scheduleTasks.editor.bot")
                     }
-                    labeled("Name") {
-                        TextField("Morning scan", text: $draft.name)
-                            .textFieldStyle(.plain)
-                            .accessibilityIdentifier("bots.scheduleTasks.editor.name")
-                    }
-                    labeled("Instruction") {
-                        TextEditor(text: $draft.prompt)
-                            .font(DS.Font.body)
-                            .frame(minHeight: 140)
-                            .accessibilityIdentifier("bots.scheduleTasks.editor.instruction")
-                    }
-                    BotScheduleSpecEditor(
-                        spec: $draft.spec,
-                        providers: providers,
-                        providersLoading: providersLoading
-                    )
-                    labeled("Run options") {
-                        ScheduledRunOptionsEditor(
-                            showsExecutionMode: draft.spec.provider == .distill,
-                            executionMode: Binding(
-                                get: { draft.spec.distillExecutionMode ?? .normal },
-                                set: { draft.spec.distillExecutionMode = $0 }
-                            ),
-                            permission: Binding(
-                                get: { draft.spec.permissionMode ?? .fullAccess },
-                                set: { draft.spec.permissionMode = $0 }
-                            ),
-                            identifierPrefix: "bots.scheduleTasks.editor"
+                    VStack(alignment: .leading, spacing: DS.Space.md) {
+                        ScheduleEditorTextField(
+                            placeholder: "Name, e.g. Morning scan",
+                            text: $draft.name,
+                            identifier: "bots.scheduleTasks.editor.name"
+                        )
+                        ScheduleEditorPromptBox(
+                            placeholder: "Describe what the Bot should do",
+                            text: $draft.prompt,
+                            identifier: "bots.scheduleTasks.editor.instruction",
+                            label: "Instruction"
                         )
                     }
-                    labeled("Execution") {
+                    .padding(DS.Space.md)
+                }
+                BotScheduleSpecEditor(
+                    spec: $draft.spec,
+                    providers: providers,
+                    providersLoading: providersLoading
+                )
+                ScheduleEditorSection("Run options", identifier: "bots.scheduleTasks.editorSection.Run options") {
+                    ScheduledRunOptionsEditor(
+                        showsExecutionMode: draft.spec.provider == .distill,
+                        executionMode: Binding(
+                            get: { draft.spec.distillExecutionMode ?? .normal },
+                            set: { draft.spec.distillExecutionMode = $0 }
+                        ),
+                        permission: Binding(
+                            get: { draft.spec.permissionMode ?? .fullAccess },
+                            set: { draft.spec.permissionMode = $0 }
+                        ),
+                        identifierPrefix: "bots.scheduleTasks.editor"
+                    )
+                    ScheduleEditorRow("Use Bot default location", hint: "Where the run executes: Mac, a VM or a workspace") {
                         Toggle("Use bot default", isOn: Binding(
                             get: { draft.spec.executionDestination == nil },
                             set: { draft.spec.executionDestination = $0 ? nil : ((try? destinationStore.executionDestination(botID: draft.botID)) ?? .mac) }
                         ))
-                        if draft.spec.executionDestination != nil {
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(DS.Palette.accent)
+                    }
+                    if draft.spec.executionDestination != nil {
+                        VStack(alignment: .leading) {
                             BotExecutionDestinationPicker(selection: Binding(
                                 get: { draft.spec.executionDestination ?? .mac },
                                 set: { draft.spec.executionDestination = $0 }
                             ), bot: bots.first { $0.id == draft.botID }, store: destinationStore, workspaces: workspaces)
                         }
+                        .padding(DS.Space.lg)
                     }
-                    Toggle("Active", isOn: $draft.isEnabled)
-                        .accessibilityIdentifier("bots.scheduleTasks.editor.active")
-                    Text(BotRoutineCopy.testRunHonestyCaption)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.warning)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .padding(DS.Space.xxl)
-                .frame(maxWidth: 920, alignment: .leading)
-            }
-        }
-    }
-
-    private func labeled<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
-            Text(title)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-                .accessibilityHidden(true)
-            content()
-                .accessibilityLabel(title)
-                .padding(DS.Space.lg)
-                .background(DS.Palette.surfaceRaised)
-                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                ScheduleEditorSection("Status", identifier: "bots.scheduleTasks.editorSection.Status") {
+                    ScheduleEditorRow("Active", hint: "Paused tasks keep their schedule but do not run", showsDivider: false) {
+                        Toggle("Active", isOn: $draft.isEnabled)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .tint(DS.Palette.success)
+                            .accessibilityIdentifier("bots.scheduleTasks.editor.active")
+                    }
+                }
+                AgentChoiceCallout(
+                    icon: "exclamationmark.triangle.fill",
+                    tint: DS.Palette.warning,
+                    text: BotRoutineCopy.testRunHonestyCaption
                 )
-        }
+            },
+            footer: { EmptyView() }
+        )
     }
 }
 
@@ -804,38 +785,11 @@ struct BotScheduleSpecEditor: View {
     }
 
     private func editorGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(title)
-                .font(DS.Font.caption.weight(.semibold))
-                .foregroundColor(DS.Palette.textSecondary)
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.vertical, DS.Space.md)
-            content()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DS.Palette.surface)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
-                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
-        )
-        .accessibilityIdentifier("bots.scheduleTasks.editorSection.\(title)")
+        ScheduleEditorSection(title, identifier: "bots.scheduleTasks.editorSection.\(title)", content: content)
     }
 
-    private func formRow<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(spacing: 0) {
-            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            HStack {
-                Text(label)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                Spacer(minLength: DS.Space.lg)
-                content()
-                    .frame(minWidth: 160, alignment: .trailing)
-            }
-            .padding(.horizontal, DS.Space.lg)
-            .padding(.vertical, DS.Space.md)
-        }
+    private func formRow<Content: View>(_ label: String, showsDivider: Bool = true, @ViewBuilder content: () -> Content) -> some View {
+        ScheduleEditorRow(label, showsDivider: showsDivider, control: content)
     }
 }
 

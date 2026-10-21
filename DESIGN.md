@@ -94,6 +94,10 @@ SF system font only, via `DS.Font`. Monospace only for code, commands, paths, br
 - **Grids:** choice grids are 2 columns, spacing `md`. Wide editors may place cards side by side and stack them when narrow.
 - **Max widths:** user bubble 420; empty-state subtitle 360–420; inline editors 880; sheet bodies scroll at 560 max height.
 
+## 7b. Responsive (mandatory)
+
+Every screen must work at any window width, from the narrowest the window allows to full screen. Cap content with `maxWidth` and center it; never fix widths that can exceed the container. Rows with a label and a control use `ViewThatFits` (side by side, then stacked). Wrapping text uses `fixedSize(horizontal: false, vertical: true)`. Two-column layouts collapse to one below about 640 pt (as Settings does). Verify narrow and wide in the running app.
+
 ## 8. Components (use these; do not fork)
 
 **Primitives (`DesignSystemKit`)**
