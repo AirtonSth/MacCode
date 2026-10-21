@@ -7294,7 +7294,8 @@ public final class BotsViewModel: ObservableObject {
     public var studioDraftReplyStyle: (verbosity: BotReplyVerbosity, caveman: Bool) {
         let bot = studioDraft.botID.flatMap { id in bots.first { $0.id == id } }
         return (
-            studioDraft.verbosity ?? bot?.verbosity ?? .human,
+            studioDraft.verbosity ?? bot?.verbosity
+                ?? BotDefinition.defaultVerbosity(handle: studioDraft.handle),
             studioDraft.cavemanEnabled ?? bot?.cavemanEnabled
                 ?? BotDefinition.defaultCavemanEnabled(handle: studioDraft.handle)
         )
@@ -13402,9 +13403,8 @@ public struct BotsRootView: View {
                         VStack(alignment: .leading, spacing: DS.Space.xl) {
                             studioDesktop
                             studioSecrets
-                            studioSecurity
                         }
-                        .frame(maxWidth: 720, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
             }
@@ -13814,24 +13814,40 @@ public struct BotsRootView: View {
         caption: String? = nil,
         @ViewBuilder trailing: () -> Trailing
     ) -> some View {
-        HStack(alignment: .center, spacing: DS.Space.lg) {
-            AgentChoiceIconTile(systemName: icon, tint: tint, size: 28)
-            VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                Text(title)
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.text)
-                if let caption {
-                    Text(caption)
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+        let control = trailing()
+        return ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: DS.Space.lg) {
+                AgentChoiceIconTile(systemName: icon, tint: tint, size: 28)
+                securityRowText(title: title, caption: caption)
+                    .frame(minWidth: 220, alignment: .leading)
+                Spacer(minLength: DS.Space.lg)
+                control
             }
-            Spacer(minLength: DS.Space.lg)
-            trailing()
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                HStack(alignment: .center, spacing: DS.Space.lg) {
+                    AgentChoiceIconTile(systemName: icon, tint: tint, size: 28)
+                    securityRowText(title: title, caption: caption)
+                    Spacer(minLength: 0)
+                }
+                control.padding(.leading, 28 + DS.Space.lg)
+            }
         }
         .padding(.vertical, DS.Space.md)
         .frame(minHeight: BotsChrome.hitTarget)
+    }
+
+    private func securityRowText(title: String, caption: String?) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            Text(title)
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+            if let caption {
+                Text(caption)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private var studioDesktop: some View {
@@ -13903,28 +13919,44 @@ public struct BotsRootView: View {
         .accessibilityIdentifier("bots.studio.desktop")
     }
 
+    private var secretsHeaderText: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xxs) {
+            Text("Secrets")
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+            Text("Encrypted values this bot can use. Values are never shown again.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var studioSecrets: some View {
         let formVisible = addingSecret || vm.studioState.editingSecretName != nil
+        let addButton = Button("Add secret") {
+            vm.cancelBotSecretEdit()
+            addingSecret = true
+        }
+        .buttonStyle(DSSecondaryButtonStyle())
+        .accessibilityIdentifier("bots.studio.secrets.add")
         return VStack(alignment: .leading, spacing: DS.Space.sm) {
             securityCard {
-                HStack(alignment: .center, spacing: DS.Space.lg) {
-                    AgentChoiceIconTile(systemName: "key.fill", tint: DS.Palette.warning, size: 28)
-                    VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                        Text("Secrets")
-                            .font(DS.Font.body)
-                            .foregroundColor(DS.Palette.text)
-                        Text("Encrypted values this bot can use. Values are never shown again.")
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .fixedSize(horizontal: false, vertical: true)
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .center, spacing: DS.Space.lg) {
+                        AgentChoiceIconTile(systemName: "key.fill", tint: DS.Palette.warning, size: 28)
+                        secretsHeaderText
+                            .frame(minWidth: 220, alignment: .leading)
+                        Spacer(minLength: DS.Space.lg)
+                        addButton
                     }
-                    Spacer(minLength: DS.Space.lg)
-                    Button("Add secret") {
-                        vm.cancelBotSecretEdit()
-                        addingSecret = true
+                    VStack(alignment: .leading, spacing: DS.Space.md) {
+                        HStack(alignment: .center, spacing: DS.Space.lg) {
+                            AgentChoiceIconTile(systemName: "key.fill", tint: DS.Palette.warning, size: 28)
+                            secretsHeaderText
+                            Spacer(minLength: 0)
+                        }
+                        addButton.padding(.leading, 28 + DS.Space.lg)
                     }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .accessibilityIdentifier("bots.studio.secrets.add")
                 }
                 .padding(.vertical, DS.Space.md)
                 .frame(minHeight: BotsChrome.hitTarget)
@@ -14053,33 +14085,6 @@ public struct BotsRootView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("bots.studio.secrets")
-    }
-
-    private var studioSecurity: some View {
-        VStack(alignment: .leading, spacing: DS.Space.sm) {
-            AgentChoiceSectionHeader("Safety")
-            securityCard {
-                securityRow(
-                    icon: "hand.raised",
-                    tint: DS.Palette.textSecondary,
-                    title: "Approvals",
-                    caption: "Allow once / Deny prompts are not live yet."
-                ) {
-                    AgentChoiceBadge("Coming soon", tint: DS.Palette.textSecondary)
-                }
-                studioRule
-                securityRow(
-                    icon: "pencil.and.outline",
-                    tint: DS.Palette.textSecondary,
-                    title: "Host writes",
-                    caption: "Host-brokered effects stay off until that phase ships."
-                ) {
-                    AgentChoiceBadge("Off", tint: DS.Palette.textSecondary)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityIdentifier("bots.studio.security")
     }
 
     private var studioAvatarAttention: BotAttentionState {

@@ -279,14 +279,14 @@ public final class SidebarViewModel: ObservableObject {
         shown < limit || always.contains(id)
     }
 
-    /// Pure: collapsed keeps the first rows up to the cap plus selected/running ones; expanded keeps all.
+    /// Pure: collapsed shows at most the cap, selected/running rows first; expanded keeps all.
     nonisolated static func visibleConversations(
         _ rows: [WorkspaceConversationRow], expanded: Bool, always: Set<AgentThreadID>
     ) -> (rows: [WorkspaceConversationRow], hidden: Int, showsToggle: Bool) {
         let limit = workspaceConversationLimit
         guard !expanded else { return (rows, 0, rows.count > limit) }
-        var visible: [WorkspaceConversationRow] = []
-        for row in rows where admitsConversation(shown: visible.count, id: row.threadID, always: always) { visible.append(row) }
+        let ordered = rows.filter { always.contains($0.threadID) } + rows.filter { !always.contains($0.threadID) }
+        let visible = Array(ordered.prefix(limit))
         let hidden = rows.count - visible.count
         return (visible, hidden, hidden > 0)
     }
@@ -344,6 +344,13 @@ public final class SidebarViewModel: ObservableObject {
     /// Pure: untitled threads stay hidden unless they are running or open.
     nonisolated static func showsThread(title: String, id: AgentThreadID, keep: Set<AgentThreadID>) -> Bool {
         title != untitledThreadTitle || keep.contains(id)
+    }
+
+    /// Pure: an untitled thread with no message yet is a draft, not a conversation;
+    /// it stays out of the sidebar unless it is open or running.
+    nonisolated static func isEmptyDraft(title: String, id: AgentThreadID, keep: Set<AgentThreadID>, hasMessages: (AgentThreadID) -> Bool) -> Bool {
+        let untitled = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || title == untitledThreadTitle
+        return untitled && !keep.contains(id) && !hasMessages(id)
     }
 
     @Published public private(set) var generalBots: [GeneralBotRow] = []
@@ -435,6 +442,30 @@ public final class SidebarViewModel: ObservableObject {
     public func isWorkspaceSectionCollapsed(_ id: WorkspaceID, _ section: WorkspaceSection) -> Bool {
         // A search shows every match, even in a hidden section.
         sidebarQuery.isEmpty && collapsedWorkspaceSections.contains(Self.workspaceSectionKey(id, section))
+    }
+
+    /// Bots/VMs lists the user expanded past the cap, keyed like `collapsedWorkspaceSections`; persisted.
+    @Published public private(set) var expandedSectionLists: Set<String> = []
+    nonisolated static let expandedSectionListsKey = "sidebar.expandedSectionLists"
+
+    /// Pure: the first `limit` rows unless expanded; `hidden` counts the rest.
+    nonisolated static func capped<T>(_ items: [T], expanded: Bool, limit: Int = workspaceConversationLimit) -> (rows: [T], hidden: Int) {
+        guard !expanded, items.count > limit else { return (items, 0) }
+        return (Array(items.prefix(limit)), items.count - limit)
+    }
+
+    /// Bots/VMs rows to draw under one workspace: capped, except while searching.
+    func sectionSlice<T>(_ items: [T], _ id: WorkspaceID, _ section: WorkspaceSection) -> (rows: [T], hidden: Int, expanded: Bool) {
+        let expanded = expandedSectionLists.contains(Self.workspaceSectionKey(id, section))
+        guard sidebarQuery.isEmpty else { return (items, 0, false) }
+        let slice = Self.capped(items, expanded: expanded)
+        return (slice.rows, slice.hidden, expanded && items.count > Self.workspaceConversationLimit)
+    }
+
+    public func toggleSectionList(_ id: WorkspaceID, _ section: WorkspaceSection) {
+        let key = Self.workspaceSectionKey(id, section)
+        if expandedSectionLists.contains(key) { expandedSectionLists.remove(key) } else { expandedSectionLists.insert(key) }
+        UserDefaults.standard.set(expandedSectionLists.sorted(), forKey: Self.expandedSectionListsKey)
     }
 
     public func toggleWorkspaceSection(_ id: WorkspaceID, _ section: WorkspaceSection) {
@@ -540,6 +571,7 @@ public final class SidebarViewModel: ObservableObject {
     private var activeBotCountSink: AnyCancellable?
     private var botRosterSink: AnyCancellable?
     private var botEventSubscription: UUID?
+    private var seenEventSubscription: UUID?
     @Published private(set) var workspaceActivityCounts: [String: PetActivityCounts] = [:]
     private var activityCountsObserver: UUID?
     /// Fired when the user activates a workspace row so the shell can leave
@@ -644,6 +676,8 @@ public final class SidebarViewModel: ObservableObject {
             UserDefaults.standard.stringArray(forKey: Self.expandedConversationWorkspacesKey))
         self.collapsedWorkspaceSections = Set(
             UserDefaults.standard.stringArray(forKey: Self.collapsedWorkspaceSectionsKey) ?? [])
+        self.expandedSectionLists = Set(
+            UserDefaults.standard.stringArray(forKey: Self.expandedSectionListsKey) ?? [])
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
             object: nil,
@@ -717,6 +751,7 @@ public final class SidebarViewModel: ObservableObject {
         authorizedBotRowsTask?.cancel()
         if let botEventSubscription { EventBus.shared.unsubscribe(botEventSubscription) }
         if let runEventSubscription { EventBus.shared.unsubscribe(runEventSubscription) }
+        if let seenEventSubscription { EventBus.shared.unsubscribe(seenEventSubscription) }
         if let activityCountsObserver {
             Task { @MainActor in PetActivityCountsProjection.shared.removeObserver(activityCountsObserver) }
         }
@@ -751,6 +786,7 @@ public final class SidebarViewModel: ObservableObject {
         }
         let botStore = context.botStore
         let threadRepo = context.threadRepo
+        let messageRepo = context.messageRepo
         if authorizedBotRowsHostID != hostID { virtualMachines = [] }
         authorizedBotRowsGeneration &+= 1
         let generation = authorizedBotRowsGeneration
@@ -774,7 +810,8 @@ public final class SidebarViewModel: ObservableObject {
                 let rows = if let loader { loader(botStore, threadRepo, hostID, workspaceIDs) }
                 else { Self.loadAuthorizedBotConversationRows(botStore: botStore, threadRepo: threadRepo, hostID: hostID, workspaceIDs: workspaceIDs) }
                 let linkedRunning = Set(((try? botStore.conversationsLinked(to: live)) ?? [:]).values.map(\.botID))
-                let tree = Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden, keepUntitled: keepUntitled)
+                let tree = Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden, keepUntitled: keepUntitled,
+                                               hasMessages: { (try? messageRepo.hasAny(threadId: $0)) ?? true })
                 var conversationBots: [BotID: BotDefinition] = [:]
                 if let tree {
                     for id in Set(tree.conversations.values.flatMap { $0.compactMap(\.botID) }) {
@@ -872,7 +909,8 @@ public final class SidebarViewModel: ObservableObject {
         hostID: String,
         expanded: Set<WorkspaceID>,
         includeHidden: Bool = false,
-        keepUntitled: Set<AgentThreadID> = []
+        keepUntitled: Set<AgentThreadID> = [],
+        hasMessages: (AgentThreadID) -> Bool = { _ in true }
     ) -> (general: [GeneralBotRow], conversations: [WorkspaceID: [WorkspaceConversationRow]], virtualMachines: [BotVirtualMachine])? {
         do {
             // Titio, pinned, user drag order, then most recent.
@@ -895,6 +933,7 @@ public final class SidebarViewModel: ObservableObject {
                 for thread in try threadRepo.list(workspaceId: workspaceID)
                 where !thread.isEphemeral && thread.parentThreadId == nil {
                     guard rows.count < Self.workspaceConversationLoadLimit || keepUntitled.contains(thread.id) else { continue }
+                    guard !Self.isEmptyDraft(title: thread.title, id: thread.id, keep: keepUntitled, hasMessages: hasMessages) else { continue }
                     // Pinned Bot threads stay visible even when their generated title looks untitled.
                     let pin = try botStore.conversationContextPin(linkedTo: thread.id)
                     if let pin {
@@ -912,6 +951,7 @@ public final class SidebarViewModel: ObservableObject {
                 if !scopedBots.isEmpty {
                     for bot in scopedBots {
                         rows += try Self.unpinnedBotRows(bot: bot, workspaceID: workspaceID, botStore: botStore, threadRepo: threadRepo)
+                            .filter { !Self.isEmptyDraft(title: $0.title, id: $0.threadID, keep: keepUntitled, hasMessages: hasMessages) }
                     }
                     rows.sort { $0.updatedAt != $1.updatedAt ? $0.updatedAt > $1.updatedAt : $0.id < $1.id }
                     var capped: [WorkspaceConversationRow] = []
@@ -1133,6 +1173,16 @@ public final class SidebarViewModel: ObservableObject {
                 Task { @MainActor [weak self] in self?.reloadAuthorizedBotConversationRows() }
             }.id
         }
+        // Opening a thread anywhere, or viewing/clearing it in Activity, drops its green dot.
+        if seenEventSubscription == nil {
+            seenEventSubscription = EventBus.shared.subscribeFromCurrent(
+                filter: .kindPrefixes(["agent.thread.read", "notification.read"])
+            ) { [weak self] event in
+                let threads = Self.seenThreadIDs(kind: event.kind, payload: event.payload)
+                let runs = Self.seenRunIDs(kind: event.kind, payload: event.payload)
+                Task { @MainActor [weak self] in self?.clearFinished(threads: threads, runs: runs) }
+            }.id
+        }
         if botEventSubscription == nil {
             botEventSubscription = EventBus.shared.subscribeFromCurrent(
                 filter: .kindPrefixes(["bot.created", "bot.deleted", "bot.updated", "bot.settings.updated", "bot.conversation.updated", "surface.updated"])
@@ -1140,6 +1190,36 @@ public final class SidebarViewModel: ObservableObject {
                 Task { @MainActor [weak self] in self?.reloadAuthorizedBotConversationRows() }
             }.id
         }
+    }
+
+    /// Pure: the thread an `agent.thread.read` event names.
+    nonisolated static func seenThreadIDs(kind: String, payload: JSONValue) -> [AgentThreadID] {
+        guard kind == "agent.thread.read",
+              let raw = payload.objectValue?["thread_id"]?.stringValue, let uuid = UUID(uuidString: raw) else { return [] }
+        return [AgentThreadID(uuid)]
+    }
+
+    /// Pure: runs an Activity view or clear marked seen; a reopen ("Undo") names none.
+    nonisolated static func seenRunIDs(kind: String, payload: JSONValue) -> [AgentRunID] {
+        guard kind == "notification.read", let object = payload.objectValue,
+              ["viewed", "acknowledged"].contains(object["reason"]?.stringValue ?? "") else { return [] }
+        return (object["activity_item_ids"]?.arrayValue ?? []).compactMap { value in
+            guard let id = value.stringValue, id.hasPrefix("run:"), let uuid = UUID(uuidString: String(id.dropFirst(4))) else { return nil }
+            return AgentRunID(uuid)
+        }
+    }
+
+    private func clearFinished(threads: [AgentThreadID], runs: [AgentRunID]) {
+        var seen = Set(threads)
+        if !runs.isEmpty, let db = context?.db {
+            seen.formUnion((try? AgentRunResultRepository(db: db).threadIDs(runIds: runs)) ?? [])
+        }
+        guard !seen.isEmpty else { return }
+        let nextThreads = finishedThreadIDs.subtracting(seen)
+        if nextThreads != finishedThreadIDs { finishedThreadIDs = nextThreads }
+        let bots = Set(seen.compactMap { context?.botStore.cachedBotID(linkedTo: $0) })
+        let nextBots = finishedBotIDs.subtracting(bots)
+        if nextBots != finishedBotIDs { finishedBotIDs = nextBots }
     }
 
     /// "2 running · 1 need you", with "· 3 bots" when Bots are running.
@@ -2632,6 +2712,8 @@ public struct SidebarRootView: View {
     /// the top or bottom of the workspace list. Stored so we can invalidate it
     /// when the drag leaves the edge zone or the drop completes.
     @State private var dragScrollTimer: Timer? = nil
+    /// Workspace whose "New conversation" popover is open.
+    @State private var newConversationMenuWorkspace: WorkspaceID?
     private let onOpenSettings: () -> Void
     private let onOpenAccount: () -> Void
     private let onOpenScheduledTasks: () -> Void
@@ -3606,6 +3688,88 @@ public struct SidebarRootView: View {
         }
     }
 
+    private func newConversationMenu(_ ws: Workspace) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            newConversationMenuRow(title: "No Bot", subtitle: "Plain agent conversation", id: "sidebar.newConversation.noBot", action: {
+                navigate { vm.newWorkspaceConversation(in: ws.id) }
+            }) {
+                AgentChoiceIconTile(systemName: "person.fill", tint: DS.Palette.textSecondary, size: 24)
+            }
+            AgentCompactMenuDivider()
+            AgentChoiceSectionHeader("Bots")
+                .padding(.horizontal, DS.Space.sm)
+                .padding(.bottom, 2)
+            let bots = vm.workspaceBotRows(ws.id)
+            if bots.isEmpty {
+                Text("No bots in this workspace")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .padding(.horizontal, DS.Space.sm)
+                    .padding(.vertical, DS.Space.xs)
+            } else {
+                ForEach(bots) { row in
+                    newConversationMenuRow(
+                        title: row.botName,
+                        subtitle: row.handle.isEmpty ? nil : "@\(row.handle)",
+                        id: "sidebar.newConversation.bot.\(row.botID.value.uuidString)",
+                        action: { navigate { vm.startNewBotConversation(row) } }
+                    ) {
+                        BotsAvatarView(name: row.botName, handle: row.handle, symbol: row.symbol.isEmpty ? nil : row.symbol, size: 24)
+                    }
+                }
+            }
+            AgentCompactMenuDivider()
+            newConversationMenuRow(title: "New bot…", subtitle: nil, id: "sidebar.newConversation.newBot", action: {
+                navigate { vm.addBot(inWorkspace: ws.id) }
+            }) {
+                AgentChoiceIconTile(systemName: "plus", tint: DS.Palette.accent, size: 24)
+            }
+        }
+        .padding(DS.Space.sm)
+        .frame(width: 260)
+        .background(DS.Palette.surfaceOverlay)
+        .accessibilityIdentifier("sidebar.newConversation.menu")
+    }
+
+    private func newConversationMenuRow<Leading: View>(
+        title: String,
+        subtitle: String?,
+        id: String,
+        action: @escaping () -> Void,
+        @ViewBuilder leading: () -> Leading
+    ) -> some View {
+        Button {
+            newConversationMenuWorkspace = nil
+            action()
+        } label: {
+            HStack(spacing: DS.Space.md) {
+                leading()
+                    .frame(width: 24, height: 24)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.text)
+                        .lineLimit(1)
+                    if let subtitle, !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .padding(.vertical, DS.Space.xs)
+            .frame(minHeight: 34)
+            .contentShape(Rectangle())
+            .dsHoverFill()
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier(id)
+    }
+
     /// Open Tabs, followed by Conversations, Bots and VMs.
     @ViewBuilder
     private func workspaceChildRows(_ ws: Workspace) -> some View {
@@ -3621,26 +3785,7 @@ public struct SidebarRootView: View {
         }
         if !vm.isWorkspaceSectionCollapsed(ws.id, .conversations) {
         if vm.showsNewConversation(ws.id) {
-            Menu {
-                Button { navigate { vm.newWorkspaceConversation(in: ws.id) } } label: {
-                    Label("No Bot", systemImage: "person.fill")
-                }
-                let bots = vm.workspaceBotRows(ws.id)
-                if bots.isEmpty {
-                    Text("No bots in this workspace").disabled(true)
-                } else {
-                    Divider()
-                    ForEach(bots) { row in
-                        Button { navigate { vm.startNewBotConversation(row) } } label: {
-                            Label(row.botName, systemImage: "cpu")
-                        }
-                    }
-                }
-                Divider()
-                Button { navigate { vm.addBot(inWorkspace: ws.id) } } label: {
-                    Text("New bot…")
-                }
-            } label: {
+            Button { newConversationMenuWorkspace = ws.id } label: {
                 HStack(spacing: DS.Space.sm) {
                     Image(systemName: "plus")
                         .font(.system(size: 11, weight: .regular))
@@ -3654,9 +3799,13 @@ public struct SidebarRootView: View {
                 .frame(height: 30)
                 .contentShape(Rectangle())
             }
-            .menuStyle(.button)
             .buttonStyle(.plain)
-            .menuIndicator(.hidden)
+            .popover(isPresented: Binding(
+                get: { newConversationMenuWorkspace == ws.id },
+                set: { if !$0 { newConversationMenuWorkspace = nil } }
+            ), arrowEdge: .trailing) {
+                newConversationMenu(ws)
+            }
             .help("Start a new conversation in \(ws.name)")
             .accessibilityIdentifier("sidebar.newConversation.\(ws.id.value.uuidString)")
         }
@@ -3664,27 +3813,8 @@ public struct SidebarRootView: View {
         let ages = SidebarViewModel.duplicateTitleAges(conversations, now: Date())
         ForEach(conversations) { workspaceConversationRow($0, workspace: ws, age: ages[$0.id]) }
         if let toggle = vm.conversationToggle(ws.id) {
-            let label = toggle.expanded ? "Show less" : "Show more (\(toggle.hidden))"
-            Button {
-                if reduceMotion { vm.toggleConversationsExpanded(ws.id) }
-                else { withAnimation(.easeOut(duration: 0.18)) { vm.toggleConversationsExpanded(ws.id) } }
-            } label: {
-                HStack(spacing: DS.Space.sm) {
-                    Image(systemName: toggle.expanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 11, weight: .regular))
-                        .frame(width: 20, height: 20)
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Text(label).font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
-                    Spacer(minLength: 0)
-                }
-                .padding(.leading, Self.workspaceChildIndent)
-                .padding(.horizontal, DS.Space.sm)
-                .frame(height: 30)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(toggle.expanded ? "Show fewer conversations" : "Show \(toggle.hidden) more conversations")
-            .accessibilityIdentifier("sidebar.conversationsToggle.\(ws.id.value.uuidString)")
+            showMoreRow(expanded: toggle.expanded, hidden: toggle.hidden, noun: "conversations",
+                        id: "sidebar.conversationsToggle.\(ws.id.value.uuidString)") { vm.toggleConversationsExpanded(ws.id) }
         }
         }
         if vm.showsAddBot(ws.id) || !vm.workspaceBotRows(ws.id).isEmpty {
@@ -3710,9 +3840,14 @@ public struct SidebarRootView: View {
             .help("Create a Bot exclusive to \(ws.name)")
             .accessibilityIdentifier("sidebar.addBot.\(ws.id.value.uuidString)")
         }
-        ForEach(SidebarViewModel.runningFirst(vm.workspaceBotRows(ws.id)) {
+        let bots = vm.sectionSlice(SidebarViewModel.runningFirst(vm.workspaceBotRows(ws.id)) {
             SidebarViewModel.isBotRunning($0.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
-        }) { botConversationRow($0) }
+        }, ws.id, .bots)
+        ForEach(bots.rows) { botConversationRow($0) }
+        if bots.hidden > 0 || bots.expanded {
+            showMoreRow(expanded: bots.expanded, hidden: bots.hidden, noun: "bots",
+                        id: "sidebar.botsToggle.\(ws.id.value.uuidString)") { vm.toggleSectionList(ws.id, .bots) }
+        }
         }
         if vm.showsNewConversation(ws.id) || !vm.workspaceVirtualMachineRows(ws.id).isEmpty {
             collapsibleSectionHeader(.vms, workspace: ws, id: "sidebar.workspaceVMs.\(ws.id.value.uuidString)")
@@ -3721,9 +3856,37 @@ public struct SidebarRootView: View {
         if vm.showsNewConversation(ws.id) {
             newVirtualMachineRow(workspaceID: ws.id)
         }
-        ForEach(vm.workspaceVirtualMachineRows(ws.id)) { virtualMachineRow($0) }
+        let machines = vm.sectionSlice(vm.workspaceVirtualMachineRows(ws.id), ws.id, .vms)
+        ForEach(machines.rows) { virtualMachineRow($0) }
+        if machines.hidden > 0 || machines.expanded {
+            showMoreRow(expanded: machines.expanded, hidden: machines.hidden, noun: "VMs",
+                        id: "sidebar.vmsToggle.\(ws.id.value.uuidString)") { vm.toggleSectionList(ws.id, .vms) }
+        }
         }
 
+    }
+
+    /// "Show more (N)" / "Show less" under a capped workspace list.
+    private func showMoreRow(expanded: Bool, hidden: Int, noun: String, id: String, toggle: @escaping () -> Void) -> some View {
+        Button {
+            if reduceMotion { toggle() } else { withAnimation(.easeOut(duration: 0.18)) { toggle() } }
+        } label: {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 11, weight: .regular))
+                    .frame(width: 20, height: 20)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Text(expanded ? "Show less" : "Show more (\(hidden))").font(DS.Font.body).foregroundColor(DS.Palette.textSecondary).lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, Self.workspaceChildIndent)
+            .padding(.horizontal, DS.Space.sm)
+            .frame(height: 30)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(expanded ? "Show fewer \(noun)" : "Show \(hidden) more \(noun)")
+        .accessibilityIdentifier(id)
     }
 
     private func activeSurfaceRow(_ item: ActiveSurfaceItem, selected: Bool) -> some View {

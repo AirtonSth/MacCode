@@ -153,6 +153,8 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         thread.status = .completed
         let conversation = BotConversation(botID: bot.id, title: "", linkedAgentThreadID: thread.id)
         try f.context.botStore.createContextualConversation(conversation, newThread: thread, hostID: f.host, context: .workspace(workspace.id), policyRevision: grant.policyRevision)
+        // An untitled thread lists once it has a message; an empty one is only a draft.
+        try f.context.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "hello"))
         XCTAssertFalse(f.vm.workspaceConversationRows(workspace.id).contains { $0.threadID == thread.id })
         EventBus.shared.publish(kind: .botConversationUpdated, payload: .object(["bot_id": .string(bot.id.value.uuidString)]))
         for _ in 0..<50 where !f.vm.workspaceConversationRows(workspace.id).contains(where: { $0.threadID == thread.id }) {

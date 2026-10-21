@@ -147,14 +147,16 @@ final class SidebarSelectionAndBotOrderTests: XCTestCase {
         XCTAssertEqual(out.hidden, 0)
     }
 
-    func test_visibleConversations_collapsedKeepsCapPlusAlwaysAndCountsHidden() {
-        // WHY: the open/running thread stays visible past the cap and the hidden count must exclude it.
+    func test_visibleConversations_collapsedKeepsCapWithAlwaysFirstAndCountsHidden() {
+        // WHY: the submenu shows New + at most 3 rows; the open/running thread
+        // takes one of those slots instead of growing the list.
         let rows = convRows(12)
         let always = rows[10].threadID
         let cap = SidebarViewModel.workspaceConversationLimit
         let out = SidebarViewModel.visibleConversations(rows, expanded: false, always: [always])
-        XCTAssertEqual(out.rows, Array(rows[0..<cap]) + [rows[10]])
-        XCTAssertEqual(out.hidden, rows.count - cap - 1)
+        XCTAssertEqual(out.rows, [rows[10]] + Array(rows[0..<(cap - 1)]))
+        XCTAssertEqual(out.rows.count, cap)
+        XCTAssertEqual(out.hidden, rows.count - cap)
         XCTAssertTrue(out.showsToggle)
     }
 
@@ -164,6 +166,16 @@ final class SidebarSelectionAndBotOrderTests: XCTestCase {
         let out = SidebarViewModel.visibleConversations(rows, expanded: true, always: [])
         XCTAssertEqual(out.rows, rows)
         XCTAssertTrue(out.showsToggle)
+    }
+
+    func test_cappedSectionShowsThreeThenShowMore() {
+        // WHY: Bots and VMs lists follow Conversations: New + 3 rows + Show more (N).
+        let items = Array(0..<7)
+        let collapsed = SidebarViewModel.capped(items, expanded: false)
+        XCTAssertEqual(collapsed.rows, [0, 1, 2])
+        XCTAssertEqual(collapsed.hidden, 4)
+        XCTAssertEqual(SidebarViewModel.capped(items, expanded: true).rows, items, "Show more reveals every row")
+        XCTAssertEqual(SidebarViewModel.capped([0, 1, 2], expanded: false).hidden, 0, "a short list grows no Show more row")
     }
 
     func test_botRunning_whenOwnRunOrLinkedThreadRuns() {

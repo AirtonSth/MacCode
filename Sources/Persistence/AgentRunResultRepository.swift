@@ -54,6 +54,47 @@ public final class AgentRunResultRepository: @unchecked Sendable {
         }
     }
 
+    /// Marks every finished, not-yet-viewed run of a thread viewed, so opening the
+    /// thread anywhere also clears it from Activity's Just finished. Returns those runs.
+    @discardableResult
+    public func markFinishedRunsViewed(threadId: AgentThreadID, at date: Date = Date()) throws -> [AgentRunID] {
+        try db.performSync { database in
+            try database.transaction {
+                let select = try database.prepare("""
+                    SELECT r.id FROM agent_runs r LEFT JOIN agent_run_results res ON res.run_id = r.id
+                    WHERE r.thread_id = ? AND r.status IN ('completed', 'failed', 'interrupted', 'cancelled')
+                      AND res.viewed_at IS NULL;
+                    """)
+                try select.bind(1, threadId.value.uuidString)
+                var ids: [String] = []
+                while try select.step() { if let id = select.columnText(0) { ids.append(id) } }
+                guard !ids.isEmpty else { return [] }
+                let ensure = try database.prepare("INSERT OR IGNORE INTO agent_run_results(run_id) VALUES (?);")
+                let update = try database.prepare("UPDATE agent_run_results SET viewed_at = ? WHERE run_id = ?;")
+                for id in ids {
+                    try ensure.bind(1, id); _ = try ensure.step(); ensure.reset()
+                    try update.bind(1, isoFractional.string(from: date)); try update.bind(2, id); _ = try update.step(); update.reset()
+                }
+                return ids.compactMap { UUID(uuidString: $0).map(AgentRunID.init) }
+            }
+        }
+    }
+
+    /// Thread of each run, for turning Activity item ids back into sidebar rows.
+    public func threadIDs(runIds: [AgentRunID]) throws -> [AgentThreadID] {
+        guard !runIds.isEmpty else { return [] }
+        return try db.performSync { database in
+            let statement = try database.prepare("SELECT thread_id FROM agent_runs WHERE id = ?;")
+            var threads: [AgentThreadID] = []
+            for id in runIds {
+                try statement.bind(1, id.value.uuidString)
+                if try statement.step(), let raw = statement.columnText(0), let uuid = UUID(uuidString: raw) { threads.append(AgentThreadID(uuid)) }
+                statement.reset()
+            }
+            return threads
+        }
+    }
+
     /// Applies exact prior timestamps. Missing map key leaves row untouched; null clears viewed state.
     public func restoreViewed(_ viewedAtByRunId: [AgentRunID: Date?]) throws {
         try db.performSync { database in

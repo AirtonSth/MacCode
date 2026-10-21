@@ -566,9 +566,9 @@ public enum BotStandingInstructions {
 
 /// How much of a Bot's work its chat shows, and how it writes.
 public enum BotReplyVerbosity: String, Codable, Sendable, Equatable, CaseIterable {
-    /// Simple (default): writes for a non-technical reader; the chat shows only its messages.
+    /// Simple (Titio's default): writes for a non-technical reader; the chat shows only its messages.
     case human
-    /// Technical: may include files, commands and code; the chat shows every step it runs.
+    /// Technical (default for new Bots): may include files, commands and code; the chat shows every step it runs.
     case verbose
 }
 
@@ -578,6 +578,11 @@ public struct BotDefinition: Codable, Sendable, Equatable {
     /// Every Bot talks caveman by default except Titio, who explains RemoteCode.
     public static func defaultCavemanEnabled(handle: String) -> Bool {
         handle.lowercased() != TitioIdentity.handle
+    }
+
+    /// New Bots reply Technical; only Titio, who explains RemoteCode, replies Simple.
+    public static func defaultVerbosity(handle: String) -> BotReplyVerbosity {
+        handle.lowercased() == TitioIdentity.handle ? .human : .verbose
     }
 
     public var id: BotID
@@ -613,7 +618,7 @@ public struct BotDefinition: Codable, Sendable, Equatable {
         currentRevisionID: BotRevisionID? = nil,
         directoryEpoch: Int = 1,
         notificationsEnabled: Bool = true,
-        verbosity: BotReplyVerbosity = .human,
+        verbosity: BotReplyVerbosity? = nil,
         cavemanEnabled: Bool? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
@@ -632,7 +637,7 @@ public struct BotDefinition: Codable, Sendable, Equatable {
         self.currentRevisionID = currentRevisionID
         self.directoryEpoch = directoryEpoch
         self.notificationsEnabled = notificationsEnabled
-        self.verbosity = verbosity
+        self.verbosity = verbosity ?? Self.defaultVerbosity(handle: handle)
         self.cavemanEnabled = cavemanEnabled ?? Self.defaultCavemanEnabled(handle: handle)
         self.createdAt = createdAt
         self.updatedAt = updatedAt

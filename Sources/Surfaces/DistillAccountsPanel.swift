@@ -112,6 +112,7 @@ public struct DistillAccountsPanel: View {
     public let remove: (String) -> Void
     public let refreshQuota: (String) -> Void
     public let saveRouting: (DistillAutoRouting) -> Void
+    public let embedded: Bool
     @Environment(\.dismiss) private var dismiss
     @State private var newProvider = DistillAccountProvider.chatgpt
     @State private var newLabel = ""
@@ -130,7 +131,8 @@ public struct DistillAccountsPanel: View {
                 add: @escaping (DistillAccountProvider, String) -> Void,
                 rename: @escaping (String, String) -> Void, connectAccount: @escaping (String) -> Void,
                 disconnectAccount: @escaping (String) -> Void, remove: @escaping (String) -> Void,
-                refreshQuota: @escaping (String) -> Void, saveRouting: @escaping (DistillAutoRouting) -> Void) {
+                refreshQuota: @escaping (String) -> Void, saveRouting: @escaping (DistillAutoRouting) -> Void,
+                embedded: Bool = false) {
         self.presentation = presentation
         self.cancel = cancel
         self.openAgain = openAgain
@@ -144,6 +146,7 @@ public struct DistillAccountsPanel: View {
         self.remove = remove
         self.refreshQuota = refreshQuota
         self.saveRouting = saveRouting
+        self.embedded = embedded
     }
 
     private var currentDraft: DistillAutoRouting { draft ?? presentation.routing }
@@ -158,31 +161,46 @@ public struct DistillAccountsPanel: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
-            HStack {
-                Text("Accounts & Auto").font(DS.Font.title2)
-                Spacer()
-                Button("Done") {
-                    if hasChanges { confirmingDiscard = true } else { dismiss() }
-                }.keyboardShortcut(.cancelAction).frame(minHeight: 44).disabled(presentation.isBusy)
+            if !embedded {
+                HStack {
+                    Text("Accounts & Auto").font(DS.Font.title2)
+                    Spacer()
+                    Button("Done") {
+                        if hasChanges { confirmingDiscard = true } else { dismiss() }
+                    }.keyboardShortcut(.cancelAction).frame(minHeight: 44).disabled(presentation.isBusy)
+                }
+                .confirmationDialog("Discard unsaved profile changes?", isPresented: $confirmingDiscard, titleVisibility: .visible) {
+                    Button("Discard changes", role: .destructive) { draft = nil; dismiss() }
+                    Button("Keep editing", role: .cancel) {}
+                }
             }
-            .confirmationDialog("Discard unsaved profile changes?", isPresented: $confirmingDiscard, titleVisibility: .visible) {
-                Button("Discard changes", role: .destructive) { draft = nil; dismiss() }
-                Button("Keep editing", role: .cancel) {}
-            }
-            GeometryReader { proxy in
-                if proxy.size.width >= 720 {
+            if embedded {
+                ViewThatFits(in: .horizontal) {
                     HStack(alignment: .top, spacing: DS.Space.xl) {
-                        ScrollView { accountsCard }
-                        ScrollView { routingCard }
+                        accountsCard.frame(minWidth: 340, maxWidth: .infinity, alignment: .top)
+                        routingCard.frame(minWidth: 340, maxWidth: .infinity, alignment: .top)
                     }
-                } else {
-                    VStack(spacing: DS.Space.lg) {
-                        Picker("Settings section", selection: $showingRouting) {
-                            Text("Accounts").tag(false)
-                            Text("Auto routing").tag(true)
-                        }.pickerStyle(.segmented).labelsHidden()
-                        ScrollView {
-                            if showingRouting { routingCard } else { accountsCard }
+                    VStack(alignment: .leading, spacing: DS.Space.lg) {
+                        accountsCard
+                        routingCard
+                    }
+                }
+            } else {
+                GeometryReader { proxy in
+                    if proxy.size.width >= 720 {
+                        HStack(alignment: .top, spacing: DS.Space.xl) {
+                            ScrollView { accountsCard }
+                            ScrollView { routingCard }
+                        }
+                    } else {
+                        VStack(spacing: DS.Space.lg) {
+                            Picker("Settings section", selection: $showingRouting) {
+                                Text("Accounts").tag(false)
+                                Text("Auto routing").tag(true)
+                            }.pickerStyle(.segmented).labelsHidden()
+                            ScrollView {
+                                if showingRouting { routingCard } else { accountsCard }
+                            }
                         }
                     }
                 }
@@ -255,25 +273,61 @@ public struct DistillAccountsPanel: View {
 
     private var accountsCard: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
-            HStack {
+            HStack(spacing: DS.Space.sm) {
                 Text("Accounts").font(DS.Font.title3)
+                Text("\(presentation.statuses.filter(\.connected).count)/\(presentation.statuses.count)")
+                    .font(DS.Font.caption).monospacedDigit().foregroundStyle(DS.Palette.textTertiary)
                 Spacer()
-                Button("Refresh", action: refreshAccounts).frame(minHeight: 44).disabled(presentation.isBusy || presentation.isRefreshing)
+                if presentation.isRefreshing {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button(action: refreshAccounts) {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Refresh accounts")
+                    .accessibilityLabel("Refresh accounts")
+                    .disabled(presentation.isBusy)
+                }
+                Button { newLabel = ""; showingAddAccount = true } label: {
+                    Label("Add", systemImage: "plus")
+                }.buttonStyle(DSSecondaryButtonStyle()).disabled(unavailable)
             }
-            Text("Connect accounts to make their models available to Main, Worker and Auto.").foregroundStyle(DS.Palette.textSecondary)
+            Text("Sign in to the accounts Distill can use.")
+                .font(DS.Font.caption).foregroundStyle(DS.Palette.textSecondary)
             installNotice
-            if presentation.isRefreshing { HStack { ProgressView().controlSize(.small); Text("Refreshing accounts…") } }
-            Button { newLabel = ""; showingAddAccount = true } label: {
-                Label("Add account", systemImage: "plus")
-            }.frame(minHeight: 44).disabled(unavailable)
-            if presentation.statuses.isEmpty { Text("Add an account, then choose Connect to sign in.").foregroundStyle(DS.Palette.textSecondary) }
-            ForEach(presentation.statuses, id: \.id) { account in
-                Divider()
-                accountRow(account)
+            if presentation.statuses.isEmpty {
+                VStack(spacing: DS.Space.sm) {
+                    AgentChoiceIconTile(systemName: "person.crop.circle.badge.plus", tint: DS.Palette.accent, size: 36)
+                    Text("No accounts yet. Add one to get started.")
+                        .font(DS.Font.caption).foregroundStyle(DS.Palette.textSecondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, DS.Space.xl)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(presentation.statuses.enumerated()), id: \.element.id) { index, account in
+                        if index > 0 { Divider() }
+                        accountRow(account)
+                    }
+                }
+                .background(DS.Palette.bg.opacity(0.4))
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
+                .overlay(RoundedRectangle(cornerRadius: DS.Radius.card).stroke(DS.Palette.line, lineWidth: 0.5))
             }
         }.padding(DS.Space.xl).frame(maxWidth: .infinity, alignment: .leading)
             .background(DS.Palette.surfaceRaised).clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
+            .overlay(RoundedRectangle(cornerRadius: DS.Radius.card).stroke(DS.Palette.line, lineWidth: 0.5))
             .accessibilityIdentifier("agent.accounts.card")
+    }
+
+    private func providerIcon(_ provider: DistillAccountProvider) -> String {
+        switch provider {
+        case .grok: return "sparkle"
+        case .chatgpt: return "bubble.left.and.bubble.right"
+        case .claude: return "asterisk"
+        case .openrouter: return "arrow.triangle.branch"
+        }
     }
 
     @ViewBuilder private var installNotice: some View {
@@ -291,33 +345,50 @@ public struct DistillAccountsPanel: View {
         let quota = DistillAccountsPanelPresentation.quotaPresentation(
             account.quota, connected: account.connected, connectionError: account.connectionError
         )
-        return VStack(alignment: .leading, spacing: DS.Space.md) {
-            Text("\(account.provider.displayName) · \(account.label)").fontWeight(.semibold).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-            Label(account.connected ? (account.email.map { "Connected · \($0)" } ?? "Connected") : "Not connected", systemImage: account.connected ? "checkmark.circle.fill" : "circle")
-                .foregroundStyle(account.connected ? DS.Palette.success : DS.Palette.textSecondary)
-                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-            if let error = account.connectionError { Text(error).foregroundStyle(DS.Palette.warning).textSelection(.enabled) }
-            Text(quota.text).font(DS.Font.bodyDense)
-                .foregroundStyle(DS.Palette.textSecondary).textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            if let remaining = quota.remainingPercent {
-                ProgressView(value: remaining, total: 100).tint(DS.Palette.accent)
-                    .accessibilityLabel("Saved remaining quota")
-                    .accessibilityValue("\(Int(remaining.rounded())) percent")
+        return HStack(alignment: .center, spacing: DS.Space.md) {
+            AgentChoiceIconTile(systemName: providerIcon(account.provider),
+                                tint: account.connected ? DS.Palette.accent : DS.Palette.textTertiary, size: 30)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(account.label).font(DS.Font.bodyStrong).lineLimit(1).textSelection(.enabled)
+                    Text(account.provider.displayName).font(DS.Font.caption).foregroundStyle(DS.Palette.textTertiary).lineLimit(1)
+                }
+                HStack(spacing: 6) {
+                    Circle().fill(account.connected ? DS.Palette.success : DS.Palette.textTertiary).frame(width: 6, height: 6)
+                    Text(account.connected ? (account.email ?? "Connected") : "Not connected")
+                        .font(DS.Font.caption).foregroundStyle(DS.Palette.textSecondary)
+                        .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                }
+                if let error = account.connectionError {
+                    Text(error).font(DS.Font.caption).foregroundStyle(DS.Palette.warning).lineLimit(2)
+                }
+                if let remaining = quota.remainingPercent {
+                    HStack(spacing: 6) {
+                        ProgressView(value: remaining, total: 100)
+                            .tint(remaining < 20 ? DS.Palette.warning : DS.Palette.accent)
+                            .frame(maxWidth: 160)
+                            .accessibilityLabel("Saved remaining quota")
+                            .accessibilityValue("\(Int(remaining.rounded())) percent")
+                        Text("\(Int(remaining.rounded()))% left")
+                            .font(DS.Font.caption2).monospacedDigit().foregroundStyle(DS.Palette.textTertiary)
+                    }
+                } else if account.connected, !quota.text.isEmpty {
+                    Text(quota.text).font(DS.Font.caption2).foregroundStyle(DS.Palette.textTertiary).lineLimit(1)
+                }
             }
+            Spacer(minLength: DS.Space.sm)
             if presentation.busyAccountID == account.id {
-                HStack {
+                HStack(spacing: DS.Space.sm) {
                     ProgressView().controlSize(.small).accessibilityLabel("Account operation in progress")
-                    if let url = presentation.signInURL { Button("Open again") { openAgain(url) }.frame(minHeight: 44) }
-                    Button("Cancel", action: cancel).frame(minHeight: 44)
+                    if let url = presentation.signInURL { Button("Open again") { openAgain(url) }.buttonStyle(.borderless) }
+                    Button("Cancel", action: cancel).buttonStyle(.borderless)
                 }
             } else {
-                HStack {
+                HStack(spacing: DS.Space.sm) {
                     if !account.connected {
-                        Button("Connect") { connectAccount(account.id) }.frame(minHeight: 44)
+                        Button("Connect") { connectAccount(account.id) }.buttonStyle(DSPrimaryButtonStyle())
                     }
-                    Spacer(minLength: 0)
-                    Menu("Account actions") {
+                    Menu {
                         Button("Refresh quota") { refreshQuota(account.id) }.disabled(!account.connected)
                         Button("Rename") { renamedLabel = account.label; renameAccount = account }
                         Divider()
@@ -325,19 +396,23 @@ public struct DistillAccountsPanel: View {
                             Button("Disconnect…", role: .destructive) { removing = false; confirmation = account }
                         }
                         Button("Remove…", role: .destructive) { removing = true; confirmation = account }
-                    }.frame(minHeight: 44)
-                        .accessibilityLabel("Account actions for \(account.provider.displayName) · \(account.label)")
-                        .help("Actions for \(account.provider.displayName) · \(account.label)")
+                    } label: {
+                        Image(systemName: "ellipsis").frame(width: 24, height: 24)
+                    }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .accessibilityLabel("Account actions for \(account.provider.displayName) · \(account.label)")
+                    .help("Actions for \(account.provider.displayName) · \(account.label)")
                 }.disabled(unavailable)
             }
-        }.accessibilityElement(children: .contain).accessibilityIdentifier("agent.accounts.\(account.id)")
+        }
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.md)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .contain).accessibilityIdentifier("agent.accounts.\(account.id)")
     }
 
     private var routingCard: some View {
         VStack(alignment: .leading, spacing: DS.Space.lg) {
-            Text("Auto routing").font(DS.Font.title3)
-            Text("Choose Auto in Main to use this profile. Worker uses this route’s setting.")
-                .foregroundStyle(DS.Palette.textSecondary).fixedSize(horizontal: false, vertical: true)
+            HStack { Text("Auto routing").font(DS.Font.title3); Spacer() }
             DistillAutoRoutingEditor(
                 draft: Binding(get: { currentDraft }, set: { draft = $0 }),
                 saved: presentation.routing,

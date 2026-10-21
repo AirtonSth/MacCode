@@ -11,6 +11,7 @@ public struct DistillAutoRoutingEditor: View {
     public let statuses: [DistillAccountStatus]
     public let models: [AgentModelDescriptor]
     public let disabled: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(draft: Binding<DistillAutoRouting>, saved: DistillAutoRouting, statuses: [DistillAccountStatus],
                 models: [AgentModelDescriptor], disabled: Bool = false) {
@@ -26,10 +27,17 @@ public struct DistillAutoRoutingEditor: View {
     }
 
     public var body: some View {
-        VStack(alignment: .leading, spacing: DS.Space.xl) {
-            explainer
-            profileCard
-            optionsSection
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
+            enableRow
+            if draft.enabled {
+                Group {
+                    strategyRow
+                    optionsSection
+                }
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: draft.enabled)
+            } else {
+                offHint
+            }
             if let error = validationError {
                 AgentChoiceCallout(icon: "exclamationmark.triangle.fill", tint: DS.Palette.warning, text: error)
             }
@@ -38,211 +46,222 @@ public struct DistillAutoRoutingEditor: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    // MARK: Explainer
+    // MARK: Enable
 
-    private var explainer: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            AgentChoiceSectionHeader("How Auto works")
-            HStack(alignment: .top, spacing: DS.Space.sm) {
-                step(icon: "bubble.left", title: "You send a message", caption: "Choose Auto as Main.")
-                flowChevron
-                step(icon: "sparkles", title: "Auto picks an option",
-                     caption: draft.strategy == .orderedFirst ? "First available in order" : "The one with the most quota left")
-                flowChevron
-                step(icon: "cpu", title: "Main + Worker run it", caption: "Models come from the chosen account.")
-            }
-        }
-    }
-
-    private func step(icon: String, title: String, caption: String) -> some View {
-        VStack(spacing: DS.Space.sm) {
-            AgentChoiceIconTile(systemName: icon, tint: DS.Palette.accent, size: 34)
-            Text(title)
-                .font(DS.Font.bodyStrong)
-                .foregroundColor(DS.Palette.text)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(caption)
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .top)
-    }
-
-    private var flowChevron: some View {
-        Image(systemName: "chevron.right")
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(DS.Palette.textTertiary)
-            .frame(height: 34)
-            .accessibilityHidden(true)
-    }
-
-    // MARK: Profile
-
-    private var profileCard: some View {
-        VStack(alignment: .leading, spacing: DS.Space.lg) {
-            HStack(alignment: .center, spacing: DS.Space.lg) {
-                VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                    Text("Use Auto profile").font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
-                    Text("Auto picks an option for Main when you choose Auto.")
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textSecondary)
-                }
-                Spacer(minLength: DS.Space.lg)
-                Toggle("Use Auto profile", isOn: Binding(get: { draft.enabled }, set: { value in
-                    var next = draft
-                    next.enabled = value
-                    draft = next
-                }))
-                .toggleStyle(.switch)
-                .labelsHidden()
-            }
-            VStack(alignment: .leading, spacing: DS.Space.sm) {
-                Text("Strategy").font(DS.Font.captionStrong).foregroundColor(DS.Palette.textSecondary)
-                AgentChoiceSegmented(
-                    options: [
-                        (value: DistillAutoStrategy.orderedFirst, title: "In order", help: "Try connected accounts in the order below."),
-                        (value: DistillAutoStrategy.highestRemaining, title: "Most quota left", help: "Prefer the connected account with the highest known remaining quota.")
-                    ],
-                    selection: draft.strategy,
-                    onSelect: { strategy in
-                        var next = draft
-                        next.strategy = strategy
-                        draft = next
-                    }
-                )
-                Text(draft.strategy == .orderedFirst
-                     ? "Try connected accounts in the order below."
-                     : "Prefer the connected account with the highest known remaining quota.")
+    private var enableRow: some View {
+        HStack(alignment: .center, spacing: DS.Space.md) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Use Auto").font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
+                Text("When you pick Auto as Main, Distill chooses an account for you.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            Spacer(minLength: DS.Space.lg)
+            Toggle("Use Auto profile", isOn: Binding(get: { draft.enabled }, set: { value in
+                var next = draft
+                next.enabled = value
+                draft = next
+            }))
+            .toggleStyle(.switch)
+            .labelsHidden()
         }
-        .padding(DS.Space.xl)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DS.Palette.surfaceRaised)
-        .overlay(RoundedRectangle(cornerRadius: DS.Radius.card).strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
+    }
+
+    private var offHint: some View {
+        Text("Auto is off. Main uses the model you pick.")
+            .font(DS.Font.caption)
+            .foregroundColor(DS.Palette.textTertiary)
+    }
+
+    // MARK: Strategy
+
+    private var strategyRow: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            Text("Pick accounts").font(DS.Font.captionStrong).foregroundColor(DS.Palette.textSecondary)
+            AgentChoiceSegmented(
+                options: [
+                    (value: DistillAutoStrategy.orderedFirst, title: "In order", help: "Try connected accounts in the order below."),
+                    (value: DistillAutoStrategy.highestRemaining, title: "Most quota left", help: "Prefer the connected account with the highest known remaining quota.")
+                ],
+                selection: draft.strategy,
+                onSelect: { strategy in
+                    var next = draft
+                    next.strategy = strategy
+                    draft = next
+                }
+            )
+            Text(draft.strategy == .orderedFirst
+                 ? "Uses the first available option below."
+                 : "Uses the option with the most quota left.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     // MARK: Options
 
     private var optionsSection: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            AgentChoiceSectionHeader("Options") {
-                HStack(spacing: DS.Space.md) {
-                    Text("\(draft.options.count)")
-                        .font(DS.Font.caption2.monospacedDigit())
-                        .foregroundColor(DS.Palette.textTertiary)
-                    Button(action: addOption) {
-                        Label("Add option", systemImage: "plus")
-                            .font(DS.Font.caption.weight(.semibold))
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Add an option")
-                }
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                Text("Options").font(DS.Font.captionStrong).foregroundColor(DS.Palette.textSecondary)
+                Text("\(draft.options.count)")
+                    .font(DS.Font.caption2.monospacedDigit())
+                    .foregroundColor(DS.Palette.textTertiary)
+                Spacer(minLength: 0)
             }
             if statuses.isEmpty {
                 AgentChoiceCallout(icon: "person.crop.circle.badge.exclamationmark", tint: DS.Palette.warning,
-                                   text: "Connect an account in Settings › Accounts & Auto to use Auto.")
+                                   text: "Add an account on the left to use Auto.")
             } else if draft.options.isEmpty {
                 AgentChoiceCallout(icon: "info.circle", tint: DS.Palette.accent,
                                    text: "Add an option to choose an account and its models.")
             }
-            ForEach(Array(draft.options.enumerated()), id: \.element.id) { index, option in
-                optionCard(option, index: index)
+            VStack(spacing: DS.Space.sm) {
+                ForEach(Array(draft.options.enumerated()), id: \.element.id) { index, option in
+                    optionCard(option, index: index)
+                }
             }
+            addOptionButton
         }
+    }
+
+    private var addOptionButton: some View {
+        Button(action: addOption) {
+            HStack(spacing: DS.Space.xs) {
+                Image(systemName: "plus")
+                Text("Add option")
+            }
+            .font(DS.Font.caption.weight(.semibold))
+            .foregroundColor(DS.Palette.accent)
+            .frame(maxWidth: .infinity, minHeight: 32)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.card)
+                .strokeBorder(DS.Palette.line, style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+        )
+        .disabled(statuses.isEmpty)
+        .help("Add an option")
     }
 
     private func optionCard(_ option: DistillAutoOption, index: Int) -> some View {
         let account = statuses.first { $0.id == option.accountID }
         let eligible = DistillRoutingValidation.models(for: account, catalog: models)
-        return VStack(alignment: .leading, spacing: DS.Space.md) {
-            HStack(alignment: .top, spacing: DS.Space.md) {
+        return VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
                 Text("\(index + 1)")
                     .font(DS.Font.caption.weight(.semibold))
                     .foregroundColor(DS.Palette.onAccent)
-                    .frame(width: 22, height: 22)
+                    .frame(width: 20, height: 20)
                     .background(DS.Palette.accent, in: Circle())
                     .accessibilityLabel("Option \(index + 1)")
                 accountField(option, account: account)
-                iconButton("chevron.up", help: "Move option up", disabled: index == 0) { moveOption(option.id, offset: -1) }
-                iconButton("chevron.down", help: "Move option down", disabled: index == draft.options.count - 1) { moveOption(option.id, offset: 1) }
-                iconButton("trash", help: "Remove option", tint: DS.Palette.danger) { removeOption(option.id) }
+                Spacer(minLength: 0)
+                Menu {
+                    Button("Move up") { moveOption(option.id, offset: -1) }
+                        .disabled(index == 0)
+                    Button("Move down") { moveOption(option.id, offset: 1) }
+                        .disabled(index == draft.options.count - 1)
+                    Divider()
+                    Button("Remove", role: .destructive) { removeOption(option.id) }
+                } label: {
+                    Image(systemName: "ellipsis").frame(width: 24, height: 24)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel("Actions for option \(index + 1)")
             }
-            HStack(alignment: .top, spacing: DS.Space.lg) {
-                VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                    fieldLabel("Main")
-                    Picker("Main", selection: Binding(get: { option.mainModel }, set: { model in editOption(option.id) { $0.mainModel = model } })) {
-                        if !eligible.contains(where: { $0.id == option.mainModel }) {
-                            Text(option.mainModel.isEmpty ? "Choose model" : "Unavailable: \(option.mainModel)").tag(option.mainModel)
-                        }
-                        ForEach(eligible, id: \.id) { Text($0.label).tag($0.id) }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .help(option.mainModel)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: DS.Space.md) {
+                    mainPicker(option, eligible: eligible).frame(minWidth: 160)
+                    workerPicker(option, eligible: eligible).frame(minWidth: 160)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                    fieldLabel("Worker")
-                    Picker("Worker", selection: Binding(get: { option.workerModel ?? "" }, set: { model in
-                        editOption(option.id) { $0.workerModel = model.isEmpty ? nil : model }
-                    })) {
-                        Text("Same as Main").tag("")
-                        if let worker = option.workerModel, !eligible.contains(where: { $0.id == worker }) {
-                            Text("Unavailable: \(worker)").tag(worker)
-                        }
-                        ForEach(eligible, id: \.id) { Text($0.label).tag($0.id) }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .help(option.workerModel ?? "Same as Main")
+                VStack(alignment: .leading, spacing: DS.Space.sm) {
+                    mainPicker(option, eligible: eligible)
+                    workerPicker(option, eligible: eligible)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .padding(DS.Space.lg)
+        .padding(DS.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DS.Palette.surfaceRaised)
+        .background(DS.Palette.bg.opacity(0.4))
         .overlay(RoundedRectangle(cornerRadius: DS.Radius.card).strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("agent.accounts.routing.\(option.id)")
     }
 
+    private func mainPicker(_ option: DistillAutoOption, eligible: [AgentModelDescriptor]) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            fieldLabel("Main")
+            Picker("Main", selection: Binding(get: { option.mainModel }, set: { model in editOption(option.id) { $0.mainModel = model } })) {
+                if !eligible.contains(where: { $0.id == option.mainModel }) {
+                    Text(option.mainModel.isEmpty ? "Choose model" : "Unavailable: \(option.mainModel)").tag(option.mainModel)
+                }
+                ForEach(eligible, id: \.id) { Text($0.label).tag($0.id) }
+            }
+            .labelsHidden()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(option.mainModel)
+        }
+    }
+
+    private func workerPicker(_ option: DistillAutoOption, eligible: [AgentModelDescriptor]) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            fieldLabel("Worker")
+            Picker("Worker", selection: Binding(get: { option.workerModel ?? "" }, set: { model in
+                editOption(option.id) { $0.workerModel = model.isEmpty ? nil : model }
+            })) {
+                Text("Same as Main").tag("")
+                if let worker = option.workerModel, !eligible.contains(where: { $0.id == worker }) {
+                    Text("Unavailable: \(worker)").tag(worker)
+                }
+                ForEach(eligible, id: \.id) { Text($0.label).tag($0.id) }
+            }
+            .labelsHidden()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(option.workerModel ?? "Same as Main")
+        }
+    }
+
     private func accountField(_ option: DistillAutoOption, account: DistillAccountStatus?) -> some View {
         let remaining = account.flatMap {
             DistillAccountsPanelPresentation.quotaPresentation($0.quota, connected: $0.connected, connectionError: $0.connectionError).remainingPercent
         }
-        return VStack(alignment: .leading, spacing: DS.Space.xxs) {
-            HStack(spacing: DS.Space.sm) {
-                Circle()
-                    .fill(account?.connected == true ? DS.Palette.success : DS.Palette.textTertiary)
-                    .frame(width: 8, height: 8)
-                    .accessibilityHidden(true)
-                Picker("Account", selection: Binding(get: { option.accountID }, set: { id in
-                    editOption(option.id) {
-                        $0.accountID = id
-                        $0.mainModel = DistillRoutingValidation.models(for: statuses.first { $0.id == id }, catalog: models).first?.id ?? ""
-                        $0.workerModel = nil
-                    }
-                })) {
-                    if account == nil { Text("Choose account").tag(option.accountID) }
-                    ForEach(statuses, id: \.id) { Text("\($0.provider.displayName) · \($0.label)").tag($0.id) }
+        return HStack(spacing: DS.Space.sm) {
+            Circle()
+                .fill(account?.connected == true ? DS.Palette.success : DS.Palette.textTertiary)
+                .frame(width: 8, height: 8)
+                .accessibilityHidden(true)
+            Picker("Account", selection: Binding(get: { option.accountID }, set: { id in
+                editOption(option.id) {
+                    $0.accountID = id
+                    $0.mainModel = DistillRoutingValidation.models(for: statuses.first { $0.id == id }, catalog: models).first?.id ?? ""
+                    $0.workerModel = nil
                 }
-                .labelsHidden()
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(account.map { "\($0.provider.displayName) · \($0.label)" } ?? "Choose account")
+            })) {
+                if account == nil { Text("Choose account").tag(option.accountID) }
+                ForEach(statuses, id: \.id) { Text("\($0.provider.displayName) · \($0.label)").tag($0.id) }
             }
+            .labelsHidden()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(account.map { "\($0.provider.displayName) · \($0.label)" } ?? "Choose account")
             if let account, !account.connected {
-                Text("Not connected").font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
+                Text("Not connected")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+                    .fixedSize()
             } else if let remaining {
-                Text("\(Int(remaining.rounded()))% remaining").font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
+                Text("\(Int(remaining.rounded()))% remaining")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+                    .fixedSize()
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -252,21 +271,7 @@ public struct DistillAutoRoutingEditor: View {
         Text(title)
             .font(DS.Font.caption)
             .foregroundColor(DS.Palette.textSecondary)
-    }
-
-    private func iconButton(_ systemName: String, help: String, disabled: Bool = false,
-                            tint: Color = DS.Palette.textSecondary, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(tint)
-                .frame(width: 26, height: 26)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(disabled)
-        .help(help)
-        .accessibilityLabel(help)
+            .fixedSize()
     }
 
     // MARK: Draft mutations

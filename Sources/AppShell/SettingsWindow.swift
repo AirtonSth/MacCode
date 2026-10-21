@@ -1636,7 +1636,7 @@ public struct SettingsView: View {
                     settingsHero
                     selectedSection
                 }
-                .frame(maxWidth: 680, alignment: .leading)
+                .frame(maxWidth: vm.selectedCategory == .accounts ? 1120 : 680, alignment: .leading)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, DS.Space.md)
             }

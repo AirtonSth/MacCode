@@ -7854,6 +7854,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             publishAgentThreadRead(thread)
         }
+        // Seen here is seen in Activity: its finished runs leave Just finished.
+        let viewedRuns = (try? AgentRunResultRepository(db: ctx.db).markFinishedRunsViewed(threadId: thread)) ?? []
+        if !viewedRuns.isEmpty {
+            let ids = viewedRuns.map { "run:\($0.value.uuidString.lowercased())" }
+            EventBus.shared.publish(kind: .notificationRead, payload: .object([
+                "id": .string("activity:\(ids[0])"),
+                "activity_item_ids": .array(ids.map(JSONValue.string)),
+                "reason": .string("viewed")
+            ]))
+        }
     }
 
     public func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {

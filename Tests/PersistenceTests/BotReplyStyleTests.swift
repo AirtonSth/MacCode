@@ -64,9 +64,12 @@ final class BotReplyStyleTests: XCTestCase {
         XCTAssertEqual(rows["titio"]?.1, 0, "Titio keeps full sentences")
     }
 
-    func test_newBotsDefaultToHumanCavemanAndTitioToHumanProse() throws {
+    func test_newBotsDefaultToTechnicalCavemanAndTitioToHumanProse() throws {
+        // WHY: Bots do technical work, so new ones show every step; only Titio,
+        // who explains RemoteCode to anyone, starts Simple.
         let ceo = try store.create(name: "Ceo", title: "", description: "")
-        XCTAssertEqual(ceo.verbosity, .human)
+        XCTAssertEqual(ceo.verbosity, .verbose)
+        XCTAssertEqual(try store.get(id: ceo.id)?.verbosity, .verbose, "the default is persisted")
         XCTAssertTrue(ceo.cavemanEnabled)
         let titio = try store.create(name: "Titio", title: "", description: "", handle: TitioIdentity.handle)
         XCTAssertEqual(titio.verbosity, .human)
@@ -95,21 +98,21 @@ final class BotReplyStyleTests: XCTestCase {
         let botID = bot.id.value.uuidString.lowercased()
         let before = try authority.dispatch(method: "bot.get", params: ["bot_id": botID])
         let encoded = before
-        XCTAssertEqual(encoded["verbosity"] as? String, "human")
+        XCTAssertEqual(encoded["verbosity"] as? String, "verbose")
         XCTAssertEqual(encoded["caveman_enabled"] as? Bool, true)
 
-        let verbose = try authority.dispatch(method: "bot.verbosity.set", params: [
-            "client_request_id": "v1", "bot_id": botID, "verbosity": "verbose",
+        let human = try authority.dispatch(method: "bot.verbosity.set", params: [
+            "client_request_id": "v1", "bot_id": botID, "verbosity": "human",
         ])
-        XCTAssertEqual((verbose["readback"] as? [String: Any])?["verbosity"] as? String, "verbose")
-        XCTAssertEqual(try store.get(id: bot.id)?.verbosity, .verbose)
+        XCTAssertEqual((human["readback"] as? [String: Any])?["verbosity"] as? String, "human")
+        XCTAssertEqual(try store.get(id: bot.id)?.verbosity, .human)
         XCTAssertEqual(try store.get(id: bot.id)?.cavemanEnabled, true, "verbosity leaves caveman alone")
 
         _ = try authority.dispatch(method: "bot.caveman.set", params: [
             "client_request_id": "c1", "bot_id": botID, "enabled": false,
         ])
         XCTAssertEqual(try store.get(id: bot.id)?.cavemanEnabled, false)
-        XCTAssertEqual(try store.get(id: bot.id)?.verbosity, .verbose, "caveman leaves verbosity alone")
+        XCTAssertEqual(try store.get(id: bot.id)?.verbosity, .human, "caveman leaves verbosity alone")
 
         XCTAssertThrowsError(try authority.dispatch(method: "bot.verbosity.set", params: [
             "client_request_id": "v2", "bot_id": botID, "verbosity": "loud",

@@ -626,13 +626,13 @@ final class TitioHostTests: XCTestCase {
         XCTAssertTrue(dev.cavemanEnabled, "new Bots are caveman")
         f.vm.reload()
         f.vm.openStudio(dev)
-        XCTAssertEqual(f.vm.studioDraftReplyStyle.verbosity, .human)
-        f.vm.studioDraft.verbosity = .verbose
+        XCTAssertEqual(f.vm.studioDraftReplyStyle.verbosity, .verbose, "new Bots start Technical")
+        f.vm.studioDraft.verbosity = .human
         f.vm.studioDraft.cavemanEnabled = false
         XCTAssertTrue(f.vm.studioHasUnpublishedChanges, "a reply style edit is an unsaved change")
         _ = try f.vm.saveStudio()
         let saved = try XCTUnwrap(try f.context.botStore.get(id: dev.id))
-        XCTAssertEqual(saved.verbosity, .verbose)
+        XCTAssertEqual(saved.verbosity, .human)
         XCTAssertFalse(saved.cavemanEnabled)
         XCTAssertFalse(f.vm.studioHasUnpublishedChanges)
 

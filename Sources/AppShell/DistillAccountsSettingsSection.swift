@@ -5,42 +5,21 @@ import CoreModel
 import DesignSystemKit
 import Surfaces
 
-/// Accounts & Auto lives in Settings: a summary of the Distill accounts and
-/// the Auto profile, with the full panel one click away. The Agent App and
-/// Bot Studio point here instead of carrying their own entry.
+/// Accounts & Auto lives inline in Settings: a summary line over the full
+/// accounts and Auto routing editor. The Agent App and Bot Studio point here
+/// instead of carrying their own entry.
 struct DistillAccountsSettingsSection: View {
     @ObservedObject var controller: DistillAccountsController
     let loadModels: () async -> [AgentModelDescriptor]
-    @State private var showingPanel = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DS.Space.md) {
-            DSSectionHeaderG("Accounts & Auto")
-            Text("Connect the accounts Distill can use and choose how Auto picks between them. Agent threads and Bots that choose the Auto model use this profile.")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: DS.Space.sm) {
-                Text(Self.summary(statuses: controller.statuses, routing: controller.routing, loaded: controller.hasLoadedState))
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityIdentifier("settings.accounts.summary")
-                Button("Manage…") { showingPanel = true }
-                    .buttonStyle(DSSecondaryButtonStyle())
-                    .accessibilityIdentifier("settings.accounts.manage")
-            }
-        }
-        .dsPanel(padding: DS.Space.lg)
-        // Cached statuses paint first; the CLI re-read runs after the section
-        // is on screen and only until the saved state has loaded once.
-        .task { if !controller.hasLoadedState { controller.refresh() } }
-        .sheet(isPresented: $showingPanel) {
-            DistillAccountsPanelHost(controller: controller, loadModels: loadModels)
-                .padding(DS.Space.xxl)
-                .frame(minWidth: 360, idealWidth: 820, maxWidth: 820, minHeight: 480, idealHeight: 640)
-                .background(DS.Palette.bg)
-                .foregroundStyle(DS.Palette.text)
+        VStack(alignment: .leading, spacing: DS.Space.lg) {
+            Text(Self.summary(statuses: controller.statuses, routing: controller.routing, loaded: controller.hasLoadedState))
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier("settings.accounts.summary")
+            DistillAccountsPanelHost(controller: controller, loadModels: loadModels, embedded: true)
         }
     }
 
@@ -60,6 +39,7 @@ struct DistillAccountsSettingsSection: View {
 struct DistillAccountsPanelHost: View {
     @ObservedObject var controller: DistillAccountsController
     let loadModels: () async -> [AgentModelDescriptor]
+    var embedded = false
 
     var body: some View {
         DistillAccountsPanel(
@@ -94,9 +74,10 @@ struct DistillAccountsPanelHost: View {
             disconnectAccount: { controller.logout(accountID: $0) },
             remove: { controller.remove(accountID: $0) },
             refreshQuota: { controller.refreshUsage(accountID: $0) },
-            saveRouting: controller.saveRouting
+            saveRouting: controller.saveRouting,
+            embedded: embedded
         )
-        .onAppear { controller.refresh() }
+        .onAppear { if !embedded || !controller.hasLoadedState { controller.refresh() } }
         .task(id: controller.statuses.filter(\.connected).map(\.id) + [controller.routing.enabled ? "auto-enabled" : "auto-disabled"]) {
             _ = await loadModels()
         }

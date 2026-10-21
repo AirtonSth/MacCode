@@ -31,6 +31,26 @@ final class SidebarUnpinnedBotConversationTests: XCTestCase {
         return try XCTUnwrap(tree?.conversations[workspace])
     }
 
+    func test_emptyThreadsStayOutOfTheSidebarUntilTheyHaveAMessageOrAreOpen() throws {
+        // WHY: opening "New conversation" or a Bot must not leave empty "New thread" rows behind.
+        let (context, directory) = try make("empty")
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let workspace = WorkspaceID(UUID())
+        let empty = AgentThread(workspaceId: workspace, title: "", provider: .distill, model: "fixture", actor: .bot(BotID()), actorLockedAt: Date())
+        let used = AgentThread(workspaceId: workspace, title: "Used", provider: .distill, model: "fixture")
+        try context.threadRepo.upsert(empty)
+        try context.threadRepo.upsert(used)
+        let load = { (keep: Set<AgentThreadID>) in
+            SidebarViewModel.loadSidebarTree(
+                botStore: context.botStore, threadRepo: context.threadRepo,
+                hostID: context.liveActivityHostIdentity.serverId, expanded: [workspace],
+                keepUntitled: keep, hasMessages: { $0 == used.id }
+            )?.conversations[workspace]?.map(\.threadID) ?? []
+        }
+        XCTAssertEqual(load([]), [used.id], "an empty thread is hidden")
+        XCTAssertEqual(Set(load([empty.id])), [empty.id, used.id], "the open or running thread still shows")
+    }
+
     func test_unpinnedBotConversationListsUnderTheBotsReadableWorkspaceNotItsStaleWorkspaceID() throws {
         // WHY: a Desk-first send or scheduled run never gets a pin; the sidebar must still show it under the Bot's live binding.
         let (context, directory) = try make("listed")
