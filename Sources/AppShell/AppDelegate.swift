@@ -415,6 +415,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // Only schedules: the first Distill update check runs off the main
         // actor, well after this frame.
         context?.startDistillAutoUpdates()
+        context?.startManagedToolInstalls()
 
         // PERF (cold launch): the first frame has now painted (show() above), so
         // the "Restoring workspaces..." affordance can animate while the heavy,

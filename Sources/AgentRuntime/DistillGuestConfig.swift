@@ -118,6 +118,10 @@ public enum DistillGuestConfig {
         out += "args = \(array([BotComputerGuestSpec.linuxUseServerPath]))\n"
         out += "env = { DISPLAY = \":1\" }\n"
 
+        // linux-use's browser and Jev tools need its Chrome extension or a key the guest lacks.
+        out += "\n[disabled_mcp_tools]\n"
+        out += "linux-use = \(array(["browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status", "jev_decide"]))\n"
+
         out += "\n[mcp_servers.playwright]\n"
         out += "command = \"playwright-mcp\"\n"
         out += "args = \(array(["--cdp-endpoint", browserCDPEndpoint]))\n"

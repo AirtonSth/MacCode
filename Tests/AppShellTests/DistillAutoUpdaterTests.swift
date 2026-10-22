@@ -130,13 +130,13 @@ final class DistillAutoUpdaterTests: XCTestCase {
         )
     }
 
-    /// `autoUpdate: false` is the user turning Distill's updater off; the app
-    /// must not install behind that choice. null (never configured) is not off.
-    func test_autoUpdateTurnedOffInDistill_installsNothing() async {
+    /// MacCode keeps Distill current on every launch, whatever Distill's own
+    /// `auto_update` says: Distill is MacCode's only dependency.
+    func test_autoUpdateOffInDistill_stillInstalls() async {
         let off = Fakes(stdout: #"{"latestVersion":"2.0.41","updateAvailable":true,"autoUpdate":false,"error":null}"#)
         let result = await outcome(off)
-        XCTAssertEqual(result, .autoUpdateOff)
-        XCTAssertEqual(off.events, ["check"])
+        XCTAssertEqual(off.events.first, "check")
+        XCTAssertTrue(off.events.contains("install"), "\(result)")
     }
 
     /// A local build behind `cli.distill.path` must never be replaced by

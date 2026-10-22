@@ -41,7 +41,6 @@ actor DistillAutoUpdater {
         case installed(latest: String?)
         /// Never read as "up to date": the next pass asks again.
         case couldNotCheck(String)
-        case autoUpdateOff
         case updateAlreadyRunning
         case installFailed(String)
         /// This release's install failed more than once; it waits some passes.
@@ -122,7 +121,6 @@ actor DistillAutoUpdater {
             // `cli.distill.path`). It is never replaced, and never called current.
             return check.latestVersion == nil ? .notManaged(current: check.currentVersion) : .upToDate
         }
-        guard check.autoUpdate != false else { return .autoUpdateOff }
         if let latest = check.latestVersion, latest == installedLatest {
             return .installedBinaryNotInUse(latest: latest)
         }
@@ -194,8 +192,6 @@ actor DistillAutoUpdater {
             distillUpdateLog.info("distill.update installed version=\(latest ?? "unknown", privacy: .public)")
         case .couldNotCheck(let reason):
             distillUpdateLog.error("distill.update check_failed reason=\(reason, privacy: .public)")
-        case .autoUpdateOff:
-            distillUpdateLog.info("distill.update skipped reason=distill_auto_update_off")
         case .updateAlreadyRunning:
             distillUpdateLog.info("distill.update skipped reason=update_already_running")
         case .installFailed(let reason):

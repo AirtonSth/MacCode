@@ -33,7 +33,11 @@ enum BotGuestAgentKit {
         guard let source else { throw Failure.missingKit }
         let fileManager = FileManager.default
         let root = BotComputerGuestSpec.guestToolsURL(appSupport: appSupport)
+        // A linux-use release downloaded from GitHub replaces the bundled copy.
+        let downloadedLinuxUse = fileManager.fileExists(atPath: ManagedToolInstaller.linuxUseDirectory(appSupport: appSupport)
+            .appendingPathComponent(ManagedToolInstaller.linuxUseVersionFile).path)
         for file in files {
+            if downloadedLinuxUse, file.path.hasPrefix("linux-use/") { continue }
             let data = try Data(contentsOf: source.appendingPathComponent(file.path))
             let target = root.appendingPathComponent(file.path)
             let currentMode = (try? fileManager.attributesOfItem(atPath: target.path))?[.posixPermissions] as? Int
