@@ -1023,6 +1023,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 record({"method":method,"sessionId":session,"text":text})
                 if "EXIT_143" in text:
                     print("\\x1b[31mold tool_error: missing field tool_input\\x1b[0m", file=sys.stderr, flush=True)
+                    print("previous output " * 150, file=sys.stderr, flush=True)
+                    print("MacCode guest lease expired: no host renewal for 50 seconds", file=sys.stderr, flush=True)
                     sys.exit(143)
                 elif "FAIL_DATA" in text:
                     fail(message["id"], {"message":"API error (status 400 Bad Request): invalid_request_error: model not allowed for this account","http_status":400})
@@ -1102,6 +1104,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(message.contains("exit 143"), message)
         XCTAssertTrue(message.contains("Last stderr (may precede the exit)"), message)
         XCTAssertTrue(message.contains("old tool_error: missing field tool_input"), message)
+        XCTAssertTrue(message.contains("MacCode guest lease expired"), "the latest cause must survive diagnostic truncation: \(message)")
         XCTAssertFalse(message.contains("\u{001B}"), message)
     }
 

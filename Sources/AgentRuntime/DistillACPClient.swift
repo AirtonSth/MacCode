@@ -243,7 +243,8 @@ enum DistillACPFailureTaxonomy {
             text = replaceAll(regex, in: text, with: template)
         }
         if text.isEmpty { text = "Provider reported an error." }
-        return String(text.prefix(800))
+        // Keep the terminal's final cause as well as the error context, after redaction.
+        return text.count <= 800 ? text : "\(text.prefix(400)) … \(text.suffix(397))"
     }
 
     private static func replaceAll(
