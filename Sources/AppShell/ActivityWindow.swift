@@ -886,6 +886,8 @@ struct ActivityRootView: View {
     private let isWorkspaceOpen: (String) -> Bool
     /// The Bot behind an item, so its row shows the Bot's avatar instead of the status icon.
     private let botForItem: (ActivityWireItem) -> BotDefinition?
+    /// The workspace's sidebar folder color; nil keeps the neutral folder.
+    private let workspaceColor: (String) -> Color?
     let route: NotificationRouteIntent?
     let consumeRoute: () -> Void
 
@@ -901,6 +903,7 @@ struct ActivityRootView: View {
         self.consumeRoute = consumeRoute
         workspaceOptions = { router.activityWorkspaceOptions }
         isWorkspaceOpen = { [weak router] id in router?.activityWorkspaceIsOpen(id) ?? false }
+        workspaceColor = { [weak router] id in router?.activityWorkspaceColor(id) }
         // In-memory only (roster + linked-thread cache): rows re-render often and must not read SQLite.
         botForItem = { [weak router] item in
             guard let router, let store = router.context?.botStore else { return nil }
@@ -909,7 +912,7 @@ struct ActivityRootView: View {
     }
 
     /// Renders a prepared model without a router: offscreen layout proofs and worst-case data.
-    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }, isWorkspaceOpen: @escaping (String) -> Bool = { _ in true }, makeConversation: @escaping (ActivityWireItem) -> ActivityConversation? = { _ in nil }, botForItem: @escaping (ActivityWireItem) -> BotDefinition? = { _ in nil }) {
+    init(model: ActivityViewModel, workspaceOptions: @escaping () -> [(id: String, name: String)] = { [] }, isWorkspaceOpen: @escaping (String) -> Bool = { _ in true }, makeConversation: @escaping (ActivityWireItem) -> ActivityConversation? = { _ in nil }, botForItem: @escaping (ActivityWireItem) -> BotDefinition? = { _ in nil }, workspaceColor: @escaping (String) -> Color? = { _ in nil }) {
         _model = StateObject(wrappedValue: model)
         openThread = { _ in }
         openEvidence = { _, _ in }
@@ -919,6 +922,7 @@ struct ActivityRootView: View {
         self.workspaceOptions = workspaceOptions
         self.isWorkspaceOpen = isWorkspaceOpen
         self.botForItem = botForItem
+        self.workspaceColor = workspaceColor
     }
 
     var body: some View {
@@ -1144,7 +1148,7 @@ struct ActivityRootView: View {
                         Section {
                             ForEach(section.items) { item in activityRow(item, showsWorkspace: false) }
                         } header: {
-                            sectionHeader(section.title, count: section.items.count)
+                            sectionHeader(section.title, count: section.items.count, workspaceID: section.id)
                         }
                     }
                     if model.cursorAvailable { loadMoreRow }
@@ -1158,12 +1162,24 @@ struct ActivityRootView: View {
         }
     }
 
-    private func sectionHeader(_ title: String, count: Int?) -> some View {
+    /// Workspace header: the sidebar's folder in the workspace color, on the raised band the
+    /// pinned header uses, so every header reads the same whether pinned or not.
+    private func sectionHeader(_ title: String, count: Int?, workspaceID: String) -> some View {
         HStack(spacing: DS.Space.xs) {
+            Image(systemName: workspaceID.isEmpty ? "tray" : "folder.fill")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundColor(workspaceColor(workspaceID) ?? DS.Palette.textSecondary)
+                .frame(width: 16)
+                .accessibilityHidden(true)
             Text(title)
             if let count { Text("\(count)").monospacedDigit().foregroundColor(DS.Palette.textTertiary) }
+            Spacer(minLength: 0)
         }
         .font(DS.Font.caption.weight(.semibold)).foregroundColor(DS.Palette.textSecondary)
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surface)
+        .listRowInsets(EdgeInsets())
         .accessibilityElement(children: .combine)
     }
 

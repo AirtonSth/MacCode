@@ -9983,6 +9983,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         context?.state.workspaces.values.map { ($0.id.value.uuidString, $0.name) } ?? []
     }
 
+    /// Same color the sidebar paints the workspace folder with.
+    func activityWorkspaceColor(_ id: String) -> Color? {
+        guard let uuid = UUID(uuidString: id),
+              let workspace = context?.state.workspaces[WorkspaceID(uuid)] else { return nil }
+        return TabColor.from(workspace.metadata["color"]).map { Color(hex: $0.hex) }
+    }
+
     /// In-memory, so Activity rows can ask on every render; `openAgentThread` checks the same.
     func activityWorkspaceIsOpen(_ id: String) -> Bool {
         guard let uuid = UUID(uuidString: id) else { return false }
