@@ -30,6 +30,7 @@ rm -f "$HOME/.browser-profiles/chromium/SingletonLock" \
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1 || true
 
 Xvfb :1 -screen 0 1280x800x24 -ac +extension RANDR >/tmp/xvfb.log 2>&1 &
+xvfb_pid=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     if xdpyinfo -display :1 >/dev/null 2>&1; then
         break
@@ -39,12 +40,22 @@ done
 xdpyinfo -display :1 >/dev/null
 
 fluxbox -display :1 -log /tmp/fluxbox.log >/tmp/fluxbox.out 2>&1 &
-/opt/remotecode-computer/launch-browser.sh || xterm -display :1 &
+# The browser restarts on its own. It must never be a `wait -n` job: a
+# Chromium crash or OOM kill would end the container and SIGKILL the agent
+# running inside it (Distill exit 137).
+if ! command -v chromium >/dev/null 2>&1; then xterm -display :1 & fi
+(
+    while true; do
+        /opt/remotecode-computer/launch-browser.sh || true
+        sleep 2
+    done
+) &
 
 # Guest VNC stays loopback. The WebSocket proxy admits only the per-Bot token;
 # Docker NAT additionally publishes 6080 on 127.0.0.1 of the host.
 x11vnc -display :1 -rfbport 5900 -localhost -forever -shared -nopw \
     >/tmp/x11vnc.log 2>&1 &
+vnc_pid=$!
 
 printf '%s: 127.0.0.1:5900\n' "$REMOTECODE_VIEWER_TOKEN" > /tmp/remotecode-viewer-tokens
 chmod 0600 /tmp/remotecode-viewer-tokens
@@ -53,6 +64,10 @@ websockify --web /usr/share/novnc \
     --token-source /tmp/remotecode-viewer-tokens \
     0.0.0.0:6080 \
     >/tmp/websockify.log 2>&1 &
+proxy_pid=$!
 
-wait -n
+# Only the display, VNC and viewer proxy end the container.
+while kill -0 "$xvfb_pid" 2>/dev/null && kill -0 "$vnc_pid" 2>/dev/null && kill -0 "$proxy_pid" 2>/dev/null; do
+    sleep 2
+done
 exit 1

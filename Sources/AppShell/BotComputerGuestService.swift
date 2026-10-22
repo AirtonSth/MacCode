@@ -78,6 +78,7 @@ public final class BotComputerGuestService: @unchecked Sendable {
             "fc19d6b61e02c4ee713dde41886f4dfbae6d8631ce990dbd045f36eced478d8e", // unauthenticated viewer
             "7479a3389036155ed694292fcafeefb683a6dd79fbf8fa0a0e7e588f8fe69950", // revision 4
             "fa7a4feecd4b97cbd9d64ae537efade078e54281df250ba41ac5b5c5a7f5566f", // revision 5 before its lock comment
+            "e91aa057e23e45af1c379bb8c0cf85548a293dbbfd028b9918fc7d7149e82a35", // revision 7, browser exit ended the container
         ],
         "launch-browser.sh": [
             "875c894932c673d7fdf66391eb38cb82002ea0ccc077b91108c486b9512419a3", // revision 4
