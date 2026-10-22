@@ -263,6 +263,13 @@ extension AppContext {
             dismissNotification: { id in
                 let router = try await router()
                 try await MainActor.run { try router.notificationDismiss(id: id) }
+            },
+            markActivityViewed: { items in
+                guard let router = try? await router() else { return }
+                // One id per call: a finished-run or dismissed-notification check rejects a whole batch.
+                await MainActor.run {
+                    for item in items { _ = try? router.activitySetViewed(params: ["item_ids": .array([.string(item)]), "viewed": .bool(true)]) }
+                }
             }
         )
     }

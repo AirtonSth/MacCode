@@ -227,6 +227,8 @@ public struct TitioNoticeActionHooks: Sendable {
     /// `notification.dismiss` for an external notice's notification row
     /// (`bot.notice.clear`).
     public var dismissNotification: @Sendable (String) async throws -> Void
+    /// Marks these Activity items viewed (`activity.set_viewed`), best effort.
+    public var markActivityViewed: @Sendable ([String]) async -> Void
 
     public init(
         isRequestOpen: @escaping @Sendable (AgentThreadID, String, RequestKind, String?) -> Bool,
@@ -237,7 +239,8 @@ public struct TitioNoticeActionHooks: Sendable {
         continueRun: @escaping @Sendable (AgentThreadID) async throws -> Void,
         rerunScheduledTask: @escaping @Sendable (UUID) async throws -> Void,
         acknowledgeActivity: @escaping @Sendable (String) async throws -> Void,
-        dismissNotification: @escaping @Sendable (String) async throws -> Void = { _ in }
+        dismissNotification: @escaping @Sendable (String) async throws -> Void = { _ in },
+        markActivityViewed: @escaping @Sendable ([String]) async -> Void = { _ in }
     ) {
         self.isRequestOpen = isRequestOpen
         self.respondRequest = respondRequest
@@ -248,6 +251,7 @@ public struct TitioNoticeActionHooks: Sendable {
         self.rerunScheduledTask = rerunScheduledTask
         self.acknowledgeActivity = acknowledgeActivity
         self.dismissNotification = dismissNotification
+        self.markActivityViewed = markActivityViewed
     }
 }
 
@@ -1747,6 +1751,16 @@ public actor TitioNoticeCenter {
         await publishInbox(target: target, fallback: inbox.map { snapshot(target: target, inbox: $0, openDecisions: openDecisions) })
     }
 
+    /// Activity item ids behind these notices, without duplicates.
+    static func activityItemIDs(_ rows: [TitioNoticeRecord]) -> [String] {
+        var seen = Set<String>()
+        return rows.compactMap { row -> String? in
+            row.source.activityItemId
+                ?? row.source.runId.map { "run:\($0.lowercased())" }
+                ?? row.source.notificationId.map { "notification:\($0)" }
+        }.filter { seen.insert($0).inserted }
+    }
+
     /// Best effort: the source may already be gone; failures are logged.
     static func acknowledgeCleared(_ rows: [TitioNoticeRecord], actions: TitioNoticeActionHooks) async {
         for row in rows {
@@ -1787,6 +1801,10 @@ public actor TitioNoticeCenter {
                 try botStore.upsertConversation(conversation)
             }
             await publishInbox(target: target, fallback: snapshot(target: target, inbox: inbox, openDecisions: openDecisions))
+            // Read in the inbox is read in Activity: the cards' source items leave Unread.
+            let open = (try? repo.rows(inStates: [.posted, .acting, .awaitingReply])) ?? []
+            let items = Self.activityItemIDs(open)
+            if !items.isEmpty { await actionsBox.value?.markActivityViewed(items) }
         } catch {
             titioNoticeLog.error("titio.notice.mark_read_failed error=\(String(describing: error), privacy: .public)")
         }
