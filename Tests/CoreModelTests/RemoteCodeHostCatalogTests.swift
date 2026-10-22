@@ -20,6 +20,7 @@ final class RemoteCodeHostCatalogTests: XCTestCase {
             RemoteCodeHostCatalog.botSkillView,
             RemoteCodeHostCatalog.activityList,
             RemoteCodeHostCatalog.hostHelp,
+            RemoteCodeHostCatalog.hostBatch,
             RemoteCodeHostCatalog.botDelegate,
             RemoteCodeHostCatalog.scheduledTaskRunNext,
             RemoteCodeHostCatalog.browserScreenshot,
@@ -28,7 +29,8 @@ final class RemoteCodeHostCatalogTests: XCTestCase {
         XCTAssertFalse(names.contains("rc_host"))
         XCTAssertEqual(Set(names).count, names.count)
         XCTAssertEqual(RemoteCodeHostCatalog.rpcMethod(for: RemoteCodeHostCatalog.genericHostCallTool), RemoteCodeHostCatalog.hostCallRPC)
-        XCTAssertTrue(RemoteCodeHostCatalog.isMutation(RemoteCodeHostCatalog.genericHostCallTool), "host.call needs operation_id and fullAccess")
+        XCTAssertTrue(RemoteCodeHostCatalog.isMutation(RemoteCodeHostCatalog.genericHostCallTool), "host.call needs operation_id; admission classifies the actual method")
+        XCTAssertEqual(RemoteCodeHostCatalog.rpcMethod(for: RemoteCodeHostCatalog.hostBatch), "host.batch")
         XCTAssertFalse(RemoteCodeHostCatalog.isMutation(RemoteCodeHostCatalog.hostHelp))
         XCTAssertEqual(RemoteCodeHostCatalog.rpcMethod(for: RemoteCodeHostCatalog.hostHelp), "host.help")
     }

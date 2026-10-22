@@ -241,7 +241,7 @@ public protocol CommandRouting: AnyObject {
     func openHostBot(botID: BotID) throws -> JSONValue
     func sendHostBot(botID: BotID, text: String, conversationID: BotConversationID?, callerThread: AgentThreadID, callerRun: AgentRunID) async throws -> JSONValue
     func createHostBotThread(botID: BotID, title: String) throws -> JSONValue
-    func listHostActivity() async throws -> JSONValue
+    func listHostActivity(params: [String: JSONValue]) async throws -> JSONValue
     func delegateHostBot(bot: String, text: String, conversationID: BotConversationID?, callerThread: AgentThreadID, callerRun: AgentRunID) async throws -> JSONValue
     func runNextHostScheduledTask(workspace: String, taskID: UUID?) throws -> JSONValue
     func captureHostBrowserToChat(callerThread: AgentThreadID, surface: SurfaceID?, reason: String) throws -> JSONValue
@@ -560,7 +560,7 @@ public extension CommandRouting {
         throw JSONRPCError.notSupported("host Bot thread create")
     }
 
-    func listHostActivity() async throws -> JSONValue {
+    func listHostActivity(params: [String: JSONValue]) async throws -> JSONValue {
         throw JSONRPCError.notSupported("host activity list")
     }
 
@@ -1812,7 +1812,16 @@ public final class JSONRPCDispatcher {
         // Peer consultation/self-configuration is already constrained by the
         // exact bearer and Bot grant. It remains available to supervised runs;
         // only host catalog mutations require full-access admission.
-        let mutation = isHost && RemoteCodeHostCatalog.rpcMutationMethods.contains(req.method)
+        let mutation: Bool
+        if req.method == RemoteCodeHostCatalog.hostCallRPC {
+            mutation = !Self.titioReadOnlyMethod(params["method"]?.stringValue ?? "")
+        } else if req.method == RemoteCodeHostCatalog.hostBatchRPC {
+            mutation = params["calls"]?.arrayValue?.contains {
+                !Self.titioReadOnlyMethod($0.objectValue?["method"]?.stringValue ?? "")
+            } ?? true
+        } else {
+            mutation = isHost && RemoteCodeHostCatalog.rpcMutationMethods.contains(req.method)
+        }
         do {
             try authenticateManagedHostParams(params, mutation: mutation, method: req.method)
         } catch let error as JSONRPCError {
@@ -1822,6 +1831,9 @@ public final class JSONRPCDispatcher {
         }
         if req.method == RemoteCodeHostCatalog.hostCallRPC {
             return await dispatchTitioHostCall(req)
+        }
+        if req.method == RemoteCodeHostCatalog.hostBatchRPC {
+            return await dispatchTitioHostBatch(req)
         }
         return await Self.$managedProviderSocketAuthenticated.withValue(true) {
             if Self.managedPeerReceiptMethods.contains(req.method) || isPeerReceiptStatus {
@@ -1898,9 +1910,80 @@ public final class JSONRPCDispatcher {
             && !method.hasPrefix("host.") && !method.hasPrefix("bot.peer.")
     }
 
+    nonisolated private static func titioReadOnlyMethod(_ method: String) -> Bool {
+        titioHostCallAdmits(method) && (readOnlyBatchMethods.contains(method) || method == "agent.activity.list")
+    }
+
+    nonisolated private static var titioHostMethods: [String] {
+        readOnlyBatchMethods.union(HostMutationContract.methods)
+            .union(["agent.activity.list", "agent.thread.fork", "agent.thread.side", "agent.thread.side.close", "agent.thread.btw"])
+            .filter {
+                titioHostCallAdmits($0)
+                    && !["private.", "sync.", "events.", "token_saver.", "command."].contains(where: $0.hasPrefix)
+            }.sorted()
+    }
+
+    /// Independent calls retain their own identities: a lost batch reply can be
+    /// retried as a batch or as individual calls without repeating mutations.
+    private func dispatchTitioHostBatch(_ req: JSONRPCRequest) async -> JSONRPCResponse {
+        let params = req.params ?? [:]
+        do {
+            guard let thread = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                  try router.managedHostCallerIsTitio(threadID: thread) else {
+                throw JSONRPCError(code: -32098, message: "rc_host_batch is available only to Titio.")
+            }
+            guard let calls = params["calls"]?.arrayValue, (1...20).contains(calls.count) else {
+                throw JSONRPCError.invalidParams
+            }
+            var operations = Set<String>()
+            var requests: [JSONRPCRequest] = []
+            for (index, call) in calls.enumerated() {
+                guard let object = call.objectValue,
+                      let method = object["method"]?.stringValue,
+                      Self.titioHostMethods.contains(method),
+                      Self.titioReadOnlyMethod(method) || Self.hostMutationMethods.contains(method),
+                      object["params"] == nil || object["params"]?.objectValue != nil,
+                      let operation = object["operation_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !operation.isEmpty, operations.insert(operation).inserted else {
+                    throw JSONRPCError(code: -32602, message: "Each batch call needs a supported method, object params and a distinct non-empty operation_id.")
+                }
+                var child = params
+                child.removeValue(forKey: "calls")
+                child["method"] = .string(method)
+                child["params"] = object["params"] ?? .object([:])
+                child["client_request_id"] = .string(operation)
+                requests.append(.init(jsonrpc: "2.0", id: .number(index), method: RemoteCodeHostCatalog.hostCallRPC, params: child))
+            }
+            var results: [JSONValue] = []
+            for (index, request) in requests.enumerated() {
+                // Reauthenticate every step: a previous action may stop this run
+                // or revoke its permission. Never inherit an earlier admission.
+                let response: JSONRPCResponse
+                if Task.isCancelled {
+                    response = .init(id: request.id, error: JSONRPCError(code: -32800, message: "Batch cancelled before this call started."))
+                } else {
+                    response = await dispatchManagedHostUnix(request)
+                }
+                var result: [String: JSONValue] = [
+                    "index": .number(Double(index)),
+                    "method": request.params?["method"] ?? .null,
+                    "operation_id": request.params?["client_request_id"] ?? .null,
+                ]
+                if let error = response.error { result["error"] = encode(error) }
+                else { result["result"] = response.result ?? .null }
+                results.append(.object(result))
+            }
+            return .init(id: req.id, result: .object(["results": .array(results)]))
+        } catch let error as JSONRPCError {
+            return .init(id: req.id, error: error)
+        } catch {
+            return .init(id: req.id, error: .internalError)
+        }
+    }
+
     /// `host.call` lets Titio run any RemoteCode RPC the app UI or a paired
     /// device can, through the same paired-device mutation path (receipts, host
-    /// binding, events). The run is already authenticated as fullAccess.
+    /// binding, events). Mutations require fullAccess; known reads do not.
     private func dispatchTitioHostCall(_ req: JSONRPCRequest) async -> JSONRPCResponse {
         let params = req.params ?? [:]
         guard let threadUUID = params["thread_id"]?.stringValue.flatMap(UUID.init),
@@ -2080,7 +2163,8 @@ public final class JSONRPCDispatcher {
             ))
         }
         var businessParams = HostMutationContract.businessParams(params)
-        if req.method.hasPrefix("bot."), !req.method.hasPrefix("bot.peer.") {
+        if (req.method.hasPrefix("bot.") && !req.method.hasPrefix("bot.peer."))
+            || (req.method == "scheduled_task.save" && businessParams["bot_id"] != nil) {
             // Paired Bot authority owns a second, user-visible receipt. Preserve
             // its request identity while the Phase 4 ledger supplies response-
             // loss safety, and inject the authenticated host binding rather
@@ -3613,10 +3697,31 @@ public final class JSONRPCDispatcher {
                     )
                 )
             case "host.activity.list":
-                return .init(id: id, result: try await router.listHostActivity())
+                return .init(id: id, result: try await router.listHostActivity(params: params))
             case "host.help":
                 let topic = params["topic"]?.stringValue
-                if params["topic"] != nil && topic == nil { throw JSONRPCError.invalidParams }
+                let query = params["query"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let method = params["method"]?.stringValue
+                if (params["topic"] != nil && topic == nil)
+                    || (params["query"] != nil && query == nil)
+                    || (params["method"] != nil && method == nil) { throw JSONRPCError.invalidParams }
+                if let method {
+                    guard Self.titioHostMethods.contains(method) else {
+                        throw JSONRPCError(code: -32602, message: "Unknown host method. Search rc_host_help with query first.")
+                    }
+                    let mutation = !Self.titioReadOnlyMethod(method)
+                    return .init(id: id, result: .object([
+                        "method": .string(method),
+                        "mutation": .bool(mutation),
+                        "batch_supported": .bool(Self.titioReadOnlyMethod(method) || Self.hostMutationMethods.contains(method)),
+                        "validation_requirements": .array(HostMutationContract.methods.contains(method)
+                            ? HostMutationContract.parameterRequirements(for: method).map(JSONValue.string) : []),
+                        "workflows": .array(TitioCapabilities.topics(forHostMethod: method).map {
+                            .object(["topic": .string($0.id), "instructions": .string($0.instructions)])
+                        }),
+                        "usage": .string("Validation requirements describe host entrance checks, not all optional fields. Follow the workflow and preserve current configuration from live reads. The host supplies host_id and client_request_id. Every call needs operation_id; mutations require Full Access."),
+                    ]))
+                }
                 if let topic {
                     guard let guide = TitioCapabilities.topics.first(where: { $0.id == topic }) else {
                         throw JSONRPCError(code: -32602, message: "Unknown topic. Call rc_host_help without topic to list supported interactions.")
@@ -3631,27 +3736,22 @@ public final class JSONRPCDispatcher {
                     }
                     return .init(id: id, result: .object(result))
                 }
-                let threadCommands: Set<String> = [
-                    "agent.thread.fork", "agent.thread.side", "agent.thread.side.close", "agent.thread.btw",
-                ]
-                let mutations = HostMutationContract.methods.union(threadCommands)
-                let methods = Self.readOnlyBatchMethods.union(mutations)
-                    .union(["agent.activity.list"])
-                    .filter {
-                        Self.titioHostCallAdmits($0)
-                            && !["private.", "sync.", "events.", "token_saver.", "command."].contains(where: $0.hasPrefix)
-                    }.sorted()
+                let search = query ?? ""
+                let methods = Self.titioHostMethods.filter { search.isEmpty || $0.localizedCaseInsensitiveContains(search) }
+                let topics = TitioCapabilities.topics.filter {
+                    search.isEmpty || "\($0.id) \($0.title) \($0.examples.joined(separator: " ")) \($0.instructions)".localizedCaseInsensitiveContains(search)
+                }
                 return .init(id: id, result: .object([
-                    "topics": .array(TitioCapabilities.topics.map { topic in
+                    "topics": .array(topics.map { topic in
                         .object([
                             "id": .string(topic.id), "title": .string(topic.title),
                             "examples": .array(topic.examples.map(JSONValue.string)),
                         ])
                     }),
                     "methods": .array(methods.map { method in
-                        .object(["method": .string(method), "mutation": .bool(mutations.contains(method))])
+                        .object(["method": .string(method), "mutation": .bool(!Self.titioReadOnlyMethod(method))])
                     }),
-                    "usage": .string("Read the relevant topic before calling rc_host_call. Resolve ids from live reads, preserve scope, supply operation_id, then verify the returned outcome. Methods still enforce their normal permissions and availability."),
+                    "usage": .string("Use topic for a workflow, method for validation requirements, or query to narrow this index. Resolve ids from live reads, preserve scope, supply operation_id, then verify outcomes. Use rc_host_batch for independent calls. Methods enforce their normal permissions and availability."),
                 ]))
             case "host.bot.delegate":
                 guard let bot = params["bot"]?.stringValue,

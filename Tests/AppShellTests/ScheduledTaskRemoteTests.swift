@@ -67,8 +67,14 @@ final class ScheduledTaskRemoteTests: XCTestCase {
             "schedule_spec_json": .string(spec.encodedJSON()),
             "execution_destination": .string(BotExecutionDestination.virtualMachine(machine.id).storageValue),
         ]
-        _ = try await router.saveScheduledTaskRemote(params: params)
-        _ = try await router.saveScheduledTaskRemote(params: params)
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let mutation = MutationRequestContext(ownerFingerprint: "titio-schedule-test", hostId: context.liveActivityHostIdentity.serverId, bootEpoch: 0)
+        func save(_ values: [String: JSONValue]) async throws {
+            let response = await dispatcher.dispatch(.init(jsonrpc: "2.0", id: .number(1), method: "scheduled_task.save", params: values), mutationContext: mutation)
+            XCTAssertNil(response.error, "\(String(describing: response.error))")
+        }
+        try await save(params)
+        try await save(params)
         let routines = try context.botStore.listRoutines(botID: bot.id)
         XCTAssertEqual(routines.count, 1)
         XCTAssertTrue(try XCTUnwrap(routines.first).activation.isEnabled)
@@ -80,11 +86,11 @@ final class ScheduledTaskRemoteTests: XCTestCase {
         edit["client_request_id"] = .string(UUID().uuidString)
         edit["task_id"] = .string(try XCTUnwrap(routines.first).definition.id.value.uuidString.lowercased())
         edit["enabled"] = .bool(false)
-        _ = try await router.saveScheduledTaskRemote(params: edit)
+        try await save(edit)
         XCTAssertFalse(try XCTUnwrap(context.botStore.listRoutines(botID: bot.id).first).activation.isEnabled)
         edit["client_request_id"] = .string(UUID().uuidString)
         edit.removeValue(forKey: "enabled")
-        _ = try await router.saveScheduledTaskRemote(params: edit)
+        try await save(edit)
         XCTAssertFalse(try XCTUnwrap(context.botStore.listRoutines(botID: bot.id).first).activation.isEnabled)
     }
 

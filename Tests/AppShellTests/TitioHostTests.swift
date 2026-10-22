@@ -99,6 +99,7 @@ final class TitioHostTests: XCTestCase {
         // not a guess or a silent no-op.
         let f = try makeFixture()
         let developer = try f.vm.create(name: "Developer", title: "Builds things")
+        _ = try f.context.botStore.setExecutionDestination(.mac, botID: developer.id)
         _ = try f.vm.create(name: "Writer", title: "Docs")
         let workspace = try f.router.createWorkspace(name: "elephant", cwd: directory)
         let host = f.context.liveActivityHostIdentity.serverId
@@ -110,7 +111,7 @@ final class TitioHostTests: XCTestCase {
         let conversation = BotConversation(botID: developer.id, title: thread.title, linkedAgentThreadID: thread.id)
         try f.context.botStore.createContextualConversation(
             conversation, newThread: thread, hostID: host,
-            context: grant.context, policyRevision: grant.policyRevision
+            context: grant.context, policyRevision: grant.policyRevision, executionDestination: .mac
         )
 
         let result = try await f.router.delegateHostBot(
@@ -161,6 +162,80 @@ final class TitioHostTests: XCTestCase {
             XCTAssertEqual(($0 as? JSONRPCError)?.code, -32044)
         }
         XCTAssertTrue(f.runner.requests.isEmpty)
+    }
+
+    func test_continueRestoresSavedContextWithoutAddingAUserMessage() async throws {
+        let f = try makeFixture()
+        let workspace = try f.router.createWorkspace(name: "Resume", cwd: directory)
+        let thread = AgentThread(
+            workspaceId: workspace.id, title: "Interrupted task", provider: .distill,
+            model: "main-a", status: .interrupted, permissionMode: .fullAccess
+        )
+        try f.context.threadRepo.upsert(thread)
+        try f.context.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "Finish the report"))
+        try f.context.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id, provider: .distill, status: .interrupted,
+            resumeCursor: "saved-report-session", cwd: directory, model: "main-a"
+        ))
+        let before = try f.context.messageRepo.list(threadId: thread.id).filter { $0.role == .user }
+
+        let resumed = try await f.router.continueAgentRun(thread: thread.id)
+
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        XCTAssertEqual(request.runId, resumed)
+        XCTAssertEqual(request.providerThreadId, "saved-report-session")
+        XCTAssertFalse(request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                       "Continue sends the provider a recovery instruction, not an empty prompt")
+        XCTAssertEqual(try f.context.messageRepo.list(threadId: thread.id).filter { $0.role == .user }.map(\.id), before.map(\.id),
+                       "recovery must not add a blank or invented user message")
+        f.runner.finish(runID: request.runId, status: .completed, reply: "Report finished")
+    }
+
+    func test_continueWithoutSavedContextDoesNotStartOrQueueNewWork() async throws {
+        let f = try makeFixture()
+        let thread = AgentThread(title: "Finished", provider: .distill, model: "main-a", status: .completed)
+        try f.context.threadRepo.upsert(thread)
+        do {
+            _ = try await f.router.continueAgentRun(thread: thread.id)
+            XCTFail("Continue must not restart completed work")
+        } catch let error as JSONRPCError {
+            XCTAssertTrue(error.message.contains("No saved interrupted context"))
+        }
+        XCTAssertTrue(f.runner.requests.isEmpty)
+        XCTAssertTrue(try f.context.messageRepo.list(threadId: thread.id).isEmpty)
+        XCTAssertTrue(try f.context.queuedMessageRepo.list(threadId: thread.id).isEmpty)
+    }
+
+    func test_focusedActivityPaginatesOnlyTheRequestedInterruptedWorkspace() async throws {
+        let f = try makeFixture()
+        let workspace = try f.router.createWorkspace(name: "Resume", cwd: directory)
+        var expected = Set<String>()
+        for index in 0..<4 {
+            let thread = AgentThread(workspaceId: index == 3 ? nil : workspace.id,
+                                     title: "Task \(index)", provider: .distill, model: "main-a")
+            try f.context.threadRepo.upsert(thread)
+            let status: AgentRunStatus = index == 2 ? .completed : .interrupted
+            try f.context.runRepo.upsert(AgentRun(threadId: thread.id, provider: .distill, model: "main-a",
+                                                status: status, startedAt: Date(timeIntervalSince1970: Double(100 + index)),
+                                                finishedAt: Date(timeIntervalSince1970: Double(110 + index))))
+            if index < 2 { expected.insert(thread.id.description.lowercased()) }
+        }
+        var filters: [String: JSONValue] = ["section": .string("needs_you"), "outcome": .string("interrupted"),
+                                          "workspace_id": .string(workspace.id.description), "limit": .number(1)]
+        let first = try await f.router.listHostActivity(params: filters)
+        XCTAssertEqual(Set(first.objectValue?.keys.map { $0 } ?? []), ["activity"],
+                       "a focused command must not load every Bot, thread and schedule")
+        let page = try XCTUnwrap(first.objectValue?["activity"]?.objectValue)
+        XCTAssertEqual(page["counts"]?.objectValue?["needs_you"], .number(2))
+        let cursor = try XCTUnwrap(page["next_cursor"]?.stringValue)
+        filters["cursor"] = .string(cursor)
+        let second = try await f.router.listHostActivity(params: filters)
+        let next = try XCTUnwrap(second.objectValue?["activity"]?.objectValue)
+        XCTAssertNil(next["next_cursor"]?.stringValue)
+        let items = (page["items"]?.arrayValue ?? []) + (next["items"]?.arrayValue ?? [])
+        XCTAssertEqual(Set(items.compactMap { $0.objectValue?["thread_id"]?.stringValue?.lowercased() }), expected)
     }
 
     func test_ambiguousBotAndWorkspaceNamesNeverStartTheFirstMatch() async throws {
@@ -253,7 +328,7 @@ final class TitioHostTests: XCTestCase {
             ], preview: "Which environment?")
         }
 
-        let snapshot = try await f.router.listHostActivity()
+        let snapshot = try await f.router.listHostActivity(params: ["include_context": .bool(true)])
 
         let object = try XCTUnwrap(snapshot.objectValue)
         let threads = object["threads"]?.arrayValue ?? []

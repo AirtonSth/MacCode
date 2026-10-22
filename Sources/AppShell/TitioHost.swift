@@ -143,11 +143,19 @@ extension AppCommandRouter {
         }
     }
 
-    public func listHostActivity() async throws -> JSONValue {
+    public func listHostActivity(params: [String: JSONValue] = [:]) async throws -> JSONValue {
         guard let ctx = context else { throw JSONRPCError.internalError }
+        if params["include_context"] != nil, params["include_context"]?.boolValue == nil {
+            throw JSONRPCError.invalidParams
+        }
+        var filters = params
+        if filters["limit"] == nil { filters["limit"] = .number(100) }
+        let activity = try await activityListOffMain(params: filters)
+        guard params["include_context"]?.boolValue == true else {
+            return .object(["activity": activity])
+        }
         let workspaces = try await listWorkspacesAuthoritative()
         let names = Dictionary(uniqueKeysWithValues: workspaces.map { ($0.id, $0.name) })
-        let activity = try await activityListOffMain(params: ["limit": .number(100)])
         let storedBots = try ctx.botStore.list()
         let notices = TitioNoticeRepository(db: ctx.db)
         let iso = ISO8601DateFormatter()

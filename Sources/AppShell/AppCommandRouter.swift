@@ -6466,7 +6466,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true, compilesBotPrompt: Bool = false, attachToProviderPromptId: String? = nil) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, requestedRunID: AgentRunID? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil, nestedRunContext: AgentNestedRunContext? = nil, executionCwdOverride: String? = nil, allowProviderCatalogListingDuringPreflight: Bool = true, preflightRejectionIsDefinite: Bool = false, queueBehindBusyBotVM: Bool = true, compilesBotPrompt: Bool = false, attachToProviderPromptId: String? = nil, resumeInterrupted: Bool = false) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         do {
             try Self.requireContextPinnedSendAuthority(thread, context: ctx)
@@ -6518,7 +6518,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if Task.isCancelled {
             throw CancellationError()
         }
+        if resumeInterrupted, !ctx.coordinator.hasRecoverableContext(threadId: thread) {
+            throw JSONRPCError(code: -32000, message: "The interrupted context changed while preparing to continue. Read the conversation again.")
+        }
         func enqueueBehindActiveRun() throws -> AgentMessageSendResult {
+            guard !resumeInterrupted else {
+                throw JSONRPCError(code: -32000, message: "Thread became active before it could be continued.")
+            }
             let queued = try ctx.queuedMessageRepo.enqueue(
                 id: requestedRunID.map { AgentQueuedMessageID($0.value) },
                 threadId: thread,
@@ -6769,7 +6775,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             prompt: runPrompt,
             userMessageContent: botPromptApplied ? text : nil,
             attachments: resolvedAttachments,
-            providerThreadId: t.providerThreadId,
+            providerThreadId: resumeInterrupted ? nil : t.providerThreadId,
             permissionMode: t.permissionMode,
             reasoningEffort: t.reasoningEffort,
             reasoningModel: t.reasoningModel,
@@ -6789,7 +6795,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         req.attachToProviderPromptId = attachToProviderPromptId
         let runId: AgentRunID
         do {
-            runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
+            runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot, recordUserMessage: !resumeInterrupted)
             vmRunStarted = true
         } catch {
             if nestedReceiptRegistered {
@@ -7716,11 +7722,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
-    /// UX-MAC_AGENT-CONTINUE parity for mirror clients: resume a
-    /// relaunch-interrupted thread exactly like the mac Continue button
-    /// (AgentAppViewModel.continueInterruptedThread) — an empty prompt routes
-    /// through the coordinator's recoverableResumeContext path, which picks up
-    /// the saved resume cursor without persisting a new user message.
+    /// Resume through the same saved-context path as the Mac Continue button,
+    /// without recording the provider-only instruction as a user message.
     public func continueAgentRun(thread: AgentThreadID) async throws -> AgentRunID? {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         if (try ctx.threadRepo.status(of: thread)) == .running
@@ -7728,7 +7731,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             || ctx.coordinator.hasProviderSession(threadId: thread) {
             throw JSONRPCError(code: -32000, message: "Thread already has an active run.")
         }
-        let result = try await sendAgentMessage(thread: thread, text: "", provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)
+        guard ctx.coordinator.hasRecoverableContext(threadId: thread) else {
+            throw JSONRPCError(code: -32000, message: "No saved interrupted context is available. Read the conversation before sending a new message.")
+        }
+        let result = try await sendAgentMessage(
+            thread: thread,
+            text: "Continue the interrupted turn from the last saved context. Do not repeat completed work.",
+            provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil,
+            serviceTier: nil, interactionMode: nil, modelSelection: nil,
+            providerInstanceId: nil, attachments: [], queueMessageId: nil,
+            queueBehindBusyBotVM: false, compilesBotPrompt: true, resumeInterrupted: true
+        )
         return result.runId
     }
 
