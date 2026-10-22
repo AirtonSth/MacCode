@@ -882,29 +882,21 @@ public struct ScheduledTasksRootView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: DS.Space.md) {
-                        ForEach(vm.tasks) { task in
-                            ScheduledTaskCard(
-                                task: task,
-                                workspaceName: vm.workspaceName(for: task),
-                                providerLabel: shortProviderModel(task),
-                                runCount: vm.runCounts[task.id, default: 0],
-                                activeRunStatus: vm.activeRunStatus(for: task.id),
-                                onOpen: {
-                                    vm.selectedTaskID = task.id
-                                    screen = .detail
-                                },
-                                onToggle: { vm.toggle(task) },
-                                onRunNow: { vm.runNow(task) },
-                                onEdit: {
-                                    vm.selectedTaskID = task.id
-                                    vm.edit(task)
-                                    openEditor(returnTo: .detail)
-                                },
-                                onDelete: { vm.delete(task) }
-                            )
+                    LazyVStack(alignment: .leading, spacing: DS.Space.md, pinnedViews: [.sectionHeaders]) {
+                        ForEach(ScheduleTaskWorkspaceGroup.groups(tasks: vm.tasks, botItems: botsVM?.scheduleTaskItems ?? [], workspaces: vm.workspaces)) { group in
+                            Section {
+                                ForEach(group.entries) { entry in
+                                    switch entry {
+                                    case .task(let task): taskCard(task)
+                                    case .bot(let item): if let botsVM { BotScheduleTaskRow(vm: botsVM, item: item) }
+                                    }
+                                }
+                            } header: {
+                                WorkspaceSectionHeader(title: group.name, count: group.entries.count,
+                                                       hasWorkspace: group.id != nil, color: group.color)
+                                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                            }
                         }
-                        if let botsVM { BotScheduleTasksSection(vm: botsVM) }
                     }
                     .padding(.horizontal, DS.Space.xxl)
                     .padding(.bottom, DS.Space.xxl)
@@ -912,6 +904,28 @@ public struct ScheduledTasksRootView: View {
                 .accessibilityIdentifier("scheduledTasks.list")
             }
         }
+    }
+
+    private func taskCard(_ task: ScheduledTask) -> some View {
+        ScheduledTaskCard(
+            task: task,
+            workspaceName: vm.workspaceName(for: task),
+            providerLabel: shortProviderModel(task),
+            runCount: vm.runCounts[task.id, default: 0],
+            activeRunStatus: vm.activeRunStatus(for: task.id),
+            onOpen: {
+                vm.selectedTaskID = task.id
+                screen = .detail
+            },
+            onToggle: { vm.toggle(task) },
+            onRunNow: { vm.runNow(task) },
+            onEdit: {
+                vm.selectedTaskID = task.id
+                vm.edit(task)
+                openEditor(returnTo: .detail)
+            },
+            onDelete: { vm.delete(task) }
+        )
     }
 
     private var overviewTitle: some View {
@@ -2145,5 +2159,53 @@ struct ScheduledRunOptionsEditor: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Schedule Tasks groups workspace tasks and Bot schedules under their workspace,
+/// like Activity. Groups keep first-appearance order; "No workspace" goes last.
+struct ScheduleTaskWorkspaceGroup: Identifiable {
+    enum Entry: Identifiable {
+        case task(ScheduledTask)
+        case bot(BotScheduleTaskItem)
+        var id: String {
+            switch self {
+            case .task(let task): return "task:\(task.id.uuidString)"
+            case .bot(let item): return "bot:\(item.id.value.uuidString)"
+            }
+        }
+        var workspaceID: WorkspaceID? {
+            switch self {
+            case .task(let task): return task.workspaceID as WorkspaceID?
+            case .bot(let item): return item.workspaceID
+            }
+        }
+    }
+
+    let id: WorkspaceID?
+    let name: String
+    let color: Color?
+    let entries: [Entry]
+
+    static func groups(tasks: [ScheduledTask], botItems: [BotScheduleTaskItem], workspaces: [Workspace]) -> [ScheduleTaskWorkspaceGroup] {
+        let entries = tasks.map(Entry.task) + botItems.map(Entry.bot)
+        var order: [WorkspaceID?] = []
+        var buckets: [WorkspaceID?: [Entry]] = [:]
+        for entry in entries {
+            // A workspace that no longer exists reads as "No workspace", not a ghost group.
+            let key = entry.workspaceID.flatMap { id in workspaces.contains { $0.id == id } ? id : nil }
+            if buckets[key] == nil { order.append(key) }
+            buckets[key, default: []].append(entry)
+        }
+        let named = order.compactMap { key -> ScheduleTaskWorkspaceGroup? in
+            guard let key, let workspace = workspaces.first(where: { $0.id == key }) else { return nil }
+            return ScheduleTaskWorkspaceGroup(
+                id: key, name: workspace.name,
+                color: TabColor.from(workspace.metadata["color"]).map { Color(hex: $0.hex) },
+                entries: buckets[key] ?? []
+            )
+        }
+        guard let loose = buckets[nil] else { return named }
+        return named + [ScheduleTaskWorkspaceGroup(id: nil, name: "No workspace", color: nil, entries: loose)]
     }
 }

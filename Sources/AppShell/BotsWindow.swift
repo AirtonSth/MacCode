@@ -5459,7 +5459,11 @@ public final class BotsViewModel: ObservableObject {
             for: conversation,
             allowStoreLookup: !navigationFirstFrameDeferral
         )
-        rememberStudioSupport(for: conversation.botID)
+        // Only patch a snapshot loaded from the store: a cold Desk has empty
+        // placeholders (routines, skills) that must not be cached as truth.
+        if studioSupportByBot[conversation.botID] != nil {
+            rememberStudioSupport(for: conversation.botID)
+        }
         let cached = cachedMessages(
             botID: conversation.botID,
             conversationID: conversation.id
@@ -5529,6 +5533,16 @@ public final class BotsViewModel: ObservableObject {
             botID: botID,
             conversationID: conversationID
         ) else { return }
+        // This pass supersedes the Desk's own freshness pass, so a cold Bot
+        // still needs its inspector (schedules, skills, memory) from the store.
+        if studioSupportByBot[botID] == nil {
+            reloadStudioSupport(id: botID)
+            guard navigationFreshnessIsCurrent(
+                generation,
+                botID: botID,
+                conversationID: conversationID
+            ) else { return }
+        }
         if cachedMessages(botID: botID, conversationID: conversationID).isEmpty {
             restoreDeskMessages(botID: botID)
         }

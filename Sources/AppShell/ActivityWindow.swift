@@ -1165,22 +1165,8 @@ struct ActivityRootView: View {
     /// Workspace header: the sidebar's folder in the workspace color, on the raised band the
     /// pinned header uses, so every header reads the same whether pinned or not.
     private func sectionHeader(_ title: String, count: Int?, workspaceID: String) -> some View {
-        HStack(spacing: DS.Space.xs) {
-            Image(systemName: workspaceID.isEmpty ? "tray" : "folder.fill")
-                .font(.system(size: 12, weight: .regular))
-                .foregroundColor(workspaceColor(workspaceID) ?? DS.Palette.textSecondary)
-                .frame(width: 16)
-                .accessibilityHidden(true)
-            Text(title)
-            if let count { Text("\(count)").monospacedDigit().foregroundColor(DS.Palette.textTertiary) }
-            Spacer(minLength: 0)
-        }
-        .font(DS.Font.caption.weight(.semibold)).foregroundColor(DS.Palette.textSecondary)
-        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DS.Palette.surface)
-        .listRowInsets(EdgeInsets())
-        .accessibilityElement(children: .combine)
+        WorkspaceSectionHeader(title: title, count: count, hasWorkspace: !workspaceID.isEmpty, color: workspaceColor(workspaceID))
+            .listRowInsets(EdgeInsets())
     }
 
     @ViewBuilder
@@ -1645,4 +1631,32 @@ extension ActivityViewModel {
     /// The host count covers the whole filter; the loaded rows cover a result the count cannot see yet.
     var hasUnreadResults: Bool { page.counts.new_results > 0 || page.items.contains(where: \.isUnread) }
     func dismissError() { error = nil }
+}
+
+/// Workspace group header shared by Activity and Schedule Tasks: folder in the
+/// workspace color (tray for "No workspace"), name and item count.
+struct WorkspaceSectionHeader: View {
+    let title: String
+    let count: Int?
+    let hasWorkspace: Bool
+    let color: Color?
+
+    var body: some View {
+        HStack(spacing: DS.Space.xs) {
+            Image(systemName: hasWorkspace ? "folder.fill" : "tray")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundColor(color ?? DS.Palette.textSecondary)
+                .frame(width: 16)
+                .accessibilityHidden(true)
+            Text(title)
+            if let count { Text("\(count)").monospacedDigit().foregroundColor(DS.Palette.textTertiary) }
+            Spacer(minLength: 0)
+        }
+        .font(DS.Font.caption.weight(.semibold)).foregroundColor(DS.Palette.textSecondary)
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surface)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+    }
 }

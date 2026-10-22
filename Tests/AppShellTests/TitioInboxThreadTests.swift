@@ -166,6 +166,28 @@ final class TitioInboxThreadTests: XCTestCase {
         XCTAssertNotNil(vm.deskAgentVM, "the inbox chat is mounted, not a Loading strip")
     }
 
+    func test_openingABotThreadColdShowsItsScheduledTasks() async throws {
+        // WHY: opening a Bot conversation from the sidebar on a cold Bot cached
+        // empty placeholders, so the Desk said "No scheduled tasks" while the
+        // Bot had schedules in Schedule Tasks.
+        let (context, router, vm) = try makeFixture()
+        vm.enableNavigationFirstFrameDeferral()
+        let other = try context.botStore.create(name: "Writer", title: "", description: "", handle: "writer", workspaceID: nil)
+        let bot = try context.botStore.create(name: "Developer", title: "", description: "", handle: "dev", workspaceID: nil)
+        let routine = BotRoutineDefinition(botID: bot.id, name: "Elephant - Task", prompt: "Do the task", scheduleNote: "Daily")
+        try context.botStore.saveRoutine(routine)
+        let conversation = BotConversation(botID: bot.id, title: "Thread")
+        try context.botStore.upsertConversation(conversation)
+        vm.reload()
+        _ = try router.openBotsDesk(botID: other.id)
+        await vm.waitForNavigationFreshnessForTesting()
+        XCTAssertEqual(vm.studioSupportCacheCountForTesting, 1, "fixture: only the other Bot is warm")
+        _ = try router.openBotsDesk(botID: bot.id, conversationID: conversation.id)
+        await vm.waitForNavigationFreshnessForTesting()
+        XCTAssertEqual(vm.selectedConversation?.id, conversation.id)
+        XCTAssertEqual(vm.routines.map(\.definition.id), [routine.id])
+    }
+
     func test_aBotWithNoConversationOffersTheComposerInsteadOfLoadingForever() async throws {
         // WHY: Titio (and any new Bot) starts with no conversation. The desk
         // used to sit on "Loading…" forever; it must offer the composer,

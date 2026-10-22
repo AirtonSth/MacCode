@@ -16,6 +16,8 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
     public var botHandle: String
     public var botAvatarSymbol: String
     public var lastTestRunRequestedAt: Date?
+    /// The Bot's workspace; Schedule Tasks groups the schedule under it.
+    public var workspaceID: WorkspaceID?
 
     public init(routine: BotRoutine, bot: BotDefinition) {
         self.id = routine.definition.id
@@ -29,6 +31,7 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
         self.botHandle = bot.handle
         self.botAvatarSymbol = bot.avatarSymbol
         self.lastTestRunRequestedAt = routine.activation.lastTestRunRequestedAt
+        self.workspaceID = bot.workspaceID
     }
 
     /// Next run is when this task would actually fire, not whether it is armed.
@@ -838,32 +841,22 @@ struct BotScheduleSpecEditor: View {
 }
 
 /// Bot schedules inside the Schedule Tasks screen: the same cards and actions as the Bots screen.
-struct BotScheduleTasksSection: View {
+/// One Bot schedule card wired to the Bots model; Schedule Tasks mounts it inside its workspace group.
+struct BotScheduleTaskRow: View {
     @ObservedObject var vm: BotsViewModel
+    let item: BotScheduleTaskItem
 
     var body: some View {
-        if !vm.scheduleTaskItems.isEmpty {
-            VStack(alignment: .leading, spacing: DS.Space.md) {
-                Text("Bot schedules")
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textTertiary)
-                LazyVStack(spacing: DS.Space.md) {
-                    ForEach(vm.scheduleTaskItems) { item in
-                        BotScheduleTaskCard(
-                            item: item,
-                            isAutonomyActive: vm.isAutonomyActive,
-                            isRunning: vm.isRoutineRunning(id: item.id),
-                            onOpen: { vm.editScheduleTask(item) },
-                            onToggle: { vm.setRoutineEnabled(id: item.id, enabled: !item.isEnabled) },
-                            onRunNow: { vm.runRoutineNow(id: item.id) },
-                            onEdit: { vm.editScheduleTask(item) },
-                            onDelete: { vm.deleteScheduleTask(item) }
-                        )
-                    }
-                }
-            }
-            .accessibilityIdentifier("scheduledTasks.botSchedules")
-        }
+        BotScheduleTaskCard(
+            item: item,
+            isAutonomyActive: vm.isAutonomyActive,
+            isRunning: vm.isRoutineRunning(id: item.id),
+            onOpen: { vm.editScheduleTask(item) },
+            onToggle: { vm.setRoutineEnabled(id: item.id, enabled: !item.isEnabled) },
+            onRunNow: { vm.runRoutineNow(id: item.id) },
+            onEdit: { vm.editScheduleTask(item) },
+            onDelete: { vm.deleteScheduleTask(item) }
+        )
     }
 }
 
