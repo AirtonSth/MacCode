@@ -139,8 +139,26 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let result = await DistillACPAdapter(binaryNameOverride: harness.path, discoveryCwd: root.path).discoveryResult()
 
         XCTAssertTrue(result.isFallback)
-        XCTAssertEqual(result.models, DistillRunner.listModels(installedVersion: nil))
+        XCTAssertEqual(result.models, DistillACPAdapter.fallbackModels)
+        XCTAssertTrue(result.models.contains { $0.id == "auto" }, "Auto routing must stay selectable on the built-in list")
         XCTAssertEqual(result.capabilities, AgentProviderCapabilities(supportsDistillMainEffortAuto: true))
+    }
+
+    func test_fallbackDiscoveryIsNotCached_soTheNextOpenRetriesLive() async throws {
+        // WHY: at app launch many Distill processes start at once and one
+        // initialize can time out; caching that built-in list hid the live
+        // catalog (and every account-routed model) for the whole TTL.
+        let root = try makeTempRoot("distill-acp-discovery-fallback-nocache")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requests) = try writeDiscoveryHarness(
+            root: root,
+            initializeReply: #"{"error":{"code":-32603,"message":"Internal error"}}"#
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path, discoveryCwd: root.path)
+        _ = await adapter.discoveryResult()
+        _ = await adapter.discoveryResult()
+        let log = (try? String(contentsOf: requests, encoding: .utf8)) ?? ""
+        XCTAssertEqual(log.components(separatedBy: "\"initialize\"").count - 1, 2, log)
     }
 
     /// A peer whose model-less session/new is refused with ACP `auth_required`.

@@ -203,7 +203,7 @@ final class AgentAppModelPickerFixesTests: XCTestCase {
         vm.providerInstanceId = "distill-acp"
         let missingBinary = NSTemporaryDirectory() + "rc2-missing-distill-" + UUID().uuidString
         vm.providerLaunchConfig = { _, _ in (binary: missingBinary, environment: [:]) }
-        let builtIn = DistillRunner.listModels(installedVersion: nil)
+        let builtIn = DistillACPAdapter.fallbackModels
         vm.providerSnapshotLoader = { [AgentProviderSnapshotFactory.snapshot(provider: .distill, models: builtIn)] }
 
         vm.refreshProviderSnapshotsInBackground()

@@ -416,6 +416,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         await listModelsResult().models
     }
 
+    /// Built-in list shown when live discovery fails. Keeps Auto selectable so
+    /// Auto routing still works (Distill resolves the route when the run starts).
+    static var fallbackModels: [AgentModelDescriptor] {
+        DistillRunner.listModels(installedVersion: nil)
+            + [AgentModelDescriptor(id: "auto", label: "Auto", provider: .distill, supportsReasoning: true)]
+    }
+
     public func listModelsResult() async -> ModelListResult {
         let discovery = await discoveryResult()
         return ModelListResult(models: discovery.models, isFallback: discovery.isFallback)
@@ -509,7 +516,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             )
             result = discovered.isEmpty
                 ? DistillACPDiscoveryResult(
-                    models: DistillRunner.listModels(installedVersion: nil),
+                    models: Self.fallbackModels,
                     isFallback: true,
                     interactionModes: [.default],
                     permissionModes: Self.defaultPermissionModes,
@@ -526,7 +533,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 )
         } catch {
             result = DistillACPDiscoveryResult(
-                models: DistillRunner.listModels(installedVersion: nil),
+                models: Self.fallbackModels,
                 isFallback: true,
                 interactionModes: [.default],
                 permissionModes: Self.defaultPermissionModes,
@@ -534,7 +541,11 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 discoveryCacheKey: cacheKey
             )
         }
-        Self.storeDiscovery(result, for: cacheKey, scope: scope, generation: generation, fetchedAt: now, ttl: modelCacheTTL)
+        // A fallback (e.g. initialize timed out while many Distill processes
+        // start at app launch) must not stick for the TTL; the next open retries.
+        if !result.isFallback {
+            Self.storeDiscovery(result, for: cacheKey, scope: scope, generation: generation, fetchedAt: now, ttl: modelCacheTTL)
+        }
         return result
     }
 

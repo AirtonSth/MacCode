@@ -18674,6 +18674,12 @@ public struct AgentAppView: View {
                             }
                         }
                     )
+                    // Built-in list came from a failed discovery: retry live on open.
+                    .onChange(of: showModelOptions) { isShowing in
+                        if isShowing, vm.availableModelsAreFallback, !vm.modelListLoading {
+                            Task { await vm.refreshModelList() }
+                        }
+                    }
                     AgentExecutionModeCapsule(
                         selected: vm.distillExecutionMode,
                         disabled: vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun,
