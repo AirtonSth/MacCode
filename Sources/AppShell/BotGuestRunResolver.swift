@@ -927,6 +927,9 @@ extension AppContext {
                     BotGuestLaunchSweep.startStoppedDesktops(docker: sweepDocker, store: store)
                 }
             }
+            if !AppContext.isRunningUnitTests, distillHostWatch == nil {
+                distillHostWatch = Self.watchHostDistill(binaries: binaries, override: distillOverride)
+            }
         }
         let contextStore = botStore
         let contextThreadRepo = threadRepo
@@ -1015,6 +1018,33 @@ extension AppContext {
             gitIdentity: { BotComputerGuestService.gitIdentity() },
             hostsGuestRuns: hostsGuestRuns
         ))
+    }
+}
+
+extension AppContext {
+    /// Distill (its own updater or `distill update`) swaps the bin symlink
+    /// when it installs a release. Each change starts the guest download for
+    /// every architecture already cached; repeats share one download.
+    static func watchHostDistill(
+        binaries: DistillGuestBinaryProvisioner, override: String?
+    ) -> DispatchSourceFileSystemObject? {
+        guard let host = DistillProvisioner.resolveInstalledBinary(override: override) else { return nil }
+        let directory = URL(fileURLWithPath: host).deletingLastPathComponent().path
+        let descriptor = open(directory, O_EVTONLY | O_DIRECTORY | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor, eventMask: [.write, .rename], queue: .global(qos: .utility)
+        )
+        source.setEventHandler {
+            Task {
+                for arch in await binaries.cachedArchitectures() {
+                    binaries.prefetch(hostBinary: host, dockerArch: arch)
+                }
+            }
+        }
+        source.setCancelHandler { close(descriptor) }
+        source.resume()
+        return source
     }
 }
 

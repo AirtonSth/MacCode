@@ -85,14 +85,6 @@ public actor DistillGuestBinaryProvisioner {
     public static let minimumVersion = DistillVersion(2, 0, 31)
     public static let releaseBaseURL = "https://github.com/samuelfaj/distill/releases/download"
     public static let versionProbeTimeout: TimeInterval = 5
-    /// How long guest runs wait for their version to download before they run
-    /// an older cached one. The asset is ~224 MB: two minutes covers a line of
-    /// about 15 Mbit/s, and the run shows "preparing the agent" meanwhile. The
-    /// bound is per download, counted from the first run that waits on it:
-    /// on a slower line later runs fall back at once instead of each waiting
-    /// two minutes, and get the new version once the download lands.
-    public static let downloadWaitBound: TimeInterval = 120
-
     /// Writes the body of `url` to `destination`; throws on a non-2xx response.
     public typealias Fetch = @Sendable (_ url: URL, _ destination: URL) async throws -> Void
     /// Runs `<binary> --version` and returns its output, nil on failure or timeout.
@@ -107,23 +99,18 @@ public actor DistillGuestBinaryProvisioner {
     private let root: URL
     private let fetch: Fetch
     private let versionProbe: VersionProbe
-    private let downloadWait: TimeInterval
     private var hostVersions: [FileStamp: DistillVersion] = [:]
     private var verified: [FileStamp: String] = [:]
     private var inflight: [String: Task<DistillGuestBinary, Error>] = [:]
-    /// When the runs waiting on an in-flight download stop waiting, by download key.
-    private var waitDeadlines: [String: Date] = [:]
 
     public init(
         guestToolsRoot: URL,
         fetch: @escaping Fetch = DistillGuestBinaryProvisioner.urlSessionFetch,
-        versionProbe: @escaping VersionProbe = DistillGuestBinaryProvisioner.processVersionProbe,
-        downloadWait: TimeInterval = DistillGuestBinaryProvisioner.downloadWaitBound
+        versionProbe: @escaping VersionProbe = DistillGuestBinaryProvisioner.processVersionProbe
     ) {
         self.root = guestToolsRoot
         self.fetch = fetch
         self.versionProbe = versionProbe
-        self.downloadWait = downloadWait
     }
 
     // MARK: Pure policy
@@ -186,14 +173,13 @@ public actor DistillGuestBinaryProvisioner {
         return version
     }
 
-    /// The binary a guest run launches. When the wanted version is not cached
-    /// yet, the run waits for its download, so a bot does not run an outdated
-    /// distill right after a host update. Only when the download fails or
-    /// outlasts `downloadWait` (counted once per download, from the first run
-    /// that waits on it; a prefetch nobody waited for is not counted) is a
-    /// cached older version at or above the minimum used; with none cached,
-    /// the run keeps waiting or fails.
-    /// The download is shared: neither the bound nor a stopped run cancels it.
+    /// The binary a guest run launches: the wanted version when it is
+    /// cached, otherwise the newest cached version at or above the minimum
+    /// while the wanted one downloads in the background, so a host update
+    /// never makes a run wait (the next run gets the new build). With
+    /// nothing usable cached the run waits for the download; only Stop ends
+    /// that wait early. The download is shared and a stopped run never
+    /// cancels it.
     public func resolve(hostBinary: String?, dockerArch: String) async throws -> DistillGuestBinary {
         let asset = try Self.assetName(dockerArch: dockerArch)
         var host: DistillVersion?
@@ -203,25 +189,12 @@ public actor DistillGuestBinaryProvisioner {
             return cached
         }
         let download = startDownload(version: wanted, asset: asset)
-        let key = Self.downloadKey(version: wanted, asset: asset)
-        let deadline = waitDeadlines[key] ?? Date().addingTimeInterval(downloadWait)
-        waitDeadlines[key] = deadline
-        let outcome = await Self.outcome(of: download, within: deadline.timeIntervalSinceNow)
-        try Task.checkCancellation()
-        let reason: String
-        switch outcome {
-        case .success(let binary)?: return binary
-        case .failure(let error)?: reason = "its download failed: \(error.localizedDescription)"
-        case nil: reason = "its download outlasted the \(Int(downloadWait)) s wait and continues"
-        }
         if let fallback = await newestCachedBinary(asset: asset, excluding: wanted, requested: wanted) {
-            NSLog("distill guest binary: the bot runs the older distill \(fallback.version) instead of \(wanted): \(reason)")
+            NSLog("distill guest binary: the bot runs the cached distill \(fallback.version) while \(wanted) downloads")
             return fallback
         }
-        if case .failure(let error)? = outcome { throw error }
-        // Without a bound the wait ends early only when the run is stopped.
-        guard let late = await Self.outcome(of: download, within: nil) else { throw CancellationError() }
-        return try late.get()
+        guard let outcome = await Self.outcome(of: download, within: nil) else { throw CancellationError() }
+        return try outcome.get()
     }
 
     /// The result of `download`, or nil when `seconds` pass first or the
@@ -394,12 +367,10 @@ public actor DistillGuestBinaryProvisioner {
 
     private func finishDownload(key: String) {
         inflight[key] = nil
-        waitDeadlines[key] = nil
     }
 
     private func finishDownload(key: String, version: DistillVersion, asset: String, url: URL, hex: String) -> DistillGuestBinary {
         inflight[key] = nil
-        waitDeadlines[key] = nil
         if let stamp = Self.stamp(path: url.path) { verified[stamp] = hex }
         return binary(version: version, asset: asset, requested: version, url: url)
     }

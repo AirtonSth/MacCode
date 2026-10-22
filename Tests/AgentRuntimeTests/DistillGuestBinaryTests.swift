@@ -115,21 +115,18 @@ final class DistillGuestBinaryTests: XCTestCase {
 
     private func provisioner(
         _ release: FakeRelease,
-        probe: ProbeCounter = ProbeCounter("distill 2.0.31 (abc)"),
-        downloadWait: TimeInterval = DistillGuestBinaryProvisioner.downloadWaitBound
+        probe: ProbeCounter = ProbeCounter("distill 2.0.31 (abc)")
     ) -> DistillGuestBinaryProvisioner {
-        DistillGuestBinaryProvisioner(
-            guestToolsRoot: root, fetch: release.fetch, versionProbe: probe.probe, downloadWait: downloadWait
-        )
+        DistillGuestBinaryProvisioner(guestToolsRoot: root, fetch: release.fetch, versionProbe: probe.probe)
     }
 
     /// A provisioner with 2.0.31 cached whose host distill was then updated to 2.0.32.
     private func provisionerAfterHostUpdate(
-        _ release: FakeRelease, downloadWait: TimeInterval = DistillGuestBinaryProvisioner.downloadWaitBound
+        _ release: FakeRelease
     ) async throws -> (subject: DistillGuestBinaryProvisioner, host: String) {
         release.publish("2.0.31", assets: [asset: Data("v31".utf8)])
         let probe = ProbeCounter("distill 2.0.31 (a)")
-        let subject = provisioner(release, probe: probe, downloadWait: downloadWait)
+        let subject = provisioner(release, probe: probe)
         let host = try hostBinary()
         _ = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
         probe.set("distill 2.0.32 (b)")
@@ -288,48 +285,13 @@ final class DistillGuestBinaryTests: XCTestCase {
 
     // MARK: Host version changes
 
-    /// A bot must not knowingly run an outdated distill: right after a host
-    /// update the run waits for the new guest build even though the previous
-    /// one is cached and would start at once.
-    func test_hostUpdate_waitsForTheNewDownloadInsteadOfRunningTheCachedPreviousVersion() async throws {
+    /// A host update must not make the next bot message wait minutes for
+    /// ~224 MB: the cached previous build runs at once while the new one
+    /// downloads, and the run after the download gets the new build.
+    func test_hostUpdate_runsTheCachedPreviousVersionAtOnceWhileTheNewOneDownloads() async throws {
         let release = FakeRelease()
         release.publish("2.0.32", assets: [asset: Data("v32".utf8)])
         let (subject, host) = try await provisionerAfterHostUpdate(release)
-        release.hold(url("2.0.32", asset))
-        let returned = Flag()
-        let pending = Task {
-            let binary = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
-            returned.set()
-            return binary
-        }
-        try await waitUntil { self.assetFetches(release, "2.0.32") == 1 }
-        try await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertFalse(returned.isSet, "the cached 2.0.31 must not run while 2.0.32 downloads")
-        release.release(url("2.0.32", asset))
-        let binary = try await pending.value
-        XCTAssertEqual(binary.version, v32)
-        XCTAssertEqual(binary.requestedVersion, v32)
-        XCTAssertEqual(try Data(contentsOf: binary.hostURL), Data("v32".utf8))
-    }
-
-    /// Offline, or a release without the asset: the bot still runs, on the
-    /// newest build it has, and the result says it is not the wanted one.
-    func test_hostUpdate_fallsBackToTheCachedPreviousVersionWhenTheNewDownloadFails() async throws {
-        let release = FakeRelease()
-        let (subject, host) = try await provisionerAfterHostUpdate(release)
-        let binary = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
-        XCTAssertEqual(binary.version, v31)
-        XCTAssertEqual(binary.requestedVersion, v32)
-        XCTAssertEqual(release.requests.last, url("2.0.32", "SHA256SUMS"), "the new version was tried first")
-    }
-
-    /// A slow line must not hold a run forever: at the bound it runs the
-    /// previous build, and the same download goes on so the next run gets
-    /// the new one without starting over.
-    func test_hostUpdate_fallsBackAtTheBoundWhileTheDownloadContinues() async throws {
-        let release = FakeRelease()
-        release.publish("2.0.32", assets: [asset: Data("v32".utf8)])
-        let (subject, host) = try await provisionerAfterHostUpdate(release, downloadWait: 0.2)
         release.hold(url("2.0.32", asset))
         let during = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
         XCTAssertEqual(during.version, v31)
@@ -340,95 +302,28 @@ final class DistillGuestBinaryTests: XCTestCase {
         try await waitUntil { FileManager.default.fileExists(atPath: self.installedPath("2.0.32") + ".sha256") }
         let after = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
         XCTAssertEqual(after.version, v32)
-        XCTAssertEqual(assetFetches(release, "2.0.32"), 1, "the timed-out wait must not cancel or restart the download")
+        XCTAssertEqual(try Data(contentsOf: after.hostURL), Data("v32".utf8))
+        XCTAssertEqual(assetFetches(release, "2.0.32"), 1, "the run that fell back must not cancel or restart the download")
     }
 
-    /// On a slow line the bound is paid once per download: the next bot
-    /// message must not wait the full bound again for a version it will not
-    /// get, holding the bot's run claim meanwhile.
-    func test_hostUpdate_laterRunsFallBackAtOnceWhileTheSameDownloadContinues() async throws {
+    /// Offline, or a release without the asset: the bot still runs, on the
+    /// newest build it has, and the result says it is not the wanted one.
+    func test_hostUpdate_fallsBackToTheCachedPreviousVersionWhenTheNewDownloadFails() async throws {
         let release = FakeRelease()
-        release.publish("2.0.32", assets: [asset: Data("v32".utf8)])
-        let (subject, host) = try await provisionerAfterHostUpdate(release, downloadWait: 0.6)
-        release.hold(url("2.0.32", asset))
-        let first = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
-        XCTAssertEqual(first.version, v31)
-
-        let started = Date()
-        let second = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
-        XCTAssertEqual(second.version, v31)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 0.3, "the bound was already paid by the first run")
-        XCTAssertEqual(assetFetches(release, "2.0.32"), 1)
-
-        release.release(url("2.0.32", asset))
-        try await waitUntil { FileManager.default.fileExists(atPath: self.installedPath("2.0.32") + ".sha256") }
-        let after = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
-        XCTAssertEqual(after.version, v32)
-    }
-
-    /// Prefetch time nobody waited for is not charged to the bound: a run
-    /// that starts after a long background download still waits for it
-    /// instead of knowingly running the outdated build.
-    func test_hostUpdate_runAfterALongPrefetchStillWaitsForTheDownload() async throws {
-        let release = FakeRelease()
-        release.publish("2.0.32", assets: [asset: Data("v32".utf8)])
-        let (subject, host) = try await provisionerAfterHostUpdate(release, downloadWait: 0.5)
-        release.hold(url("2.0.32", asset))
-        subject.prefetch(hostBinary: host, dockerArch: "arm64")
-        try await waitUntil { self.assetFetches(release, "2.0.32") == 1 }
-        try await Task.sleep(nanoseconds: 550_000_000)
-        let returned = Flag()
-        let pending = Task {
-            let binary = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
-            returned.set()
-            return binary
-        }
-        try await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertFalse(returned.isSet, "the download outlasted the bound only while nobody waited on it")
-        release.release(url("2.0.32", asset))
-        let binary = try await pending.value
-        XCTAssertEqual(binary.version, v32)
-        XCTAssertEqual(assetFetches(release, "2.0.32"), 1)
-    }
-
-    /// Stop while the agent is being prepared must end the run at once, and
-    /// must not throw away a download every other bot shares.
-    func test_stopDuringTheWait_endsTheWaitAndLeavesTheDownloadUsable() async throws {
-        let release = FakeRelease()
-        release.publish("2.0.32", assets: [asset: Data("v32".utf8)])
-        let (subject, host) = try await provisionerAfterHostUpdate(release, downloadWait: 60)
-        release.hold(url("2.0.32", asset))
-        let ended = Flag()
-        let stopped = Task { () -> Result<DistillGuestBinary, Error> in
-            defer { ended.set() }
-            do {
-                return .success(try await subject.resolve(hostBinary: host, dockerArch: "arm64"))
-            } catch {
-                return .failure(error)
-            }
-        }
-        try await waitUntil { self.assetFetches(release, "2.0.32") == 1 }
-        stopped.cancel()
-        try await waitUntil(timeout: 2) { ended.isSet }
-        // Released either way so a regression fails here instead of hanging the suite.
-        release.release(url("2.0.32", asset))
-        switch await stopped.value {
-        case .success(let binary): XCTFail("a stopped run must not get a binary, got \(binary.version)")
-        case .failure(let error): XCTAssertTrue(error is CancellationError, "\(error)")
-        }
-
-        let next = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
-        XCTAssertEqual(next.version, v32)
-        XCTAssertEqual(assetFetches(release, "2.0.32"), 1, "the stopped run's download finished and was reused")
+        let (subject, host) = try await provisionerAfterHostUpdate(release)
+        let binary = try await subject.resolve(hostBinary: host, dockerArch: "arm64")
+        XCTAssertEqual(binary.version, v31)
+        XCTAssertEqual(binary.requestedVersion, v32)
+        try await waitUntil { release.requests.last == self.url("2.0.32", "SHA256SUMS") }
     }
 
     /// With no build cached there is nothing older to run: the first run
-    /// keeps waiting past the bound instead of failing.
-    func test_nothingCached_keepsWaitingPastTheBound() async throws {
+    /// waits for the download instead of failing.
+    func test_nothingCached_waitsForTheDownload() async throws {
         let release = FakeRelease()
         release.publish("2.0.31", assets: [asset: Data("v31".utf8)])
         release.hold(url("2.0.31", asset))
-        let subject = provisioner(release, downloadWait: 0.05)
+        let subject = provisioner(release)
         let host = try hostBinary()
         let pending = Task { try await subject.resolve(hostBinary: host, dockerArch: "arm64") }
         try await waitUntil { self.assetFetches(release, "2.0.31") == 1 }
@@ -438,14 +333,14 @@ final class DistillGuestBinaryTests: XCTestCase {
         XCTAssertEqual(binary.version, v31)
     }
 
-    /// A first run on a slow line waits without a bound, so Stop is the only
-    /// way out: it must end the run at once instead of holding it until
+    /// A first run waits for the download without a bound, so Stop is the
+    /// only way out: it must end the run at once instead of holding it until
     /// ~224 MB arrive, and must not throw away the download the next run needs.
-    func test_nothingCached_stopPastTheBoundEndsTheWaitAndLeavesTheDownloadUsable() async throws {
+    func test_nothingCached_stopEndsTheWaitAndLeavesTheDownloadUsable() async throws {
         let release = FakeRelease()
         release.publish("2.0.31", assets: [asset: Data("v31".utf8)])
         release.hold(url("2.0.31", asset))
-        let subject = provisioner(release, downloadWait: 0.05)
+        let subject = provisioner(release)
         let host = try hostBinary()
         let ended = Flag()
         let stopped = Task { () -> Result<DistillGuestBinary, Error> in
@@ -457,9 +352,8 @@ final class DistillGuestBinaryTests: XCTestCase {
             }
         }
         try await waitUntil { self.assetFetches(release, "2.0.31") == 1 }
-        // Past the bound: the run is now in the wait that has no deadline.
         try await Task.sleep(nanoseconds: 200_000_000)
-        XCTAssertFalse(ended.isSet, "with nothing cached the run keeps waiting past the bound")
+        XCTAssertFalse(ended.isSet, "with nothing cached the run waits for the download")
         stopped.cancel()
         try await waitUntil(timeout: 2) { ended.isSet }
         // Released either way so a regression fails here instead of hanging the suite.
