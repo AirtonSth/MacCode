@@ -165,15 +165,38 @@ final class AgentActivityServiceTests: XCTestCase {
         let activity = service(context)
         XCTAssertEqual(try decodePage(activity.list(["section": .string("finished")])).items.count, 50, "an ordinary page stays small")
         let bulk = try decodePage(activity.list(["section": .string("finished"), "limit": .number(500)]))
-        XCTAssertEqual(bulk.items.count, 120, "a bulk action must be able to read its filter without one full recompute per 50 rows")
+        XCTAssertEqual(bulk.items.count, ActivityService.resultsLimit, "Results keeps only the newest 99 finished items; the rest stay in the database")
         XCTAssertNil(bulk.nextCursor)
         XCTAssertEqual(bulk.items.first?.id, "notification:note-119", "the larger page keeps newest-first order")
-        for index in 120..<520 {
-            try repository.insert(AppNotification(id: "note-\(index)", title: "safe", category: PetNotificationCategory.gitCompleted.rawValue, createdAt: Date(timeIntervalSince1970: Double(1_000 + index))))
+        // Failures need action, so the Results cap never drops them; the page limit still bounds the response.
+        for index in 120..<620 {
+            try repository.insert(AppNotification(id: "note-\(index)", title: "safe", category: PetNotificationCategory.gitFailed.rawValue, createdAt: Date(timeIntervalSince1970: Double(1_000 + index))))
         }
         let capped = try decodePage(activity.list(["section": .string("finished"), "limit": .number(5_000)]))
         XCTAssertEqual(capped.items.count, 500, "the response size stays bounded whatever a client asks for")
         XCTAssertNotNil(capped.nextCursor)
+    }
+
+    func test_resultsKeepNewest99CompletedAndNeverDropAnItemThatNeedsAction() throws {
+        // WHY: Results is a feed the owner reads, not an archive; 548 finished rows buried the
+        // list. Only done items are capped, so a failure still waiting for the owner stays visible.
+        let context = try makeContext()
+        let failed = try makeRun(context, thread: try makeThread(context), status: .failed, at: 1)
+        var completedIDs: [String] = []
+        for index in 0..<120 {
+            let run = try makeRun(context, thread: try makeThread(context), status: .completed, at: Double(1_000 + index))
+            completedIDs.append("run:\(run.id.description)")
+        }
+        let activity = service(context)
+        let page = try decodePage(activity.list(["section": .string("finished"), "limit": .number(500)]))
+        let ids = Set(page.items.map(\.id))
+        XCTAssertTrue(ids.contains("run:\(failed.id.description)"), "a failure that needs action is never dropped, however old")
+        XCTAssertEqual(page.items.filter { $0.state == .completed }.count, ActivityService.resultsLimit)
+        XCTAssertEqual(page.counts.finished, ActivityService.resultsLimit + 1, "the count matches what Results lists")
+        XCTAssertEqual(page.items.first { $0.state == .completed }?.id, completedIDs.last, "the newest completed run is kept")
+        XCTAssertFalse(ids.contains(completedIDs[0]), "the oldest completed run is dropped from the view")
+        XCTAssertNotNil(try AgentRunRepository(db: context.db).get(id: AgentRunID(UUID(uuidString: String(completedIDs[0].dropFirst(4)))!)),
+                        "the cap is a view limit: the run row stays in the database")
     }
 
     func test_durableRunWithoutCanonicalRuntimeIdentityIsNotReportedRunning() throws {

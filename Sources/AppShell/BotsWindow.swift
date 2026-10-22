@@ -8745,9 +8745,6 @@ public final class BotsViewModel: ObservableObject {
            !deskSupportedReasoning.contains(effort) {
             return "Main effort \(effort.displayName) is unavailable for the selected Distill model. Choose Auto or a supported effort."
         }
-        if mainSelection.isAutomatic, !deskSupportsDistillMainEffortAuto {
-            return "Update the Distill ACP harness to apply Auto Main effort."
-        }
         if let reasoningModel = deskRouting.reasoningModel,
            let effort = deskDistillReasoningEffortSelection.effort {
             if !deskDistillReasoningEfforts.isEmpty, !deskDistillReasoningEfforts.contains(effort) {
@@ -14361,15 +14358,19 @@ public struct BotsRootView: View {
             // Same copy as the linked thread's empty state, which is rarely
             // painted: a thread is linked by its first message.
             if vm.deskMessages.isEmpty {
-                AgentNewConversationEmptyState(
-                    title: "Message \(BotsViewModel.displayName(bot.name))",
-                    subtitle: "This thread has no messages yet."
-                )
-                // Reaches the subtitle too: three lines keep it whole in the
-                // narrowest chat column.
-                .lineLimit(3)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, DS.Space.lg)
+                // Scrolls so a tall empty state cannot push the Desk header out.
+                ScrollView(.vertical) {
+                    AgentNewConversationEmptyState(
+                        title: "Message \(BotsViewModel.displayName(bot.name))",
+                        subtitle: "This thread has no messages yet."
+                    )
+                    // Reaches the subtitle too: three lines keep it whole in the
+                    // narrowest chat column.
+                    .lineLimit(3)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, DS.Space.lg)
+                }
+                .frame(maxHeight: .infinity)
             } else {
                 // A send that persisted but could not link its thread: the
                 // message exists, so the column must not say it does not.

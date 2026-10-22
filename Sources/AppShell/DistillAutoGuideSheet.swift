@@ -92,7 +92,7 @@ struct DistillAutoGuideSheet: View {
     @MainActor static func installFactory(context: AppContext) {
         AgentAccountsInline.make = { [weak context] in
             guard let context else { return AnyView(EmptyView()) }
-            return AnyView(DistillAccountsSettingsSection(
+            return AnyView(DistillAccountsInlineDisclosure(
                 controller: context.distillAccountsController,
                 loadModels: { [weak context] in await context?.router?.listAgentModels(provider: .distill) ?? [] }
             ))

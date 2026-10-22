@@ -5991,10 +5991,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
            !supportedReasoningEffortsForSelectedModel.contains(effort) {
             return "Main effort \(effort.displayName) is unavailable for the selected Distill model. Choose Auto or a supported effort."
         }
-        if distillMainEffortSelection.isAutomatic,
-           !selectedProviderCapabilities.supportsDistillMainEffortAuto {
-            return "Update the Distill ACP harness to apply Auto Main effort."
-        }
         if let reasoningModel, let effort = distillReasoningEffortSelection.effort {
             if !distillReasoningEfforts.isEmpty, !distillReasoningEfforts.contains(effort) {
                 return "Worker effort \(effort.displayName) is unavailable for \(reasoningModel). Choose Auto or a supported effort."

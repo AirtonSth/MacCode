@@ -434,9 +434,6 @@ public final class ScheduledTaskExecutor {
             throw ScheduledTaskPreflightError.invalidTask("Select an explicit Distill Main model.")
         }
         let mainEffortSelection = task.distillMainEffortSelection ?? .fixed(task.reasoningEffort)
-        if mainEffortSelection.isAutomatic && !snapshot.effectiveCapabilities.supportsDistillMainEffortAuto {
-            throw ScheduledTaskPreflightError.invalidTask("Update the Distill ACP session to apply Auto Main effort.")
-        }
         let mainDescriptor = snapshot.models.first(where: { $0.id == mainModel })
         if let effort = mainEffortSelection.effort,
            let supported = mainDescriptor?.supportedReasoningEfforts,

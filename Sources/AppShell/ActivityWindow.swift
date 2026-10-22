@@ -720,9 +720,10 @@ final class ActivityViewModel: ObservableObject {
         }
         // Advance to the neighbor so triage continues without re-aiming.
         var successor: ActivityWireItem?
-        if let selectedID, ids.contains(selectedID), let index = page.items.firstIndex(where: { $0.id == selectedID }) {
-            successor = page.items[(index + 1)...].first { !ids.contains($0.id) }
-                ?? page.items[..<index].last { !ids.contains($0.id) }
+        let visual = listSections.flatMap(\.items)
+        if let selectedID, ids.contains(selectedID), let index = visual.firstIndex(where: { $0.id == selectedID }) {
+            successor = visual[(index + 1)...].first { !ids.contains($0.id) }
+                ?? visual[..<index].last { !ids.contains($0.id) }
         }
         let selectionCleared = selectedID.map(ids.contains) ?? false
         page.items.removeAll { ids.contains($0.id) }
@@ -1139,24 +1140,11 @@ struct ActivityRootView: View {
         } else {
             ScrollViewReader { proxy in
                 List(selection: selection) {
-                    if model.tab == .running {
-                        if !model.runningItems.isEmpty {
-                            Section("Running") {
-                                ForEach(model.runningItems) { item in activityRow(item) }
-                            }
-                        }
-                        if !model.queuedItems.isEmpty {
-                            Section("Queued · \(model.page.counts.queued)") {
-                                ForEach(model.queuedItems) { item in activityRow(item) }
-                            }
-                        }
-                    } else {
-                        ForEach(model.tab == .needsYou ? model.needsYouSections : model.resultSections, id: \.title) { section in
-                            Section {
-                                ForEach(section.items) { item in activityRow(item) }
-                            } header: {
-                                sectionHeader(section.title, count: model.tab == .needsYou ? section.items.count : nil)
-                            }
+                    ForEach(model.listSections) { section in
+                        Section {
+                            ForEach(section.items) { item in activityRow(item, showsWorkspace: false) }
+                        } header: {
+                            sectionHeader(section.title, count: section.items.count)
                         }
                     }
                     if model.cursorAvailable { loadMoreRow }
@@ -1201,14 +1189,15 @@ struct ActivityRootView: View {
         .listRowSeparator(.hidden)
     }
 
-    private func activityRow(_ item: ActivityWireItem) -> some View {
+    private func activityRow(_ item: ActivityWireItem, showsWorkspace: Bool) -> some View {
         ActivityRow(
             item: item,
             bot: botForItem(item),
             toggleRead: { item.isUnread ? model.markRead(item) : model.markUnread(item) },
             clear: { model.acknowledge(item) },
             open: canOpen(item) ? { openThread(item) } : nil,
-            openLabel: openLabel(item)
+            openLabel: openLabel(item),
+            showsWorkspace: showsWorkspace
         )
         .id(item.id)
         .listRowSeparatorTint(DS.Palette.line)
@@ -1496,6 +1485,8 @@ private struct ActivityRow: View {
     let clear: () -> Void
     let open: (() -> Void)?
     let openLabel: String
+    /// Off inside a workspace section, where the header already names the workspace.
+    var showsWorkspace: Bool = true
     @State private var hovering = false
     @Environment(\.backgroundProminence) private var prominence
 
@@ -1505,7 +1496,10 @@ private struct ActivityRow: View {
     private var secondary: Color { prominence == .increased ? DS.Palette.text : DS.Palette.textSecondary }
     private var stateColor: Color { prominence == .increased ? DS.Palette.text : ActivityStatusStyle.color(item.state) }
     private var showsActions: Bool { hovering && (item.isMarkable || item.isClearable) }
-    private var facts: String { [item.workspace_name, item.provider, item.origin_label].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ") }
+    private var facts: String { factsLine(workspace: showsWorkspace) }
+    private func factsLine(workspace: Bool) -> String {
+        [workspace ? item.workspace_name : nil, item.provider, item.origin_label].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: DS.Space.md) {
@@ -1549,7 +1543,7 @@ private struct ActivityRow: View {
             if item.isClearable { Button("Dismiss alert", action: clear) }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel([item.displayTitle, item.statusLabel, facts, item.listSummary ?? ""].filter { !$0.isEmpty }.joined(separator: ", "))
+        .accessibilityLabel([item.displayTitle, item.statusLabel, factsLine(workspace: true), item.listSummary ?? ""].filter { !$0.isEmpty }.joined(separator: ", "))
         .accessibilityValue(item.isUnread ? "Unread" : "")
         .accessibilityActions {
             if let open { Button(openLabel, action: open) }
@@ -1590,42 +1584,46 @@ private extension DSIconButton {
 extension ActivityViewModel {
     var runningItems: [ActivityWireItem] { page.items.filter { $0.state != "queued" } }
 
-    struct ItemSection { let title: String; let items: [ActivityWireItem] }
+    struct ItemSection: Identifiable { let id: String; let title: String; let items: [ActivityWireItem] }
 
-    /// What the user has to do decides the group: answer a paused run first, then decide on failures.
-    var needsYouSections: [ItemSection] {
-        let reply: Set<String> = ["waiting_approval", "waiting_answer"]
-        let groups: [(String, (ActivityWireItem) -> Bool)] = [
-            ("Waiting for your reply", { reply.contains($0.state) }),
-            ("Review and retry", { ["failed", "interrupted"].contains($0.state) || ($0.state == "needs_you" && $0.kind == "agent") }),
-            ("Review required", { $0.state == "needs_you" && $0.kind != "agent" }),
-        ]
-        var sections = groups.map { title, match in ItemSection(title: title, items: page.items.filter(match)) }
-        let grouped = Set(sections.flatMap { $0.items.map(\.id) })
-        sections.append(ItemSection(title: "Other", items: page.items.filter { !grouped.contains($0.id) }))
-        return sections.filter { !$0.items.isEmpty }
-    }
-
-    /// Results read like a feed: newest day first.
-    func resultSections(now: Date = Date(), calendar: Calendar = .current) -> [ItemSection] {
+    /// One list for every tab: rows grouped by workspace, in the order each workspace first
+    /// appears (newest first). Items without a workspace go last.
+    func workspaceSections(_ items: [ActivityWireItem]) -> [ItemSection] {
         var order: [String] = []
+        var names: [String: String] = [:]
         var buckets: [String: [ActivityWireItem]] = [:]
-        for item in page.items {
-            let title = Self.dayTitle(item.occurredDate, now: now, calendar: calendar)
-            if buckets[title] == nil { order.append(title) }
-            buckets[title, default: []].append(item)
+        var unassigned: [ActivityWireItem] = []
+        for item in items {
+            guard let key = item.workspace_id, !key.isEmpty else { unassigned.append(item); continue }
+            if buckets[key] == nil {
+                order.append(key)
+                names[key] = item.workspace_name.flatMap { $0.isEmpty ? nil : $0 } ?? "Workspace"
+            }
+            buckets[key, default: []].append(item)
         }
-        return order.map { ItemSection(title: $0, items: buckets[$0] ?? []) }
+        var sections = order.map { ItemSection(id: $0, title: names[$0] ?? "Workspace", items: buckets[$0] ?? []) }
+        if !unassigned.isEmpty { sections.append(ItemSection(id: "", title: "No workspace", items: unassigned)) }
+        return sections
     }
-    var resultSections: [ItemSection] { resultSections() }
 
-    static func dayTitle(_ date: Date?, now: Date, calendar: Calendar) -> String {
-        guard let date else { return "Earlier" }
-        if calendar.isDate(date, inSameDayAs: now) { return "Today" }
-        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(date, inSameDayAs: yesterday) { return "Yesterday" }
-        if let week = calendar.date(byAdding: .day, value: -7, to: now), date > week { return "Past 7 days" }
-        return "Earlier"
+    /// Sections as the list shows them. Needs you puts answers first inside each workspace.
+    var listSections: [ItemSection] {
+        let sections = workspaceSections(page.items)
+        guard tab == .needsYou else { return sections }
+        return sections.map { section in
+            let ranked = section.items.enumerated().sorted { lhs, rhs in
+                let left = Self.needsAnswerFirst(lhs.element) ? 0 : 1
+                let right = Self.needsAnswerFirst(rhs.element) ? 0 : 1
+                return left == right ? lhs.offset < rhs.offset : left < right
+            }
+            return ItemSection(id: section.id, title: section.title, items: ranked.map(\.element))
+        }
     }
+
+    private static func needsAnswerFirst(_ item: ActivityWireItem) -> Bool {
+        item.state == "waiting_approval" || item.state == "waiting_answer"
+    }
+
     var queuedItems: [ActivityWireItem] { page.items.filter { $0.state == "queued" } }
     var cursorAvailable: Bool { cursor != nil }
     /// The host count covers the whole filter; the loaded rows cover a result the count cannot see yet.

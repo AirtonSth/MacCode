@@ -213,11 +213,12 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: prepared.identity.storageBotID)
             let leaseHeartbeat = try BotGuestLeaseHeartbeat(guestHome: guestHome, runID: runID, interval: deps.heartbeatInterval)
             heartbeat = leaseHeartbeat
-            let guestCwd: String
+            let computedGuestCwd: String
             switch admission.pin.context {
-            case .general: guestCwd = BotComputerGuestSpec.guestUserHome
-            case .workspace: guestCwd = request.cwd
+            case .general: computedGuestCwd = BotComputerGuestSpec.guestUserHome
+            case .workspace: computedGuestCwd = request.cwd
             }
+            let guestCwd = Self.guestResumeCwd(request, guestHome: guestHome, computed: computedGuestCwd, mounted: [])
             let guestCommand = try DistillGuestLaunchPlan.guestCommand(binaryPath: binaryPath, for: request)
             try validate()
             progress(.launching)
@@ -332,10 +333,14 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             try Task.checkCancellation()
             // A workspace-pinned Bot conversation runs in the Bot's Mac home like a
             // desk one; that path is never mounted, so it runs in the guest home.
-            let guestCwd = try Self.guestCwd(
+            let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: resourceID)
+            let computedGuestCwd = try Self.guestCwd(
                 requestCwd: thread.workspaceId == nil ? (workspace ?? request.cwd) : request.cwd,
                 workspace: Self.isBotHome(request.cwd, appSupport: deps.appSupport) ? nil : workspace,
                 mounted: vm.mountedWorkspaces
+            )
+            let guestCwd = Self.guestResumeCwd(
+                request, guestHome: guestHome, computed: computedGuestCwd, mounted: vm.mountedWorkspaces
             )
 
             progress(.preparingAgent)
@@ -401,7 +406,6 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 deadline.cancel()
             }
             try Task.checkCancellation()
-            let guestHome = BotComputerGuestSpec.guestHomeURL(appSupport: deps.appSupport, botID: resourceID)
             let guestDistillHome = DistillGuestCredentials.distillHome(guestHome: guestHome)
             let mirror = mirror(hostHome: hostHome, binary: hostBinary, environment: hostEnvironment)
             try mirror.begin(runID: runID, guestDistillHome: guestDistillHome, provider: provider, accounts: accounts)
@@ -545,6 +549,34 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             )
         }
         return cwd
+    }
+
+    /// A resumed guest session must run in the cwd Distill stored it under:
+    /// `session/load` fails when the cwd differs. Keep the stored cwd only when
+    /// it is the guest home or inside a mounted workspace; otherwise keep `computed`.
+    static func resumeGuestCwd(computed: String, stored: String?, mounted: [String]) -> String {
+        guard let stored, stored != computed else { return computed }
+        if stored == BotComputerGuestSpec.guestUserHome || mountContaining(stored, mounted) != nil {
+            return stored
+        }
+        return computed
+    }
+
+    /// `resumeGuestCwd` for a run; reads the stored session from the guest's `.distill`.
+    static func guestResumeCwd(
+        _ request: AgentRunRequest, guestHome: URL, computed: String, mounted: [String]
+    ) -> String {
+        guard let sessionId = request.providerThreadId, !sessionId.isEmpty else { return computed }
+        let sessionsRoot = DistillGuestCredentials.distillHome(guestHome: guestHome)
+            .appendingPathComponent("sessions", isDirectory: true)
+        let stored = DistillACPAdapter.storedSessionCwd(sessionsRoot: sessionsRoot, sessionId: sessionId)
+        let resumed = resumeGuestCwd(computed: computed, stored: stored, mounted: mounted)
+        if resumed != computed {
+            guestResolverLog.info(
+                "bot.guest.resume_cwd_switched run=\(request.runId.value.uuidString.lowercased(), privacy: .public) thread=\(request.threadId.description, privacy: .public)"
+            )
+        }
+        return resumed
     }
 
     /// A Bot home: under the running app's bots root, or at

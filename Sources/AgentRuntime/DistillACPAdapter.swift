@@ -513,7 +513,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     isFallback: true,
                     interactionModes: [.default],
                     permissionModes: Self.defaultPermissionModes,
-                    capabilities: .conservative,
+                    capabilities: AgentProviderCapabilities(supportsDistillMainEffortAuto: true),
                     discoveryCacheKey: cacheKey
                 )
                 : DistillACPDiscoveryResult(
@@ -530,7 +530,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 isFallback: true,
                 interactionModes: [.default],
                 permissionModes: Self.defaultPermissionModes,
-                capabilities: .conservative,
+                capabilities: AgentProviderCapabilities(supportsDistillMainEffortAuto: true),
                 discoveryCacheKey: cacheKey
             )
         }
@@ -1245,7 +1245,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
 
     /// Finds `<sessionsRoot>/<encoded cwd>/<sessionId>` and returns its cwd:
     /// `summary.json` `info.cwd` first, else the percent-decoded parent name.
-    static func storedSessionCwd(sessionsRoot: URL, sessionId: String) -> String? {
+    public static func storedSessionCwd(sessionsRoot: URL, sessionId: String) -> String? {
         guard !sessionId.isEmpty, !sessionId.contains("/"), !sessionId.contains("..") else { return nil }
         let fileManager = FileManager.default
         guard let groups = try? fileManager.contentsOfDirectory(

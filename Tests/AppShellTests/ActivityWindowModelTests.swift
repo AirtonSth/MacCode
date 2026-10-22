@@ -737,17 +737,24 @@ final class ActivityWindowModelTests: XCTestCase {
     }
 
     @MainActor
-    func test_needsYouGroupsByWhatTheUserMustDoAndResultsGroupByDay() async throws {
-        // WHY: a flat mixed list of approvals, failures and expired requests did not tell the
-        // owner what to do first (2026-10-19). Replies come first, then failures.
+    private func inWorkspace(_ item: ActivityWireItem, _ id: String?, _ name: String?) -> ActivityWireItem {
+        var copy = item
+        copy.workspace_id = id
+        copy.workspace_name = name
+        return copy
+    }
+
+    @MainActor
+    func test_sectionsGroupByWorkspaceInFirstAppearanceOrderAndAnswersLeadNeedsYou() async throws {
+        // WHY: the owner scans Activity per project. Sections follow the newest-first list, so the
+        // most recent workspace is on top; a workspace is keyed by id because names can collide.
         let defaults = UserDefaults(suiteName: "activity-sections-\(UUID())")!
-        let iso = ISO8601DateFormatter()
-        let now = Date()
         let fixture = [
-            item("failed", at: iso.string(from: now), state: "failed", needsAction: true),
-            item("approval", at: iso.string(from: now), kind: "request", state: "waiting_approval"),
-            item("expired", at: iso.string(from: now.addingTimeInterval(-86_400)), kind: "request", state: "expired"),
-            item("old", at: iso.string(from: now.addingTimeInterval(-30 * 86_400)), needsAction: true),
+            inWorkspace(item("elephant-task", state: "completed"), "ws-elephant", "Elephant"),
+            inWorkspace(item("star-deploy", state: "completed"), "ws-star", "Star"),
+            inWorkspace(item("loose", state: "completed"), nil, nil),
+            inWorkspace(item("elephant-failed", state: "failed", needsAction: true), "ws-elephant", "Elephant"),
+            inWorkspace(item("star-approval", kind: "request", state: "waiting_approval"), "ws-star", "Star-renamed"),
         ]
         let response = page(fixture)
         let model = ActivityViewModel(service: ActivityClient(
@@ -755,9 +762,17 @@ final class ActivityWindowModelTests: XCTestCase {
             setViewed: { _ in .object([:]) }, acknowledge: { _ in .object([:]) }
         ), defaults: defaults)
         model.refreshAfterFrame()
-        await waitUntil("loaded") { model.page.items.count == 4 && !model.loading }
-        XCTAssertEqual(model.needsYouSections.map(\.title), ["Waiting for your reply", "Review and retry", "Other"])
-        XCTAssertEqual(model.needsYouSections.first?.items.map(\.id), ["approval"])
-        XCTAssertEqual(model.resultSections(now: now).map(\.title), ["Today", "Yesterday", "Earlier"])
+        await waitUntil("loaded") { model.page.items.count == 5 && !model.loading }
+
+        XCTAssertEqual(model.workspaceSections(model.page.items).map(\.title), ["Elephant", "Star", "No workspace"])
+        XCTAssertEqual(model.workspaceSections(model.page.items).map { $0.items.map(\.id) },
+                       [["elephant-task", "elephant-failed"], ["star-deploy", "star-approval"], ["loose"]])
+
+        model.tab = .needsYou
+        await waitUntil("needs you loaded") { model.page.items.count == 5 && !model.loading }
+        XCTAssertEqual(model.listSections.first { $0.title == "Star" }?.items.map(\.id), ["star-approval", "star-deploy"],
+                       "a reply the user owes comes before other rows of the same workspace")
+        XCTAssertEqual(model.listSections.first { $0.title == "Elephant" }?.items.map(\.id), ["elephant-task", "elephant-failed"],
+                       "without a waiting reply the newest-first order stays")
     }
 }

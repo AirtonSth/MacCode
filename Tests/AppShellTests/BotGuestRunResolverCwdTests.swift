@@ -42,4 +42,24 @@ final class BotGuestRunResolverCwdTests: XCTestCase {
             BotComputerGuestSpec.guestUserHome
         )
     }
+
+    /// A resumed Distill session is only found again under the cwd it was stored
+    /// with, so the stored cwd wins when the guest can still reach it.
+    func test_resumeGuestCwd_keepsStoredCwdOnlyWhenReachable() {
+        let computed = "/Users/u/repo"
+        let mount = "/Users/u/repo"
+        XCTAssertEqual(BotGuestRunResolver.resumeGuestCwd(computed: computed, stored: nil, mounted: [mount]), computed)
+        XCTAssertEqual(
+            BotGuestRunResolver.resumeGuestCwd(computed: computed, stored: BotComputerGuestSpec.guestUserHome, mounted: [mount]),
+            BotComputerGuestSpec.guestUserHome
+        )
+        XCTAssertEqual(
+            BotGuestRunResolver.resumeGuestCwd(computed: computed, stored: "/Users/u/other", mounted: [mount]),
+            computed
+        )
+        XCTAssertEqual(
+            BotGuestRunResolver.resumeGuestCwd(computed: computed, stored: mount + "/src", mounted: [mount]),
+            mount + "/src"
+        )
+    }
 }

@@ -31,7 +31,7 @@ public struct AgentNewConversationEmptyState: View {
 
     public var body: some View {
         if let makeAccounts = AgentAccountsInline.make {
-            VStack(spacing: DS.Space.xxl) {
+            VStack(spacing: DS.Space.xl) {
                 VStack(spacing: DS.Space.md) {
                     AgentChoiceIconTile(systemName: "sparkles", tint: DS.Palette.ultracode, size: 40)
                     Text(title).font(DS.Font.title3).foregroundColor(DS.Palette.text)
@@ -46,7 +46,7 @@ public struct AgentNewConversationEmptyState: View {
                     .accessibilityIdentifier("agent.accounts.inline")
             }
             .padding(.horizontal, DS.Space.xxl)
-            .padding(.vertical, DS.Space.xxl)
+            .padding(.vertical, DS.Space.xl)
             .frame(maxWidth: .infinity, alignment: .center)
         } else {
             DSEmptyState(icon: "sparkles", title: title, subtitle: subtitle)

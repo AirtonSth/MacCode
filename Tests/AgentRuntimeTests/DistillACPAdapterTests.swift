@@ -140,7 +140,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
 
         XCTAssertTrue(result.isFallback)
         XCTAssertEqual(result.models, DistillRunner.listModels(installedVersion: nil))
-        XCTAssertEqual(result.capabilities, .conservative)
+        XCTAssertEqual(result.capabilities, AgentProviderCapabilities(supportsDistillMainEffortAuto: true))
     }
 
     /// A peer whose model-less session/new is refused with ACP `auth_required`.

@@ -128,7 +128,7 @@ Every screen must work at any window width, from the narrowest the window allows
 - Creation actions ("New bot…", "Add option") come last in a list, after a divider, styled as a dashed `lineStrong` card or a `plus` row.
 - Menus are ordered: selection → actions on the current object → destructive (separated) → creation.
 
-**New conversation** — `AgentNewConversationEmptyState` (Agent App and Bot Desk): 40 purple sparkles tile, title, subtitle, and the inline Accounts & Auto editor when available.
+**New conversation** — `AgentNewConversationEmptyState` (Agent App and Bot Desk): 40 purple sparkles tile, title, subtitle, and the inline Accounts & Auto editor when available. The editor is a disclosure card (`DistillAccountsInlineDisclosure`): 28 icon tile, `bodyStrong` title, summary line (2 lines max), chevron rotating 90° with "Show"/"Hide", `micro` motion, open until Auto routing is set up; the choice persists in `agent.emptyState.accountsExpanded`.
 
 ## 9. States
 

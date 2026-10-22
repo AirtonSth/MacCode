@@ -246,7 +246,7 @@ final class ActivityService: @unchecked Sendable {
         items.append(contentsOf: busySurfaces)
         items.append(contentsOf: origins.botRequests)
         items.append(contentsOf: origins.scheduledOccurrences)
-        return items.filter { $0.occurredAt <= snapshotAt && filter.matches($0) }
+        return Self.applyingResultsLimit(items.filter { $0.occurredAt <= snapshotAt && filter.matches($0) })
     }
 
     func setViewed(_ params: [String: JSONValue]) throws -> JSONValue {
@@ -604,6 +604,15 @@ final class ActivityService: @unchecked Sendable {
         Dictionary(grouping: items.compactMap { item in
             item.workspaceID.map { ($0.uuidString, item) }
         }, by: { $0.0 }).mapValues { Self.counts(for: $0.map { $0.1 }) }
+    }
+
+    /// Results keep only the newest terminal items that need no action. This is a view cap:
+    /// rows stay in the database, and an item that still needs action is never dropped.
+    static let resultsLimit = 99
+    static func applyingResultsLimit(_ items: [AgentActivityItem]) -> [AgentActivityItem] {
+        let results = items.filter { Self.isTerminal($0.state) && !$0.needsAction }.sorted(by: Self.activityOrder)
+        let kept = Set(results.prefix(resultsLimit).map(\.id))
+        return items.filter { !Self.isTerminal($0.state) || $0.needsAction || kept.contains($0.id) }
     }
 
     private static let terminalRunStatuses: Set<String> = ["completed", "failed", "interrupted", "cancelled"]
