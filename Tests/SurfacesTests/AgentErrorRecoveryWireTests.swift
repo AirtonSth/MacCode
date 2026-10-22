@@ -20,6 +20,13 @@ final class AgentErrorRecoveryWireTests: XCTestCase {
                      "a fatal error must not offer a misleading action on iOS either")
     }
 
+    func test_spentAccountRoute_offersNoSignIn() {
+        // WHY: a used-up quota is not fixed by signing in; old stored runs carry the auth tag.
+        let stored = "[auth-required] Distill authentication failed: Distill ACP RPC error: Authentication required: No available account route for this session"
+        XCTAssertNil(AgentAppViewModel.errorRecoveryAction(message: stored, recoverable: false))
+        XCTAssertEqual(AgentAppViewModel.errorRecoveryAction(message: "[auth-required] Distill authentication failed: token expired", recoverable: false), .signIn)
+    }
+
     func test_freshSessionFailure_isNewSessionOnTheWireButRetryOnTheMac() {
         // WHY: the host already retired the rejected session; iOS must retry on
         // the SAME thread (a bot desk keeps its link), and can say a new session

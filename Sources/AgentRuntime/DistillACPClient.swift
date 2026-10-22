@@ -73,6 +73,11 @@ enum DistillACPFailureTaxonomy {
         "encrypted_content", "encrypted content could not be decrypted or parsed",
         "history is incompatible", "history incompatible"
     ]
+    /// Distill reports every account for the model as used up or unusable as
+    /// "Authentication required"; signing in again cannot fix it.
+    static let accountRouteMarkers = [
+        "no available account route", "saved account route is unavailable"
+    ]
 
     static func normalize(_ error: Error, context: DistillACPFailureContext) -> DistillACPFailure {
         if let failure = error as? DistillACPFailure { return failure }
@@ -98,6 +103,8 @@ enum DistillACPFailureTaxonomy {
         switch category {
         case .authRequired:
             prefix = "\(authRequiredMarker) Distill authentication failed"
+        case .rateLimited where accountRouteMarkers.contains(where: diagnostic.lowercased().contains):
+            prefix = "\(rateLimitedMarker) No Distill account can serve this model now (quota used up or unavailable). Choose Auto or another model, or wait for the quota reset"
         case .rateLimited:
             prefix = "\(rateLimitedMarker) Distill rate limit"
         case .network:
@@ -123,6 +130,8 @@ enum DistillACPFailureTaxonomy {
             case .requestTimedOut:
                 return .timeout
             case .rpcError(let code, let message, let detail, let httpStatus):
+                let described = ACPRPCErrorPayload.describe(message: message, detail: detail).lowercased()
+                if accountRouteMarkers.contains(where: described.contains) { return .rateLimited }
                 // The JSON-RPC code is -32603 for every provider failure; the
                 // provider's HTTP status rides in error.data.http_status.
                 for status in [httpStatus, code].compactMap({ $0 }) {
@@ -152,6 +161,7 @@ enum DistillACPFailureTaxonomy {
         if normalized.contains(timeoutMarker) { return .timeout }
         if normalized.contains(networkMarker) { return .network }
         if incompatibleHistoryMarkers.contains(where: normalized.contains) { return .incompatibleHistory }
+        if accountRouteMarkers.contains(where: normalized.contains) { return .rateLimited }
         let invalidResumeMarkers = [
             "invalid resume", "invalid_resume", "invalid-resume", "resume invalid",
             "resume is invalid", "resume cursor", "failed to resume",

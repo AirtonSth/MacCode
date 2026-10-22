@@ -10138,6 +10138,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if resumeInvalidMarkers.contains(where: normalized.contains) {
             return .startFresh
         }
+        // Distill words a used-up account route as "Authentication required";
+        // signing in cannot fix it, so offer no Sign in.
+        if normalized.contains("no available account route") || normalized.contains("saved account route is unavailable") {
+            return nil
+        }
         let authMarkers = [
             "[auth-required]", "401", "403", "unauthorized", "unauthenticated",
             "authentication", "login required", "sign in required", "token expired",
