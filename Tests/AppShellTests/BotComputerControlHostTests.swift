@@ -188,7 +188,7 @@ final class BotComputerControlHostTests: XCTestCase {
         XCTAssertTrue(names.contains("request_mac_execution"))
         let schema = BotComputerCatalog.schema(for: BotComputerCatalog.requestUserAction)
         let kind = ((schema["properties"] as? [String: Any])?["kind"] as? [String: Any])?["enum"] as? [String]
-        XCTAssertEqual(kind, ["login", "captcha", "2fa", "payment", "confirm", "other"])
+        XCTAssertEqual(kind, ["login", "captcha", "2fa", "payment", "confirm", "file", "other"])
     }
 
     func test_managedMCPReturnsRefusalAsNormalToolResult() async throws {

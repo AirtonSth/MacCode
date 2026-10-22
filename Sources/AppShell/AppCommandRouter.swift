@@ -3512,6 +3512,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             self?.botWorkspaceRunHooks?.runStarted(botID, runID, threadID)
         }
         agent.viewModel.openBotScreen = { [weak self] botID in self?.openBotGuestDesktopInNewWindow(botID) }
+        agent.viewModel.importFilesToBotComputer = { [weak self] botID, threadID, urls in
+            guard let context = self?.context else { throw BotWorkspaceRunUnavailable() }
+            let resource = try context.botStore.guestResourceID(botID: botID, threadID: threadID)
+            return try BotGuestHome.importFiles(urls, appSupport: context.appSupportDirectory, botID: resource)
+        }
     }
 
     /// The bot VM hooks every Agent App that runs bot threads shares (Agent

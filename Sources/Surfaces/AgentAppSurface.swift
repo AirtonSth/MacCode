@@ -707,6 +707,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Who drives the bot computer; tests inject an isolated instance.
     public var botComputerControl: BotComputerControl = .shared
     public var openBotScreen: ((BotID) -> Void)?
+    /// Copies Mac files into the bot's VM home (~/Downloads); returns guest paths. Wired by the host.
+    public var importFilesToBotComputer: ((BotID, AgentThreadID?, [URL]) throws -> [String])?
     @Published public internal(set) var botScreenControlled = false
     /// Request awaiting the user on the selected thread (open or taken).
     @Published public internal(set) var openManualAction: ManualActionRequest?

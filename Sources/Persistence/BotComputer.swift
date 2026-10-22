@@ -61,7 +61,7 @@ public enum BotComputerCatalog: Sendable {
         case rebuild:
             return "Rebuild this bot's Linux image from /home/remotecode/Dockerfile and restart the desktop. Use after editing that Dockerfile."
         case requestUserAction:
-            return "Pause and ask the user to do a manual step on the computer (login, captcha, 2FA, payment, human confirmation). Never ask for passwords, codes or card data in chat. Returns at once; end your turn, the user's reply arrives as a new message."
+            return "Pause and ask the user to do a manual step on the computer (login, captcha, 2FA, payment, human confirmation), or to send a file from their Mac (kind file; it lands in /home/remotecode/Downloads and the reply lists the paths). Never ask for passwords, codes or card data in chat. Returns at once; end your turn, the user's reply arrives as a new message."
         case postScreenshot:
             return "Post a screenshot of the Linux desktop into the chat. Use at the end of a visual task, on a visible error, before an irreversible action or after a big screen change. Limited to one per 30 seconds except kind error or action."
         case requestMacExecution:
@@ -99,7 +99,7 @@ public enum BotComputerCatalog: Sendable {
                     "kind": [
                         "type": "string",
                         "enum": ManualActionKind.allCases.map(\.rawValue),
-                        "description": "login, captcha, 2fa, payment, confirm, or other.",
+                        "description": "login, captcha, 2fa, payment, confirm, file (you need a file from the user's Mac; name it in reason), or other.",
                     ],
                 ]) { _, new in new },
                 "required": ["reason", "kind"],
@@ -540,7 +540,7 @@ public struct BotComputerService: Sendable {
         case BotComputerCatalog.requestUserAction:
             let rawKind = (arguments["kind"] as? String ?? "other").trimmingCharacters(in: .whitespacesAndNewlines)
             guard let kind = ManualActionKind(rawValue: rawKind) else {
-                throw BotComputerError.invalid("kind must be login, captcha, 2fa, payment, confirm, or other.")
+                throw BotComputerError.invalid("kind must be login, captcha, 2fa, payment, confirm, file, or other.")
             }
             return try perform(
                 kind: BotComputerCatalog.requestUserAction,

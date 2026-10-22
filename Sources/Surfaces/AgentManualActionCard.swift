@@ -220,6 +220,11 @@ struct AgentManualActionCard: View {
                     .help("Drive the bot's computer yourself; the bot stays paused")
                     .accessibilityIdentifier("agent.manualAction.take")
                 }
+                if request.kind == .file, vm.importFilesToBotComputer != nil {
+                    Button("Choose file…") { chooseFiles(for: request) }
+                        .help("Copy files from this Mac into the bot's Linux desktop and resume the bot")
+                        .accessibilityIdentifier("agent.manualAction.chooseFile")
+                }
                 Button("Ready, continue") {
                     let text = note
                     note = ""
@@ -237,6 +242,24 @@ struct AgentManualActionCard: View {
         .padding(DS.Space.sm)
         .background(DS.Palette.surface)
         .cornerRadius(8)
+    }
+
+    private func chooseFiles(for request: ManualActionRequest) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Send to Linux desktop"
+        guard panel.runModal() == .OK, !panel.urls.isEmpty, let importFiles = vm.importFilesToBotComputer else { return }
+        do {
+            let paths = try importFiles(request.botID, request.threadID, panel.urls)
+            let typed = note.trimmingCharacters(in: .whitespacesAndNewlines)
+            note = ""
+            let copied = "Files copied into the Linux desktop: " + paths.joined(separator: ", ")
+            Task { await vm.continueManualAction(note: typed.isEmpty ? copied : "\(copied). \(typed)") }
+        } catch {
+            vm.statusMessage = "Could not copy files to the Linux desktop: \(error.localizedDescription)"
+        }
     }
 
     private func resolvedRow(_ request: ManualActionRequest) -> some View {
@@ -259,6 +282,7 @@ struct AgentManualActionCard: View {
         case .twoFactor: return "lock.shield"
         case .payment: return "creditcard"
         case .confirm: return "hand.raised"
+        case .file: return "doc.badge.plus"
         case .other: return "hand.point.up.left"
         }
     }

@@ -376,7 +376,7 @@ public enum BotStandingInstructions {
 
     Screenshots: enviar bot_post_screenshot em: fim de tarefa visual; erro visível; pedido de login/ação humana; antes de ação irreversível; mudança grande de tela em tarefa longa.
 
-    Ação manual: Peça ação manual com bot_request_user_action só para login, captcha, 2FA, pagamento ou confirmação humana. Nunca peça senha, código ou dados de cartão no chat. Depois de retomar, sempre tire screenshot antes de agir.
+    Ação manual: Peça ação manual com bot_request_user_action só para login, captcha, 2FA, pagamento ou confirmação humana. Para um arquivo que está no Mac do usuário, use bot_request_user_action com kind file e diga qual arquivo; ele chega em ~/Downloads. Nunca peça senha, código ou dados de cartão no chat. Depois de retomar, sempre tire screenshot antes de agir.
     """
 
     /// How a Bot with Caveman off talks to the user, on every provider.
@@ -499,7 +499,7 @@ public enum BotStandingInstructions {
     /// relays (`bot_computer_*`, `bot_browser_*`) are not served to it: the
     /// guest has its own shell, linux-use and Playwright instead.
     public static let generatedInGuestComputerLine =
-        "You run inside this bot's Linux VM (Docker on 127.0.0.1). Your own shell runs here: run commands and install packages directly. To see or use the Linux desktop, use the linux-use tools: list_windows, then screenshot, then left_click, type, key, or scroll on that exact window. For websites, use the Playwright tools (browser_navigate, browser_snapshot, browser_click, browser_type); they drive the visible Chromium, which keeps the logins the user made in the viewer. To show the user the screen, call \(postScreenshotTool). For a login, captcha, 2FA, payment, or human confirmation, call \(requestUserActionTool). For macOS-only work, call \(requestMacExecutionTool). bot_computer_*, bot_browser_*, host computer-use, and host docker do not exist here."
+        "You run inside this bot's Linux VM (Docker on 127.0.0.1). Your own shell runs here: run commands and install packages directly. To see or use the Linux desktop, use the linux-use tools: list_windows, then screenshot, then left_click, type, key, or scroll on that exact window. For websites, use the Playwright tools (browser_navigate, browser_snapshot, browser_click, browser_type); they drive the visible Chromium, which keeps the logins the user made in the viewer. To show the user the screen, call \(postScreenshotTool). For a login, captcha, 2FA, payment, or human confirmation, call \(requestUserActionTool). When you need a file that is on the user's Mac, call \(requestUserActionTool) with kind file and name the file in reason; it arrives in ~/Downloads. For macOS-only work, call \(requestMacExecutionTool). bot_computer_*, bot_browser_*, host computer-use, and host docker do not exist here."
 
     /// `inGuest`: the run's agent runs inside the bot's guest (only a Docker
     /// desktop has one); its tools differ from a Mac run of the same bot.

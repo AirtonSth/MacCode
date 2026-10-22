@@ -12594,6 +12594,11 @@ public final class BotsViewModel: ObservableObject {
         return try botStore.guestResourceID(botID: botID, threadID: threadID)
     }
 
+    /// Drop/paste on the Linux desktop viewer: copies into the displayed VM's ~/Downloads.
+    func importFilesToGuest(botID: BotID, urls: [URL]) throws -> [String] {
+        try BotGuestHome.importFiles(urls, appSupport: context.appSupportDirectory, botID: guestDisplayResourceID(botID))
+    }
+
     func guestScreenURL(for botID: BotID) -> URL? {
         guestScreenURLByBot[(try? guestDisplayResourceID(botID))?.value ?? botID.value]
     }
@@ -14041,7 +14046,8 @@ public struct BotsRootView: View {
                     },
                     onStop: {
                         if let id = vm.studioDraft.botID { vm.stopDockerGuest(botID: id) }
-                    }
+                    },
+                    onImportFiles: vm.studioDraft.botID.map { id in { try vm.importFilesToGuest(botID: id, urls: $0) } }
                 )
                 .disabled(!vm.studioDestinationIsSaved)
             }
@@ -14638,7 +14644,8 @@ public struct BotsRootView: View {
                     onStart: { vm.presentGuestDesktop(botID: bot.id) },
                     onRebuild: { vm.rebuildDockerGuest(botID: bot.id) },
                     onStop: { vm.stopDockerGuest(botID: bot.id) },
-                    onOpenInNewWindow: { vm.openGuestDesktopInNewWindow(bot) }
+                    onOpenInNewWindow: { vm.openGuestDesktopInNewWindow(bot) },
+                    onImportFiles: { try vm.importFilesToGuest(botID: bot.id, urls: $0) }
                 )
             }
             Text(vm.desktopHonestyLabel)
@@ -15353,7 +15360,8 @@ private struct BotGuestDesktopRoot: View {
                         screenIdentifier: "bots.desk.desktop.window.guestScreen",
                         onStart: { vm.presentGuestDesktop(botID: bot.id) },
                         onRebuild: { vm.rebuildDockerGuest(botID: bot.id) },
-                        onStop: { vm.stopDockerGuest(botID: bot.id) }
+                        onStop: { vm.stopDockerGuest(botID: bot.id) },
+                        onImportFiles: { try vm.importFilesToGuest(botID: bot.id, urls: $0) }
                     )
                     .padding(DS.Space.lg)
                 } else {

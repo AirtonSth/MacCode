@@ -6,6 +6,8 @@ public enum ManualActionKind: String, Codable, CaseIterable, Sendable {
     case twoFactor = "2fa"
     case payment
     case confirm
+    /// The bot needs a file from the user's Mac copied into its VM.
+    case file
     case other
 }
 

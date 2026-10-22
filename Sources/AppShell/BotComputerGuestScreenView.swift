@@ -6,6 +6,8 @@ import WebKit
 /// Interactive noVNC guest screen. The URL must already be 127.0.0.1.
 struct BotComputerGuestScreenView: NSViewRepresentable {
     let url: URL
+    /// Copies Mac files dropped or pasted on the screen into the guest; nil disables it.
+    var onImportFiles: (([URL]) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -26,6 +28,7 @@ struct BotComputerGuestScreenView: NSViewRepresentable {
         view.setValue(false, forKey: "drawsBackground")
         view.navigationDelegate = context.coordinator
         view.allowsBackForwardNavigationGestures = false
+        view.onImportFiles = onImportFiles
         return view
     }
 
@@ -44,6 +47,7 @@ struct BotComputerGuestScreenView: NSViewRepresentable {
     """
 
     func updateNSView(_ view: BotComputerGuestWebView, context: Context) {
+        view.onImportFiles = onImportFiles
         guard (try? BotComputerGuestSpec.validateScreenURL(url)) != nil else { return }
         if view.url != url {
             view.load(URLRequest(url: url))
@@ -70,7 +74,73 @@ struct BotComputerGuestScreenView: NSViewRepresentable {
 }
 
 /// Clicks on the guest must steal key focus from the Desk composer.
+/// Cmd+V pastes Mac text into the guest; Mac files pasted or dropped are copied in.
 final class BotComputerGuestWebView: WKWebView {
+    var onImportFiles: (([URL]) -> Void)?
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags == .command, event.charactersIgnoringModifiers?.lowercased() == "v",
+              let responder = window?.firstResponder as? NSView, responder === self || responder.isDescendant(of: self)
+        else { return super.performKeyEquivalent(with: event) }
+        let pasteboard = NSPasteboard.general
+        if let files = Self.fileURLs(pasteboard), !files.isEmpty, let onImportFiles {
+            onImportFiles(files)
+        } else if let text = pasteboard.string(forType: .string), !text.isEmpty {
+            evaluateJavaScript(Self.pasteScript(text), completionHandler: nil)
+        }
+        return true
+    }
+
+    /// Sets the guest CLIPBOARD through noVNC's clipboard field, then presses Ctrl+V in the guest.
+    static func pasteScript(_ text: String) -> String {
+        let literal = (try? String(data: JSONEncoder().encode(text), encoding: .utf8)) ?? "\"\""
+        return """
+        (function() {
+          const field = document.getElementById('noVNC_clipboard_text');
+          const canvas = document.querySelector('canvas');
+          if (!field || !canvas) return;
+          field.value = \(literal);
+          field.dispatchEvent(new Event('change'));
+          setTimeout(function() {
+            const key = function(type, key, code, ctrl) {
+              canvas.dispatchEvent(new KeyboardEvent(type, { key: key, code: code, ctrlKey: ctrl, bubbles: true, cancelable: true }));
+            };
+            key('keydown', 'Control', 'ControlLeft', true);
+            key('keydown', 'v', 'KeyV', true);
+            key('keyup', 'v', 'KeyV', true);
+            key('keyup', 'Control', 'ControlLeft', false);
+          }, 150);
+        })();
+        """
+    }
+
+    static func fileURLs(_ pasteboard: NSPasteboard) -> [URL]? {
+        pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]
+    }
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        guard onImportFiles != nil, Self.fileURLs(sender.draggingPasteboard)?.isEmpty == false else {
+            return super.draggingEntered(sender)
+        }
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        guard onImportFiles != nil, Self.fileURLs(sender.draggingPasteboard)?.isEmpty == false else {
+            return super.draggingUpdated(sender)
+        }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        guard let onImportFiles, let files = Self.fileURLs(sender.draggingPasteboard), !files.isEmpty else {
+            return super.performDragOperation(sender)
+        }
+        onImportFiles(files)
+        return true
+    }
+
     override var acceptsFirstResponder: Bool { true }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -120,6 +190,9 @@ struct BotComputerGuestCanvas: View {
     let onStop: () -> Void
     var onOpenInNewWindow: (() -> Void)? = nil
     var openInNewWindowIdentifier: String = "bots.desk.desktop.openInNewWindow"
+    /// Copies Mac files into the guest's ~/Downloads and returns the guest paths.
+    var onImportFiles: (([URL]) throws -> [String])? = nil
+    @State private var importMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
@@ -172,7 +245,18 @@ struct BotComputerGuestCanvas: View {
             if let url {
                 // Match the guest framebuffer (start.sh Xvfb size, pinned against
                 // BotComputerGuestSpec) so the viewer hugs the actual screen.
-                BotComputerGuestScreenView(url: url)
+                BotComputerGuestScreenView(url: url, onImportFiles: onImportFiles.map { importFiles in
+                    { urls in
+                        do {
+                            let paths = try importFiles(urls)
+                            importMessage = paths.count == 1
+                                ? "Copied to \(paths[0])"
+                                : "Copied \(paths.count) items to ~/Downloads"
+                        } catch {
+                            importMessage = "Could not copy to the Linux desktop: \(error.localizedDescription)"
+                        }
+                    }
+                })
                     .aspectRatio(
                         CGFloat(BotComputerGuestSpec.screenWidth) / CGFloat(BotComputerGuestSpec.screenHeight),
                         contentMode: .fit
@@ -184,6 +268,17 @@ struct BotComputerGuestCanvas: View {
                     )
                     .frame(maxWidth: .infinity)
                     .accessibilityIdentifier(screenIdentifier)
+                if let importMessage {
+                    Text(importMessage)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .lineLimit(2)
+                        .accessibilityIdentifier("\(screenIdentifier).importMessage")
+                } else if onImportFiles != nil {
+                    Text("⌘V pastes text. Drop or paste Mac files to copy them to ~/Downloads.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
             } else {
                 emptyScreen
             }
