@@ -16,10 +16,11 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
     public var botHandle: String
     public var botAvatarSymbol: String
     public var lastTestRunRequestedAt: Date?
-    /// The Bot's workspace; Schedule Tasks groups the schedule under it.
+    /// The workspace that lists the Bot (its active context binding, else its own
+    /// `workspaceID`); Schedule Tasks groups the schedule under it.
     public var workspaceID: WorkspaceID?
 
-    public init(routine: BotRoutine, bot: BotDefinition) {
+    public init(routine: BotRoutine, bot: BotDefinition, workspaceID: WorkspaceID? = nil) {
         self.id = routine.definition.id
         self.botID = bot.id
         self.name = routine.definition.name
@@ -31,7 +32,7 @@ public struct BotScheduleTaskItem: Identifiable, Equatable {
         self.botHandle = bot.handle
         self.botAvatarSymbol = bot.avatarSymbol
         self.lastTestRunRequestedAt = routine.activation.lastTestRunRequestedAt
-        self.workspaceID = bot.workspaceID
+        self.workspaceID = workspaceID ?? bot.workspaceID
     }
 
     /// Next run is when this task would actually fire, not whether it is armed.
@@ -165,7 +166,8 @@ public struct BotScheduleTasksRootView: View {
             scopedSource = []
             return
         }
-        scopedSource = routines.map { BotScheduleTaskItem(routine: $0, bot: bot) }
+        let workspaceID = vm.scheduleWorkspace(for: bot)
+        scopedSource = routines.map { BotScheduleTaskItem(routine: $0, bot: bot, workspaceID: workspaceID) }
     }
 
     private var subtitle: String {

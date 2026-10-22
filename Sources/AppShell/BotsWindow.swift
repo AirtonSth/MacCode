@@ -4050,10 +4050,16 @@ public final class BotsViewModel: ObservableObject {
         }
     }
 
+    /// The workspace the sidebar lists this Bot under, the same one its scheduled runs pin to.
+    func scheduleWorkspace(for bot: BotDefinition) -> WorkspaceID? {
+        SidebarViewModel.scheduleWorkspace(for: bot, botStore: botStore, hostID: context.liveActivityHostIdentity.serverId)
+    }
+
     public func reloadScheduleTasks() {
         let rows: [BotScheduleTaskItem] = bots.flatMap { bot in
-            ((try? botStore.listRoutines(botID: bot.id)) ?? []).map { routine in
-                BotScheduleTaskItem(routine: routine, bot: bot)
+            let workspaceID = scheduleWorkspace(for: bot)
+            return ((try? botStore.listRoutines(botID: bot.id)) ?? []).map { routine in
+                BotScheduleTaskItem(routine: routine, bot: bot, workspaceID: workspaceID)
             }
         }
         .sorted { lhs, rhs in
@@ -4104,7 +4110,7 @@ public final class BotsViewModel: ObservableObject {
             errorMessage = "Pick a bot for this scheduled task."
             return
         }
-        editScheduleTask(BotScheduleTaskItem(routine: routine, bot: bot))
+        editScheduleTask(BotScheduleTaskItem(routine: routine, bot: bot, workspaceID: scheduleWorkspace(for: bot)))
         openScheduleTasks()
     }
 

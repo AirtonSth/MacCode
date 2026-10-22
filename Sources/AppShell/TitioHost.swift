@@ -204,7 +204,11 @@ extension AppCommandRouter {
             ])
         }
         let botSchedules: [JSONValue] = try storedBots.flatMap { bot in
-            try ctx.botStore.listRoutines(botID: bot.id).map { ScheduledTaskRemoteWire.encodeRoutine($0, bot: bot) }
+            let workspaceID = SidebarViewModel.scheduleWorkspace(
+                for: bot, botStore: ctx.botStore, hostID: ctx.liveActivityHostIdentity.serverId)
+            return try ctx.botStore.listRoutines(botID: bot.id).map {
+                ScheduledTaskRemoteWire.encodeRoutine($0, bot: bot, workspaceID: workspaceID)
+            }
         }
         let attention: [JSONValue] = try ctx.botStore.listAttention().map {
             .object([

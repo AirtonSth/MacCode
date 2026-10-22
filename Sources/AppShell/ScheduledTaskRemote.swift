@@ -83,7 +83,7 @@ public enum ScheduledTaskRemoteWire {
         ])
     }
 
-    static func encodeRoutine(_ routine: BotRoutine, bot: BotDefinition) -> JSONValue {
+    static func encodeRoutine(_ routine: BotRoutine, bot: BotDefinition, workspaceID: WorkspaceID?) -> JSONValue {
         let spec = routine.definition.scheduleSpec
         return .object([
             "kind": .string("bot"),
@@ -94,6 +94,7 @@ public enum ScheduledTaskRemoteWire {
             "bot_name": .string(bot.name),
             "bot_handle": .string(bot.handle),
             "bot_avatar": .string(bot.avatarSymbol),
+            "workspace_id": workspaceID.map { .string($0.value.uuidString.lowercased()) } ?? .null,
             "schedule_spec_json": .string(routine.definition.scheduleSpecJSON),
             "summary": .string(spec?.displayNote() ?? routine.definition.scheduleNote),
             "ultracode": .bool(spec?.distillExecutionMode == .ultracode),
@@ -115,7 +116,11 @@ extension AppCommandRouter {
         }
         var routines: [JSONValue] = []
         for bot in try context.botStore.list() {
-            routines += try context.botStore.listRoutines(botID: bot.id).map { ScheduledTaskRemoteWire.encodeRoutine($0, bot: bot) }
+            let workspaceID = SidebarViewModel.scheduleWorkspace(
+                for: bot, botStore: context.botStore, hostID: context.liveActivityHostIdentity.serverId)
+            routines += try context.botStore.listRoutines(botID: bot.id).map {
+                ScheduledTaskRemoteWire.encodeRoutine($0, bot: bot, workspaceID: workspaceID)
+            }
         }
         return .object([
             "tasks": .array(tasks),

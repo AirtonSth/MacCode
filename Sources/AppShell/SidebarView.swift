@@ -1485,6 +1485,13 @@ public final class SidebarViewModel: ObservableObject {
         return readable.min { $0.value.uuidString < $1.value.uuidString }
     }
 
+    /// The workspace a Bot's scheduled tasks group under and pin their runs to: the sidebar
+    /// workspace, else the Bot's own `workspaceID`.
+    nonisolated static func scheduleWorkspace(for bot: BotDefinition, botStore: BotStore, hostID: String) -> WorkspaceID? {
+        let bindings = (try? botStore.listContextBindings(hostID: hostID, botID: bot.id)) ?? []
+        return sidebarWorkspace(for: bot, bindings: bindings) ?? bot.workspaceID
+    }
+
     /// A Bot's conversations that no context pin lists: plain threads it started (Desk first send,
     /// scheduled run, remote). Hidden, grouped and foreign-owned threads are excluded.
     nonisolated private static func unpinnedBotRows(

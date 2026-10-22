@@ -121,4 +121,27 @@ final class SidebarUnpinnedBotConversationTests: XCTestCase {
         XCTAssertNil(SidebarViewModel.sidebarWorkspace(for: bot, bindings: [binding(first, state: .revoked), binding(second, actions: [.send])]),
                      "revoked or send-only bindings give no sidebar workspace")
     }
+
+    func test_scheduleWorkspaceFollowsTheSidebarBindingNotTheStaleOwner() throws {
+        // WHY: Schedule Tasks (Mac list, scheduled_task.list, Titio) must group a Bot's schedules
+        // under the workspace the sidebar lists the Bot in, which is where its runs pin.
+        let (context, directory) = try make("schedule")
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let owner = WorkspaceID(UUID()), bound = WorkspaceID(UUID())
+        let hostID = context.liveActivityHostIdentity.serverId
+        let bot = try context.botStore.create(name: "Star", title: "", description: "", handle: "star", workspaceID: owner)
+        XCTAssertEqual(SidebarViewModel.scheduleWorkspace(for: bot, botStore: context.botStore, hostID: hostID), owner,
+                       "without bindings the Bot's own workspace is used")
+        try context.botStore.grantContext(hostID: hostID, botID: bot.id, context: .workspace(bound), actions: [.read, .send], expectedRevision: nil)
+        XCTAssertEqual(SidebarViewModel.scheduleWorkspace(for: bot, botStore: context.botStore, hostID: hostID), bound)
+
+        let routine = BotRoutine(
+            definition: BotRoutineDefinition(botID: bot.id, name: "r", prompt: "p", scheduleNote: "Daily"),
+            activation: BotRoutineActivation(routineID: BotRoutineID(), botID: bot.id, isEnabled: true))
+        let wire = ScheduledTaskRemoteWire.encodeRoutine(routine, bot: bot, workspaceID: bound)
+        guard case .object(let fields) = wire, case .string(let wired)? = fields["workspace_id"] else {
+            return XCTFail("scheduled_task.list Bot rows must carry workspace_id")
+        }
+        XCTAssertEqual(wired, bound.value.uuidString.lowercased())
+    }
 }
