@@ -332,7 +332,11 @@ final class BotGuestAgentKitTests: XCTestCase {
         let runAgent = BotComputerGuestSpec.runAgentPath
         let killAgent = BotComputerGuestSpec.killAgentPath
         let fast = ["RC_AGENT_LEASE_MAX_AGE": "2", "RC_AGENT_REAP_INTERVAL": "1"]
-        try docker.guest(["mkdir", "-p", leases])
+        // The test bypasses the image entrypoint that normally prepares the home.
+        // Fail setup explicitly rather than silently running the renewer in a root-owned directory.
+        let setup = try docker(["exec", "-u", "0", docker.container, "sh", "-c",
+            "mkdir -p \(leases) && chown remotecode:remotecode \(leases)"])
+        XCTAssertEqual(setup.status, 0, "the guest must be able to renew its lease")
 
         // 1. Lease reaper. The Mac never renews `stale`. It renews `renewed` the
         //    way a Mac whose clock is far behind the guest's would (mtimes in

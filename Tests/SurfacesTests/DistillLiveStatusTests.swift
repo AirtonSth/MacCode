@@ -3,6 +3,27 @@ import AgentRuntime
 @testable import Surfaces
 
 final class DistillLiveStatusTests: XCTestCase {
+
+    func test_operationHeartbeatDoesNotResetProgressAndOlderUpdatesCannotReplaceNewWork() throws {
+        var status = DistillLiveStatus()
+        let start = Date(timeIntervalSince1970: 1_000)
+        func apply(_ id: String, _ revision: Int, _ age: Double, _ now: Date, stalled: Bool = false) throws {
+            let payload: [String: Any] = ["operationId": id, "sequence": 1, "revision": revision,
+                "phase": "executing_tool", "lastProgressAgeMs": age, "phaseElapsedMs": age, "stalled": stalled]
+            let data = try JSONSerialization.data(withJSONObject: payload)
+            status.apply(method: "_remotecode/operation", payloadJSON: String(decoding: data, as: UTF8.self), receivedAt: now)
+        }
+        try apply("first", 1, 2_000, start)
+        let progress = status.operation?.lastProgressAt
+        try apply("first", 2, 0, start.addingTimeInterval(5))
+        XCTAssertEqual(status.operation?.lastProgressAt, progress, "a heartbeat cannot move the last real progress forward")
+        XCTAssertTrue(status.operationHeadline(now: start.addingTimeInterval(5))?.contains("7s ago") == true)
+        try apply("second", 3, 700_000, start.addingTimeInterval(6), stalled: true)
+        try apply("first", 2, 0, start.addingTimeInterval(7))
+        XCTAssertEqual(status.operation?.id, "second", "an older operation cannot replace the current one")
+        XCTAssertTrue(status.operationHeadline(now: start.addingTimeInterval(7))?.contains("no progress") == true)
+        XCTAssertTrue(status.operationHeadline(now: start.addingTimeInterval(7))?.contains("Stop to cancel") == true)
+    }
     private let method = "x.ai/session_notification"
 
     private func send(_ s: inout DistillLiveStatus, _ session: String, _ update: [String: Any], at: Date = Date()) {

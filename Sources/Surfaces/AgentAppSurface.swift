@@ -11167,6 +11167,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func applyDistillRuntime(_ runtime: ProviderRuntimeEvent, run: AgentRunID, threadId: AgentThreadID) {
         guard !isDisposed, selectedThreadId == threadId else { return }
+        if runtime.method == "_remotecode/operation",
+           let active = coordinator.activeRunId(threadId: threadId), active != run { return }
         var next: DistillLiveStatus
         if distillLive?.runId == run, let current = distillLive {
             next = current

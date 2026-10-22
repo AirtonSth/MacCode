@@ -2,7 +2,7 @@ import Foundation
 import CoreModel
 import Persistence
 
-public enum DistillACPError: Error, CustomStringConvertible {
+public enum DistillACPError: Error, LocalizedError, CustomStringConvertible {
     case missingBinary(String)
     case spawnFailed(String)
     case invalidJSON(String)
@@ -14,6 +14,8 @@ public enum DistillACPError: Error, CustomStringConvertible {
     case unsupported(String)
     case requestTimedOut(String)
 
+    public var errorDescription: String? { description }
+
     public var description: String {
         switch self {
         case .missingBinary(let binary): return "Distill ACP binary not found: \(binary)"
@@ -22,7 +24,7 @@ public enum DistillACPError: Error, CustomStringConvertible {
         case .rpcError(_, let message, let detail, _):
             return "Distill ACP RPC error: \(ACPRPCErrorPayload.describe(message: message, detail: detail))"
         case .processExited(let reason, let status, let stderr):
-            let suffix = stderr.isEmpty ? "" : ": \(stderr)"
+            let suffix = stderr.isEmpty ? "" : ". Last stderr (may precede the exit): \(stderr)"
             return "Distill ACP process exited (\(reason == .exit ? "exit" : "signal") \(status))\(suffix)"
         case .responseTypeMismatch(let method): return "Distill ACP \(method) response had an unexpected shape"
         case .unsupported(let message): return message
@@ -211,6 +213,9 @@ enum DistillACPFailureTaxonomy {
     private static let whitespaceCollapseRegex = try! NSRegularExpression(
         pattern: #"\s+"#
     )
+    private static let ansiControlRegex = try! NSRegularExpression(
+        pattern: #"\x1B\[[0-?]*[ -/]*[@-~]"#
+    )
     private static let diagnosticRedactions: [(NSRegularExpression, String)] = [
         (try! NSRegularExpression(
             pattern: #"(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"#,
@@ -231,7 +236,8 @@ enum DistillACPFailureTaxonomy {
     ]
 
     private static func sanitize(_ raw: String) -> String {
-        var text = replaceAll(whitespaceCollapseRegex, in: raw, with: " ")
+        let plainText = replaceAll(ansiControlRegex, in: raw, with: "")
+        var text = replaceAll(whitespaceCollapseRegex, in: plainText, with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         for (regex, template) in diagnosticRedactions {
             text = replaceAll(regex, in: text, with: template)
@@ -544,7 +550,18 @@ public final class DistillACPClient: @unchecked Sendable {
     public typealias NotificationHandler = @Sendable (_ method: String, _ params: Any?) -> Void
     public typealias ServerRequestHandler = @Sendable (_ id: DistillACPRequestID, _ method: String, _ params: Any?) async throws -> Any?
 
-    private struct Pending { let resume: @Sendable (Result<Any?, Error>) -> Void }
+    private struct Pending {
+        let operationId: String?
+        let sessionId: String?
+        var sequence: Int = 0
+        let resume: @Sendable (Result<Any?, Error>) -> Void
+    }
+    static let operationMethod = "_remotecode/operation"
+    private var operationStatusEnabled = false
+    private var operationRevision = 0
+    public var supportsOperationStatus: Bool { lock.withLock { operationStatusEnabled } }
+    var operationPollInterval: TimeInterval = 5
+    var operationResponseTimeout: TimeInterval = 10
 
     private let process: Process
     private let stdinPipe = Pipe()
@@ -744,8 +761,10 @@ public final class DistillACPClient: @unchecked Sendable {
                 status: process.terminationStatus,
                 stderrTail: self.stderrTail()
             )
-            self.failPending(error)
+            // Settle the turn before waking its prompt waiter. Both paths report
+            // transport failure; waking first races two visible error emissions.
             self.terminationHandler?(process.terminationReason, process.terminationStatus, error)
+            self.failPending(error)
         }
         do {
             try process.run()
@@ -785,13 +804,20 @@ public final class DistillACPClient: @unchecked Sendable {
     public static func initializeParams(clientVersion: String) -> JSONObject {
         [
             "protocolVersion": 1,
-            "clientCapabilities": JSONObject(),
+            "clientCapabilities": ["_meta": ["remotecode/operationStatusV1": true]],
             "clientInfo": ["name": "RemoteCode", "title": "RemoteCode", "version": clientVersion]
         ]
     }
 
     public func initialize(clientVersion: String = "0.0.0", timeout: TimeInterval = 15) async throws -> DistillACPInitializeResult {
-        let result = try await requestJSONObject(method: "initialize", params: Self.initializeParams(clientVersion: clientVersion), timeout: timeout)
+        var result = try await requestJSONObject(method: "initialize", params: Self.initializeParams(clientVersion: clientVersion), timeout: timeout)
+        if let meta = result["_meta"] as? JSONObject,
+           meta["remotecode/operationStatusV1"] as? Bool == true {
+            lock.withLock { operationStatusEnabled = true }
+            if meta["remotecode/readyRequired"] as? Bool == true {
+                result = try await requestJSONObject(method: "_remotecode/ready", params: [:], timeout: timeout)
+            }
+        }
         let initialized = try DistillACPInitializeResult.parse(result)
         lock.withLock {
             modelCatalog = initialized.models
@@ -1781,15 +1807,27 @@ public final class DistillACPClient: @unchecked Sendable {
         acceptancePermit: AgentRunAcceptancePermit? = nil,
         writePermit: AgentRunAcceptancePermit? = nil,
         beforeWrite: (@Sendable () -> Void)? = nil,
-        onAccepted: (@Sendable () throws -> Void)? = nil
+        onAccepted: (@Sendable () throws -> Void)? = nil,
+        stopOnTimeout: Bool = true
     ) async throws -> Any? {
         let id = reserveId()
+        let monitored = supportsOperationStatus && ["_remotecode/ready", "session/new", "session/load", "session/resume", "session/prompt"].contains(method)
+        let operationId = monitored ? UUID().uuidString : nil
+        var requestParams = params
+        if let operationId {
+            var object = params as? JSONObject ?? [:]
+            var meta = object["_meta"] as? JSONObject ?? [:]
+            meta["remotecode/operationId"] = operationId
+            object["_meta"] = meta
+            requestParams = object
+        }
+        let sessionId = (requestParams as? JSONObject)?["sessionId"] as? String
         return try await withCheckedThrowingContinuation { continuation in
             lock.lock()
-            pending[id] = Pending { continuation.resume(with: $0) }
+            pending[id] = Pending(operationId: operationId, sessionId: sessionId) { continuation.resume(with: $0) }
             lock.unlock()
             var payload: JSONObject = ["jsonrpc": "2.0", "id": id, "method": method]
-            if let params { payload["params"] = params }
+            if let requestParams { payload["params"] = requestParams }
             do {
                 if let onAccepted {
                     let writeAndAccept = {
@@ -1820,13 +1858,77 @@ public final class DistillACPClient: @unchecked Sendable {
                 }
             }
             catch { completePending(id: id, result: .failure(error)) }
-            if let timeout {
+            if let operationId {
+                Task { [weak self] in await self?.monitorOperation(id: id, operationId: operationId, method: method) }
+            } else if let timeout {
                 DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [weak self] in
                     guard let self else { return }
-                    if self.completePending(id: id, result: .failure(DistillACPError.requestTimedOut(method))) { self.stop() }
+                    if self.completePending(id: id, result: .failure(DistillACPError.requestTimedOut(method))), stopOnTimeout { self.stop() }
                 }
             }
         }
+    }
+
+    /// Poll through the real ACP dispatcher. Heartbeats never advance the progress clock.
+    private func monitorOperation(id: Int, operationId: String, method: String) async {
+        while lock.withLock({ pending[id] != nil && !stopped }) {
+            try? await Task.sleep(nanoseconds: UInt64(operationPollInterval * 1_000_000_000))
+            guard lock.withLock({ pending[id] != nil && !stopped }) else { return }
+            do {
+                let result = try await request(
+                    method: "_remotecode/status", params: ["operationId": operationId],
+                    timeout: operationResponseTimeout, stopOnTimeout: false
+                )
+                guard lock.withLock({ pending[id] != nil && !stopped }) else { return }
+                guard let payload = result as? JSONObject,
+                      payload["operationId"] as? String == operationId,
+                      payload["state"] as? String == "running",
+                      acceptOperationStatus(payload) else {
+                    throw DistillACPError.unsupported("Distill did not provide evidence for the pending \(method) operation")
+                }
+            } catch {
+                guard lock.withLock({ pending[id] != nil && !stopped }) else { return }
+                let failure = DistillACPError.unsupported(
+                    "Distill ACP stopped responding during \(method). Status probe: \(error.localizedDescription)"
+                )
+                // Claim the terminal before waking request continuations, as on process exit.
+                terminationHandler?(.exit, -1, failure)
+                failPending(failure)
+                stop()
+                return
+            }
+        }
+    }
+
+    @discardableResult
+    private func acceptOperationStatus(_ payload: JSONObject) -> Bool {
+        guard let operationId = payload["operationId"] as? String,
+              let sequence = payload["sequence"] as? Int, sequence > 0,
+              let phase = payload["phase"] as? String,
+              let age = payload["lastProgressAgeMs"] as? Double, age >= 0 else { return false }
+        let limit: Double
+        switch phase {
+        case "loading_configuration", "preparing_session": limit = 60_000
+        case "waiting_model": limit = 180_000
+        case "executing_tool": limit = 600_000
+        case "waiting_authorization": limit = 300_000
+        default: return false
+        }
+        let revision = lock.withLock { () -> Int? in
+            guard let id = pending.first(where: { $0.value.operationId == operationId })?.key,
+                  var entry = pending[id], sequence >= entry.sequence,
+                  entry.sessionId == (payload["sessionId"] as? String) else { return nil }
+            entry.sequence = sequence
+            pending[id] = entry
+            operationRevision += 1
+            return operationRevision
+        }
+        guard let revision else { return false }
+        var status = payload
+        status["revision"] = revision
+        status["stalled"] = age >= limit
+        notificationHandler?(Self.operationMethod, status)
+        return true
     }
 
     private func reserveId() -> Int {
@@ -1840,8 +1942,8 @@ public final class DistillACPClient: @unchecked Sendable {
         guard let data = line.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? JSONObject else {
             let error = DistillACPError.invalidJSON(String(line.prefix(500)))
-            failPending(error)
             terminationHandler?(.exit, -1, error)
+            failPending(error)
             stop()
             return
         }
@@ -1863,7 +1965,11 @@ public final class DistillACPClient: @unchecked Sendable {
         if let id = DistillACPRequestID(object["id"]) {
             Task { [weak self] in await self?.handleServerRequest(id: id, method: method, params: object["params"]) }
         } else {
-            notificationHandler?(method, object["params"])
+            if method == Self.operationMethod {
+                if let payload = object["params"] as? JSONObject { acceptOperationStatus(payload) }
+            } else {
+                notificationHandler?(method, object["params"])
+            }
         }
     }
 

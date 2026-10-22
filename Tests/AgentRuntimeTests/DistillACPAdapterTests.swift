@@ -1021,7 +1021,10 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 session = params.get("sessionId")
                 text = prompt_text(params.get("prompt", []))
                 record({"method":method,"sessionId":session,"text":text})
-                if "FAIL_DATA" in text:
+                if "EXIT_143" in text:
+                    print("\\x1b[31mold tool_error: missing field tool_input\\x1b[0m", file=sys.stderr, flush=True)
+                    sys.exit(143)
+                elif "FAIL_DATA" in text:
                     fail(message["id"], {"message":"API error (status 400 Bad Request): invalid_request_error: model not allowed for this account","http_status":400})
                 elif "FAIL_AUTH" in text:
                     fail(message["id"], {"message":"upstream rejected the request","http_status":401})
@@ -1071,6 +1074,35 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             prompt: prompt,
             providerThreadId: providerThreadId
         )
+    }
+
+    func test_processExitReportsOneFailureEvenWhenTheErrorConsumerIsSlow() async throws {
+        let root = try makeTempRoot("distill-acp-exit-once")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, _) = try writeFailureHarness(root: root)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let events = DistillACPAdapterEventBox()
+        let slowConsumer = DispatchSemaphore(value: 0)
+        _ = try await adapter.startSession(
+            distillRequest(thread: AgentThreadID(), model: "auto", prompt: "EXIT_143", root: root)
+        ) { event in
+            events.append(event)
+            if case .error = event {
+                // Give the failed prompt waiter time to race process termination.
+                _ = slowConsumer.wait(timeout: .now() + 0.2)
+            }
+        }
+
+        let finished = try await events.waitForFinish()
+        XCTAssertEqual(finished.status, .failed)
+        XCTAssertEqual(events.finishedCount, 1)
+        XCTAssertEqual(events.errors.count, 1, "one process exit must produce one visible failure")
+        let message = try XCTUnwrap(events.errors.first)
+        XCTAssertTrue(message.contains("exit 143"), message)
+        XCTAssertTrue(message.contains("Last stderr (may precede the exit)"), message)
+        XCTAssertTrue(message.contains("old tool_error: missing field tool_input"), message)
+        XCTAssertFalse(message.contains("\u{001B}"), message)
     }
 
     func test_promptRPCErrorDataReplacesGenericInternalError_becauseUsersMustSeeTheProviderFailure() async throws {
@@ -1524,7 +1556,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                        "2,000 events must reuse one inactivity timer")
     }
 
-    func test_turnInactivityWatchdogFinishesAQuietTurnAfterAStreamBurst() async throws {
+    func test_turnInactivityWatchdogFailsAQuietTurnDespitePartialText() async throws {
         // WHY: when session/prompt never returns, the inactivity watchdog is the
         // only thing that ends the turn and releases Working. The burst test only
         // counts timers; this pins that stream events really arm the single
@@ -1546,8 +1578,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let finished = try await events.waitForFinish(timeout: 15)
         XCTAssertEqual(events.assistantText.count, 2_000,
                        "the window must not fire while the burst is still streaming")
-        XCTAssertEqual(finished.status, .completed,
-                       "streamed text with no open tool call resolves as completed")
+        XCTAssertEqual(finished.status, .failed,
+                       "partial text and silence cannot substitute for the provider's completion")
         XCTAssertTrue(events.hasWatchdogSynthesizedMarker,
                       "only the inactivity watchdog can end a turn whose prompt never returns")
         XCTAssertEqual(adapter.turnWatchdogTimersScheduledForTesting, 1)

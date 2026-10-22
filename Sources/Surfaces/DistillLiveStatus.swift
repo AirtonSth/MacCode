@@ -87,6 +87,24 @@ public struct DistillLiveStatus: Equatable, Sendable {
         public var lastFiredAt: Date?
     }
 
+    public struct Operation: Equatable, Sendable {
+        public var id: String
+        public var sequence: Int
+        public var revision: Int
+        public var label: String
+        public var stalled: Bool
+        public var lastProgressAt: Date
+        public var phaseStartedAt: Date
+    }
+    public var operation: Operation?
+
+    public func operationHeadline(now: Date) -> String? {
+        guard let operation else { return nil }
+        let seconds = max(0, Int(now.timeIntervalSince(operation.lastProgressAt)))
+        if operation.stalled { return "\(operation.label) — no progress for \(seconds)s · Stop to cancel" }
+        return "\(operation.label) — last update \(seconds)s ago"
+    }
+
     public static let maxSubagents = 50
     public static let maxScheduledTasks = 50
 
@@ -112,6 +130,7 @@ public struct DistillLiveStatus: Equatable, Sendable {
 
     /// "Subagent (<description>): Compacting…" / "Compacting…" / nil (keep existing copy).
     public var headline: String? {
+        if let operation { return operation.stalled ? "\(operation.label) — no progress" : operation.label }
         if let sub = compactingSubagent { return "Subagent (\(sub.description)): Compacting…" }
         if mainCompactingSince != nil { return "Compacting…" }
         if let text = guestStage?.text { return text }
@@ -163,7 +182,7 @@ public struct DistillLiveStatus: Equatable, Sendable {
     ]
 
     public static func isCarrierMethod(_ method: String) -> Bool {
-        method == DistillGuestStage.runtimeMethod
+        method == "_remotecode/operation" || method == DistillGuestStage.runtimeMethod
             || method == "x.ai/session_notification" || method == "x.ai/session/update"
             || method == "_x.ai/session_notification" || method == "_x.ai/session/update"
             || kinds.contains(where: { method.hasPrefix($0) })
@@ -174,6 +193,33 @@ public struct DistillLiveStatus: Equatable, Sendable {
         guard Self.isCarrierMethod(method),
               let data = payloadJSON.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        if method == "_remotecode/operation" {
+            guard let id = payload["operationId"] as? String,
+                  let sequence = payload["sequence"] as? Int,
+                  let revision = payload["revision"] as? Int,
+                  revision > (operation?.revision ?? 0),
+                  let phase = payload["phase"] as? String,
+                  let age = payload["lastProgressAgeMs"] as? Double, age.isFinite, age >= 0,
+                  let elapsed = payload["phaseElapsedMs"] as? Double, elapsed.isFinite, elapsed >= 0 else { return }
+            let label: String
+            switch phase {
+            case "loading_configuration": label = "Loading configuration"
+            case "preparing_session": label = "Preparing conversation"
+            case "waiting_model": label = "Waiting for model"
+            case "executing_tool": label = "Running tool"
+            case "waiting_authorization": label = "Waiting for authorization"
+            default: return
+            }
+            var lastProgress = receivedAt.addingTimeInterval(-age / 1000)
+            if let previous = operation, previous.id == id {
+                guard sequence >= previous.sequence else { return }
+                if sequence == previous.sequence { lastProgress = min(lastProgress, previous.lastProgressAt) }
+            }
+            operation = Operation(id: id, sequence: sequence, revision: revision, label: label,
+                stalled: payload["stalled"] as? Bool ?? false, lastProgressAt: lastProgress,
+                phaseStartedAt: receivedAt.addingTimeInterval(-elapsed / 1000))
             return
         }
         if method == DistillGuestStage.runtimeMethod {

@@ -1330,7 +1330,11 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 client = try DistillACPClient(
                     guest: guestPlan,
                     notificationHandler: { method, params in
-                        bufferedNotifications.append(method: method, params: params)
+                        if method == DistillACPClient.operationMethod {
+                            onEvent(.event(Self.runtimeEvent(method: method, payload: params as? [String: Any] ?? [:])))
+                        } else {
+                            bufferedNotifications.append(method: method, params: params)
+                        }
                     }
                 )
             } else {
@@ -1349,7 +1353,11 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                     runAsUser: request.runAsUser,
                     askpassPath: askpass,
                     notificationHandler: { method, params in
-                        bufferedNotifications.append(method: method, params: params)
+                        if method == DistillACPClient.operationMethod {
+                            onEvent(.event(Self.runtimeEvent(method: method, payload: params as? [String: Any] ?? [:])))
+                        } else {
+                            bufferedNotifications.append(method: method, params: params)
+                        }
                     }
                 )
             }
@@ -1879,6 +1887,10 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     }
 
     private func handleNotification(method: String, params: Any?, session: Session) {
+        if method == DistillACPClient.operationMethod {
+            emit(Self.runtimeEvent(method: method, payload: params as? [String: Any] ?? [:]), session: session)
+            return
+        }
         foldLoops(method: method, params: params, session: session)
         if routeWakeNotification(method: method, params: params, session: session) { return }
         guard method == "session/update",
@@ -2542,6 +2554,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     /// longer open. Stream/tool events fully reset the deadline so long-running
     /// goals stay live for as long as the provider keeps producing activity.
     private func refreshTurnWatchdog(session: Session, generation: UInt64) {
+        // Negotiated providers are supervised by operation evidence and live ACP probes.
+        guard !session.client.supportsOperationStatus else { return }
         lock.lock()
         guard sessions[session.threadId] === session,
               session.isLive,
@@ -2569,10 +2583,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         session.turnWatchdog = nil
     }
 
-    /// When `session/prompt` never returns after the model finished streaming
-    /// *and* no further events arrive within the inactivity window, synthesize a
-    /// terminal so coordinator ownership / Working release.
-    /// Prefer `.completed` when the mapper already has speakable final text.
+    /// Legacy providers without operation evidence have a bounded inactivity failure.
+    /// A partial answer is never evidence that session/prompt completed.
     private func fireTurnInactivityWatchdog(session: Session, generation: UInt64) {
         lock.lock()
         guard sessions[session.threadId] === session,
@@ -2600,9 +2612,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         session.turnWatchdogSynthesisInProgress = true
         cancelTurnWatchdogLocked(session: session)
         lock.unlock()
-        // Open tools mean quiet ≠ goal success — synthesize interrupted so the
-        // host does not paint a green completed goal mid long silent shell/CI.
-        // Speakable text alone is only enough when no tool_call is still open.
+        // Silence cannot prove success, even when a partial answer was streamed.
         let hasOpenTools = session.mapper.hasOpenToolCalls
         if hasOpenTools {
             synchronized {
@@ -2618,9 +2628,6 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         if hasOpenTools {
             status = .interrupted
             stopReason = "interrupted"
-        } else if hasFinal {
-            status = .completed
-            stopReason = "end_turn"
         } else {
             status = .failed
             stopReason = "failed"

@@ -1267,7 +1267,7 @@ public struct AgentChatWorkingStatusStrip: View {
                         .foregroundColor(DS.Palette.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
-                        .accessibilityLabel(AgentChatWorkingCopy.accessibilityLabel(
+                        .accessibilityLabel(distill?.operationHeadline(now: timeline.date) ?? AgentChatWorkingCopy.accessibilityLabel(
                             context: context,
                             elapsedSeconds: seconds,
                             hold: hold
@@ -1322,7 +1322,7 @@ public struct AgentChatWorkingStatusStrip: View {
             hold: hold
         )
         guard let distill else { return Text(base) }
-        var line = Text(distill.headline.map { h in
+        var line = Text(distill.operationHeadline(now: now) ?? distill.headline.map { h in
             let secs = distill.headlineSince.map { max(0, Int(now.timeIntervalSince($0))) }
             return secs.map { "\(h) \($0)s" } ?? h
         } ?? distill.goalHeadline ?? base)

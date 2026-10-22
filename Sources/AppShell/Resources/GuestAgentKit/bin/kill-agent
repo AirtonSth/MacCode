@@ -160,7 +160,13 @@ reap() {
             idle=$((idle + reap_interval))
         fi
         if [ "$idle" -gt "$lease_max_age" ]; then
-            # The Mac stopped renewing the lease: end the run, then this reaper.
+            # Write the cause to the agent's existing stderr before TERM. The
+            # reaper owns no stdio descriptor, so it cannot delay docker EOF.
+            local leader
+            if read -r leader < "$state/$run.pid" && [[ $leader =~ ^[0-9]+$ ]]; then
+                timeout 1 sh -c 'printf "MacCode guest lease expired: no host renewal for %s seconds; stopping run %s\n" "$2" "$3" > "/proc/$1/fd/2"' \
+                    sh "$leader" "$idle" "$run" 2>/dev/null || true
+            fi
             kill_runs "$run" 0
             exit
         fi

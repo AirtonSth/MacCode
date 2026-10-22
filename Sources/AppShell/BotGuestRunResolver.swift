@@ -726,12 +726,19 @@ final class BotGuestLeaseHeartbeat: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var stopped = false
     private var renewals = 0
+    private var activity: NSObjectProtocol?
 
     /// Writes the lease once before returning; throws when it cannot.
     init(guestHome: URL, runID: String, interval: TimeInterval = BotGuestLeaseHeartbeat.interval) throws {
         directoryURL = guestHome.appendingPathComponent(".rc-runs", isDirectory: true)
         fileURL = directoryURL.appendingPathComponent("\(runID).lease")
         try queue.sync { try renew() }
+        // This lease is a correctness deadline, not discretionary background work.
+        // App Nap must not defer it past the guest reaper's 45-second bound.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep,
+            reason: "Keep the active bot VM run lease current"
+        )
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + interval, repeating: interval)
         timer.setEventHandler { [weak self] in
@@ -746,7 +753,10 @@ final class BotGuestLeaseHeartbeat: @unchecked Sendable {
         timer.resume()
     }
 
-    deinit { timer?.cancel() }
+    deinit {
+        timer?.cancel()
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+    }
 
     /// Idempotent. Removes the lease so a leftover agent is reaped.
     func stop() {
@@ -755,6 +765,7 @@ final class BotGuestLeaseHeartbeat: @unchecked Sendable {
             stopped = true
             timer?.cancel()
             timer = nil
+            if let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
             guard let directory = try? PrivateDirectory(directoryURL, create: false) else { return }
             directory.remove(fileURL.lastPathComponent)
             directory.close()
