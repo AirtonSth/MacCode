@@ -320,6 +320,12 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     /// Pure: a Bot row spins while the Bot has a live run or its linked thread is running.
+    /// Titio's sidebar badge is the same needs-you plus just-finished total as the
+    /// pet's red dot and the Dock badge, so every surface shows one number.
+    static func titioBadgeCount(_ counts: PetActivityCounts) -> Int {
+        counts.isAvailable ? counts.badgeTotal : 0
+    }
+
     nonisolated static func isBotRunning(_ botID: BotID, running: Set<BotID>, runningLinked: Set<BotID>) -> Bool {
         running.contains(botID) || runningLinked.contains(botID)
     }
@@ -790,7 +796,6 @@ public final class SidebarViewModel: ObservableObject {
         let botStore = context.botStore
         let threadRepo = context.threadRepo
         let messageRepo = context.messageRepo
-        let noticeRepo = TitioNoticeRepository(db: context.db)
         if authorizedBotRowsHostID != hostID { virtualMachines = [] }
         authorizedBotRowsGeneration &+= 1
         let generation = authorizedBotRowsGeneration
@@ -815,8 +820,7 @@ public final class SidebarViewModel: ObservableObject {
                 else { Self.loadAuthorizedBotConversationRows(botStore: botStore, threadRepo: threadRepo, hostID: hostID, workspaceIDs: workspaceIDs) }
                 let linkedRunning = Set(((try? botStore.conversationsLinked(to: live)) ?? [:]).values.map(\.botID))
                 let tree = Self.loadSidebarTree(botStore: botStore, threadRepo: threadRepo, hostID: hostID, expanded: expanded, includeHidden: includeHidden, keepUntitled: keepUntitled,
-                                               hasMessages: { (try? messageRepo.hasAny(threadId: $0)) ?? true },
-                                               titioUnreadCount: { (try? noticeRepo.inboxState().unreadCount) ?? 0 })
+                                               hasMessages: { (try? messageRepo.hasAny(threadId: $0)) ?? true })
                 var conversationBots: [BotID: BotDefinition] = [:]
                 if let tree {
                     for id in Set(tree.conversations.values.flatMap { $0.compactMap(\.botID) }) {
@@ -915,8 +919,7 @@ public final class SidebarViewModel: ObservableObject {
         expanded: Set<WorkspaceID>,
         includeHidden: Bool = false,
         keepUntitled: Set<AgentThreadID> = [],
-        hasMessages: (AgentThreadID) -> Bool = { _ in true },
-        titioUnreadCount: () -> Int = { 0 }
+        hasMessages: (AgentThreadID) -> Bool = { _ in true }
     ) -> (general: [GeneralBotRow], conversations: [WorkspaceID: [WorkspaceConversationRow]], virtualMachines: [BotVirtualMachine])? {
         do {
             // Titio, pinned, user drag order, then most recent.
@@ -931,8 +934,9 @@ public final class SidebarViewModel: ObservableObject {
                 let generalReadable = bindings.contains { $0.context == .general && $0.state == .active && $0.actions.contains(.read) }
                 // Never-bound Bots are the pre-contextual catalog Bots the roster already lists; they open their Desk.
                 guard bot.handle == TitioIdentity.handle || generalReadable || (bindings.isEmpty && !workspaceScoped) else { continue }
+                // Titio's badge is the global Activity total (see titioBadgeCount), not a count of its own.
                 let unread = bot.handle == TitioIdentity.handle
-                    ? titioUnreadCount()
+                    ? 0
                     : ((try? botStore.listConversations(botID: bot.id)) ?? []).filter(\.unread).count
                 general.append(GeneralBotRow(botID: bot.id, name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol, pinned: bot.pinned, hidden: bot.hidden,
                                              unreadCount: bot.notificationsEnabled ? unread : 0))
@@ -3528,6 +3532,7 @@ public struct SidebarRootView: View {
     private func generalBotRow(_ row: SidebarViewModel.GeneralBotRow) -> some View {
         let selected = vm.newBotConversationThreadID != nil && vm.deskSelection?.threadID == vm.newBotConversationThreadID && vm.deskSelection?.botID == row.botID && vm.deskSelection?.context == .general
         let running = SidebarViewModel.isBotRunning(row.botID, running: vm.runningBotIDs, runningLinked: vm.runningLinkedBotIDs)
+        let unread = row.isTitio ? SidebarViewModel.titioBadgeCount(vm.activityCounts) : row.unreadCount
         return Button { navigate { vm.openGeneralBot(row) } } label: {
             HStack(spacing: DS.Space.sm) {
                 BotsAvatarView(name: row.name, handle: row.handle, symbol: row.symbol, size: 20, attention: running ? .working : .none)
@@ -3535,7 +3540,7 @@ public struct SidebarRootView: View {
                 Text(BotsViewModel.displayName(row.name)).font(selected ? DS.Font.bodyStrong : DS.Font.body).foregroundColor(DS.Palette.text).lineLimit(1)
                 Spacer(minLength: 0)
                 if running { DSBusySpinner(label: "Running") } else if vm.finishedBotIDs.contains(row.botID) { finishedDot }
-                if row.unreadCount > 0 { unreadBadge(row.unreadCount) }
+                if unread > 0 { unreadBadge(unread) }
                 if row.hidden {
                     Image(systemName: "eye.slash")
                         .font(.system(size: 9, weight: .semibold))
@@ -3566,7 +3571,7 @@ public struct SidebarRootView: View {
         .onDrop(of: [.text], delegate: BotDropDelegate(vm: vm, target: row.botID))
         .help(searchHelp(type: "General Bot", location: "General", name: row.name))
         .accessibilityLabel(BotsViewModel.displayName(row.name))
-        .accessibilityValue("\(running ? "Running. " : "")\(row.unreadCount > 0 ? "\(row.unreadCount) unread. " : "")\(row.pinned ? "Pinned. " : "")\(row.hidden ? "Hidden. " : "")General Bot")
+        .accessibilityValue("\(running ? "Running. " : "")\(unread > 0 ? "\(unread) unread. " : "")\(row.pinned ? "Pinned. " : "")\(row.hidden ? "Hidden. " : "")General Bot")
         .accessibilityIdentifier("sidebar.generalBot.\(row.handle)")
         .contextMenu {
             Button(row.pinned ? "Unpin" : "Pin") { vm.setBotPinned(row.botID, !row.pinned) }
@@ -3967,7 +3972,7 @@ public struct SidebarRootView: View {
         }
     }
 
-    /// Same success dot as the workspace row: this item just finished.
+    /// Red like the pet's needs-you dot.
     private func unreadBadge(_ count: Int) -> some View {
         Text(count > 99 ? "99+" : "\(count)")
             .font(DS.Font.caption2.weight(.semibold))
@@ -3975,7 +3980,7 @@ public struct SidebarRootView: View {
             .foregroundColor(.white)
             .padding(.horizontal, 5)
             .frame(minWidth: 16, minHeight: 16)
-            .background(Capsule().fill(DS.Palette.accent))
+            .background(Capsule().fill(Color.red))
             .help("\(count) unread")
             .accessibilityHidden(true)
             .accessibilityIdentifier("sidebar.unreadBadge")

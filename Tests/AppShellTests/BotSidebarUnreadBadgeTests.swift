@@ -18,12 +18,21 @@ final class BotSidebarUnreadBadgeTests: XCTestCase {
         try context.botStore.upsertConversation(read)
         let tree = SidebarViewModel.loadSidebarTree(
             botStore: context.botStore, threadRepo: context.threadRepo,
-            hostID: context.liveActivityHostIdentity.serverId, expanded: [],
-            titioUnreadCount: { 3 }
+            hostID: context.liveActivityHostIdentity.serverId, expanded: []
         )
         let rows = try XCTUnwrap(tree?.general)
         XCTAssertEqual(rows.first { $0.botID == bot.id }?.unreadCount, 1)
-        if let titio = rows.first(where: \.isTitio) { XCTAssertEqual(titio.unreadCount, 3) }
+        if let titio = rows.first(where: \.isTitio) { XCTAssertEqual(titio.unreadCount, 0) }
+    }
+
+    func test_titioBadgeIsThePetAndDockTotal() {
+        // WHY: Titio showed 2 while the pet, Dock and Activity showed nothing; every
+        // surface must show the same needs-you plus just-finished number.
+        let counts = PetActivityCounts(running: 4, needsYou: 2, newResults: 3)
+        XCTAssertEqual(SidebarViewModel.titioBadgeCount(counts), counts.badgeTotal)
+        XCTAssertEqual(SidebarViewModel.titioBadgeCount(counts), 5)
+        XCTAssertEqual(ActivityDockBadge.label(for: counts), "5")
+        XCTAssertEqual(SidebarViewModel.titioBadgeCount(.zero), 0, "unknown counts hide the badge like the Dock")
     }
 
     func test_activityItemIDsForReadNotices_areUniqueAndCoverRunsAndNotifications() {
