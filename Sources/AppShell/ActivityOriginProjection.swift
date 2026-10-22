@@ -41,8 +41,8 @@ enum ActivityOriginProjection {
         }
 
         let botStore = BotStore(db: db)
-        let conversations = try [BotAttentionState.none, .working, .unreadActivity, .needsAttention]
-            .flatMap { try botStore.listConversations(attentionStates: [$0]) }
+        // One pass: each call re-runs the correlated attention subqueries over every conversation.
+        let conversations = try botStore.listConversations(attentionStates: [.none, .working, .unreadActivity, .needsAttention])
         let contextLabels = Dictionary(conversations.compactMap { conversation -> (String, String)? in
             guard let threadID = conversation.linkedAgentThreadID,
                   threadByID[threadID.value.uuidString.lowercased()] != nil else { return nil }

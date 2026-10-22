@@ -43,6 +43,27 @@ final class ProviderSessionChromeProbeTests: XCTestCase {
         )
     }
 
+    /// WHY: the composer permission capsule asks this on every MainActor render.
+    /// An idle thread must answer from memory; a SQLite read there blocked the
+    /// main thread behind Activity reads on the shared read connection.
+    func test_hasProviderSession_idleThreadSkipsSQLite() throws {
+        let (threadRepo, messageRepo, runRepo) = try makeRepos("session-idle")
+        let live = AgentThread(title: "live", provider: .codex, model: "fake-model")
+        let idle = AgentThread(title: "idle", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(live)
+        try threadRepo.upsert(idle)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: LiveSessionAdapter(threadId: live.id)]
+        )
+        let chromeBefore = threadRepo.listChromeCallCountForTesting
+        XCTAssertFalse(coordinator.hasProviderSession(threadId: idle.id))
+        XCTAssertEqual(threadRepo.listChromeCallCountForTesting, chromeBefore)
+        XCTAssertTrue(coordinator.hasProviderSession(threadId: live.id))
+    }
+
     func test_adapterForThread_sourceUsesListChrome() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)

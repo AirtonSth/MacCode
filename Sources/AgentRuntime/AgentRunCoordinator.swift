@@ -2408,6 +2408,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Provider-authoritative busy state. This remains true when a surface or
     /// coordinator projection is stale but the adapter still owns a live turn.
     public func hasProviderSession(threadId: AgentThreadID) -> Bool {
+        // SwiftUI bodies call this on MainActor. Without any live adapter turn
+        // the answer is false, so skip the SQLite provider lookup that waits
+        // behind long Activity reads on the shared read connection.
+        lock.lock()
+        let adapters = Array(providers.values)
+        lock.unlock()
+        guard adapters.contains(where: { providerSessionIsLive($0, threadId: threadId) }) else { return false }
         guard let adapter = try? adapterForThread(threadId) else { return false }
         return providerSessionIsLive(adapter, threadId: threadId)
     }
