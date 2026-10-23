@@ -99,7 +99,7 @@ public struct DistillLiveStatus: Equatable, Sendable {
     public var operation: Operation?
 
     public func operationHeadline(now: Date) -> String? {
-        guard let operation else { return nil }
+        guard guestRecoveryText == nil, let operation else { return nil }
         let seconds = max(0, Int(now.timeIntervalSince(operation.lastProgressAt)))
         if operation.stalled { return "\(operation.label) — no progress for \(seconds)s · Stop to cancel" }
         return "\(operation.label) — last update \(seconds)s ago"
@@ -128,8 +128,16 @@ public struct DistillLiveStatus: Equatable, Sendable {
         subagents.last(where: { $0.isCompacting })
     }
 
+    private var guestRecoveryText: String? {
+        switch guestStage {
+        case .diagnosing, .repairing, .verifying, .recovered, .repairFailed: return guestStage?.text
+        default: return nil
+        }
+    }
+
     /// "Subagent (<description>): Compacting…" / "Compacting…" / nil (keep existing copy).
     public var headline: String? {
+        if let guestRecoveryText { return guestRecoveryText }
         if let operation { return operation.stalled ? "\(operation.label) — no progress" : operation.label }
         if let sub = compactingSubagent { return "Subagent (\(sub.description)): Compacting…" }
         if mainCompactingSince != nil { return "Compacting…" }
@@ -145,7 +153,8 @@ public struct DistillLiveStatus: Equatable, Sendable {
 
     /// Start of the compaction the headline describes.
     public var headlineSince: Date? {
-        compactingSubagent?.compactingSince ?? mainCompactingSince
+        if guestRecoveryText != nil { return guestStageSince }
+        return compactingSubagent?.compactingSince ?? mainCompactingSince
             ?? (guestStage?.text != nil ? guestStageSince : nil)
     }
 
@@ -226,6 +235,7 @@ public struct DistillLiveStatus: Equatable, Sendable {
             guard let stage = (payload["stage"] as? String).flatMap(DistillGuestStage.init(rawValue:)) else { return }
             if stage != guestStage { guestStageSince = receivedAt }
             guestStage = stage == .ready ? nil : stage
+            if stage == .ready { guestStageSince = nil }
             return
         }
         let update: [String: Any]

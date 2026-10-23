@@ -1376,7 +1376,12 @@ public final class DistillACPClient: @unchecked Sendable {
             params: ["sessionId": sessionId, "enabled": enabled],
             timeout: 15
         )
-        return response["enabled"] as? Bool ?? enabled
+        let nested = response["result"] as? JSONObject
+        guard let applied = (response["enabled"] as? Bool) ?? (nested?["enabled"] as? Bool),
+              applied == enabled else {
+            throw DistillACPError.unsupported("Distill did not confirm the requested Ultracode mode; prompt was not sent.")
+        }
+        return applied
     }
 
     /// Distill extension method that selects the session's one exclusive execution mode.
@@ -1391,7 +1396,10 @@ public final class DistillACPClient: @unchecked Sendable {
         )
         let nested = response["result"] as? JSONObject
         let raw = (response["mode"] as? String) ?? (nested?["mode"] as? String)
-        return raw.flatMap(DistillExecutionMode.init(rawValue:)) ?? mode
+        guard let applied = raw.flatMap(DistillExecutionMode.init(rawValue:)), applied == mode else {
+            throw DistillACPError.unsupported("Distill did not confirm \(mode.displayName) mode; prompt was not sent.")
+        }
+        return applied
     }
     /// Distill extension method that deletes a scheduled (`/loop`) task.
     static let schedulerDeleteMethod = "_x.ai/scheduler/delete"

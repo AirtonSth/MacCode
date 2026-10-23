@@ -828,23 +828,68 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(try legacyUltracodeSets(requestsURL), [true])
     }
 
-    func test_modeUnknownToAnyDistillDoesNotFailTurn() async throws {
+    func test_unsupportedExecutionModeDoesNotSendPrompt() async throws {
         let root = try makeTempRoot("distill-acp-mode-none")
         defer { try? FileManager.default.removeItem(at: root) }
         let notFound = #"{"jsonrpc":"2.0","id":message["id"],"error":{"code":-32601,"message":"method not found"}}"#
-        let (harness, _) = try writeWorkerHarness(
+        let (harness, requestsURL) = try writeWorkerHarness(
             root: root, initializeCapabilities: "{}", workerResult: "{}",
             ultracodeReplyJSON: notFound, executionModeReplyJSON: notFound
         )
         let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
         defer { adapter.stopAll() }
+        do {
+            _ = try await adapter.startSession(
+                AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: root.path,
+                                prompt: "Go", distillExecutionMode: .ultrafast)
+            ) { _ in }
+            XCTFail("An unavailable mode must not silently run with another mode")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Ultrafast"), error.localizedDescription)
+        }
+        XCTAssertFalse(try recordedRequests(requestsURL).contains { $0["method"] as? String == "session/prompt" })
+    }
+
+    func test_executionModeRequiresMatchingAcknowledgementBeforePrompt() async throws {
+        let root = try makeTempRoot("distill-acp-mode-confirmation")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root, initializeCapabilities: "{}", workerResult: "{}",
+            executionModeReplyJSON: #"{"jsonrpc":"2.0","id":message["id"],"result":{"mode":"normal"}}"#
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        do {
+            _ = try await adapter.startSession(
+                AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: root.path,
+                                prompt: "Go", distillExecutionMode: .ultrasave)
+            ) { _ in }
+            XCTFail("A different acknowledged mode must not accept the prompt")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Ultrasave"), error.localizedDescription)
+        }
+        XCTAssertFalse(try recordedRequests(requestsURL).contains { $0["method"] as? String == "session/prompt" })
+    }
+
+    func test_resumedSessionExplicitlyRestoresNormalBeforePrompt() async throws {
+        let root = try makeTempRoot("distill-acp-mode-resume")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root, initializeCapabilities: #"{"loadSession":True}"#, workerResult: "{}"
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
         let events = DistillACPAdapterEventBox()
-        _ = try await adapter.startSession(
+        _ = try await adapter.sendTurn(
             AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: root.path,
-                            prompt: "Go", distillExecutionMode: .ultrafast)
+                            prompt: "Go", providerThreadId: "worker-session", distillExecutionMode: .normal)
         ) { events.append($0) }
-        let finished = try await events.waitForFinish()
-        XCTAssertEqual(finished.status, .completed)
+        _ = try await events.waitForFinish()
+        XCTAssertEqual(try modeSets(requestsURL), ["normal"], "a saved session can still have a previous non-Normal mode")
+        let methods = try recordedRequests(requestsURL).compactMap { $0["method"] as? String }
+        if let modeIndex = methods.firstIndex(of: DistillACPClient.executionModeSetMethod) {
+            XCTAssertLessThan(modeIndex, try XCTUnwrap(methods.firstIndex(of: "session/prompt")))
+        }
     }
 
     func test_clientSetExecutionModeSendsSessionAndModeAndReturnsTheConfirmedMode() async throws {
@@ -924,6 +969,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 else:
                     state["main"] = next_main
                     send({"jsonrpc":"2.0", "id":message["id"], "result":{"meta":{"model":next_main,"canonicalModelId":next_main}}})
+            elif method == "_x.ai/session/execution_mode/set":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"mode":message.get("params", {}).get("mode")}})
             elif method in ("session/set_mode", "session/set_config_option"):
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
             elif method == "session/prompt":
@@ -1080,6 +1127,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             elif method == "session/set_model":
                 record({"method":method,"sessionId":params.get("sessionId"),"modelId":params.get("modelId")})
                 send({"jsonrpc":"2.0","id":message["id"],"result":{"meta":{"model":params.get("modelId"),"canonicalModelId":params.get("modelId")}}})
+            elif method == "_x.ai/session/execution_mode/set":
+                send({"jsonrpc":"2.0","id":message["id"],"result":{"mode":params.get("mode")}})
             elif method == "session/prompt":
                 session = params.get("sessionId")
                 text = prompt_text(params.get("prompt", []))
