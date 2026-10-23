@@ -126,4 +126,16 @@ final class DistillACPOperationTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("23"), "\(error)")
         }
     }
+
+    func test_signalExitDoesNotReuseAnOldProviderError() {
+        let failure = DistillACPFailureTaxonomy.normalize(
+            DistillACPError.processExited(
+                reason: .uncaughtSignal, status: 9,
+                stderrTail: "old recovered API error: HTTP 429 Too Many Requests; authentication required"
+            ),
+            context: .turn
+        )
+        XCTAssertEqual(failure.category, .nonRecoverable)
+        XCTAssertTrue(failure.message.contains("signal 9"))
+    }
 }

@@ -722,7 +722,7 @@ final class BotGuestLeaseHeartbeat: @unchecked Sendable {
 
     let fileURL: URL
     private let directoryURL: URL
-    private let queue = DispatchQueue(label: "io.remotecode.bot-guest.lease", qos: .utility)
+    private let queue = DispatchQueue(label: "io.remotecode.bot-guest.lease", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private var stopped = false
     private var renewals = 0
@@ -739,7 +739,7 @@ final class BotGuestLeaseHeartbeat: @unchecked Sendable {
             options: .userInitiatedAllowingIdleSystemSleep,
             reason: "Keep the active bot VM run lease current"
         )
-        let timer = DispatchSource.makeTimerSource(queue: queue)
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
         timer.schedule(deadline: .now() + interval, repeating: interval)
         timer.setEventHandler { [weak self] in
             guard let self, !self.stopped else { return }
@@ -776,7 +776,10 @@ final class BotGuestLeaseHeartbeat: @unchecked Sendable {
         renewals += 1
         let directory = try PrivateDirectory(directoryURL, create: true)
         defer { directory.close() }
-        try directory.writeAtomically(Data("\(renewals)\n".utf8), to: fileURL.lastPathComponent)
+        // The guest reads the live bind mount. Persisting a heartbeat through
+        // a host power loss is useless, and fsync can stall past its deadline
+        // while the Mac is paging or busy with other disk writes.
+        try directory.writeAtomically(Data("\(renewals)\n".utf8), to: fileURL.lastPathComponent, synchronize: false)
     }
 }
 

@@ -151,8 +151,10 @@ reap() {
             rm -f "$state/$run.pid"
             exit 0
         fi
-        # %y has sub-second precision: every renewal changes it.
-        current=$(stat -c %y -- "$lease" 2>/dev/null) || current=""
+        # Read the host's renewal counter, not bind-mount timestamp metadata.
+        # A cached mtime must never expire a lease whose contents keep changing.
+        # The guest owns this path: a FIFO or large file must not block the reaper.
+        current=$(timeout 1 head -c 32 -- "$lease" 2>/dev/null) || current=""
         if [ -n "$current" ] && [ "$current" != "$seen" ]; then
             seen=$current
             idle=0
