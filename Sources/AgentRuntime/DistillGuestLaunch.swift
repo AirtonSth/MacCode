@@ -13,6 +13,8 @@ public protocol DistillGuestLaunchResolving: Sendable {
     /// has no side effects: recovery and transcript reads call it on open.
     func isGuestThread(_ threadId: AgentThreadID) -> Bool
     func preservesSessionIdentity(_ threadId: AgentThreadID) -> Bool
+    var supportsGuestRecovery: Bool { get }
+    func resynchronizeGuest(_ request: AgentRunRequest) async throws -> Bool
     /// A launch plan for a guest thread, nil for a Mac thread. Throws when the
     /// thread belongs in a guest that cannot run it now; the run fails rather
     /// than run on the Mac. `progress` reports each stage as it starts.
@@ -24,6 +26,8 @@ public protocol DistillGuestLaunchResolving: Sendable {
 
 public extension DistillGuestLaunchResolving {
     func preservesSessionIdentity(_ threadId: AgentThreadID) -> Bool { false }
+    var supportsGuestRecovery: Bool { false }
+    func resynchronizeGuest(_ request: AgentRunRequest) async throws -> Bool { false }
 }
 
 /// Why a guest thread cannot run now. It never runs on the Mac instead.
@@ -55,6 +59,11 @@ public enum DistillGuestStage: String, Sendable, Equatable, CaseIterable {
     case launching
     /// The guest agent answered `initialize`; the strip returns to normal.
     case ready
+    case diagnosing
+    case repairing
+    case verifying
+    case recovered
+    case repairFailed
 
     public var text: String? {
         switch self {
@@ -65,6 +74,11 @@ public enum DistillGuestStage: String, Sendable, Equatable, CaseIterable {
         case .signingIn: return "Checking your sign-in…"
         case .launching: return "Launching the agent in the Linux VM…"
         case .ready: return nil
+        case .diagnosing: return "Diagnosing Linux agent on Mac…"
+        case .repairing: return "Repairing Linux agent catalog…"
+        case .verifying: return "Verifying Linux agent catalog…"
+        case .recovered: return "Linux agent catalog restored."
+        case .repairFailed: return "Automatic Linux agent recovery stopped."
         }
     }
 

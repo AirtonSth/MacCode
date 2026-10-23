@@ -124,7 +124,13 @@ final class BotGuestRunResolverTests: XCTestCase {
         )
     }
 
-    /// A conversation locked to the bot's VM; `marked` adds the plan-A guest marker.
+    private func makeRecoveryFixture() async throws -> Fixture {
+        let fixture = try await makeFixture()
+        try fixture.ctx.botStore.setExecutionDestination(.ownVM, botID: fixture.bot.id)
+        fixture.vm.container = BotComputerGuestSpec.containerName(botID: fixture.bot.id)
+        return fixture
+    }
+
     private func makeThread(
         _ f: Fixture, workspace: Bool = false, marked: Bool = true,
         target: ExecutionTarget = .vm, title: String = "Desk chat"
@@ -801,6 +807,97 @@ final class BotGuestRunResolverTests: XCTestCase {
         await secondPlan.finish(.completed).value
     }
 
+    func test_resynchronizeGuestWithoutLivePlanReturnsFalseAndDoesNotCopyCredentials() async throws {
+        let f = try await makeRecoveryFixture()
+        let thread = try makeThread(f)
+        let req = request(thread)
+
+        let resynchronized = try await f.resolver.resynchronizeGuest(req)
+        XCTAssertFalse(resynchronized)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: f.guestDistillHome.appendingPathComponent("claude-auth.json").path))
+    }
+
+    func test_resynchronizeGuestCopiesCurrentHostAccessTokenWithoutRefreshToken() async throws {
+        let f = try await makeRecoveryFixture()
+        let thread = try makeThread(f)
+        let req = request(thread)
+        let plan = try unwrapPlan(try await f.resolver.prepare(req) { _ in })
+        defer {
+            plan.finish(.completed)
+            f.registry.endRun(runID: req.runId)
+        }
+        try #"{"access_token":"at-2","refresh_token":"rt-new-host-only","expires_at":4102444800000}"#
+            .write(to: f.hostHome.appendingPathComponent("claude-auth.json"), atomically: true, encoding: .utf8)
+
+        let resynchronized = try await f.resolver.resynchronizeGuest(req)
+        XCTAssertTrue(resynchronized)
+        let copy = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf:
+            f.guestDistillHome.appendingPathComponent("claude-auth.json"))) as? [String: Any])
+        XCTAssertEqual(copy["access_token"] as? String, "at-2")
+        XCTAssertEqual(copy["refresh_token"] as? String, "")
+        XCTAssertEqual(f.refreshes.values, [.claude], "resynchronization only recopies credentials; it does not renew them")
+    }
+
+    func test_resynchronizeGuestAfterPlanFinishesDoesNotResurrectCredentialCopy() async throws {
+        let f = try await makeRecoveryFixture()
+        let thread = try makeThread(f)
+        let req = request(thread)
+        let plan = try unwrapPlan(try await f.resolver.prepare(req) { _ in })
+        await plan.finish(.completed).value
+        f.registry.endRun(runID: req.runId)
+
+        let resynchronized = try await f.resolver.resynchronizeGuest(req)
+        XCTAssertFalse(resynchronized)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: f.guestDistillHome.appendingPathComponent("claude-auth.json").path))
+    }
+
+    func test_resynchronizeGuestAfterOneParallelRunFinishesKeepsOtherRunCredentialsAndClaim() async throws {
+        let f = try await makeRecoveryFixture()
+        let first = try makeThread(f, title: "First chat")
+        let second = try makeThread(f, title: "Second chat")
+        let firstRequest = request(first)
+        let secondRequest = request(second)
+        let firstPlan = try unwrapPlan(try await f.resolver.prepare(firstRequest) { _ in })
+        let secondPlan = try unwrapPlan(try await f.resolver.prepare(secondRequest) { _ in })
+        await firstPlan.finish(.completed).value
+        f.registry.endRun(runID: firstRequest.runId)
+
+        let resynchronized = try await f.resolver.resynchronizeGuest(secondRequest)
+        XCTAssertTrue(resynchronized)
+        XCTAssertEqual(f.registry.active(botID: f.bot.id)?.runID, secondRequest.runId)
+        let copy = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf:
+            f.guestDistillHome.appendingPathComponent("claude-auth.json"))) as? [String: Any])
+        XCTAssertEqual(copy["refresh_token"] as? String, "")
+        await secondPlan.finish(.completed).value
+        f.registry.endRun(runID: secondRequest.runId)
+    }
+
+    func test_resynchronizeGuestCancelledTaskThrowsBeforeCredentialWrite() async throws {
+        let f = try await makeRecoveryFixture()
+        let thread = try makeThread(f)
+        let req = request(thread)
+        let plan = try unwrapPlan(try await f.resolver.prepare(req) { _ in })
+        defer {
+            plan.finish(.completed)
+            f.registry.endRun(runID: req.runId)
+        }
+        let copyURL = f.guestDistillHome.appendingPathComponent("claude-auth.json")
+        try FileManager.default.removeItem(at: copyURL)
+        let task = Task {
+            try await f.resolver.resynchronizeGuest(req)
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("cancelled resynchronization must throw before writing credentials")
+        } catch is CancellationError {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: copyURL.path))
+        }
+    }
+
     func test_twoBotsShareOneVMAndRunTogether() async throws {
         let f = try await makeFixture()
         let machine = try f.ctx.botStore.saveVirtualMachine(name: "Shared")
@@ -1346,6 +1443,7 @@ private final class FakeGuestVM: BotGuestVMPreparing, @unchecked Sendable {
     var error: Error?
     var gate: DispatchSemaphore?
     var onPrepare: (() -> Void)?
+    var container = "remotecode-bot-test"
 
     var calls: [Call] { lock.withLock { recorded } }
 
@@ -1359,7 +1457,7 @@ private final class FakeGuestVM: BotGuestVMPreparing, @unchecked Sendable {
         onPrepare?()
         gate?.wait()
         if let error { throw error }
-        return BotGuestVM(container: "remotecode-bot-test", dockerArch: "aarch64", mountedWorkspaces: workspace.map { [$0] } ?? [])
+        return BotGuestVM(container: container, dockerArch: "aarch64", mountedWorkspaces: workspace.map { [$0] } ?? [])
     }
 }
 

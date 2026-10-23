@@ -428,6 +428,14 @@ public final class DistillGuestCredentialMirror: @unchecked Sendable {
         }
     }
 
+    public func resynchronize(runID: String) throws -> Bool {
+        try queue.sync {
+            guard let run = runs[runID] else { return false }
+            _ = try DistillGuestCredentials.sync(hostHome: hostHome, guestDistillHome: run.home)
+            return true
+        }
+    }
+
     public func end(runID: String) {
         queue.sync {
             guard let run = runs.removeValue(forKey: runID) else { return }

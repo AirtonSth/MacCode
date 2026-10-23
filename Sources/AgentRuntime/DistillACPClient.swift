@@ -605,6 +605,8 @@ public final class DistillACPClient: @unchecked Sendable {
     private var stderrBuffer = Data()
     private var modelCatalog: [AgentModelDescriptor] = []
     private var modelCatalogAdvertised = false
+    var guestCatalogRecovery: (@Sendable () async throws -> Bool)?
+    var guestCatalogRecoveryFinished: (@Sendable (Bool) -> Void)?
     private var stopped = false
     /// Set on `writeQueue` once stdin is closed; later writes fail instead of
     /// reaching a descriptor number the system may have reused.
@@ -873,38 +875,86 @@ public final class DistillACPClient: @unchecked Sendable {
         return try await resolveSelectedModels([value], catalog: catalog)[value]
     }
 
+    private func takeGuestCatalogRecovery() -> (@Sendable () async throws -> Bool)? {
+        lock.withLock {
+            defer { guestCatalogRecovery = nil }
+            return guestCatalogRecovery
+        }
+    }
+
     private func resolveSelectedModels(_ selections: [String], catalog: [AgentModelDescriptor] = []) async throws -> [String: String] {
         let snapshot = lock.withLock { (catalog.isEmpty ? modelCatalog : catalog, modelCatalogAdvertised) }
         if selections.isEmpty {
-            if snapshot.1 && snapshot.0.isEmpty { _ = try await refreshModelCatalog() }
+            if snapshot.1 && snapshot.0.isEmpty {
+                do { _ = try await refreshModelCatalog() }
+                catch {
+                    let originalError = error
+                    let category = DistillACPFailureTaxonomy.normalize(error, context: .start).category
+                    guard category != .authRequired, category != .rateLimited,
+                          let guestCatalogRecovery = takeGuestCatalogRecovery() else { throw originalError }
+                    do {
+                        try Task.checkCancellation()
+                        guard try await guestCatalogRecovery() else { throw originalError }
+                        try Task.checkCancellation()
+                        _ = try await refreshModelCatalog()
+                        guestCatalogRecoveryFinished?(true)
+                    } catch is CancellationError { throw CancellationError() }
+                    catch { guestCatalogRecoveryFinished?(false); throw originalError }
+                }
+            }
             return [:]
         }
         guard snapshot.1 || !snapshot.0.isEmpty else {
             return Dictionary(uniqueKeysWithValues: Set(selections).map { ($0, $0) })
         }
         var models = snapshot.0
+        var resolutionError: Error?
         if selections.contains(where: { Self.matchingModels($0, in: models).isEmpty }) {
             do {
                 models = try await refreshModelCatalog()
             } catch {
-                throw DistillACPError.unsupported("Could not refresh the Distill catalog for the selected model. Retry while connected. (\(error.localizedDescription))")
+                resolutionError = DistillACPError.unsupported("Could not refresh the Distill catalog for the selected model. Retry while connected. (\(error.localizedDescription))")
             }
         }
-        var resolved = [String: String]()
-        for selection in selections {
-            let matches = Self.matchingModels(selection, in: models)
-            guard matches.count == 1, let model = matches.first else {
-                // The picker of a guest thread lists the Mac's catalog, so
-                // refreshing it cannot help: say whose catalog lacks the model.
-                if matches.isEmpty, guest != nil {
-                    throw DistillACPError.unsupported("The Distill in this bot's Linux VM does not list the model '\(selection)'. The model picker shows the Mac's catalog, which can list models the Linux VM does not. Select another model for this bot.")
+        func validate(_ catalog: [AgentModelDescriptor]) throws -> [String: String] {
+            var resolved = [String: String]()
+            for selection in selections {
+                let matches = Self.matchingModels(selection, in: catalog)
+                guard matches.count == 1, let model = matches.first else {
+                    if matches.isEmpty, guest != nil {
+                        throw DistillACPError.unsupported("The Distill in this bot's Linux VM does not list the model '\(selection)'. The model picker shows the Mac's catalog, which can list models the Linux VM does not. Select another model for this bot.")
+                    }
+                    let reason = matches.isEmpty ? "is not advertised" : "matches multiple advertised models"
+                    throw DistillACPError.unsupported("Selected Distill model '\(selection)' \(reason). Refresh the model catalog and select one exact model.")
                 }
-                let reason = matches.isEmpty ? "is not advertised" : "matches multiple advertised models"
-                throw DistillACPError.unsupported("Selected Distill model '\(selection)' \(reason). Refresh the model catalog and select one exact model.")
+                resolved[selection] = model.id
             }
-            resolved[selection] = model.id
+            return resolved
         }
-        return resolved
+        do {
+            if let resolutionError { throw resolutionError }
+            return try validate(models)
+        } catch {
+            let originalError = resolutionError ?? error
+            let selectedMissingQualifiedModel = selections.contains { selection in
+                selection.contains("/") && Self.matchingModels(selection, in: models).isEmpty
+            }
+            let category = DistillACPFailureTaxonomy.normalize(originalError, context: .start).category
+            guard category != .authRequired, category != .rateLimited,
+                  selectedMissingQualifiedModel || (snapshot.1 && models.isEmpty),
+                  selections.allSatisfy({ Self.matchingModels($0, in: models).count <= 1 }),
+                  let guestCatalogRecovery = takeGuestCatalogRecovery() else { throw originalError }
+            do {
+                try Task.checkCancellation()
+                guard try await guestCatalogRecovery() else { throw originalError }
+                try Task.checkCancellation()
+                models = try await refreshModelCatalog()
+                let resolved = try validate(models)
+                guestCatalogRecoveryFinished?(true)
+                return resolved
+            } catch is CancellationError { throw CancellationError() }
+            catch { guestCatalogRecoveryFinished?(false); throw originalError }
+        }
     }
 
     public static func sessionMCPServers(
