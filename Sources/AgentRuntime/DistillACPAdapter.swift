@@ -1386,8 +1386,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // Stop before the prompt is accepted ends the open now instead of after
         // initialize/session/new/set_model; the coordinator records the Stop.
         request.acceptancePermit?.onInvalidate { [weak client] in client?.stop() }
-        // ponytail: only fresh guest catalogs recover; transport recovery needs separate run-ownership checks.
-        if guestPlan != nil, request.providerThreadId == nil, let resolver {
+        // Both fresh and resumed turns validate the guest catalog before any
+        // prompt is sent; the resolver verifies the live run's ownership.
+        if guestPlan != nil, let resolver {
             let diagnose = synchronized { guestRecoveryDiagnosis }
             client.guestCatalogRecovery = {
                 let work = Task {
@@ -2417,7 +2418,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             exitStatus: status
         )
         if terminal == .failed {
-            session.onEvent?(.error(DistillACPFailureTaxonomy.normalize(error, context: .turn).message))
+            let failure = DistillACPFailureTaxonomy.normalize(error, context: .turn)
+            let guestWasKilled = session.guestPlan != nil && !cancelled && !forced
+                && (reason == .uncaughtSignal || (128...255).contains(status))
+            let message = guestWasKilled
+                ? "\(TransientNetworkRetry.guestProcessMarker) \(failure.message)"
+                : failure.message
+            session.onEvent?(.error(message))
         }
         for event in session.mapper.finishTurn(stopReason: terminal == .cancelled ? "cancelled" : "failed", usage: nil) {
             emit(event, session: session)

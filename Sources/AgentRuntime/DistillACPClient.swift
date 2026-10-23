@@ -939,12 +939,12 @@ public final class DistillACPClient: @unchecked Sendable {
             return try validate(models)
         } catch {
             let originalError = resolutionError ?? error
-            let selectedMissingQualifiedModel = selections.contains { selection in
-                selection.contains("/") && Self.matchingModels(selection, in: models).isEmpty
+            let selectedMissingModel = selections.contains { selection in
+                Self.matchingModels(selection, in: models).isEmpty
             }
             let category = DistillACPFailureTaxonomy.normalize(originalError, context: .start).category
             guard category != .authRequired, category != .rateLimited,
-                  selectedMissingQualifiedModel || (snapshot.1 && models.isEmpty),
+                  selectedMissingModel || (snapshot.1 && models.isEmpty),
                   selections.allSatisfy({ Self.matchingModels($0, in: models).count <= 1 }),
                   let guestCatalogRecovery = takeGuestCatalogRecovery() else { throw originalError }
             do {

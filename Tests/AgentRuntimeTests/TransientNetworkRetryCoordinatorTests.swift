@@ -12,14 +12,15 @@ final class TransientNetworkRetryCoordinatorTests: XCTestCase {
 
     /// Fails with `failure` for the first `failures` starts, then completes.
     private final class FlakyRunner: AgentProviderRunner, @unchecked Sendable {
-        let provider: AgentProvider = .codex
+        let provider: AgentProvider
         let failure: String
         let failures: Int
         private let lock = NSLock()
         private var _requests: [AgentRunRequest] = []
         var requests: [AgentRunRequest] { lock.lock(); defer { lock.unlock() }; return _requests }
 
-        init(failure: String, failures: Int) {
+        init(provider: AgentProvider = .codex, failure: String, failures: Int) {
+            self.provider = provider
             self.failure = failure
             self.failures = failures
         }
@@ -47,21 +48,26 @@ final class TransientNetworkRetryCoordinatorTests: XCTestCase {
         }
     }
 
-    private func start(_ runner: FlakyRunner) async throws -> (AgentRunCoordinator, AgentThread, AgentThreadRepository) {
+    private func start(_ runner: FlakyRunner, selection: AgentModelSelection? = nil) async throws -> (AgentRunCoordinator, AgentThread, AgentThreadRepository) {
         let tmp = NSTemporaryDirectory() + "rc2-net-retry-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
-        let thread = AgentThread(title: "net", provider: .codex, model: "fake-model")
+        var thread = AgentThread(title: "net", provider: runner.provider, model: "fake-model")
+        if let selection { thread.modelSelection = selection }
         try threadRepo.upsert(thread)
         let coordinator = AgentRunCoordinator(
             runRepo: AgentRunRepository(db: db),
             messageRepo: AgentMessageRepository(db: db),
             threadRepo: threadRepo,
-            providers: [.codex: runner]
+            providers: [runner.provider: runner]
         )
         coordinator.networkRetryDelays = [0, 0, 0]
         _ = try await coordinator.startRun(AgentRunRequest(
-            threadId: thread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "do it"
+            threadId: thread.id, provider: runner.provider, model: "fake-model", cwd: tmp, prompt: "do it",
+            reasoningEffort: selection?.reasoningEffort,
+            distillMainEffortSelection: selection?.distillMainEffortSelection,
+            distillReasoningEffortSelection: selection?.distillReasoningEffortSelection,
+            distillExecutionMode: selection?.distillExecutionMode ?? .normal
         ))
         return (coordinator, thread, threadRepo)
     }
@@ -75,8 +81,14 @@ final class TransientNetworkRetryCoordinatorTests: XCTestCase {
     }
 
     func test_networkDropMidTurn_resumesOnTheSameSessionAndCompletes() async throws {
-        let runner = FlakyRunner(failure: Self.realFailure, failures: 2)
-        let (_, thread, threadRepo) = try await start(runner)
+        let runner = FlakyRunner(provider: .distill, failure: Self.realFailure, failures: 2)
+        let selection = AgentModelSelection(
+            provider: .distill, modelId: "fake-model", reasoningEffort: .high,
+            distillMainEffortSelection: .automatic,
+            distillReasoningEffortSelection: .fixed(.low),
+            distillExecutionMode: .ultrafast
+        )
+        let (_, thread, threadRepo) = try await start(runner, selection: selection)
 
         await waitUntil { runner.requests.count >= 3 && (try? threadRepo.status(of: thread.id)) == .completed }
 
@@ -85,6 +97,10 @@ final class TransientNetworkRetryCoordinatorTests: XCTestCase {
         let resumed = runner.requests[1]
         XCTAssertEqual(resumed.providerThreadId, "session-1", "resume the same provider session")
         XCTAssertEqual(resumed.prompt, TransientNetworkRetry.prompt)
+        XCTAssertEqual(resumed.reasoningEffort, .high)
+        XCTAssertEqual(resumed.distillMainEffortSelection, .automatic)
+        XCTAssertEqual(resumed.distillReasoningEffortSelection, .fixed(.low))
+        XCTAssertEqual(resumed.distillExecutionMode, .ultrafast)
     }
 
     func test_persistentNetworkFailure_stopsAfterTheBound() async throws {
@@ -97,6 +113,19 @@ final class TransientNetworkRetryCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(runner.requests.count, expected, "never loops forever")
         XCTAssertEqual(try threadRepo.status(of: thread.id), .failed, "the Retry button stays for the user")
+    }
+
+    func test_guestProcessKill_resumesTheSameSessionAndCompletes() async throws {
+        let runner = FlakyRunner(
+            provider: .distill,
+            failure: "\(TransientNetworkRetry.guestProcessMarker) Distill ACP process exited (signal 9).",
+            failures: 1
+        )
+        let (_, thread, threadRepo) = try await start(runner)
+        await waitUntil { runner.requests.count == 2 && (try? threadRepo.status(of: thread.id)) == .completed }
+        XCTAssertEqual(runner.requests.count, 2)
+        XCTAssertEqual(try threadRepo.status(of: thread.id), .completed)
+        XCTAssertEqual(runner.requests.last?.providerThreadId, "session-1")
     }
 
     func test_nonNetworkFailure_isNotRetried() async throws {

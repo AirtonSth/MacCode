@@ -157,11 +157,12 @@ final class BotGuestRunResolverTests: XCTestCase {
 
     private func request(
         _ thread: AgentThread, cwd: String? = nil, runAsUser: AgentRunAsUser? = nil,
-        permit: AgentRunAcceptancePermit? = nil
+        permit: AgentRunAcceptancePermit? = nil, providerThreadId: String? = nil
     ) -> AgentRunRequest {
         AgentRunRequest(
             threadId: thread.id, provider: .distill, model: "claude/claude-sonnet-4-5",
             cwd: cwd ?? root.appendingPathComponent("BotHome").path, prompt: "uname -a",
+            providerThreadId: providerThreadId,
             environment: [
                 "RC_TOKEN_SAVER_DISTILL_HINT": "1",
                 BotSecretEnvironment.botIDEnvironmentKey: "bot",
@@ -826,10 +827,10 @@ final class BotGuestRunResolverTests: XCTestCase {
             atPath: f.guestDistillHome.appendingPathComponent("claude-auth.json").path))
     }
 
-    func test_resynchronizeGuestCopiesCurrentHostAccessTokenWithoutRefreshToken() async throws {
+    func test_resynchronizeResumedGuestCopiesCurrentHostAccessTokenWithoutRefreshToken() async throws {
         let f = try await makeRecoveryFixture()
         let thread = try makeThread(f)
-        let req = request(thread)
+        let req = request(thread, providerThreadId: "existing-session")
         let plan = try unwrapPlan(try await f.resolver.prepare(req) { _ in })
         defer {
             plan.finish(.completed)

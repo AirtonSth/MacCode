@@ -194,7 +194,32 @@ final class DistillACPColdCatalogTests: XCTestCase {
         XCTAssertEqual((worker["params"] as? [String: Any])?["modelId"] as? String, "chatgpt/gpt-6-luna")
     }
 
-    func test_guestRecoveryRunsWhenOnlyWorkerModelIsMissing() async throws {
+    func test_guestRecoveryRestoresAutoAndBareDeepSeekBeforeOpeningSession() async throws {
+        for selected in ["auto", "deepseek-v4.1-flash"] {
+            let root = try makeRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let (binary, log) = try writeHarness(
+                root: root, models: [selected],
+                initialModels: ["unrelated-default"],
+                catalogSequence: [["unrelated-default"], [selected]]
+            )
+            let client = try DistillACPClient(binary: binary.path, cwd: root.path, tagProcess: false)
+            defer { client.stop() }
+            let calls = RecoveryCallCount()
+            client.guestCatalogRecovery = { await calls.increment(); return true }
+            _ = try await client.initialize()
+            let opened = try await client.newSession(cwd: root.path, modelId: selected)
+            XCTAssertEqual(opened.sessionId, "catalog-session")
+            let recoveryCount = await calls.value
+            XCTAssertEqual(recoveryCount, 1)
+            let requests = try recorded(log)
+            XCTAssertEqual(requests.filter { $0["method"] as? String == "session/new" }.count, 1)
+            let open = try XCTUnwrap(requests.first { $0["method"] as? String == "session/new" })
+            XCTAssertEqual(((open["params"] as? [String: Any])?["_meta"] as? [String: Any])?["modelId"] as? String, selected)
+        }
+    }
+
+    func test_guestRecoveryRunsBeforeResumeWhenOnlyWorkerModelIsMissing() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let (binary, log) = try writeHarness(root: root, models: ["chatgpt/gpt-6.1-sol", "chatgpt/gpt-6-luna"], initialModels: ["chatgpt/gpt-6.1-sol"], catalogSequence: [["chatgpt/gpt-6.1-sol"], ["chatgpt/gpt-6.1-sol", "chatgpt/gpt-6-luna"]])
@@ -203,7 +228,7 @@ final class DistillACPColdCatalogTests: XCTestCase {
         let calls = RecoveryCallCount()
         client.guestCatalogRecovery = { await calls.increment(); return true }
         _ = try await client.initialize()
-        _ = try await client.newSession(cwd: root.path, modelId: "chatgpt/gpt-6.1-sol", reasoningModel: "chatgpt/gpt-6-luna")
+        _ = try await client.loadSession(sessionId: "existing-session", cwd: root.path, modelId: "chatgpt/gpt-6.1-sol", reasoningModel: "chatgpt/gpt-6-luna")
         let recoveryCount = await calls.value
         XCTAssertEqual(recoveryCount, 1)
         XCTAssertEqual(try recorded(log).compactMap { $0["method"] as? String }.filter { $0 == "_x.ai/models/list" }.count, 2)

@@ -118,7 +118,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
 
     func resynchronizeGuest(_ request: AgentRunRequest) async throws -> Bool {
         try Task.checkCancellation()
-        guard deps.hostsGuestRuns, request.providerThreadId == nil,
+        guard deps.hostsGuestRuns,
               request.runAsUser.map({ $0.uid == getuid() }) ?? true,
               deps.contextualAdmissions?.hasAdmission(for: request.runId) != true,
               deps.contextualAdmissions?.hasAdmission(threadID: request.threadId) != true,
