@@ -363,4 +363,15 @@ final class DistillBotCavemanEnvironmentTests: XCTestCase {
         XCTAssertEqual(DistillACPClient.launchEnvironment(env)["GROK_CAVEMAN"], "ultra")
         XCTAssertNil(BotRunMCPAdmission.distillSessionRules(environment: env))
     }
+
+    func test_distill2xImageGate_keepsIOSCameraAndPhotosEnabled() {
+        // WHY: distill 2.0.53 still advertises image=false but answered an
+        // image-only prompt live. Gating it off made iOS Camera/Photos show
+        // "Unavailable" for every Distill thread.
+        XCTAssertTrue(DistillACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "2.0.53"))
+        XCTAssertTrue(DistillACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "1.0.4"))
+        XCTAssertFalse(DistillACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "0.3.0"),
+                       "unverified families still fail closed")
+        XCTAssertFalse(DistillACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: nil))
+    }
 }

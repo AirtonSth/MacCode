@@ -293,7 +293,8 @@ public enum DistillACPRequestID: Hashable, Sendable {
 }
 
 /// The distill agent stdio advertises `promptCapabilities.image=false` but still
-/// accepts `type=image` prompt blocks end-to-end (live canary: 0.2.x and 1.0.x).
+/// accepts `type=image` prompt blocks end-to-end (live canary: 0.2.x, 1.0.x and
+/// 2.0.53, which answered an image-only question correctly).
 /// Use one effective gate for both capability advertisement and prompt embedding
 /// so iOS Camera/Photos stay aligned with the wire path.
 public enum DistillACPImageCompatibility {
@@ -307,8 +308,8 @@ public enum DistillACPImageCompatibility {
         if advertised { return true }
         let version = agentVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !version.isEmpty else { return false }
-        // Verified families: 0.2.x and 1.0.x accept image blocks despite image=false.
-        return version.hasPrefix("0.2.") || version.hasPrefix("1.0.")
+        // Verified families accept image blocks despite image=false: 0.2.x, 1.0.x, 2.x.
+        return version.hasPrefix("0.2.") || version.hasPrefix("1.0.") || version.hasPrefix("2.")
     }
 }
 
