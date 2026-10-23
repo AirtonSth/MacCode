@@ -1497,7 +1497,8 @@ public final class DistillACPClient: @unchecked Sendable {
             meta["reasoningEffort"] = wireEffort
         }
         if !meta.isEmpty { params["_meta"] = meta }
-        let response = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
+        // Model binding can await session readiness and account credentials, as session/load does.
+        let response = try await requestJSONObject(method: "session/set_model", params: params, timeout: 60)
         let resultMeta = response["_meta"] as? JSONObject ?? response["meta"] as? JSONObject ?? response
         // Distill 2.0.25 serializes the switch result as `{"Ok": "<model>"}` / `{"Err": "<reason>"}`.
         let rawModel = resultMeta["model"]

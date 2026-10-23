@@ -199,6 +199,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         workerResult: String,
         sessionModels: String = #"{"currentModelId":"main"}"#,
         setModelResult: String? = nil,
+        setModelDelay: TimeInterval = 0,
         sessionOpenJSON: String? = nil,
         ultracodeReplyJSON: String = #"{"jsonrpc":"2.0","id":message["id"],"result":{"enabled":params.get("enabled")}}"#,
         executionModeReplyJSON: String = #"{"jsonrpc":"2.0","id":message["id"],"result":{"mode":params.get("mode")}}"#
@@ -207,7 +208,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let harnessURL = root.appendingPathComponent("distill-agent")
         let harness = """
         #!/usr/bin/env python3
-        import json, pathlib, sys
+        import json, pathlib, sys, time
         requests = pathlib.Path(\(String(reflecting: requestsURL.path)))
         def send(value): print(json.dumps(value), flush=True)
         for line in sys.stdin:
@@ -223,6 +224,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 if extra: result.update(json.loads(extra))
                 send({"jsonrpc":"2.0", "id":message["id"], "result":result})
             elif method == "session/set_model":
+                time.sleep(\(setModelDelay))
                 fixed = \(String(reflecting: setModelResult ?? ""))
                 result = json.loads(fixed) if fixed else {"_meta":{"model":params.get("modelId"),"contextWindow":1000}}
                 if not fixed and params.get("modelId") == "auto":
@@ -287,6 +289,29 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let bindings = requests.filter { $0["method"] as? String == "session/set_model" }
         XCTAssertEqual(bindings.count, 2)
         XCTAssertTrue(bindings.allSatisfy { ($0["params"] as? [String: Any])?["modelId"] as? String == "auto" })
+    }
+
+    func test_slowAutoModelBindingConfirmsSelectionBeforeSendingPromptOnce() async throws {
+        let root = try makeTempRoot("distill-acp-slow-model-binding")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root,
+            initializeCapabilities: "{}", workerResult: "{}", sessionModels: Self.autoCatalog,
+            setModelDelay: 16)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        adapter.autoRoutingPreflight = { _ in [] }
+        let events = DistillACPAdapterEventBox()
+        let request = AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "auto",
+            cwd: root.path, prompt: "Run once", distillMainEffortSelection: .automatic)
+        _ = try await adapter.startSession(request) { events.append($0) }
+        let finished = try await events.waitForFinish()
+        XCTAssertEqual(finished.status, .completed)
+        let requests = try recordedRequests(requestsURL)
+        let bindings = requests.indices.filter { requests[$0]["method"] as? String == "session/set_model" }
+        let prompts = requests.indices.filter { requests[$0]["method"] as? String == "session/prompt" }
+        XCTAssertEqual(bindings.count, 1)
+        XCTAssertEqual(prompts.count, 1)
+        XCTAssertLessThan(try XCTUnwrap(bindings.first), try XCTUnwrap(prompts.first))
     }
 
     func test_autoTurnRechecksAdmissionBeforePhysicalPromptAfterHandshake() async throws {
