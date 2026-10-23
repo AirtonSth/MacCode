@@ -305,7 +305,8 @@ final class ThreadActorRemoteTests: XCTestCase {
         let thread = try newThread(f.router, workspace: f.workspace.id, title: "Granted", provider: .distill)
 
         let refused = await setActor(f, thread: thread.id, bot: bot.id)
-        XCTAssertNotNil(refused.error)
+        XCTAssertEqual(refused.error?.code, -32602)
+        XCTAssertEqual(refused.error?.message, "This Bot has no active read and send grant for this context.")
         XCTAssertNil(try f.ctx.threadRepo.get(id: thread.id)?.actorLockedAt)
         XCTAssertNil(try f.ctx.botStore.conversationLinked(to: thread.id))
 

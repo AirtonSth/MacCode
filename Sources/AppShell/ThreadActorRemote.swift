@@ -89,6 +89,8 @@ extension AppCommandRouter {
                 code: ThreadActorWire.lockedCode, kind: "locked",
                 message: "This thread's actor is fixed after the first message. Start a new thread to run as a different actor."
             )
+        } catch BotStoreError.invalidInput(let message) {
+            throw actorRefusal(code: -32602, kind: "invalid_context", message: message)
         }
         for viewModel in botThreadViewModels {
             viewModel.mirrorActorLock(actor, lockedAt: lockedAt, target: target, thread: thread)
