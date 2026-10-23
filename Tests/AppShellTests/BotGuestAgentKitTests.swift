@@ -338,17 +338,23 @@ final class BotGuestAgentKitTests: XCTestCase {
             "mkdir -p \(leases) && chown remotecode:remotecode \(leases)"])
         XCTAssertEqual(setup.status, 0, "the guest must be able to renew its lease")
 
-        // 1. Lease reaper. The Mac never renews `stale`. It renews `renewed` the
-        //    way a Mac whose clock is far behind the guest's would (mtimes in
-        //    1970): only a change of the lease may count, never its age
-        //    against the guest clock, or a Mac waking from sleep loses its run.
+        // 1. Lease reaper. The Mac never renews `stale`. The `renewed`
+        //    counter advances even when the bind mount's mtime stays fixed in 1970:
+        //    the renewal itself must count, not cached filesystem metadata
+        //    or its age against the guest clock.
         let stale = AgentRunID().description
         let renewed = AgentRunID().description
-        try docker.guest(["sh", "-c", "i=0; while :; do i=$((i+1)); touch -d @$i \(leases)/\(renewed).lease; sleep 0.3; done"], detached: true)
+        let blocked = AgentRunID().description
+        try docker.guest(["mkfifo", "\(leases)/\(blocked).lease"])
+        try docker.guest(["sh", "-c", "i=0; while :; do i=$((i+1)); printf '%s\\n' $i > \(leases)/\(renewed).tmp; touch -d @1 \(leases)/\(renewed).tmp; mv \(leases)/\(renewed).tmp \(leases)/\(renewed).lease; sleep 0.3; done"], detached: true)
         try docker.guest([runAgent, stale, "--", "sleep", "300"], env: fast, detached: true)
         try docker.guest([runAgent, renewed, "--", "sleep", "300"], env: fast, detached: true)
-        XCTAssertTrue(try waitUntil(5) { try docker.runIsAlive(stale) && docker.runIsAlive(renewed) }, "runs never started")
+        try docker.guest([runAgent, blocked, "--", "sleep", "300"], env: fast, detached: true)
+        XCTAssertTrue(try waitUntil(5) {
+            try docker.runIsAlive(stale) && docker.runIsAlive(renewed) && docker.runIsAlive(blocked)
+        }, "runs never started")
         XCTAssertTrue(try waitUntil(15) { try !docker.runIsAlive(stale) }, "a run whose lease is never renewed must be reaped")
+        XCTAssertTrue(try waitUntil(15) { try !docker.runIsAlive(blocked) }, "a FIFO must not prevent orphan cleanup")
         Thread.sleep(forTimeInterval: 3)
         XCTAssertTrue(try docker.runIsAlive(renewed), "a run whose lease keeps changing must survive")
 

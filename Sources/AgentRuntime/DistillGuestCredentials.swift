@@ -710,9 +710,10 @@ public struct PrivateDirectory {
         return try? handle.read(upToCount: Int(info.st_size)) ?? Data()
     }
 
-    /// Temp file at 0600 + fsync + rename, so a reader sees the old file or
-    /// the whole new one, never a partial one.
-    public func writeAtomically(_ data: Data, to name: String) throws {
+    /// Temp file at 0600 + rename, so a reader sees the old file or the whole
+    /// new one. Durable state is synced first; ephemeral leases need only
+    /// visibility to readers and must not wait for a disk flush.
+    public func writeAtomically(_ data: Data, to name: String, synchronize: Bool = true) throws {
         let temp = "\(DistillGuestCredentials.temporaryPrefix)\(UUID().uuidString).tmp"
         let fd = openat(descriptor, temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw DistillGuestCredentialError.writeFailed(path: "\(path)/\(name)", errno: errno) }
@@ -729,7 +730,7 @@ public struct PrivateDirectory {
                 offset += written
             }
         }
-        if failure == 0, fsync(fd) != 0 { failure = errno }
+        if failure == 0, synchronize, fsync(fd) != 0 { failure = errno }
         Darwin.close(fd)
         if failure == 0, renameat(descriptor, temp, descriptor, name) != 0 {
             failure = errno

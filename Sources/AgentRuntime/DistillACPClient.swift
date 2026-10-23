@@ -131,6 +131,11 @@ enum DistillACPFailureTaxonomy {
             switch error {
             case .requestTimedOut:
                 return .timeout
+            case .processExited(let reason, let status, _)
+                where reason == .uncaughtSignal || (128...255).contains(status):
+                // A killed process may retain a recovered API error in stderr.
+                // The signal (including docker's 128 + signal exit) is authoritative.
+                return .nonRecoverable
             case .rpcError(let code, let message, let detail, let httpStatus):
                 let described = ACPRPCErrorPayload.describe(message: message, detail: detail).lowercased()
                 if accountRouteMarkers.contains(where: described.contains) { return .rateLimited }
