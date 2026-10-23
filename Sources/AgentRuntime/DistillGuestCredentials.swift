@@ -264,17 +264,11 @@ public enum DistillGuestCredentials {
 
     /// Accounts this run may use. Distill remains the routing/eligibility authority.
     public static func accountsForRun(model: String?, hostConfig: String, hostHome: URL) throws -> [DistillAccountStatus] {
-        let registry = try DistillAccounts.readRegistry(home: hostHome)
-        let connected = DistillAccounts.connectedAccounts(home: hostHome).filter(\.connected)
         if model?.trimmingCharacters(in: .whitespacesAndNewlines) == "auto" {
-            guard let registry, registry.routing.enabled else {
-                throw DistillAccountError.failed("Enable and save Distill Auto routing before running Auto.")
-            }
-            let ids = Set(registry.routing.options.map(\.accountID))
-            let accounts = connected.filter { ids.contains($0.id) }
-            guard !accounts.isEmpty else { throw DistillAccountError.failed("No connected account is available for Distill Auto routing.") }
-            return accounts
+            return try DistillAccounts.autoRoutingAccounts(home: hostHome)
         }
+        _ = try DistillAccounts.readRegistry(home: hostHome)
+        let connected = DistillAccounts.connectedAccounts(home: hostHome).filter(\.connected)
         guard let provider = accountProvider(model: model, hostConfig: hostConfig) else { return [] }
         let accounts = connected.filter { $0.provider == provider }
         // Preserve the legacy preflight error when no managed account exists.

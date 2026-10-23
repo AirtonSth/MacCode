@@ -4,6 +4,13 @@ import CoreModel
 import Persistence
 @testable import AgentRuntime
 
+private final class LockedAutoRoutingEnabled: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = true
+    func set(_ value: Bool) { lock.withLock { self.value = value } }
+    func get() -> Bool { lock.withLock { value } }
+}
+
 final class DistillACPAdapterTests: ProviderProcessTestCase {
     func test_emptyMainModelIsRejectedBeforeACPStarts_becauseDistillMustNotUseAccountDefault() async throws {
         let adapter = DistillACPAdapter(binaryNameOverride: "/missing/distill-agent")
@@ -282,6 +289,61 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(bindings.allSatisfy { ($0["params"] as? [String: Any])?["modelId"] as? String == "auto" })
     }
 
+    func test_autoTurnRechecksAdmissionBeforePhysicalPromptAfterHandshake() async throws {
+        let root = try makeTempRoot("distill-acp-auto-admission-handshake")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root,
+            initializeCapabilities: #"{"_meta":{"x.ai/capabilities":{"sessionWorkerModel":True}}}"#,
+            workerResult: "{}", sessionModels: Self.autoCatalog)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let enabled = LockedAutoRoutingEnabled()
+        adapter.autoRoutingPreflight = { _ in
+            guard enabled.get() else { throw DistillAutoRoutingError.disabled }
+            return []
+        }
+        adapter.beforePhysicalPromptWriteForTesting = { enabled.set(false) }
+        let request = AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "auto", cwd: root.path, prompt: "Run")
+        do {
+            _ = try await adapter.startSession(request) { _ in }
+            XCTFail("Auto routing disabled during handshake must prevent physical prompt")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Auto routing is off"), error.localizedDescription)
+        }
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/new" }.count, 1)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/prompt" }.count, 0)
+    }
+
+    func test_cachedAutoSessionRechecksAdmissionBetweenTurns() async throws {
+        let root = try makeTempRoot("distill-acp-auto-cached-admission")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root,
+            initializeCapabilities: "{}", workerResult: "{}", sessionModels: Self.autoCatalog)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let enabled = LockedAutoRoutingEnabled()
+        adapter.autoRoutingPreflight = { _ in
+            guard enabled.get() else { throw DistillAutoRoutingError.disabled }
+            return []
+        }
+        let thread = AgentThreadID()
+        let request = AgentRunRequest(threadId: thread, provider: .distill, model: "auto", cwd: root.path, prompt: "Run")
+        let first = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(request) { first.append($0) }
+        let finished = try await first.waitForFinish()
+        enabled.set(false)
+        do {
+            _ = try await adapter.sendTurn(AgentRunRequest(threadId: thread, provider: .distill, model: "auto", cwd: root.path, prompt: "Again", providerThreadId: finished.providerThreadId)) { _ in }
+            XCTFail("A cached Auto session must recheck admission before each turn")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Auto routing is off"), error.localizedDescription)
+        }
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/new" }.count, 1)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/prompt" }.count, 1)
+    }
+
     func test_autoRepeatedTurnsDoNotRebindConcreteMainOrStaleWorker_andChangedEffortUsesConcreteCatalog() async throws {
         let root = try makeTempRoot("distill-acp-auto-turns")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -290,6 +352,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let (harness, requestsURL) = try writeWorkerHarness(root: root,
             initializeCapabilities: #"{"_meta":{"x.ai/capabilities":{"sessionWorkerModel":True}}}"#, workerResult: "{}", sessionModels: changingCatalog)
         let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        adapter.autoRoutingPreflight = { _ in [] }
         defer { adapter.stopAll() }
         let thread = AgentThreadID()
         func request(_ effort: AgentReasoningEffort, worker: String?) -> AgentRunRequest {
@@ -1084,6 +1147,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let (harness, _) = try writeFailureHarness(root: root)
         let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        adapter.autoRoutingPreflight = { _ in [] }
         defer { adapter.stopAll() }
         let events = DistillACPAdapterEventBox()
         let slowConsumer = DispatchSemaphore(value: 0)

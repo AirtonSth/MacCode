@@ -90,12 +90,31 @@ final class AgentChatImageGalleryTests: XCTestCase {
         XCTAssertNil(none)
     }
 
-    func test_fileSignatureRejectsDirectoriesAndNonImages() throws {
+    func test_contentAddressedImageAttachmentLoadsWithoutFileExtension() async throws {
+        let original = try writePNG(width: 1_200, height: 800)
+        let stored = URL(fileURLWithPath: original).deletingPathExtension().path
+        try FileManager.default.moveItem(atPath: original, toPath: stored)
+        defer { try? FileManager.default.removeItem(atPath: stored) }
+        let attachment = AgentAttachment(id: "stored-image", path: stored, displayName: "screenshot.png", kind: .image, mimeType: "image/png")
+        let ref = try XCTUnwrap(AgentChatImageGallery.refs(text: "Screenshot", attachments: [attachment]).first)
+        let loaded = await AgentChatImageLoader().image(for: ref)
+        let image = try XCTUnwrap(loaded, "attachment storage uses extensionless hashes; image content determines decodability")
+        let pixels = try XCTUnwrap(image.cgImage(forProposedRect: nil, context: nil, hints: nil))
+        XCTAssertLessThanOrEqual(max(pixels.width, pixels.height), AgentChatImageLoader.decodeMaxPixel)
+        XCTAssertNotNil(AgentChatImageLoader.cachedImage(for: ref))
+        let link = try XCTUnwrap(AgentMessageMarkdown.fileLinkURL(for: stored))
+        XCTAssertEqual(AgentMessageMarkdown.filePath(fromFileLink: link), stored, "click-to-open must retain the original attachment path")
+    }
+
+    func test_localLoadingRejectsDirectoriesAndNonImageContent() async throws {
         XCTAssertNil(AgentChatImageLoader.fileSignature(NSTemporaryDirectory()))
-        let text = FileManager.default.temporaryDirectory.appendingPathComponent("not-image-\(UUID().uuidString).txt")
+        let text = FileManager.default.temporaryDirectory.appendingPathComponent("not-image-\(UUID().uuidString)")
         try Data("hi".utf8).write(to: text)
         defer { try? FileManager.default.removeItem(at: text) }
-        XCTAssertNil(AgentChatImageLoader.fileSignature(text.path))
+        let ref = AgentMessageImageRef(source: .attachment(id: "invalid", path: text.path), ref: "invalid", displayName: "claimed.png")
+        let loaded = await AgentChatImageLoader().image(for: ref)
+        XCTAssertNil(loaded, "an image attachment label must not make non-image bytes decodable")
+        XCTAssertNil(AgentChatImageLoader.cachedImage(for: ref))
     }
 
     // MARK: Remote caps

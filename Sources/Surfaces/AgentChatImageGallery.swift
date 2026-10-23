@@ -146,10 +146,9 @@ actor AgentChatImageLoader {
         }
     }
 
-    /// Path + size + mtime of a regular image file; nil for anything else.
+    /// Path + size + mtime; attachment storage paths may have no extension.
     static func fileSignature(_ path: String) -> String? {
-        guard AgentMessageImageRefs.hasImageExtension(path),
-              let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
               (attributes[.type] as? FileAttributeType) == .typeRegular,
               let size = attributes[.size] as? NSNumber,
               let modified = attributes[.modificationDate] as? Date else { return nil }

@@ -698,7 +698,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     }
 
     static func launchError(_ error: Error) -> Error {
-        if error is DistillGuestLaunchError || error is CancellationError { return error }
+        if error is DistillAutoRoutingError || error is DistillGuestLaunchError || error is CancellationError { return error }
         let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         return DistillGuestLaunchError.unavailable(reason)
     }

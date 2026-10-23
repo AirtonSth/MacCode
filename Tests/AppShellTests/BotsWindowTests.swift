@@ -18163,6 +18163,46 @@ final class BotsWindowTests: XCTestCase {
         return store
     }
 
+    func test_DistillModelSwitchClearsUnsupportedDeskMainEffort() throws {
+        AgentProvider.selectableForTesting = nil
+        defer { AgentProvider.selectableForTesting = AgentProvider.allCases }
+        let context = try makeContext()
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let models = [
+            AgentModelDescriptor(id: "previous", label: "Previous", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: [.medium, .high]),
+            AgentModelDescriptor(id: "deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: [.low, .high, .max])
+        ]
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: models,
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "distill-acp",
+            capabilitiesOverride: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
+        )
+        let vm = BotsViewModel(context: context, router: router)
+        vm.replaceProvidersForTests([snapshot])
+        let bot = try vm.create(name: "Piper", title: "Scout")
+        vm.openDesk(bot)
+        vm.setDeskProvider(.distill, instanceID: "distill-acp")
+        vm.setDeskModel("previous")
+        vm.setDeskDistillMainEffortSelection(.fixed(.medium))
+
+        vm.setDeskModel("deepseek-v4.1-flash")
+
+        XCTAssertEqual(vm.deskRouting.model, "deepseek-v4.1-flash")
+        XCTAssertEqual(vm.deskRouting.distillMainEffortSelection, .automatic)
+        vm.setDeskDistillMainEffortSelection(.fixed(.high))
+        XCTAssertEqual(vm.deskRouting.distillMainEffortSelection, .fixed(.high))
+        vm.setDeskDistillMainEffortSelection(.automatic)
+        XCTAssertEqual(vm.deskRouting.distillMainEffortSelection, .automatic)
+        vm.setDeskModel("previous")
+        vm.setDeskDistillMainEffortSelection(.fixed(.medium))
+        vm.replaceProvidersForTests([])
+        XCTAssertEqual(vm.deskRouting.distillMainEffortSelection, .fixed(.medium), "loading model metadata must not erase an explicit effort")
+    }
+
     func test_unlinkedDeskMainModelPickIsTheModelTheFirstSendRuns() async throws {
         // WHY: an empty bot conversation has no embedded Agent App, so its
         // composer mounts the shared Main pill bound to deskRouting. Run 1 once
@@ -18226,6 +18266,11 @@ final class BotsWindowTests: XCTestCase {
         XCTAssertEqual(
             BotsViewModel.resolvedUnlinkedDeskModel(stickyRoute, snapshot: snapshot, lastUsed: "main-a"),
             "main-b", "a valid copied model is the sticky-model feature and must win over last-used")
+        var autoRoute = emptyRoute
+        autoRoute.model = "auto"
+        XCTAssertEqual(
+            BotsViewModel.resolvedUnlinkedDeskModel(autoRoute, snapshot: snapshot, lastUsed: "main-b"),
+            "auto", "a disabled or temporarily omitted Auto profile must not silently switch the Bot to a concrete model")
 
         let context = try makeContext()
         let vm = BotsViewModel(context: context)

@@ -6042,6 +6042,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } else if !efforts.contains(reasoningEffort) {
             reasoningEffort = efforts.contains(.high) ? .high : (efforts.first ?? .medium)
         }
+        if provider == .distill {
+            let advertisedEfforts = modelOptionsForSelectedProvider.first { $0.id == model }?.supportedReasoningEfforts ?? []
+            distillMainEffortSelection = distillMainEffortSelection.normalized(
+                for: advertisedEfforts,
+                supportsAutomatic: selectedProviderCapabilities.supportsDistillMainEffortAuto
+            )
+        }
         if provider == .distill, reasoningModel == nil {
             distillReasoningEffortSelection = .automatic
         }

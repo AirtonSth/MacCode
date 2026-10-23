@@ -35,6 +35,14 @@ final class BotGuestRunResolverTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func test_autoProfileFailuresAreNotReportedAsVMFailures() {
+        for failure in [DistillAutoRoutingError.disabled, .missingOptions, .noConnectedAccounts] {
+            let surfaced = BotGuestRunResolver.launchError(failure)
+            XCTAssertEqual(surfaced as? DistillAutoRoutingError, failure)
+            XCTAssertFalse(String(describing: surfaced).contains("VM unavailable"))
+        }
+    }
+
     // MARK: - Fixture
 
     private struct Fixture {

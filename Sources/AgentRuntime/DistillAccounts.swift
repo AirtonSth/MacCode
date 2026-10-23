@@ -124,6 +124,19 @@ public struct DistillAccountQuota: Equatable, Codable, Sendable {
     }
 }
 
+public enum DistillAutoRoutingError: Error, LocalizedError, CustomStringConvertible, Equatable, Sendable {
+    case disabled, missingOptions, noConnectedAccounts
+
+    public var errorDescription: String? { description }
+    public var description: String {
+        switch self {
+        case .disabled: return "Auto routing is off. Open Auto profile, enable it, and save before running Auto."
+        case .missingOptions: return "Auto routing has no saved options. Open Auto profile, add an option, and save before running Auto."
+        case .noConnectedAccounts: return "Auto routing has no connected account eligible for its saved options. Connect an account in Auto profile before running Auto."
+        }
+    }
+}
+
 public enum DistillAutoStrategy: String, CaseIterable, Codable, Sendable {
     case orderedFirst = "ordered_first", highestRemaining = "highest_remaining"
 }
@@ -229,6 +242,17 @@ public final class DistillAccounts: Sendable {
             throw DistillAccountError.failed("Distill account metadata cannot be read safely.")
         }
         return registry
+    }
+
+    public static func autoRoutingAccounts(home: URL) throws -> [DistillAccountStatus] {
+        guard let registry = try readRegistry(home: home), registry.routing.enabled else {
+            throw DistillAutoRoutingError.disabled
+        }
+        guard !registry.routing.options.isEmpty else { throw DistillAutoRoutingError.missingOptions }
+        let eligibleIDs = Set(registry.routing.options.map(\.accountID))
+        let eligible = connectedAccounts(home: home).filter { eligibleIDs.contains($0.id) && $0.connected }
+        guard !eligible.isEmpty else { throw DistillAutoRoutingError.noConnectedAccounts }
+        return eligible
     }
 
     public static func connectedAccounts(home: URL) -> [DistillAccountStatus] {

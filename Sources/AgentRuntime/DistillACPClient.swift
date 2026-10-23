@@ -921,6 +921,9 @@ public final class DistillACPClient: @unchecked Sendable {
             for selection in selections {
                 let matches = Self.matchingModels(selection, in: catalog)
                 guard matches.count == 1, let model = matches.first else {
+                    if selection == "auto" {
+                        throw DistillACPError.unsupported("Auto is not available in this Distill session. Open Auto profile to check that it is enabled, saved, and has a connected account.")
+                    }
                     if matches.isEmpty, guest != nil {
                         throw DistillACPError.unsupported("The Distill in this bot's Linux VM does not list the model '\(selection)'. The model picker shows the Mac's catalog, which can list models the Linux VM does not. Select another model for this bot.")
                     }
@@ -1603,7 +1606,7 @@ public final class DistillACPClient: @unchecked Sendable {
         capabilities: DistillACPInitializeResult,
         writePermit: AgentRunAcceptancePermit,
         contextHandoff: String? = nil,
-        beforeWrite: @escaping @Sendable () -> Void,
+        beforeWrite: @escaping @Sendable () throws -> Void,
         onAccepted: @escaping @Sendable () throws -> Void
     ) async throws -> JSONObject {
         try await requestJSONObject(
@@ -1871,7 +1874,7 @@ public final class DistillACPClient: @unchecked Sendable {
         timeout: TimeInterval?,
         acceptancePermit: AgentRunAcceptancePermit? = nil,
         writePermit: AgentRunAcceptancePermit? = nil,
-        beforeWrite: (@Sendable () -> Void)? = nil,
+        beforeWrite: (@Sendable () throws -> Void)? = nil,
         onAccepted: (@Sendable () throws -> Void)? = nil
     ) async throws -> JSONObject {
         let value: Any? = try await request(
@@ -1893,7 +1896,7 @@ public final class DistillACPClient: @unchecked Sendable {
         timeout: TimeInterval?,
         acceptancePermit: AgentRunAcceptancePermit? = nil,
         writePermit: AgentRunAcceptancePermit? = nil,
-        beforeWrite: (@Sendable () -> Void)? = nil,
+        beforeWrite: (@Sendable () throws -> Void)? = nil,
         onAccepted: (@Sendable () throws -> Void)? = nil,
         stopOnTimeout: Bool = true
     ) async throws -> Any? {
@@ -1918,7 +1921,7 @@ public final class DistillACPClient: @unchecked Sendable {
             do {
                 if let onAccepted {
                     let writeAndAccept = {
-                        beforeWrite?()
+                        try beforeWrite?()
                         let queueGuardedWrite = {
                             if let acceptancePermit {
                                 try acceptancePermit.withAcceptance(failureOutcome: .notAccepted) {

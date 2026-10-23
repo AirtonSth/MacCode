@@ -9015,6 +9015,10 @@ public final class BotsViewModel: ObservableObject {
                     ? .automatic
                     : .fixed(deskRouting.reasoningEffort)
             }
+            deskRouting.distillMainEffortSelection = deskRouting.distillMainEffortSelection?.normalized(
+                for: supported,
+                supportsAutomatic: deskSupportsDistillMainEffortAuto
+            )
             if deskRouting.reasoningModel == nil {
                 deskRouting.distillReasoningEffortSelection = .automatic
             }
@@ -9085,6 +9089,7 @@ public final class BotsViewModel: ObservableObject {
         guard routing.provider == .distill else { return routing.model }
         let models = snapshot?.models.filter { $0.provider == routing.provider } ?? []
         let current = routing.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if current == "auto" { return routing.model }
         if !current.isEmpty,
            models.isEmpty
             || models.contains(where: { $0.id == current })

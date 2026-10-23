@@ -21,6 +21,23 @@ final class DistillACPColdCatalogTests: XCTestCase {
         XCTAssertEqual((worker["params"] as? [String: Any])?["modelId"] as? String, "chatgpt/gpt-6-luna")
     }
 
+    func test_missingAutoExplainsSetupWithoutSelectingAConcreteModel() async throws {
+        let root = try makeRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (binary, log) = try writeHarness(root: root, models: ["chatgpt/gpt-6.1-sol"])
+        let client = try DistillACPClient(binary: binary.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        do {
+            _ = try await client.newSession(cwd: root.path, modelId: "auto")
+            XCTFail("Unavailable Auto must not become a concrete model or open a session")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("Auto profile"))
+            XCTAssertFalse(String(describing: error).contains("select one exact model"))
+        }
+        XCTAssertEqual(try recorded(log).compactMap { $0["method"] as? String }, ["initialize", "_x.ai/models/list"])
+    }
+
     func test_missingModelAfterRefreshDoesNotOpenSessionOrPrompt() async throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }

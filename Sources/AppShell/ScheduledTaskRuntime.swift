@@ -375,12 +375,7 @@ public final class ScheduledTaskExecutor {
         guard descriptor != nil || snapshot.models.isEmpty || snapshot.models.contains(where: \.supportsCustomModel) else {
             throw ScheduledTaskPreflightError.unsupportedModel(task.model)
         }
-        if let descriptor, descriptor.supportsReasoning,
-           !descriptor.supportedReasoningEfforts.isEmpty,
-           !descriptor.supportedReasoningEfforts.contains(task.reasoningEffort) {
-            throw ScheduledTaskPreflightError.unsupportedReasoning(task.reasoningEffort.displayName)
-        }
-        try Self.validateDistillConfiguration(task, snapshot: snapshot)
+        try Self.validateModelConfiguration(task, snapshot: snapshot)
         let binary = snapshot.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines)
         let baseBinary = binary?.isEmpty == false ? binary! : task.provider.rawValue
         let probeEnvironment = user.name == NSUserName()
@@ -423,11 +418,19 @@ public final class ScheduledTaskExecutor {
         )
     }
 
-    static func validateDistillConfiguration(
+    static func validateModelConfiguration(
         _ task: ScheduledTask,
         snapshot: AgentProviderSnapshot
     ) throws {
-        guard task.provider == .distill else { return }
+        guard task.provider == .distill else {
+            let descriptor = snapshot.models.first { $0.id == task.model }
+            if let descriptor, descriptor.supportsReasoning,
+               !descriptor.supportedReasoningEfforts.isEmpty,
+               !descriptor.supportedReasoningEfforts.contains(task.reasoningEffort) {
+                throw ScheduledTaskPreflightError.unsupportedReasoning(task.reasoningEffort.displayName)
+            }
+            return
+        }
         let mainModel = task.model.trimmingCharacters(in: .whitespacesAndNewlines)
         let reasoningModel = task.reasoningModel?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !mainModel.isEmpty else {

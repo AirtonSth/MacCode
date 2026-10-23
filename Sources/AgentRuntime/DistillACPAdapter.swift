@@ -328,6 +328,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private let modelCacheTTL: TimeInterval
     private let maxReadableEvents: Int
     private let maxReadableBytes: Int64
+    var autoRoutingPreflight: @Sendable (URL) throws -> [DistillAccountStatus] = { try DistillAccounts.autoRoutingAccounts(home: $0) }
     private let lock = NSLock()
     private static let discoveryCacheLock = NSLock()
     private static let discoveryAccountEnvironmentKeys = ["HOME", "DISTILL_HOME", "GROK_HOME", "REMOTE_CODE_INSTANCE"]
@@ -647,11 +648,21 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         sharedDiscoveryCache[key] = (result, fetchedAt, scope)
     }
 
+    private func validateAutoRouting(_ request: AgentRunRequest) throws {
+        guard request.attachToProviderPromptId == nil,
+              request.model.trimmingCharacters(in: .whitespacesAndNewlines) == "auto",
+              request.runAsUser.map({ $0.uid == getuid() }) ?? true else { return }
+        let environment = ProcessInfo.processInfo.environment.merging(request.environment) { _, run in run }
+        let userHome = request.runAsUser?.homePath ?? FileManager.default.homeDirectoryForCurrentUser.path
+        _ = try autoRoutingPreflight(DistillProvisioner.homeURL(environment: environment, userHome: userHome))
+    }
+
     public func startSession(
         _ request: AgentRunRequest,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws -> AgentRunHandle {
-        try await openSession(request, loadExisting: false, onEvent: onEvent, startPrompt: true)
+        try validateAutoRouting(request)
+        return try await openSession(request, loadExisting: false, onEvent: onEvent, startPrompt: true)
     }
 
     public func sendTurn(
@@ -661,6 +672,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         guard !request.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AgentProviderAdapterError.unsupported("Select an explicit Distill Main model before running.")
         }
+        if request.attachToProviderPromptId == nil { try validateAutoRouting(request) }
         if let promptId = request.attachToProviderPromptId {
             return try attachWakeTurn(request, promptId: promptId, onEvent: onEvent)
         }
@@ -1851,6 +1863,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                             contextHandoff: freshSession?.handoff,
                             beforeWrite: { [weak self] in
                                 self?.beforePhysicalPromptWriteForTesting?()
+                                try self?.validateAutoRouting(request)
                             },
                             onAccepted: { [weak self, weak session] in
                                 guard let self, let session else {

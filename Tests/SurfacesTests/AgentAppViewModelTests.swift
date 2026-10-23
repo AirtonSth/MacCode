@@ -5734,6 +5734,48 @@ final class AgentAppViewModelTests: XCTestCase {
                        "the model menu must not keep Codex GPT rows after the selected Source snapshot is Claude")
     }
 
+    func test_DistillModelSwitchClearsUnsupportedMainEffortAndPreservesChoiceWhileLoading() throws {
+        let (vm, repo) = try makeVM()
+        vm.provider = .distill
+        vm.availableModels = [
+            AgentModelDescriptor(id: "previous", label: "Previous", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: [.medium, .high]),
+            AgentModelDescriptor(id: "deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: [.low, .high, .max])
+        ]
+        vm.providerSnapshots = [AgentProviderSnapshotFactory.snapshot(
+            provider: .distill,
+            models: vm.availableModels,
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "distill-acp",
+            capabilitiesOverride: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
+        )]
+        vm.providerInstanceId = "distill-acp"
+        vm.createThread(title: "Distill Main effort")
+        let threadID = try XCTUnwrap(vm.selectedThreadId)
+        vm.model = "previous"
+        vm.distillMainEffortSelection = .fixed(.medium)
+
+        vm.setModel("deepseek-v4.1-flash")
+
+        XCTAssertEqual(vm.model, "deepseek-v4.1-flash")
+        XCTAssertEqual(vm.distillMainEffortSelection, .automatic)
+        XCTAssertEqual(try repo.get(id: threadID)?.modelSelection.modelId, "deepseek-v4.1-flash")
+        XCTAssertEqual(try repo.get(id: threadID)?.modelSelection.distillMainEffortSelection, .automatic)
+
+        vm.distillMainEffortSelection = .fixed(.high)
+        vm.normalizeSelectedModelOptions()
+        XCTAssertEqual(vm.distillMainEffortSelection, .fixed(.high))
+        vm.distillMainEffortSelection = .automatic
+        vm.normalizeSelectedModelOptions()
+        XCTAssertEqual(vm.distillMainEffortSelection, .automatic)
+
+        vm.distillMainEffortSelection = .fixed(.max)
+        vm.providerSnapshots = []
+        vm.availableModels = []
+        vm.normalizeSelectedModelOptions()
+        XCTAssertEqual(vm.distillMainEffortSelection, .fixed(.max), "loading model metadata must not erase an explicit effort")
+    }
+
     func test_modelDescriptorControlsClampIllegalReasoningAndServiceTier() throws {
         let (vm, _) = try makeVM()
         vm.providerSnapshots = []
