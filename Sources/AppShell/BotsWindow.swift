@@ -12764,9 +12764,9 @@ public final class BotsViewModel: ObservableObject {
             ?? botStore.executionDestination(botID: bot.id)
         try botStore.validateExecutionDestination(destination, botID: bot.id)
         if let threadID, try context.threadRepo.guestPlacement(of: threadID)?.executionTarget == .mac { return }
-        // Named VMs are provisioned by the send's asynchronous preflight and use
-        // the shared queue; opening a conversation never starts a competing VM.
-        if destination.virtualMachineID != nil { return }
+        // The run's asynchronous preflight prepares both bot-owned and named
+        // VMs. The desktop screen cache is empty after reopening the app.
+        if destination.target == .vm { return }
         let revision = try currentRevision(for: bot)
         let kind = desktopKindOverrideForTesting
             ?? (destination.target == .vm ? .dockerDesktop : resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace))

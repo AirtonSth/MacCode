@@ -351,6 +351,30 @@ final class BotRoutineSchedulerTests: XCTestCase {
         XCTAssertTrue(try f.context.botStore.listConversations(botID: bot.id).isEmpty)
     }
 
+    func test_pairedRunNowDoesNotRequireTheDesktopScreenCacheForGuestExecution() async throws {
+        let f = try makeFixture()
+        let bot = try f.vm.create(name: "Star", title: "Developer")
+        try f.context.botStore.setExecutionDestination(.ownVM, botID: bot.id)
+        f.vm.dockerGuestReadyOverrideForTesting = false
+        let (routine, _) = try saveActiveRoutine(f, bot: bot, base: Date())
+
+        let ran = try await f.router.dispatchPairedBotRemote(method: "bot.routine.run", params: [
+            "client_request_id": .string("run-now-cold-screen"),
+            "bot_id": .string(bot.id.value.uuidString.lowercased()),
+            "routine_id": .string(routine.id.value.uuidString.lowercased()),
+        ])
+
+        XCTAssertEqual(ran.objectValue?["readback"]?.objectValue?["result"]?.stringValue, "started",
+                       "the guest resolver prepares the VM even when no desktop screen has been opened")
+        let started = await waitUntil { !f.runner.requests.isEmpty }
+        XCTAssertTrue(started)
+        let request = try XCTUnwrap(f.runner.requests.first)
+        let placement = try XCTUnwrap(f.context.threadRepo.guestPlacement(of: request.threadId))
+        XCTAssertTrue(placement.runsInGuest, "admission must preserve VM execution, never fall back to the Mac")
+        XCTAssertFalse(f.vm.isGuestRunning(bot.id), "no desktop screen is required for the provider run")
+        f.runner.finish(runID: request.runId, status: .completed, reply: "ok")
+    }
+
     func test_pairedRunNowStartsARealRunOfTheInstruction() async throws {
         // WHY: iOS Run now answered "accepted" and ran nothing.
         let f = try makeFixture()
