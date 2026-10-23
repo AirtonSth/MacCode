@@ -103,6 +103,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
 
     // MARK: - DistillGuestLaunchResolving
 
+
     func isGuestThread(_ threadId: AgentThreadID) -> Bool {
         (try? deps.threadRepo.guestPlacement(of: threadId))??.runsInGuest == true
     }
@@ -111,6 +112,37 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         guard deps.contextualAdmissions?.hasAdmission(threadID: threadId) == true else { return false }
         do { return try deps.botStore.conversationContextPin(linkedTo: threadId) != nil }
         catch { return true }
+    }
+
+    var supportsGuestRecovery: Bool { deps.hostsGuestRuns }
+
+    func resynchronizeGuest(_ request: AgentRunRequest) async throws -> Bool {
+        try Task.checkCancellation()
+        guard deps.hostsGuestRuns, request.providerThreadId == nil,
+              request.runAsUser.map({ $0.uid == getuid() }) ?? true,
+              deps.contextualAdmissions?.hasAdmission(for: request.runId) != true,
+              deps.contextualAdmissions?.hasAdmission(threadID: request.threadId) != true,
+              try deps.botStore.conversationContextPin(linkedTo: request.threadId) == nil,
+              let placement = try deps.threadRepo.guestPlacement(of: request.threadId), placement.runsInGuest,
+              let thread = try deps.threadRepo.get(id: request.threadId) else { return false }
+        let botID = try dockerBot(of: thread)
+        let destination = try deps.botStore.threadExecutionDestination(thread.id)
+            ?? deps.botStore.executionDestination(botID: botID)
+        guard destination.target == .vm else { return false }
+        try deps.botStore.validateExecutionDestination(destination, botID: botID, workspaceID: thread.workspaceId, contextPin: nil)
+        let resourceID = try deps.botStore.guestResourceID(botID: botID, threadID: thread.id)
+        guard !BotComputerControl.shared.isControlledByUser(botID, resourceID: resourceID),
+              deps.registry.claim(botID: botID, threadID: thread.id, resourceID: resourceID)?.runID == request.runId else { return false }
+        let environment = deps.processEnvironment.merging(request.environment) { _, run in run }
+        let hostHome = DistillProvisioner.homeURL(environment: environment)
+        let runID = request.runId.value.uuidString.lowercased()
+        // Only re-copy current credentials; token renewal remains owned by normal preflight.
+        return try lock.withLock {
+            guard let plan = livePlans[runID], plan.container == BotComputerGuestSpec.containerName(botID: resourceID),
+                  let mirror = mirrors[hostHome.path] else { return false }
+            try Task.checkCancellation()
+            return try mirror.resynchronize(runID: runID)
+        }
     }
 
     func prepare(
@@ -459,9 +491,9 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 lease: nil,
                 teardown: { [weak self] _ in
                     heartbeat.stop()
+                    self?.forgetPlan(runID: runID)
                     mirror.end(runID: runID)
                     gateway.revoke(runID: runID)
-                    self?.forgetPlan(runID: runID)
                 }
             )
             lock.withLock { livePlans[runID] = plan }

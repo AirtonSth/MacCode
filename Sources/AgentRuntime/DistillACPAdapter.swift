@@ -351,6 +351,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     }
     /// Set by AppShell after the adapter is built; nil runs everything on the Mac.
     private var guestLaunchResolver: DistillGuestLaunchResolving?
+    var guestRecoveryDiagnosis: @Sendable (DistillGuestRecoveryContext, AgentRunRequest) async throws -> DistillGuestRecoveryAction = {
+        try await DistillGuestHostDiagnosis.diagnose($0, request: $1)
+    }
     /// Provider sessions whose history the model rejected. A Retry (or a resume
     /// after the live process ended) must open a new session instead of
     /// replaying the same history into the same 400.
@@ -1371,6 +1374,35 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // Stop before the prompt is accepted ends the open now instead of after
         // initialize/session/new/set_model; the coordinator records the Stop.
         request.acceptancePermit?.onInvalidate { [weak client] in client?.stop() }
+        // ponytail: only fresh guest catalogs recover; transport recovery needs separate run-ownership checks.
+        if guestPlan != nil, request.providerThreadId == nil, let resolver {
+            let diagnose = synchronized { guestRecoveryDiagnosis }
+            client.guestCatalogRecovery = {
+                let work = Task {
+                    try Task.checkCancellation()
+                    var actions: [DistillGuestRecoveryAction] = [.refreshGuestCatalog, .stop]
+                    if resolver.supportsGuestRecovery { actions.insert(.resynchronizeGuest, at: 0) }
+                    onEvent(.event(DistillGuestStage.diagnosing.runtimeEvent))
+                    let action = try await diagnose(.init(category: .catalog, availableActions: actions), request)
+                    try Task.checkCancellation()
+                    guard actions.contains(action), action != .stop else { return false }
+                    onEvent(.event(DistillGuestStage.repairing.runtimeEvent))
+                    if action == .resynchronizeGuest, try await !resolver.resynchronizeGuest(request) { return false }
+                    try Task.checkCancellation()
+                    onEvent(.event(DistillGuestStage.verifying.runtimeEvent))
+                    return true
+                }
+                request.acceptancePermit?.onInvalidate { work.cancel() }
+                return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
+            }
+            client.guestCatalogRecoveryFinished = { restored in
+                onEvent(.event((restored ? DistillGuestStage.recovered : .repairFailed).runtimeEvent))
+            }
+        }
+        defer {
+            client.guestCatalogRecovery = nil
+            client.guestCatalogRecoveryFinished = nil
+        }
         do {
             let capabilities = try await client.initialize(
                 timeout: DistillGuestLaunchPlan.initializeTimeout
