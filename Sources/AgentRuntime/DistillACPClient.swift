@@ -297,6 +297,27 @@ public enum DistillACPRequestID: Hashable, Sendable {
 /// 2.0.53, which answered an image-only question correctly).
 /// Use one effective gate for both capability advertisement and prompt embedding
 /// so iOS Camera/Photos stay aligned with the wire path.
+/// Copies prompt images to `/tmp/maccode-attachments`, readable by every local
+/// user, so a run under another macOS user can still open the path it is given.
+public enum DistillPromptImageStaging {
+    public static let root = URL(fileURLWithPath: "/tmp/maccode-attachments", isDirectory: true)
+
+    public static func stage(path: String, fileManager: FileManager = .default) throws -> String {
+        let source = URL(fileURLWithPath: path)
+        guard fileManager.isReadableFile(atPath: source.path) else {
+            throw DistillACPError.unsupported("Attached image is missing: \(source.lastPathComponent)")
+        }
+        let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true,
+                                        attributes: [.posixPermissions: 0o755])
+        try? fileManager.setAttributes([.posixPermissions: 0o1777], ofItemAtPath: root.path)
+        let target = directory.appendingPathComponent(source.lastPathComponent)
+        try fileManager.copyItem(at: source, to: target)
+        try fileManager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: target.path)
+        return target.path
+    }
+}
+
 public enum DistillACPImageCompatibility {
     public static let supportedImageMediaTypes = [
         "image/jpeg", "image/png", "image/gif", "image/webp"
@@ -1669,9 +1690,14 @@ public final class DistillACPClient: @unchecked Sendable {
                 : providerPrompt + "\n\n" + alwaysOn
             if !composed.isEmpty { blocks.append(["type": "text", "text": composed]) }
         }
+        var imagePaths: [String] = []
         for attachment in request.attachments {
             switch attachment.kind {
+            case .image where !guest:
+                // Distill reads the file itself, so the prompt carries only a path.
+                imagePaths.append(try DistillPromptImageStaging.stage(path: attachment.path))
             case .image:
+                // A guest VM cannot see host paths, so it still gets the bytes.
                 guard DistillACPImageCompatibility.effectiveImageEnabled(
                     advertised: capabilities.image,
                     agentVersion: capabilities.agentVersion
@@ -1716,6 +1742,10 @@ public final class DistillACPClient: @unchecked Sendable {
                     ]
                 ])
             }
+        }
+        if !imagePaths.isEmpty {
+            let list = imagePaths.map { "- \($0)" }.joined(separator: "\n")
+            blocks.append(["type": "text", "text": "Attached images (read these files):\n" + list])
         }
         return blocks
     }

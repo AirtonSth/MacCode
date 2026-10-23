@@ -374,4 +374,27 @@ final class DistillBotCavemanEnvironmentTests: XCTestCase {
                        "unverified families still fail closed")
         XCTAssertFalse(DistillACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: nil))
     }
+
+    func test_distillImageAttachment_sendsTmpPathInsteadOfBytes() throws {
+        // WHY: Distill opens image files itself. Sending a /tmp path keeps the
+        // prompt small and works for runs under another macOS user.
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("distill-image-\(UUID().uuidString).png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: source)
+        defer { try? FileManager.default.removeItem(at: source) }
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: "/tmp",
+            prompt: "Look", attachments: [AgentAttachment(path: source.path, kind: .image, mimeType: "image/png")]
+        )
+        let capabilities = DistillACPInitializeResult(protocolVersion: 1, loadSession: true, embeddedContext: true)
+
+        let blocks = try DistillACPClient.promptBlocks(for: request, capabilities: capabilities)
+
+        XCTAssertFalse(blocks.contains { $0["type"] as? String == "image" }, "no base64 image block")
+        let text = try XCTUnwrap(blocks.last?["text"] as? String)
+        let staged = try XCTUnwrap(text.split(separator: "\n").last.map { String($0.dropFirst(2)) })
+        XCTAssertTrue(staged.hasPrefix(DistillPromptImageStaging.root.path + "/"))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: staged)), try Data(contentsOf: source))
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: staged).deletingLastPathComponent())
+    }
 }
