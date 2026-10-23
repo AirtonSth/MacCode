@@ -296,6 +296,38 @@ final class ThreadActorRemoteTests: XCTestCase {
         XCTAssertEqual(vm.executionTarget(for: f.vmBot.id), .vm)
     }
 
+    func test_actorSet_usesAnExistingWorkspaceGrantBeforeLockingTheThread() async throws {
+        let f = try makeFixture()
+        let bot = try f.ctx.botStore.create(
+            name: "Shared", title: "Ops", description: "", desktopKind: .dockerDesktop,
+            workspaceID: WorkspaceID(UUID())
+        )
+        let thread = try newThread(f.router, workspace: f.workspace.id, title: "Granted", provider: .distill)
+
+        let refused = await setActor(f, thread: thread.id, bot: bot.id)
+        XCTAssertNotNil(refused.error)
+        XCTAssertNil(try f.ctx.threadRepo.get(id: thread.id)?.actorLockedAt)
+        XCTAssertNil(try f.ctx.botStore.conversationLinked(to: thread.id))
+
+        let hostID = f.ctx.liveActivityHostIdentity.serverId
+        let binding = try f.ctx.botStore.grantContext(
+            hostID: hostID, botID: bot.id, context: .workspace(f.workspace.id),
+            actions: [.read, .send], expectedRevision: nil
+        )
+        let accepted = await setActor(f, thread: thread.id, bot: bot.id)
+
+        XCTAssertNil(accepted.error)
+        let pin = try XCTUnwrap(try f.ctx.botStore.conversationContextPin(linkedTo: thread.id))
+        XCTAssertEqual(pin.hostID, hostID)
+        XCTAssertEqual(pin.context, .workspace(f.workspace.id))
+        XCTAssertEqual(pin.policyRevision, binding.policyRevision)
+        XCTAssertEqual(try f.ctx.threadRepo.get(id: thread.id)?.actor, .bot(bot.id))
+        XCTAssertEqual(try f.ctx.threadRepo.guestPlacement(of: thread.id)?.guestRuntime, BotGuestRuntime.distillV1)
+        XCTAssertNoThrow(try f.ctx.botStore.validateExecutionDestination(
+            .ownVM, botID: bot.id, workspaceID: f.workspace.id, contextPin: pin
+        ))
+    }
+
     /// Same lock rules as the Mac chip: a thread with messages or a locked
     /// actor never changes; asking for what it already is changes nothing.
     func test_actorSet_refusesLockedThreadsAndIsIdempotent() async throws {

@@ -11204,7 +11204,23 @@ public final class BotsViewModel: ObservableObject {
             title: thread.title,
             linkedAgentThreadID: threadID
         )
-        try botStore.upsertConversation(conversation)
+        if let owner = bot.workspaceID, let workspaceID = thread.workspaceId, owner != workspaceID {
+            let hostID = context.liveActivityHostIdentity.serverId
+            let workspaceContext = BotContext.workspace(workspaceID)
+            guard let binding = try botStore.getContextBinding(hostID: hostID, botID: bot.id, context: workspaceContext),
+                  binding.state == .active, binding.actions.isSuperset(of: [.read, .send]) else {
+                throw BotStoreError.invalidInput("This Bot has no active read and send grant for this context.")
+            }
+            guard thread.provider == .distill, thread.providerThreadId == nil,
+                  thread.runAsUser == nil || thread.runAsUser?.isCurrentAccount == true else {
+                throw BotStoreError.invalidInput("Contextual threads require a new thread with the current Distill account.")
+            }
+            try botStore.createContextualConversation(
+                conversation, hostID: hostID, context: workspaceContext, policyRevision: binding.policyRevision
+            )
+        } else {
+            try botStore.upsertConversation(conversation)
+        }
         adoptFollowThroughConversation(conversation)
     }
 
