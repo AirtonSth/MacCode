@@ -17,7 +17,7 @@ cat > "$fake_bin/git" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "${1:-}" = "rev-parse" ]; then
-  printf '%s\n' "${RC2_FAKE_TAG_SHA:-$CI_COMMIT_SHA}"
+  printf '%s\n' "${RC2_FAKE_TAG_SHA:-$GITHUB_SHA}"
   exit 0
 fi
 exec /usr/bin/git "$@"
@@ -56,12 +56,12 @@ if [ "$method" = "DELETE" ]; then
   exit 0
 fi
 case "$url" in
-  */releases/v9.8.7)
+  */releases/tags/v9.8.7)
     printf 'GET %s\n' "$url" >> "${RC2_FAKE_CURL_LOG:?}"
     if [ -n "${RC2_FAKE_RELEASE_STATE:-}" ] && [ -f "$RC2_FAKE_RELEASE_STATE" ]; then
       owner="$(<"$RC2_FAKE_RELEASE_STATE")"
       body="$(jq -n --arg marker "remotecode-release-owner:$owner" \
-        '{description: ("RemoteCode macOS 9.8.7\n\n" + $marker)}')"
+        '{id: 4242, body: ("RemoteCode macOS 9.8.7\n\n" + $marker)}')"
       code="200"
     else
       body='{"message":"404 Release Not Found"}'
@@ -136,14 +136,15 @@ EOF
 
 chmod +x "$fake_bin/git" "$fake_bin/curl" "$fake_bin/aws"
 
-CI_COMMIT_SHA="0123456789abcdef0123456789abcdef01234567"
-export CI_COMMIT_SHA
+GITHUB_SHA="0123456789abcdef0123456789abcdef01234567"
+export GITHUB_SHA
 export RELEASE_TAG="v9.8.7"
-export CI_COMMIT_TAG="$RELEASE_TAG"
-export CI_PIPELINE_ID="456"
-export CI_API_V4_URL="https://gitlab.example/api/v4"
-export CI_PROJECT_ID="1"
-export CI_JOB_TOKEN="job-token"
+export GITHUB_REF_TYPE="tag"
+export GITHUB_REF_NAME="$RELEASE_TAG"
+export GITHUB_RUN_ID="456"
+export GITHUB_API_URL="https://api.github.example"
+export GITHUB_REPOSITORY="owner/repo"
+export GITHUB_TOKEN="job-token"
 export RC2_FAKE_CURL_LOG="$fixture_root/curl.log"
 export PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -162,58 +163,55 @@ export RC2_FAKE_TAG_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 expect_preflight_failure "wrong tag SHA" "$preflight"
 unset RC2_FAKE_TAG_SHA
 
-saved_tag="$CI_COMMIT_TAG"
-export CI_COMMIT_TAG="v9.8.8"
+saved_tag="$GITHUB_REF_NAME"
+export GITHUB_REF_NAME="v9.8.8"
 expect_preflight_failure "mismatched RELEASE_TAG" "$preflight"
-export CI_COMMIT_TAG="$saved_tag"
+export GITHUB_REF_NAME="$saved_tag"
 
 saved_release_tag="$RELEASE_TAG"
 export RELEASE_TAG="v9.8.7-beta"
-export CI_COMMIT_TAG="$RELEASE_TAG"
+export GITHUB_REF_NAME="$RELEASE_TAG"
 expect_preflight_failure "non-semver tag" "$preflight"
 export RELEASE_TAG="$saved_release_tag"
-export CI_COMMIT_TAG="$saved_release_tag"
+export GITHUB_REF_NAME="$saved_release_tag"
 
-saved_commit_tag="$CI_COMMIT_TAG"
-unset CI_COMMIT_TAG
-expect_preflight_failure "missing CI_COMMIT_TAG" "$preflight"
-export CI_COMMIT_TAG="$saved_commit_tag"
+export GITHUB_REF_TYPE="branch"
+expect_preflight_failure "branch ref" "$preflight"
+export GITHUB_REF_TYPE="tag"
 
-ci_yaml="$repo_root/.gitlab-ci.yml"
-stable_rules="$(awk '
-  /^stable_macos_arm64_dmg:/ { in_job=1 }
-  in_job && /^[^[:space:]][^:]*:/ && $0 !~ /^stable_macos_arm64_dmg:/ { exit }
-  in_job { print }
-' "$ci_yaml")"
-other_jobs="$(awk '
-  /^[a-zA-Z][A-Za-z0-9_]*:/ {
-    name=$1
-    sub(/:.*/, "", name)
-    if (name != "stages" && name != "workflow" && name != "variables" && name != "stable_macos_arm64_dmg") {
-      print name
-    }
-  }
-' "$ci_yaml")"
-if [ -n "$other_jobs" ]; then
-  echo "FAIL: CI defines an unexpected job:" >&2
-  printf '%s\n' "$other_jobs" >&2
+saved_ref_name="$GITHUB_REF_NAME"
+unset GITHUB_REF_NAME
+expect_preflight_failure "missing GITHUB_REF_NAME" "$preflight"
+export GITHUB_REF_NAME="$saved_ref_name"
+
+workflow="$repo_root/.github/workflows/release.yml"
+release_script="$repo_root/scripts/release-stable.sh"
+stable_rules="$(<"$release_script")"
+workflow_jobs="$(awk '
+  /^jobs:/ { in_jobs=1; next }
+  in_jobs && /^[^[:space:]]/ { exit }
+  in_jobs && /^  [A-Za-z0-9_-]+:/ { name=$1; sub(/:.*/, "", name); print name }
+' "$workflow")"
+if [ "$workflow_jobs" != "stable_macos_arm64_dmg" ]; then
+  echo "FAIL: release workflow defines an unexpected job:" >&2
+  printf '%s\n' "$workflow_jobs" >&2
   exit 1
 fi
-if grep -E 'release_validation_receipt:|lint_scripts:|pr_unit_tests:|package_bundle_check:|RUN_ALL_MACOS_CI|merge_request_event|RC2_VALIDATED_PIPELINE_ID|RC2_ACCEPTANCE_MANIFEST' "$ci_yaml" >/dev/null; then
-  echo "FAIL: CI still contains non-release pipeline jobs or controller gates" >&2
+if grep -E 'pull_request|workflow_dispatch|branches:|schedule:' "$workflow" >/dev/null; then
+  echo "FAIL: release workflow must run only on tag pushes" >&2
   exit 1
 fi
-# shellcheck disable=SC2016
-if ! printf '%s\n' "$stable_rules" | grep -F "if: '\$CI_COMMIT_TAG =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+$/'" >/dev/null; then
-  echo "FAIL: stable publication is not admitted by a bare glab semver tag" >&2
-  exit 1
-fi
-# shellcheck disable=SC2016
-if ! grep -F "if: '\$CI_COMMIT_TAG =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+$/'" "$ci_yaml" >/dev/null \
-  || grep -F 'merge_request_event' "$ci_yaml" >/dev/null \
-  || grep -F 'CI_PIPELINE_SOURCE == "push"' "$ci_yaml" >/dev/null
+if ! grep -F '      - "v*.*.*"' "$workflow" >/dev/null \
+  || ! grep -F 'run: bash scripts/release-stable.sh' "$workflow" >/dev/null
 then
-  echo "FAIL: workflow must admit only semver tags" >&2
+  echo "FAIL: release workflow is not admitted by a semver tag push" >&2
+  exit 1
+fi
+# shellcheck disable=SC2016
+if ! grep -F '[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]' "$workflow" >/dev/null \
+  || ! printf '%s\n' "$stable_rules" | grep -F 'scripts/release-preflight.sh' >/dev/null
+then
+  echo "FAIL: workflow must admit only stable semver tags" >&2
   exit 1
 fi
 # shellcheck disable=SC2016
@@ -246,7 +244,7 @@ run_rollback_boundary() {
   local case_root="$fixture_root/rollback-$boundary"
   export RC2_FAKE_S3_ROOT="$case_root/s3"
   export RC2_FAKE_AWS_LOG="$case_root/aws.log"
-  export RC2_FAKE_RELEASE_STATE="$case_root/gitlab-release.state"
+  export RC2_FAKE_RELEASE_STATE="$case_root/github-release.state"
   mkdir -p "$RC2_FAKE_S3_ROOT/downloads/macos/latest" "$case_root/backup"
   printf 'old-dmg' > "$RC2_FAKE_S3_ROOT/downloads/macos/latest/stable-macos-arm64-RemoteCode.dmg"
   printf 'old-appcast' > "$RC2_FAKE_S3_ROOT/downloads/macos/appcast.xml"
@@ -258,9 +256,9 @@ run_rollback_boundary() {
   export RC2_RELEASE_LATEST_KEY="downloads/macos/latest/stable-macos-arm64-RemoteCode.dmg"
   export RC2_RELEASE_APPCAST_KEY="downloads/macos/appcast.xml"
   export RC2_RELEASE_CLOUDFRONT_DISTRIBUTION_ID="distribution"
-  export RC2_RELEASE_API="https://gitlab.example/api/v4/projects/1/releases"
+  export RC2_RELEASE_API="https://api.github.example/repos/owner/repo/releases"
   export RC2_RELEASE_TAG="v9.8.7"
-  export RC2_RELEASE_JOB_TOKEN="job-token"
+  export RC2_RELEASE_TOKEN="job-token"
   export RC2_RELEASE_OWNERSHIP_TOKEN="owned-token"
   unset RC2_RELEASE_GUARD_CAPTURED RC2_RELEASE_GUARD_MUTATED
   unset RC2_RELEASE_GUARD_RELEASE_CREATED RC2_RELEASE_GUARD_COMMITTED
@@ -305,12 +303,12 @@ run_rollback_boundary() {
   grep -F 'cloudfront create-invalidation' "$RC2_FAKE_AWS_LOG" >/dev/null
   if [ "$boundary" = "release-unowned" ] || [ "$boundary" = "release-mismatched-marked" ]; then
     [ -e "$RC2_FAKE_RELEASE_STATE" ]
-    if grep -F 'DELETE https://gitlab.example/api/v4/projects/1/releases/v9.8.7' "$RC2_FAKE_CURL_LOG" >/dev/null; then
+    if grep -F 'DELETE https://api.github.example/repos/owner/repo/releases/4242' "$RC2_FAKE_CURL_LOG" >/dev/null; then
       echo "FAIL: rollback deleted a release without confirmed ownership" >&2
       exit 1
     fi
   elif [[ "$boundary" == release* ]]; then
-    grep -F 'DELETE https://gitlab.example/api/v4/projects/1/releases/v9.8.7' "$RC2_FAKE_CURL_LOG" >/dev/null
+    grep -F 'DELETE https://api.github.example/repos/owner/repo/releases/4242' "$RC2_FAKE_CURL_LOG" >/dev/null
     [ ! -e "$RC2_FAKE_RELEASE_STATE" ]
   fi
 }

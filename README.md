@@ -25,7 +25,7 @@ The Mac is the source of truth. Agents, shells, git, browsers, and files run on 
 ## Requirements
 
 - macOS 14 or later (`Package.swift`: `.macOS(.v14)`).
-- Xcode 16 or later with the macOS SDK (`swift-tools-version: 5.9`; CI uses Xcode 16).
+- Xcode with the macOS SDK. Releases are built with Xcode 27.
 - Git and Git LFS. `Vendor/GhosttyKit.xcframework` is stored in Git LFS.
 - The release DMG is built for Apple Silicon (arm64). `GhosttyKit.xcframework` also contains an x86_64 slice, but Intel builds are not part of the release process.
 
@@ -96,7 +96,7 @@ Tests live in `Tests/`, one target per module. Build and helper scripts live in 
 
 ## Releases
 
-Releases are for maintainers only. Creating a `vX.Y.Z` tag starts the release pipeline. The pipeline signs and notarizes the DMG, publishes it and the Sparkle appcast to remotecode.io, and creates the release.
+Releases are for maintainers only. Pushing a `vX.Y.Z` tag to GitHub starts `.github/workflows/release.yml` on a GitHub-hosted Xcode 27 runner. The workflow runs `scripts/release-stable.sh`, which signs and notarizes the DMG, publishes it and the Sparkle appcast to remotecode.io, and creates the GitHub release.
 
 ## Contributing
 

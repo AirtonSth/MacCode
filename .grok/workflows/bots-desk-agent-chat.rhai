@@ -77,7 +77,7 @@ fn rules(macos, do_push) {
     s += "Honesty Desktop stays: Same macOS account; not isolated. Not a dedicated Desktop. ";
     s += "User workflow state must survive close/reopen: replay persisted stream events for the linked thread when Desk opens. ";
     if do_push {
-        s += "After commit, rebase onto origin/production if behind without dropping Codex commits, then git push origin HEAD. ";
+        s += "After commit, rebase onto origin/main if behind without dropping Codex commits, then git push origin HEAD. ";
     } else {
         s += "Do not push. ";
     }

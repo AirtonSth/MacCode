@@ -25,7 +25,7 @@ fi
 # Registra PID para debug sem expor segredos
 echo $$ > "$LOCK_FILE.pid" 2>/dev/null || true
 
-# 1) garante origin/production atualizado (read-only check)
+# 1) garante origin/main atualizado (read-only check)
 git -C "$REPO_ROOT" fetch origin production 2>&1 | head -20 || echo "fetch falhou, segue com HEAD local" >&2
 
 # 2) calcula fingerprint estável (mesma lógica de loops/_shared.md)
@@ -46,7 +46,7 @@ else
   echo "Nenhum MR aberto para fingerprint $FP — será criado na primeira entrega COMPLETE" >&2
 fi
 
-# 4) cria/atualiza worktree isolado a partir de origin/production (nunca toca worktree primário sujo)
+# 4) cria/atualiza worktree isolado a partir de origin/main (nunca toca worktree primário sujo)
 # Reusa worktree existente se branch já tem worktree em qualquer path (evita 'already used')
 EXISTING_WT=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | awk -v br="refs/heads/$BRANCH" ' $1=="worktree" {wt=$2} $1=="branch" && $2==br {print wt; exit}')
 if [ -n "$EXISTING_WT" ] && [ -d "$EXISTING_WT" ]; then
@@ -62,7 +62,7 @@ else
       if [ -n "$EXISTING_WT" ]; then WT="$EXISTING_WT"; echo "Worktree existente detectado em $WT — reutilizando" >&2; else exit 1; fi
     }
   else
-    git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WT" origin/production 2>&1 | head -20
+    git -C "$REPO_ROOT" worktree add -b "$BRANCH" "$WT" origin/main 2>&1 | head -20
   fi
 fi
 

@@ -51,7 +51,7 @@ fn rules(macos, plan_dir, do_push) {
     s += "At every checkpoint: run python3 ~/.grok/skills/sam-codex-advisor/scripts/resolve_advisor.py --model gpt-5.6-sol --effort max, then invoke that argv with the question on stdin. ";
     s += "After advisor, commit with a focused message. ";
     if do_push {
-        s += "Then rebase onto origin/production if behind (do not drop Codex commits such as RCW1 fail-open) and git push origin HEAD. ";
+        s += "Then rebase onto origin/main if behind (do not drop Codex commits such as RCW1 fail-open) and git push origin HEAD. ";
     } else {
         s += "Do not push. ";
     }

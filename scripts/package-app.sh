@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Package the SwiftPM-built executable as a minimal local .app bundle.
 # This is not a release artifact. Release DMGs must be Developer ID signed
-# and notarized by scripts/package-dmg.sh (GitLab release pipeline), which
+# and notarized by scripts/package-dmg.sh (GitHub release workflow), which
 # delegates all packaging to this script.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -216,7 +216,7 @@ if [ ! -d "$STAGING_APP/Contents/Resources/RemoteCode_AgentRuntime.bundle" ]; th
 fi
 # Claude Agent SDK Node bridge: must ship inside the .app. The adapter resolves
 # this at runtime from Contents/Resources — never via compile-time #filePath
-# (that baked CI gitlab-runner paths into release builds and broke customers).
+# (that baked CI runner paths into release builds and broke customers).
 CLAUDE_SDK_BRIDGE="Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs"
 if [ ! -f "$CLAUDE_SDK_BRIDGE" ]; then
   echo "missing $CLAUDE_SDK_BRIDGE" >&2

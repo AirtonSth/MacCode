@@ -21,7 +21,7 @@ rc2_release_guard_validate_configuration() {
     RC2_RELEASE_CLOUDFRONT_DISTRIBUTION_ID \
     RC2_RELEASE_API \
     RC2_RELEASE_TAG \
-    RC2_RELEASE_JOB_TOKEN \
+    RC2_RELEASE_TOKEN \
     RC2_RELEASE_OWNERSHIP_TOKEN
   do
     rc2_release_guard_require "$name" || return 1
@@ -102,8 +102,9 @@ rc2_release_guard_ownership_marker() {
 rc2_release_guard_fetch_release_once() {
   local response="$1"
   curl --silent --show-error --output "$response" --write-out '%{http_code}' \
-    --header "JOB-TOKEN: $RC2_RELEASE_JOB_TOKEN" \
-    "$RC2_RELEASE_API/$RC2_RELEASE_TAG"
+    --header "Authorization: Bearer $RC2_RELEASE_TOKEN" \
+    --header "Accept: application/vnd.github+json" \
+    "$RC2_RELEASE_API/tags/$RC2_RELEASE_TAG"
 }
 
 rc2_release_guard_confirm_release_ownership() {
@@ -115,7 +116,7 @@ rc2_release_guard_confirm_release_ownership() {
   [ "$code" = "200" ] || return 1
   marker="$(rc2_release_guard_ownership_marker)"
   jq -e --arg marker "$marker" \
-    '(.description // "" | split("\n") | index($marker)) != null' \
+    '(.body // "" | split("\n") | index($marker)) != null' \
     "$response" >/dev/null
 }
 
@@ -163,16 +164,20 @@ rc2_release_guard_delete_release_once() {
   [ "$code" = "200" ] || return 1
   marker="$(rc2_release_guard_ownership_marker)"
   if ! jq -e --arg marker "$marker" \
-    '(.description // "" | split("\n") | index($marker)) != null' \
+    '(.body // "" | split("\n") | index($marker)) != null' \
     "$response" >/dev/null
   then
     echo "release guard: refusing to delete a release owned by another job" >&2
     return 1
   fi
+  local release_id
+  release_id="$(jq -r '.id // empty' "$response")"
+  [ -n "$release_id" ] || return 1
   code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
     --request DELETE \
-    --header "JOB-TOKEN: $RC2_RELEASE_JOB_TOKEN" \
-    "$RC2_RELEASE_API/$RC2_RELEASE_TAG")"
+    --header "Authorization: Bearer $RC2_RELEASE_TOKEN" \
+    --header "Accept: application/vnd.github+json" \
+    "$RC2_RELEASE_API/$release_id")"
   [ "$code" = "200" ] || [ "$code" = "204" ] || [ "$code" = "404" ]
 }
 
@@ -203,7 +208,7 @@ rc2_release_guard_rollback() {
   fi
   if [ "${RC2_RELEASE_GUARD_RELEASE_CREATED:-0}" = "1" ]; then
     if ! rc2_release_guard_retry rc2_release_guard_delete_release_once; then
-      echo "release guard: failed to delete partial GitLab release" >&2
+      echo "release guard: failed to delete partial GitHub release" >&2
       failed=1
     fi
   fi

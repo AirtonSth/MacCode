@@ -23,7 +23,7 @@ Identity, ports, and App Support are defined only in that script. Print them wit
 3. Tests: `scripts/isolated-sandbox.sh test` or `scripts/isolated-sandbox.sh test --filter NameTests`
 4. Second GUI (optional): `scripts/isolated-sandbox.sh run` and later `stop`
 
-`ensure` from the primary tree creates `.sandbox-worktrees/<stamp>` on branch `sandbox/isolated-<stamp>` at `HEAD`. Already inside a linked worktree, it reprints `pwd`. Use `RC2_SANDBOX_REF=origin/production` and `RC2_SANDBOX_FETCH=1` when the sandbox must track origin, not the current `HEAD`.
+`ensure` from the primary tree creates `.sandbox-worktrees/<stamp>` on branch `sandbox/isolated-<stamp>` at `HEAD`. Already inside a linked worktree, it reprints `pwd`. Use `RC2_SANDBOX_REF=origin/main` and `RC2_SANDBOX_FETCH=1` when the sandbox must track origin, not the current `HEAD`.
 
 ## Forbidden
 

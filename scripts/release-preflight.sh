@@ -9,22 +9,27 @@ require_value() {
   fi
 }
 
-export RELEASE_TAG="${RELEASE_TAG:-${CI_COMMIT_TAG:-}}"
+export RELEASE_TAG="${RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
 
 for name in \
   RELEASE_TAG \
-  CI_COMMIT_TAG \
-  CI_COMMIT_SHA \
-  CI_PIPELINE_ID \
-  CI_API_V4_URL \
-  CI_PROJECT_ID \
-  CI_JOB_TOKEN
+  GITHUB_REF_TYPE \
+  GITHUB_REF_NAME \
+  GITHUB_SHA \
+  GITHUB_RUN_ID \
+  GITHUB_API_URL \
+  GITHUB_REPOSITORY \
+  GITHUB_TOKEN
 do
   require_value "$name"
 done
 
-if [ "$RELEASE_TAG" != "$CI_COMMIT_TAG" ]; then
-  echo "release preflight: RELEASE_TAG must equal CI_COMMIT_TAG" >&2
+if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+  echo "release preflight: GITHUB_REF_TYPE must be tag" >&2
+  exit 1
+fi
+if [ "$RELEASE_TAG" != "$GITHUB_REF_NAME" ]; then
+  echo "release preflight: RELEASE_TAG must equal GITHUB_REF_NAME" >&2
   exit 1
 fi
 if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -40,9 +45,9 @@ for command in git curl jq; do
 done
 
 tag_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
-if [ "$tag_sha" != "$CI_COMMIT_SHA" ]; then
-  echo "release preflight: tag does not peel to CI_COMMIT_SHA" >&2
+if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+  echo "release preflight: tag does not peel to GITHUB_SHA" >&2
   exit 1
 fi
 
-echo "release preflight: PASS tag=$RELEASE_TAG sha=$CI_COMMIT_SHA pipeline=$CI_PIPELINE_ID"
+echo "release preflight: PASS tag=$RELEASE_TAG sha=$GITHUB_SHA run=$GITHUB_RUN_ID"
