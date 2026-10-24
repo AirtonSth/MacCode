@@ -1,246 +1,115 @@
 ![MacCode in action](https://remotecode.io/videos/video-3x.gif)
 
-# MacCode for macOS
+# MacCode
 
-Your entire dev workflow — agents, terminals, browsers, and git — in one native cockpit you can drive from anywhere.
+MacCode is a native macOS development cockpit. It keeps agents, terminals, browsers, files, and git in one workspace, and lets you control that workspace from the Mac or from an iPhone.
 
-All a developer need to code anywhere.
+The Mac is the source of truth. Agents, shells, git, browsers, and files run on the Mac. Remote clients mirror and control that host state instead of running their own copies.
 
-## Get Started
+## Download
 
-[Latest Release](https://remotecode.io/downloads/macos/latest/stable-macos-arm64-RemoteCode.dmg)
+[Download the latest release for Apple Silicon (DMG)](https://remotecode.io/downloads/macos/latest/stable-macos-arm64-RemoteCode.dmg)
 
-## What MacCode Does
+## Features
 
-MacCode is a native macOS development cockpit. It brings the tools a developer normally keeps spread across terminals, browser tabs, git windows, agent CLIs, and mobile devices into one workspace that can be controlled locally on the Mac or remotely from iPhone.
+- **Agent App:** run agent threads from Codex, Claude Code, Grok, and Distill. Choose provider, model, reasoning effort, permissions, and execution mode before a run. Run in local mode or an isolated worktree. Queue follow-ups, attach files, approve or deny provider actions, and answer provider questions. Threads restore after restart.
+- **Terminal:** real macOS terminal tabs (Ghostty) scoped to each workspace, with ANSI styling and persistent scrollback.
+- **SSH:** saved host profiles scoped to a workspace, with reconnect and file transfer while connected.
+- **Browser:** embedded browser surfaces with a local address field. Open the current URL in the default browser.
+- **Files:** browse workspace files and preview supported file types. Hidden previews unload.
+- **Git:** git and diff surfaces, changed-file review, and git context in the Agent composer.
+- **Workspaces and panes:** multiple workspaces, each with its own working directory. Tabs can be split, dragged between panes, and minimized. Layout, tabs, and workspace state persist across launches.
+- **Bots and Schedule Tasks:** run agents as Bots and schedule Bot and workspace tasks.
+- **iPhone remote control:** pair an iPhone over the local network or VPN. The phone mirrors workspaces, threads, terminals, browser surfaces, and git state, and can send prompts, answer provider requests, and stop runs. The iPhone companion app is closed source.
 
-MacCode is built around a simple rule: the Mac stays the source of truth. Agents, shells, git, browsers, files, and workspaces run on the Mac. Remote clients mirror and control that real host state instead of running separate copies.
+## Requirements
 
-## Core Capabilities
+- macOS 14 or later (`Package.swift`: `.macOS(.v14)`).
+- Xcode 16 or later with the macOS SDK (`swift-tools-version: 5.9`; CI uses Xcode 16).
+- Git and Git LFS. `Vendor/GhosttyKit.xcframework` is stored in Git LFS.
+- The release DMG is built for Apple Silicon (arm64). `GhosttyKit.xcframework` also contains an x86_64 slice, but Intel builds are not part of the release process.
 
-### Agent App
-
-- Start and continue agent threads from a native macOS surface.
-- Use Codex and Claude Code as first-class providers.
-- Switch provider, model, reasoning effort, service tier, permissions, and execution mode before a run starts.
-- Use dynamic provider model discovery where available, with safe fallback model aliases.
-- Add custom model IDs, persist them, and manage them later from Settings.
-- Run in local mode or isolated worktree mode.
-- Attach files to the next agent message.
-- Queue follow-up messages while a run is active.
-- Stop active runs.
-- Continue provider sessions without losing the provider thread cursor.
-- Render assistant output, tool activity, work logs, proposed plans, approvals, provider questions, user-input requests, errors, and token/context status.
-- Answer provider approval and user-input cards directly in the app.
-- Rehydrate thread history and runtime state after app restart.
-- Track running/failed/completed state in tabs and workspace chrome.
-
-### Terminal
-
-- Open real macOS terminal tabs inside the workspace.
-- Run local shell commands in the selected workspace directory.
-- Keep terminal output, scrollback, and tab state tied to the workspace.
-- Mirror terminal output to remote clients.
-- Preserve ANSI styling and terminal-like output for rich CLI/TUI workflows.
-- Read terminal text through the host API for automation and remote proof.
-
-### SSH
-
-- Open SSH surfaces for remote machines.
-- Save SSH host profiles.
-- Scope saved hosts to the current workspace.
-- Reconnect to saved hosts from the SSH sidebar.
-- Show file-transfer controls only when a connection is active.
-- Preserve active SSH tab behavior across tab and split-pane operations.
-
-### Browser
-
-- Open embedded browser surfaces inside a workspace.
-- Navigate from a local address field.
-- Keep browser state attached to the workspace layout.
-- Open the current URL in the Mac default browser when needed.
-- Mirror browser surfaces to remote clients where supported.
-
-### Files
-
-- Browse workspace files from a native surface.
-- Open file previews for supported file types.
-- Keep heavy previews unloaded when hidden so background tabs do not retain unnecessary memory.
-- Support file-oriented workflows from macOS and mirrored mobile surfaces.
-
-### Git And Delivery
-
-- Open Git and diff surfaces from the workspace.
-- Review changed files.
-- Use git summary context in the Agent composer.
-- Prepare pull-request-oriented agent flows.
-- Keep git review actions close to the agent thread that produced the work.
-
-### Panes, Tabs, And Workspaces
-
-- Create multiple workspaces, each with its own current working directory.
-- Use tabs for Terminal, SSH, Browser, Agent App, Files, Git, and preview surfaces.
-- Split panes horizontally or vertically.
-- Drag tabs between panes.
-- Split a selected tab into a new pane.
-- Minimize panes without destroying their tab strip.
-- Right-click tabs to close all others, close all to the left, or close all to the right.
-- Persist and restore workspace layout.
-- Show busy indicators when an agent thread is running.
-
-### iPhone Remote Control
-
-- Pair an iPhone with the Mac over the local network or VPN.
-- Mirror real Mac workspaces, surfaces, agent threads, terminals, browser surfaces, git state, and activity.
-- Control the Mac from iPhone without running agents, shells, git, or browser logic on the phone.
-- Send agent prompts, queue follow-ups, answer provider questions, approve or deny provider actions, and stop runs from iPhone.
-- Drive hosted terminal surfaces from iPhone while the command still runs on the Mac.
-- Use host readback and event streams so mobile state stays tied to actual Mac state.
-
-### Watch And Notifications
-
-- Surface agent thread state through iOS widgets and Live Activities.
-- Schedule local notifications for host events.
-- Keep mobile activity indicators aligned with host-side agent status.
-
-### Account And Pairing
-
-- Pair devices through host-issued pairing codes and trusted-device tokens.
-- Store remote-control tokens in the iOS Keychain.
-- Keep direct LAN/VPN control separate from optional private account features.
-- Use private account sign-in for backend-assisted push delivery where configured.
-- Keep the Mac usable without a private account for local/direct workflows.
-
-### Settings And Diagnostics
-
-- Toggle remote access for paired devices.
-- Configure Codex and Claude executable paths.
-- Inspect provider install/auth/update state.
-- Run provider update actions.
-- Manage custom model IDs.
-- Configure diff defaults.
-- Generate and revoke pairing codes.
-- Review trusted devices.
-
-## Security Model
-
-- The Mac is the authority for workspace state and execution.
-- Remote clients mutate state through explicit host RPCs and event streams.
-- Paired-device tokens are required for remote control.
-- Remote access can be disabled to bind the host API to localhost.
-- When remote access is enabled, the host API binds to the LAN interface and still requires trusted-device authorization.
-- iOS stores pairing tokens in Keychain.
-- Remote clients do not run local shell, git, browser, or agent logic independently.
-- Sensitive host state is not treated as a stale client cache; the host remains the source of truth.
-
-## Architecture
-
-MacCode is split into focused modules:
-
-- `AppShell`: macOS app shell, workspaces, tabs, panes, settings, command routing, and app lifecycle.
-- `Surfaces`: native macOS surfaces for Agent App, Terminal, Browser, Files, Git/Diff, previews, and related UI.
-- `AgentRuntime`: provider adapters and runtime logic for Codex, Claude Code, streaming, approvals, user input, session recovery, and model discovery.
-- `SocketServer`: local HTTP/RPC/WebSocket API, pairing, event streaming, and remote-control dispatch.
-- `CoreModel`: shared workspace, surface, agent, provider, and event models.
-- `Persistence`: SQLite-backed storage for settings, workspaces, threads, messages, queues, checkpoints, prompts, and trusted devices.
-- `RemoteCodeDistillService`: packaged helper executable for the provider proxy, Agent App middleware, subagent telemetry, the Chrome host, and the bot and computer-use MCP servers.
-- `DesignSystemKit`: shared tokens and native UI components.
-- `ios-app`: SwiftUI remote-control client for iPhone.
-- `watchos-app`: watch-side companion surfaces.
-- `private`: optional backend/account/push infrastructure.
-
-## Typical Workflows
-
-### Run an agent against a repository
-
-1. Open a workspace pointing at a project directory.
-2. Open an Agent App tab.
-3. Choose Codex or Claude Code.
-4. Select the model, reasoning effort, permission mode, and execution mode.
-5. Send a prompt.
-6. Review streaming output, work logs, proposed plans, approvals, and file changes.
-7. Open Git/Diff review from the same workspace.
-
-### Continue work from iPhone
-
-1. Enable remote access on the Mac.
-2. Pair the iPhone using a host pairing code.
-3. Open the same workspace on iPhone.
-4. Continue the agent thread, answer pending questions, stop a run, or drive a terminal command.
-5. Let the Mac keep executing while the phone mirrors host state.
-
-### Use MacCode as a local cockpit
-
-1. Keep Terminal, Agent App, Browser, Files, and Git tabs in one workspace.
-2. Split panes for side-by-side review.
-3. Drag tabs into the layout that fits the task.
-4. Use tab context actions to clean up finished work quickly.
-
-## Connection dual-track (plan-connection)
-
-Host flags for material silent wakes and transport keep-alive live in
-`UserDefaults` (see `ConnectionFeatureFlags`). Defaults when the key is
-**unset**:
-
-| Key | Default | Effect |
-|---|---|---|
-| `connection.flag.wake_phase_a` | **on** | Material agent/lifecycle events may emit silent APNs catch-up (`silent_catchup.v1`) |
-| `connection.flag.transport_keepalive_exp` | **on** | HTTP keep-alive idle **25s** (vs 5s baseline) for cellular RRC gaps |
-| `connection.flag.wake_phase_b_git` | off | Git material silent wakes |
-| `connection.flag.wake_outbox` | off | Durable silent outbox |
-| `connection.flag.selective_catchup` | off | Host-side selective catch-up experiment inventory |
-
-**Kill switch** (explicit `false` always wins; restart MacCode after change):
+## Build From Source
 
 ```bash
-# Bundle id may be io.remotecode.app or your signed product id — check Activity Monitor / Info.plist
-defaults write io.remotecode.app connection.flag.wake_phase_a -bool false
-defaults write io.remotecode.app connection.flag.transport_keepalive_exp -bool false
-```
-
-Unset restores default-on for those two:
-
-```bash
-defaults delete io.remotecode.app connection.flag.wake_phase_a
-defaults delete io.remotecode.app connection.flag.transport_keepalive_exp
-```
-
-On HTTP server start the log should show `keepAliveIdle=25s wakePhaseA=true`
-when defaults are unset. iOS client docs: `ios-app/docs/RUNBOOKS.md` (RB-8),
-`ios-app/docs/BACKGROUND-LIMITS.md`.
-
-## Build And Test
-
-`script/build_and_run.sh` launches `dist/RemoteCodeDebug.app` via `scripts/isolated-sandbox.sh` and does not quit the host app. Do not run `scripts/run-app.sh` against the user's running host app (see `AGENTS.md`).
-
-```bash
+git lfs install
+git clone https://github.com/samuelfaj/MacCode.git
+cd MacCode
+git lfs pull
+scripts/bootstrap.sh
 swift build --product RemoteCode
-swift test
 ```
 
-When running from environments where `xcode-select` points at Command Line Tools, use:
+If `xcode-select` points at the Command Line Tools, set the developer directory first:
 
 ```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift build --product RemoteCode
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 ```
 
-Focused examples:
+### Tests
 
 ```bash
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter AgentAppViewModelTests
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter PaneActionTests
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter ProviderSnapshotRuntimeTests
+scripts/test-unit.sh
 ```
 
-## Design Principles
+`scripts/test-unit.sh` runs `swift test` and selects the Xcode developer directory when XCTest is available there. Set `RC2_COVERAGE=1` to produce a coverage report. Focused runs can use `swift test --filter <TestName>`.
 
-- Native macOS first: use platform controls, predictable window behavior, keyboard support, and desktop density.
-- Host truth first: every remote surface must reflect real Mac state, not optimistic client-only state.
-- Fail loud: provider auth, install, model, pairing, and runtime problems should be visible and recoverable.
-- Keep workflows close: agent output, terminal state, browser context, files, and git review should stay in the same workspace.
-- Mobile mirrors, Mac executes: iPhone control is powerful because it drives the real host instead of duplicating developer tools on the phone.
+### Run the App
+
+Run the debug app inside the isolated sandbox from a linked git worktree:
+
+```bash
+cd "$(scripts/isolated-sandbox.sh ensure)"
+scripts/isolated-sandbox.sh run
+```
+
+The sandbox builds and launches `io.remotecode.desktop.debug` with its own Application Support directory, SQLite store, and HTTP port (18218 by default). An installed MacCode app (`io.remotecode.desktop`) is not affected. Use `scripts/isolated-sandbox.sh stop` to stop the sandbox app. `script/build_and_run.sh` runs the same sandbox flow.
+
+`scripts/isolated-sandbox.sh test` runs the test suite in the sandbox worktree.
+
+### Local Package
+
+`scripts/package-app.sh` builds a local `MacCode.app` into `dist/`. The output is not a release artifact. `scripts/package-dmg.sh` builds the signed DMG and requires a Developer ID Application identity in `RC2_CODESIGN_IDENTITY`.
+
+## Project Layout
+
+Modules under `Sources/`:
+
+| Module | Purpose |
+| --- | --- |
+| `AppShell` | macOS app shell: workspaces, tabs, panes, settings, command routing, lifecycle |
+| `Surfaces` | Native surfaces: Agent App, Terminal, Browser, Files, Git/Diff, previews |
+| `AgentRuntime` | Provider adapters (Codex, Claude Code, Grok, Distill), streaming, approvals, session recovery |
+| `SocketServer` | Local HTTP, RPC, and WebSocket API, pairing, event streams, remote dispatch |
+| `CoreModel` | Shared workspace, surface, agent, provider, and event models |
+| `Persistence` | SQLite storage for settings, workspaces, threads, messages, queues, and trusted devices |
+| `DesignSystemKit` | Shared design tokens and native UI components |
+| `AppLifecycleSupport` | App lifecycle helpers |
+| `RemoteCodeTreaty` | Host RPC contract types shared with remote clients |
+| `RemoteCodeDistillService` | Helper executable: provider proxy, Agent App middleware, subagent telemetry, Chrome host, bot and computer-use MCP servers |
+| `RemoteCodeScheduledTaskAgent` | Executable that runs scheduled tasks |
+| `RemoteCodeRunAsUserHelper` | Executable for the privileged run-as-user helper |
+| `RC2CLI` | `rc2` command-line tool |
+| `CSystem` | C system bridge used by the Swift modules |
+
+Tests live in `Tests/`, one target per module. Build and helper scripts live in `scripts/` and `script/`.
+
+## Releases
+
+Releases are for maintainers only. Creating a `vX.Y.Z` tag starts the release pipeline. The pipeline signs and notarizes the DMG, publishes it and the Sparkle appcast to remotecode.io, and creates the release.
+
+## Contributing
+
+1. Branch from `main`.
+2. Open a pull request against `main`.
+3. Read [AGENTS.md](AGENTS.md) and [DESIGN.md](DESIGN.md) before changing behavior or UI. Both are binding for this repository.
+4. Keep macOS and iOS in sync. Browser state, workspace state, and remote-control behavior must match on both sides. The iOS companion app is closed source, so iOS changes cannot be tested from this repository.
+5. Run `scripts/test-unit.sh` and verify UI changes in the isolated sandbox app.
+
+## Security
+
+Do not report vulnerabilities in public issues. Email samuelfajreldines@gmail.com with the details. Include steps to reproduce if you can.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Ghostty and Sparkle are MIT-licensed.
