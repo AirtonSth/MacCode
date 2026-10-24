@@ -64,7 +64,7 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
         routingMode: AgentRoutingMode = .manual,
-        distillExecutionMode: DistillExecutionMode = .normal,
+        distillExecutionMode: DistillExecutionMode = .auto,
         permissionMode: AgentPermissionMode = .fullAccess,
         interactionMode: AgentInteractionMode = .default,
         executionMode: AgentExecutionMode = .local,
@@ -134,7 +134,7 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
         routingMode = try c.decodeIfPresent(AgentRoutingMode.self, forKey: .routingMode)
-        distillExecutionMode = try c.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .normal
+        distillExecutionMode = try c.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .auto
         permissionMode = try c.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode) ?? .fullAccess
         interactionMode = try c.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode) ?? .default
         executionMode = try c.decodeIfPresent(AgentExecutionMode.self, forKey: .executionMode) ?? .local

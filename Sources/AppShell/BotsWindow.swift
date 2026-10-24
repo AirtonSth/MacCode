@@ -78,7 +78,7 @@ public struct BotDeskRouting: Equatable, Codable {
         reasoningModel: String? = nil,
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
-        distillExecutionMode: DistillExecutionMode = .normal,
+        distillExecutionMode: DistillExecutionMode = .auto,
         serviceTier: AgentServiceTier = .auto,
         runAsUser: AgentRunAsUser? = nil
     ) {
@@ -124,7 +124,7 @@ public struct BotDeskRouting: Equatable, Codable {
         reasoningModel = try container.decodeIfPresent(String.self, forKey: .reasoningModel)
         distillMainEffortSelection = try container.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try container.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
-        distillExecutionMode = try container.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .normal
+        distillExecutionMode = try container.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .auto
         serviceTier = try container.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         runAsUser = try container.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
             ?? AgentRunAsUser.current()
@@ -7574,7 +7574,7 @@ public final class BotsViewModel: ObservableObject {
             ? (spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)) : nil
         routing.distillReasoningEffortSelection = spec.provider == .distill
             ? (spec.distillReasoningEffortSelection ?? .automatic) : nil
-        routing.distillExecutionMode = spec.provider == .distill ? (spec.distillExecutionMode ?? .normal) : .normal
+        routing.distillExecutionMode = spec.provider == .distill ? (spec.distillExecutionMode ?? .auto) : .normal
         if let permission = spec.permissionMode { routing.permissionMode = permission }
         return routing
     }

@@ -493,7 +493,7 @@ struct BotScheduleTaskEditorView: View {
                     ScheduledRunOptionsEditor(
                         showsExecutionMode: draft.spec.provider == .distill,
                         executionMode: Binding(
-                            get: { draft.spec.distillExecutionMode ?? .normal },
+                            get: { draft.spec.distillExecutionMode ?? .auto },
                             set: { draft.spec.distillExecutionMode = $0 }
                         ),
                         permission: Binding(

@@ -1301,10 +1301,27 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(plain.result?.objectValue?["distill_ultracode"], .bool(false))
     }
 
+    @MainActor
+    func test_distillExecutionModeAutoIsAcceptedAndAbsentDefaultsToAuto() async {
+        // WHY: iOS sends distill_execution_mode "auto"; an omitted option must mean Auto, not Normal.
+        let router = FakeRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let explicit = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.create", params: [
+            "provider": .string("distill"), "model": .string("distill-main"), "distill_execution_mode": .string("auto")
+        ]))
+        XCTAssertNil(explicit.error)
+        XCTAssertEqual(explicit.result?.objectValue?["distill_execution_mode"], .string("auto"))
+        XCTAssertEqual(explicit.result?.objectValue?["distill_ultracode"], .bool(false))
+        let plain = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(2), method: "agent.thread.create", params: [
+            "provider": .string("distill"), "model": .string("distill-main")
+        ]))
+        XCTAssertEqual(plain.result?.objectValue?["distill_execution_mode"], .string("auto"))
+    }
+
     func test_modelSelectionDecodesMissingUltracodeAsFalse() throws {
         let json = #"{"provider":"distill","modelId":"m","reasoningEffort":"high","serviceTier":"auto"}"#
         let decoded = try JSONDecoder().decode(AgentModelSelection.self, from: Data(json.utf8))
-        XCTAssertEqual(decoded.distillExecutionMode, .normal)
+        XCTAssertEqual(decoded.distillExecutionMode, .auto)
         let withFlag = AgentModelSelection(provider: .distill, modelId: "m", distillExecutionMode: .ultracode)
         let round = try JSONDecoder().decode(AgentModelSelection.self, from: JSONEncoder().encode(withFlag))
         XCTAssertEqual(round.distillExecutionMode, .ultracode)

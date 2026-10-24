@@ -493,6 +493,7 @@ private struct OptionalAccessibilityIdentifier: ViewModifier {
 public extension DistillExecutionMode {
     var capsuleTint: Color {
         switch self {
+        case .auto: return DS.Palette.accent
         case .normal: return DS.Palette.textSecondary
         case .ultrafast: return DS.Palette.warning
         case .ultracode: return DS.Palette.ultracode
@@ -502,6 +503,7 @@ public extension DistillExecutionMode {
 
     var capsuleIcon: String {
         switch self {
+        case .auto: return "sparkles"
         case .normal: return "circle.dotted"
         case .ultrafast: return "bolt.fill"
         case .ultracode: return "wand.and.stars"
