@@ -118,7 +118,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
 
     func resynchronizeGuest(_ request: AgentRunRequest) async throws -> Bool {
         try Task.checkCancellation()
-        guard deps.hostsGuestRuns, request.providerThreadId == nil,
+        guard deps.hostsGuestRuns,
               request.runAsUser.map({ $0.uid == getuid() }) ?? true,
               deps.contextualAdmissions?.hasAdmission(for: request.runId) != true,
               deps.contextualAdmissions?.hasAdmission(threadID: request.threadId) != true,
@@ -698,7 +698,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     }
 
     static func launchError(_ error: Error) -> Error {
-        if error is DistillGuestLaunchError || error is CancellationError { return error }
+        if error is DistillAutoRoutingError || error is DistillGuestLaunchError || error is CancellationError { return error }
         let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         return DistillGuestLaunchError.unavailable(reason)
     }

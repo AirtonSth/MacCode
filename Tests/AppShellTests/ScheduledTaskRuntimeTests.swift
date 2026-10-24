@@ -199,18 +199,18 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         let selection = ScheduledTaskExecutor.modelSelection(for: task)
         XCTAssertEqual(selection.distillMainEffortSelection, .fixed(.high))
         XCTAssertEqual(selection.distillReasoningEffortSelection, .fixed(.high))
-        XCTAssertNoThrow(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot))
+        XCTAssertNoThrow(try ScheduledTaskExecutor.validateModelConfiguration(task, snapshot: snapshot))
 
         task.distillMainEffortSelection = .fixed(.high)
         task.distillReasoningEffortSelection = .fixed(.low)
-        XCTAssertThrowsError(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot)) {
+        XCTAssertThrowsError(try ScheduledTaskExecutor.validateModelConfiguration(task, snapshot: snapshot)) {
             XCTAssertEqual(($0 as? ScheduledTaskPreflightError)?.description,
                            ScheduledTaskPreflightError.unsupportedReasoning("Low").description)
         }
 
         task.model = "  "
         task.reasoningModel = nil
-        XCTAssertThrowsError(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot)) {
+        XCTAssertThrowsError(try ScheduledTaskExecutor.validateModelConfiguration(task, snapshot: snapshot)) {
             XCTAssertEqual(
                 ($0 as? ScheduledTaskPreflightError)?.description,
                 ScheduledTaskPreflightError.invalidTask("Select an explicit Distill Main model.").description
@@ -220,7 +220,48 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         task.model = "reason"
         task.reasoningModel = "reason"
         task.distillReasoningEffortSelection = .fixed(.high)
-        XCTAssertNoThrow(try ScheduledTaskExecutor.validateDistillConfiguration(task, snapshot: snapshot))
+        XCTAssertNoThrow(try ScheduledTaskExecutor.validateModelConfiguration(task, snapshot: snapshot))
+    }
+
+    @MainActor
+    func test_deepseekAutomaticMainEffortIgnoresStaleLegacyEffort_becauseScheduleEditorPersistsBothFields() throws {
+        let snapshot = AgentProviderSnapshot(
+            id: "distill",
+            provider: .distill,
+            driverKind: .distillACP,
+            displayName: "Distill",
+            accentColor: "#6E56CF",
+            continuationGroup: "distill",
+            interactionModes: [.default],
+            permissionModes: [.fullAccess],
+            enabled: true,
+            installed: true,
+            status: .available,
+            authenticated: true,
+            models: [
+                AgentModelDescriptor(id: "nativeDistillDeepseek", label: "DeepSeek", provider: .distill, supportsReasoning: true, supportedReasoningEfforts: [.low, .high, .max]),
+            ],
+            slashCommands: [],
+            capabilities: AgentProviderCapabilities(supportsDistillMainEffortAuto: true)
+        )
+        var task = makeHourly(nextRunAt: nil)
+        task.provider = .distill
+        task.model = "nativeDistillDeepseek"
+        task.reasoningEffort = .medium
+        task.distillMainEffortSelection = .automatic
+        XCTAssertNoThrow(try ScheduledTaskExecutor.validateModelConfiguration(task, snapshot: snapshot))
+
+        task.distillMainEffortSelection = .fixed(.medium)
+        XCTAssertThrowsError(try ScheduledTaskExecutor.validateModelConfiguration(task, snapshot: snapshot))
+        task.distillMainEffortSelection = nil
+        XCTAssertThrowsError(try ScheduledTaskExecutor.validateModelConfiguration(task, snapshot: snapshot))
+
+        task.distillMainEffortSelection = .fixed(.high)
+        XCTAssertNoThrow(try ScheduledTaskExecutor.validateModelConfiguration(task, snapshot: snapshot))
+
+        task.provider = .codex
+        task.distillMainEffortSelection = nil
+        XCTAssertThrowsError(try ScheduledTaskExecutor.validateModelConfiguration(task, snapshot: snapshot))
     }
 
     func test_ultracodeReachesTheRunSelectionOnlyForDistill_becauseScheduledRunsMustMatchTheComposer() {

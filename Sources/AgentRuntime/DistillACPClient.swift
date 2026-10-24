@@ -207,7 +207,8 @@ enum DistillACPFailureTaxonomy {
         let networkMarkers = [
             "network error", "network failure", "connection refused", "connection reset",
             "connection closed", "host unreachable", "dns failure", "socket error",
-            "transport error", "websocket closed", "offline"
+            "transport error", "websocket closed", "offline",
+            "stream error (overloaded_error)", "stream error (service_unavailable_error)"
         ]
         if networkMarkers.contains(where: normalized.contains) { return .network }
         return .nonRecoverable
@@ -921,6 +922,9 @@ public final class DistillACPClient: @unchecked Sendable {
             for selection in selections {
                 let matches = Self.matchingModels(selection, in: catalog)
                 guard matches.count == 1, let model = matches.first else {
+                    if selection == "auto" {
+                        throw DistillACPError.unsupported("Auto is not available in this Distill session. Open Auto profile to check that it is enabled, saved, and has a connected account.")
+                    }
                     if matches.isEmpty, guest != nil {
                         throw DistillACPError.unsupported("The Distill in this bot's Linux VM does not list the model '\(selection)'. The model picker shows the Mac's catalog, which can list models the Linux VM does not. Select another model for this bot.")
                     }
@@ -936,12 +940,12 @@ public final class DistillACPClient: @unchecked Sendable {
             return try validate(models)
         } catch {
             let originalError = resolutionError ?? error
-            let selectedMissingQualifiedModel = selections.contains { selection in
-                selection.contains("/") && Self.matchingModels(selection, in: models).isEmpty
+            let selectedMissingModel = selections.contains { selection in
+                Self.matchingModels(selection, in: models).isEmpty
             }
             let category = DistillACPFailureTaxonomy.normalize(originalError, context: .start).category
             guard category != .authRequired, category != .rateLimited,
-                  selectedMissingQualifiedModel || (snapshot.1 && models.isEmpty),
+                  selectedMissingModel || (snapshot.1 && models.isEmpty),
                   selections.allSatisfy({ Self.matchingModels($0, in: models).count <= 1 }),
                   let guestCatalogRecovery = takeGuestCatalogRecovery() else { throw originalError }
             do {
@@ -1373,7 +1377,12 @@ public final class DistillACPClient: @unchecked Sendable {
             params: ["sessionId": sessionId, "enabled": enabled],
             timeout: 15
         )
-        return response["enabled"] as? Bool ?? enabled
+        let nested = response["result"] as? JSONObject
+        guard let applied = (response["enabled"] as? Bool) ?? (nested?["enabled"] as? Bool),
+              applied == enabled else {
+            throw DistillACPError.unsupported("Distill did not confirm the requested Ultracode mode; prompt was not sent.")
+        }
+        return applied
     }
 
     /// Distill extension method that selects the session's one exclusive execution mode.
@@ -1388,7 +1397,10 @@ public final class DistillACPClient: @unchecked Sendable {
         )
         let nested = response["result"] as? JSONObject
         let raw = (response["mode"] as? String) ?? (nested?["mode"] as? String)
-        return raw.flatMap(DistillExecutionMode.init(rawValue:)) ?? mode
+        guard let applied = raw.flatMap(DistillExecutionMode.init(rawValue:)), applied == mode else {
+            throw DistillACPError.unsupported("Distill did not confirm \(mode.displayName) mode; prompt was not sent.")
+        }
+        return applied
     }
     /// Distill extension method that deletes a scheduled (`/loop`) task.
     static let schedulerDeleteMethod = "_x.ai/scheduler/delete"
@@ -1486,7 +1498,8 @@ public final class DistillACPClient: @unchecked Sendable {
             meta["reasoningEffort"] = wireEffort
         }
         if !meta.isEmpty { params["_meta"] = meta }
-        let response = try await requestJSONObject(method: "session/set_model", params: params, timeout: 15)
+        // Model binding can await session readiness and account credentials, as session/load does.
+        let response = try await requestJSONObject(method: "session/set_model", params: params, timeout: 60)
         let resultMeta = response["_meta"] as? JSONObject ?? response["meta"] as? JSONObject ?? response
         // Distill 2.0.25 serializes the switch result as `{"Ok": "<model>"}` / `{"Err": "<reason>"}`.
         let rawModel = resultMeta["model"]
@@ -1603,7 +1616,7 @@ public final class DistillACPClient: @unchecked Sendable {
         capabilities: DistillACPInitializeResult,
         writePermit: AgentRunAcceptancePermit,
         contextHandoff: String? = nil,
-        beforeWrite: @escaping @Sendable () -> Void,
+        beforeWrite: @escaping @Sendable () throws -> Void,
         onAccepted: @escaping @Sendable () throws -> Void
     ) async throws -> JSONObject {
         try await requestJSONObject(
@@ -1871,7 +1884,7 @@ public final class DistillACPClient: @unchecked Sendable {
         timeout: TimeInterval?,
         acceptancePermit: AgentRunAcceptancePermit? = nil,
         writePermit: AgentRunAcceptancePermit? = nil,
-        beforeWrite: (@Sendable () -> Void)? = nil,
+        beforeWrite: (@Sendable () throws -> Void)? = nil,
         onAccepted: (@Sendable () throws -> Void)? = nil
     ) async throws -> JSONObject {
         let value: Any? = try await request(
@@ -1893,7 +1906,7 @@ public final class DistillACPClient: @unchecked Sendable {
         timeout: TimeInterval?,
         acceptancePermit: AgentRunAcceptancePermit? = nil,
         writePermit: AgentRunAcceptancePermit? = nil,
-        beforeWrite: (@Sendable () -> Void)? = nil,
+        beforeWrite: (@Sendable () throws -> Void)? = nil,
         onAccepted: (@Sendable () throws -> Void)? = nil,
         stopOnTimeout: Bool = true
     ) async throws -> Any? {
@@ -1918,7 +1931,7 @@ public final class DistillACPClient: @unchecked Sendable {
             do {
                 if let onAccepted {
                     let writeAndAccept = {
-                        beforeWrite?()
+                        try beforeWrite?()
                         let queueGuardedWrite = {
                             if let acceptancePermit {
                                 try acceptancePermit.withAcceptance(failureOutcome: .notAccepted) {

@@ -9015,6 +9015,10 @@ public final class BotsViewModel: ObservableObject {
                     ? .automatic
                     : .fixed(deskRouting.reasoningEffort)
             }
+            deskRouting.distillMainEffortSelection = deskRouting.distillMainEffortSelection?.normalized(
+                for: supported,
+                supportsAutomatic: deskSupportsDistillMainEffortAuto
+            )
             if deskRouting.reasoningModel == nil {
                 deskRouting.distillReasoningEffortSelection = .automatic
             }
@@ -9085,6 +9089,7 @@ public final class BotsViewModel: ObservableObject {
         guard routing.provider == .distill else { return routing.model }
         let models = snapshot?.models.filter { $0.provider == routing.provider } ?? []
         let current = routing.model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if current == "auto" { return routing.model }
         if !current.isEmpty,
            models.isEmpty
             || models.contains(where: { $0.id == current })
@@ -11199,7 +11204,23 @@ public final class BotsViewModel: ObservableObject {
             title: thread.title,
             linkedAgentThreadID: threadID
         )
-        try botStore.upsertConversation(conversation)
+        if let owner = bot.workspaceID, let workspaceID = thread.workspaceId, owner != workspaceID {
+            let hostID = context.liveActivityHostIdentity.serverId
+            let workspaceContext = BotContext.workspace(workspaceID)
+            guard let binding = try botStore.getContextBinding(hostID: hostID, botID: bot.id, context: workspaceContext),
+                  binding.state == .active, binding.actions.isSuperset(of: [.read, .send]) else {
+                throw BotStoreError.invalidInput("This Bot has no active read and send grant for this context.")
+            }
+            guard thread.provider == .distill, thread.providerThreadId == nil,
+                  thread.runAsUser == nil || thread.runAsUser?.isCurrentAccount == true else {
+                throw BotStoreError.invalidInput("Contextual threads require a new thread with the current Distill account.")
+            }
+            try botStore.createContextualConversation(
+                conversation, hostID: hostID, context: workspaceContext, policyRevision: binding.policyRevision
+            )
+        } else {
+            try botStore.upsertConversation(conversation)
+        }
         adoptFollowThroughConversation(conversation)
     }
 
@@ -12759,9 +12780,9 @@ public final class BotsViewModel: ObservableObject {
             ?? botStore.executionDestination(botID: bot.id)
         try botStore.validateExecutionDestination(destination, botID: bot.id)
         if let threadID, try context.threadRepo.guestPlacement(of: threadID)?.executionTarget == .mac { return }
-        // Named VMs are provisioned by the send's asynchronous preflight and use
-        // the shared queue; opening a conversation never starts a competing VM.
-        if destination.virtualMachineID != nil { return }
+        // The run's asynchronous preflight prepares both bot-owned and named
+        // VMs. The desktop screen cache is empty after reopening the app.
+        if destination.target == .vm { return }
         let revision = try currentRevision(for: bot)
         let kind = desktopKindOverrideForTesting
             ?? (destination.target == .vm ? .dockerDesktop : resolvedDesktopKind(revision?.desktopKind ?? .logicalExecutionSpace))

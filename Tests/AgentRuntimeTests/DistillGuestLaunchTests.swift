@@ -345,10 +345,12 @@ final class DistillGuestLaunchTests: ProviderProcessTestCase {
         adapter.setGuestLaunchResolver(resolver)
         let box = GuestEventBox()
         _ = try await adapter.startSession(AgentRunRequest(
-            threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: "/tmp", prompt: "DIE now"
+            threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: "/tmp", prompt: "KILLED now"
         )) { box.append($0) }
         let finished = try await box.waitForFinish()
         XCTAssertEqual(finished.status, .failed)
+        XCTAssertTrue(box.errors.contains { $0.hasPrefix(TransientNetworkRetry.guestProcessMarker) },
+                      "an unexpected guest kill must permit bounded host recovery")
         try await waitUntil { teardowns.values == [.failed] }
         XCTAssertTrue(kills.values.contains("kill"), "the guest process is killed even though its client already exited")
         try await Task.sleep(nanoseconds: 200_000_000)
@@ -676,9 +678,11 @@ final class DistillGuestLaunchTests: ProviderProcessTestCase {
                 record open "$exists" >> "$log"
                 printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s","models":{"availableModels":[],"currentModelId":"grok-4.6"}}}\n' "$id" "$session" ;;
             *'"method":"session/prompt"'*)
-                case $line in *DIE*) exit 3 ;; *HANG*) continue ;; esac
+                case $line in *KILLED*) kill -9 $$ ;; *DIE*) exit 3 ;; *HANG*) continue ;; esac
                 printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"guest reply 1"}}}}\n' "$(string sessionId)"
                 printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+            *'"method":"_x.ai/session/execution_mode/set"'*)
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"mode":"%s"}}\n' "$id" "$(string mode)" ;;
             *)
                 printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
             esac
@@ -793,6 +797,15 @@ private final class GuestEventBox: @unchecked Sendable {
     private var values: [AgentRunEvent] = []
 
     func append(_ event: AgentRunEvent) { lock.withLock { values.append(event) } }
+
+    var errors: [String] {
+        lock.withLock {
+            values.compactMap { event in
+                if case .error(let message) = event { return message }
+                return nil
+            }
+        }
+    }
 
     /// Guest stages in arrival order.
     var guestStages: [String] {

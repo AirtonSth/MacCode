@@ -7,9 +7,9 @@ import SwiftUI
 public enum AgentAutoGuide {
     /// Builds the guide sheet body. `onClose` dismisses the hosting sheet.
     public static let title = "Auto profile"
-    public static let subtitle = "How Auto picks a model for each turn. Changes apply to every Auto conversation."
+    public static let subtitle = "The global Auto profile affects all Auto conversations, Bots, and scheduled Auto runs."
 
-    @MainActor public static var makeGuide: ((_ onClose: @escaping () -> Void) -> AnyView)?
+    @MainActor public static var makeGuide: ((_ onClose: @escaping () -> Void, _ onUseAuto: (() -> Void)?) -> AnyView)?
 }
 
 /// Inline Accounts & Auto editor shown in a Distill conversation's empty state.

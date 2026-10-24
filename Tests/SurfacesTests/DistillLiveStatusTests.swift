@@ -4,6 +4,23 @@ import AgentRuntime
 
 final class DistillLiveStatusTests: XCTestCase {
 
+    func test_guestRecoveryIsVisibleOverThePreviousProviderOperation() {
+        var status = DistillLiveStatus()
+        let start = Date(timeIntervalSince1970: 1_000)
+        status.apply(method: "_remotecode/operation",
+            payloadJSON: #"{"operationId":"open","sequence":1,"revision":1,"phase":"loading_configuration","lastProgressAgeMs":0,"phaseElapsedMs":0}"#,
+            receivedAt: start)
+        status.apply(method: DistillGuestStage.runtimeMethod,
+            payloadJSON: #"{"stage":"repairing"}"#, receivedAt: start.addingTimeInterval(2))
+        XCTAssertEqual(status.headline, "Repairing Linux agent catalog…")
+        XCTAssertNil(status.operationHeadline(now: start.addingTimeInterval(3)), "the timed operation label must not cover recovery")
+        XCTAssertEqual(status.headlineSince, start.addingTimeInterval(2))
+        status.apply(method: DistillGuestStage.runtimeMethod, payloadJSON: #"{"stage":"ready"}"#)
+        XCTAssertEqual(status.headline, "Loading configuration")
+        XCTAssertNotNil(status.operationHeadline(now: start.addingTimeInterval(4)))
+        XCTAssertNil(status.guestStageSince)
+    }
+
     func test_operationHeartbeatDoesNotResetProgressAndOlderUpdatesCannotReplaceNewWork() throws {
         var status = DistillLiveStatus()
         let start = Date(timeIntervalSince1970: 1_000)

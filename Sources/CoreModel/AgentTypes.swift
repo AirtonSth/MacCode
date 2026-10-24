@@ -490,6 +490,17 @@ public struct AgentEffortSelection: Codable, Sendable, Equatable, Hashable {
 
     public var isAutomatic: Bool { effort == nil }
 
+    public func normalized(
+        for supportedEfforts: [AgentReasoningEffort],
+        supportsAutomatic: Bool = true
+    ) -> Self {
+        // Empty discovery results do not establish which efforts a model supports.
+        guard !supportedEfforts.isEmpty else { return self }
+        guard let effort, !supportedEfforts.contains(effort) else { return self }
+        if supportsAutomatic { return .automatic }
+        return .fixed(supportedEfforts.contains(.high) ? .high : supportedEfforts[0])
+    }
+
     /// Pill/menu label: the pinned effort name, or Auto when unset.
     public var pickerDisplayName: String { effort?.displayName ?? "Auto" }
 }

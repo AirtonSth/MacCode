@@ -51,14 +51,14 @@ public struct DistillAutoRoutingEditor: View {
     private var enableRow: some View {
         HStack(alignment: .center, spacing: DS.Space.md) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Use Auto").font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
-                Text("When you pick Auto as Main, Distill chooses an account for you.")
+                Text("Enable Auto for all conversations").font(DS.Font.bodyStrong).foregroundColor(DS.Palette.text)
+                Text("This global profile affects all Auto conversations and Bots.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: DS.Space.lg)
-            Toggle("Use Auto profile", isOn: Binding(get: { draft.enabled }, set: { value in
+            Toggle("Enable Auto for all conversations", isOn: Binding(get: { draft.enabled }, set: { value in
                 var next = draft
                 next.enabled = value
                 draft = next
@@ -69,7 +69,7 @@ public struct DistillAutoRoutingEditor: View {
     }
 
     private var offHint: some View {
-        Text("Auto is off. Main uses the model you pick.")
+        Text("Auto is off. Existing Auto threads and tasks need the profile enabled on the next turn.")
             .font(DS.Font.caption)
             .foregroundColor(DS.Palette.textTertiary)
     }

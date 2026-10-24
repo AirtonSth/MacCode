@@ -159,8 +159,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         var mainEffortSelection: AgentEffortSelection?
         var reasoningModel: String?
         var reasoningModelEffortSelection: AgentEffortSelection?
-        /// Last Ultracode state applied to this ACP session; fresh and loaded sessions start off.
-        var executionMode: DistillExecutionMode = .normal
+        /// Last confirmed mode; a loaded session's persisted mode is unknown until bound.
+        var executionMode: DistillExecutionMode? = .normal
         /// True when open advertised a selectable `reasoning_effort` config option.
         let advertisesReasoningEffortConfig: Bool
         /// Thought-level ids from the open-result config option (and live model catalog).
@@ -328,6 +328,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
     private let modelCacheTTL: TimeInterval
     private let maxReadableEvents: Int
     private let maxReadableBytes: Int64
+    var autoRoutingPreflight: @Sendable (URL) throws -> [DistillAccountStatus] = { try DistillAccounts.autoRoutingAccounts(home: $0) }
     private let lock = NSLock()
     private static let discoveryCacheLock = NSLock()
     private static let discoveryAccountEnvironmentKeys = ["HOME", "DISTILL_HOME", "GROK_HOME", "REMOTE_CODE_INSTANCE"]
@@ -647,11 +648,21 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         sharedDiscoveryCache[key] = (result, fetchedAt, scope)
     }
 
+    private func validateAutoRouting(_ request: AgentRunRequest) throws {
+        guard request.attachToProviderPromptId == nil,
+              request.model.trimmingCharacters(in: .whitespacesAndNewlines) == "auto",
+              request.runAsUser.map({ $0.uid == getuid() }) ?? true else { return }
+        let environment = ProcessInfo.processInfo.environment.merging(request.environment) { _, run in run }
+        let userHome = request.runAsUser?.homePath ?? FileManager.default.homeDirectoryForCurrentUser.path
+        _ = try autoRoutingPreflight(DistillProvisioner.homeURL(environment: environment, userHome: userHome))
+    }
+
     public func startSession(
         _ request: AgentRunRequest,
         onEvent: @escaping @Sendable (AgentRunEvent) -> Void
     ) async throws -> AgentRunHandle {
-        try await openSession(request, loadExisting: false, onEvent: onEvent, startPrompt: true)
+        try validateAutoRouting(request)
+        return try await openSession(request, loadExisting: false, onEvent: onEvent, startPrompt: true)
     }
 
     public func sendTurn(
@@ -661,6 +672,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         guard !request.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AgentProviderAdapterError.unsupported("Select an explicit Distill Main model before running.")
         }
+        if request.attachToProviderPromptId == nil { try validateAutoRouting(request) }
         if let promptId = request.attachToProviderPromptId {
             return try attachWakeTurn(request, promptId: promptId, onEvent: onEvent)
         }
@@ -1374,8 +1386,9 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         // Stop before the prompt is accepted ends the open now instead of after
         // initialize/session/new/set_model; the coordinator records the Stop.
         request.acceptancePermit?.onInvalidate { [weak client] in client?.stop() }
-        // ponytail: only fresh guest catalogs recover; transport recovery needs separate run-ownership checks.
-        if guestPlan != nil, request.providerThreadId == nil, let resolver {
+        // Both fresh and resumed turns validate the guest catalog before any
+        // prompt is sent; the resolver verifies the live run's ownership.
+        if guestPlan != nil, let resolver {
             let diagnose = synchronized { guestRecoveryDiagnosis }
             client.guestCatalogRecovery = {
                 let work = Task {
@@ -1495,6 +1508,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 maxReadableBytes: maxReadableBytes,
                 onEvent: onEvent
             )
+            if loadExisting { session.executionMode = nil }
             session.holdsThreadStartedUntilPromptAccepted = freshSession != nil
             client.notificationHandler = { [weak self, weak session] method, params in
                 guard let self, let session else { return }
@@ -1791,21 +1805,18 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                 } catch DistillACPError.rpcError(let code, let message, _, _) where code == -32601 {
                     // Older Distill only knows the Ultracode flag; Ultrafast and Ultrasave cannot be applied there.
                     distillAcpLog.info("Distill peer lacks execution_mode/set: \(message, privacy: .public)")
+                    guard wantedMode == .normal || wantedMode == .ultracode else {
+                        throw DistillACPError.unsupported("Update Distill to use \(wantedMode.displayName) mode; prompt was not sent.")
+                    }
                     do {
                         try await session.client.setUltracode(
                             sessionId: session.providerThreadId,
                             enabled: wantedMode == .ultracode
                         )
-                        synchronized { session.executionMode = wantedMode == .ultracode ? .ultracode : .normal }
-                    } catch DistillACPError.rpcError(let legacyCode, _, _, _) where legacyCode == -32601 {
                         synchronized { session.executionMode = wantedMode }
-                    } catch let error as DistillACPError {
-                        if case .processExited = error { throw error }
-                        distillAcpLog.error("Distill ultracode/set failed: \(String(describing: error), privacy: .public)")
+                    } catch DistillACPError.rpcError(let legacyCode, _, _, _) where legacyCode == -32601 {
+                        throw DistillACPError.unsupported("Update Distill to confirm \(wantedMode.displayName) mode; prompt was not sent.")
                     }
-                } catch let error as DistillACPError {
-                    if case .processExited = error { throw error }
-                    distillAcpLog.error("Distill execution_mode/set failed: \(String(describing: error), privacy: .public)")
                 }
             }
             let requestedMode: String?
@@ -1851,6 +1862,7 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                             contextHandoff: freshSession?.handoff,
                             beforeWrite: { [weak self] in
                                 self?.beforePhysicalPromptWriteForTesting?()
+                                try self?.validateAutoRouting(request)
                             },
                             onAccepted: { [weak self, weak session] in
                                 guard let self, let session else {
@@ -2406,7 +2418,13 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
             exitStatus: status
         )
         if terminal == .failed {
-            session.onEvent?(.error(DistillACPFailureTaxonomy.normalize(error, context: .turn).message))
+            let failure = DistillACPFailureTaxonomy.normalize(error, context: .turn)
+            let guestWasKilled = session.guestPlan != nil && !cancelled && !forced
+                && (reason == .uncaughtSignal || (128...255).contains(status))
+            let message = guestWasKilled
+                ? "\(TransientNetworkRetry.guestProcessMarker) \(failure.message)"
+                : failure.message
+            session.onEvent?(.error(message))
         }
         for event in session.mapper.finishTurn(stopReason: terminal == .cancelled ? "cancelled" : "failed", usage: nil) {
             emit(event, session: session)

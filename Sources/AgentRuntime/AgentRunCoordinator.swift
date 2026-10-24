@@ -510,7 +510,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var deletedThreadRetirementRetryTask: Task<Void, Never>?
     private static let deletedThreadRetirementRetryBaseDelayNanoseconds: UInt64 = 50_000_000
     private static let deletedThreadRetirementRetryMaximumDelayNanoseconds: UInt64 = 2_000_000_000
-    private typealias RunMetadata = (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)
+    private typealias RunMetadata = (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?, reasoningEffort: AgentReasoningEffort?, distillMainEffort: AgentEffortSelection?, distillReasoningEffort: AgentEffortSelection?, distillMode: DistillExecutionMode)
     private var activeRunMetadata: [AgentRunID: RunMetadata] = [:]
     /// Process environments are immutable after launch. Resident provider adapters
     /// therefore retain the exact scope of the process that owns their idle session.
@@ -1732,7 +1732,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     capability: delegationCapability
                 )
             }
-            activeRunMetadata[runId] = (effectiveRequest.provider, effectiveRequest.providerInstanceId, effectiveRequest.model, effectiveRequest.cwd, effectiveRequest.serviceTier, effectiveRequest.permissionMode, effectiveRequest.interactionMode, adapterKey, binaryIdentity)
+            activeRunMetadata[runId] = (effectiveRequest.provider, effectiveRequest.providerInstanceId, effectiveRequest.model, effectiveRequest.cwd, effectiveRequest.serviceTier, effectiveRequest.permissionMode, effectiveRequest.interactionMode, adapterKey, binaryIdentity, effectiveRequest.reasoningEffort, effectiveRequest.distillMainEffortSelection, effectiveRequest.distillReasoningEffortSelection, effectiveRequest.distillExecutionMode)
             // A runner may emit synchronously before sendTurn returns. Preserve
             // the sequence already assigned to those buffered events instead of
             // resetting it and reusing seq 1 for a different event. Also seed
@@ -3801,7 +3801,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 runtimeMode: .fullAccess,
                 interactionMode: .default,
                 adapterKey: "test",
-                binaryIdentity: nil
+                binaryIdentity: nil,
+                reasoningEffort: nil,
+                distillMainEffort: nil,
+                distillReasoningEffort: nil,
+                distillMode: .normal
             ),
             resumeCursor: nil,
             reason: reason
@@ -4011,8 +4015,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
-    /// A turn that failed on a transient network error (the provider stream
-    /// dropped mid-response) is resumed automatically on the same session, a
+    /// A turn interrupted by a network error or an owned guest process exit
+    /// is resumed automatically on the same session, a
     /// bounded number of times with backoff, instead of stopping on a red
     /// "Retry" the user must press.
     private func maybeScheduleNetworkRetry(
@@ -4028,7 +4032,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         guard status == .failed,
               let runMetadata,
-              TransientNetworkRetry.isTransientNetworkFailure(errorMessage) else { return }
+              TransientNetworkRetry.isRetryableInterruption(errorMessage) else { return }
         lock.lock()
         let attempt = (networkRetryCounts[threadId] ?? 0) + 1
         guard attempt <= networkRetryDelays.count else {
@@ -4051,7 +4055,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             userMessageContent: TransientNetworkRetry.prompt,
             providerThreadId: resumeCursor,
             permissionMode: runMetadata.runtimeMode,
+            reasoningEffort: runMetadata.reasoningEffort,
             reasoningModel: identity?.reasoningModel,
+            distillMainEffortSelection: runMetadata.distillMainEffort,
+            distillReasoningEffortSelection: runMetadata.distillReasoningEffort,
+            distillExecutionMode: runMetadata.distillMode,
             serviceTier: runMetadata.serviceTier,
             interactionMode: runMetadata.interactionMode,
             runAsUser: identity?.runAsUser
@@ -4117,7 +4125,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             userMessageContent: prompt,
             providerThreadId: resumeCursor,
             permissionMode: runMetadata.runtimeMode,
+            reasoningEffort: runMetadata.reasoningEffort,
             reasoningModel: identity?.reasoningModel,
+            distillMainEffortSelection: runMetadata.distillMainEffort,
+            distillReasoningEffortSelection: runMetadata.distillReasoningEffort,
+            distillExecutionMode: runMetadata.distillMode,
             serviceTier: runMetadata.serviceTier,
             interactionMode: runMetadata.interactionMode,
             runAsUser: identity?.runAsUser
@@ -7969,7 +7981,7 @@ private struct PendingStartFailure {
 }
 
 private struct TerminalPersistenceContext {
-    var runMetadata: (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)?
+    var runMetadata: (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?, reasoningEffort: AgentReasoningEffort?, distillMainEffort: AgentEffortSelection?, distillReasoningEffort: AgentEffortSelection?, distillMode: DistillExecutionMode)?
     var completedTurnId: String?
     var assistantMessageId: AgentMessageID?
     var resumeCursor: String?

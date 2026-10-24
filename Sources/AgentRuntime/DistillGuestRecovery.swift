@@ -26,7 +26,7 @@ public struct DistillGuestRecoveryContext: Codable, Sendable {
 
 public enum DistillGuestHostDiagnosis {
     static let outputLimit = 64 * 1024
-    static let prompt = "Choose the safest allowed recovery action. Do not use tools. For a missing catalog, refresh it first; resynchronize only when credential copies need repair. Return only the required JSON object."
+    static let prompt = "Choose the safest allowed recovery action. Do not use tools. A missing guest catalog has already failed refresh; resynchronize the guest's credential copy when allowed, then the host will verify the selected model again. Return only the required JSON object."
     enum Failure: Error { case unavailable, invalidOutput, timedOut, outputLimit }
 
     public static func diagnose(_ context: DistillGuestRecoveryContext, request: AgentRunRequest) async throws -> DistillGuestRecoveryAction {

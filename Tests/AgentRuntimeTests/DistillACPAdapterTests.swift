@@ -4,6 +4,13 @@ import CoreModel
 import Persistence
 @testable import AgentRuntime
 
+private final class LockedAutoRoutingEnabled: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = true
+    func set(_ value: Bool) { lock.withLock { self.value = value } }
+    func get() -> Bool { lock.withLock { value } }
+}
+
 final class DistillACPAdapterTests: ProviderProcessTestCase {
     func test_emptyMainModelIsRejectedBeforeACPStarts_becauseDistillMustNotUseAccountDefault() async throws {
         let adapter = DistillACPAdapter(binaryNameOverride: "/missing/distill-agent")
@@ -192,6 +199,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         workerResult: String,
         sessionModels: String = #"{"currentModelId":"main"}"#,
         setModelResult: String? = nil,
+        setModelDelay: TimeInterval = 0,
         sessionOpenJSON: String? = nil,
         ultracodeReplyJSON: String = #"{"jsonrpc":"2.0","id":message["id"],"result":{"enabled":params.get("enabled")}}"#,
         executionModeReplyJSON: String = #"{"jsonrpc":"2.0","id":message["id"],"result":{"mode":params.get("mode")}}"#
@@ -200,7 +208,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let harnessURL = root.appendingPathComponent("distill-agent")
         let harness = """
         #!/usr/bin/env python3
-        import json, pathlib, sys
+        import json, pathlib, sys, time
         requests = pathlib.Path(\(String(reflecting: requestsURL.path)))
         def send(value): print(json.dumps(value), flush=True)
         for line in sys.stdin:
@@ -216,6 +224,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 if extra: result.update(json.loads(extra))
                 send({"jsonrpc":"2.0", "id":message["id"], "result":result})
             elif method == "session/set_model":
+                time.sleep(\(setModelDelay))
                 fixed = \(String(reflecting: setModelResult ?? ""))
                 result = json.loads(fixed) if fixed else {"_meta":{"model":params.get("modelId"),"contextWindow":1000}}
                 if not fixed and params.get("modelId") == "auto":
@@ -282,6 +291,84 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(bindings.allSatisfy { ($0["params"] as? [String: Any])?["modelId"] as? String == "auto" })
     }
 
+    func test_slowAutoModelBindingConfirmsSelectionBeforeSendingPromptOnce() async throws {
+        let root = try makeTempRoot("distill-acp-slow-model-binding")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root,
+            initializeCapabilities: "{}", workerResult: "{}", sessionModels: Self.autoCatalog,
+            setModelDelay: 16)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        adapter.autoRoutingPreflight = { _ in [] }
+        let events = DistillACPAdapterEventBox()
+        let request = AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "auto",
+            cwd: root.path, prompt: "Run once", distillMainEffortSelection: .automatic)
+        _ = try await adapter.startSession(request) { events.append($0) }
+        let finished = try await events.waitForFinish()
+        XCTAssertEqual(finished.status, .completed)
+        let requests = try recordedRequests(requestsURL)
+        let bindings = requests.indices.filter { requests[$0]["method"] as? String == "session/set_model" }
+        let prompts = requests.indices.filter { requests[$0]["method"] as? String == "session/prompt" }
+        XCTAssertEqual(bindings.count, 1)
+        XCTAssertEqual(prompts.count, 1)
+        XCTAssertLessThan(try XCTUnwrap(bindings.first), try XCTUnwrap(prompts.first))
+    }
+
+    func test_autoTurnRechecksAdmissionBeforePhysicalPromptAfterHandshake() async throws {
+        let root = try makeTempRoot("distill-acp-auto-admission-handshake")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root,
+            initializeCapabilities: #"{"_meta":{"x.ai/capabilities":{"sessionWorkerModel":True}}}"#,
+            workerResult: "{}", sessionModels: Self.autoCatalog)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let enabled = LockedAutoRoutingEnabled()
+        adapter.autoRoutingPreflight = { _ in
+            guard enabled.get() else { throw DistillAutoRoutingError.disabled }
+            return []
+        }
+        adapter.beforePhysicalPromptWriteForTesting = { enabled.set(false) }
+        let request = AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "auto", cwd: root.path, prompt: "Run")
+        do {
+            _ = try await adapter.startSession(request) { _ in }
+            XCTFail("Auto routing disabled during handshake must prevent physical prompt")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Auto routing is off"), error.localizedDescription)
+        }
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/new" }.count, 1)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/prompt" }.count, 0)
+    }
+
+    func test_cachedAutoSessionRechecksAdmissionBetweenTurns() async throws {
+        let root = try makeTempRoot("distill-acp-auto-cached-admission")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(root: root,
+            initializeCapabilities: "{}", workerResult: "{}", sessionModels: Self.autoCatalog)
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let enabled = LockedAutoRoutingEnabled()
+        adapter.autoRoutingPreflight = { _ in
+            guard enabled.get() else { throw DistillAutoRoutingError.disabled }
+            return []
+        }
+        let thread = AgentThreadID()
+        let request = AgentRunRequest(threadId: thread, provider: .distill, model: "auto", cwd: root.path, prompt: "Run")
+        let first = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(request) { first.append($0) }
+        let finished = try await first.waitForFinish()
+        enabled.set(false)
+        do {
+            _ = try await adapter.sendTurn(AgentRunRequest(threadId: thread, provider: .distill, model: "auto", cwd: root.path, prompt: "Again", providerThreadId: finished.providerThreadId)) { _ in }
+            XCTFail("A cached Auto session must recheck admission before each turn")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Auto routing is off"), error.localizedDescription)
+        }
+        let requests = try recordedRequests(requestsURL)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/new" }.count, 1)
+        XCTAssertEqual(requests.filter { $0["method"] as? String == "session/prompt" }.count, 1)
+    }
+
     func test_autoRepeatedTurnsDoNotRebindConcreteMainOrStaleWorker_andChangedEffortUsesConcreteCatalog() async throws {
         let root = try makeTempRoot("distill-acp-auto-turns")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -290,6 +377,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         let (harness, requestsURL) = try writeWorkerHarness(root: root,
             initializeCapabilities: #"{"_meta":{"x.ai/capabilities":{"sessionWorkerModel":True}}}"#, workerResult: "{}", sessionModels: changingCatalog)
         let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        adapter.autoRoutingPreflight = { _ in [] }
         defer { adapter.stopAll() }
         let thread = AgentThreadID()
         func request(_ effort: AgentReasoningEffort, worker: String?) -> AgentRunRequest {
@@ -765,23 +853,68 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(try legacyUltracodeSets(requestsURL), [true])
     }
 
-    func test_modeUnknownToAnyDistillDoesNotFailTurn() async throws {
+    func test_unsupportedExecutionModeDoesNotSendPrompt() async throws {
         let root = try makeTempRoot("distill-acp-mode-none")
         defer { try? FileManager.default.removeItem(at: root) }
         let notFound = #"{"jsonrpc":"2.0","id":message["id"],"error":{"code":-32601,"message":"method not found"}}"#
-        let (harness, _) = try writeWorkerHarness(
+        let (harness, requestsURL) = try writeWorkerHarness(
             root: root, initializeCapabilities: "{}", workerResult: "{}",
             ultracodeReplyJSON: notFound, executionModeReplyJSON: notFound
         )
         let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
         defer { adapter.stopAll() }
+        do {
+            _ = try await adapter.startSession(
+                AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: root.path,
+                                prompt: "Go", distillExecutionMode: .ultrafast)
+            ) { _ in }
+            XCTFail("An unavailable mode must not silently run with another mode")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Ultrafast"), error.localizedDescription)
+        }
+        XCTAssertFalse(try recordedRequests(requestsURL).contains { $0["method"] as? String == "session/prompt" })
+    }
+
+    func test_executionModeRequiresMatchingAcknowledgementBeforePrompt() async throws {
+        let root = try makeTempRoot("distill-acp-mode-confirmation")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root, initializeCapabilities: "{}", workerResult: "{}",
+            executionModeReplyJSON: #"{"jsonrpc":"2.0","id":message["id"],"result":{"mode":"normal"}}"#
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        do {
+            _ = try await adapter.startSession(
+                AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: root.path,
+                                prompt: "Go", distillExecutionMode: .ultrasave)
+            ) { _ in }
+            XCTFail("A different acknowledged mode must not accept the prompt")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Ultrasave"), error.localizedDescription)
+        }
+        XCTAssertFalse(try recordedRequests(requestsURL).contains { $0["method"] as? String == "session/prompt" })
+    }
+
+    func test_resumedSessionExplicitlyRestoresNormalBeforePrompt() async throws {
+        let root = try makeTempRoot("distill-acp-mode-resume")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root, initializeCapabilities: #"{"loadSession":True}"#, workerResult: "{}"
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
         let events = DistillACPAdapterEventBox()
-        _ = try await adapter.startSession(
+        _ = try await adapter.sendTurn(
             AgentRunRequest(threadId: AgentThreadID(), provider: .distill, model: "grok-4.6", cwd: root.path,
-                            prompt: "Go", distillExecutionMode: .ultrafast)
+                            prompt: "Go", providerThreadId: "worker-session", distillExecutionMode: .normal)
         ) { events.append($0) }
-        let finished = try await events.waitForFinish()
-        XCTAssertEqual(finished.status, .completed)
+        _ = try await events.waitForFinish()
+        XCTAssertEqual(try modeSets(requestsURL), ["normal"], "a saved session can still have a previous non-Normal mode")
+        let methods = try recordedRequests(requestsURL).compactMap { $0["method"] as? String }
+        if let modeIndex = methods.firstIndex(of: DistillACPClient.executionModeSetMethod) {
+            XCTAssertLessThan(modeIndex, try XCTUnwrap(methods.firstIndex(of: "session/prompt")))
+        }
     }
 
     func test_clientSetExecutionModeSendsSessionAndModeAndReturnsTheConfirmedMode() async throws {
@@ -861,6 +994,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
                 else:
                     state["main"] = next_main
                     send({"jsonrpc":"2.0", "id":message["id"], "result":{"meta":{"model":next_main,"canonicalModelId":next_main}}})
+            elif method == "_x.ai/session/execution_mode/set":
+                send({"jsonrpc":"2.0", "id":message["id"], "result":{"mode":message.get("params", {}).get("mode")}})
             elif method in ("session/set_mode", "session/set_config_option"):
                 send({"jsonrpc":"2.0", "id":message["id"], "result":{}})
             elif method == "session/prompt":
@@ -1017,6 +1152,8 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             elif method == "session/set_model":
                 record({"method":method,"sessionId":params.get("sessionId"),"modelId":params.get("modelId")})
                 send({"jsonrpc":"2.0","id":message["id"],"result":{"meta":{"model":params.get("modelId"),"canonicalModelId":params.get("modelId")}}})
+            elif method == "_x.ai/session/execution_mode/set":
+                send({"jsonrpc":"2.0","id":message["id"],"result":{"mode":params.get("mode")}})
             elif method == "session/prompt":
                 session = params.get("sessionId")
                 text = prompt_text(params.get("prompt", []))
@@ -1084,6 +1221,7 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let (harness, _) = try writeFailureHarness(root: root)
         let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        adapter.autoRoutingPreflight = { _ in [] }
         defer { adapter.stopAll() }
         let events = DistillACPAdapterEventBox()
         let slowConsumer = DispatchSemaphore(value: 0)

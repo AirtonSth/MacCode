@@ -115,6 +115,10 @@ public struct AgentModelAutoRoutingCard: View {
 }
 
 public enum AgentDistillModelCatalog {
+    public static func shouldShowAutoOption(setupAvailable: Bool, catalogHasAuto: Bool, selectedAuto: Bool) -> Bool {
+        setupAvailable || catalogHasAuto || selectedAuto
+    }
+
     public static func selectableModels(_ models: [AgentModelDescriptor]) -> [AgentModelDescriptor] {
         models.filter { !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
@@ -996,7 +1000,15 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
     }
 
     private var hasAutoOption: Bool {
-        mainModel == "auto" || mainModels.contains(where: { $0.id == "auto" })
+        AgentDistillModelCatalog.shouldShowAutoOption(
+            setupAvailable: AgentAutoGuide.makeGuide != nil,
+            catalogHasAuto: mainModels.contains(where: { $0.id == "auto" }),
+            selectedAuto: mainModel == "auto"
+        )
+    }
+
+    private var catalogAdvertisesAuto: Bool {
+        mainModels.contains(where: { $0.id == "auto" })
     }
 
     var body: some View {
@@ -1011,7 +1023,7 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
             onClose: close
         ) {
             if showingAutoGuide, let makeGuide = AgentAutoGuide.makeGuide {
-                makeGuide(close)
+                makeGuide(close, isDisabled ? nil : { onSelectMainModel("auto"); close() })
             } else if let target = effortTarget {
                 AgentDistillEffortStep(
                     efforts: target.efforts,
@@ -1061,8 +1073,10 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
         VStack(alignment: .leading, spacing: DS.Space.md) {
             AgentChoiceCard(
                 title: "Auto",
-                subtitle: "Picks the best account and model for each turn from your Auto profile.",
-                badge: "Recommended",
+                subtitle: catalogAdvertisesAuto
+                    ? "Picks the best account and model for each turn from your Auto profile."
+                    : "Set up a profile before choosing Auto for this conversation.",
+                badge: catalogAdvertisesAuto ? "Recommended" : "Set up",
                 selected: mainModel == "auto",
                 tint: DS.Palette.ultracode,
                 disabledReason: agentDistillDisabledReason(isDisabled),
@@ -1097,9 +1111,16 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
             emptyTitle: emptyListTitle,
             searchIdentifier: "agent.distill.mainModel.search",
             onSelectModel: { id in
-                onSelectMainModel(id)
                 let descriptor = models.first { $0.id == id }
                 let efforts = descriptor?.supportedReasoningEfforts ?? []
+                let normalizedSelection = mainEffortSelection.normalized(
+                    for: efforts,
+                    supportsAutomatic: supportsMainEffortAuto
+                )
+                if normalizedSelection != mainEffortSelection {
+                    onSelectMainEffort(normalizedSelection)
+                }
+                onSelectMainModel(id)
                 if efforts.isEmpty {
                     close()
                 } else {
@@ -1147,10 +1168,10 @@ private struct AgentDistillMainModelSheet<StatusHeader: View, MainFooter: View>:
     }
 
     private func selectAuto() {
-        onSelectMainModel("auto")
         if AgentAutoGuide.makeGuide != nil {
             showingAutoGuide = true
         } else {
+            onSelectMainModel("auto")
             close()
         }
     }
@@ -1195,7 +1216,7 @@ private struct AgentDistillWorkerModelSheet<StatusHeader: View>: View {
             onClose: close
         ) {
             if showingAutoGuide, let makeGuide = AgentAutoGuide.makeGuide {
-                makeGuide(close)
+                makeGuide(close, nil)
             } else if let target = effortTarget {
                 AgentDistillEffortStep(
                     efforts: target.efforts,
