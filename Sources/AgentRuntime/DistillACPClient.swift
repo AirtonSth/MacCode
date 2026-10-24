@@ -207,7 +207,8 @@ enum DistillACPFailureTaxonomy {
         let networkMarkers = [
             "network error", "network failure", "connection refused", "connection reset",
             "connection closed", "host unreachable", "dns failure", "socket error",
-            "transport error", "websocket closed", "offline"
+            "transport error", "websocket closed", "offline",
+            "stream error (overloaded_error)", "stream error (service_unavailable_error)"
         ]
         if networkMarkers.contains(where: normalized.contains) { return .network }
         return .nonRecoverable

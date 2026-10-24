@@ -103,6 +103,19 @@ final class TransientNetworkRetryCoordinatorTests: XCTestCase {
         XCTAssertEqual(resumed.distillExecutionMode, .ultrafast)
     }
 
+    func test_providerOverload_resumesTheSameSessionAndCompletes() async throws {
+        let failure = DistillACPFailureTaxonomy.normalize(
+            DistillACPError.rpcError(code: -32603, message: "stream error (overloaded_error): Overloaded"),
+            context: .turn
+        )
+        let runner = FlakyRunner(provider: .distill, failure: failure.message, failures: 1)
+        let (_, thread, threadRepo) = try await start(runner)
+        await waitUntil { runner.requests.count == 2 && (try? threadRepo.status(of: thread.id)) == .completed }
+        XCTAssertEqual(runner.requests.count, 2)
+        XCTAssertEqual(try threadRepo.status(of: thread.id), .completed)
+        XCTAssertEqual(runner.requests.last?.providerThreadId, "session-1")
+    }
+
     func test_persistentNetworkFailure_stopsAfterTheBound() async throws {
         let runner = FlakyRunner(failure: Self.realFailure, failures: 99)
         let (coordinator, thread, threadRepo) = try await start(runner)
