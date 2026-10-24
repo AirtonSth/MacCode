@@ -406,6 +406,7 @@ public enum AgentAttachmentResolver {
 /// Distill session execution mode: exactly one is active per session.
 /// Wire values match `_x.ai/session/execution_mode/set`.
 public enum DistillExecutionMode: String, Sendable, CaseIterable, Equatable, Hashable {
+    case auto
     case normal
     case ultrafast
     case ultracode
@@ -413,6 +414,7 @@ public enum DistillExecutionMode: String, Sendable, CaseIterable, Equatable, Has
 
     public var displayName: String {
         switch self {
+        case .auto: return "Auto"
         case .normal: return "Normal"
         case .ultrafast: return "Ultrafast"
         case .ultracode: return "Ultracode"
@@ -422,6 +424,7 @@ public enum DistillExecutionMode: String, Sendable, CaseIterable, Equatable, Has
 
     public var pickerHelpText: String {
         switch self {
+        case .auto: return "Distill picks the best mode for each step, balancing quality, time and cost"
         case .normal: return "Standard behavior: plans, delegates and verifies as needed"
         case .ultrafast: return "Direct execution and parallel independent work"
         case .ultracode: return "Plan, fan out to parallel subagents, then integrate and verify"
@@ -429,13 +432,15 @@ public enum DistillExecutionMode: String, Sendable, CaseIterable, Equatable, Has
         }
     }
 
-    /// Integer kept in `scheduled_tasks.distill_ultracode`; 0 and 1 keep the legacy flag's meaning.
+    /// Integer kept in `scheduled_tasks.distill_ultracode`. 1 keeps the legacy Ultracode meaning; the legacy
+    /// default 0 now reads as Auto, so an explicit Normal is stored as 5.
     public var storageValue: Int {
         switch self {
-        case .normal: return 0
         case .ultracode: return 1
         case .ultrafast: return 2
         case .ultrasave: return 3
+        case .auto: return 4
+        case .normal: return 5
         }
     }
 
@@ -444,18 +449,19 @@ public enum DistillExecutionMode: String, Sendable, CaseIterable, Equatable, Has
         case 1: self = .ultracode
         case 2: self = .ultrafast
         case 3: self = .ultrasave
-        default: self = .normal
+        case 5: self = .normal
+        default: self = .auto
         }
     }
 }
 
-/// Persisted as the legacy Ultracode Bool for Normal and Ultracode, so stored data and older
-/// readers keep working; Ultrafast and Ultrasave persist as their wire string.
+/// Ultracode persists as the legacy Bool `true`; every other mode persists as its wire string. A legacy
+/// `false` (the old default) decodes to Auto, matching Distill's own legacy migration.
 extension DistillExecutionMode: Codable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let legacy = try? container.decode(Bool.self) {
-            self = legacy ? .ultracode : .normal
+            self = legacy ? .ultracode : .auto
             return
         }
         let raw = try container.decode(String.self)
@@ -468,9 +474,8 @@ extension DistillExecutionMode: Codable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         switch self {
-        case .normal: try container.encode(false)
         case .ultracode: try container.encode(true)
-        case .ultrafast, .ultrasave: try container.encode(rawValue)
+        case .auto, .normal, .ultrafast, .ultrasave: try container.encode(rawValue)
         }
     }
 }
@@ -531,7 +536,7 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
         serviceTier: AgentServiceTier = .auto,
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
-        distillExecutionMode: DistillExecutionMode = .normal
+        distillExecutionMode: DistillExecutionMode = .auto
     ) {
         self.provider = provider
         self.modelId = modelId
@@ -558,7 +563,7 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
         serviceTier = try c.decode(AgentServiceTier.self, forKey: .serviceTier)
         distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
-        distillExecutionMode = try c.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .normal
+        distillExecutionMode = try c.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .auto
     }
 }
 
@@ -851,7 +856,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         reasoningModel: String? = nil,
         distillMainEffortSelection: AgentEffortSelection? = nil,
         distillReasoningEffortSelection: AgentEffortSelection? = nil,
-        distillExecutionMode: DistillExecutionMode = .normal,
+        distillExecutionMode: DistillExecutionMode = .auto,
         serviceTier: AgentServiceTier = .auto,
         interactionMode: AgentInteractionMode = .default,
         providerBinary: String? = nil,
@@ -911,7 +916,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         reasoningModel = try c.decodeIfPresent(String.self, forKey: .reasoningModel)
         distillMainEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillMainEffortSelection)
         distillReasoningEffortSelection = try c.decodeIfPresent(AgentEffortSelection.self, forKey: .distillReasoningEffortSelection)
-        distillExecutionMode = try c.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .normal
+        distillExecutionMode = try c.decodeIfPresent(DistillExecutionMode.self, forKey: .distillExecutionMode) ?? .auto
         serviceTier = try c.decodeIfPresent(AgentServiceTier.self, forKey: .serviceTier) ?? .auto
         interactionMode = try c.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode) ?? .default
         providerBinary = try c.decodeIfPresent(String.self, forKey: .providerBinary)

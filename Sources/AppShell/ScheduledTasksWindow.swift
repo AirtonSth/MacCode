@@ -56,7 +56,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         distillMainEffortSelection = task?.distillMainEffortSelection
         distillReasoningEffortSelection = task?.distillReasoningEffortSelection
         routingMode = provider == .distill ? .manual : (task?.effectiveRoutingMode ?? .auto)
-        distillExecutionMode = task?.distillExecutionMode ?? .normal
+        distillExecutionMode = task?.distillExecutionMode ?? .auto
         permissionMode = task?.permissionMode ?? .fullAccess
         interactionMode = task?.interactionMode ?? .default
         executionMode = task?.executionMode ?? .local

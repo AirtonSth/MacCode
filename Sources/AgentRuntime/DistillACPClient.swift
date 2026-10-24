@@ -1387,7 +1387,8 @@ public final class DistillACPClient: @unchecked Sendable {
 
     /// Distill extension method that selects the session's one exclusive execution mode.
     static let executionModeSetMethod = "_x.ai/session/execution_mode/set"
-    /// Selects `mode`; returns the mode Distill confirmed (Normal, UltraFast, UltraCode or UltraSave).
+    /// Selects `mode`; returns the choice Distill confirmed (Auto, Normal, UltraFast, UltraCode or UltraSave).
+    /// Auto replies with the effective fixed `mode` plus `choice: "auto"`; older peers send only `mode`.
     @discardableResult
     func setExecutionMode(sessionId: String, mode: DistillExecutionMode) async throws -> DistillExecutionMode {
         let response = try await requestJSONObject(
@@ -1396,7 +1397,8 @@ public final class DistillACPClient: @unchecked Sendable {
             timeout: 15
         )
         let nested = response["result"] as? JSONObject
-        let raw = (response["mode"] as? String) ?? (nested?["mode"] as? String)
+        let raw = (response["choice"] as? String) ?? (nested?["choice"] as? String)
+            ?? (response["mode"] as? String) ?? (nested?["mode"] as? String)
         guard let applied = raw.flatMap(DistillExecutionMode.init(rawValue:)), applied == mode else {
             throw DistillACPError.unsupported("Distill did not confirm \(mode.displayName) mode; prompt was not sent.")
         }

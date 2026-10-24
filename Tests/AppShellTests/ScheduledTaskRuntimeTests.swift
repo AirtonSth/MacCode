@@ -284,7 +284,7 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertEqual(routing.permissionMode, .supervised)
 
         let legacy = BotsViewModel.routineRouting(BotScheduleSpec(provider: .distill), base: BotDeskRouting())
-        XCTAssertEqual(legacy.distillExecutionMode, .normal)
+        XCTAssertEqual(legacy.distillExecutionMode, .auto, "a spec that never chose a mode gets the Auto default")
         XCTAssertEqual(legacy.permissionMode, BotDeskRouting().permissionMode, "Old specs keep the Bot default")
     }
 

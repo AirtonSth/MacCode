@@ -664,7 +664,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var reasoningModel: String?
     @Published public var distillMainEffortSelection: AgentEffortSelection = .automatic
     @Published public var distillReasoningEffortSelection: AgentEffortSelection = .automatic
-    @Published public var distillExecutionMode: DistillExecutionMode = .normal
+    @Published public var distillExecutionMode: DistillExecutionMode = .auto
     @Published public var serviceTier: AgentServiceTier = .auto
     @Published public private(set) var routingMode: AgentRoutingMode = .manual
     @Published public var executionMode: AgentExecutionMode = .local

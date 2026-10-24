@@ -98,7 +98,7 @@ public enum ScheduledTaskRemoteWire {
             "schedule_spec_json": .string(routine.definition.scheduleSpecJSON),
             "summary": .string(spec?.displayNote() ?? routine.definition.scheduleNote),
             "ultracode": .bool(spec?.distillExecutionMode == .ultracode),
-            "distill_mode": .string((spec?.distillExecutionMode ?? .normal).rawValue),
+            "distill_mode": .string((spec?.distillExecutionMode ?? .auto).rawValue),
             "permission_mode": .string((spec?.permissionMode ?? .fullAccess).rawValue),
             "enabled": .bool(routine.activation.isEnabled),
         ])

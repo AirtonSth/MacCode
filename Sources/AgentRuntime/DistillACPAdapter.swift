@@ -159,8 +159,8 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
         var mainEffortSelection: AgentEffortSelection?
         var reasoningModel: String?
         var reasoningModelEffortSelection: AgentEffortSelection?
-        /// Last confirmed mode; a loaded session's persisted mode is unknown until bound.
-        var executionMode: DistillExecutionMode? = .normal
+        /// Last confirmed mode; a loaded session's persisted mode is unknown until bound. Fresh sessions start in Auto.
+        var executionMode: DistillExecutionMode? = .auto
         /// True when open advertised a selectable `reasoning_effort` config option.
         let advertisesReasoningEffortConfig: Bool
         /// Thought-level ids from the open-result config option (and live model catalog).
@@ -1802,10 +1802,19 @@ public final class DistillACPAdapter: AgentProviderAdapter, @unchecked Sendable 
                         mode: wantedMode
                     )
                     synchronized { session.executionMode = applied }
+                } catch DistillACPError.rpcError(let code, let message, _, _) where wantedMode == .auto && code == -32602 {
+                    // Distill <= 2.0.54 rejects "auto"; reset a previously set mode to Normal, then record Auto so later turns do not retry.
+                    distillAcpLog.info("Distill peer rejected Auto execution mode: \(message, privacy: .public)")
+                    do {
+                        try await session.client.setExecutionMode(sessionId: session.providerThreadId, mode: .normal)
+                    } catch {
+                        distillAcpLog.info("Distill peer could not reset to Normal after rejecting Auto: \(error.localizedDescription, privacy: .public)")
+                    }
+                    synchronized { session.executionMode = wantedMode }
                 } catch DistillACPError.rpcError(let code, let message, _, _) where code == -32601 {
                     // Older Distill only knows the Ultracode flag; Ultrafast and Ultrasave cannot be applied there.
                     distillAcpLog.info("Distill peer lacks execution_mode/set: \(message, privacy: .public)")
-                    guard wantedMode == .normal || wantedMode == .ultracode else {
+                    guard wantedMode == .auto || wantedMode == .normal || wantedMode == .ultracode else {
                         throw DistillACPError.unsupported("Update Distill to use \(wantedMode.displayName) mode; prompt was not sent.")
                     }
                     do {

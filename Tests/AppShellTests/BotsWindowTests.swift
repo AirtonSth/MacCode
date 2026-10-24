@@ -7850,14 +7850,14 @@ final class BotsWindowTests: XCTestCase {
         }
     }
 
-    func test_deskRoutingExecutionModeRoundTripsAndMissingLegacyFieldDefaultsToNormal() throws {
+    func test_deskRoutingExecutionModeRoundTripsAndMissingLegacyFieldDefaultsToAuto() throws {
         let routing = BotDeskRouting(provider: .distill, providerInstanceID: "distill", model: "main-a", distillExecutionMode: .ultrasave)
         let restored = try JSONDecoder().decode(BotDeskRouting.self, from: JSONEncoder().encode(routing))
         XCTAssertEqual(restored.distillExecutionMode, .ultrasave)
         XCTAssertEqual(restored.modelSelection.distillExecutionMode, .ultrasave, "first-thread model selection must receive the mode")
 
         let legacy = Data(#"{"provider":"distill","providerInstanceID":"distill","model":"main-a","routingMode":"manual","permissionMode":"supervised"}"#.utf8)
-        XCTAssertEqual(try JSONDecoder().decode(BotDeskRouting.self, from: legacy).distillExecutionMode, .normal)
+        XCTAssertEqual(try JSONDecoder().decode(BotDeskRouting.self, from: legacy).distillExecutionMode, .auto)
     }
 
     func test_deskRoutingDecodesLegacyPayloadWithoutRunAsUser() throws {

@@ -800,9 +800,9 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             )
         }
         let first = DistillACPAdapterEventBox()
-        _ = try await adapter.startSession(request(.normal)) { first.append($0) }
+        _ = try await adapter.startSession(request(.auto)) { first.append($0) }
         let firstFinished = try await first.waitForFinish()
-        XCTAssertEqual(try modeSets(requestsURL), [], "Normal on a fresh session sends nothing")
+        XCTAssertEqual(try modeSets(requestsURL), [], "Auto on a fresh session sends nothing")
 
         var last = firstFinished.providerThreadId
         for mode in [DistillExecutionMode.ultrafast, .ultrafast, .ultrasave, .ultracode, .ultracode, .normal] {
@@ -894,6 +894,53 @@ final class DistillACPAdapterTests: ProviderProcessTestCase {
             XCTAssertTrue(error.localizedDescription.contains("Ultrasave"), error.localizedDescription)
         }
         XCTAssertFalse(try recordedRequests(requestsURL).contains { $0["method"] as? String == "session/prompt" })
+    }
+
+    func test_autoRejectedByOlderDistillDoesNotFailTheTurnAndIsNotRetried() async throws {
+        // WHY: Distill <= 2.0.54 rejects "auto" with invalid params; the turn must still run and not re-send every turn.
+        let root = try makeTempRoot("distill-acp-mode-auto-old")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root, initializeCapabilities: "{}", workerResult: "{}",
+            executionModeReplyJSON: #"{"jsonrpc":"2.0","id":message["id"],"error":{"code":-32602,"message":"unknown variant auto"}} if params.get("mode") == "auto" else {"jsonrpc":"2.0","id":message["id"],"result":{"mode":params.get("mode")}}"#
+        )
+        let adapter = DistillACPAdapter(binaryNameOverride: harness.path)
+        defer { adapter.stopAll() }
+        let threadID = AgentThreadID()
+        func request(_ mode: DistillExecutionMode, providerThreadId: String? = nil) -> AgentRunRequest {
+            AgentRunRequest(threadId: threadID, provider: .distill, model: "grok-4.6", cwd: root.path, prompt: "Go",
+                            providerThreadId: providerThreadId, distillExecutionMode: mode)
+        }
+        let first = DistillACPAdapterEventBox()
+        _ = try await adapter.startSession(request(.ultracode)) { first.append($0) }
+        var last = try await first.waitForFinish().providerThreadId
+        for _ in 0..<2 {
+            let box = DistillACPAdapterEventBox()
+            _ = try await adapter.sendTurn(request(.auto, providerThreadId: last)) { box.append($0) }
+            let finished = try await box.waitForFinish()
+            XCTAssertEqual(finished.status, .completed)
+            last = finished.providerThreadId
+        }
+        XCTAssertEqual(try modeSets(requestsURL), ["ultracode", "auto", "normal"],
+                       "Auto is attempted once, followed by one reset to Normal, then recorded as applied")
+        XCTAssertEqual(try legacyUltracodeSets(requestsURL), [])
+    }
+
+    func test_clientSetExecutionModeAcceptsAutoChoiceWithEffectiveMode() async throws {
+        // WHY: Distill 2.0.55 answers Auto with the effective fixed mode plus choice "auto"; that must confirm Auto.
+        let root = try makeTempRoot("distill-acp-mode-auto-wire")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (harness, requestsURL) = try writeWorkerHarness(
+            root: root, initializeCapabilities: "{}", workerResult: "{}",
+            executionModeReplyJSON: #"{"jsonrpc":"2.0","id":message["id"],"result":{"mode":"normal","choice":"auto"}}"#
+        )
+        let client = try DistillACPClient(binary: harness.path, cwd: root.path, tagProcess: false)
+        defer { client.stop() }
+        _ = try await client.initialize()
+        let applied = try await client.setExecutionMode(sessionId: "s1", mode: .auto)
+        XCTAssertEqual(applied, .auto)
+        let sent = try recordedRequests(requestsURL).first { $0["method"] as? String == DistillACPClient.executionModeSetMethod }
+        XCTAssertEqual((sent?["params"] as? [String: Any])?["mode"] as? String, "auto")
     }
 
     func test_resumedSessionExplicitlyRestoresNormalBeforePrompt() async throws {

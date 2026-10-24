@@ -143,6 +143,20 @@ final class ScheduledTaskStoreTests: XCTestCase {
         XCTAssertEqual(try store.list(), [task])
     }
 
+    func test_autoExecutionModeRoundTripsThroughTheIntegerColumn_becauseNewTasksDefaultToAuto() throws {
+        // WHY: Auto is stored as 4 and must survive a save/load, since new rows must not collapse to Normal (0).
+        var task = makeTask(nextRunAt: nil)
+        task.provider = .distill
+        task.providerInstanceID = "distill"
+        task.model = "auto"
+        XCTAssertEqual(task.distillExecutionMode, .auto)
+        try store.save(task)
+        XCTAssertEqual(try store.get(id: task.id)?.distillExecutionMode, .auto)
+        task.distillExecutionMode = .normal
+        try store.save(task)
+        XCTAssertEqual(try store.get(id: task.id)?.distillExecutionMode, .normal, "explicit Normal (5) must not read back as Auto")
+    }
+
     func test_claimDueDeduplicatesOccurrenceAndBlocksSameTaskOverlap_becauseCrashesMustNotDoubleRun() throws {
         let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
         try store.save(task)

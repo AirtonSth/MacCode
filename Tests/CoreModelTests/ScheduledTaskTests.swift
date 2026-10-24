@@ -78,7 +78,7 @@ final class ScheduledTaskTests: XCTestCase {
 
         let decoded = try JSONDecoder().decode(ScheduledTask.self, from: JSONSerialization.data(withJSONObject: object))
 
-        XCTAssertEqual(decoded.distillExecutionMode, .normal)
+        XCTAssertEqual(decoded.distillExecutionMode, .auto)
         XCTAssertEqual(decoded.permissionMode, .fullAccess)
         XCTAssertEqual(decoded.interactionMode, .default)
         XCTAssertEqual(decoded.executionMode, .local)
