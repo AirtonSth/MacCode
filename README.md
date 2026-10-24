@@ -240,3 +240,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test --filter Pro
 - Fail loud: provider auth, install, model, pairing, and runtime problems should be visible and recoverable.
 - Keep workflows close: agent output, terminal state, browser context, files, and git review should stay in the same workspace.
 - Mobile mirrors, Mac executes: iPhone control is powerful because it drives the real host instead of duplicating developer tools on the phone.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
