@@ -2,6 +2,13 @@ import XCTest
 @testable import CoreModel
 
 final class BotMentionParserTests: XCTestCase {
+    func test_emailAndAmbiguousNamesDoNotSelectABotButExactHandlesDo() {
+        let first = BotDefinition(handle: "first", name: "Reviewer", title: "", description: "")
+        let second = BotDefinition(handle: "second", name: "Reviewer", title: "", description: "")
+        XCTAssertEqual(BotMentionParser.mentionedBots(in: "mail@first @Reviewer @SECOND @first @second",
+            bots: [first, second], excluding: nil).map(\.id), [second.id, first.id])
+    }
+
     func test_peerConsultationIdleWindowRestartsOnProgress() {
         // WHY: a live Bot must not be cut off at 10 minutes of wall time
         // while it is still emitting updates.
@@ -107,6 +114,12 @@ final class BotMentionParserTests: XCTestCase {
         XCTAssertEqual(parsed.title, "CRM Controller")
         XCTAssertEqual(parsed.handle, "quinn")
         XCTAssertEqual(parsed.avatarSymbol, peer.avatarSymbol)
+        XCTAssertEqual(parsed.botID, peer.id)
+        let legacy = try XCTUnwrap(BotPeerTranscript.parse(
+            "[[rc:bot-from:quinn|Quinn|CRM Controller|circle]]\nInbox is clear."
+        ))
+        XCTAssertEqual(legacy.body, "Inbox is clear.")
+        XCTAssertNil(legacy.botID)
     }
 
     func test_hostHopPromptKeepsUserLanguageAndStripsMentionHandles() {

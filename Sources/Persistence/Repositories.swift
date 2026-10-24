@@ -3817,8 +3817,8 @@ public final class AgentMessageRepository: @unchecked Sendable {
     public func delete(ids: [AgentMessageID]) throws {
         guard !ids.isEmpty else { return }
         let placeholders = ids.map { _ in "?" }.joined(separator: ",")
-        try db.transaction {
-            let st = try db.prepare("DELETE FROM agent_messages WHERE id IN (\(placeholders));")
+        try db.performSync { database in
+            let st = try database.prepare("DELETE FROM agent_messages WHERE id IN (\(placeholders));")
             for (index, id) in ids.enumerated() {
                 try st.bind(Int32(index + 1), id.value.uuidString)
             }

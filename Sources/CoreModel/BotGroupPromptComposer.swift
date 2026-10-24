@@ -5,6 +5,8 @@ import Foundation
 /// compiles the result through the bot's brain and advances the watermark.
 public enum BotGroupPromptComposer {
     public static let defaultMaxDeltaCharacters = 24_000
+    /// An intentional group turn without a public reply; must be the entire response.
+    public static let silentTurnMarker = "[[rc:bot-silent]]"
 
     public struct Composition: Equatable, Sendable {
         public let prompt: String
@@ -54,6 +56,13 @@ public enum BotGroupPromptComposer {
             kept.insert(entry, at: 0)
             used += entry.count
         }
+        // Peer replies can fill the delta after the user's request. Keep
+        // that request whole too, so its constraints never disappear.
+        if let request = unseen.last(where: { $0.role == .user }),
+           let userEntry = entry(for: request, me: me, turnsByRow: turnsByRow),
+           !kept.contains(userEntry) {
+            kept.insert(userEntry, at: 0)
+        }
         let omitted = entries.count - kept.count
 
         var sections = [header(groupTitle: groupTitle, me: me, participants: participants)]
@@ -70,6 +79,7 @@ public enum BotGroupPromptComposer {
             "Reply to the group as \(me.name). To hand the floor to another participant, @mention them."
                 + " " + participantsAnswerOnTheirTurnsLine
         )
+        sections.append(contributionGuidance)
         sections.append(BotPeerTranscript.languageInstruction)
 
         let blocker = unseen.firstIndex { holdsWatermark($0, me: me, turnsByRow: turnsByRow) }
@@ -89,6 +99,11 @@ public enum BotGroupPromptComposer {
     /// nobody sees. The room already gives every participant its own turn.
     static let participantsAnswerOnTheirTurnsLine =
         "The other participants answer in this group on their own turns: never use bot_ask_peer to ask them, and do not answer for them."
+
+    static let contributionGuidance = """
+    Make a useful contribution to the current request: a direct answer, new evidence, a completed dependency, a material contradiction, or an actionable question. Answer questions and tasks directed to you; report a blocker instead of silently skipping them. Do not repeat another participant just to agree. If you have no useful contribution and no unanswered direct request, end this group turn with exactly \(silentTurnMarker) as your entire reply, without explanation or @mentions. This group-only signal completes your turn without a public message or another hand-off. An empty response is a failure, not this signal.
+    Attribute findings by the participant's name. Use an @mention only for a specific necessary next task, stating the question and relevant constraints; an @mention can start another turn. Avoid courtesy mentions, repeated invitations, and hand-offs without new work. Preserve disagreements with their evidence and the check needed to resolve them; a majority opinion is not validation. Do not claim another participant finished work or that the group reached consensus without their actual results.
+    """
 
     public static func omissionLine(_ count: Int) -> String {
         count == 1

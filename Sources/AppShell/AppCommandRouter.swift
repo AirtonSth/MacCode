@@ -3583,15 +3583,45 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             mutation: false,
             method: "bot.peer.list"
         )
+        let caller = try ctx.threadRepo.get(id: callerThread)
+        let inheritsWorkspace = try caller.map {
+            try ctx.botPeerHandoffAuthority.inheritedWorkspaceScope(thread: $0, runID: callerRun) != nil
+        } ?? true
         return .object([
             "bots": .array(try ctx.botStore.list().map { bot in
-                .object([
+                let skills = try ctx.botStore.listSkillBindings(botID: bot.id).filter(\.enabled).map(\.skillID)
+                let binding: BotContextBinding?
+                let unavailableReason: String?
+                do {
+                    binding = try ctx.botPeerHandoffAuthority.peerContextBinding(callerThread: callerThread, peerBotID: bot.id)
+                    unavailableReason = nil
+                } catch {
+                    binding = nil
+                    unavailableReason = (error as? JSONRPCError)?.message ?? "Current context access could not be verified."
+                }
+                let destination = try ctx.botStore.executionDestination(botID: bot.id)
+                return .object([
                     "id": .string(bot.id.value.uuidString.lowercased()),
                     "handle": .string(bot.handle),
                     "name": .string(bot.name),
                     "title": .string(bot.title),
+                    "description": .string(bot.description),
+                    "revision_id": bot.currentRevisionID.map { .string($0.value.uuidString.lowercased()) } ?? .null,
+                    "configured_skills": .array(skills.map(JSONValue.string)),
+                    "execution_destination": .string(destination.storageValue),
+                    "context_actions": binding.map { .array($0.actions.map(\.rawValue).sorted().map(JSONValue.string)) } ?? .null,
+                    "context_available": .bool(unavailableReason == nil),
+                    "unavailable_reason": unavailableReason.map(JSONValue.string) ?? .null,
+                    "busy": .bool(ctx.botPeerHandoffAuthority.peerIsBusy(bot.id)),
+                    "async_available": .bool(unavailableReason == nil && !inheritsWorkspace),
+                    "execution_readiness": .string("validated_at_dispatch"),
+                    "route": .string("inherits_current_caller"),
+                    "consultations": .array(ctx.botPeerHandoffAuthority.availableConsultations(
+                        callerThread: callerThread, callerRun: callerRun, peerBotID: bot.id)),
                 ])
             }),
+            "limits": .object(["root_admissions": .number(12), "root_active": .number(4),
+                "depth": .number(4), "root_seconds": .number(900), "provider_usage": .string("unknown_until_reported")]),
         ])
     }
 
@@ -3599,6 +3629,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let runUUID = UUID(uuidString: runID) else { return nil }
         _ = threadID
         return context?.botPeerHandoffAuthority.latestPeerProgress(hostRunID: AgentRunID(runUUID))
+    }
+
+    public func botPeerActivityProgress(threadID: String, activityID: String) -> Date? {
+        guard let thread = UUID(uuidString: threadID), let activity = UUID(uuidString: activityID) else { return nil }
+        return context?.botPeerHandoffAuthority.activityProgress(activityID: activity, callerThread: AgentThreadID(thread))
     }
 
     public func askBotPeer(
@@ -3621,12 +3656,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func askBotPeer(
+        callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String,
+        replyMode: BotPeerDelegation.ReplyMode, consultationID: UUID?, delegationCapability: String?
+    ) async throws -> JSONValue {
+        try await askBotPeer(callerThread: callerThread, callerRun: callerRun, handle: handle,
+            prompt: prompt, replyMode: replyMode, consultationID: consultationID, wait: true,
+            delegationCapability: delegationCapability)
+    }
+
+    public func askBotPeer(
         callerThread: AgentThreadID,
         callerRun: AgentRunID,
         handle: String,
         prompt: String,
         replyMode: BotPeerDelegation.ReplyMode,
         consultationID: UUID?,
+        wait: Bool = true,
         delegationCapability: String? = nil
     ) async throws -> JSONValue {
         let ctx = try validatedBotPeerCaller(
@@ -3636,78 +3681,85 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             mutation: false,
             method: "bot.peer.ask"
         )
-        // A peer's agent runs on the Mac. A caller inside its bot's Linux VM
-        // reaches the Mac only through the user-approved Mac-execution request,
-        // never through a peer.
-        if try ctx.threadRepo.guestPlacement(of: callerThread)?.runsInGuest == true {
-            throw JSONRPCError(
-                code: -32052,
-                message: "bot_ask_peer is not available inside the bot's Linux VM: the other Bot would run on the Mac. Ask the user to run this conversation on the Mac, or use bot_request_mac_execution."
-            )
-        }
-        guard let normalizedHandle = BotHandle.normalize(handle),
-              let peer = try ctx.botStore.list().first(where: { $0.handle == normalizedHandle }) else {
-            throw JSONRPCError(code: -32044, message: "MacCode Bot @\(handle) was not found.")
-        }
-        let delegatedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !delegatedPrompt.isEmpty else { throw JSONRPCError.invalidParams }
-        guard let originThread = try ctx.threadRepo.get(id: callerThread) else {
-            throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.")
-        }
-
+        let peer: BotDefinition
+        let delegatedPrompt: String
+        let originThread: AgentThread
         var claimedConsultationID: UUID?
-        if let consultationID {
-            try ctx.botPeerHandoffAuthority.claimContinuation(
-                consultationID: consultationID,
-                callerThread: callerThread,
-                hostRunID: callerRun,
-                peerBotID: peer.id
-            )
-            claimedConsultationID = consultationID
-        }
         defer {
             if let claimedConsultationID {
                 ctx.botPeerHandoffAuthority.releaseContinuation(consultationID: claimedConsultationID)
             }
         }
-
+        do {
+            guard let normalizedHandle = BotHandle.normalize(handle),
+                  let found = try ctx.botStore.list().first(where: { $0.handle == normalizedHandle }) else {
+                throw JSONRPCError(code: -32044, message: "MacCode Bot @\(handle) was not found.")
+            }
+            peer = found
+            delegatedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !delegatedPrompt.isEmpty, wait || replyMode == .consult else {
+                throw JSONRPCError(code: -32602, message: "Provide a prompt and use consult mode for asynchronous work.")
+            }
+            guard let thread = try ctx.threadRepo.get(id: callerThread) else {
+                throw JSONRPCError(code: -32004, message: "The calling Agent thread no longer exists.")
+            }
+            originThread = thread
+            _ = try ctx.botPeerHandoffAuthority.peerContextBinding(callerThread: callerThread, peerBotID: peer.id)
+            if let consultationID {
+                try ctx.botPeerHandoffAuthority.claimContinuation(consultationID: consultationID,
+                    callerThread: callerThread, hostRunID: callerRun, peerBotID: peer.id)
+                claimedConsultationID = consultationID
+            }
+        } catch let error as JSONRPCError {
+            throw JSONRPCError(code: error.code, message: error.message,
+                data: .object(["admission": .string("rejected")]))
+        }
         ctx.botPeerHandoffAuthority.router = self
-        guard let result = await ctx.botPeerHandoffAuthority.askPeerFromActiveProvider(
+        let result = try await ctx.botPeerHandoffAuthority.askPeerFromActiveProvider(
             peer: peer,
             prompt: delegatedPrompt,
             originThread: originThread,
             hostRunID: callerRun,
             providerSnapshots: cachedProviderSnapshotsForSend(),
-            consultationID: consultationID
-        ) else {
-            throw JSONRPCError(code: -32045, message: "The Bot delegation did not produce a verified reply.")
+            delegationCapability: delegationCapability?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+            consultationID: consultationID,
+            wait: wait
+        )
+        _ = try validatedBotPeerCaller(threadID: callerThread, runID: callerRun,
+            delegationCapability: delegationCapability, mutation: false, method: "bot.peer.ask")
+        guard var object = result.objectValue else { throw JSONRPCError.internalError }
+        if wait, object["status"] != .string("completed") {
+            throw JSONRPCError(code: -32045, message: "The Bot activity did not produce a verified reply.", data: result)
         }
-        let current = (try? ctx.botStore.get(id: peer.id)) ?? peer
-        if replyMode == .replyOnly {
-            ctx.coordinator.suppressPrimaryAssistantReply(runId: callerRun)
+        if replyMode == .replyOnly { ctx.coordinator.suppressPrimaryAssistantReply(runId: callerRun) }
+        object["reply_mode"] = .string(replyMode.rawValue)
+        object["next"] = .string(!wait
+            ? "Observe this activity with bot_peer_status before using its result."
+            : (replyMode == .replyOnly
+                ? "End the turn now. MacCode will keep only the attributed Bot reply."
+                : "Continue the original user request using this reply."))
+        return .object(object)
+    }
+
+    public func observeBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, activityID: UUID,
+                               wait: Bool, cancel: Bool, delegationCapability: String?) async throws -> JSONValue {
+        let ctx = try validatedBotPeerCaller(threadID: callerThread, runID: callerRun,
+            delegationCapability: delegationCapability, mutation: false,
+            method: cancel ? "bot.peer.cancel" : "bot.peer.status")
+        let result = try await ctx.botPeerHandoffAuthority.observePeerActivity(activityID,
+            callerThread: callerThread, wait: wait, cancel: cancel)
+        _ = try validatedBotPeerCaller(threadID: callerThread, runID: callerRun,
+            delegationCapability: delegationCapability, mutation: false,
+            method: cancel ? "bot.peer.cancel" : "bot.peer.status")
+        return result
+    }
+
+    public func validateBotPeerReceipt(callerThread: AgentThreadID, result: JSONValue) throws {
+        guard let ctx = context,
+              let activityID = result.objectValue?["activity_id"]?.stringValue.flatMap(UUID.init) else {
+            throw JSONRPCError(code: -32050, message: "This Bot receipt cannot be authorized.")
         }
-        return .object([
-            "activity_id": .string(result.activityID.uuidString.lowercased()),
-            "lifecycle_receipt_id": .string(result.activityID.uuidString.lowercased()),
-            BotPeerDelegation.consultationIDParameterKey: .string(result.consultationID.uuidString.lowercased()),
-            "conversation_id": .string(result.peerConversationID.value.uuidString.lowercased()),
-            "thread_id": .string(result.peerThreadID.value.uuidString.lowercased()),
-            "run_id": .string(result.peerRunID.value.uuidString.lowercased()),
-            "bot": .object([
-                "id": .string(current.id.value.uuidString.lowercased()),
-                "handle": .string(current.handle),
-                "name": .string(current.name),
-                "title": .string(current.title),
-            ]),
-            "reply": .string(result.reply),
-            "reply_mode": .string(replyMode.rawValue),
-            "attributed_reply_already_displayed": .bool(true),
-            "next": .string(
-                replyMode == .replyOnly
-                    ? "End the turn now. MacCode will keep only the attributed Bot reply."
-                    : "Continue the original user request using this reply."
-            ),
-        ])
+        _ = try ctx.botPeerHandoffAuthority.peerActivity(activityID, callerThread: callerThread)
     }
 
     public func invokeDelegatedBotSelfConfig(
@@ -3766,14 +3818,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         var foundationArguments = arguments.mapValues(Self.botPeerFoundationValue)
         foundationArguments["bot_id"] = targetID.value.uuidString.lowercased()
-        let environment = [
-            "RC_REMOTE_CODE_APP_SUPPORT_DIRECTORY": ctx.appSupportDirectory.path,
-            BotSelfConfigCatalog.callerEnvironmentKey: targetID.value.uuidString.lowercased(),
-        ]
-        let service = try BotSelfConfigService.make(
-            environment: environment,
+        let delegatedContext = ctx.botPeerHandoffAuthority.delegatedContext(
+            forHostRunID: callerRun, requestedBotID: targetID
+        )
+        guard isSecretTool || delegatedContext != nil else {
+            throw JSONRPCError(code: -32046, message: "The consulted Bot context is no longer authorized.")
+        }
+        let service = BotSelfConfigService(
+            callerBotID: targetID,
+            callerThreadID: delegatedContext?.threadID,
             store: ctx.botStore,
-            secretStore: botSecretStore
+            secretStore: botSecretStore,
+            appSupportDirectory: ctx.appSupportDirectory
         )
         let result = try service.invoke(name: toolName, arguments: foundationArguments)
         if toolName == BotSelfConfigCatalog.setSettings {
@@ -3802,6 +3858,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             mutation: mutation,
             method: method
         )
+        if let pin = try ctx.botStore.conversationContextPin(linkedTo: threadID) {
+            guard try ctx.botStore.authorizes(hostID: pin.hostID, botID: pin.botID, context: pin.context,
+                    action: .read, policyRevision: pin.policyRevision),
+                  try ctx.botStore.authorizesContextDelegation(hostID: pin.hostID, runID: runID, threadID: threadID) else {
+                throw JSONRPCError(code: -32047, message: "The calling Bot context is no longer authorized.")
+            }
+        }
         return ctx
     }
 
@@ -6234,6 +6297,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         requestedRunID: AgentRunID,
         routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil,
         orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil,
+        nestedRunContext: AgentNestedRunContext? = nil,
         executionCwdOverride: String? = nil,
         allowProviderCatalogListingDuringPreflight: Bool = true
     ) async throws -> AgentMessageSendResult {
@@ -6253,6 +6317,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             routingSnapshot: routingSnapshot,
             requestedRunID: requestedRunID,
             orchestrationRoutingSnapshot: orchestrationRoutingSnapshot,
+            nestedRunContext: nestedRunContext,
             executionCwdOverride: executionCwdOverride,
             allowProviderCatalogListingDuringPreflight: allowProviderCatalogListingDuringPreflight,
             // Desk, peer and hop callers send an already compiled bot prompt:
@@ -6527,6 +6592,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             throw JSONRPCError(code: -32000, message: "The interrupted context changed while preparing to continue. Read the conversation again.")
         }
         func enqueueBehindActiveRun() throws -> AgentMessageSendResult {
+            guard nestedRunContext == nil else {
+                throw JSONRPCError(code: -32051, message: "The delegated thread is busy. Wait for its current run to finish before continuing.")
+            }
             guard !resumeInterrupted else {
                 throw JSONRPCError(code: -32000, message: "Thread became active before it could be continued.")
             }
@@ -6691,9 +6759,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 requestedWorkspace: t.workspaceId,
                 requestedPermissionMode: t.permissionMode
             )
-            guard t.workspaceId == parentThread.workspaceId,
+            let isBotPeer = try ctx.coordinator.isDelegatedRun(requestedRunID, threadId: t.id,
+                parentRunId: nestedRunContext.parentRunID)
+                && ctx.botStore.conversationLinked(to: t.id) != nil
+            // Bot consultations inherit the execution scope but keep their
+            // private thread out of the workspace's Agent App rail.
+            guard (t.workspaceId == parentThread.workspaceId || (isBotPeer && t.workspaceId == nil)),
                   t.projectId == parentThread.projectId,
-                  t.runAsUser == parentThread.runAsUser,
+                  (t.runAsUser == parentThread.runAsUser
+                    || (isBotPeer && (t.runAsUser ?? .current()) == (parentThread.runAsUser ?? .current()))),
                   t.executionMode == parentThread.executionMode,
                   t.worktreePath == parentThread.worktreePath else {
                 throw JSONRPCError(

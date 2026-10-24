@@ -124,7 +124,8 @@ final class BotGroupPromptComposerTests: XCTestCase {
         let result = compose(me: alpha, messages)
         XCTAssertFalse(result.prompt.contains("ALPHA OWN REPLY"), "own replies already live in the member thread")
         XCTAssertTrue(result.prompt.contains("Beta (@beta):\nBeta says ship  @alpha"))
-        XCTAssertFalse(result.prompt.contains("[[rc:"))
+        XCTAssertFalse(result.prompt.contains("[[rc:deadbeef]]"))
+        XCTAssertFalse(result.prompt.contains("[[rc:bot-activity:"))
         XCTAssertFalse(result.prompt.contains("[[RC_"))
         XCTAssertFalse(result.prompt.contains(uncalled), "the uncalled-tool marker is host-internal")
         XCTAssertEqual(result.includedCount, 2)
@@ -258,6 +259,27 @@ final class BotGroupPromptComposerTests: XCTestCase {
         let result = compose(me: alpha, [message(.user, "short", at: 0), message(.user, long, at: 1)], max: 100)
         XCTAssertTrue(result.prompt.contains("User:\n\(long)"))
         XCTAssertEqual(result.omittedCount, 1)
+    }
+
+    func test_cap_keepsCurrentUserConstraintsWhenPeerRepliesFillTheDelta() {
+        let request = "  Review the evidence only.\nDo not publish; keep `limit = 17`.  "
+        let messages = [
+            message(.user, "OLD REQUEST", at: 0),
+            message(.user, request, at: 1),
+            message(.assistant, BotPeerTranscript.encode(peer: beta, text: String(repeating: "evidence ", count: 100)), at: 2),
+        ]
+        let result = compose(me: alpha, messages, max: 100)
+
+        XCTAssertTrue(result.prompt.contains("User:\n" + request))
+        XCTAssertTrue(result.prompt.contains("Beta (@beta):\n"))
+        XCTAssertFalse(result.prompt.contains("OLD REQUEST"))
+        XCTAssertEqual(result.includedCount, 2)
+        XCTAssertEqual(result.omittedCount, 1)
+        XCTAssertTrue(result.prompt.contains("Use an @mention only for a specific necessary next task"))
+        XCTAssertTrue(result.prompt.contains("a majority opinion is not validation"))
+        XCTAssertTrue(result.prompt.contains("Answer questions and tasks directed to you"))
+        XCTAssertTrue(result.prompt.contains("exactly \(BotGroupPromptComposer.silentTurnMarker) as your entire reply"))
+        XCTAssertEqual(result.lastSeenMessageID, messages.last?.id)
     }
 
     func test_noNewMessages_saysSo_andKeepsWatermark() {

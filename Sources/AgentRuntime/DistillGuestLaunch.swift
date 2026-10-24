@@ -159,11 +159,15 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
     private let teardown: @Sendable (AgentRunStatus) async -> Void
     private let teardownTimeout: TimeInterval
     private let onSessionOpened: (@Sendable (String) throws -> Void)?
-    private let killGuestBody: @Sendable () async -> Void
+    private let onTerminationConfirmed: (@Sendable () -> Void)?
+    private let killGuestBody: @Sendable () async -> Bool
     private let killGuestDetachedBody: @Sendable () -> Void
     private let lock = NSLock()
     private var finishTask: Task<Void, Never>?
     private var killedDetached = false
+    private var guestTerminationConfirmed = false
+    private var cleanupFinished = false
+    private var terminationNotified = false
 
     /// Bound on one `kill-agent` (TERM, 1 s, KILL inside the guest).
     public static let killTimeout: TimeInterval = 5
@@ -196,7 +200,8 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         killGuest: (@Sendable () async -> Void)? = nil,
         killGuestDetached: (@Sendable () -> Void)? = nil,
         teardownTimeout: TimeInterval = DistillGuestLaunchPlan.teardownTimeout,
-        onSessionOpened: (@Sendable (String) throws -> Void)? = nil
+        onSessionOpened: (@Sendable (String) throws -> Void)? = nil,
+        onTerminationConfirmed: (@Sendable () -> Void)? = nil
     ) {
         self.runID = runID
         self.dockerExecutable = dockerExecutable
@@ -208,10 +213,15 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         self.teardown = teardown
         self.teardownTimeout = teardownTimeout
         self.onSessionOpened = onSessionOpened
+        self.onTerminationConfirmed = onTerminationConfirmed
         let killArguments = Self.killArguments(container: container, runID: runID, detached: false)
         let detachedArguments = Self.killArguments(container: container, runID: runID, detached: true)
-        self.killGuestBody = killGuest ?? {
-            await Self.runDocker(dockerExecutable, killArguments, runID: runID, timeout: Self.killTimeout)
+        if let killGuest {
+            self.killGuestBody = { await killGuest(); return true }
+        } else {
+            self.killGuestBody = {
+                await Self.runDocker(dockerExecutable, killArguments, runID: runID, timeout: Self.killTimeout)
+            }
         }
         self.killGuestDetachedBody = killGuestDetached ?? {
             Self.startDocker(dockerExecutable, detachedArguments, runID: runID)
@@ -256,7 +266,19 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
     /// Ends the guest process. Idempotent: `kill-agent` exits 0 for a run that
     /// already ended, so Stop and the run's own finish may both call it.
     public func killGuest() async {
-        await killGuestBody()
+        if await killGuestBody() {
+            lock.withLock { guestTerminationConfirmed = true }
+            notifyTerminationIfReady()
+        }
+    }
+
+    private func notifyTerminationIfReady() {
+        let shouldNotify = lock.withLock {
+            guard guestTerminationConfirmed, cleanupFinished, !terminationNotified else { return false }
+            terminationNotified = true
+            return true
+        }
+        if shouldNotify { onTerminationConfirmed?() }
     }
 
     /// Fire-and-forget kill for app termination, which cannot wait. Once per
@@ -300,6 +322,8 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
             }
             unlink(envFileURL.path)
             await lease?.release()
+            lock.withLock { cleanupFinished = true }
+            notifyTerminationIfReady()
             guestLaunchLog.info(
                 "distill.guest.finished run=\(self.runID, privacy: .public) status=\(status.rawValue, privacy: .public)"
             )
@@ -339,7 +363,7 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
         _ arguments: [String],
         runID: String,
         timeout: TimeInterval
-    ) async {
+    ) async -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -372,6 +396,7 @@ public final class DistillGuestLaunchPlan: @unchecked Sendable {
                 "distill.guest.kill.failed run=\(runID, privacy: .public) status=\(status.map(String.init) ?? "timeout_or_spawn", privacy: .public)"
             )
         }
+        return status == 0
     }
 
     private static func startDocker(_ executable: String, _ arguments: [String], runID: String) {

@@ -450,8 +450,14 @@ public enum AgentReplyQuoteTarget {
             needle = String(needle.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         guard !needle.isEmpty, let end = messages.firstIndex(where: { $0.id == before }) else { return nil }
+        let isPeerQuote = needle.range(of: #"^@[A-Za-z0-9_-]+: "#, options: .regularExpression) != nil
         return messages[..<end].last { message in
             guard message.role == .assistant else { return false }
+            if isPeerQuote {
+                guard let peer = BotPeerTranscript.parse(message.content) else { return false }
+                let labeled = "\(BotPeerTranscript.handleLabel(peer.handle)): \(AgentReplyQuote.excerpt(of: peer.body))"
+                return labeled.hasPrefix(needle)
+            }
             let visible = TitioNoticeBlock.visibleText(message.content)
             let source = TitioNoticeBlock.parse(message.content).block?.source ?? [:]
             let label = [source["workspace"], source["bot"]].compactMap { $0 }.joined(separator: " › ")

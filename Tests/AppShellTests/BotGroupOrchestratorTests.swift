@@ -152,7 +152,7 @@ final class BotGroupOrchestratorTests: XCTestCase {
         var events: [(kind: String, payload: [String: JSONValue])] { lock.withLock { stored } }
     }
 
-    /// Room `agent.message.appended` ids and `bot.group.turn.updated` states.
+    /// Room message changes and `bot.group.turn.updated` states.
     private func recordEvents(roomThreadID: AgentThreadID) -> (EventLog, UUID) {
         let log = EventLog()
         let room = roomThreadID.value.uuidString
@@ -160,6 +160,9 @@ final class BotGroupOrchestratorTests: XCTestCase {
             guard let object = event.payload.objectValue else { return }
             if event.kind == "agent.message.appended",
                object["threadId"]?.objectValue?["value"]?.stringValue == room {
+                log.append(event.kind, object)
+            } else if event.kind == "agent.messages.removed",
+                      object["thread_id"]?.stringValue == room.lowercased() {
                 log.append(event.kind, object)
             } else if event.kind == "bot.group.turn.updated",
                       object["room_thread_id"]?.stringValue == room.lowercased() {
@@ -185,6 +188,8 @@ final class BotGroupOrchestratorTests: XCTestCase {
 
     func test_sendShowsUserAndWaitingRowsAtOnceThenBotsAnswerInOrderReplacingTheirRows() async throws {
         let f = try makeFixture()
+        try BotHome(appSupportDirectory: f.ctx.appSupportDirectory, bot: f.ana)
+            .writeFile(relativePath: "MEMORY.md", contents: "ANA-GROUP-LEGACY-MEMORY")
         let group = try await makeGroup(f, bots: [f.ana, f.bob])
         let (log, subscription) = recordEvents(roomThreadID: group.roomThreadID)
         defer { EventBus.shared.unsubscribe(subscription) }
@@ -207,6 +212,7 @@ final class BotGroupOrchestratorTests: XCTestCase {
         XCTAssertTrue(anaStarted)
         let anaRequest = try request(f, onThreadOf: f.ana, in: group)
         XCTAssertTrue(anaRequest.prompt.contains("ANA-SOUL"), "the bot's own brain compiles the turn")
+        XCTAssertTrue(anaRequest.prompt.contains("ANA-GROUP-LEGACY-MEMORY"), "an unpinned group keeps its Bot's global memory")
         XCTAssertTrue(anaRequest.prompt.contains("Plan the launch"))
         XCTAssertNotEqual(anaRequest.threadId, group.roomThreadID, "the room never runs a provider")
         try await Task.sleep(nanoseconds: 150_000_000)
@@ -219,6 +225,7 @@ final class BotGroupOrchestratorTests: XCTestCase {
         XCTAssertTrue(bobRequest.prompt.contains("Ship it on Monday."), "later bots see earlier replies of the round")
         XCTAssertTrue(bobRequest.prompt.contains("BOB-SOUL"))
         XCTAssertFalse(bobRequest.prompt.contains("ANA-SOUL"), "never another bot's brain")
+        XCTAssertFalse(bobRequest.prompt.contains("ANA-GROUP-LEGACY-MEMORY"))
 
         XCTAssertTrue(f.runner.finish(runID: bobRequest.runId, status: .completed, reply: "Monday is too soon."))
         let done = await waitUntil { (try? self.turns(f, group).allSatisfy { $0.state == .completed }) == true }
@@ -254,6 +261,62 @@ final class BotGroupOrchestratorTests: XCTestCase {
         XCTAssertEqual(anaThread.executionTarget, .mac)
         XCTAssertNil(anaThread.workspaceId)
         XCTAssertTrue(try f.ctx.botStore.listConversations(botID: f.ana.id).isEmpty, "never in the bot's desk list")
+    }
+
+    func test_anExplicitSilentTurnRemovesItsRowAndAdvancesButAnEmptyReplyStillFails() async throws {
+        let f = try makeFixture()
+        let group = try await makeGroup(f, bots: [f.ana, f.bob, f.cid])
+        let (log, subscription) = recordEvents(roomThreadID: group.roomThreadID)
+        defer { EventBus.shared.unsubscribe(subscription) }
+        let receipt = try f.orchestrator.send(groupID: group.id, text: "Add useful findings", submitKey: "silent")
+        let rows = try room(f, group)
+        let started = await waitUntil { f.runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let ana = try request(f, onThreadOf: f.ana, in: group)
+        XCTAssertTrue(ana.prompt.contains(BotGroupPromptComposer.silentTurnMarker))
+
+        XCTAssertTrue(f.runner.finish(
+            runID: ana.runId, status: .completed, reply: " \n" + BotGroupPromptComposer.silentTurnMarker + "\n "
+        ))
+        let next = await waitUntil { f.runner.requests.count == 2 }
+        XCTAssertTrue(next, "silence gives the next planned participant its turn")
+        XCTAssertEqual(try f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state, .completed)
+        XCTAssertNil(try f.ctx.messageRepo.get(id: receipt.turns[0].roomMessageID), "no public silence or waiting row remains")
+        let watermark = try XCTUnwrap(try f.ctx.botStore.listGroupParticipants(groupID: group.id).first { $0.botID == f.ana.id })
+        XCTAssertEqual(watermark.seenRoomMessageID, receipt.turns[0].roomMessageID)
+        XCTAssertEqual(watermark.seenRoomCreatedAt, rows[1].createdAt, "the timestamp preserves progress after the row is removed")
+
+        let bob = try request(f, onThreadOf: f.bob, in: group)
+        XCTAssertTrue(bob.prompt.contains("User:\nAdd useful findings"))
+        XCTAssertFalse(bob.prompt.contains("Ana (@ana):\n"), "the silent turn adds no room context")
+        XCTAssertTrue(f.runner.finish(runID: bob.runId, status: .completed, reply: "The release still needs a signature."))
+        let last = await waitUntil { f.runner.requests.count == 3 }
+        XCTAssertTrue(last)
+        let cid = try request(f, onThreadOf: f.cid, in: group)
+        XCTAssertTrue(f.runner.finish(runID: cid.runId, status: .completed, reply: " \n "))
+        let done = await waitUntil { (try? self.turns(f, group).map(\.state)) == [.completed, .completed, .failed] }
+        XCTAssertTrue(done, "an accidental empty response is still a failure")
+        XCTAssertNotNil(try turns(f, group).last?.error)
+        XCTAssertEqual(try room(f, group).map(\.id), [receipt.userMessageID, receipt.turns[1].roomMessageID, receipt.turns[2].roomMessageID])
+        XCTAssertEqual(BotPeerTranscript.parse(try room(f, group)[1].content)?.body, "The release still needs a signature.")
+        XCTAssertEqual(BotPeerTranscript.parseActivity(try room(f, group)[2].content)?.phase, .needsAttention)
+
+        let eventsDone = await waitUntil {
+            self.turnStates(log, receipt.turns[2]).last == "failed"
+                && log.events.contains { $0.kind == "agent.messages.removed" }
+        }
+        XCTAssertTrue(eventsDone)
+        let removals = log.events.filter { $0.kind == "agent.messages.removed" }
+        XCTAssertEqual(removals.count, 1)
+        XCTAssertEqual(removals.first?.payload["message_ids"]?.arrayValue?.compactMap(\.stringValue),
+                       [receipt.turns[0].roomMessageID.value.uuidString.lowercased()])
+        XCTAssertEqual(appendedIDs(log).filter { $0 == receipt.turns[0].roomMessageID.value.uuidString }.count, 1,
+                       "only the waiting row was published; silence never publishes a reply")
+        XCTAssertEqual(turnStates(log, receipt.turns[0]), ["planned", "running", "completed"])
+        let replay = try f.orchestrator.send(groupID: group.id, text: "Add useful findings", submitKey: "silent")
+        XCTAssertEqual(replay.turns.map(\.id), receipt.turns.map(\.id), "silence creates no hand-off")
+        XCTAssertNil(try f.ctx.messageRepo.get(id: receipt.turns[0].roomMessageID), "replay does not restore the silent row")
+        XCTAssertEqual(f.runner.requests.count, 3)
     }
 
     // MARK: - D12
@@ -802,6 +865,29 @@ final class BotGroupOrchestratorTests: XCTestCase {
             BotPeerTranscript.parseActivity(try XCTUnwrap(try f.ctx.messageRepo.get(id: receipt.turns[0].roomMessageID)).content)?.phase,
             .needsAttention
         )
+
+        // Removing a silent turn's row has the same all-or-nothing contract.
+        try f.orchestrator.retry(turnID: receipt.turns[0].id, groupID: group.id)
+        let retried = await waitUntil { f.runner.requests.count == 2 }
+        XCTAssertTrue(retried)
+        try f.ctx.db.execute("""
+            CREATE TRIGGER test_fail_silent_row_delete BEFORE DELETE ON agent_messages
+            WHEN OLD.id = '\(receipt.turns[0].roomMessageID.value.uuidString)'
+            BEGIN SELECT RAISE(ABORT, 'disk full'); END;
+            """)
+        let retry = try XCTUnwrap(f.runner.requests.last)
+        f.runner.finish(runID: retry.runId, status: .completed, reply: BotGroupPromptComposer.silentTurnMarker)
+        let retryFinished = await waitUntil { f.ctx.coordinator.activeRunId(threadId: retry.threadId) == nil }
+        XCTAssertTrue(retryFinished)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(try f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state, .running)
+        XCTAssertEqual(
+            BotPeerTranscript.parseActivity(try XCTUnwrap(try f.ctx.messageRepo.get(id: receipt.turns[0].roomMessageID)).content)?.phase,
+            .waiting
+        )
+        try f.ctx.db.execute("DROP TRIGGER test_fail_silent_row_delete;")
+        f.orchestrator.reconcileAfterRelaunch()
+        XCTAssertEqual(try f.ctx.botStore.groupTurn(id: receipt.turns[0].id)?.state, .interrupted)
     }
 
     // MARK: - Plan A guest

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Tracks the runs on each bot's VM. Conversations run on one VM in parallel;
-/// only an exclusive claim (a rebuild or stop of the VM) keeps others out.
+/// exclusive delegated runs and VM maintenance keep others out.
 public final class BotVMRunRegistry: @unchecked Sendable {
     public static let shared = BotVMRunRegistry()
 
@@ -10,7 +10,7 @@ public final class BotVMRunRegistry: @unchecked Sendable {
         public let runID: AgentRunID
         public let title: String
         public let workspace: String
-        /// Replaces or stops the container: no run may share the VM with it.
+        /// No other run may share the VM with this delegated run or maintenance.
         public let exclusive: Bool
 
         public init(threadID: AgentThreadID, runID: AgentRunID, title: String, workspace: String, exclusive: Bool = false) {
@@ -39,11 +39,15 @@ public final class BotVMRunRegistry: @unchecked Sendable {
     /// Claims the VM for `entry`; returns the other thread's claim in the way.
     /// A run is kept out only by an exclusive claim; an exclusive claim by any
     /// claim of another thread (its own thread's agent may rebuild mid-run).
-    public func tryBegin(botID: BotID, entry: Entry, resourceID: BotID? = nil) -> Entry? {
+    /// New guest runs disable that maintenance exception, even on the same thread.
+    public func tryBegin(botID: BotID, entry: Entry, resourceID: BotID? = nil, allowsSameThreadExclusive: Bool = true) -> Entry? {
         let botID = resourceID ?? botID
         return lock.withLock {
             let held = claims[botID] ?? []
-            if let holder = held.first(where: { ($0.exclusive || entry.exclusive) && $0.threadID != entry.threadID }) {
+            if let holder = held.first(where: {
+                ($0.exclusive || entry.exclusive) && $0.runID != entry.runID
+                    && (!allowsSameThreadExclusive || $0.threadID != entry.threadID)
+            }) {
                 return holder
             }
             if let index = held.firstIndex(where: { $0.runID == entry.runID }) {

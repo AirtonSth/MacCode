@@ -234,6 +234,24 @@ final class AgentAppEmbeddingTests: XCTestCase {
         XCTAssertTrue(h.runner.requests.isEmpty)
     }
 
+    func test_peerReplyKeepsTheAttributedBotEvenWhereOrdinaryRepliesAreHidden() async throws {
+        let h = try makeHarness(threadWorkspace: nil) { AgentAppEmbedding(pinnedThreadId: $0) }
+        h.vm.selectThread(h.thread.id)
+        await h.vm.waitForSelectThreadHydrationForTesting()
+        XCTAssertFalse(h.vm.supportsReplies)
+        let bot = BotDefinition(handle: "quinn", name: "Quinn", title: "CRM", description: "")
+        h.vm.beginReply(to: AgentMessage(
+            threadId: h.thread.id, role: .assistant,
+            content: BotPeerTranscript.encode(peer: bot, text: "**Inbox** is clear.")
+        ))
+        XCTAssertEqual(h.vm.activeReplyTarget?.peerHandle, "quinn")
+        XCTAssertEqual(h.vm.activeReplyTarget?.peerBotID, bot.id)
+        XCTAssertEqual(h.vm.activeReplyTarget?.excerpt, "Inbox is clear.")
+        h.vm.cancelReply()
+        h.vm.beginReply(to: "Ordinary answer")
+        XCTAssertNil(h.vm.activeReplyTarget)
+    }
+
     func test_sendNoticeReplyReportsAcceptedAndClearsItsOwnDraft() async throws {
         // WHY: a host-accepted notice answer must read as sent (no resend), and the
         // composer must end empty so the card's text is not sent twice.

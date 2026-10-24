@@ -78,12 +78,19 @@ public struct ManagedBotSelfConfigMCP: Sendable {
                         "isError": false,
                     ])
                 }
-                if name == BotSelfConfigCatalog.listPeers || name == BotSelfConfigCatalog.askPeer {
+                let peerMethods = [BotSelfConfigCatalog.listPeers: "bot.peer.list",
+                    BotSelfConfigCatalog.askPeer: "bot.peer.ask", BotSelfConfigCatalog.peerStatus: "bot.peer.status",
+                    BotSelfConfigCatalog.cancelPeer: "bot.peer.cancel"]
+                if let method = peerMethods[name] {
+                    var peerArguments = arguments
+                    if let operationID = peerArguments.removeValue(forKey: "operation_id") as? String {
+                        guard !operationID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                            throw BotSelfConfigError.invalid("operation_id cannot be empty.")
+                        }
+                        peerArguments["client_request_id"] = operationID
+                    }
                     let object = try BotPeerRPCClient(environment: environment).call(
-                        method: name == BotSelfConfigCatalog.listPeers
-                            ? "bot.peer.list"
-                            : "bot.peer.ask",
-                        arguments: arguments
+                        method: method, arguments: peerArguments
                     )
                     return reply(id: id, result: [
                         "content": [["type": "text", "text": encodeJSON(object) ?? "{}"]],

@@ -2,6 +2,31 @@ import XCTest
 @testable import CoreModel
 
 final class BotBrainCompilerTests: XCTestCase {
+    func test_taskGuidanceIsRecordedWithoutRewritingRequestOrDirective() {
+        let bot = BotDefinition(handle: "piper", name: "Piper", title: "Scout", description: "")
+        let revision = BotRevision(
+            botID: bot.id, revisionNumber: 1, name: bot.name, title: bot.title,
+            description: "", soul: "Be brief.", permissionMode: .supervised,
+            desktopKind: .logicalExecutionSpace, digest: "revision"
+        )
+        let request = "  Compare the evidence.\nKeep `limit = 17`; do not publish.  "
+        let directive = "  Required source: files/result.md\n\nDo not repeat the action.  "
+        let receipt = BotBrainCompiler.assemble(
+            bot: bot, revision: revision, userText: request, turnDirective: directive
+        )
+
+        XCTAssertTrue(receipt.compiledPayload.hasSuffix("User request:\n\n" + request))
+        XCTAssertEqual(receipt.layers.first { $0.kind == .user }?.text, request)
+        XCTAssertEqual(receipt.layers.first { $0.id == "bot-delegation" }?.text, directive)
+        XCTAssertTrue(receipt.compiledPayload.contains(directive))
+        let guidance = receipt.layers.first { $0.id == "task-guidance" }
+        XCTAssertEqual(guidance?.text, BotBrainCompiler.taskGuidance)
+        XCTAssertEqual(guidance?.included, true)
+        XCTAssertTrue(receipt.compiledPayload.contains(BotBrainCompiler.taskGuidance))
+        XCTAssertTrue(receipt.compiledPayload.contains("Answer simple requests directly."))
+        XCTAssertTrue(receipt.compiledPayload.contains("not new permission or proof that an action happened"))
+    }
+
     func test_effectivePayloadMatchesComposeAndExcludesForgottenMemory() {
         // WHY: Brain Inspector Effective must be the exact adapter payload.
         // A second compiler path would show Source/Effective that the model never saw.

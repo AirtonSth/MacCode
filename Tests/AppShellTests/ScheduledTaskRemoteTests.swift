@@ -95,6 +95,55 @@ final class ScheduledTaskRemoteTests: XCTestCase {
     }
 
     @MainActor
+    func test_oldBotScheduleSavePreservesOmittedOptionsAndExplicitDestinationClear() async throws {
+        let directory = NSTemporaryDirectory() + "RC2ScheduleLegacy-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        SettingsStore(db: context.db).update { $0.botsControlPlaneEnabled = true }
+        let bot = try context.botStore.create(name: "Writer", title: "", description: "")
+        let otherBot = try context.botStore.create(name: "Other", title: "", description: "")
+        let machine = try context.botStore.saveVirtualMachine(name: "Research")
+        var original = BotScheduleSpec(model: "original")
+        original.executionDestination = .virtualMachine(machine.id)
+        original.distillExecutionMode = .ultrasave
+        original.permissionMode = .autoAcceptEdits
+        original.reasoningModel = "worker"
+        let routine = BotRoutineDefinition(
+            botID: bot.id, name: "Research", prompt: "Summarize", scheduleSpecJSON: original.encodedJSON()
+        )
+        try context.botStore.saveRoutine(routine)
+        var params: [String: JSONValue] = [
+            "client_request_id": .string(UUID().uuidString),
+            "bot_id": .string(bot.id.value.uuidString), "task_id": .string(routine.id.value.uuidString),
+            "title": .string("Updated"), "prompt": .string("Review"),
+            "schedule_spec_json": .string(BotScheduleSpec(model: "updated").encodedJSON()),
+        ]
+        let result = try await router.saveScheduledTaskRemote(params: params)
+        XCTAssertEqual(result.objectValue?["status"], .string("completed"))
+        let saved = try XCTUnwrap(context.botStore.listRoutines(botID: bot.id).first?.definition.scheduleSpec)
+        XCTAssertEqual(saved.model, "updated")
+        XCTAssertEqual(saved.executionDestination, original.executionDestination)
+        XCTAssertEqual(saved.distillExecutionMode, .ultrasave)
+        XCTAssertEqual(saved.permissionMode, .autoAcceptEdits)
+        XCTAssertEqual(saved.reasoningModel, "worker")
+
+        params["client_request_id"] = .string(UUID().uuidString)
+        params["execution_destination"] = .null
+        let cleared = try await router.saveScheduledTaskRemote(params: params)
+        XCTAssertEqual(cleared.objectValue?["status"], .string("completed"))
+        XCTAssertNil(try XCTUnwrap(context.botStore.listRoutines(botID: bot.id).first?.definition.scheduleSpec).executionDestination)
+
+        params["client_request_id"] = .string(UUID().uuidString)
+        params["bot_id"] = .string(otherBot.id.value.uuidString)
+        let rejected = try await router.saveScheduledTaskRemote(params: params)
+        XCTAssertEqual(rejected.objectValue?["status"], .string("failed"))
+        XCTAssertTrue(try context.botStore.listRoutines(botID: otherBot.id).isEmpty)
+        XCTAssertEqual(try context.botStore.listRoutines(botID: bot.id).count, 1)
+    }
+
+    @MainActor
     func test_invalidBotScheduleDoesNotCreateAnUnrunnableTask() async throws {
         let directory = NSTemporaryDirectory() + "RC2InvalidBotSchedule-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: directory) }

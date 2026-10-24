@@ -1631,6 +1631,51 @@ final class BotRemoteControlAuthorityTests: XCTestCase {
         XCTAssertEqual((listed["routines"] as? [[String: Any]])?.count, 1)
     }
 
+    func test_routineUpdatePreservesOmittedOptionsAndHonorsExplicitNull() throws {
+        let owner = try createBotConversation(prefix: "schedule-merge")
+        let botID = BotID(try XCTUnwrap(UUID(uuidString: owner.botID)))
+        var original = BotScheduleSpec(model: "original", distillMainEffortSelection: .fixed(.high))
+        original.executionDestination = .mac
+        original.distillExecutionMode = .ultrasave
+        original.reasoningModel = "worker"
+        original.additionalFrequencies = [ScheduledFrequencyRule(
+            frequency: .weekly, scheduledDate: Date(timeIntervalSince1970: 1_800_000_000)
+        )]
+        let routine = BotRoutineDefinition(
+            botID: botID, name: "Review", prompt: "Review changes", scheduleSpecJSON: original.encodedJSON()
+        )
+        try store.saveRoutine(routine)
+        let incoming = BotScheduleSpec(model: "updated").encodedJSON()
+        var params: [String: Any] = [
+            "client_request_id": "schedule-merge-update", "bot_id": owner.botID,
+            "routine_id": routine.id.value.uuidString, "name": "Review", "prompt": "Review changes",
+            "schedule_spec_json": incoming,
+        ]
+        _ = try authority.dispatch(method: "bot.routine.update", params: params)
+        let saved = try XCTUnwrap(store.listRoutines(botID: botID).first?.definition.scheduleSpec)
+        XCTAssertEqual(saved.model, "updated")
+        XCTAssertEqual(saved.executionDestination, .mac)
+        XCTAssertEqual(saved.distillExecutionMode, .ultrasave)
+        XCTAssertEqual(saved.reasoningModel, "worker")
+        XCTAssertEqual(saved.additionalFrequencies, original.additionalFrequencies)
+        XCTAssertEqual(saved.distillMainEffortSelection, .fixed(.high))
+
+        var clear = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(incoming.utf8)) as? [String: Any])
+        clear["executionDestination"] = NSNull()
+        clear["reasoningModel"] = NSNull()
+        clear["additionalFrequencies"] = NSNull()
+        clear["distillUltracode"] = "ultrafast"
+        params["client_request_id"] = "schedule-merge-clear"
+        params["schedule_spec_json"] = String(decoding: try JSONSerialization.data(withJSONObject: clear), as: UTF8.self)
+        _ = try authority.dispatch(method: "bot.routine.update", params: params)
+        let cleared = try XCTUnwrap(store.listRoutines(botID: botID).first?.definition.scheduleSpec)
+        XCTAssertNil(cleared.executionDestination)
+        XCTAssertNil(cleared.reasoningModel)
+        XCTAssertNil(cleared.additionalFrequencies)
+        XCTAssertEqual(cleared.distillExecutionMode, .ultrafast)
+        XCTAssertEqual(cleared.distillMainEffortSelection, .fixed(.high))
+    }
+
     /// C30: a conversation cleared on the Mac used to fail select / send /
     /// attachment reads with -32084 "Attachment grant does not match…", so
     /// iOS showed attachment copy with nothing attached and never refreshed.

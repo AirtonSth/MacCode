@@ -11,7 +11,7 @@ private let botGroupLog = Logger(subsystem: "io.remotecode.agent", category: "bo
 /// runs a provider; each participant answers on its own hidden member thread
 /// (its own runtime, brain and VM). Turns run one at a time per group, settle
 /// only from their own run's finish, and every room row change is published
-/// once as `agent.message.appended`, every turn change once as
+/// once as `agent.message.appended` or `agent.messages.removed`, every turn change once as
 /// `bot.group.turn.updated`.
 @MainActor
 final class BotGroupOrchestrator: AgentRunObserver {
@@ -508,13 +508,19 @@ final class BotGroupOrchestrator: AgentRunObserver {
             groupTurns: (try? botStore.listGroupTurns(groupID: group.id)) ?? []
         )
         let home = BotHome(appSupportDirectory: appSupportDirectory, bot: bot)
+        let memoryAllowed: Bool
+        do {
+            memoryAllowed = try botStore.globalMemoryUnavailableReason(botID: bot.id, threadID: threadID) == nil
+        } catch {
+            return fail(Self.describe(error), runID: runID)
+        }
         var receipt = BotBrainCompiler.assemble(
             bot: bot,
             revision: revision,
             userText: composition.prompt,
-            memoryFiles: ((try? home.readBootstrapMemory()) ?? []).map {
+            memoryFiles: memoryAllowed ? ((try? home.readBootstrapMemory()) ?? []).map {
                 BotMemoryFileText(path: $0.path, body: $0.body)
-            },
+            } : [],
             skills: (try? botStore.listSkillBindings(botID: bot.id)) ?? [],
             ownedSkills: ((try? home.listOwnedSkills()) ?? []).map {
                 BotOwnedSkillText(slug: $0.slug, body: $0.body)
@@ -727,20 +733,21 @@ final class BotGroupOrchestrator: AgentRunObserver {
             )
             return
         }
+        let isSilent = reply.trimmingCharacters(in: .whitespacesAndNewlines) == BotGroupPromptComposer.silentTurnMarker
         guard let completed = move(
             turn,
             from: [.running],
             to: .completed,
             expectedMemberRunID: runID,
             roomThreadID: roomThreadID,
-            outcome: .reply(reply)
+            outcome: isSilent ? .silent : .reply(reply)
         ) else { return }
         if let seenThrough {
             try? botStore.setGroupParticipantWatermark(
                 groupID: group.id, botID: completed.botID, messageID: seenThrough.id, createdAt: seenThrough.createdAt
             )
         }
-        planHandOff(after: completed, reply: reply, group: group)
+        if !isSilent { planHandOff(after: completed, reply: reply, group: group) }
     }
 
     /// A reply that @mentions participants hands them the floor (next hops).
@@ -810,6 +817,7 @@ final class BotGroupOrchestrator: AgentRunObserver {
 
     private enum RowOutcome {
         case reply(String)
+        case silent
         case needsAttention
         case note(String)
         case waiting
@@ -820,8 +828,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
     static let removedNote = "was removed before answering."
     static let interruptedError = "MacCode closed while this turn was running."
 
-    /// Moves the turn and, with `outcome`, rewrites its room row in the same
-    /// transaction, then publishes the row and the turn once each. Nil when
+    /// Moves the turn and, with `outcome`, rewrites or removes its room row in
+    /// the same transaction, then publishes the row change and turn once each. Nil when
     /// the turn had already moved on, or when the write failed (logged; the
     /// turn keeps its state and its row, and a turn left running is
     /// interrupted with its row at the next launch).
@@ -838,7 +846,9 @@ final class BotGroupOrchestrator: AgentRunObserver {
         roomThreadID: AgentThreadID,
         outcome: RowOutcome? = nil
     ) -> BotGroupTurn? {
-        let row = outcome.map { roomRow(for: turn, roomThreadID: roomThreadID, outcome: $0) }
+        let removesRow: Bool
+        if case .silent? = outcome { removesRow = true } else { removesRow = false }
+        let row = removesRow ? nil : outcome.map { roomRow(for: turn, roomThreadID: roomThreadID, outcome: $0) }
         let moved: BotGroupTurn?
         do {
             moved = try botStore.transitionGroupTurn(
@@ -850,7 +860,10 @@ final class BotGroupOrchestrator: AgentRunObserver {
                 clearMemberRunID: clearMemberRunID,
                 error: error,
                 clearError: clearError,
-                alsoWriting: { _ in if let row { try self.messageRepo.append(row) } }
+                alsoWriting: { _ in
+                    if removesRow { try self.messageRepo.delete(ids: [turn.roomMessageID]) }
+                    else if let row { try self.messageRepo.append(row) }
+                }
             )
         } catch let failure {
             botGroupLog.error("bot.group.turn_move_failed turn=\(turn.id.value.uuidString, privacy: .public) to=\(state.rawValue, privacy: .public) error=\(failure.localizedDescription, privacy: .public)")
@@ -858,6 +871,13 @@ final class BotGroupOrchestrator: AgentRunObserver {
         }
         guard let moved else { return nil }
         if let row { publishRow(row) }
+        if removesRow {
+            EventBus.shared.publish(
+                kind: .agentMessagesRemoved,
+                payload: AppContext.messagesRemovedEventPayload(threadID: roomThreadID, messageIDs: [turn.roomMessageID])
+            )
+            router?.projectTitioInboxRemoval([turn.roomMessageID], threadID: roomThreadID)
+        }
         publishTurn(moved, roomThreadID: roomThreadID)
         return moved
     }
@@ -924,6 +944,8 @@ final class BotGroupOrchestrator: AgentRunObserver {
         case .reply(let text):
             content = BotPeerTranscript.encode(peer: identity, text: text)
             role = .assistant
+        case .silent:
+            preconditionFailure("A silent group turn removes its room row.")
         case .needsAttention:
             content = BotPeerTranscript.encodeActivity(peer: identity, phase: .needsAttention)
             role = .assistant

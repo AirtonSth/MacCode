@@ -90,6 +90,8 @@ final class BotSelfConfigTests: XCTestCase {
             BotSelfConfigCatalog.askUser,
             BotSelfConfigCatalog.listPeers,
             BotSelfConfigCatalog.askPeer,
+            BotSelfConfigCatalog.peerStatus,
+            BotSelfConfigCatalog.cancelPeer,
         ])
 
         let before = try service.call(name: BotSelfConfigCatalog.getSettings)
@@ -3837,6 +3839,7 @@ final class BotSelfConfigTests: XCTestCase {
         let quinn = try store.create(name: "Quinn", title: "Editor", description: "", soul: "Edit.", provider: .claude)
         let appSupport = FileManager.default.temporaryDirectory
             .appendingPathComponent("rc-recall-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
         let piperHome = BotHome(appSupportDirectory: appSupport, bot: piper)
         try piperHome.ensure(
             name: piper.name,
@@ -3846,21 +3849,32 @@ final class BotSelfConfigTests: XCTestCase {
             soul: ""
         )
         try piperHome.writeFile(relativePath: "MEMORY.md", contents: "Piper remembers the indigo vault.\n")
+        try piperHome.writeFile(relativePath: "memory/2020-01-01.md", contents: "The vault uses an indigo key.\n")
         let quinnHome = BotHome(appSupportDirectory: appSupport, bot: quinn)
         try quinnHome.ensure(name: quinn.name, handle: quinn.handle, title: quinn.title, description: "", soul: "")
         try quinnHome.writeFile(relativePath: "MEMORY.md", contents: "Quinn remembers the indigo vault.\n")
 
         let piperThread = UUID()
+        let otherPiperThread = UUID()
         let quinnThread = UUID()
         try insertThread(id: piperThread, title: "Piper chat")
+        try insertThread(id: otherPiperThread, title: "Piper other project")
         try insertThread(id: quinnThread, title: "Quinn chat")
         try insertMessage(thread: piperThread, role: "user", content: "indigo vault from piper thread")
+        try insertMessage(thread: otherPiperThread, role: "user", content: "indigo vault from another project")
         try insertMessage(thread: quinnThread, role: "user", content: "indigo vault from quinn thread")
         try store.upsertConversation(
             BotConversation(
                 botID: piper.id,
                 title: "Desk",
                 linkedAgentThreadID: AgentThreadID(piperThread)
+            )
+        )
+        try store.upsertConversation(
+            BotConversation(
+                botID: piper.id,
+                title: "Other project",
+                linkedAgentThreadID: AgentThreadID(otherPiperThread)
             )
         )
         try store.upsertConversation(
@@ -3873,6 +3887,8 @@ final class BotSelfConfigTests: XCTestCase {
 
         let piperService = BotSelfConfigService(
             callerBotID: piper.id,
+            callerThreadID: AgentThreadID(piperThread),
+            callerRunID: AgentRunID(),
             store: store,
             appSupportDirectory: appSupport
         )
@@ -3884,6 +3900,135 @@ final class BotSelfConfigTests: XCTestCase {
         XCTAssertTrue(rows.contains { $0["source"] == "MEMORY.md" })
         XCTAssertTrue(rows.contains { ($0["snippet"] ?? "").contains("piper thread") })
         XCTAssertFalse(rows.contains { ($0["snippet"] ?? "").contains("quinn thread") })
+        XCTAssertFalse(rows.contains { ($0["snippet"] ?? "").contains("another project") })
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(rows.first?["match_kind"], "exact_phrase")
+        XCTAssertEqual(rows.last?["source"], "memory/2020-01-01.md")
+        XCTAssertEqual(rows.last?["match_kind"], "all_terms")
+        XCTAssertTrue(rows.allSatisfy { $0["bot_id"] == piper.id.value.uuidString.lowercased() })
+        let conversation = try XCTUnwrap(rows.first { $0["source_kind"] == "conversation" })
+        XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(conversation["message_id"])))
+        XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(conversation["conversation_id"])))
+        XCTAssertEqual(conversation["digest"], RemoteCodeHostCatalog.bodyDigest("indigo vault from piper thread"))
+        XCTAssertEqual(hits["truncated"] as? Bool, false)
+
+        let reordered = try piperService.recall(query: "vault indigo", scope: "both")
+        XCTAssertEqual((reordered["hits"] as? [[String: String]])?.count, 3)
+        let previousDigest = rows.first { $0["source"] == "MEMORY.md" }?["digest"]
+        try piperHome.writeFile(relativePath: "MEMORY.md", contents: "Piper corrected the indigo location to cedar.\n")
+        let corrected = try piperService.recall(query: "cedar indigo", scope: "memory")
+        let correctedRows = try XCTUnwrap(corrected["hits"] as? [[String: String]])
+        XCTAssertEqual(correctedRows.count, 1)
+        XCTAssertNotEqual(correctedRows.first?["digest"], previousDigest)
+        let old = try piperService.recall(query: "indigo vault", scope: "memory")
+        XCTAssertFalse((old["hits"] as? [[String: String]] ?? []).contains { $0["source"] == "MEMORY.md" })
+    }
+
+    func test_workspaceRecallOmitsGlobalMemoryAndKeepsAuthorizedConversationAndSkills() throws {
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", soul: "Keep the identity.")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("rc-memory-scope-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let legacy = BotSelfConfigService(callerBotID: bot.id, store: store, appSupportDirectory: directory)
+        _ = try legacy.writeHomeFile(path: "MEMORY.md", contents: "indigo global fact")
+        let workspaceID = WorkspaceID()
+        let context = BotContext.workspace(workspaceID)
+        let grant = try store.grantContext(hostID: "memory-test", botID: bot.id, context: context,
+            actions: [.read, .send, .memory], expectedRevision: nil)
+        let thread = AgentThread(workspaceId: workspaceID, title: "Workspace", provider: .distill, model: "distill")
+        _ = try store.createContextualConversation(
+            BotConversation(botID: bot.id, title: thread.title, linkedAgentThreadID: thread.id),
+            newThread: thread, hostID: grant.hostID, context: context, policyRevision: grant.policyRevision)
+        try AgentMessageRepository(db: db).append(AgentMessage(
+            threadId: thread.id, role: .user, content: "indigo fact in this conversation"
+        ))
+        let service = BotSelfConfigService(callerBotID: bot.id, callerThreadID: thread.id,
+            callerRunID: AgentRunID(), store: store, appSupportDirectory: directory)
+
+        let result = try service.recall(query: "indigo", scope: "both")
+        let hits = try XCTUnwrap(result["hits"] as? [[String: String]])
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(hits.first?["source_kind"], "conversation")
+        XCTAssertEqual(result["memory_available"] as? Bool, false)
+        XCTAssertTrue((result["memory_unavailable_reason"] as? String)?.contains("workspace") == true)
+        XCTAssertEqual(result["truncated"] as? Bool, true)
+        XCTAssertTrue(result["omitted_memory_files"] is NSNull)
+        XCTAssertThrowsError(try service.recall(query: "indigo", scope: "memory"))
+        XCTAssertThrowsError(try service.writeHomeFile(path: "MEMORY.md", contents: "workspace replacement"))
+        let snapshot = try service.writeHomeFile(path: "skills/review/SKILL.md", contents: "Review the sources.")
+        XCTAssertTrue(snapshot.memory.isEmpty)
+        XCTAssertEqual(snapshot.memoryAvailable, false)
+        XCTAssertEqual(snapshot.name, bot.name)
+        XCTAssertEqual(snapshot.soul, "Keep the identity.")
+        XCTAssertEqual(snapshot.skills.map(\.skillID), ["review"])
+        XCTAssertEqual(try service.viewSkill(skillID: "review")["body"] as? String, "Review the sources.")
+        XCTAssertEqual(try legacy.snapshot().memory.first { $0.id == "MEMORY.md" }?.content, "indigo global fact")
+
+        _ = try store.revokeContext(hostID: grant.hostID, botID: bot.id, context: context,
+            expectedRevision: grant.policyRevision)
+        XCTAssertThrowsError(try service.recall(query: "indigo", scope: "both"), "Revocation also protects conversation history")
+    }
+
+    func test_generalMemoryRequiresCurrentGrantForReadsAndWrites() throws {
+        let bot = try store.create(name: "Piper", title: "Scout", description: "")
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("rc-memory-grant-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let legacy = BotSelfConfigService(callerBotID: bot.id, store: store, appSupportDirectory: directory)
+        _ = try legacy.writeHomeFile(path: "MEMORY.md", contents: "indigo global fact")
+        func service(for grant: BotContextBinding) throws -> BotSelfConfigService {
+            let thread = AgentThread(workspaceId: nil, title: "General", provider: .distill, model: "distill")
+            _ = try store.createContextualConversation(
+                BotConversation(botID: bot.id, title: thread.title, linkedAgentThreadID: thread.id),
+                newThread: thread, hostID: grant.hostID, context: .general, policyRevision: grant.policyRevision)
+            return BotSelfConfigService(callerBotID: bot.id, callerThreadID: thread.id,
+                callerRunID: AgentRunID(), store: store, appSupportDirectory: directory)
+        }
+        let deniedGrant = try store.grantContext(hostID: "memory-test", botID: bot.id, context: .general,
+            actions: [.read, .send], expectedRevision: nil)
+        let denied = try service(for: deniedGrant)
+        XCTAssertTrue(try denied.snapshot().memory.isEmpty)
+        XCTAssertThrowsError(try denied.recall(query: "indigo", scope: "memory"))
+        XCTAssertThrowsError(try denied.writeHomeFile(path: "USER.md", contents: "A user fact"))
+
+        let granted = try store.grantContext(hostID: deniedGrant.hostID, botID: bot.id, context: .general,
+            actions: [.read, .send, .memory], expectedRevision: deniedGrant.policyRevision)
+        let authorized = try service(for: granted)
+        XCTAssertEqual(try authorized.snapshot().memoryAvailable, true)
+        XCTAssertEqual((try authorized.recall(query: "indigo", scope: "memory")["hits"] as? [[String: String]])?.count, 1)
+        _ = try authorized.writeHomeFile(path: "MEMORY.md", contents: "indigo corrected fact")
+        XCTAssertEqual(try legacy.snapshot().memory.first { $0.id == "MEMORY.md" }?.content, "indigo corrected fact")
+        _ = try store.revokeContext(hostID: granted.hostID, botID: bot.id, context: .general,
+            expectedRevision: granted.policyRevision)
+        XCTAssertThrowsError(try authorized.snapshot())
+        XCTAssertThrowsError(try authorized.recall(query: "indigo", scope: "memory"))
+        XCTAssertThrowsError(try authorized.writeHomeFile(path: "MEMORY.md", contents: "revoked write"))
+        XCTAssertEqual(try legacy.snapshot().memory.first { $0.id == "MEMORY.md" }?.content, "indigo corrected fact")
+    }
+
+    func test_recallReportsBoundedMemorySearchAndRejectsUnknownScope() throws {
+        let bot = try store.create(name: "Piper", title: "Scout", description: "", provider: .claude)
+        let appSupport = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-recall-limits-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let home = BotHome(appSupportDirectory: appSupport, bot: bot)
+        try home.ensure(name: bot.name, handle: bot.handle, title: bot.title, description: "", soul: "")
+        try home.writeFile(
+            relativePath: "MEMORY.md",
+            contents: String(repeating: "x", count: BotHome.recallMemoryByteLimit + 1) + " indigo vault"
+        )
+        for index in 0...BotHome.recallMemoryFileLimit {
+            try home.writeFile(relativePath: "memory/2020-01-01-note-\(index).md", contents: "indigo vault note \(index)")
+        }
+        let service = BotSelfConfigService(callerBotID: bot.id, store: store, appSupportDirectory: appSupport)
+        let result = try service.recall(query: "indigo vault", scope: "memory")
+        let rows = try XCTUnwrap(result["hits"] as? [[String: String]])
+
+        XCTAssertEqual(rows.count, 12)
+        XCTAssertEqual(result["truncated"] as? Bool, true)
+        XCTAssertEqual(result["omitted_memory_files"] as? Int, 3)
+        XCTAssertFalse(rows.contains { $0["source"] == "MEMORY.md" })
+        XCTAssertThrowsError(try service.recall(query: "indigo vault", scope: "everything")) { error in
+            XCTAssertEqual(error as? BotSelfConfigError, .invalid("scope must be memory, conversations, or both."))
+        }
     }
 
     func test_askUserWritesQuestionAndReturns() throws {

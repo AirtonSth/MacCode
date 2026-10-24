@@ -39,7 +39,7 @@ enum BotPeerRPCError: Error, CustomStringConvertible, Equatable {
 struct BotPeerRPCClient {
     static let maximumResponseBytes = 2 * 1_024 * 1_024
     private static let durablePeerMethods: Set<String> = [
-        "bot.peer.ask", "bot.peer.self_config",
+        "bot.peer.ask", "bot.peer.self_config", "bot.peer.cancel",
     ]
 
     enum Budget: String, Equatable, Sendable {
@@ -84,7 +84,7 @@ struct BotPeerRPCClient {
         guard Self.durablePeerMethods.contains(method) else {
             return try callOnce(method: method, params: params, context: context, budget: budget)
         }
-        let clientRequestID = UUID().uuidString.lowercased()
+        let clientRequestID = (params["client_request_id"] as? String) ?? UUID().uuidString.lowercased()
         params["client_request_id"] = clientRequestID
         do {
             return try callOnce(method: method, params: params, context: context, budget: budget)
@@ -164,6 +164,10 @@ struct BotPeerRPCClient {
             throw BotPeerRPCError.invalidResponse
         }
         if let error = object["error"] as? [String: Any] {
+            if error["data"] != nil, let data = try? JSONSerialization.data(withJSONObject: error, options: [.sortedKeys]),
+               let structured = String(data: data, encoding: .utf8) {
+                throw BotPeerRPCError.remote(structured)
+            }
             throw BotPeerRPCError.remote(error["message"] as? String ?? "Bot delegation failed.")
         }
         guard let result = object["result"] else {

@@ -84,12 +84,12 @@ public struct BotHome: Sendable {
         title: String,
         description: String,
         soul: String,
-        legacyFacts: [String] = []
+        legacyFacts: [String] = [],
+        initializeMemory: Bool = true
     ) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: skillsURL, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: filesURL, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: memoryDirectoryURL, withIntermediateDirectories: true)
         try writeIdentity(name: name, handle: handle, title: title)
         if !FileManager.default.fileExists(atPath: descriptionURL.path) {
             try writeDescription(description)
@@ -97,9 +97,12 @@ public struct BotHome: Sendable {
         if !FileManager.default.fileExists(atPath: soulURL.path) {
             try writeSoul(soul)
         }
-        try migrateLegacyMemoryIfNeeded(legacyFacts: legacyFacts)
-        if !FileManager.default.fileExists(atPath: memoryURL.path) {
-            try writeAtomic(Self.memoryStarter + "\n", to: memoryURL)
+        if initializeMemory {
+            try FileManager.default.createDirectory(at: memoryDirectoryURL, withIntermediateDirectories: true)
+            try migrateLegacyMemoryIfNeeded(legacyFacts: legacyFacts)
+            if !FileManager.default.fileExists(atPath: memoryURL.path) {
+                try writeAtomic(Self.memoryStarter + "\n", to: memoryURL)
+            }
         }
     }
 
@@ -236,6 +239,52 @@ public struct BotHome: Sendable {
             files.append(contentsOf: try dailyNotes(dayPrefix: day))
         }
         return files
+    }
+
+    static let recallMemoryFileLimit = 64
+    static let recallMemoryByteLimit = 256 * 1024
+
+    /// Recall includes older daily notes, without injecting them into every
+    /// turn. Read whole files only; skipped files make the search incomplete.
+    func readRecallMemory() throws -> (files: [MemoryFile], omittedCount: Int) {
+        let manager = FileManager.default
+        var paths = [Self.userMemoryName, Self.memoryName].filter {
+            manager.fileExists(atPath: root.appendingPathComponent($0).path)
+        }
+        if manager.fileExists(atPath: memoryDirectoryURL.path) {
+            paths += try manager.contentsOfDirectory(atPath: memoryDirectoryURL.path)
+                .map { "\(Self.memoryDirectoryName)/\($0)" }
+                .filter(Self.isWritableMemoryPath)
+                .sorted(by: >)
+        }
+        var files: [MemoryFile] = []
+        var remainingBytes = Self.recallMemoryByteLimit
+        var omitted = max(0, paths.count - Self.recallMemoryFileLimit)
+        for path in paths.prefix(Self.recallMemoryFileLimit) {
+            let url = try resolvedURL(path)
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            guard values.isRegularFile == true,
+                  remainingBytes > 0,
+                  (values.fileSize ?? 0) <= remainingBytes else {
+                omitted += 1
+                continue
+            }
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let data = try handle.read(upToCount: remainingBytes + 1) ?? Data()
+            guard data.count <= remainingBytes else {
+                omitted += 1
+                continue
+            }
+            guard let body = String(data: data, encoding: .utf8) else {
+                throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [NSFilePathErrorKey: url.path])
+            }
+            remainingBytes -= data.count
+            if !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                files.append(MemoryFile(path: path, body: body))
+            }
+        }
+        return (files, omitted)
     }
 
     // PERF: memory-path guard recompiled its regex via range(of:options:

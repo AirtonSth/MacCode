@@ -71,6 +71,7 @@ extension AppCommandRouter {
     /// Frees a claim whose run never started and hands the VM to the next
     /// queued thread, as the run-finished callback does for a started run.
     func releaseBotVMRun(_ runID: AgentRunID) {
+        guard context?.botGuestRunResolver?.retainsExclusiveVMClaim(runID: runID) != true else { return }
         guard let next = BotVMRunRegistry.shared.releaseAndNextWaiter(runID: runID) else { return }
         Task { @MainActor [weak self] in await self?.handOffBotVM(botID: next.botID, to: next.threadID) }
     }

@@ -246,7 +246,7 @@ public enum HostMutationContract {
     /// catalog. Only the authenticated Unix entry point may route them here.
     static let managedProviderMutationMethods =
         RemoteCodeHostCatalog.rpcMutationMethods.union([
-            "bot.peer.ask", "bot.peer.self_config",
+            "bot.peer.ask", "bot.peer.self_config", "bot.peer.cancel",
         ])
 
     public static func preflight(method: String, params: [String: JSONValue]) throws {
@@ -466,8 +466,10 @@ public enum HostMutationContract {
                 return [
                     .uuid("thread_id"), .uuid("run_id"), .string("handle"), .string("prompt"),
                     .stringEnum("reply_mode", ["consult", "reply_only"]),
-                    .optionalUUID(BotPeerDelegation.consultationIDParameterKey),
+                    .optionalUUID(BotPeerDelegation.consultationIDParameterKey), .optionalBool("wait"),
                 ]
+            case "bot.peer.cancel":
+                return [.uuid("thread_id"), .uuid("run_id"), .uuid("activity_id"), .optionalBool("wait")]
             case "bot.peer.self_config":
                 return [
                     .uuid("thread_id"), .uuid("run_id"), .string("tool_name"), .object("arguments"),

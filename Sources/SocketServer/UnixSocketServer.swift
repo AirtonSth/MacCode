@@ -64,6 +64,7 @@ public final class UnixSocketServer: @unchecked Sendable {
     var outboundWriteWillBeginForTesting: (@Sendable (Data) -> Void)?
     /// Latest peer-progress timestamp for `bot.peer.ask` (thread_id, run_id).
     public var botPeerAskProgress: (@Sendable (String, String) -> Date?)?
+    public var botPeerActivityProgress: (@Sendable (String, String) -> Date?)?
     var listenFDForTesting: Int32 {
         lifecycleLock.lock(); defer { lifecycleLock.unlock() }
         return listenFD
@@ -549,7 +550,9 @@ public final class UnixSocketServer: @unchecked Sendable {
             semaphore.signal()
         }
         let requestTimeout: DispatchTimeInterval
-        if req.method == "bot.peer.ask" {
+        let waitsForPeer = req.method == "bot.peer.ask"
+            || (req.method == "bot.peer.status" && req.params?["wait"]?.boolValue == true)
+        if waitsForPeer {
             requestTimeout = botPeerAskRequestTimeout
         } else if req.method == "agent.message.send"
             || RemoteCodeHostCatalog.usesUnixCatalogDeadline(req.method) {
@@ -557,7 +560,7 @@ public final class UnixSocketServer: @unchecked Sendable {
         } else {
             requestTimeout = localRequestTimeout
         }
-        if req.method == "bot.peer.ask" {
+        if waitsForPeer {
             guard waitForBotPeerAsk(
                 semaphore: semaphore,
                 timeout: requestTimeout,
@@ -600,7 +603,10 @@ public final class UnixSocketServer: @unchecked Sendable {
                 return true
             }
             if task.isCancelled { return false }
-            if let progress = botPeerAskProgress?(threadID, runID),
+            let progress = req.method == "bot.peer.status"
+                ? botPeerActivityProgress?(threadID, req.params?["activity_id"]?.stringValue ?? "")
+                : botPeerAskProgress?(threadID, runID)
+            if let progress,
                progress > lastProgress {
                 lastProgress = progress
                 _ = outbound.enqueue(Data([BotPeerDelegation.peerConsultationKeepaliveByte]))

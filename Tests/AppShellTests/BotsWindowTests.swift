@@ -7855,6 +7855,11 @@ final class BotsWindowTests: XCTestCase {
         let restored = try JSONDecoder().decode(BotDeskRouting.self, from: JSONEncoder().encode(routing))
         XCTAssertEqual(restored.distillExecutionMode, .ultrasave)
         XCTAssertEqual(restored.modelSelection.distillExecutionMode, .ultrasave, "first-thread model selection must receive the mode")
+        XCTAssertNil(restored.modelSelection.distillMainEffortSelection,
+            "an omitted effort must not become an unsupported fixed effort in Desk or group runs")
+        let scheduled = BotsViewModel.routineRouting(BotScheduleSpec(), base: routing)
+        XCTAssertNil(scheduled.modelSelection.distillMainEffortSelection,
+            "scheduled Bot runs must preserve the same omitted effort")
 
         let legacy = Data(#"{"provider":"distill","providerInstanceID":"distill","model":"main-a","routingMode":"manual","permissionMode":"supervised"}"#.utf8)
         XCTAssertEqual(try JSONDecoder().decode(BotDeskRouting.self, from: legacy).distillExecutionMode, .auto)
@@ -7953,6 +7958,7 @@ final class BotsWindowTests: XCTestCase {
 
         XCTAssertEqual(restoredFirst.reasoningModel, "grok-4.5")
         XCTAssertEqual(restoredFirst.distillMainEffortSelection, .fixed(.high))
+        XCTAssertEqual(restoredFirst.modelSelection.distillMainEffortSelection, .fixed(.high))
         XCTAssertEqual(restoredFirst.distillReasoningEffortSelection, .automatic)
         XCTAssertNil(restoredSecond.reasoningModel)
         XCTAssertEqual(restoredSecond.distillMainEffortSelection, .automatic)

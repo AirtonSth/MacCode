@@ -23,6 +23,40 @@ final class AgentReplyQuoteTargetTests: XCTestCase {
         )
     }
 
+    func test_peerReplyKeepsExplicitAddressAndJumpsToTheRightBotWhenBodiesMatch() throws {
+        let bot = BotDefinition(handle: "quinn", name: "Quinn", title: "CRM", description: "")
+        let quinn = message(.assistant, "[[rc:bot-from:quinn|Quinn|CRM|circle]]\n**Inbox** is clear.")
+        let sage = message(.assistant, "[[rc:bot-from:sage|Sage|Review|circle]]\n**Inbox** is clear.", at: 1)
+        let sageQuote = message(.assistant, "[[rc:bot-from:sage|Sage|Review|circle]]\nI agree with @quinn: Inbox is clear.", at: 2)
+        let target = AgentReplyTarget(threadId: thread, excerpt: "Inbox is clear.", peerHandle: "quinn", peerBotID: bot.id)
+        let reply = message(.user, target.compose(text: "What changed?", bots: [bot]), at: 3)
+        let quote = try XCTUnwrap(AgentReplyQuote.parse(reply.content))
+        XCTAssertEqual(quote.excerpt, "@quinn: Inbox is clear.")
+        XCTAssertEqual(quote.body, "@quinn What changed?")
+        XCTAssertEqual(
+            AgentReplyQuoteTarget.messageID(for: quote.excerpt, in: [quinn, sage, sageQuote, reply], before: reply.id),
+            quinn.id
+        )
+        XCTAssertNil(AgentReplyQuoteTarget.messageID(for: quote.excerpt, in: [sageQuote, reply], before: reply.id))
+        XCTAssertEqual(
+            AgentReplyTarget(threadId: thread, excerpt: "Inbox is clear.").compose(text: "Thanks"),
+            AgentReplyQuote.compose(excerpt: "Inbox is clear.", text: "Thanks")
+        )
+    }
+
+    func test_peerReplyUsesStableIdentityAfterRenameAndDoesNotAddressReusedOrMissingHandles() throws {
+        let botID = BotID()
+        let renamed = BotDefinition(id: botID, handle: "quinn2", name: "Quinn", title: "CRM", description: "")
+        let reused = BotDefinition(handle: "quinn", name: "Other", title: "", description: "")
+        let target = AgentReplyTarget(threadId: thread, excerpt: "Inbox is clear.", peerHandle: "quinn", peerBotID: botID)
+        let renamedQuote = try XCTUnwrap(AgentReplyQuote.parse(target.compose(text: "What changed?", bots: [reused, renamed])))
+        XCTAssertEqual(renamedQuote.excerpt, "@quinn: Inbox is clear.")
+        XCTAssertEqual(renamedQuote.body, "@quinn2 What changed?")
+        XCTAssertEqual(AgentReplyQuote.parse(target.compose(text: "What changed?", bots: [reused]))?.body, "What changed?")
+        let legacy = AgentReplyTarget(threadId: thread, excerpt: "Inbox is clear.", peerHandle: "quinn")
+        XCTAssertEqual(AgentReplyQuote.parse(legacy.compose(text: "What changed?", bots: [reused]))?.body, "What changed?")
+    }
+
     func test_ignoresTrailingEllipsisOfClippedExcerpt() {
         // WHY: long excerpts are clipped with "…"; the clipped text must still match its source.
         let answer = message(.assistant, "The build failed on the signing step.", at: 0)

@@ -232,6 +232,9 @@ public protocol CommandRouting: AnyObject {
     func listBotPeers(callerThread: AgentThreadID, callerRun: AgentRunID, delegationCapability: String?) throws -> JSONValue
     func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, delegationCapability: String?) async throws -> JSONValue
     func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, consultationID: UUID?, delegationCapability: String?) async throws -> JSONValue
+    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, consultationID: UUID?, wait: Bool, delegationCapability: String?) async throws -> JSONValue
+    func observeBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, activityID: UUID, wait: Bool, cancel: Bool, delegationCapability: String?) async throws -> JSONValue
+    func validateBotPeerReceipt(callerThread: AgentThreadID, result: JSONValue) throws
     func invokeDelegatedBotSelfConfig(callerThread: AgentThreadID, callerRun: AgentRunID, toolName: String, arguments: [String: JSONValue], delegationCapability: String?) throws -> JSONValue
     func authenticateManagedHostCall(threadID: AgentThreadID, runID: AgentRunID, delegationCapability: String?, mutation: Bool, method: String) throws
     /// True when the thread belongs to Titio, the only caller admitted to `host.call`.
@@ -517,6 +520,20 @@ public extension CommandRouting {
 
     func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, delegationCapability: String?) async throws -> JSONValue {
         throw JSONRPCError.notSupported("Bot delegation")
+    }
+
+    func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, consultationID: UUID?, wait: Bool, delegationCapability: String?) async throws -> JSONValue {
+        guard wait else { throw JSONRPCError.notSupported("Asynchronous Bot delegation") }
+        return try await askBotPeer(callerThread: callerThread, callerRun: callerRun, handle: handle,
+            prompt: prompt, replyMode: replyMode, consultationID: consultationID, delegationCapability: delegationCapability)
+    }
+
+    func observeBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, activityID: UUID, wait: Bool, cancel: Bool, delegationCapability: String?) async throws -> JSONValue {
+        throw JSONRPCError.notSupported("Bot activity observation")
+    }
+
+    func validateBotPeerReceipt(callerThread: AgentThreadID, result: JSONValue) throws {
+        throw JSONRPCError.notSupported("Bot receipt authorization")
     }
 
     func askBotPeer(callerThread: AgentThreadID, callerRun: AgentRunID, handle: String, prompt: String, replyMode: BotPeerDelegation.ReplyMode, consultationID: UUID?, delegationCapability: String?) async throws -> JSONValue {
@@ -916,11 +933,11 @@ public final class JSONRPCDispatcher {
     @TaskLocal private static var managedProviderSocketAuthenticated = false
     private nonisolated static let managedProviderSocketMethods =
         RemoteCodeHostCatalog.rpcMethods.union([
-            "bot.peer.list", "bot.peer.ask", "bot.peer.self_config",
+            "bot.peer.list", "bot.peer.ask", "bot.peer.self_config", "bot.peer.status", "bot.peer.cancel",
             "bot.peer.receipt.status",
         ])
     nonisolated static let managedPeerReceiptMethods: Set<String> = [
-        "bot.peer.ask", "bot.peer.self_config",
+        "bot.peer.ask", "bot.peer.self_config", "bot.peer.cancel",
     ]
     /// Bounded unknown-outcome fence (same cap as committed receipts). Does not
     /// store request payloads or secrets — only owner fingerprint + params hash.
@@ -1803,6 +1820,8 @@ public final class JSONRPCDispatcher {
                 && peerReceiptMethod.map(Self.managedPeerReceiptMethods.contains) == true)
         let isPeer = req.method == "bot.peer.list"
             || req.method == "bot.peer.ask"
+            || req.method == "bot.peer.status"
+            || req.method == "bot.peer.cancel"
             || req.method == "bot.peer.self_config"
             || isPeerReceiptStatus
         let isHost = RemoteCodeHostCatalog.rpcMethods.contains(req.method)
@@ -2330,6 +2349,9 @@ public final class JSONRPCDispatcher {
                     requiresSnapshot: true
                 )
             }
+            do { try validatePeerReceipt(method: req.method, params: params, result: result) }
+            catch let error as JSONRPCError { return .init(id: req.id, error: error) }
+            catch { return .init(id: req.id, error: Self.mapDomainError(error, method: req.method)) }
             return .init(id: req.id, result: result)
         case .unknown:
             return receiptFailure(
@@ -2456,6 +2478,10 @@ public final class JSONRPCDispatcher {
                 ownerFingerprint: context.ownerFingerprint,
                 paramsHash: paramsHash
             )
+            if Self.managedPeerReceiptMethods.contains(req.method),
+               response.error?.data?.objectValue?["activity_id"]?.stringValue != nil {
+                return response
+            }
             return receiptFailure(
                 id: req.id,
                 code: -32095,
@@ -2525,6 +2551,9 @@ public final class JSONRPCDispatcher {
                 success: true,
                 latencyMilliseconds: Self.elapsedMilliseconds(since: finalizationStarted)
             )
+            do { try validatePeerReceipt(method: req.method, params: params, result: committedResult) }
+            catch let error as JSONRPCError { return .init(id: req.id, error: error) }
+            catch { return .init(id: req.id, error: Self.mapDomainError(error, method: req.method)) }
             return successfulResponse
         } catch {
             commandReceiptMetrics.recordFinalization(
@@ -2707,9 +2736,20 @@ public final class JSONRPCDispatcher {
                     requiresSnapshot: true
                 )
             }
+            do { try validatePeerReceipt(method: method, params: peerIdentity ?? [:], result: committed) }
+            catch let error as JSONRPCError { return .init(id: req.id, error: error) }
+            catch { return .init(id: req.id, error: Self.mapDomainError(error, method: method)) }
             result["result"] = committed
         }
         return .init(id: req.id, result: .object(result))
+    }
+
+    private func validatePeerReceipt(method: String, params: [String: JSONValue], result: JSONValue) throws {
+        guard method == "bot.peer.ask" || method == "bot.peer.cancel" else { return }
+        guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else {
+            throw JSONRPCError.invalidParams
+        }
+        try router.validateBotPeerReceipt(callerThread: threadID, result: result)
     }
 
     /// HTTP-authoritative mutation identity.
@@ -3633,9 +3673,20 @@ public final class JSONRPCDispatcher {
                         prompt: prompt,
                         replyMode: replyMode,
                         consultationID: consultationID,
+                        wait: params["wait"]?.boolValue ?? true,
                         delegationCapability: params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue
                     )
                 )
+            case "bot.peer.status", "bot.peer.cancel":
+                guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init),
+                      let activityID = params["activity_id"]?.stringValue.flatMap(UUID.init) else {
+                    throw JSONRPCError.invalidParams
+                }
+                return .init(id: id, result: try await router.observeBotPeer(
+                    callerThread: threadID, callerRun: runID, activityID: activityID,
+                    wait: params["wait"]?.boolValue ?? false, cancel: req.method == "bot.peer.cancel",
+                    delegationCapability: params[BotPeerDelegation.capabilityRPCParameterKey]?.stringValue))
             case "bot.peer.self_config":
                 guard let threadID = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let runID = params["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init),
@@ -5424,6 +5475,9 @@ public final class JSONRPCDispatcher {
             }
             return .init(id: id, error: Self.mapDomainError(rejection.underlying, method: req.method))
         } catch let e as JSONRPCError {
+            if req.method == "bot.peer.ask", e.data?.objectValue?["admission"] == .string("rejected") {
+                Self.definiteRejectionRecorder?.rejected = true
+            }
             return .init(id: id, error: e)
         } catch {
             // UX-005: map known domain errors to a stable code + concise,

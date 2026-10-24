@@ -197,7 +197,7 @@ public struct BotDeskRouting: Equatable, Codable {
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier,
             distillMainEffortSelection: provider == .distill
-                ? (distillMainEffortSelection ?? .fixed(reasoningEffort)) : nil,
+                ? distillMainEffortSelection : nil,
             distillReasoningEffortSelection: provider == .distill
                 ? (distillReasoningEffortSelection ?? .automatic) : nil,
             distillExecutionMode: provider == .distill ? distillExecutionMode : .normal
@@ -611,6 +611,7 @@ private struct BotPeerRunPlan {
     let attachments: [AgentAttachment]
     let providerSnapshots: [AgentProviderSnapshot]
     let executionCwd: String?
+    var nestedRunContext: AgentNestedRunContext? = nil
 
     func receipt(userText: String) -> ContextAssemblyReceipt {
         BotBrainCompiler.assemble(
@@ -626,7 +627,8 @@ private struct BotPeerRunPlan {
             conversationID: started.conversation.id,
             liveRunMode: started.routing.permissionMode,
             runProvider: started.routing.provider,
-            runModel: started.routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:))
+            runModel: started.routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
+            runsInGuest: started.thread.executionTarget == .vm
         )
     }
 }
@@ -654,6 +656,7 @@ private struct BotPeerExecutionPlan {
     let peerRun: BotPeerRunPlan
     let peerReceipt: ContextAssemblyReceipt
     let host: BotPeerHostContinuation?
+    var deadline: Date? = nil
 }
 
 private struct BotPeerHandoffDelta {
@@ -820,7 +823,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     private var armedRunIDs: Set<AgentRunID> = []
     private var exactRunWaiters: [AgentRunID: [CheckedContinuation<AgentRun?, Never>]] = [:]
     private var observedTerminalRuns: [AgentRunID: AgentRun] = [:]
-    private var agentAppDispatchWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
+    private var agentAppDispatchWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
     /// EV-21: stamped from the coordinator's stream thread for EVERY event of
     /// EVERY run (~90/s with 3 runs). It used to be MainActor state written via
     /// `Task { @MainActor }`, i.e. one main-queue hop per token. A lock-guarded
@@ -913,7 +916,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
 
     deinit {
         tasksByActivityID.values.forEach { $0.cancel() }
-        agentAppDispatchWaiters.values.flatMap { $0 }.forEach { $0.resume() }
+        agentAppDispatchWaiters.values.flatMap { $0.values }.forEach { $0.resume() }
         if let peerQueueLifecycleSubscription {
             EventBus.shared.unsubscribe(peerQueueLifecycleSubscription)
         }
@@ -1023,7 +1026,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         ) != nil else {
             throw JSONRPCError(
                 code: -32050,
-                message: "The consultation id is not valid for this active run and Bot."
+                message: "The consultation id is not valid for this conversation and Bot."
             )
         }
         activeConsultationClaims.insert(consultationID)
@@ -1043,7 +1046,6 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             $0.consultationID == consultationID
                 && $0.peerBotID == peerBotID
                 && $0.hostThreadID == callerThread
-                && $0.hostRunID == hostRunID
                 && $0.requiresHostContinuation
                 && ($0.phase == .peerCompleted || $0.phase == .completed)
         }
@@ -1056,27 +1058,285 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
               conversation.botID == peerBotID,
               let peerThreadID = handoff.peerThreadID,
               conversation.linkedAgentThreadID == peerThreadID,
-              (try? threadRepo.status(of: peerThreadID)) != nil else {
+              (try? threadRepo.status(of: peerThreadID)) != nil,
+              coordinator.activeRunId(threadId: peerThreadID) == nil,
+              !coordinator.hasPendingProviderStart(threadId: peerThreadID),
+              contextAllows(threadID: callerThread, action: .send),
+              contextAllows(threadID: peerThreadID, action: .send),
+              (try? botStore.get(id: peerBotID))?.deletedAt == nil else {
             return nil
         }
         return handoff
     }
 
+    private func contextAllows(threadID: AgentThreadID, action: BotContextAction) -> Bool {
+        do {
+            guard let pin = try botStore.conversationContextPin(linkedTo: threadID) else { return true }
+            return try botStore.authorizes(hostID: pin.hostID, botID: pin.botID,
+                context: pin.context, action: action, policyRevision: pin.policyRevision)
+        } catch { return false }
+    }
+
+    private func handoffAllows(_ row: PersistedBotPeerHandoff, action: BotContextAction) -> Bool {
+        guard let peer = try? botStore.get(id: row.peerBotID), peer.deletedAt == nil,
+              row.peerThreadID != nil,
+              handoffContextAllows(row, action: action) else { return false }
+        if let runID = row.hostRunID, let status = try? runRepo.status(of: runID),
+           status == .cancelled || status == .interrupted || status == .failed { return false }
+        return true
+    }
+
+    // A captured reply is history, even when its unscoped Bot or runtime no
+    // longer exists. Context grants still govern every protected projection.
+    private func handoffContextAllows(_ row: PersistedBotPeerHandoff, action: BotContextAction) -> Bool {
+        if let peerThreadID = row.peerThreadID,
+           !contextAllows(threadID: peerThreadID, action: action) { return false }
+        let source = row.hostThreadID ?? row.originAgentThreadID
+        if let source, !contextAllows(threadID: source, action: action) { return false }
+        if let source,
+           let sourcePin = try? botStore.conversationContextPin(linkedTo: source) {
+            guard let peerThreadID = row.peerThreadID,
+                  let peerPin = try? botStore.conversationContextPin(linkedTo: peerThreadID),
+                  peerPin.hostID == sourcePin.hostID, peerPin.context == sourcePin.context,
+                  contextAllows(threadID: source, action: .delegate) else { return false }
+        }
+        return true
+    }
+
+    /// A guest may delegate only into another admitted context and VM. The
+    /// user's saved destination is authoritative; there is no Mac fallback.
+    func peerContextBinding(callerThread: AgentThreadID, peerBotID: BotID) throws -> BotContextBinding? {
+        let inGuest = try threadRepo.guestPlacement(of: callerThread)?.runsInGuest == true
+        guard let pin = try botStore.conversationContextPin(linkedTo: callerThread) else {
+            guard !inGuest else {
+                throw JSONRPCError(code: -32052, message: "VM delegation requires an authorized conversation context for both Bots.")
+            }
+            guard try botStore.executionDestination(botID: peerBotID).target == .mac else {
+                throw JSONRPCError(code: -32052, message: "This Bot uses a VM. Start its consultation from an authorized Bot context; execution will not fall back to the Mac.")
+            }
+            return nil
+        }
+        guard contextAllows(threadID: callerThread, action: .delegate),
+              let binding = try botStore.getContextBinding(hostID: pin.hostID, botID: peerBotID, context: pin.context) else {
+            throw JSONRPCError(code: -32047, message: "Both Bots need current grants for this context, including delegate on the caller.")
+        }
+        let actions: [BotContextAction] = pin.context == .general ? [.read, .send, .configure] : [.read, .send, .configure, .files]
+        guard try actions.allSatisfy({ try botStore.authorizes(hostID: pin.hostID, botID: peerBotID,
+            context: pin.context, action: $0, policyRevision: binding.policyRevision) }) else {
+            throw JSONRPCError(code: -32047, message: "The peer's context grant is inactive or incomplete.")
+        }
+        let destination = try botStore.executionDestination(botID: peerBotID)
+        guard !inGuest || destination.target == .vm else {
+            throw JSONRPCError(code: -32052, message: "A VM cannot delegate execution to the Mac. Choose an admitted VM for the peer or request Mac execution explicitly.")
+        }
+        if inGuest, try botStore.guestResourceID(botID: pin.botID, threadID: callerThread)
+            == botStore.guestResourceID(botID: peerBotID) {
+            throw JSONRPCError(code: -32054, message: "The caller and peer share one VM. A waiting parent cannot reserve another slot on that VM.")
+        }
+        return binding
+    }
+
+    func availableConsultations(callerThread: AgentThreadID, callerRun: AgentRunID, peerBotID: BotID) -> [JSONValue] {
+        refreshStorageProjection()
+        var seen = Set<UUID>()
+        return handoffs.values.sorted { $0.createdAt > $1.createdAt }.compactMap { handoff in
+            guard let id = handoff.consultationID, seen.insert(id).inserted,
+                  continuationHandoff(consultationID: id, callerThread: callerThread,
+                    hostRunID: callerRun, peerBotID: peerBotID) != nil else { return nil }
+            return .object([
+                "consultation_id": .string(id.uuidString.lowercased()),
+                "activity_id": .string(handoff.activityID.uuidString.lowercased()),
+                "updated_at": .number((handoff.replyCreatedAt ?? handoff.createdAt).timeIntervalSince1970),
+            ])
+        }.prefix(20).map { $0 }
+    }
+
+    private var activePeerHandoffs: [PersistedBotPeerHandoff] {
+        handoffs.values.filter { row in
+            row.phase == .peerPrepared || row.phase == .peerRunning
+                || row.peerRunID.flatMap { try? runRepo.status(of: $0) } == .running
+                || (row.phase == .needsAttention && row.peerThreadID.map {
+                    coordinator.hasProviderSession(threadId: $0) || coordinator.hasPendingProviderStart(threadId: $0)
+                } == true)
+        }
+    }
+
+    func peerIsBusy(_ botID: BotID) -> Bool {
+        refreshStorageProjection()
+        if activePeerHandoffs.contains(where: { $0.peerBotID == botID }) { return true }
+        guard let conversations = try? botStore.listConversations(botID: botID, includeGroupMembers: true) else { return true }
+        return conversations.contains { conversation in
+            guard let threadID = conversation.linkedAgentThreadID else { return false }
+            return coordinator.activeRunId(threadId: threadID) != nil
+                || coordinator.hasPendingProviderStart(threadId: threadID)
+        }
+    }
+
+    /// Private peer threads stay outside the workspace rail; their durable
+    /// parent chain still owns the inherited working directory.
+    func inheritedWorkspaceScope(thread: AgentThread, runID: AgentRunID?) throws -> AgentThread? {
+        refreshStorageProjection()
+        var current = thread
+        var runID = runID
+        var visited = Set<AgentRunID>()
+        while true {
+            if current.workspaceId != nil || current.executionMode == .worktree { return current }
+            guard let run = runID,
+                  let parent = handoffs.values.first(where: { $0.peerRunID == run && $0.peerThreadID == current.id }) else {
+                return nil
+            }
+            guard visited.insert(run).inserted, visited.count < 4,
+                  let parentThreadID = parent.hostThreadID ?? parent.originAgentThreadID,
+                  let parentThread = try threadRepo.get(id: parentThreadID) else {
+                throw JSONRPCError(code: -32050, message: "The inherited Bot execution scope is unavailable.")
+            }
+            current = parentThread
+            runID = parent.hostRunID
+        }
+    }
+
+    /// The existing durable handoffs are the admission ledger. Reserve before
+    /// starting a task, and count pending work and every descendant together.
+    @discardableResult
+    func validateAdmission(callerThread: AgentThreadID, callerRun: AgentRunID, peerBotID: BotID, wait: Bool = true) throws -> Date {
+        refreshStorageProjection()
+        var root = callerRun
+        var ancestry = Set<AgentRunID>()
+        var bots = Set<BotID>()
+        if let conversation = try botStore.conversationLinked(to: callerThread) { bots.insert(conversation.botID) }
+        while let parent = handoffs.values.first(where: { $0.peerRunID == root }), let host = parent.hostRunID {
+            guard ancestry.insert(root).inserted, ancestry.count < 4 else {
+                throw JSONRPCError(code: -32053, message: "Bot delegation depth is exhausted.")
+            }
+            bots.insert(parent.peerBotID)
+            if let origin = parent.originBotID { bots.insert(origin) }
+            root = host
+        }
+        guard !bots.contains(peerBotID) else {
+            throw JSONRPCError(code: -32053, message: "This delegation would create a Bot cycle.")
+        }
+        var descendants: Set<AgentRunID> = [root]
+        var rows: [PersistedBotPeerHandoff] = []
+        for _ in 0..<4 {
+            let next = handoffs.values.filter { row in
+                row.hostRunID.map(descendants.contains) == true && !rows.contains { $0.activityID == row.activityID }
+            }
+            rows.append(contentsOf: next)
+            descendants.formUnion(next.compactMap(\.peerRunID))
+        }
+        guard rows.count < 12,
+              rows.map(\.createdAt).min().map({ Date().timeIntervalSince($0) < 900 }) ?? true else {
+            throw JSONRPCError(code: -32053, message: "This task has reached its Bot delegation budget (12 admissions or 15 minutes).")
+        }
+        let active = activePeerHandoffs
+        guard active.count < 8, active.filter({ $0.hostRunID.map(descendants.contains) == true }).count < 4 else {
+            throw JSONRPCError(code: -32054, message: "Bot execution capacity is full. Observe an existing activity before submitting more work.")
+        }
+        guard !peerIsBusy(peerBotID) else {
+            throw JSONRPCError(code: -32051, message: "This Bot is still executing a consultation. Wait for its terminal state before reusing its resources.")
+        }
+        if let caller = try threadRepo.get(id: callerThread),
+           let scope = try inheritedWorkspaceScope(thread: caller, runID: callerRun) {
+            guard wait else {
+                throw JSONRPCError(code: -32054, message: "This peer inherits the caller's workspace. Use a synchronous consultation so both agents cannot edit it concurrently.")
+            }
+            guard let router else { throw JSONRPCError.internalError }
+            let directory = URL(fileURLWithPath: try router.effectiveAgentExecutionCwd(for: scope))
+                .resolvingSymlinksInPath().standardizedFileURL
+            for row in active {
+                // A synchronous child may use the scope held by its waiting
+                // ancestors. Independent siblings still conflict.
+                if row.peerRunID.map(ancestry.contains) == true { continue }
+                guard let ownerID = row.hostThreadID ?? row.originAgentThreadID,
+                      let owner = try threadRepo.get(id: ownerID),
+                      let ownerScope = try inheritedWorkspaceScope(thread: owner, runID: row.hostRunID) else { continue }
+                let occupied = URL(fileURLWithPath: try router.effectiveAgentExecutionCwd(for: ownerScope))
+                    .resolvingSymlinksInPath().standardizedFileURL
+                guard occupied != directory else {
+                    throw JSONRPCError(code: -32054, message: "Another Bot activity still owns this workspace. Wait for it to finish or use an independent worktree.")
+                }
+            }
+        }
+        guard contextAllows(threadID: callerThread, action: .send) else {
+            throw JSONRPCError(code: -32047, message: "The calling conversation is no longer authorized.")
+        }
+        return (rows.map(\.createdAt).min() ?? Date()).addingTimeInterval(900)
+    }
+
+    func peerActivity(_ activityID: UUID, callerThread: AgentThreadID) throws -> JSONValue {
+        refreshStorageProjection()
+        guard let row = handoffs[activityID], row.hostThreadID == callerThread,
+              contextAllows(threadID: callerThread, action: .read),
+              let peer = try botStore.get(id: row.peerBotID), peer.deletedAt == nil,
+              let peerThreadID = row.peerThreadID,
+              contextAllows(threadID: peerThreadID, action: .read) else {
+            throw JSONRPCError(code: -32050, message: "This Bot activity is not available to this conversation.")
+        }
+        let runStatus = row.peerRunID.flatMap { try? runRepo.status(of: $0) }
+        let terminal = row.phase == .completed || row.phase == .needsAttention
+        var result: [String: JSONValue] = [
+            "activity_id": .string(activityID.uuidString.lowercased()),
+            "lifecycle_receipt_id": .string(activityID.uuidString.lowercased()),
+            "consultation_id": row.consultationID.map { .string($0.uuidString.lowercased()) } ?? .null,
+            "conversation_id": .string(row.peerConversationID.value.uuidString.lowercased()),
+            "thread_id": .string(peerThreadID.value.uuidString.lowercased()),
+            "run_id": row.peerRunID.map { .string($0.value.uuidString.lowercased()) } ?? .null,
+            "phase": .string(row.phase.rawValue), "terminal": .bool(terminal),
+            "status": .string(row.phase == .completed ? "completed" : (runStatus?.rawValue ?? (terminal ? "interrupted" : "pending"))),
+            "bot": .object(["id": .string(peer.id.value.uuidString.lowercased()),
+                "handle": .string(peer.handle), "name": .string(peer.name), "title": .string(peer.title)]),
+        ]
+        if row.phase == .completed, let reply = row.replyText {
+            result["reply"] = .string(reply)
+            result["attributed_reply_already_displayed"] = .bool(true)
+        } else if terminal {
+            let failure = row.peerRunID.flatMap { try? runRepo.errorMessage(of: $0) }
+            result["reason"] = .string(failure ?? "No verified completion. Inspect the activity; do not replay effects with an unknown outcome.")
+        }
+        return .object(result)
+    }
+
+    func observePeerActivity(_ activityID: UUID, callerThread: AgentThreadID, wait: Bool, cancel: Bool) async throws -> JSONValue {
+        _ = try peerActivity(activityID, callerThread: callerThread)
+        if cancel, let row = handoffs[activityID], row.phase != .completed {
+            if let runID = row.peerRunID { coordinator.stopRun(runID) }
+            if let threadID = row.peerThreadID { coordinator.stopRun(threadId: threadID) }
+            tasksByActivityID[activityID]?.cancel()
+            setPhase(activityID, .needsAttention)
+            if let threadID = row.peerThreadID {
+                do { try await coordinator.stopAndAwaitTermination(threadId: threadID) }
+                catch {
+                    throw JSONRPCError(code: -32055, message: "Cancellation was requested but provider termination is unconfirmed.",
+                        data: try peerActivity(activityID, callerThread: callerThread))
+                }
+            }
+        }
+        if wait { await awaitAgentAppDispatch(activityID: activityID) }
+        return try peerActivity(activityID, callerThread: callerThread)
+    }
+
     /// Grants an active primary run access only to peers it actually consulted.
     /// A requested id is required when that run consulted more than one peer.
     func delegatedBotID(forHostRunID runID: AgentRunID, requestedBotID: BotID? = nil) -> BotID? {
+        delegatedContext(forHostRunID: runID, requestedBotID: requestedBotID)?.botID
+    }
+
+    func delegatedContext(forHostRunID runID: AgentRunID, requestedBotID: BotID? = nil)
+        -> (botID: BotID, threadID: AgentThreadID)? {
         refreshStorageProjection()
-        let ids = Set(handoffs.values.compactMap { handoff -> BotID? in
-            guard handoff.requiresHostContinuation,
-                  handoff.hostRunID == runID,
-                  (handoff.phase == .peerCompleted
+        let candidates = handoffs.values.filter { handoff in
+            handoff.requiresHostContinuation && handoff.hostRunID == runID
+                && handoffAllows(handoff, action: .read)
+                && (handoff.phase == .peerCompleted
                     || handoff.phase == .hostPrepared
                     || handoff.phase == .hostRunning
-                    || handoff.phase == .completed) else { return nil }
-            return handoff.peerBotID
-        })
-        if let requestedBotID { return ids.contains(requestedBotID) ? requestedBotID : nil }
-        return ids.count == 1 ? ids.first : nil
+                    || handoff.phase == .completed)
+        }
+        let ids = Set(candidates.map(\.peerBotID))
+        guard let botID = requestedBotID ?? (ids.count == 1 ? ids.first : nil),
+              let handoff = candidates.filter({ $0.peerBotID == botID }).max(by: { $0.createdAt < $1.createdAt }),
+              let threadID = handoff.peerThreadID else { return nil }
+        return (botID, threadID)
     }
 
     func delegatedBotID(forAgentAppHostRunID runID: AgentRunID) -> BotID? {
@@ -1101,7 +1361,9 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         originConversation: BotConversation? = nil,
         consultationID: UUID? = nil,
         continuationConversationID: BotConversationID? = nil,
-        continuationPeerThreadID: AgentThreadID? = nil
+        continuationPeerThreadID: AgentThreadID? = nil,
+        deadline: Date? = nil,
+        nestedRunContext: AgentNestedRunContext? = nil
     ) -> Task<Void, Never>? {
         do {
             if let pin = try botStore.conversationContextPin(linkedTo: originThread.id) {
@@ -1138,6 +1400,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         )
         let peerRunID = AgentRunID()
         do {
+            let binding = try peerContextBinding(callerThread: originThread.id, peerBotID: peer.id)
             let thread: AgentThread
             let routing: BotDeskRouting
             if let continuationConversationID {
@@ -1145,12 +1408,41 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                       existing.botID == peer.id,
                       let existingThreadID = existing.linkedAgentThreadID,
                       existingThreadID == continuationPeerThreadID,
-                      let existingThread = try threadRepo.get(id: existingThreadID) else {
+                      var existingThread = try threadRepo.get(id: existingThreadID),
+                      existingThread.projectId == originThread.projectId,
+                      existingThread.worktreePath == originThread.worktreePath else {
                     return nil
                 }
+                if let binding {
+                    guard let pin = try botStore.conversationContextPin(linkedTo: existingThreadID),
+                          pin.hostID == binding.hostID, pin.context == binding.context,
+                          pin.policyRevision == binding.policyRevision,
+                          try botStore.threadExecutionDestination(existingThreadID)
+                            == botStore.executionDestination(botID: peer.id) else { return nil }
+                } else if try threadRepo.guestPlacement(of: existingThreadID)?.runsInGuest == true { return nil }
                 conversation = existing
+                routing = BotDeskRouting(thread: originThread, activeRunRoute: activeCallerRoute)
+                existingThread.runAsUser = routing.runAsUser
+                existingThread.routingConfiguration = peerRoutingConfiguration(routing)
+                try threadRepo.upsert(existingThread)
                 thread = existingThread
-                routing = BotDeskRouting(thread: existingThread)
+            } else if let binding {
+                routing = BotDeskRouting(thread: originThread, activeRunRoute: activeCallerRoute)
+                let fresh = AgentThread(projectId: originThread.projectId, workspaceId: originThread.workspaceId,
+                    title: conversation.title, provider: routing.provider,
+                    providerInstanceId: routing.providerInstanceID,
+                    model: routing.resolvedModel(defaultModel: BotsViewModel.defaultModel(for:)),
+                    permissionMode: routing.permissionMode, reasoningEffort: routing.reasoningEffort,
+                    executionMode: originThread.executionMode, baseBranch: originThread.baseBranch,
+                    worktreePath: originThread.worktreePath, serviceTier: routing.serviceTier,
+                    modelSelection: routing.modelSelection, runAsUser: routing.runAsUser,
+                    routingConfiguration: peerRoutingConfiguration(routing))
+                conversation.linkedAgentThreadID = fresh.id
+                _ = try botStore.createContextualConversation(conversation, newThread: fresh,
+                    hostID: binding.hostID, context: binding.context, policyRevision: binding.policyRevision,
+                    executionDestination: botStore.executionDestination(botID: peer.id))
+                guard let stored = try threadRepo.get(id: fresh.id) else { return nil }
+                thread = stored
             } else {
                 conversation = BotConversation(
                     botID: peer.id,
@@ -1174,9 +1466,10 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                         reasoningEffort: routing.reasoningEffort,
                         serviceTier: routing.serviceTier,
                         distillMainEffortSelection: routing.provider == .distill
-                            ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                            ? routing.distillMainEffortSelection : nil,
                         distillReasoningEffortSelection: routing.provider == .distill
-                            ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
+                            ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
+                        distillExecutionMode: routing.distillExecutionMode
                     ),
                     providerInstanceId: routing.providerInstanceID,
                     runAsUser: routing.runAsUser,
@@ -1242,7 +1535,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 )
                 // Telemetry-only Subagents row on the HOST thread (no
                 // capability digests — can never authorize descendants).
-                if let telemetry = try? orchestrationRuntime?.recordBotDelegationTelemetry(
+                if nestedRunContext == nil, let telemetry = try? orchestrationRuntime?.recordBotDelegationTelemetry(
                     runId: peerRunID,
                     hostThreadId: originThread.id,
                     nodeId: "bot.\(peer.handle).\(peerRunID.value.uuidString)",
@@ -1272,7 +1565,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             }
 
             let home = BotHome(appSupportDirectory: appSupportDirectory, bot: peer)
-            let memoryFiles = ((try? home.readBootstrapMemory()) ?? []).map {
+            let memoryUnavailable = try botStore.globalMemoryUnavailableReason(botID: peer.id, threadID: thread.id)
+            let memoryFiles = (memoryUnavailable == nil ? ((try? home.readBootstrapMemory()) ?? []) : []).map {
                 BotMemoryFileText(path: $0.path, body: $0.body)
             }
             let ownedSkills = ((try? home.listOwnedSkills()) ?? []).map {
@@ -1281,11 +1575,11 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             let browserStore = BotBrowserStore(appSupportDirectory: appSupportDirectory)
             let browser = try? browserStore.loadTarget(botID: peer.id)
             let executionCwd: String?
-            if originConversation == nil,
-               originThread.workspaceId != nil || originThread.executionMode == .worktree {
-                executionCwd = try router.effectiveAgentExecutionCwd(for: originThread)
+            if let scope = try inheritedWorkspaceScope(thread: originThread, runID: hostRunID) {
+                executionCwd = try router.effectiveAgentExecutionCwd(for: scope)
             } else {
-                executionCwd = nil
+                try FileManager.default.createDirectory(at: home.root, withIntermediateDirectories: true)
+                executionCwd = home.root.path
             }
             let started = BotStartedRun(
                 conversation: conversation,
@@ -1304,7 +1598,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 browser: browser ?? nil,
                 attachments: [],
                 providerSnapshots: providerSnapshots,
-                executionCwd: executionCwd
+                executionCwd: executionCwd,
+                nestedRunContext: nestedRunContext
             )
             submit(
                 BotPeerExecutionPlan(
@@ -1314,7 +1609,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                     peerReceipt: peerPlan.receipt(userText: peerDisplay),
                     host: resumeHostAfterPeer ? hostRunID.map {
                         .agentApp(BotPeerAgentAppHostPlan(thread: originThread, runID: $0))
-                    } : nil
+                    } : nil,
+                    deadline: deadline
                 )
             )
             return Task { @MainActor [weak self] in
@@ -1335,78 +1631,72 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         originThread: AgentThread,
         hostRunID: AgentRunID,
         providerSnapshots: [AgentProviderSnapshot],
-        consultationID: UUID? = nil
-    ) async -> (
-        activityID: UUID,
-        reply: String,
-        consultationID: UUID,
-        peerConversationID: BotConversationID,
-        peerThreadID: AgentThreadID,
-        peerRunID: AgentRunID
-    )? {
+        delegationCapability: String,
+        consultationID: UUID? = nil,
+        wait: Bool = true
+    ) async throws -> JSONValue {
         refreshStorageProjection()
-        let originConversation = try? botStore.conversationLinked(to: originThread.id)
-        let originBot = originConversation.flatMap { try? botStore.get(id: $0.botID) }
-        if originConversation != nil, originBot == nil { return nil }
+        let deadline: Date
+        do { deadline = try validateAdmission(callerThread: originThread.id, callerRun: hostRunID, peerBotID: peer.id, wait: wait) }
+        catch let error as JSONRPCError {
+            throw JSONRPCError(code: error.code, message: error.message,
+                data: .object(["admission": .string("rejected")]))
+        }
+        let originConversation = try botStore.conversationLinked(to: originThread.id)
+        let originBot = try originConversation.flatMap { try botStore.get(id: $0.botID) }
+        if originConversation != nil, originBot == nil {
+            throw JSONRPCError(code: -32050, message: "The calling Bot no longer exists.")
+        }
         let continuation = consultationID.flatMap {
-            continuationHandoff(
-                consultationID: $0,
-                callerThread: originThread.id,
-                hostRunID: hostRunID,
-                peerBotID: peer.id
-            )
+            continuationHandoff(consultationID: $0, callerThread: originThread.id,
+                hostRunID: hostRunID, peerBotID: peer.id)
         }
         if let consultationID {
-            guard continuation != nil,
-                  activeConsultationClaims.contains(consultationID) else { return nil }
+            guard continuation != nil, activeConsultationClaims.contains(consultationID) else {
+                throw JSONRPCError(code: -32050, message: "This consultation is unavailable.")
+            }
         }
-
         let activityID = AgentMessageID()
         if originConversation == nil {
-            guard persistAgentAppProjection(
-                peer: peer,
-                threadID: originThread.id,
-                activityID: activityID,
-                content: BotPeerTranscript.encodeActivity(peer: peer, phase: .waiting),
-                createdAt: Date()
-            ) else { return nil }
+            guard persistAgentAppProjection(peer: peer, threadID: originThread.id, activityID: activityID,
+                content: BotPeerTranscript.encodeActivity(peer: peer, phase: .waiting), createdAt: Date()) else {
+                throw JSONRPCError(code: -32045, message: "Could not persist the Bot activity.")
+            }
         }
         guard let milestone = submitAgentAppMention(
-            peer: peer,
-            text: prompt,
-            peerText: prompt,
-            originThread: originThread,
-            activityID: activityID,
-            hostRunID: hostRunID,
-            providerSnapshots: providerSnapshots,
-            resumeHostAfterPeer: false,
-            originBot: originBot,
-            originConversation: originConversation,
-            consultationID: consultationID,
-            continuationConversationID: continuation?.peerConversationID,
-            continuationPeerThreadID: continuation?.peerThreadID
-        ) else { return nil }
-        await milestone.value
-        guard let reply = replyText(forActivityID: activityID.value),
-              let handoff = handoffs[activityID.value],
-              let consultationID = handoff.consultationID,
-              let peerThreadID = handoff.peerThreadID,
-              let peerRunID = handoff.peerRunID else { return nil }
-        return (
-            activityID.value,
-            reply,
-            consultationID,
-            handoff.peerConversationID,
-            peerThreadID,
-            peerRunID
-        )
+            peer: peer, text: prompt, peerText: prompt, originThread: originThread,
+            activityID: activityID, hostRunID: hostRunID, providerSnapshots: providerSnapshots,
+            resumeHostAfterPeer: false, originBot: originBot, originConversation: originConversation,
+            consultationID: consultationID, continuationConversationID: continuation?.peerConversationID,
+            continuationPeerThreadID: continuation?.peerThreadID, deadline: deadline,
+            nestedRunContext: AgentNestedRunContext(parentRunID: hostRunID, parentThreadID: originThread.id,
+                nodeID: "bot.\(peer.handle).\(activityID.value.uuidString)", parentCapability: delegationCapability)
+        ) else {
+            let data = (try? peerActivity(activityID.value, callerThread: originThread.id))
+                ?? .object(["activity_id": .string(activityID.value.uuidString.lowercased()),
+                    "reason": .string("admission_failed")])
+            throw JSONRPCError(code: -32045, message: "The Bot activity could not be admitted.", data: data)
+        }
+        if wait { await milestone.value }
+        return try peerActivity(activityID.value, callerThread: originThread.id)
     }
 
     private func awaitAgentAppDispatch(activityID: UUID) async {
-        await withCheckedContinuation { continuation in
-            agentAppDispatchWaiters[activityID, default: []].append(continuation)
-            if agentAppDispatchReachedMilestone(activityID) {
-                resolveAgentAppDispatchWaiters(activityID: activityID)
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            guard !Task.isCancelled else { return }
+            await withCheckedContinuation { continuation in
+                agentAppDispatchWaiters[activityID, default: [:]][waiterID] = continuation
+                if agentAppDispatchReachedMilestone(activityID) {
+                    resolveAgentAppDispatchWaiters(activityID: activityID)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.agentAppDispatchWaiters[activityID]?.removeValue(forKey: waiterID)?.resume()
+                if self?.agentAppDispatchWaiters[activityID]?.isEmpty == true {
+                    self?.agentAppDispatchWaiters[activityID] = nil
+                }
             }
         }
     }
@@ -1451,8 +1741,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
 
     private func resolveAgentAppDispatchWaiters(activityID: UUID, force: Bool = false) {
         guard force || agentAppDispatchReachedMilestone(activityID) else { return }
-        let waiters = agentAppDispatchWaiters.removeValue(forKey: activityID) ?? []
-        waiters.forEach { $0.resume() }
+        let waiters = agentAppDispatchWaiters.removeValue(forKey: activityID) ?? [:]
+        waiters.values.forEach { $0.resume() }
     }
 
     private static func titleFromFirstMessage(_ text: String) -> String {
@@ -1768,6 +2058,16 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
 
     private func execute(_ plan: BotPeerExecutionPlan) async {
         guard await awaitDeletionResolution(activityID: plan.activityID) else { return }
+        let deadline = Task { @MainActor [weak self] in
+            let remaining = max(0, min(900, plan.deadline?.timeIntervalSinceNow ?? 900))
+            do { try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000)) } catch { return }
+            guard let self, self.tasksByActivityID[plan.activityID] != nil else { return }
+            self.coordinator.stopRun(plan.peerRun.started.runID)
+            self.coordinator.stopRun(threadId: plan.peerRun.started.thread.id)
+            self.setPhase(plan.activityID, .needsAttention)
+            self.cancelExactRunWait(plan.peerRun.started.runID)
+        }
+        defer { deadline.cancel() }
         guard await start(plan.peerRun, receipt: plan.peerReceipt, activityID: plan.activityID) else {
             // The run never started, so no coordinator terminal will ever fire:
             // settle the Subagents telemetry row here or it stays Working.
@@ -1778,6 +2078,12 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 detail: plan.peerReceipt.compiledPayload
             )
             setPhase(plan.activityID, .needsAttention)
+            return
+        }
+        guard !Task.isCancelled, handoffs[plan.activityID]?.phase == .peerPrepared else {
+            coordinator.stopRun(plan.peerRun.started.runID)
+            coordinator.stopRun(threadId: plan.peerRun.started.thread.id)
+            cancelExactRunWait(plan.peerRun.started.runID)
             return
         }
         setPhase(plan.activityID, .peerRunning)
@@ -1791,7 +2097,9 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         )
         guard await awaitDeletionResolution(activityID: plan.activityID) else { return }
         settleConversation(plan.peerRun.started.conversation, run: peerRun)
-        guard peerRun?.status == .completed,
+        guard let current = handoffs[plan.activityID], current.phase == .peerRunning,
+              handoffAllows(current, action: .read),
+              peerRun?.status == .completed,
               let replyMessage = exactAssistantMessage(
                 threadID: plan.peerRun.started.thread.id,
                 runID: plan.peerRun.started.runID
@@ -1893,7 +2201,17 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
             router.rememberProviderSnapshotsForSend(plan.providerSnapshots)
         }
         beforeBotRunDispatchForTesting?(plan.started.runID)
+        guard let current = handoffs[activityID] else { return false }
+        let isPeer = current.peerRunID == plan.started.runID
+        let expectedPhase: BotPeerHandoffPhase = isPeer ? .peerPrepared : .hostPrepared
+        guard current.phase == expectedPhase,
+              handoffAllows(current, action: .send) else { return false }
         do {
+            if isPeer, let row = handoffs[activityID], let hostRunID = row.hostRunID,
+               let pin = try botStore.conversationContextPin(linkedTo: plan.started.thread.id) {
+                _ = try botStore.recordContextDelegation(hostID: pin.hostID, parentRunID: hostRunID,
+                    childRunID: plan.started.runID, childThreadID: plan.started.thread.id)
+            }
             let result = try await sendPeerRunWithDeadline(
                 plan,
                 receipt: receipt,
@@ -1903,7 +2221,9 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 cancelExactRunWait(plan.started.runID)
                 return false
             }
-            guard await awaitDeletionResolution(activityID: activityID) else {
+            guard await awaitDeletionResolution(activityID: activityID), !Task.isCancelled,
+                  let current = handoffs[activityID], current.phase == expectedPhase,
+                  handoffAllows(current, action: .send) else {
                 coordinator.stopRun(plan.started.runID)
                 cancelExactRunWait(plan.started.runID)
                 return false
@@ -1961,14 +2281,16 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                                 reasoningEffort: routing.reasoningEffort,
                                 serviceTier: routing.serviceTier,
                                 distillMainEffortSelection: routing.provider == .distill
-                                    ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                                    ? routing.distillMainEffortSelection : nil,
                                 distillReasoningEffortSelection: routing.provider == .distill
-                                    ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
+                                    ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
+                                distillExecutionMode: routing.distillExecutionMode
                             ),
                             providerInstanceId: routing.providerInstanceID,
                             attachments: plan.attachments,
                             requestedRunID: runID,
                             orchestrationRoutingSnapshot: peerOrchestrationRoutingSnapshot(plan),
+                            nestedRunContext: plan.nestedRunContext,
                             executionCwdOverride: plan.executionCwd,
                             allowProviderCatalogListingDuringPreflight: false
                         )
@@ -2013,9 +2335,10 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
                 reasoningEffort: routing.reasoningEffort,
                 serviceTier: routing.serviceTier,
                 distillMainEffortSelection: routing.provider == .distill
-                    ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                    ? routing.distillMainEffortSelection : nil,
                 distillReasoningEffortSelection: routing.provider == .distill
-                    ? (routing.distillReasoningEffortSelection ?? .automatic) : nil
+                    ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
+                distillExecutionMode: routing.distillExecutionMode
             ),
             manualProviderInstanceId: routing.providerInstanceID,
             eligibleProviders: [routing.provider],
@@ -2097,6 +2420,7 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
 
     private func projectAgentAppReply(activityID: UUID) -> Bool {
         guard let handoff = handoffs[activityID],
+              handoffContextAllows(handoff, action: .read),
               let threadID = handoff.originAgentThreadID,
               let reply = handoff.replyText else { return false }
         let peer = BotDefinition(
@@ -2542,7 +2866,8 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
     }
 
     private func importRestoredPeerReply(activityID: UUID) -> Bool {
-        guard let handoff = handoffs[activityID], handoff.replyText != nil else { return false }
+        guard let handoff = handoffs[activityID], handoff.replyText != nil,
+              handoffContextAllows(handoff, action: .read) else { return false }
         guard handoff.originAgentThreadID != nil else { return true }
         guard projectAgentAppReply(activityID: activityID) else {
             projectAgentAppNeedsAttention(activityID: activityID)
@@ -2652,6 +2977,12 @@ final class BotPeerHandoffAuthority: AgentRunObserver {
         for observer in observers.compactMap(\.value) {
             observer.botPeerHandoffAuthority(self, didApply: delta)
         }
+    }
+
+    func activityProgress(activityID: UUID, callerThread: AgentThreadID) -> Date? {
+        guard let row = handoffs[activityID], row.hostThreadID == callerThread,
+              let runID = row.peerRunID, handoffAllows(row, action: .read) else { return nil }
+        return peerProgress.date(for: runID) ?? row.createdAt
     }
 
     func latestPeerProgress(hostRunID: AgentRunID) -> Date? {
@@ -5306,7 +5637,7 @@ public final class BotsViewModel: ObservableObject {
             modelSelection: AgentModelSelection(
                 provider: .distill, modelId: model,
                 reasoningEffort: route.reasoningEffort, serviceTier: route.serviceTier,
-                distillMainEffortSelection: route.distillMainEffortSelection ?? .fixed(route.reasoningEffort),
+                distillMainEffortSelection: route.distillMainEffortSelection,
                 distillReasoningEffortSelection: route.distillReasoningEffortSelection ?? .automatic,
                 distillExecutionMode: route.distillExecutionMode
             ),
@@ -7571,7 +7902,7 @@ public final class BotsViewModel: ObservableObject {
         routing.reasoningEffort = spec.reasoningEffort
         routing.reasoningModel = spec.reasoningModel
         routing.distillMainEffortSelection = spec.provider == .distill
-            ? (spec.distillMainEffortSelection ?? .fixed(spec.reasoningEffort)) : nil
+            ? spec.distillMainEffortSelection : nil
         routing.distillReasoningEffortSelection = spec.provider == .distill
             ? (spec.distillReasoningEffortSelection ?? .automatic) : nil
         routing.distillExecutionMode = spec.provider == .distill ? (spec.distillExecutionMode ?? .auto) : .normal
@@ -11319,11 +11650,12 @@ public final class BotsViewModel: ObservableObject {
         let conversation = conversations.first(where: { $0.id == conversationID })
             ?? ((try? botStore.conversation(id: conversationID)) ?? nil)
         let brain = destBrainInputs(for: bot, deskCache: deskBrainCache(for: bot))
+        let memoryAllowed = try botStore.globalMemoryUnavailableReason(botID: bot.id, threadID: threadID) == nil
         let receipt = BotBrainCompiler.assemble(
             bot: bot,
             revision: revision,
             userText: text,
-            memoryFiles: brain.memoryFiles,
+            memoryFiles: memoryAllowed ? brain.memoryFiles : [],
             skills: brain.skills,
             ownedSkills: ownedSkillTexts(for: bot),
             routines: brain.routines,
@@ -11840,7 +12172,7 @@ public final class BotsViewModel: ObservableObject {
                     reasoningEffort: routing.reasoningEffort,
                     serviceTier: routing.serviceTier,
                     distillMainEffortSelection: routing.provider == .distill
-                        ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                        ? routing.distillMainEffortSelection : nil,
                     distillReasoningEffortSelection: routing.provider == .distill
                         ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
                     distillExecutionMode: routing.provider == .distill ? routing.distillExecutionMode : .normal
@@ -11869,7 +12201,7 @@ public final class BotsViewModel: ObservableObject {
                     reasoningEffort: routing.reasoningEffort,
                     serviceTier: routing.serviceTier,
                     distillMainEffortSelection: routing.provider == .distill
-                        ? (routing.distillMainEffortSelection ?? .fixed(routing.reasoningEffort)) : nil,
+                        ? routing.distillMainEffortSelection : nil,
                     distillReasoningEffortSelection: routing.provider == .distill
                         ? (routing.distillReasoningEffortSelection ?? .automatic) : nil,
                     distillExecutionMode: routing.provider == .distill ? routing.distillExecutionMode : .normal
@@ -12159,11 +12491,12 @@ public final class BotsViewModel: ObservableObject {
                 startDeskLiveTurnWatch(botID: bot.id, threadID: prepared.thread.id)
             }
             let inGuest = runsInGuest(threadID: prepared.thread.id, provider: routing.provider)
+            let memoryAllowed = try botStore.globalMemoryUnavailableReason(botID: bot.id, threadID: prepared.thread.id) == nil
             let receipt = BotBrainCompiler.assemble(
                 bot: bot,
                 revision: revision,
                 userText: userText,
-                memoryFiles: memoryFiles,
+                memoryFiles: memoryAllowed ? memoryFiles : [],
                 skills: skills,
                 ownedSkills: ownedSkillTexts(for: bot),
                 routines: routines,

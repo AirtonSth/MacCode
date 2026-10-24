@@ -318,6 +318,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             _ = gate.wait(timeout: .now() + 0.25)
             return box.date
         }
+        server.botPeerActivityProgress = { [weak router] threadID, activityID in
+            let box = UnixBotPeerProgressBox()
+            let gate = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async {
+                box.date = router?.botPeerActivityProgress(threadID: threadID, activityID: activityID)
+                gate.signal()
+            }
+            _ = gate.wait(timeout: .now() + 0.25)
+            return box.date
+        }
         do {
             try server.start()
             socketServer = server

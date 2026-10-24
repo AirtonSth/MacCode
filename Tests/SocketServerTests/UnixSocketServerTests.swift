@@ -576,6 +576,48 @@ final class UnixSocketServerTests: XCTestCase {
     }
 
     @MainActor
+    func testBotPeerStatusWaitUsesActivityProgressBeyondTheLocalDeadline() async throws {
+        // A resumed observer must wait on the activity even when its current caller run is different.
+        let socketURL = URL(
+            fileURLWithPath: "/tmp/rc2-u-bot-status-idle-\(UUID().uuidString.prefix(8)).sock"
+        )
+        let started = Date()
+        let server = UnixSocketServer(
+            socketPath: socketURL.path,
+            dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            localRequestTimeoutForTesting: .milliseconds(40),
+            botPeerAskRequestTimeoutForTesting: .milliseconds(80),
+            activeRequestLimitForTesting: 2,
+            localRequestHandlerForTesting: { request in
+                try? await Task.sleep(nanoseconds: 160_000_000)
+                return JSONRPCResponse(
+                    id: request.id,
+                    result: .object(["status": .string("replied")])
+                )
+            }
+        )
+        server.botPeerActivityProgress = { _, _ in Date() }
+        try server.start()
+        defer { server.stop() }
+
+        let path = socketURL.path
+        let response = try await Task.detached {
+            let client = try self.connectUnix(path: path)
+            defer { Darwin.close(client) }
+            try self.writeAll(
+                fd: client,
+                data: Data((
+                    #"{"jsonrpc":"2.0","id":"ask","method":"bot.peer.status","params":{"wait":true,"activity_id":"00000000-0000-0000-0000-000000000003","thread_id":"00000000-0000-0000-0000-000000000001","run_id":"00000000-0000-0000-0000-000000000002"}}"#
+                        + "\n"
+                ).utf8)
+            )
+            return try self.readLine(fd: client)
+        }.value
+        XCTAssertTrue(response.contains(#""status":"replied""#), response)
+        XCTAssertGreaterThan(Date().timeIntervalSince(started), 0.12)
+    }
+
+    @MainActor
     func testBotPeerAskStillTimesOutWithoutProgress() async throws {
         let socketURL = URL(
             fileURLWithPath: "/tmp/rc2-u-bot-peer-idle-stop-\(UUID().uuidString.prefix(8)).sock"

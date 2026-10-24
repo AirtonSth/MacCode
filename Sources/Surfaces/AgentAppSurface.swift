@@ -92,11 +92,26 @@ public struct AgentReplyTarget: Equatable, Sendable {
     public let threadId: AgentThreadID
     public let excerpt: String
     public let noticeMessageID: String?
+    public let peerHandle: String?
+    public let peerBotID: BotID?
 
-    public init(threadId: AgentThreadID, excerpt: String, noticeMessageID: String? = nil) {
+    public init(threadId: AgentThreadID, excerpt: String, noticeMessageID: String? = nil, peerHandle: String? = nil, peerBotID: BotID? = nil) {
         self.threadId = threadId
         self.excerpt = excerpt
         self.noticeMessageID = noticeMessageID
+        self.peerHandle = peerHandle
+        self.peerBotID = peerBotID
+    }
+
+    public var displayExcerpt: String {
+        peerHandle.map { "\(BotPeerTranscript.handleLabel($0)): \(excerpt)" } ?? excerpt
+    }
+
+    public func compose(text: String, bots: [BotDefinition] = []) -> String {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentHandle = peerBotID.flatMap { id in bots.first { $0.id == id }?.handle }
+        let addressed = currentHandle.map { "\(BotPeerTranscript.handleLabel($0)) \(body)" } ?? body
+        return AgentReplyQuote.compose(excerpt: displayExcerpt, text: addressed)
     }
 }
 
@@ -8733,6 +8748,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func beginReply(to message: AgentMessage) {
+        if let peer = BotPeerTranscript.parse(message.content), let threadID = selectedThreadId {
+            let excerpt = AgentReplyQuote.excerpt(of: peer.body)
+            guard !excerpt.isEmpty else { return }
+            composerState.replyTarget = AgentReplyTarget(
+                threadId: threadID, excerpt: excerpt, peerHandle: peer.handle, peerBotID: peer.botID
+            )
+            focusTick += 1
+            return
+        }
         let parsed = BotChoicesBlock.parse(message.content)
         if supportsReplies, embedding?.hostReplyHandler != nil,
            let choices = parsed.choices, choices.notice != nil, choices.canReply,
@@ -8849,10 +8873,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // only) keep no quote.
         if let reply = activeReplyTarget,
            !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            prompt = AgentReplyQuote.compose(
-                excerpt: reply.excerpt,
-                text: prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
+            prompt = reply.compose(text: prompt, bots: mentionableBotsProvider())
             composerState.replyTarget = nil
         }
         let originalPrompt = prompt
@@ -13982,8 +14003,13 @@ public struct AgentAppView: View {
     }
 
     static func messagedPeer(in text: String, bots: [BotDefinition]) -> BotDefinition? {
-        guard !BotPeerTranscript.isHostHopUserText(text) else { return nil }
-        return BotMentionParser.mentionedBots(in: text, bots: bots, excluding: nil).first
+        let peers = messagedPeers(in: text, bots: bots)
+        return peers.count == 1 ? peers.first : nil
+    }
+
+    static func messagedPeers(in text: String, bots: [BotDefinition]) -> [BotDefinition] {
+        guard !BotPeerTranscript.isHostHopUserText(text) else { return [] }
+        return BotMentionParser.mentionedBots(in: text, bots: bots, excluding: nil)
     }
 
     nonisolated static func isInternalPeerHopUserMessage(_ message: AgentMessage) -> Bool {
@@ -17528,7 +17554,7 @@ public struct AgentAppView: View {
                 )
             } else {
             let displayText = Self.userMessageDisplayText(msg.content)
-            let mentioned = Self.messagedPeer(
+            let mentioned = Self.messagedPeers(
                 in: displayText,
                 bots: mentionableBots
             )
@@ -17540,18 +17566,12 @@ public struct AgentAppView: View {
                 accessibilityIdentifier: "agent.userMessageBubble",
                 roleIdentifier: "agent.role.user",
                 copyIdentifier: "agent.userMessage.copy.\(msg.id.value.uuidString)",
-                header: mentioned.map { bot in
-                    AnyView(
-                        AgentChatPeerIdentityHeader(
-                            name: bot.name,
-                            handle: bot.handle,
-                            symbol: bot.avatarSymbol,
-                            trailing: true,
-                            caption: BotPeerTranscript.mentionedCaption(for: bot),
-                            accessibilityIdentifier: "agent.peer.mentioned"
-                        )
+                header: mentioned.isEmpty ? nil : AnyView(
+                    AgentChatMentionedPeersHeader(
+                        bots: mentioned,
+                        accessibilityIdentifier: "agent.peer.mentioned"
                     )
-                },
+                ),
                 onReplyQuoteTap: replyQuoteJumpAction(for: msg)
             )
             }
@@ -17583,7 +17603,7 @@ public struct AgentAppView: View {
                         copyIdentifier: "agent.assistantMessage.copy.\(msg.id.value.uuidString)",
                         branchIdentifier: "agent.assistantMessage.branch.\(msg.id.value.uuidString)",
                         onBranch: vm.onForkInNewChat == nil ? nil : { vm.onForkInNewChat?(msg.id.value.uuidString) },
-                        onReply: vm.supportsReplies ? { vm.beginReply(to: parsed.body) } : nil,
+                        onReply: { vm.beginReply(to: msg) },
                         stripsChoices: vm.showsBotChoices,
                         attachments: msg.attachments,
                         content: AnyView(
@@ -18788,7 +18808,7 @@ public struct AgentAppView: View {
         guard reply != nil || summary != nil else { return nil }
         return AnyView(VStack(spacing: 0) {
             if let reply {
-                AgentChatReplyQuoteStrip(excerpt: reply.excerpt, onCancel: { vm.cancelReply() })
+                AgentChatReplyQuoteStrip(excerpt: reply.displayExcerpt, onCancel: { vm.cancelReply() })
             }
             if let summary { changedFilesStrip(summary) }
         })

@@ -1254,7 +1254,8 @@ public final class AppContext {
                     runID: rid, threadID: tid, store: self.botStore, appSupport: self.appSupportDirectory
                 )
             }
-            let nextWaiting = BotVMRunRegistry.shared.releaseAndNextWaiter(runID: rid)
+            let retainsVMClaim = self?.botGuestRunResolver?.retainsExclusiveVMClaim(runID: rid) == true
+            let nextWaiting = retainsVMClaim ? nil : BotVMRunRegistry.shared.releaseAndNextWaiter(runID: rid)
             let streamErrorAction = runErrorActions.take(runId: rid)
             // Read before the hop: closing a side chat stops its run and deletes
             // the row right after this callback returns.

@@ -53,6 +53,8 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         var botStore: BotStore
         var appSupport: URL
         var registry: BotVMRunRegistry = .shared
+        var isDelegatedRun: @Sendable (AgentRunID, AgentThreadID) -> Bool = { _, _ in false }
+        var onVMAvailable: @Sendable (BotID, AgentThreadID) -> Void = { _, _ in }
         var leases = DistillGuestLeases()
         var barrier: DistillGuestLaunchBarrier
         var gateway: BotGuestMCPGateway
@@ -95,10 +97,14 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     private let lock = NSLock()
     private var mirrors: [String: DistillGuestCredentialMirror] = [:]
     /// Plans handed out and not yet torn down, by run id.
-    private var livePlans: [String: DistillGuestLaunchPlan] = [:]
+    private var livePlans: [String: (plan: DistillGuestLaunchPlan, retainsVMClaim: Bool)] = [:]
 
     init(_ dependencies: Dependencies) {
         self.deps = dependencies
+    }
+
+    func retainsExclusiveVMClaim(runID: AgentRunID) -> Bool {
+        lock.withLock { livePlans[runID.value.uuidString.lowercased()]?.retainsVMClaim == true }
     }
 
     // MARK: - DistillGuestLaunchResolving
@@ -138,7 +144,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         let runID = request.runId.value.uuidString.lowercased()
         // Only re-copy current credentials; token renewal remains owned by normal preflight.
         return try lock.withLock {
-            guard let plan = livePlans[runID], plan.container == BotComputerGuestSpec.containerName(botID: resourceID),
+            guard let plan = livePlans[runID]?.plan, plan.container == BotComputerGuestSpec.containerName(botID: resourceID),
                   let mirror = mirrors[hostHome.path] else { return false }
             try Task.checkCancellation()
             return try mirror.resynchronize(runID: runID)
@@ -266,7 +272,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 },
                 onSessionOpened: admission.recordOpened
             )
-            lock.withLock { livePlans[runID] = plan }
+            lock.withLock { livePlans[runID] = (plan, false) }
             return plan
         } catch {
             heartbeat?.stop()
@@ -320,17 +326,16 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
         try await deps.barrier.wait()
 
         let claim = BotVMRunRegistry.Entry(
-            threadID: request.threadId, runID: request.runId, title: thread.title, workspace: request.cwd
+            threadID: request.threadId, runID: request.runId, title: thread.title, workspace: request.cwd,
+            exclusive: deps.isDelegatedRun(request.runId, request.threadId)
         )
-        if let holder = deps.registry.tryBegin(botID: botID, entry: claim, resourceID: resourceID) {
+        if let holder = deps.registry.tryBegin(botID: botID, entry: claim, resourceID: resourceID,
+                                              allowsSameThreadExclusive: false) {
             throw DistillGuestLaunchError.busy("The VM is busy in \(holder.title)")
         }
-        // From here the claim is the coordinator's to free (run finished,
-        // which also fires for a failed start): freeing it here would skip
-        // the queued send that run-finished hands to the next thread.
-        // Runs share the VM: each has its own env file, lease file, gateway
-        // bearer and in-guest process, and the sign-in copies stay until the
-        // last run on the VM ends.
+        // Failed preparation leaves release to the coordinator. A prepared
+        // delegated run keeps its exclusive claim until guest termination
+        // is confirmed; ordinary runs continue sharing the VM.
         let leaseKey = resourceID.value.uuidString.lowercased()
         let runID = request.runId.value.uuidString.lowercased()
         var undo: [() -> Void] = []
@@ -481,6 +486,16 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
             guestResolverLog.info(
                 "bot.guest.prepared run=\(runID, privacy: .public) bot=\(leaseKey, privacy: .public) binary=\(binaryPath, privacy: .public)"
             )
+            let onTerminationConfirmed: (@Sendable () -> Void)?
+            if claim.exclusive {
+                onTerminationConfirmed = { [weak self, registry = deps.registry, onVMAvailable = deps.onVMAvailable] in
+                    let next = registry.releaseAndNextWaiter(runID: request.runId)
+                    self?.forgetPlan(runID: runID)
+                    if let next { onVMAvailable(next.botID, next.threadID) }
+                }
+            } else {
+                onTerminationConfirmed = nil
+            }
             let plan = DistillGuestLaunchPlan(
                 runID: runID,
                 dockerExecutable: dockerExecutable,
@@ -491,12 +506,13 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
                 lease: nil,
                 teardown: { [weak self] _ in
                     heartbeat.stop()
-                    self?.forgetPlan(runID: runID)
+                    if !claim.exclusive { self?.forgetPlan(runID: runID) }
                     mirror.end(runID: runID)
                     gateway.revoke(runID: runID)
-                }
+                },
+                onTerminationConfirmed: onTerminationConfirmed
             )
-            lock.withLock { livePlans[runID] = plan }
+            lock.withLock { livePlans[runID] = (plan, claim.exclusive) }
             return plan
         } catch {
             undo.reversed().forEach { $0() }
@@ -524,7 +540,7 @@ final class BotGuestRunResolver: DistillGuestLaunchResolving, @unchecked Sendabl
     /// host guest runs (the scheduled-task agent) leaves the app's alone.
     func endRunsForAppTermination() {
         guard deps.hostsGuestRuns else { return }
-        let (plans, mirrors) = lock.withLock { (Array(livePlans.values), Array(self.mirrors.values)) }
+        let (plans, mirrors) = lock.withLock { (livePlans.values.map(\.plan), Array(self.mirrors.values)) }
         plans.forEach { $0.killGuestDetached() }
         mirrors.forEach { $0.endAll() }
         BotGuestLaunchSweep.removeLeftovers(appSupport: deps.appSupport)
@@ -984,6 +1000,14 @@ extension AppContext {
             threadRepo: threadRepo,
             botStore: botStore,
             appSupport: appSupport,
+            isDelegatedRun: { [weak coordinator = coordinator] runID, threadID in
+                coordinator?.isDelegatedRun(runID, threadId: threadID) == true
+            },
+            onVMAvailable: { [weak self] botID, threadID in
+                Task { @MainActor [weak self] in
+                    await self?.router?.handOffBotVM(botID: botID, to: threadID)
+                }
+            },
             barrier: barrier,
             gateway: botGuestMCPGateway,
             vm: BotGuestDockerVM(

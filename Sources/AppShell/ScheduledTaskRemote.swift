@@ -138,23 +138,28 @@ extension AppCommandRouter {
         guard let context else { throw JSONRPCError.internalError }
         if params["bot_id"] != nil {
             guard let json = params["schedule_spec_json"]?.stringValue,
-                  var spec = BotScheduleSpec.decodeJSON(json) else {
+                  BotScheduleSpec.decodeJSON(json) != nil,
+                  var object = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else {
                 throw JSONRPCError(code: -32602, message: "Provide a valid Bot schedule.")
             }
             if let value = params["execution_destination"] {
                 if value == .null {
-                    spec.executionDestination = nil
+                    object["executionDestination"] = NSNull()
                 } else {
                     guard let raw = value.stringValue, let destination = BotExecutionDestination(storageValue: raw) else {
                         throw JSONRPCError(code: -32602, message: "Choose a valid execution destination.")
                     }
-                    spec.executionDestination = destination
+                    object["executionDestination"] = destination.storageValue
                 }
             }
             var routine = params
             routine["name"] = params["title"] ?? params["name"]
             routine["routine_id"] = params["task_id"]
-            routine["schedule_spec_json"] = .string(spec.encodedJSON())
+            // Keep absent keys distinct from explicit null until the shared
+            // routine writer merges options an older client cannot edit.
+            routine["schedule_spec_json"] = .string(String(
+                decoding: try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), as: UTF8.self
+            ))
             return try await dispatchPairedBotRemote(
                 method: params["task_id"] == nil ? "bot.routine.create" : "bot.routine.update", params: routine)
         }

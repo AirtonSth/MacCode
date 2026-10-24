@@ -862,40 +862,9 @@ public struct SubagentActivityBadge: View {
         Button {
             isPresented.toggle()
         } label: {
-            HStack(spacing: DS.Space.xs) {
-                Image(systemName: "person.2")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(DS.Palette.textSecondary)
-                Text("Subagents")
-                    .font(DS.Font.caption.weight(.semibold))
-                    .foregroundColor(DS.Palette.text)
-                if !snapshot.compactAvatarItems.isEmpty {
-                    let botsIndex = SubagentActivityProjection.botsByNormalizedHandle(bots)
-                    HStack(spacing: 2) {
-                        ForEach(snapshot.compactAvatarItems) { item in
-                            SubagentIdentityAvatarView(
-                                item: item,
-                                bots: bots,
-                                botsByHandle: botsIndex,
-                                size: 12,
-                                showsMonogram: false
-                            )
-                        }
-                    }
-                    .accessibilityHidden(true)
-                }
-                if snapshot.isLive {
-                    Circle()
-                        .fill(DS.Palette.accent)
-                        .frame(width: 6, height: 6)
-                        .accessibilityHidden(true)
-                }
-                Text(countLabel)
-                    .font(DS.Font.caption2.monospacedDigit())
-                    .foregroundColor(DS.Palette.textSecondary)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundColor(DS.Palette.textTertiary)
+            ViewThatFits(in: .horizontal) {
+                badgeLabel(compact: false)
+                badgeLabel(compact: true)
             }
             .padding(.horizontal, DS.Space.sm)
             .padding(.vertical, DS.Space.xs)
@@ -931,6 +900,48 @@ public struct SubagentActivityBadge: View {
                 unknownExpanded = false
             }
         }
+    }
+
+    private func badgeLabel(compact: Bool) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            Image(systemName: "person.2")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(DS.Palette.textSecondary)
+            if !compact {
+                Text("Subagents")
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.text)
+            }
+            if !compact, !snapshot.compactAvatarItems.isEmpty {
+                let botsIndex = SubagentActivityProjection.botsByNormalizedHandle(bots)
+                HStack(spacing: 2) {
+                    ForEach(snapshot.compactAvatarItems) { item in
+                        SubagentIdentityAvatarView(
+                            item: item,
+                            bots: bots,
+                            botsByHandle: botsIndex,
+                            size: 12,
+                            showsMonogram: false
+                        )
+                    }
+                }
+                .accessibilityHidden(true)
+            }
+            if snapshot.isLive {
+                Circle()
+                    .fill(DS.Palette.accent)
+                    .frame(width: 6, height: 6)
+                    .accessibilityHidden(true)
+            }
+            Text(countLabel)
+                .font(DS.Font.caption2.monospacedDigit())
+                .foregroundColor(DS.Palette.textSecondary)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundColor(DS.Palette.textTertiary)
+        }
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private var countLabel: String {

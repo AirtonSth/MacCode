@@ -816,6 +816,89 @@ final class BotGuestRunResolverTests: XCTestCase {
         await secondPlan.finish(.completed).value
     }
 
+    func test_delegatedGuestKeepsSharedVMExclusiveUntilTerminationAndCannotReleaseANewerRun() async throws {
+        let f = try await makeFixture()
+        let machine = try f.ctx.botStore.saveVirtualMachine(name: "Shared")
+        try f.ctx.botStore.setExecutionDestination(.virtualMachine(machine.id), botID: f.bot.id)
+        try FileManager.default.createDirectory(
+            at: BotComputerGuestSpec.guestHomeURL(appSupport: f.appSupport, botID: machine.storageID),
+            withIntermediateDirectories: true)
+        let thread = try makeThread(f, title: "Peer consultation")
+        let req = request(thread)
+        let coordinator = f.ctx.coordinator
+        coordinator.registerDelegatedRun(req.runId, threadId: thread.id, parentRunId: AgentRunID())
+        let handoffs = Recorder<AgentThreadID>()
+        var deps = f.deps
+        deps.isDelegatedRun = { coordinator.isDelegatedRun($0, threadId: $1) }
+        deps.onVMAvailable = { _, threadID in handoffs.append(threadID) }
+        let resolver = BotGuestRunResolver(deps)
+        let plan = try unwrapPlan(try await resolver.prepare(req) { _ in })
+        let claim = try XCTUnwrap(f.registry.active(botID: f.bot.id, resourceID: machine.storageID))
+        XCTAssertTrue(claim.exclusive)
+        XCTAssertNil(f.registry.tryBegin(botID: f.bot.id, entry: claim, resourceID: machine.storageID,
+                                         allowsSameThreadExclusive: false), "the same run can reclaim its own slot")
+
+        do {
+            _ = try await resolver.prepare(request(thread)) { _ in }
+            XCTFail("a new run on the same thread must wait for the previous guest to end")
+        } catch {
+            XCTAssertEqual(error as? DistillGuestLaunchError, .busy("The VM is busy in Peer consultation"))
+        }
+        let otherBot = BotID()
+        let next = BotVMRunRegistry.Entry(threadID: AgentThreadID(), runID: AgentRunID(), title: "Next", workspace: "")
+        XCTAssertEqual(f.registry.tryBegin(botID: otherBot, entry: next, resourceID: machine.storageID)?.runID, req.runId,
+                       "a different bot using the same VM sees the same exclusive claim")
+        f.registry.addWaiting(botID: otherBot, threadID: next.threadID, resourceID: machine.storageID)
+
+        let held = OSAllocatedUnfairLock(initialState: true)
+        let closing = Recorder<Bool>()
+        let finish = plan.finish(.completed) {
+            closing.append(true)
+            let limit = Date().addingTimeInterval(5)
+            while held.withLock({ $0 }), Date() < limit { try? await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        try await waitUntil { !closing.values.isEmpty }
+        XCTAssertTrue(resolver.retainsExclusiveVMClaim(runID: req.runId))
+        XCTAssertEqual(f.registry.active(botID: f.bot.id, resourceID: machine.storageID)?.runID, req.runId)
+        XCTAssertTrue(handoffs.values.isEmpty)
+        held.withLock { $0 = false }
+        await finish.value
+        XCTAssertFalse(resolver.retainsExclusiveVMClaim(runID: req.runId))
+        XCTAssertNil(f.registry.active(botID: f.bot.id, resourceID: machine.storageID))
+        XCTAssertEqual(handoffs.values, [next.threadID])
+
+        let newer = BotVMRunRegistry.Entry(threadID: thread.id, runID: AgentRunID(), title: "Newer", workspace: "", exclusive: true)
+        XCTAssertNil(f.registry.tryBegin(botID: f.bot.id, entry: newer, resourceID: machine.storageID,
+                                         allowsSameThreadExclusive: false))
+        await plan.finish(.completed).value
+        await plan.killGuest()
+        XCTAssertEqual(f.registry.active(botID: f.bot.id, resourceID: machine.storageID)?.runID, newer.runID)
+        XCTAssertEqual(handoffs.values, [next.threadID], "old termination notifies only once")
+        f.registry.endRun(runID: newer.runID)
+    }
+
+    func test_delegatedGuestKeepsItsExclusiveClaimWhenTerminationCannotBeConfirmed() async throws {
+        let f = try await makeFixture()
+        let thread = try makeThread(f)
+        let req = request(thread)
+        let coordinator = f.ctx.coordinator
+        coordinator.registerDelegatedRun(req.runId, threadId: thread.id, parentRunId: AgentRunID())
+        var deps = f.deps
+        deps.isDelegatedRun = { coordinator.isDelegatedRun($0, threadId: $1) }
+        deps.dockerExecutable = { "/usr/bin/false" }
+        let resolver = BotGuestRunResolver(deps)
+        let plan = try unwrapPlan(try await resolver.prepare(req) { _ in })
+        await plan.finish(.cancelled).value
+
+        XCTAssertTrue(resolver.retainsExclusiveVMClaim(runID: req.runId))
+        XCTAssertEqual(f.registry.active(botID: f.bot.id)?.runID, req.runId)
+        XCTAssertEqual(f.registry.active(botID: f.bot.id)?.exclusive, true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: plan.envFileURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: f.guestDistillHome.appendingPathComponent("claude-auth.json").path))
+        f.registry.endRun(runID: req.runId)
+    }
+
     func test_resynchronizeGuestWithoutLivePlanReturnsFalseAndDoesNotCopyCredentials() async throws {
         let f = try await makeRecoveryFixture()
         let thread = try makeThread(f)

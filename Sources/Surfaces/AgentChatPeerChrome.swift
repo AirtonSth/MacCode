@@ -2,6 +2,31 @@ import CoreModel
 import DesignSystemKit
 import SwiftUI
 
+/// Mention identity is separate from admitted peer work and its activity rows.
+public struct AgentChatMentionedPeersHeader: View {
+    public let bots: [BotDefinition]
+    public var accessibilityIdentifier: String
+
+    public init(bots: [BotDefinition], accessibilityIdentifier: String = "agent.peer.mentioned") {
+        self.bots = bots
+        self.accessibilityIdentifier = accessibilityIdentifier
+    }
+
+    public var body: some View {
+        VStack(alignment: .trailing, spacing: DS.Space.xs) {
+            ForEach(bots, id: \.id) { bot in
+                AgentChatPeerIdentityHeader(
+                    name: bot.name, handle: bot.handle, symbol: bot.avatarSymbol,
+                    trailing: true, caption: BotPeerTranscript.mentionedCaption(for: bot),
+                    accessibilityIdentifier: "\(accessibilityIdentifier).\(bot.handle)"
+                )
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(accessibilityIdentifier)
+    }
+}
+
 /// One teammate identity row for a bot-to-bot hop. Desk and Agent App
 /// mount this so avatar, name, and @handle stay one control.
 public struct AgentChatPeerIdentityHeader: View {
@@ -33,7 +58,7 @@ public struct AgentChatPeerIdentityHeader: View {
             if !trailing {
                 avatar
             }
-            VStack(alignment: trailing ? .trailing : .leading, spacing: 1) {
+            VStack(alignment: trailing ? .trailing : .leading, spacing: DS.Space.xxs) {
                 Text(caption)
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textSecondary)
@@ -41,6 +66,8 @@ public struct AgentChatPeerIdentityHeader: View {
                     .font(DS.Font.caption2)
                     .foregroundColor(DS.Palette.textTertiary)
             }
+            .multilineTextAlignment(trailing ? .trailing : .leading)
+            .fixedSize(horizontal: false, vertical: true)
             if trailing {
                 avatar
             }

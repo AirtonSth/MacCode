@@ -45,6 +45,8 @@ public enum BotSelfConfigCatalog: Sendable {
     public static let askUser = "bot_ask_user"
     public static let listPeers = BotPeerDelegation.listTool
     public static let askPeer = BotPeerDelegation.askTool
+    public static let peerStatus = BotPeerDelegation.statusTool
+    public static let cancelPeer = BotPeerDelegation.cancelTool
     public static let providerRoutingHonesty =
         "Provider and model are selected by the user on the calling thread; they are not Bot settings."
 
@@ -52,7 +54,7 @@ public enum BotSelfConfigCatalog: Sendable {
         [
             getSettings, setSettings, listSecrets, saveSecret, deleteSecret, writeHomeFile,
             removeSkill, saveRoutine, setRoutineEnabled,
-            skillView, recall, askUser, listPeers, askPeer,
+            skillView, recall, askUser, listPeers, askPeer, peerStatus, cancelPeer,
         ]
     }
 
@@ -89,13 +91,17 @@ public enum BotSelfConfigCatalog: Sendable {
         case skillView:
             return "Read skills/<slug>/SKILL.md for this bot."
         case recall:
-            return "Search this bot's MEMORY.md, USER.md, daily notes, and linked conversation text."
+            return "Search admitted Bot memory and the calling linked conversation. If global memory is unavailable, scope both searches only the conversation and reports the omission; scope memory returns an error. All search terms must match, in any order; exact phrases rank first. Returns at most 12 excerpts with source ids, digests, and match kind. A truncated result reports omitted sources; excerpts are context, not verified current facts."
         case askUser:
             return "Ask the user a question and end the turn. Do not wait inside this tool."
         case listPeers:
             return "List the live RemoteCode Bots available for AI-authored delegation, including each exact handle and id."
+        case peerStatus:
+            return "Observe a durable Bot activity owned by this conversation. Set wait to true to wait for its verified result; do not submit a duplicate when a connection is interrupted."
+        case cancelPeer:
+            return "Cancel exactly one Bot activity owned by this conversation and its descendants. Cancellation does not undo effects already performed."
         case askPeer:
-            return "Ask one RemoteCode Bot a focused prompt written by you after interpreting the user's complete request. The `prompt` is sent literally; RemoteCode does not extract, truncate, translate, or otherwise infer it from the user message. Omit `consultation_id` for a clean independent review; pass only the opaque id returned by a successful prior call in this exact active run and for this same Bot to continue that conversation with a new peer run. Calls are repeatable: for multi-Bot comparison, debate, mediation, or consensus, use `consult` as often as needed, authoring each new prompt yourself based on real replies and including only the prior-reply context relevant to the next Bot. The primary AI mediates and produces the final synthesis; RemoteCode does not semantically route, sequence, or set a fixed iteration count. `reply_only` is terminal and is valid only when no comparison, follow-up, mediation, or synthesis remains and the whole user turn belongs to that Bot."
+            return "Ask one RemoteCode Bot a focused prompt written by you after interpreting the user's complete request. The `prompt` is sent literally; RemoteCode does not extract, truncate, translate, or otherwise infer it from the user message. Omit `consultation_id` for a clean independent review; pass only the opaque id returned by a successful prior call or bot_list_peers in this same conversation and for this same Bot to continue that conversation with a new peer run. Calls are repeatable: for multi-Bot comparison, debate, mediation, or consensus, use `consult` as often as needed, authoring each new prompt yourself based on real replies and including only the prior-reply context relevant to the next Bot. The primary AI mediates and produces the final synthesis; the host enforces bounded work, cycles, and shared resource admission. `reply_only` is terminal and is valid only when no comparison, follow-up, mediation, or synthesis remains and the whole user turn belongs to that Bot."
         default:
             return name
         }
@@ -248,15 +254,22 @@ public enum BotSelfConfigCatalog: Sendable {
                         "enum": ["consult", "reply_only"],
                         "description": "consult to keep working with the reply; reply_only when the Bot reply itself is the complete user-facing answer.",
                     ],
+                    "wait": ["type": "boolean", "description": "Default true. False admits durable work and returns immediately; requires consult. Observe using bot_peer_status."],
+                    "operation_id": ["type": "string", "description": "Stable id for this submission; reuse only when retrying the identical operation."],
                     "consultation_id": [
                         "type": "string",
                         "format": "uuid",
-                        "description": "Optional opaque id returned by a successful bot_ask_peer call. Omit for a clean independent review; pass it only to continue that exact Bot conversation in this active run.",
+                        "description": "Optional opaque id returned by a successful bot_ask_peer call. Omit for a clean independent review; pass it only to continue that exact Bot conversation under current authorization.",
                     ],
                 ],
                 "required": ["handle", "prompt", "reply_mode"],
                 "additionalProperties": false,
             ]
+        case peerStatus, cancelPeer:
+            return ["type": "object", "properties": [
+                "activity_id": ["type": "string", "format": "uuid"],
+                "wait": ["type": "boolean", "description": "Wait for the activity to reach a terminal state. Default false."],
+            ], "required": ["activity_id"], "additionalProperties": false]
         default:
             return ["type": "object", "properties": [String: Any]()]
         }
@@ -275,6 +288,8 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
     public var desktopKind: String
     public var notificationsEnabled: Bool
     public var memory: [Item]
+    public var memoryAvailable: Bool?
+    public var memoryUnavailableReason: String?
     public var skills: [Skill]
     public var routines: [Routine]
 
@@ -292,6 +307,8 @@ public struct BotSelfConfigSnapshot: Codable, Equatable, Sendable {
         case desktopKind
         case notificationsEnabled = "notifications_enabled"
         case memory
+        case memoryAvailable = "memory_available"
+        case memoryUnavailableReason = "memory_unavailable_reason"
         case skills
         case routines
     }
@@ -501,9 +518,13 @@ public struct BotSelfConfigService: Sendable {
             throw BotSelfConfigError.notFound
         }
         let revision = try bot.currentRevisionID.flatMap { try store.getRevision(id: $0) }
-        let memory = (try? botHome(for: bot).readBootstrapMemory()) ?? []
+        let memoryReason = try store.globalMemoryUnavailableReason(
+            botID: callerBotID, threadID: callerThreadID, runID: callerRunID
+        )
+        let memory = memoryReason == nil ? ((try? botHome(for: bot).readBootstrapMemory()) ?? []) : []
         let skills = (try? botHome(for: bot).listOwnedSkills()) ?? []
         let routines = try store.listRoutines(botID: callerBotID)
+        _ = try store.globalMemoryUnavailableReason(botID: callerBotID, threadID: callerThreadID, runID: callerRunID)
         return BotSelfConfigSnapshot(
             id: bot.id.value.uuidString.lowercased(),
             handle: bot.handle,
@@ -516,6 +537,8 @@ public struct BotSelfConfigService: Sendable {
             desktopKind: (revision?.desktopKind ?? .logicalExecutionSpace).advertisedOrLogical.rawValue,
             notificationsEnabled: bot.notificationsEnabled,
             memory: memory.map { .init(id: $0.path, content: $0.body) },
+            memoryAvailable: memoryReason == nil,
+            memoryUnavailableReason: memoryReason,
             skills: skills.map { .init(skillID: $0.slug, enabled: true) },
             routines: routines.map {
                 .init(
@@ -573,13 +596,20 @@ public struct BotSelfConfigService: Sendable {
                     : BotBrainCompiler.memoryHonesty
             )
         }
+        let memoryReason = try store.globalMemoryUnavailableReason(
+            botID: callerBotID, threadID: callerThreadID, runID: callerRunID
+        )
+        if BotHome.isWritableMemoryPath(path), let memoryReason {
+            throw BotSelfConfigError.invalid(memoryReason)
+        }
         let home = botHome(for: bot)
         try home.ensure(
             name: bot.name,
             handle: bot.handle,
             title: bot.title,
             description: bot.description,
-            soul: ""
+            soul: "",
+            initializeMemory: memoryReason == nil
         )
         try home.writeFile(relativePath: path, contents: contents)
         if BotHome.isWritableHomePath(path),
@@ -614,13 +644,17 @@ public struct BotSelfConfigService: Sendable {
         guard let slug = BotHome.normalizeSkillSlug(skillID) else {
             throw BotSelfConfigError.invalid("Skill id must be a catalog-style slug, not a path.")
         }
+        let memoryReason = try store.globalMemoryUnavailableReason(
+            botID: callerBotID, threadID: callerThreadID, runID: callerRunID
+        )
         let home = botHome(for: bot)
         try home.ensure(
             name: bot.name,
             handle: bot.handle,
             title: bot.title,
             description: bot.description,
-            soul: ""
+            soul: "",
+            initializeMemory: memoryReason == nil
         )
         let path = try home.createOwnedSkill(slug: slug)
         if let body {
@@ -641,30 +675,72 @@ public struct BotSelfConfigService: Sendable {
         }
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !needle.isEmpty else { throw BotSelfConfigError.invalid("query is required.") }
+        let terms = Self.recallTerms(needle)
+        guard needle.count <= 512, terms.count <= 16 else {
+            throw BotSelfConfigError.invalid("Use at most 16 search terms and 512 characters.")
+        }
         let wanted = scope.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard ["", "both", "memory", "conversations"].contains(wanted) else {
+            throw BotSelfConfigError.invalid("scope must be memory, conversations, or both.")
+        }
         let includeMemory = wanted.isEmpty || wanted == "both" || wanted == "memory"
         let includeConversations = wanted.isEmpty || wanted == "both" || wanted == "conversations"
+        let memoryReason = try store.globalMemoryUnavailableReason(
+            botID: callerBotID, threadID: callerThreadID, runID: callerRunID
+        )
+        if wanted == "memory", let memoryReason { throw BotSelfConfigError.invalid(memoryReason) }
+        let limit = 12
         var hits: [[String: String]] = []
-        if includeMemory {
+        var omittedMemoryFiles = 0
+        if includeMemory, memoryReason == nil {
             let home = botHome(for: bot)
-            let files = (try? home.readBootstrapMemory()) ?? []
-            for file in files {
-                if file.body.localizedCaseInsensitiveContains(needle) {
-                    hits.append([
-                        "source": file.path,
-                        "snippet": Self.snippet(in: file.body, matching: needle),
-                    ])
-                }
+            let memory = try home.readRecallMemory()
+            omittedMemoryFiles = memory.omittedCount
+            for file in memory.files where terms.allSatisfy({ file.body.localizedCaseInsensitiveContains($0) }) {
+                let modified = try home.resolvedURL(file.path)
+                    .resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                hits.append([
+                    "source": file.path,
+                    "source_kind": "memory",
+                    "bot_id": callerBotID.value.uuidString.lowercased(),
+                    "snippet": Self.snippet(in: file.body, matching: needle),
+                    "digest": RemoteCodeHostCatalog.bodyDigest(file.body),
+                    "match_kind": file.body.localizedCaseInsensitiveContains(needle) ? "exact_phrase" : "all_terms",
+                    "modified_at": modified?.ISO8601Format() ?? "",
+                ])
             }
         }
         if includeConversations {
-            hits.append(contentsOf: try store.searchLinkedMessages(botID: callerBotID, query: needle, limit: 12))
+            hits.append(contentsOf: try store.searchLinkedMessages(
+                botID: callerBotID, query: needle, limit: limit + 1, threadID: callerThreadID
+            ))
         }
-        return [
+        hits.sort {
+            let lhsExact = $0["match_kind"] == "exact_phrase"
+            let rhsExact = $1["match_kind"] == "exact_phrase"
+            if lhsExact != rhsExact { return lhsExact }
+            let lhsDate = $0["modified_at"] ?? $0["created_at"] ?? ""
+            let rhsDate = $1["modified_at"] ?? $1["created_at"] ?? ""
+            if lhsDate != rhsDate { return lhsDate > rhsDate }
+            return ($0["message_id"] ?? $0["source"] ?? "") < ($1["message_id"] ?? $1["source"] ?? "")
+        }
+        _ = try store.globalMemoryUnavailableReason(botID: callerBotID, threadID: callerThreadID, runID: callerRunID)
+        var result: [String: Any] = [
             "query": needle,
             "scope": includeMemory && includeConversations ? "both" : (includeMemory ? "memory" : "conversations"),
-            "hits": hits,
+            "hits": Array(hits.prefix(limit)),
+            "truncated": omittedMemoryFiles > 0 || hits.count > limit || (includeMemory && memoryReason != nil),
+            "omitted_memory_files": omittedMemoryFiles,
+            "memory_available": memoryReason == nil,
+            "max_hits": limit,
+            "memory_file_limit": BotHome.recallMemoryFileLimit,
+            "memory_byte_limit": BotHome.recallMemoryByteLimit,
         ]
+        if let memoryReason {
+            result["memory_unavailable_reason"] = memoryReason
+            if includeMemory { result["omitted_memory_files"] = NSNull() }
+        }
+        return result
     }
 
     public func askUser(question: String) throws -> [String: Any] {
@@ -752,15 +828,21 @@ public struct BotSelfConfigService: Sendable {
         return object
     }
 
-    static func snippet(in body: String, matching needle: String, radius: Int = 160) -> String {
-        let folded = body as NSString
-        let range = folded.range(of: needle, options: [.caseInsensitive])
-        guard range.location != NSNotFound else {
-            return String(body.prefix(radius))
-        }
-        let start = max(0, range.location - radius / 2)
-        let end = min(folded.length, range.location + range.length + radius / 2)
-        return folded.substring(with: NSRange(location: start, length: end - start))
+    static func recallTerms(_ query: String) -> [String] {
+        var seen = Set<String>()
+        return query.split(whereSeparator: \.isWhitespace).map(String.init)
+            .filter { seen.insert($0.lowercased()).inserted }
+    }
+
+    static func snippet(in body: String, matching needle: String, radius: Int = 320) -> String {
+        let match = body.range(of: needle, options: .caseInsensitive)
+            ?? recallTerms(needle).compactMap { body.range(of: $0, options: .caseInsensitive) }
+                .min { $0.lowerBound < $1.lowerBound }
+        let start = match.flatMap {
+            body.index($0.lowerBound, offsetBy: -radius / 2, limitedBy: body.startIndex)
+        } ?? body.startIndex
+        let end = body.index(start, offsetBy: radius, limitedBy: body.endIndex) ?? body.endIndex
+        return (start > body.startIndex ? "…" : "") + String(body[start..<end]) + (end < body.endIndex ? "…" : "")
     }
 
     func botHome(for bot: BotDefinition) -> BotHome {

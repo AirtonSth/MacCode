@@ -841,35 +841,80 @@ public final class BotStore: @unchecked Sendable {
         }
     }
 
-    public func searchLinkedMessages(botID: BotID, query: String, limit: Int) throws -> [[String: String]] {
-        let escaped = query
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "%", with: "\\%")
-            .replacingOccurrences(of: "_", with: "\\_")
+    /// BotHome memory is global to the Bot. A workspace pin does not grant
+    /// that memory; only an authorized general pin with memory access does.
+    public func globalMemoryUnavailableReason(
+        botID: BotID, threadID: AgentThreadID?, runID: AgentRunID? = nil
+    ) throws -> String? {
+        guard let threadID else { return nil }
+        guard let conversation = try conversationLinked(to: threadID), conversation.botID == botID else {
+            throw BotStoreError.invalidInput("The calling conversation does not belong to this Bot.")
+        }
+        guard let pin = try conversationContextPin(linkedTo: threadID) else { return nil }
+        guard pin.botID == botID, pin.conversationID == conversation.id,
+              try authorizes(hostID: pin.hostID, botID: botID, context: pin.context,
+                             action: .read, policyRevision: pin.policyRevision),
+              try runID.map({ try authorizesContextDelegation(hostID: pin.hostID, runID: $0, threadID: threadID) }) ?? true else {
+            throw BotStoreError.invalidInput("The calling Bot conversation is no longer authorized.")
+        }
+        guard pin.context == .general else {
+            return "Global Bot memory is unavailable in a workspace conversation; no workspace memory namespace is configured."
+        }
+        guard try authorizes(hostID: pin.hostID, botID: botID, context: pin.context,
+                             action: .memory, policyRevision: pin.policyRevision) else {
+            return "This general conversation requires a current memory grant to access global Bot memory."
+        }
+        return nil
+    }
+
+    public func searchLinkedMessages(
+        botID: BotID, query: String, limit: Int, threadID: AgentThreadID? = nil
+    ) throws -> [[String: String]] {
+        let terms = BotSelfConfigService.recallTerms(query)
+        guard !terms.isEmpty else { return [] }
+        func pattern(_ text: String) -> String {
+            "%" + text.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "%", with: "\\%")
+                .replacingOccurrences(of: "_", with: "\\_") + "%"
+        }
+        let matches = terms.map { _ in "m.content LIKE ? ESCAPE '\\'" }.joined(separator: " AND ")
+        var values = [botID.value.uuidString.lowercased()]
+        if let threadID { values.append(threadID.value.uuidString.lowercased()) }
+        values += terms.map(pattern)
+        values.append(pattern(query))
         return try db.performSync { database in
             let statement = try database.prepare("""
-                SELECT m.thread_id, m.role, m.content, m.created_at
+                SELECT m.thread_id, m.role, m.content, m.created_at, m.id, c.id
                 FROM agent_messages m
                 INNER JOIN bot_conversations c
-                    ON c.linked_agent_thread_id = m.thread_id
+                    ON c.linked_agent_thread_id = m.thread_id COLLATE NOCASE
                 WHERE c.bot_id = ?
-                  AND m.content LIKE ? ESCAPE '\\'
-                ORDER BY m.created_at DESC
+                  \(threadID == nil ? "" : "AND m.thread_id = ? COLLATE NOCASE")
+                  AND \(matches)
+                ORDER BY CASE WHEN m.content LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,
+                         m.created_at DESC, m.id
                 LIMIT ?;
                 """)
             defer { statement.reset() }
-            try statement.bind(1, botID.value.uuidString.lowercased())
-            try statement.bind(2, "%\(escaped)%")
-            try statement.bind(3, Int64(max(1, min(limit, 20))))
+            for (index, value) in values.enumerated() {
+                try statement.bind(Int32(index + 1), value)
+            }
+            try statement.bind(Int32(values.count + 1), Int64(max(1, min(limit, 20))))
             var hits: [[String: String]] = []
             while try statement.step() {
                 let content = statement.columnText(2) ?? ""
                 hits.append([
                     "source": "conversation",
+                    "source_kind": "conversation",
+                    "bot_id": botID.value.uuidString.lowercased(),
                     "thread_id": statement.columnText(0) ?? "",
+                    "message_id": statement.columnText(4) ?? "",
+                    "conversation_id": statement.columnText(5) ?? "",
                     "role": statement.columnText(1) ?? "",
                     "snippet": BotSelfConfigService.snippet(in: content, matching: query),
                     "created_at": statement.columnText(3) ?? "",
+                    "digest": RemoteCodeHostCatalog.bodyDigest(content),
+                    "match_kind": content.localizedCaseInsensitiveContains(query) ? "exact_phrase" : "all_terms",
                 ])
             }
             return hits

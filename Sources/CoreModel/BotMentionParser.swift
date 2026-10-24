@@ -65,9 +65,10 @@ public enum BotMentionParser {
         }
         // SEP-3: case-insensitive compare without per-call lowercased()
         // copies (token needle + per-bot name allocs per resolve).
-        return bots.first { bot in
+        let matches = bots.filter { bot in
             bot.id != excluding && bot.name.caseInsensitiveCompare(token) == .orderedSame
         }
+        return matches.count == 1 ? matches[0] : nil
     }
 
     public static func mentionTokens(in text: String) -> [String] {
@@ -81,6 +82,13 @@ public enum BotMentionParser {
         var index = text.startIndex
         while index < text.endIndex {
             if text[index] == "@" {
+                if index > text.startIndex {
+                    let before = text[text.index(before: index)]
+                    if before.isLetter || before.isNumber || before == "_" {
+                        index = text.index(after: index)
+                        continue
+                    }
+                }
                 let start = text.index(after: index)
                 var end = start
                 while end < text.endIndex {
@@ -153,7 +161,7 @@ public enum BotPeerTranscript {
     }
 
     public static func encode(peer: BotDefinition, text: String) -> String {
-        "\(prefix)\(peer.handle)|\(peer.name)|\(peer.title)|\(peer.avatarSymbol)]]\n\(text)"
+        "\(prefix)\(peer.handle)|\(peer.name)|\(peer.title)|\(peer.avatarSymbol)|\(peer.id.value.uuidString.lowercased())]]\n\(text)"
     }
 
     public static func parse(
@@ -164,7 +172,8 @@ public enum BotPeerTranscript {
         name: String,
         title: String,
         handle: String,
-        avatarSymbol: String
+        avatarSymbol: String,
+        botID: BotID?
     )? {
         guard content.hasPrefix(prefix),
               let end = content.range(of: "]]") else { return nil }
@@ -175,10 +184,11 @@ public enum BotPeerTranscript {
         let name = parts[1]
         let title = parts.count > 2 ? parts[2] : ""
         let avatarSymbol = parts.count > 3 ? parts[3] : ""
+        let botID = parts.count > 4 ? UUID(uuidString: parts[4]).map(BotID.init) : nil
         let bodyStart = content.index(end.upperBound, offsetBy: 0)
         var body = String(content[bodyStart...])
         if body.hasPrefix("\n") { body.removeFirst() }
-        return (fromCaption(name: name), body, name, title, handle, avatarSymbol)
+        return (fromCaption(name: name), body, name, title, handle, avatarSymbol, botID)
     }
 
     public static func encodeActivity(peer: BotDefinition, phase: BotPeerActivityPhase) -> String {

@@ -693,6 +693,26 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertTrue(peerStarted)
         let peerRequest = try XCTUnwrap(runner.requests.last)
         XCTAssertEqual(peerRequest.cwd, callerWorkspaceCwd)
+        let helper = try botsVM.create(name: "Nested helper", title: "Workspace reviewer", provider: .codex)
+        let peerCapability = try XCTUnwrap(peerRequest.environment[AgentDelegationCapabilityTransport.environmentKey])
+        do {
+            _ = try await router.askBotPeer(callerThread: peerRequest.threadId, callerRun: peerRequest.runId,
+                handle: helper.handle, prompt: "Review independently.", replyMode: .consult,
+                consultationID: nil, wait: false, delegationCapability: peerCapability)
+            XCTFail("a private peer must retain its inherited workspace's async restriction")
+        } catch let error as JSONRPCError { XCTAssertEqual(error.code, -32054) }
+        let nestedAsk = Task { @MainActor in
+            try await router.askBotPeer(callerThread: peerRequest.threadId, callerRun: peerRequest.runId,
+                handle: helper.handle, prompt: "NESTED_WORKSPACE_REVIEW", replyMode: .consult,
+                delegationCapability: peerCapability)
+        }
+        defer { nestedAsk.cancel() }
+        let nestedStarted = await waitUntil(timeout: 5) { runner.requests.count == 3 }
+        XCTAssertTrue(nestedStarted, "a waiting ancestor must not block its synchronous child")
+        let nestedRequest = try XCTUnwrap(runner.requests.first { $0.prompt.contains("NESTED_WORKSPACE_REVIEW") })
+        XCTAssertEqual(nestedRequest.cwd, callerWorkspaceCwd)
+        XCTAssertTrue(runner.finish(runID: nestedRequest.runId, status: .completed, reply: "NESTED_REVIEW"))
+        _ = try await nestedAsk.value
         XCTAssertTrue(runner.finish(
             runID: peerRequest.runId,
             status: .completed,
@@ -725,8 +745,8 @@ final class AgentAppBotMentionTests: XCTestCase {
 
     func test_agentAppPeerConsultationIsFreshByDefaultAndReusesOnlyExplicitLiveContext() async throws {
         // WHY: omission is the independent-review boundary. Only an opaque id
-        // returned to this exact active run and Bot may continue the prior peer
-        // transcript, and even that continuation must own a new activity/run.
+        // returned to this conversation and Bot may continue the prior peer
+        // transcript, under the new run's capability and current route.
         let (router, botsVM, surface, quinn, threadID, ctx) = try makeWiredMentionSurface(
             peerReply: "unused controlled reply"
         )
@@ -1047,20 +1067,49 @@ final class AgentAppBotMentionTests: XCTestCase {
             laterHostRequest.environment[AgentDelegationCapabilityTransport.environmentKey]
         )
         do {
-            _ = try await router.askBotPeer(
-                callerThread: threadID,
-                callerRun: laterHostRunID,
-                handle: quinn.handle,
-                prompt: "Try to revive an earlier run's consultation.",
-                replyMode: .consult,
-                consultationID: firstConsultationID,
-                delegationCapability: laterCapability
-            )
-            XCTFail("consultation ids must become stale when their owning host run ends")
-        } catch let error as JSONRPCError {
-            XCTAssertEqual(error.code, -32050)
+            _ = try await router.askBotPeer(callerThread: threadID, callerRun: laterHostRunID,
+                handle: quinn.handle, prompt: "Old bearer must not authorize a new turn.", replyMode: .consult,
+                consultationID: firstConsultationID, delegationCapability: capability)
+            XCTFail("the previous run's capability must be rejected")
+        } catch let error as JSONRPCError { XCTAssertEqual(error.code, -32047) }
+        let catalog = try router.listBotPeers(callerThread: threadID, callerRun: laterHostRunID,
+            delegationCapability: laterCapability)
+        let catalogPeer = try XCTUnwrap(catalog.objectValue?["bots"]?.arrayValue?.first {
+            $0.objectValue?["handle"]?.stringValue == quinn.handle
+        })
+        XCTAssertTrue(catalogPeer.objectValue?["consultations"]?.arrayValue?.contains {
+            $0.objectValue?["consultation_id"]?.stringValue == firstConsultationID.uuidString.lowercased()
+        } == true)
+        let resumeTask = Task { @MainActor in
+            try await router.askBotPeer(callerThread: threadID, callerRun: laterHostRunID,
+                handle: quinn.handle, prompt: "Continue the earlier discussion with current authority.", replyMode: .consult,
+                consultationID: firstConsultationID, wait: true, delegationCapability: laterCapability)
         }
-        XCTAssertEqual(runner.requests.count, 6, "stale cross-run rejection must precede dispatch")
+        defer { resumeTask.cancel() }
+        let resumedStarted = await waitUntil(timeout: 5) { runner.requests.count == 7 }
+        XCTAssertTrue(resumedStarted)
+        let resumedRequest = try XCTUnwrap(runner.requests.last)
+        XCTAssertEqual(resumedRequest.threadId, firstPeerThreadID)
+        XCTAssertNotEqual(resumedRequest.runId, firstPeerRequest.runId)
+        XCTAssertTrue(runner.finish(runID: resumedRequest.runId, status: .completed, reply: "LATER_REVIEW"))
+        let resumed = try await resumeTask.value
+        let resumedActivity = try XCTUnwrap(resumed.objectValue?["activity_id"]?.stringValue.flatMap(UUID.init))
+        let observed = try await router.observeBotPeer(callerThread: threadID, callerRun: laterHostRunID,
+            activityID: resumedActivity, wait: true, cancel: false, delegationCapability: laterCapability)
+        XCTAssertEqual(observed.objectValue?["reply"], .string("LATER_REVIEW"))
+        let privateSend = try await router.sendAgentMessage(thread: firstPeerThreadID, text: "A direct private message.",
+            provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)
+        let privateRunID = try XCTUnwrap(privateSend.runId)
+        let privateStarted = await waitUntil(timeout: 5) { runner.requests.contains { $0.runId == privateRunID } }
+        XCTAssertTrue(privateStarted)
+        do {
+            _ = try await router.askBotPeer(callerThread: threadID, callerRun: laterHostRunID,
+                handle: quinn.handle, prompt: "Continue while that thread is busy.", replyMode: .consult,
+                consultationID: firstConsultationID, delegationCapability: laterCapability)
+            XCTFail("a consultation must never become an unscoped queued root")
+        } catch let error as JSONRPCError { XCTAssertEqual(error.code, -32050) }
+        XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: firstPeerThreadID).isEmpty)
+        XCTAssertTrue(runner.finish(runID: privateRunID, status: .completed, reply: "PRIVATE_DONE"))
         XCTAssertTrue(runner.finish(
             runID: laterHostRunID,
             status: .completed,
@@ -2832,6 +2881,100 @@ final class AgentAppBotMentionTests: XCTestCase {
         XCTAssertEqual(surface.viewModel.prompt, "draft that belongs to Other")
         XCTAssertEqual(try ctx.threadRepo.get(id: other.id)?.hasUnread, false)
         XCTAssertTrue(try ctx.messageRepo.list(threadId: other.id).isEmpty)
+    }
+
+    func test_asyncPeerRejectsInheritedWorkspaceBeforeStartingWork() async throws {
+        let (router, _, _, peer, threadID, ctx) = try makeWiredMentionSurface(peerReply: "unused")
+        defer { ctx.coordinator.stopRun(threadId: threadID) }
+        let runner = ControlledBotHandoffRunner(provider: .codex)
+        ctx.coordinator.replaceProviderAdapter(.codex, adapter: TerminalRetiringOneShotAdapter(runner: runner))
+        let sent = try await router.sendAgentMessage(thread: threadID, text: "Review this workspace.",
+            provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)
+        let started = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let capability = try XCTUnwrap(runner.requests.first?.environment[AgentDelegationCapabilityTransport.environmentKey])
+        do {
+            _ = try await router.askBotPeer(callerThread: threadID, callerRun: XCTUnwrap(sent.runId),
+                handle: peer.handle, prompt: "Edit the inherited directory.", replyMode: .consult,
+                consultationID: nil, wait: false, delegationCapability: capability)
+            XCTFail("the parent and peer must not edit one inherited workspace concurrently")
+        } catch let error as JSONRPCError {
+            XCTAssertEqual(error.code, -32054)
+            XCTAssertEqual(error.data?.objectValue?["admission"], .string("rejected"))
+        }
+        XCTAssertEqual(runner.requests.count, 1)
+        XCTAssertTrue(ctx.botPeerHandoffAuthority.availableConsultations(callerThread: threadID,
+            callerRun: try XCTUnwrap(sent.runId), peerBotID: peer.id).isEmpty)
+    }
+
+    func test_asyncPeersAreIndependentAndCancellationStopsOnlyTheChosenActivity() async throws {
+        let (router, botsVM, _, firstPeer, _, ctx) = try makeWiredMentionSurface(peerReply: "unused")
+        let thread = AgentThread(workspaceId: nil, title: "Independent reviews", provider: .codex,
+            model: "fake-model", modelSelection: AgentModelSelection(provider: .codex, modelId: "fake-model"))
+        let threadID = thread.id
+        defer { ctx.coordinator.stopRun(threadId: threadID) }
+        let secondPeer = try botsVM.create(name: "Second", title: "Independent evidence", provider: .codex)
+        let helper = try botsVM.create(name: "Helper", title: "Dependent evidence", provider: .codex)
+        try ctx.threadRepo.upsert(thread)
+        let runner = ControlledBotHandoffRunner(provider: .codex)
+        ctx.coordinator.replaceProviderAdapter(.codex, adapter: TerminalRetiringOneShotAdapter(runner: runner))
+        let sent = try await router.sendAgentMessage(thread: threadID, text: "Two independent reviews.",
+            provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)
+        let hostRun = try XCTUnwrap(sent.runId)
+        let started = await waitUntil(timeout: 5) { runner.requests.count == 1 }
+        XCTAssertTrue(started)
+        let capability = try XCTUnwrap(runner.requests.first?.environment[AgentDelegationCapabilityTransport.environmentKey])
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let request = JSONRPCRequest(jsonrpc: "2.0", id: .string("async"), method: "bot.peer.ask", params: [
+            "thread_id": .string(threadID.value.uuidString), "run_id": .string(hostRun.value.uuidString),
+            "handle": .string(firstPeer.handle), "prompt": .string("FIRST_INDEPENDENT_REVIEW"),
+            "reply_mode": .string("consult"), "wait": .bool(false),
+            "client_request_id": .string(UUID().uuidString),
+            BotPeerDelegation.capabilityRPCParameterKey: .string(capability),
+        ])
+        let admitted = await dispatcher.dispatchUnixSocket(request)
+        XCTAssertNil(admitted.error)
+        let first = try XCTUnwrap(admitted.result)
+        let replay = await dispatcher.dispatchUnixSocket(request)
+        XCTAssertEqual(replay.result, first, "retry observes the same durable submission")
+        let second = try await router.askBotPeer(callerThread: threadID, callerRun: hostRun,
+            handle: secondPeer.handle, prompt: "SECOND_INDEPENDENT_REVIEW", replyMode: .consult,
+            consultationID: nil, wait: false, delegationCapability: capability)
+        let peersStarted = await waitUntil(timeout: 5) { runner.requests.count == 3 }
+        XCTAssertTrue(peersStarted, "the second peer starts before the first finishes")
+        let firstRequest = try XCTUnwrap(runner.requests.first { $0.prompt.contains("FIRST_INDEPENDENT_REVIEW") })
+        let secondRequest = try XCTUnwrap(runner.requests.first { $0.prompt.contains("SECOND_INDEPENDENT_REVIEW") })
+        XCTAssertNotEqual(firstRequest.cwd, secondRequest.cwd, "independent peers must use separate Bot homes")
+        let firstCapability = try XCTUnwrap(firstRequest.environment[AgentDelegationCapabilityTransport.environmentKey])
+        do {
+            _ = try await router.askBotPeer(callerThread: firstRequest.threadId, callerRun: firstRequest.runId,
+                handle: firstPeer.handle, prompt: "Recursive consultation", replyMode: .consult,
+                consultationID: nil, wait: false, delegationCapability: firstCapability)
+            XCTFail("a Bot must not recursively delegate to itself")
+        } catch let error as JSONRPCError { XCTAssertEqual(error.code, -32053, error.message) }
+        let child = try await router.askBotPeer(callerThread: firstRequest.threadId, callerRun: firstRequest.runId,
+            handle: helper.handle, prompt: "DEPENDENT_EVIDENCE", replyMode: .consult,
+            consultationID: nil, wait: false, delegationCapability: firstCapability)
+        let childStarted = await waitUntil(timeout: 5) { runner.requests.count == 4 }
+        XCTAssertTrue(childStarted, "an authorized peer can ask a different specialist for help")
+        let childRun = try XCTUnwrap(child.objectValue?["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init))
+        let firstID = try XCTUnwrap(first.objectValue?["activity_id"]?.stringValue.flatMap(UUID.init))
+        let secondID = try XCTUnwrap(second.objectValue?["activity_id"]?.stringValue.flatMap(UUID.init))
+        let cancelled = try await router.observeBotPeer(callerThread: threadID, callerRun: hostRun,
+            activityID: firstID, wait: true, cancel: true, delegationCapability: capability)
+        XCTAssertEqual(cancelled.objectValue?["terminal"], .bool(true))
+        XCTAssertNil(cancelled.objectValue?["reply"])
+        let childStopped = await waitUntil(timeout: 5) { (try? ctx.runRepo.status(of: childRun)) == .cancelled }
+        XCTAssertTrue(childStopped, "cancelling one consultation also stops its descendants")
+        let secondRun = try XCTUnwrap(second.objectValue?["run_id"]?.stringValue.flatMap(UUID.init).map(AgentRunID.init))
+        XCTAssertEqual(try ctx.runRepo.status(of: secondRun), .running)
+        XCTAssertEqual(try ctx.runRepo.status(of: hostRun), .running)
+        XCTAssertTrue(runner.finish(runID: secondRun, status: .completed, reply: "INDEPENDENT_EVIDENCE"))
+        let completed = try await router.observeBotPeer(callerThread: threadID, callerRun: hostRun,
+            activityID: secondID, wait: true, cancel: false, delegationCapability: capability)
+        XCTAssertEqual(completed.objectValue?["reply"], .string("INDEPENDENT_EVIDENCE"))
+        XCTAssertThrowsError(try ctx.botPeerHandoffAuthority.peerActivity(secondID, callerThread: AgentThreadID()))
+        XCTAssertEqual(runner.requests.count, 4)
     }
 
     private func waitUntil(timeout: TimeInterval, _ predicate: () -> Bool) async -> Bool {

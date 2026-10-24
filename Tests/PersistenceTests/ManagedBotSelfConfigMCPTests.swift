@@ -82,7 +82,7 @@ final class ManagedBotSelfConfigMCPTests: XCTestCase {
             "authoring each new prompt yourself based on real replies",
             "including only the prior-reply context relevant to the next Bot",
             "primary AI mediates and produces the final synthesis",
-            "RemoteCode does not semantically route, sequence, or set a fixed iteration count",
+            "the host enforces bounded work, cycles, and shared resource admission",
             "`reply_only` is terminal",
             "no comparison, follow-up, mediation, or synthesis remains",
         ]

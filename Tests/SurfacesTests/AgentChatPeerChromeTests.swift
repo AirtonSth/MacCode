@@ -3,6 +3,24 @@ import CoreModel
 @testable import Surfaces
 
 final class AgentChatPeerChromeTests: XCTestCase {
+    func test_allMentionedBotsKeepTextOrderWithoutAssigningTheMessageToOnePeer() {
+        let quinn = BotDefinition(handle: "quinn", name: "Quinn", title: "CRM", description: "")
+        let sage = BotDefinition(handle: "sage", name: "Sage", title: "Review", description: "")
+        let text = "Compare @sage and @quinn. Do not ask @sage yet."
+        XCTAssertEqual(
+            AgentAppView.messagedPeers(in: text, bots: [quinn, sage]).map(\.handle),
+            ["sage", "quinn"]
+        )
+        XCTAssertNil(AgentAppView.messagedPeer(in: text, bots: [quinn, sage]),
+                     "a multi-peer mention must not be grouped under its first Bot")
+        XCTAssertEqual(BotPeerTranscript.mentionedCaption(for: sage), "Mentions Sage")
+        XCTAssertEqual(
+            AgentAppView.messagedPeers(in: "> @quinn suggested this. Do not call @sage.", bots: [quinn, sage]).count,
+            2,
+            "identity chrome describes references without claiming that a Bot was called"
+        )
+    }
+
     func test_peerIdentityHeaderUsesBotAvatar_becauseInitialsAreNotTheTeammate() throws {
         // WHY: Desk hop chrome painted a letter tile. Agent App and Desk
         // must share one header that forwards the blobatar token.

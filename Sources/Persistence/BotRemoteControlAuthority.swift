@@ -2299,13 +2299,30 @@ public final class BotRemoteControlAuthority: @unchecked Sendable {
     private func routineUpsert(params: [String: Any], requestID: String, now: Date) throws -> [String: Any] {
         let bot = try requireBot(params)
         let existingID = string(params, "routine_id").flatMap(UUID.init).map(BotRoutineID.init)
+        let existing: BotRoutineDefinition?
         if let existingID {
-            guard try store.listRoutines(botID: bot.id).contains(where: {
+            guard let routine = try store.listRoutines(botID: bot.id).first(where: {
                 $0.definition.id == existingID
             }) else { throw Error.routineGone }
+            existing = routine.definition
+        } else {
+            existing = nil
         }
-        let specJSON = string(params, "schedule_spec_json") ?? ""
+        var specJSON = string(params, "schedule_spec_json") ?? existing?.scheduleSpecJSON ?? ""
         if !specJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard BotScheduleSpec.decodeJSON(specJSON) != nil else {
+                throw Error(code: -32602, message: "Provide a valid Bot schedule.")
+            }
+            if let existing,
+               let previous = try? JSONSerialization.jsonObject(with: Data(existing.scheduleSpecJSON.utf8)) as? [String: Any],
+               var incoming = try? JSONSerialization.jsonObject(with: Data(specJSON.utf8)) as? [String: Any] {
+                // Missing means an older editor did not know this option.
+                // An explicit null remains present and clears an optional.
+                for (key, value) in previous where incoming[key] == nil { incoming[key] = value }
+                specJSON = String(
+                    decoding: try JSONSerialization.data(withJSONObject: incoming, options: [.sortedKeys]), as: UTF8.self
+                )
+            }
             guard let spec = BotScheduleSpec.decodeJSON(specJSON) else {
                 throw Error(code: -32602, message: "Provide a valid Bot schedule.")
             }
