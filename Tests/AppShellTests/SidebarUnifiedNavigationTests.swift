@@ -63,6 +63,55 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         XCTAssertEqual(f.vm.workspaceVirtualMachineRows(workspace.id).map(\.name), ["Renamed"])
     }
 
+    func test_ownedCatalogBotsAppearInWorkspaceWithoutInventingContextAccess() async throws {
+        let f = try make("owned-catalog")
+        defer { try? FileManager.default.removeItem(atPath: f.directory) }
+        let workspace = try f.router.createWorkspace(name: "airtours", cwd: NSTemporaryDirectory())
+        let other = try f.router.createWorkspace(name: "Other", cwd: NSTemporaryDirectory())
+        let owned = try f.context.botStore.create(name: "Tech Lead", title: "", description: "", workspaceID: workspace.id)
+        let machine = try f.context.botStore.saveVirtualMachine(name: "Project VM", workspaceID: workspace.id)
+        f.vm.reload()
+        await expand(f.vm, workspace.id)
+
+        XCTAssertEqual(f.vm.workspaceBotRows(workspace.id).map(\.botID), [owned.id],
+                       "Catalog ownership must list existing bots even before a host context is granted")
+        XCTAssertFalse(f.vm.generalBots.contains { $0.botID == owned.id }, "An exclusive bot belongs in its workspace")
+        XCTAssertEqual(f.vm.workspaceVirtualMachineRows(workspace.id).map(\.id), [machine.id])
+        XCTAssertTrue(f.vm.authorizedBotConversationRows.allSatisfy { $0.botID != owned.id },
+                      "Catalog visibility must not fabricate contextual authority")
+        XCTAssertNil(try f.context.botStore.getContextBinding(hostID: f.host, botID: owned.id, context: .workspace(workspace.id)))
+        let catalogRow = try XCTUnwrap(f.vm.workspaceBotRows(workspace.id).first)
+        XCTAssertTrue(catalogRow.isCatalogOnly)
+        let botsVM = BotsViewModel(context: f.context, router: f.router)
+        f.router.botsViewModel = botsVM
+        f.vm.startBotConversation(catalogRow)
+        XCTAssertEqual(botsVM.screen, .studio, "Without contextual access a catalog click opens configuration")
+        XCTAssertTrue(try f.context.botStore.listConversations(botID: owned.id).isEmpty,
+                      "Discovering an owned resource must not create an unauthorized thread")
+
+        f.vm.filterText = "Tech Lead"
+        XCTAssertEqual(f.vm.treeWorkspaces.map(\.id), [workspace.id])
+        XCTAssertTrue(f.vm.workspaceBotRows(other.id).isEmpty)
+        f.vm.filterText = ""
+        let binding = try f.context.botStore.grantContext(hostID: f.host, botID: owned.id,
+            context: .workspace(workspace.id), actions: [.read, .send], expectedRevision: 0)
+        await f.vm.reloadAuthorizedBotConversationRowsAndWait()
+        XCTAssertEqual(f.vm.workspaceBotRows(workspace.id).map(\.botID), [owned.id], "A grant enriches the same catalog row")
+        XCTAssertFalse(try XCTUnwrap(f.vm.workspaceBotRows(workspace.id).first).isCatalogOnly)
+        _ = try f.context.botStore.revokeContext(hostID: f.host, botID: owned.id,
+            context: .workspace(workspace.id), expectedRevision: binding.policyRevision)
+        await f.vm.reloadAuthorizedBotConversationRowsAndWait()
+        XCTAssertEqual(f.vm.workspaceBotRows(workspace.id).map(\.botID), [owned.id], "Revocation removes access, not catalog ownership")
+        XCTAssertFalse(f.vm.authorizedBotConversationRows.contains { $0.botID == owned.id })
+        let revokedRow = try XCTUnwrap(f.vm.workspaceBotRows(workspace.id).first)
+        XCTAssertTrue(revokedRow.isCatalogOnly)
+        f.vm.startNewBotConversation(revokedRow)
+        XCTAssertEqual(botsVM.screen, .studio)
+        XCTAssertTrue(try f.context.botStore.listConversations(botID: owned.id).isEmpty)
+        XCTAssertEqual(try f.context.botStore.getContextBinding(hostID: f.host, botID: owned.id,
+            context: .workspace(workspace.id))?.state, .revoked)
+    }
+
     func test_generalBotsPutTitioFirstAndKeepWorkspaceOnlyBotsInTheirWorkspace() async throws {
         let f = try make("general")
         defer { try? FileManager.default.removeItem(atPath: f.directory) }
@@ -336,7 +385,7 @@ final class SidebarUnifiedNavigationTests: XCTestCase {
         let source = try String(contentsOf: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
         XCTAssertEqual(source.components(separatedBy: "SidebarSearchField(").count - 1, 1, "the sidebar mounts exactly one search field")
-        XCTAssertEqual(source.components(separatedBy: "SidebarSectionMoreMenu(help:").count - 1, 3, "Bots, Workspaces and VMs headers share one \"...\" menu component")
+        XCTAssertEqual(source.components(separatedBy: "SidebarSectionMoreMenu(help:").count - 1, 5, "Global and workspace resource headers share one menu component")
         XCTAssertTrue(source.contains("Text(\"Bots\")") && !source.contains("Text(\"General Bots\")"), "the section is titled Bots")
     }
 

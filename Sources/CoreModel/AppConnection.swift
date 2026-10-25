@@ -56,8 +56,9 @@ public struct AppConnection: Codable, Equatable, Sendable, Identifiable {
     public var status: ConnectionStatus
     public var testedAt: Date?
     public var revision: Int
-    public init(id: UUID = UUID(), name: String, account: String = "", kind: ConnectionKind, endpoint: String, arguments: [String] = [], access: ConnectionAccess = ConnectionAccess(), status: ConnectionStatus = .untested, testedAt: Date? = nil, revision: Int = 0) {
-        self.id = id; self.name = name; self.account = account; self.kind = kind; self.endpoint = endpoint; self.arguments = arguments; self.access = access; self.status = status; self.testedAt = testedAt; self.revision = revision
+    public var composio: ComposioConnectionMetadata?
+    public init(id: UUID = UUID(), name: String, account: String = "", kind: ConnectionKind, endpoint: String, arguments: [String] = [], access: ConnectionAccess = ConnectionAccess(), status: ConnectionStatus = .untested, testedAt: Date? = nil, revision: Int = 0, composio: ComposioConnectionMetadata? = nil) {
+        self.id = id; self.name = name; self.account = account; self.kind = kind; self.endpoint = endpoint; self.arguments = arguments; self.access = access; self.status = status; self.testedAt = testedAt; self.revision = revision; self.composio = composio
     }
     public func validate() throws {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, name.count <= 120 else { throw ConnectionError.invalidConfiguration }

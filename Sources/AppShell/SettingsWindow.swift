@@ -1639,10 +1639,10 @@ public struct SettingsView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
-                    settingsHero
+                    if vm.selectedCategory != .connections { settingsHero }
                     selectedSection
                 }
-                .frame(maxWidth: vm.selectedCategory == .accounts ? 1120 : 680, alignment: .leading)
+                .frame(maxWidth: (vm.selectedCategory == .accounts || vm.selectedCategory == .connections) ? 1120 : 680, alignment: .leading)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, DS.Space.md)
             }

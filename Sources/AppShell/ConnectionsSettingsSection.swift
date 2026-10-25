@@ -44,7 +44,7 @@ final class ConnectionsSettingsModel: ObservableObject {
 }
 
 /// One app-owned catalog shared by Agent App, bots and scheduled tasks.
-struct ConnectionsSettingsSection: View {
+struct ManualConnectionsSettingsSection: View {
     let context: AppContext
     @StateObject private var model: ConnectionsSettingsModel
     @State private var editing: AppConnection?
@@ -73,7 +73,7 @@ struct ConnectionsSettingsSection: View {
                     .font(DS.Font.body).foregroundStyle(DS.Palette.textSecondary).padding(DS.Space.xl)
                     .frame(maxWidth: .infinity, alignment: .leading).dsPanel()
             }
-            ForEach(model.connections) { connection in
+            ForEach(model.connections.filter { $0.composio == nil }) { connection in
                 VStack(alignment: .leading, spacing: DS.Space.md) {
                     HStack {
                         Label(connection.name, systemImage: "puzzlepiece.extension").font(DS.Font.bodyStrong)

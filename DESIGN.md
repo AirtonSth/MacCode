@@ -190,3 +190,7 @@ the header and sidebar rather than a floating button over transcript content.
 Full access uses the shared compact status strip with an accessible details
 popover and direct switch-to-supervised action. Actual failures and approval
 requests stay visible; compact presentation never changes execution permission.
+
+## App connections and workspace resource menus (2026-10-25)
+
+Connections is a first-class sidebar destination shared with its Settings category. The primary surface is a searchable app catalog with categories, connected account cards, Add Account and explicit per-bot/workspace/task access. A Composio project is configured once in a secure sheet; provider endpoints, JSON and headers do not appear in the normal app connection flow. OAuth is pending until the exact account is verified active. Custom MCP configuration lives under Advanced. Workspace Bots and VMs each have a single ellipsis menu next to their disclosure header; creation/attachment commands do not occupy permanent rows. Catalog ownership remains visible without implying permission to read or send in that context.

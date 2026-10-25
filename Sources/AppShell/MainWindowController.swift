@@ -454,6 +454,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
         sidebar.onPresentSettings = { [weak self] in
             self?.presentSettingsInMainContent()
         }
+        sidebar.onPresentConnections = { [weak self] in
+            self?.presentConnectionsInMainContent()
+        }
         sidebar.botsViewModel.onLeaveBots = { [weak self] in
             self?.presentWorkspaceContent()
         }
@@ -1357,6 +1360,12 @@ public final class MainWindowController: NSObject, NSWindowDelegate, PaneKeyboar
 
     /// Settings shell destination: System Settings-style categories in the main
     /// content column. A non-nil route selects its category first.
+    func presentConnectionsInMainContent() {
+        settingsShellViewModel()?.selectedCategory = .connections
+        presentSettingsInMainContent()
+        sidebar.setConnectionsSelected(true)
+    }
+
     func presentSettingsInMainContent(route: PetSettingsRoute? = nil) {
         if let route, let vm = settingsShellViewModel() {
             vm.select(route: route)
